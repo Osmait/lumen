@@ -214,8 +214,12 @@ install -Dm755 zig-out/bin/lumen ~/.local/bin/lumen
 exec-once = lumen --daemon
 bind = ALT, SPACE, exec, lumen
 layerrule = blur true,match:namespace lumen
-layerrule = ignore_alpha 0,match:namespace lumen
+layerrule = ignore_alpha 0.45,match:namespace lumen
 ```
+
+`ignore_alpha` keeps the blur behind the search bar and the results only:
+at 0 the soft shadows around them are blurred too, which shows as a
+frosted halo on the clear part of the surface.
 
 ## Command line
 
