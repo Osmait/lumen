@@ -452,15 +452,16 @@ fn rebuildDelta(l: *Live) !void {
 
 /// Searches base and delta and merges by score. Paths are allocated in
 /// `arena`.
-pub fn search(l: *Live, arena: std.mem.Allocator, pool: *Pool, query: []const u8, limit: usize, opts: engine.Options, out: *std.ArrayList(Hit)) !void {
+pub fn search(l: *Live, arena: std.mem.Allocator, pool: *Pool, query: []const u8, opts: engine.Options, out: *std.ArrayList(Hit)) !void {
+    const limit = opts.limit;
     out.clearRetainingCapacity();
     var hits: std.ArrayList(engine.Hit) = .empty;
     defer hits.deinit(l.gpa);
     var buf: [4096]u8 = undefined;
-    try l.engine_base.search(l.gpa, pool, &l.base, query, limit, opts, &hits);
+    try l.engine_base.search(l.gpa, pool, &l.base, query, opts, &hits);
     for (hits.items) |h| try out.append(arena, .{ .path = try arena.dupe(u8, l.base.path(h.id, &buf)), .score = h.score, .is_dir = l.base.isDir(h.id) });
     if (l.delta.len() > 0) {
-        try l.engine_delta.search(l.gpa, pool, &l.delta, query, limit, opts, &hits);
+        try l.engine_delta.search(l.gpa, pool, &l.delta, query, opts, &hits);
         for (hits.items) |h| try out.append(arena, .{ .path = try arena.dupe(u8, l.delta.path(h.id, &buf)), .score = h.score, .is_dir = l.delta.isDir(h.id) });
     }
     std.mem.sort(Hit, out.items, {}, struct {
@@ -654,7 +655,7 @@ const Tree = struct {
     }
 
     fn searchOpts(t: *Tree, query: []const u8, opts: engine.Options) ![]const Hit {
-        try t.live.search(t.arena.allocator(), t.pool, query, 50, opts, &t.hits);
+        try t.live.search(t.arena.allocator(), t.pool, query, opts, &t.hits);
         return t.hits.items;
     }
 
@@ -663,7 +664,7 @@ const Tree = struct {
         var buf: [4096]u8 = undefined;
         const want = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ t.root, rel });
         var n: usize = 0;
-        for (try t.searchOpts(query, .{ .recency = false })) |h| n += @intFromBool(std.mem.eql(u8, h.path, want));
+        for (try t.searchOpts(query, .{ .limit = 50, .recency = false })) |h| n += @intFromBool(std.mem.eql(u8, h.path, want));
         return n;
     }
 
@@ -678,7 +679,7 @@ const Tree = struct {
         var buf: [4096]u8 = undefined;
         const prefix = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ t.dir, rel });
         var n: usize = 0;
-        for (try t.searchOpts(query, .{ .recency = false })) |h| {
+        for (try t.searchOpts(query, .{ .limit = 50, .recency = false })) |h| {
             n += @intFromBool(std.mem.startsWith(u8, h.path, prefix) and !std.mem.eql(u8, h.path, t.root));
         }
         return n;
@@ -696,7 +697,7 @@ const Tree = struct {
     fn scoreOf(t: *Tree, query: []const u8, rel: []const u8) !?i32 {
         var buf: [4096]u8 = undefined;
         const want = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ t.root, rel });
-        for (try t.searchOpts(query, .{ .recency = false })) |h| if (std.mem.eql(u8, h.path, want)) return h.score;
+        for (try t.searchOpts(query, .{ .limit = 50, .recency = false })) |h| if (std.mem.eql(u8, h.path, want)) return h.score;
         return null;
     }
 };
@@ -919,14 +920,14 @@ test "live: adopt leaves a clean index that finds the same" {
 
     const arena = t.arena.allocator();
     var before: std.ArrayList([]const u8) = .empty;
-    for (try t.searchOpts("rs", .{ .recency = false })) |h| try before.append(arena, h.path);
+    for (try t.searchOpts("rs", .{ .limit = 50, .recency = false })) |h| try before.append(arena, h.path);
     try t.compact();
 
     try testing.expectEqual(0, t.live.delta.len());
     try testing.expectEqual(t.live.base.len(), t.live.base.liveLen());
     try testing.expect(!t.live.dirty);
     try testing.expect(t.live.fullyArmed());
-    const after = try t.searchOpts("rs", .{ .recency = false });
+    const after = try t.searchOpts("rs", .{ .limit = 50, .recency = false });
     try testing.expectEqual(before.items.len, after.len);
     for (before.items, after) |a, b| try testing.expectEqualStrings(a, b.path);
     try testing.expect(try t.found("agregado", "src/agregado.rs"));
@@ -1021,10 +1022,10 @@ test "live: recency on a file deleted but not yet applied" {
     // The event is still queued: the stale entry is stat'ed and must just
     // get no bonus.
     var any = false;
-    for (try t.searchOpts("main", .{})) |h| any = any or std.mem.endsWith(u8, h.path, "/src/main.rs");
+    for (try t.searchOpts("main", .{ .limit = 50 })) |h| any = any or std.mem.endsWith(u8, h.path, "/src/main.rs");
     try testing.expect(any);
     _ = try t.sync();
-    for (try t.searchOpts("main", .{})) |h| try testing.expect(!std.mem.endsWith(u8, h.path, "/src/main.rs"));
+    for (try t.searchOpts("main", .{ .limit = 50 })) |h| try testing.expect(!std.mem.endsWith(u8, h.path, "/src/main.rs"));
 }
 
 test "live: one path in base and delta comes out once" {
@@ -1035,7 +1036,7 @@ test "live: one path in base and delta comes out once" {
     const r = try t.live.deltaRoot(t.root, 0);
     _ = try t.live.delta_b.push(testing.allocator, "dup.txt", r, store_mod.flag_hidden, 1);
     try t.live.rebuildDelta();
-    const hits = try t.searchOpts("dup", .{ .recency = false });
+    const hits = try t.searchOpts("dup", .{ .limit = 50, .recency = false });
     try testing.expectEqual(2, hits.len);
     try testing.expect(std.mem.endsWith(u8, hits[0].path, "/dup.txt"));
     try testing.expect(std.mem.endsWith(u8, hits[1].path, "/dupe.txt"));

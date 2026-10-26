@@ -27,8 +27,21 @@ pub fn settingsCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
     var out: std.ArrayList(Item) = .empty;
     const st = &ui.settings;
     const S = struct {
-        fn row(al: std.mem.Allocator, section: [:0]const u8, name: []const u8, title: [:0]const u8, value: [:0]const u8, icon: [:0]const u8, color: item_mod.Color, action: item_mod.Setting, keywords: []const u8) Item {
-            return .{ .key = settingKey(al, name), .section = section, .title = title, .accessory = value, .icon = .{ .tile = .{ .name = icon, .color = color } }, .action = .{ .setting = action }, .keywords = keywords };
+        const Row = struct {
+            section: [:0]const u8,
+            /// The key the row is found by again (reselect).
+            name: []const u8,
+            title: [:0]const u8,
+            /// The current value, shown on the right.
+            value: [:0]const u8,
+            icon: [:0]const u8,
+            color: item_mod.Color,
+            action: item_mod.Setting,
+            /// Extra words it is found by.
+            keywords: []const u8 = "",
+        };
+        fn row(al: std.mem.Allocator, r: Row) Item {
+            return .{ .key = settingKey(al, r.name), .section = r.section, .title = r.title, .accessory = r.value, .icon = .{ .tile = .{ .name = r.icon, .color = r.color } }, .action = .{ .setting = r.action }, .keywords = r.keywords };
         }
         fn onOff(b: bool) [:0]const u8 {
             return if (b) "On" else "Off";
@@ -39,21 +52,21 @@ pub fn settingsCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
             return .{ .choose = ch };
         }
     }.f;
-    out.append(a, S.row(a, "Appearance", "theme", "Theme", themes.displayName(a, st.theme, ui.preferDark()), "applications-graphics-symbolic", .purple, .{ .go = .themes }, "color dark light appearance")) catch {};
-    out.append(a, S.row(a, "Appearance", "text_size", "Text Size", choiceLabel(ui, a, .text_size), "preferences-desktop-font-symbolic", .purple, choose(.text_size), "font scale zoom bigger smaller")) catch {};
-    out.append(a, S.row(a, "Appearance", "opacity", "Window Opacity", choiceLabel(ui, a, .opacity), "display-brightness-symbolic", .purple, choose(.opacity), "transparency translucent background")) catch {};
-    out.append(a, S.row(a, "Appearance", "position", "Window Position", choiceLabel(ui, a, .position), "preferences-desktop-display-symbolic", .purple, choose(.position), "center top place")) catch {};
-    out.append(a, S.row(a, "Search", "files_in_root", "Show Files in Main Search", S.onOff(st.files_in_root), "folder-saved-search-symbolic", .orange, .{ .toggle = .files_in_root }, "results")) catch {};
-    out.append(a, S.row(a, "Search", "suggestions", "Show Suggestions", S.onOff(st.suggestions), "starred-symbolic", .orange, .{ .toggle = .suggestions }, "frecency recent most used")) catch {};
-    out.append(a, S.row(a, "Clipboard", "clipboard", "Clipboard History", S.onOff(st.clipboard), "edit-paste-symbolic", .red, .{ .toggle = .clipboard }, "copy paste record")) catch {};
-    out.append(a, S.row(a, "Clipboard", "clipboard_keep", "Clipboard Entries to Keep", choiceLabel(ui, a, .clipboard_keep), "document-open-recent-symbolic", .red, choose(.clipboard_keep), "history size limit")) catch {};
-    out.append(a, S.row(a, "Apps", "default_apps", "Default Apps", defaultAppsSummary(ui, a), "applications-system-symbolic", .blue, .{ .go = .default_apps }, "open with file types associations mime")) catch {};
-    out.append(a, S.row(a, "Apps", "terminal", "Terminal", choiceLabel(ui, a, .terminal), "utilities-terminal-symbolic", .blue, choose(.terminal), "console shell emulator")) catch {};
-    out.append(a, S.row(a, "Apps", "editor", "Editor for Open at Line", choiceLabel(ui, a, .editor), "accessories-text-editor-symbolic", .blue, choose(.editor), "code vim nvim")) catch {};
-    var file_item = S.row(a, "Lumen", "open_file", "Open Settings File", "", "document-edit-symbolic", .gray, .open_file, "config edit text");
+    out.append(a, S.row(a, .{ .section = "Appearance", .name = "theme", .title = "Theme", .value = themes.displayName(a, st.theme, ui.preferDark()), .icon = "applications-graphics-symbolic", .color = .purple, .action = .{ .go = .themes }, .keywords = "color dark light appearance" })) catch {};
+    out.append(a, S.row(a, .{ .section = "Appearance", .name = "text_size", .title = "Text Size", .value = choiceLabel(ui, a, .text_size), .icon = "preferences-desktop-font-symbolic", .color = .purple, .action = choose(.text_size), .keywords = "font scale zoom bigger smaller" })) catch {};
+    out.append(a, S.row(a, .{ .section = "Appearance", .name = "opacity", .title = "Window Opacity", .value = choiceLabel(ui, a, .opacity), .icon = "display-brightness-symbolic", .color = .purple, .action = choose(.opacity), .keywords = "transparency translucent background" })) catch {};
+    out.append(a, S.row(a, .{ .section = "Appearance", .name = "position", .title = "Window Position", .value = choiceLabel(ui, a, .position), .icon = "preferences-desktop-display-symbolic", .color = .purple, .action = choose(.position), .keywords = "center top place" })) catch {};
+    out.append(a, S.row(a, .{ .section = "Search", .name = "files_in_root", .title = "Show Files in Main Search", .value = S.onOff(st.files_in_root), .icon = "folder-saved-search-symbolic", .color = .orange, .action = .{ .toggle = .files_in_root }, .keywords = "results" })) catch {};
+    out.append(a, S.row(a, .{ .section = "Search", .name = "suggestions", .title = "Show Suggestions", .value = S.onOff(st.suggestions), .icon = "starred-symbolic", .color = .orange, .action = .{ .toggle = .suggestions }, .keywords = "frecency recent most used" })) catch {};
+    out.append(a, S.row(a, .{ .section = "Clipboard", .name = "clipboard", .title = "Clipboard History", .value = S.onOff(st.clipboard), .icon = "edit-paste-symbolic", .color = .red, .action = .{ .toggle = .clipboard }, .keywords = "copy paste record" })) catch {};
+    out.append(a, S.row(a, .{ .section = "Clipboard", .name = "clipboard_keep", .title = "Clipboard Entries to Keep", .value = choiceLabel(ui, a, .clipboard_keep), .icon = "document-open-recent-symbolic", .color = .red, .action = choose(.clipboard_keep), .keywords = "history size limit" })) catch {};
+    out.append(a, S.row(a, .{ .section = "Apps", .name = "default_apps", .title = "Default Apps", .value = defaultAppsSummary(ui, a), .icon = "applications-system-symbolic", .color = .blue, .action = .{ .go = .default_apps }, .keywords = "open with file types associations mime" })) catch {};
+    out.append(a, S.row(a, .{ .section = "Apps", .name = "terminal", .title = "Terminal", .value = choiceLabel(ui, a, .terminal), .icon = "utilities-terminal-symbolic", .color = .blue, .action = choose(.terminal), .keywords = "console shell emulator" })) catch {};
+    out.append(a, S.row(a, .{ .section = "Apps", .name = "editor", .title = "Editor for Open at Line", .value = choiceLabel(ui, a, .editor), .icon = "accessories-text-editor-symbolic", .color = .blue, .action = choose(.editor), .keywords = "code vim nvim" })) catch {};
+    var file_item = S.row(a, .{ .section = "Lumen", .name = "open_file", .title = "Open Settings File", .value = "", .icon = "document-edit-symbolic", .color = .gray, .action = .open_file, .keywords = "config edit text" });
     file_item.subtitle = labels.homeRelative(a, ui.settings_path);
     out.append(a, file_item) catch {};
-    var reset = S.row(a, "Lumen", "reset", "Reset All Settings", "", "edit-undo-symbolic", .gray, .reset, "defaults restore");
+    var reset = S.row(a, .{ .section = "Lumen", .name = "reset", .title = "Reset All Settings", .value = "", .icon = "edit-undo-symbolic", .color = .gray, .action = .reset, .keywords = "defaults restore" });
     reset.confirm = true;
     out.append(a, reset) catch {};
     return out.items;

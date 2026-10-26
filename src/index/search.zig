@@ -44,7 +44,12 @@ pub const max_query = 255;
 
 pub const Hit = struct { id: u32, score: i32 };
 
-pub const Options = struct { recency: bool = true };
+pub const Options = struct {
+    /// Hits wanted, best first.
+    limit: usize,
+    /// Recent files rank higher (costs a statx per finalist).
+    recency: bool = true,
+};
 
 const Pair = struct {
     score: i32,
@@ -80,7 +85,8 @@ pub const Engine = struct {
     }
 
     /// Top `limit` hits for `query`, appended to `out` (cleared first).
-    pub fn search(e: *Engine, gpa: std.mem.Allocator, pool: *Pool, store: *const Store, query_in: []const u8, limit: usize, opts: Options, out: *std.ArrayList(Hit)) !void {
+    pub fn search(e: *Engine, gpa: std.mem.Allocator, pool: *Pool, store: *const Store, query_in: []const u8, opts: Options, out: *std.ArrayList(Hit)) !void {
+        const limit = opts.limit;
         out.clearRetainingCapacity();
         var packed_buf: [max_query]u8 = undefined;
         const query = packQuery(query_in, &packed_buf);
@@ -520,7 +526,7 @@ test "cascade matches the exhaustive reference (recall 100%)" {
         // Accents and case, both ways, typed letter by letter.
         [_][]const u8{ "e", "es", "esp", "espa", "españ", "español", "espanol_", "configuracion", "CONFIGURACIÓN", "configuración.md", "nandu", "Ñandú", "uber", "an", "anonuevo", "ÜBER_ÑAN" };
     for (queries) |q| {
-        try e.search(gpa, pool, &s, q, 20, .{ .recency = false }, &got);
+        try e.search(gpa, pool, &s, q, .{ .limit = 20, .recency = false }, &got);
         try searchExhaustive(gpa, &s, q, 20, &want);
         try testing.expectEqual(want.items.len, got.items.len);
         for (want.items, got.items) |w, g| try testing.expectEqual(w.score, g.score);
@@ -539,7 +545,7 @@ fn topName(gpa: std.mem.Allocator, pool: *Pool, s: *const Store, q: []const u8) 
     defer e.deinit(gpa);
     var got: std.ArrayList(Hit) = .empty;
     defer got.deinit(gpa);
-    try e.search(gpa, pool, s, q, 10, .{ .recency = false }, &got);
+    try e.search(gpa, pool, s, q, .{ .limit = 10, .recency = false }, &got);
     if (got.items.len == 0) return "";
     return s.name(got.items[0].id);
 }

@@ -43,7 +43,7 @@ pub fn main(init: std.process.Init) !void {
         var hits: std.ArrayList(index.search.Hit) = .empty;
         defer hits.deinit(gpa);
         const t = sys.monotonicNs();
-        try e.search(gpa, pool, &store, cmd, 20, .{}, &hits);
+        try e.search(gpa, pool, &store, cmd, .{ .limit = 20 }, &hits);
         std.debug.print("search    {d:>8.3} ms\n", .{ms(sys.monotonicNs() - t)});
         var buf: [4096]u8 = undefined;
         for (hits.items, 1..) |h, i| std.debug.print("{d:>3}. {d:>5}  {s}\n", .{ i, h.score, store.path(h.id, &buf) });
@@ -71,13 +71,13 @@ pub fn main(init: std.process.Init) !void {
         var e: index.search.Engine = .empty;
         defer e.deinit(gpa);
         t = sys.monotonicNs();
-        try e.search(gpa, pool, &mapped, q, 20, .{ .recency = false }, &hits);
+        try e.search(gpa, pool, &mapped, q, .{ .limit = 20, .recency = false }, &hits);
         const cold = ms(sys.monotonicNs() - t);
         e.reset();
         t = sys.monotonicNs();
-        try e.search(gpa, pool, &mapped, q, 20, .{}, &hits);
+        try e.search(gpa, pool, &mapped, q, .{ .limit = 20 }, &hits);
         const rec = ms(sys.monotonicNs() - t);
-        try e.search(gpa, pool, &mapped, q, 20, .{ .recency = false }, &hits);
+        try e.search(gpa, pool, &mapped, q, .{ .limit = 20, .recency = false }, &hits);
         t = sys.monotonicNs();
         try index.search.searchExhaustive(gpa, &mapped, q, 20, &want);
         const ex = ms(sys.monotonicNs() - t);
@@ -98,7 +98,7 @@ pub fn main(init: std.process.Init) !void {
     const typed = "cargo.toml";
     for (1..typed.len + 1) |n| {
         t = sys.monotonicNs();
-        try e.search(gpa, pool, &mapped, typed[0..n], 20, .{}, &hits);
+        try e.search(gpa, pool, &mapped, typed[0..n], .{ .limit = 20 }, &hits);
         std.debug.print("  {s:<12} {d:>8.3} ms\n", .{ typed[0..n], ms(sys.monotonicNs() - t) });
     }
     var buf: [4096]u8 = undefined;
@@ -127,7 +127,7 @@ fn contentBench(gpa: std.mem.Allocator, io: std.Io, pool: *index.Pool, root: []c
 
     var st: index.content.BuildStats = .{};
     var dummy: u8 = 0;
-    var ix = try index.content.build(gpa, pool, docs, plainText, &dummy, &st);
+    var ix = try index.content.build(gpa, pool, docs, .{ .read = plainText, .ctx = &dummy }, &st);
     defer ix.deinit(gpa);
     std.debug.print("build     {d:>8.1} ms  {d} pairs, {d} segments, index {d:.1} MB (postings {d:.1} MB)\n", .{ ms(st.ns), st.pairs, st.segments, @as(f64, @floatFromInt(ix.buf.len)) / 1e6, @as(f64, @floatFromInt(ix.postingBytes())) / 1e6 });
     const path = "/tmp/lumen-content-bench.idx";
@@ -146,7 +146,7 @@ fn contentBench(gpa: std.mem.Allocator, io: std.Io, pool: *index.Pool, root: []c
         const words = try index.content.splitWords(arena, q);
         try mapped.candidates(gpa, words, &cands);
         t = sys.monotonicNs();
-        try index.content.search(&mapped, gpa, arena, pool, q, 50, index.content.plainPath, &dummy, &matches);
+        try index.content.search(&mapped, gpa, arena, pool, q, .{ .limit = 50, .text_path = index.content.plainPath, .text_ctx = &dummy }, &matches);
         std.debug.print("{s:<20} {d:>9} {d:>9} {d:>9.2}\n", .{ q, cands.items.len, matches.items.len, ms(sys.monotonicNs() - t) });
     }
     if (one_query != null) {
@@ -161,7 +161,7 @@ fn contentLive(gpa: std.mem.Allocator, io: std.Io, pool: *index.Pool, xdg_cache:
     const cache = if (xdg_cache) |x| try std.fmt.bufPrint(&buf, "{s}/lumen", .{x}) else try std.fmt.bufPrint(&buf, "{s}/.cache/lumen", .{home});
     const build_pool = try index.Pool.create(gpa, io, index.Pool.halfCores());
     defer build_pool.destroy();
-    const cs = try index.ContentService.start(gpa, io, home, cache, pool, build_pool);
+    const cs = try index.ContentService.start(gpa, io, home, cache, .{ .search = pool, .build = build_pool });
     defer cs.shutdown();
     while (!cs.status().ready) sys.sleepUs(10_000);
     var arena_state: std.heap.ArenaAllocator = .init(gpa);

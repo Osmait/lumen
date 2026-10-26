@@ -103,7 +103,7 @@ fn names(gpa: std.mem.Allocator, pool: *index.Pool, dir: []const u8) !void {
         var e: index.search.Engine = .empty;
         defer e.deinit(gpa);
         t = sys.monotonicNs();
-        try e.search(gpa, pool, &m, q[0], 20, .{ .recency = false }, &hits);
+        try e.search(gpa, pool, &m, q[0], .{ .limit = 20, .recency = false }, &hits);
         var label: [64]u8 = undefined;
         check(try std.fmt.bufPrint(&label, "cold query \"{s}\"", .{q[0]}), ms(sys.monotonicNs() - t), q[1]);
         // Recall against the exhaustive reference: exact, not timed.
@@ -138,7 +138,7 @@ fn names(gpa: std.mem.Allocator, pool: *index.Pool, dir: []const u8) !void {
     var worst: u64 = 0;
     for (1..typed.len + 1) |n| {
         t = sys.monotonicNs();
-        try e.search(gpa, pool, &m, typed[0..n], 20, .{ .recency = false }, &hits);
+        try e.search(gpa, pool, &m, typed[0..n], .{ .limit = 20, .recency = false }, &hits);
         worst = @max(worst, sys.monotonicNs() - t);
     }
     check("typing \"handler.rs\", worst keystroke", ms(worst), 25);
@@ -179,7 +179,7 @@ fn contents(gpa: std.mem.Allocator, pool: *index.Pool, dir: []const u8) !void {
 
     var dummy: u8 = 0;
     var t = sys.monotonicNs();
-    var ix = try content.build(gpa, pool, docs.items, plainText, &dummy, null);
+    var ix = try content.build(gpa, pool, docs.items, .{ .read = plainText, .ctx = &dummy }, null);
     defer ix.deinit(gpa);
     check("build", ms(sys.monotonicNs() - t), 1500);
 
@@ -187,7 +187,7 @@ fn contents(gpa: std.mem.Allocator, pool: *index.Pool, dir: []const u8) !void {
     const queries = [_]struct { []const u8, f64 }{ .{ "zebrafish", 30 }, .{ "allocator", 40 }, .{ "the", 40 }, .{ "useState return", 40 }, .{ "SELECT FROM WHERE", 50 }, .{ "nothinghere", 5 } };
     for (queries) |q| {
         t = sys.monotonicNs();
-        try content.search(&ix, gpa, a, pool, q[0], 50, content.plainPath, &dummy, &matches);
+        try content.search(&ix, gpa, a, pool, q[0], .{ .limit = 50, .text_path = content.plainPath, .text_ctx = &dummy }, &matches);
         var label: [64]u8 = undefined;
         check(try std.fmt.bufPrint(&label, "search \"{s}\" ({d} hits)", .{ q[0], matches.items.len }), ms(sys.monotonicNs() - t), q[1]);
     }

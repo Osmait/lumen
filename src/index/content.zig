@@ -392,6 +392,9 @@ fn intersect(gpa: std.mem.Allocator, a: []const u32, b: []const u8, n_docs: usiz
 /// empty until it changed.
 pub const TextFn = *const fn (ctx: *anyopaque, doc: DocIn, buf: *std.ArrayList(u8), gpa: std.mem.Allocator) std.mem.Allocator.Error!bool;
 
+/// A `TextFn` and the context it is called with.
+pub const TextReader = struct { read: TextFn, ctx: *anyopaque };
+
 /// Plain text of a file: up to `max_text` bytes, rejected if binary (a NUL in
 /// the first 8 KB, git's rule).
 pub fn readPlain(gpa: std.mem.Allocator, path: []const u8, buf: *std.ArrayList(u8)) std.mem.Allocator.Error!bool {
@@ -470,7 +473,7 @@ pub const BuildStats = struct { docs_indexed: usize = 0, pairs: usize = 0, segme
 /// Builds the index of `docs` (their order defines doc ids). `text` gives
 /// each document's text; documents it rejects are kept (their path still
 /// resolves) but have no postings.
-pub fn build(gpa: std.mem.Allocator, pool: *Pool, docs: []const DocIn, text: TextFn, text_ctx: *anyopaque, stats: ?*BuildStats) !Index {
+pub fn build(gpa: std.mem.Allocator, pool: *Pool, docs: []const DocIn, text: TextReader, stats: ?*BuildStats) !Index {
     const t0 = sys.monotonicNs();
     var st: BuildStats = .{};
 
@@ -531,7 +534,7 @@ pub fn build(gpa: std.mem.Allocator, pool: *Pool, docs: []const DocIn, text: Tex
     var lo: usize = 0;
     while (lo < n) {
         const hi = @min(lo + batch_docs, n);
-        var ctx: ExtractCtx = .{ .gpa = gpa, .docs = docs, .lo = lo, .text = text, .text_ctx = text_ctx, .out = task_out, .tasks = tasks, .batch_hi = hi };
+        var ctx: ExtractCtx = .{ .gpa = gpa, .docs = docs, .lo = lo, .text = text.read, .text_ctx = text.ctx, .out = task_out, .tasks = tasks, .batch_hi = hi };
         pool.run(tasks, &ctx, extractTask);
         if (ctx.oom.load(.acquire)) return error.OutOfMemory;
         // Task ranges are contiguous and in order: concatenating keeps pairs
@@ -867,7 +870,7 @@ test "candidates equal a brute-force scan, across segments, after save/open" {
     const pool = try Pool.create(gpa, testing.io, 3);
     defer pool.destroy();
     var td: TestDocs = .{ .texts = texts.items };
-    var ix = try build(gpa, pool, docs.items, TestDocs.text, &td, null);
+    var ix = try build(gpa, pool, docs.items, .{ .read = TestDocs.text, .ctx = &td }, null);
     defer ix.deinit(gpa);
 
     var tmp = testing.tmpDir(.{});
@@ -926,6 +929,14 @@ pub fn splitWords(arena: std.mem.Allocator, q: []const u8) std.mem.Allocator.Err
 /// extracted text in a cache. Verification maps it instead of reading it,
 /// so a hit on page 1 of a 4 MB book touches a few pages, not the book.
 pub const PathFn = *const fn (ctx: *anyopaque, doc: DocIn, buf: []u8) ?[:0]const u8;
+
+pub const SearchOptions = struct {
+    /// Matches wanted, best first.
+    limit: usize,
+    /// Where each document's text is read from, and its context.
+    text_path: PathFn,
+    text_ctx: *anyopaque,
+};
 
 /// For plain documents only (benchmarks, tests).
 pub fn plainPath(_: *anyopaque, doc: DocIn, buf: []u8) ?[:0]const u8 {
@@ -1012,7 +1023,10 @@ pub const max_candidates = 4000;
 
 /// Full query: candidates from the trigram lists, verified in parallel by
 /// reading each file, ranked. Snippets live in `arena`; at most `limit`.
-pub fn search(ix: *const Index, gpa: std.mem.Allocator, arena: std.mem.Allocator, pool: *Pool, query: []const u8, limit: usize, text_path: PathFn, text_ctx: *anyopaque, out: *std.ArrayList(Match)) !void {
+pub fn search(ix: *const Index, gpa: std.mem.Allocator, arena: std.mem.Allocator, pool: *Pool, query: []const u8, opts: SearchOptions, out: *std.ArrayList(Match)) !void {
+    const limit = opts.limit;
+    const text_path = opts.text_path;
+    const text_ctx = opts.text_ctx;
     out.clearRetainingCapacity();
     if (limit == 0) return;
     const words = try splitWords(arena, query);
@@ -1195,7 +1209,7 @@ test "search: unaccented and capital queries find accented text" {
     const pool = try Pool.create(gpa, testing.io, 2);
     defer pool.destroy();
     var dummy: u8 = 0;
-    var ix = try build(gpa, pool, &docs, FileDocs.text, &dummy, null);
+    var ix = try build(gpa, pool, &docs, .{ .read = FileDocs.text, .ctx = &dummy }, null);
     defer ix.deinit(gpa);
 
     var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -1211,13 +1225,13 @@ test "search: unaccented and capital queries find accented text" {
         .{ .q = "aqui", .doc = 0, .line = 2, .snippet = "La acción empieza aquí." },
     };
     for (cases) |c| {
-        try search(&ix, gpa, arena.allocator(), pool, c.q, 10, plainPath, &dummy, &out);
+        try search(&ix, gpa, arena.allocator(), pool, c.q, .{ .limit = 10, .text_path = plainPath, .text_ctx = &dummy }, &out);
         try testing.expectEqual(@as(usize, 1), out.items.len);
         try testing.expectEqual(c.doc, out.items[0].doc);
         try testing.expectEqual(c.line, out.items[0].line);
         try testing.expectEqualStrings(c.snippet, out.items[0].snippet);
     }
-    try search(&ix, gpa, arena.allocator(), pool, "×yz", 10, plainPath, &dummy, &out);
+    try search(&ix, gpa, arena.allocator(), pool, "×yz", .{ .limit = 10, .text_path = plainPath, .text_ctx = &dummy }, &out);
     try testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
@@ -1255,7 +1269,7 @@ fn smallIndex(gpa: std.mem.Allocator) !Index {
     const pool = try Pool.create(gpa, testing.io, 1);
     defer pool.destroy();
     var td: TestDocs = .{ .texts = &texts };
-    return build(gpa, pool, &docs, TestDocs.text, &td, null);
+    return build(gpa, pool, &docs, .{ .read = TestDocs.text, .ctx = &td }, null);
 }
 
 /// Touches everything a reader of an index may touch: must never crash on

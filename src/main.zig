@@ -216,7 +216,7 @@ fn startFileIndex() void {
     // The content index shares the file index's thread pools.
     const files = ui.files.?;
     const cache_dir = std.fmt.bufPrint(&buf, "{s}/lumen", .{std.mem.span(c.g_get_user_cache_dir())}) catch return;
-    ui.contents = index.ContentService.start(ui.gpa, ui.io, home, cache_dir, files.search_pool, files.scan_pool) catch |err| {
+    ui.contents = index.ContentService.start(ui.gpa, ui.io, home, cache_dir, .{ .search = files.search_pool, .build = files.scan_pool }) catch |err| {
         log.warn("content index: {t}", .{err});
         return;
     };

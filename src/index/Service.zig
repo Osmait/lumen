@@ -116,7 +116,7 @@ pub fn search(s: *Service, arena: std.mem.Allocator, query: []const u8, limit: u
     // Only the UI thread searches, so readers never queue behind each other.
     s.lock.lockUncancelable(s.io);
     defer s.lock.unlock(s.io);
-    try s.live.search(arena, s.search_pool, query, limit, .{}, out);
+    try s.live.search(arena, s.search_pool, query, .{ .limit = limit }, out);
 }
 
 pub const Status = struct { entries: usize, watches: usize, unwatched: u32 = 0, armed: bool, rescanning: bool, index_bytes: usize = 0, rescans: u32 = 0, last_rescan_ns: u64 = 0 };
@@ -463,7 +463,7 @@ test "service: shutdown saves what was learned and the next start maps it" {
     defer e.deinit(gpa);
     var hits: std.ArrayList(engine.Hit) = .empty;
     defer hits.deinit(gpa);
-    try e.search(gpa, pool, &saved, "de_la_sesion", 10, .{ .recency = false }, &hits);
+    try e.search(gpa, pool, &saved, "de_la_sesion", .{ .limit = 10, .recency = false }, &hits);
     var pbuf: [4096]u8 = undefined;
     try testing.expect(hits.items.len > 0 and std.mem.endsWith(u8, saved.path(hits.items[0].id, &pbuf), "/de_la_sesion.rs"));
 

@@ -58,13 +58,16 @@ last_extract_ns: std.atomic.Value(u64) = .init(0),
 /// nothing changed. Service thread only.
 unsaved: bool = false,
 
-pub fn start(gpa: std.mem.Allocator, io: Io, root: []const u8, cache_dir: []const u8, search_pool: *Pool, build_pool: *Pool) !*ContentService {
-    return startWith(gpa, io, root, cache_dir, search_pool, build_pool, .{});
+/// The thread pools it borrows: they must outlive the service.
+pub const Pools = struct { search: *Pool, build: *Pool };
+
+pub fn start(gpa: std.mem.Allocator, io: Io, root: []const u8, cache_dir: []const u8, pools: Pools) !*ContentService {
+    return startWith(gpa, io, root, cache_dir, pools, .{});
 }
 
 /// Starts the background thread. Borrows the pools, which must outlive it.
 /// Thread-safe once started.
-pub fn startWith(gpa: std.mem.Allocator, io: Io, root: []const u8, cache_dir: []const u8, search_pool: *Pool, build_pool: *Pool, opts: Options) !*ContentService {
+pub fn startWith(gpa: std.mem.Allocator, io: Io, root: []const u8, cache_dir: []const u8, pools: Pools, opts: Options) !*ContentService {
     const s = try gpa.create(ContentService);
     errdefer gpa.destroy(s);
     const root_copy = try gpa.dupe(u8, root);
@@ -79,8 +82,8 @@ pub fn startWith(gpa: std.mem.Allocator, io: Io, root: []const u8, cache_dir: []
         .root = root_copy,
         .cache_path = cache_path,
         .text_dir = text_dir,
-        .search_pool = search_pool,
-        .build_pool = build_pool,
+        .search_pool = pools.search,
+        .build_pool = pools.build,
         .opts = opts,
     };
     sys.mkdirP(s.text_dir);
@@ -170,7 +173,7 @@ pub fn search(s: *ContentService, arena: std.mem.Allocator, query: []const u8, l
     defer s.lock.unlockShared(s.io);
     const ix = if (s.index) |*i| i else return;
     var matches: std.ArrayList(content.Match) = .empty;
-    try content.search(ix, s.gpa, arena, s.search_pool, query, limit, pathOf, s, &matches);
+    try content.search(ix, s.gpa, arena, s.search_pool, query, .{ .limit = limit, .text_path = pathOf, .text_ctx = s }, &matches);
     for (matches.items) |m| try out.append(arena, .{
         .path = try arena.dupe(u8, ix.path(m.doc)),
         .line = m.line,
@@ -319,7 +322,7 @@ fn refresh(s: *ContentService) void {
     s.last_extract_ns.store(sys.monotonicNs() - t, .monotonic);
     if (s.stop.load(.acquire)) return;
     t = sys.monotonicNs();
-    var fresh = content.build(s.gpa, s.build_pool, docs, textOf, s, null) catch |err| {
+    var fresh = content.build(s.gpa, s.build_pool, docs, .{ .read = textOf, .ctx = s }, null) catch |err| {
         log.warn("building the content index: {t}", .{err});
         return;
     };
@@ -444,7 +447,7 @@ const Fixture = struct {
 
     /// Refreshes only when poked (no rate limit) and once at start.
     fn start(f: *Fixture) !*ContentService {
-        return startWith(testing.allocator, testing.io, f.root.abs, f.cache.abs, f.search_pool, f.build_pool, .{
+        return startWith(testing.allocator, testing.io, f.root.abs, f.cache.abs, .{ .search = f.search_pool, .build = f.build_pool }, .{
             .refresh_every_ns = std.math.maxInt(u64),
             .poke_min_ns = 0,
         });
