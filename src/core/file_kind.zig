@@ -1,0 +1,141 @@
+//! File kinds for "Default Apps": the groups a person picks an app for
+//! ("PDF Documents", "Images"), decided from the MIME type GLib guesses and
+//! the file name. Pure: the caller does the guessing.
+
+const std = @import("std");
+const file_badge = @import("file_badge.zig");
+
+pub const Kind = enum {
+    folder,
+    pdf,
+    image,
+    video,
+    audio,
+    markdown,
+    html,
+    text,
+    office,
+    archive,
+
+    pub fn title(k: Kind) [:0]const u8 {
+        return switch (k) {
+            .folder => "Folders",
+            .pdf => "PDF Documents",
+            .image => "Images",
+            .video => "Videos",
+            .audio => "Audio",
+            .markdown => "Markdown",
+            .html => "Web Pages",
+            .text => "Text & Code",
+            .office => "Office Documents",
+            .archive => "Archives",
+        };
+    }
+
+    /// A MIME type every app for this kind handles, to ask GIO for them.
+    pub fn sampleMime(k: Kind) [:0]const u8 {
+        return switch (k) {
+            .folder => "inode/directory",
+            .pdf => "application/pdf",
+            .image => "image/png",
+            .video => "video/mp4",
+            .audio => "audio/mpeg",
+            .markdown => "text/markdown",
+            .html => "text/html",
+            .text => "text/plain",
+            .office => "application/vnd.oasis.opendocument.text",
+            .archive => "application/zip",
+        };
+    }
+
+    pub fn icon(k: Kind) [:0]const u8 {
+        return switch (k) {
+            .folder => "folder-symbolic",
+            .pdf => "x-office-document-symbolic",
+            .image => "image-x-generic-symbolic",
+            .video => "video-x-generic-symbolic",
+            .audio => "audio-x-generic-symbolic",
+            .markdown => "text-x-generic-symbolic",
+            .html => "text-html-symbolic",
+            .text => "text-editor-symbolic",
+            .office => "x-office-spreadsheet-symbolic",
+            .archive => "package-x-generic-symbolic",
+        };
+    }
+
+    /// Where to look when this kind has no app of its own: Markdown is
+    /// text too.
+    pub fn fallback(k: Kind) ?Kind {
+        return if (k == .markdown) .text else null;
+    }
+};
+
+/// The kind of a file, or null when it is none of the groups (then the
+/// system default opens it).
+pub fn of(mime: []const u8, name: []const u8, is_dir: bool) ?Kind {
+    if (is_dir or std.mem.eql(u8, mime, "inode/directory")) return .folder;
+    if (std.mem.eql(u8, mime, "text/markdown") or hasExt(name, &.{ ".md", ".markdown" })) return .markdown;
+    if (std.mem.eql(u8, mime, "text/html") or std.mem.eql(u8, mime, "application/xhtml+xml")) return .html;
+    if (std.mem.eql(u8, mime, "application/pdf")) return .pdf;
+    if (std.mem.startsWith(u8, mime, "image/")) return .image;
+    if (std.mem.startsWith(u8, mime, "audio/")) return .audio;
+    // GLib calls some source files videos (.ts "MPEG transport stream",
+    // .mts): a code badge wins over that guess.
+    const code = file_badge.isKnown(name);
+    if (std.mem.startsWith(u8, mime, "video/")) return if (code) .text else .video;
+    if (std.mem.startsWith(u8, mime, "application/vnd.oasis.opendocument.") or
+        std.mem.startsWith(u8, mime, "application/vnd.openxmlformats-officedocument.") or
+        std.mem.eql(u8, mime, "application/msword") or std.mem.eql(u8, mime, "application/vnd.ms-excel") or
+        std.mem.eql(u8, mime, "application/vnd.ms-powerpoint") or std.mem.eql(u8, mime, "application/rtf")) return .office;
+    const archives = [_][]const u8{ "application/zip", "application/x-tar", "application/gzip", "application/x-compressed-tar", "application/x-7z-compressed", "application/vnd.rar", "application/x-rar", "application/x-xz", "application/x-xz-compressed-tar", "application/zstd", "application/x-zstd-compressed-tar", "application/x-bzip2", "application/x-bzip2-compressed-tar" };
+    for (archives) |a| if (std.mem.eql(u8, mime, a)) return .archive;
+    if (std.mem.startsWith(u8, mime, "text/") or code) return .text;
+    const texty = [_][]const u8{ "application/json", "application/xml", "application/x-shellscript", "application/javascript", "application/toml", "application/x-yaml", "application/yaml", "application/sql", "application/x-desktop" };
+    for (texty) |t| if (std.mem.eql(u8, mime, t)) return .text;
+    return null;
+}
+
+/// ".log" for "server.LOG": the key an extension override is stored under
+/// (lowercase, with the dot). Empty when the name has no extension.
+pub fn extKey(buf: []u8, name: []const u8) []const u8 {
+    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return "";
+    if (dot == 0 or name.len - dot > buf.len or name.len - dot < 2) return "";
+    return std.ascii.lowerString(buf, name[dot..]);
+}
+
+fn hasExt(name: []const u8, exts: []const []const u8) bool {
+    for (exts) |e| if (name.len > e.len and std.ascii.endsWithIgnoreCase(name, e)) return true;
+    return false;
+}
+
+test "kinds from MIME type and name" {
+    const t = std.testing;
+    try t.expectEqual(Kind.folder, of("", "Projects", true));
+    try t.expectEqual(Kind.pdf, of("application/pdf", "a.pdf", false));
+    try t.expectEqual(Kind.image, of("image/jpeg", "a.jpg", false));
+    try t.expectEqual(Kind.video, of("video/mp4", "a.mp4", false));
+    try t.expectEqual(Kind.audio, of("audio/flac", "a.flac", false));
+    try t.expectEqual(Kind.markdown, of("text/markdown", "README.md", false));
+    try t.expectEqual(Kind.markdown, of("application/octet-stream", "notes.MD", false));
+    try t.expectEqual(Kind.html, of("text/html", "index.html", false));
+    try t.expectEqual(Kind.text, of("text/plain", "a.txt", false));
+    try t.expectEqual(Kind.text, of("text/rust", "lib.rs", false));
+    try t.expectEqual(Kind.text, of("application/json", "a.json", false));
+    try t.expectEqual(Kind.office, of("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "a.docx", false));
+    try t.expectEqual(Kind.archive, of("application/zip", "a.zip", false));
+    // GLib's guesses for code it does not know.
+    try t.expectEqual(Kind.text, of("application/octet-stream", "main.zig", false));
+    try t.expectEqual(Kind.text, of("video/mp2t", "app.ts", false));
+    try t.expectEqual(@as(?Kind, null), of("application/x-executable", "a.out", false));
+    try t.expectEqual(@as(?Kind, null), of("application/octet-stream", "firmware.bin", false));
+    try t.expectEqual(Kind.text, Kind.markdown.fallback().?);
+}
+
+test "extension keys" {
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings(".log", extKey(&buf, "server.LOG"));
+    try std.testing.expectEqualStrings(".gz", extKey(&buf, "a.tar.gz"));
+    try std.testing.expectEqualStrings("", extKey(&buf, ".bashrc"));
+    try std.testing.expectEqualStrings("", extKey(&buf, "Makefile"));
+    try std.testing.expectEqualStrings("", extKey(&buf, "trailing."));
+}
