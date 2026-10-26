@@ -36,7 +36,8 @@ pub const MonitorJson = struct {
 };
 
 /// `hyprctl -j` output as `T`, or null if it does not parse (new Hyprland
-/// fields are ignored; missing optional ones take their defaults).
+/// fields are ignored; missing optional ones take their defaults). Out of
+/// memory is null too: every caller works without Hyprland's answer.
 pub fn parse(comptime T: type, arena: std.mem.Allocator, json: []const u8) ?T {
     return std.json.parseFromSliceLeaky(T, arena, json, .{
         .ignore_unknown_fields = true,
@@ -81,6 +82,9 @@ pub fn monitor(arena: std.mem.Allocator, id: i64) ?geometry.Monitor {
 
 pub fn findMonitor(all: []const MonitorJson, id: i64) ?geometry.Monitor {
     for (all) |m| {
+        // Sizes are divided by the scale: a zero, negative or NaN one from a
+        // broken reply would make the geometry meaningless.
+        if (m.id == id and !(m.scale > 0 and std.math.isFinite(m.scale))) return null;
         if (m.id == id) return .{
             .x = m.x,
             .y = m.y,

@@ -14,7 +14,7 @@
 
 const std = @import("std");
 
-pub const Mode = enum { silent, compact, fullOutput, inline_, unknown };
+pub const Mode = enum { silent, compact, full_output, @"inline", unknown };
 
 pub const Meta = struct {
     title: []const u8 = "",
@@ -47,7 +47,7 @@ pub fn parse(source: []const u8) ?Meta {
         const value = std.mem.trim(u8, rest[sp..], " \t");
 
         if (std.mem.eql(u8, key, "title")) meta.title = value else if (std.mem.eql(u8, key, "mode")) {
-            meta.mode = if (std.mem.eql(u8, value, "silent")) .silent else if (std.mem.eql(u8, value, "compact")) .compact else if (std.mem.eql(u8, value, "fullOutput")) .fullOutput else if (std.mem.eql(u8, value, "inline")) .inline_ else .unknown;
+            meta.mode = if (std.mem.eql(u8, value, "silent")) .silent else if (std.mem.eql(u8, value, "compact")) .compact else if (std.mem.eql(u8, value, "fullOutput")) .full_output else if (std.mem.eql(u8, value, "inline")) .@"inline" else .unknown;
         } else if (std.mem.eql(u8, key, "icon")) meta.icon = value else if (std.mem.eql(u8, key, "packageName")) meta.package_name = value else if (std.mem.eql(u8, key, "description")) meta.description = value else if (std.mem.eql(u8, key, "needsConfirmation")) meta.needs_confirmation = std.mem.eql(u8, value, "true");
     }
     if (meta.title.len == 0) return null;

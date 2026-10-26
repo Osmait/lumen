@@ -146,7 +146,7 @@ fn names(gpa: std.mem.Allocator, pool: *index.Pool, dir: []const u8) !void {
 
 const vocab = [_][]const u8{ "const", "return", "struct", "allocator", "buffer", "index", "query", "token", "parser", "window", "render", "TODO", "error", "result", "value", "string", "async", "await", "import", "export", "function", "useState", "SELECT", "FROM", "WHERE", "zebrafish", "the", "and", "for" };
 
-fn plainText(_: *anyopaque, d: content.DocIn, buf: *std.ArrayList(u8), gpa: std.mem.Allocator) bool {
+fn plainText(_: *anyopaque, d: content.DocIn, buf: *std.ArrayList(u8), gpa: std.mem.Allocator) std.mem.Allocator.Error!bool {
     return content.readPlain(gpa, d.path, buf);
 }
 

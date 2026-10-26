@@ -148,7 +148,7 @@ pub extern fn read(fd: c_int, buf: *anyopaque, count: usize) isize;
 pub extern fn g_free(mem: ?*anyopaque) void;
 pub extern fn g_bytes_new_static(data: [*]const u8, size: usize) *GBytes;
 pub extern fn g_bytes_unref(bytes: *GBytes) void;
-pub extern fn g_strfreev(v: ?*anyopaque) void;
+pub extern fn g_strfreev(v: ?[*]?[*:0]u8) void;
 pub extern fn g_error_free(err: *GError) void;
 pub extern fn g_get_real_time() i64;
 pub extern fn g_get_user_config_dir() [*:0]const u8;
@@ -160,7 +160,7 @@ pub extern fn g_markup_escape_text(text: [*]const u8, length: isize) [*:0]u8;
 pub extern fn g_filename_to_uri(path: [*:0]const u8, hostname: ?[*:0]const u8, err: ?*?*GError) ?[*:0]u8;
 pub extern fn g_build_filename(first: [*:0]const u8, ...) [*:0]u8;
 pub extern fn g_mkdir_with_parents(path: [*:0]const u8, mode: c_int) c_int;
-pub extern fn g_file_get_contents(path: [*:0]const u8, contents: *[*c]u8, length: ?*usize, err: ?*?*GError) gboolean;
+pub extern fn g_file_get_contents(path: [*:0]const u8, contents: *?[*:0]u8, length: ?*usize, err: ?*?*GError) gboolean;
 pub extern fn g_file_read_link(path: [*:0]const u8, err: ?*?*GError) ?[*:0]u8;
 pub extern fn g_find_program_in_path(program: [*:0]const u8) ?[*:0]u8;
 pub extern fn g_dir_open(path: [*:0]const u8, flags: c_uint, err: ?*?*GError) ?*GDir;
@@ -178,10 +178,10 @@ pub extern fn g_timeout_add_seconds(interval: c_uint, func: GSourceFunc, data: ?
 pub extern fn g_timeout_add(interval: c_uint, func: GSourceFunc, data: ?*anyopaque) c_uint;
 
 pub extern fn g_spawn_async(working_directory: ?[*:0]const u8, argv: [*]const ?[*:0]const u8, envp: ?[*]const ?[*:0]const u8, flags: c_int, child_setup: ?GSpawnChildSetupFunc, user_data: ?*anyopaque, child_pid: ?*GPid, err: ?*?*GError) gboolean;
-pub extern fn g_spawn_sync(working_directory: ?[*:0]const u8, argv: [*]const ?[*:0]const u8, envp: ?[*]const ?[*:0]const u8, flags: c_int, child_setup: ?GSpawnChildSetupFunc, user_data: ?*anyopaque, standard_output: ?*[*c]u8, standard_error: ?*[*c]u8, wait_status: ?*c_int, err: ?*?*GError) gboolean;
+pub extern fn g_spawn_sync(working_directory: ?[*:0]const u8, argv: [*]const ?[*:0]const u8, envp: ?[*]const ?[*:0]const u8, flags: c_int, child_setup: ?GSpawnChildSetupFunc, user_data: ?*anyopaque, standard_output: ?*?[*:0]u8, standard_error: ?*?[*:0]u8, wait_status: ?*c_int, err: ?*?*GError) gboolean;
 
-pub extern fn g_date_time_new_now_local() *GDateTime;
-pub extern fn g_date_time_new_local(year: c_int, month: c_int, day: c_int, hour: c_int, minute: c_int, seconds: f64) *GDateTime;
+pub extern fn g_date_time_new_now_local() ?*GDateTime;
+pub extern fn g_date_time_new_local(year: c_int, month: c_int, day: c_int, hour: c_int, minute: c_int, seconds: f64) ?*GDateTime;
 pub extern fn g_date_time_new_from_unix_local(t: i64) ?*GDateTime;
 pub extern fn g_date_time_unref(dt: *GDateTime) void;
 pub extern fn g_date_time_get_year(dt: *GDateTime) c_int;
@@ -195,7 +195,8 @@ pub extern fn g_date_time_format(dt: *GDateTime, format: [*:0]const u8) ?[*:0]u8
 pub extern fn g_object_unref(obj: ?*anyopaque) void;
 pub extern fn g_object_set_data(obj: *anyopaque, key: [*:0]const u8, data: ?*anyopaque) void;
 pub extern fn g_object_get_data(obj: *anyopaque, key: [*:0]const u8) ?*anyopaque;
-pub extern fn g_signal_connect_data(instance: *anyopaque, signal: [*:0]const u8, handler: GCallback, data: ?*anyopaque, destroy: ?*anyopaque, flags: c_int) c_ulong;
+pub const GClosureNotify = *const fn (data: ?*anyopaque, closure: ?*anyopaque) callconv(.c) void;
+pub extern fn g_signal_connect_data(instance: *anyopaque, signal: [*:0]const u8, handler: GCallback, data: ?*anyopaque, destroy: ?GClosureNotify, flags: c_int) c_ulong;
 
 // ------------------------------------------------------------------- gio
 
@@ -234,7 +235,7 @@ pub extern fn g_application_hold(app: *GApplication) void;
 pub extern fn g_application_register(app: *GApplication, cancellable: ?*anyopaque, err: ?*?*GError) gboolean;
 pub extern fn g_application_get_is_remote(app: *GApplication) gboolean;
 pub extern fn g_application_quit(app: *GApplication) void;
-pub extern fn g_application_command_line_get_arguments(cmdline: *GApplicationCommandLine, argc: *c_int) [*][*:0]u8;
+pub extern fn g_application_command_line_get_arguments(cmdline: *GApplicationCommandLine, argc: *c_int) [*]?[*:0]u8;
 pub extern fn g_application_command_line_print(cmdline: *GApplicationCommandLine, format: [*:0]const u8, ...) void;
 pub extern fn g_application_command_line_printerr(cmdline: *GApplicationCommandLine, format: [*:0]const u8, ...) void;
 
@@ -248,7 +249,8 @@ pub extern fn g_output_stream_close(stream: *GOutputStream, cancellable: ?*anyop
 
 // ------------------------------------------------------------------- gdk
 
-pub extern fn gdk_display_get_default() *GdkDisplay;
+/// Null before GTK opens a display (never once the app has started).
+pub extern fn gdk_display_get_default() ?*GdkDisplay;
 pub const GDK_MEMORY_R8G8B8A8: c_int = 5;
 pub extern fn gdk_memory_texture_new(width: c_int, height: c_int, format: c_int, bytes: *GBytes, stride: usize) *GdkTexture;
 pub extern fn gdk_texture_new_from_bytes(bytes: *GBytes, err: ?*?*GError) ?*GdkTexture;

@@ -251,11 +251,9 @@ pub const Store = struct {
 
     /// Writes the buffer as is (to a temp file, then rename: a crash midway
     /// never leaves a corrupt index in place).
-    pub fn save(s: *const Store, path_z: [:0]const u8) !void {
-        var tmp_buf: [4096]u8 = undefined;
-        const tmp = try std.fmt.bufPrintZ(&tmp_buf, "{s}.tmp", .{path_z});
-        try sys.writeFile(tmp, s.buf);
-        try sys.rename(tmp, path_z);
+    /// Writes the index to `path_z` atomically (see `sys.writeFileAtomic`).
+    pub fn save(s: *const Store, path_z: [:0]const u8) sys.Error!void {
+        try sys.writeFileAtomic(path_z, s.buf);
     }
 
     /// Maps an index file. PROT_WRITE with MAP_PRIVATE is copy-on-write, so
@@ -380,11 +378,12 @@ pub const Builder = struct {
         b.masks.items[id] = 0;
     }
 
-    /// Builds the store and empties the builder.
-    pub fn finish(b: *Builder, gpa: std.mem.Allocator) !Store {
-        defer b.deinit(gpa);
+    /// Builds the store and empties the builder. On error the builder is
+    /// left as it was.
+    pub fn finish(b: *Builder, gpa: std.mem.Allocator) std.mem.Allocator.Error!Store {
         const lay = Layout.init(b.len(), b.names.items.len);
         const buf = try gpa.alignedAlloc(u8, .@"8", lay.total);
+        defer b.deinit(gpa);
         @memset(buf, 0);
         @memcpy(buf[0..8], magic);
         std.mem.writeInt(u64, buf[8..16], lay.n, .little);

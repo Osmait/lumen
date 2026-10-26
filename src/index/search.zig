@@ -228,7 +228,11 @@ const SiftCtx = struct {
 fn siftChunk(ctx: *SiftCtx, ci: usize) void {
     const lo = ci * chunk;
     const hi = @min(lo + chunk, ctx.source_len);
-    sift(ctx, ci, lo, hi) catch {};
+    // Out of memory: the chunk's candidates are incomplete, so they must not
+    // be refined on the next keystroke as if they were all of them.
+    sift(ctx, ci, lo, hi) catch {
+        ctx.partials[ci].overflow = true;
+    };
 }
 
 /// Layers 2 and 3 over one chunk: mask, cheap score, local top-K. Only what
@@ -329,7 +333,7 @@ pub fn cheapScoreMasked(name: []const u8, q: []const u8, mask: u64) ?i32 {
     if (mask & store_mod.mask_non_ascii != 0) return cheapFolded(name, q);
     // The same loop as before folding existed. A damaged mapped mask could
     // only score a non-ASCII name as plain bytes: never unsafe.
-    return cheapCore(.known_ascii, name, &.{}, q) catch unreachable;
+    return cheapCore(.known_ascii, name, &.{}, q) catch unreachable; // NonAscii comes only from .ascii mode
 }
 
 // Out of line: its 2 KB of buffers stay off the hot loop's stack frame.
@@ -337,7 +341,7 @@ noinline fn cheapFolded(name: []const u8, q: []const u8) ?i32 {
     var buf: [max_folded]u8 = undefined;
     var upper: [max_folded]bool = undefined;
     const n = fold.foldCase(&buf, &upper, name);
-    return cheapCore(.folded, buf[0..n], upper[0..n], q) catch unreachable;
+    return cheapCore(.folded, buf[0..n], upper[0..n], q) catch unreachable; // NonAscii comes only from .ascii mode
 }
 
 /// Longest name folded for `cheapScore`; a longer non-ASCII name is scored
@@ -417,7 +421,7 @@ fn recencyBonus(store: *const Store, id: u32, now: i64, buf: *[4096]u8) i32 {
     const p = store.path(id, buf[0 .. buf.len - 1]);
     if (p.len == 0) return 0;
     buf[p.len] = 0;
-    const mt = sys.mtime(@ptrCast(buf)) orelse return 0;
+    const mt = sys.mtime(buf[0..p.len :0]) orelse return 0;
     if (mt > now) return recency_max;
     return switch (@divTrunc(now - mt, 86_400)) {
         0 => 300,

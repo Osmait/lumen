@@ -37,7 +37,7 @@ pub fn kindOf(path: []const u8) ?Kind {
 /// Returns error on unreadable/corrupt files; callers skip those.
 /// error.ToolMissing: pdftotext/unzip is not installed.
 pub fn extractText(gpa: std.mem.Allocator, io: std.Io, path: [:0]const u8, kind: Kind, max_bytes: usize) ![]u8 {
-    const fd = try openRegular(path);
+    const fd = try sys.openRegular(path);
     defer sys.close(fd);
 
     if (kind == .pdf) {
@@ -48,7 +48,7 @@ pub fn extractText(gpa: std.mem.Allocator, io: std.Io, path: [:0]const u8, kind:
     }
 
     const members: []const []const u8 = switch (kind) {
-        .pdf => unreachable,
+        .pdf => unreachable, // handled above
         .docx => &.{ "word/document.xml", "word/footnotes.xml", "word/endnotes.xml" },
         .xlsx => &.{"xl/sharedStrings.xml"},
         .pptx => &.{"ppt/slides/slide*.xml"},
@@ -69,26 +69,7 @@ pub fn extractText(gpa: std.mem.Allocator, io: std.Io, path: [:0]const u8, kind:
     return shrink(gpa, try xmlToText(gpa, xml), max_bytes);
 }
 
-const Error = error{ NotFound, Access, NotRegular, Syscall, ToolMissing, ToolFailed, Timeout };
-
-fn openRegular(path: [*:0]const u8) Error!i32 {
-    // NONBLOCK: opening a FIFO must not hang; it is refused below anyway.
-    const rc = linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true }, 0);
-    switch (linux.errno(rc)) {
-        .SUCCESS => {},
-        .NOENT, .NOTDIR => return error.NotFound,
-        .ACCES, .PERM => return error.Access,
-        else => return error.Syscall,
-    }
-    const fd: i32 = @intCast(rc);
-    var stx: linux.Statx = undefined;
-    const src = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stx);
-    if (linux.errno(src) != .SUCCESS or stx.mode & linux.S.IFMT != linux.S.IFREG) {
-        sys.close(fd);
-        return error.NotRegular;
-    }
-    return fd;
-}
+pub const Error = sys.Error || error{ ToolMissing, ToolFailed, Timeout };
 
 /// Runs `argv` with `input` as stdin and returns at most `cap` bytes of its
 /// stdout. Reaching the cap or the timeout kills the tool and keeps what was
@@ -240,7 +221,7 @@ fn xmlToText(gpa: std.mem.Allocator, xml: []const u8) ![]u8 {
                         switch (cp) {
                             '\n' => w.sep(.newline),
                             ' ', '\t', '\r' => w.sep(.space),
-                            else => try w.text(buf[0 .. std.unicode.utf8Encode(cp, &buf) catch unreachable]),
+                            else => try w.text(buf[0 .. std.unicode.utf8Encode(cp, &buf) catch unreachable]), // decodeEntity returns only encodable code points
                         }
                     }
                 }
@@ -646,14 +627,14 @@ test "extract truncates xml documents at a UTF-8 boundary" {
 
 test "runTool: size cap and timeout kill the tool" {
     const gpa = testing.allocator;
-    try testing.expectError(error.NotRegular, openRegular("/dev/null"));
+    try testing.expectError(error.NotRegular, sys.openRegular("/dev/null"));
     var td: TestDir = undefined;
     try td.init();
     defer td.deinit();
     try td.write("in", "");
     const in_path = try td.absZ("in");
     defer gpa.free(in_path);
-    const in = try openRegular(in_path);
+    const in = try sys.openRegular(in_path);
     defer sys.close(in);
 
     // Endless output: cut at the cap, the tool killed and reaped.

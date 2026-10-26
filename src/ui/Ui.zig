@@ -11,10 +11,10 @@ const core = @import("core");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
 pub const View = item_mod.View;
-const Db = @import("../sys/db.zig").Db;
+const Db = @import("../sys/Db.zig");
 const hypr = @import("../sys/hypr.zig");
 const proc = @import("../sys/proc.zig");
-const Apps = @import("../providers/apps.zig").Apps;
+const Apps = @import("../providers/Apps.zig");
 const commands = @import("../providers/commands.zig");
 const scripts = @import("../providers/scripts.zig");
 const run = @import("../actions.zig");
@@ -29,6 +29,8 @@ const Kind = core.file_kind.Kind;
 
 const Ui = @This();
 
+const log = std.log.scoped(.ui);
+
 const panel_w = 750;
 const panel_h = 474;
 /// The list's height limit: what is left under the search bar (56), the gap
@@ -39,6 +41,7 @@ const shell_margin = 48;
 const max_results = 60;
 
 gpa: std.mem.Allocator,
+io: std.Io,
 app: *c.GtkApplication,
 db: Db,
 apps: Apps,
@@ -148,16 +151,19 @@ fn testMode() bool {
     return c.g_getenv("LUMEN_TEST") != null;
 }
 
-pub fn init(gpa: std.mem.Allocator, app: *c.GtkApplication, db: Db) Ui {
+/// Takes `db`. Call `build` before anything else: the widgets are made
+/// there. Main thread only (GTK), like every method of Ui.
+pub fn init(gpa: std.mem.Allocator, io: std.Io, app: *c.GtkApplication, db: Db) Ui {
     return .{
         .gpa = gpa,
+        .io = io,
         .app = app,
         .db = db,
-        .apps = Apps.init(gpa),
-        .settings = Settings.init(gpa),
-        .data_arena = std.heap.ArenaAllocator.init(gpa),
-        .query_arena = std.heap.ArenaAllocator.init(gpa),
-        .frec_arena = std.heap.ArenaAllocator.init(gpa),
+        .apps = .init(gpa),
+        .settings = .init(gpa),
+        .data_arena = .init(gpa),
+        .query_arena = .init(gpa),
+        .frec_arena = .init(gpa),
     };
 }
 
@@ -298,7 +304,7 @@ fn makeBackdrop(self: *Ui) *c.GtkWidget {
 /// One backdrop per monitor, mapped before the window so they stack under it.
 fn showBackdrops(self: *Ui) void {
     if (testMode()) return;
-    const monitors = c.gdk_display_get_monitors(c.gdk_display_get_default());
+    const monitors = c.gdk_display_get_monitors(c.gdk_display_get_default() orelse return);
     const n = @min(c.g_list_model_get_n_items(monitors), self.backdrops.len);
     for (&self.backdrops, 0..) |*slot, i| {
         if (i >= n) {
@@ -378,7 +384,8 @@ fn buildDetail(self: *Ui) void {
 
 fn loadCss(self: *Ui) void {
     self.css = c.gtk_css_provider_new();
-    c.gtk_style_context_add_provider_for_display(c.gdk_display_get_default(), @ptrCast(self.css), c.GTK_STYLE_PROVIDER_PRIORITY_USER);
+    const display = c.gdk_display_get_default() orelse return;
+    c.gtk_style_context_add_provider_for_display(display, @ptrCast(self.css), c.GTK_STYLE_PROVIDER_PRIORITY_USER);
 }
 
 // ------------------------------------------------------------ settings
@@ -394,7 +401,7 @@ fn reloadSettings(self: *Ui) void {
 }
 
 fn saveSettings(self: *Ui) void {
-    self.settings.save(self.gpa, self.settings_path) catch |err| std.log.warn("saving settings: {s}", .{@errorName(err)});
+    self.settings.save(self.gpa, self.settings_path) catch |err| log.warn("saving settings: {t}", .{err});
     self.settings_stamp = settings_mod.Stamp.of(self.settings_path.ptr);
     self.applyAppearance(null);
     if (self.on_settings_changed) |f| f();
@@ -544,14 +551,16 @@ fn setChoosing(self: *Ui, next: Choosing) void {
         self.gpa.free(self.choosing.file.mime);
     }
     self.choosing = next;
-    const title: []const u8 = switch (next) {
-        .none => "",
-        .setting => |ch| chooseTitle(ch),
-        .kind => |k| std.fmt.bufPrint(&self.choose_title, "Open {s} With", .{k.title()}) catch "",
-        .file => |f| std.fmt.bufPrint(&self.choose_title, "Open {s} With", .{std.fs.path.basename(f.path)}) catch "",
-    };
-    const n = @min(title.len, self.choose_title.len);
-    std.mem.copyForwards(u8, self.choose_title[0..n], title[0..n]);
+    // A name too long for the buffer is cut (on a character boundary), not
+    // dropped: an empty title helped nobody.
+    var w: std.Io.Writer = .fixed(self.choose_title[0 .. self.choose_title.len - 1]);
+    switch (next) {
+        .none => {},
+        .setting => |ch| w.writeAll(chooseTitle(ch)) catch {},
+        .kind => |k| w.print("Open {s} With", .{k.title()}) catch {},
+        .file => |f| w.print("Open {s} With", .{std.Io.Dir.path.basename(f.path)}) catch {},
+    }
+    const n = validUtf8Prefix(w.buffered()).len;
     self.choose_title[n] = 0;
 }
 
@@ -779,8 +788,7 @@ fn performSetting(self: *Ui, s: item_mod.Setting, op: item_mod.Op) void {
                 self.goBack();
             },
             .kind => |k| {
-                self.settings.setOpenWith(@tagName(k), v) catch {};
-                self.saveSettings();
+                if (self.settings.setOpenWith(@tagName(k), v)) self.saveSettings() else |err| log.warn("default app for {t}: {t}", .{ k, err });
                 self.goBack();
             },
             else => {},
@@ -802,8 +810,7 @@ fn performSetting(self: *Ui, s: item_mod.Setting, op: item_mod.Op) void {
                 var ebuf: [16]u8 = undefined;
                 const key: []const u8 = if (core.file_kind.of(f.mime, name, false)) |k| @tagName(k) else core.file_kind.extKey(&ebuf, name);
                 if (key.len > 0) {
-                    self.settings.setOpenWith(key, id) catch {};
-                    self.saveSettings();
+                    if (self.settings.setOpenWith(key, id)) self.saveSettings() else |err| log.warn("default app for {s}: {t}", .{ key, err });
                 }
             }
             if (!run.openWith(f.path, id)) return;
@@ -858,6 +865,7 @@ pub fn showWith(self: *Ui, view: View, text: ?[*:0]const u8) void {
     const t_show = stats.now();
     const was_hidden = c.gtk_widget_get_visible(self.window) == 0;
     _ = self.frec_arena.reset(.retain_capacity);
+    // Without it, results are ranked by match quality alone.
     self.frec = self.db.loadFrecency(self.frec_arena.allocator(), now()) catch .empty;
     if (c.gtk_widget_get_visible(self.window) == 0) {
         // Edited by hand since the last look?
@@ -912,7 +920,7 @@ fn placeOnFocusedMonitor(self: *Ui) void {
     var arena = std.heap.ArenaAllocator.init(self.gpa);
     defer arena.deinit();
     const name = hypr.focusedMonitorName(arena.allocator()) orelse return;
-    const monitors = c.gdk_display_get_monitors(c.gdk_display_get_default());
+    const monitors = c.gdk_display_get_monitors(c.gdk_display_get_default() orelse return);
     const n = c.g_list_model_get_n_items(monitors);
     var i: c_uint = 0;
     while (i < n) : (i += 1) {
@@ -1045,7 +1053,7 @@ fn clipCandidates(self: *Ui, a: std.mem.Allocator) []Item {
             .icon = .{ .tile = .{ .name = "edit-copy-symbolic", .color = .gray } },
             .action = .{ .clip = clip.id },
             .detail = clip.content,
-            .score = @intCast(@min(clip.last_copied, std.math.maxInt(i32))),
+            .score = std.math.lossyCast(i32, clip.last_copied),
         }) catch break;
     }
     return out.items;
@@ -1107,7 +1115,9 @@ fn refresh(self: *Ui) void {
             if (self.content_search) |cs| {
                 // Ask the worker unless the result for this exact query is
                 // already here; meanwhile keep showing the last result.
-                const fresh = if (self.content_result) |r| std.mem.eql(u8, r.query, q) else false;
+                // The worker searches the clipped query: compare with that,
+                // or a query longer than the clip never counts as answered.
+                const fresh = if (self.content_result) |r| std.mem.eql(u8, r.query, ContentSearch.clip(q)) else false;
                 if (!fresh) self.content_gen = cs.submit(q, t0);
                 self.content_pending = !fresh;
                 if (self.content_result) |r| {
@@ -1185,7 +1195,7 @@ fn fillRoot(self: *Ui, a: std.mem.Allocator, q: []const u8) void {
         for (self.base) |it| {
             const v = self.frec.get(it.key) orelse continue;
             var copy = it;
-            copy.score = @intFromFloat(v * 1000);
+            copy.score = std.math.lossyCast(i32, v * 1000);
             used.append(a, copy) catch break;
         }
         sortByScore(used.items);
@@ -1286,24 +1296,30 @@ fn sortByScore(items: []Item) void {
 }
 
 fn addSection(self: *Ui, title: [:0]const u8) void {
+    // Room first: a widget without its `rows` entry would shift every later
+    // row's index.
+    self.rows.ensureUnusedCapacity(self.query_arena.allocator(), 1) catch return;
     const row = c.gtk_list_box_row_new();
     c.gtk_widget_add_css_class(row, "section");
     c.gtk_list_box_row_set_selectable(@ptrCast(row), 0);
     c.gtk_list_box_row_set_activatable(@ptrCast(row), 0);
     c.gtk_list_box_row_set_child(@ptrCast(row), label(title, "section-title"));
     c.gtk_list_box_append(@ptrCast(self.list), row);
-    self.rows.append(self.query_arena.allocator(), .{ .widget = row, .item = null, .section = title }) catch {};
+    self.rows.appendAssumeCapacity(.{ .widget = row, .item = null, .section = title });
 }
 
 fn addItem(self: *Ui, it: Item) void {
     const a = self.query_arena.allocator();
     const item_index = self.items.items.len;
+    // Room first: a widget without its `rows` entry would shift every later
+    // row's index (and `onRowActivated` would select the wrong item).
+    self.rows.ensureUnusedCapacity(a, 1) catch return;
     self.items.append(a, it) catch return;
     var parts: RowParts = .{};
     const row = if (it.action == .calc) calcRow(it) else itemRow(it, &parts);
     c.g_object_set_data(@ptrCast(row), "lumen-row", @ptrFromInt(self.rows.items.len + 1));
     c.gtk_list_box_append(@ptrCast(self.list), row);
-    self.rows.append(a, .{ .widget = row, .item = item_index, .hint = parts.hint, .accessory = parts.accessory }) catch {};
+    self.rows.appendAssumeCapacity(.{ .widget = row, .item = item_index, .hint = parts.hint, .accessory = parts.accessory });
 }
 
 /// Icon, title over subtitle, accessory, and the hidden hint that shows
@@ -1377,7 +1393,7 @@ fn calcSide(value: [:0]const u8, tag: [:0]const u8) *c.GtkWidget {
 fn iconWidget(icon: item_mod.Icon, size: c_int) *c.GtkWidget {
     switch (icon) {
         .logo => |l| {
-            const t = logos.texture(std.heap.c_allocator, l.name) orelse return iconWidget(.none, size);
+            const t = logos.texture(l.name) orelse return iconWidget(.none, size);
             const img = c.gtk_image_new_from_paintable(t);
             c.gtk_image_set_pixel_size(@ptrCast(img), if (l.on_light) size - 6 else size);
             c.gtk_widget_add_css_class(img, if (l.on_light) "logo-plate" else "logo");
@@ -1529,6 +1545,7 @@ pub fn onContentResult(result: *ContentSearch.Result, ctx: ?*anyopaque) void {
         result.destroy(self.gpa);
         return;
     }
+    if (result.err) |err| log.warn("content search for \"{s}\": {t}", .{ result.query, err });
     const old = self.content_result;
     self.content_result = result;
     self.content_pending = false;
@@ -1561,7 +1578,7 @@ fn itemsFromHits(self: *Ui, a: std.mem.Allocator, hits: []const index.ContentSer
             .icon = self.fileIcon(path, false),
             .action = .{ .file = .{ .path = path, .is_dir = false, .line = h.line, .extracted = h.extracted } },
             .detail = h.snippet,
-            .score = @intCast(@min(h.mtime, std.math.maxInt(i32))),
+            .score = std.math.lossyCast(i32, h.mtime),
         }) catch break;
     }
     return out.items;
@@ -1619,7 +1636,7 @@ fn showContentDetail(self: *Ui, it: *const Item) void {
 
     const info = index.sys.info(f.path);
     const service = self.contents orelse return;
-    const text = service.readText(a, f.path, if (info) |i| i.mtime else 0, f.extracted) orelse it.detail;
+    const text = service.readText(a, f.path, if (info) |i| i.mtime else 0, f.extracted, f.line + context_after) orelse it.detail;
     const words = index.content.splitWords(a, self.query()) catch return;
     // The theme's accent behind matches, its text colour on top.
     const hl_open = std.fmt.allocPrint(a, "<span background=\"{s}\" bgalpha=\"40%\" foreground=\"{s}\">", .{ std.mem.sliceTo(&self.hl_bg, 0), std.mem.sliceTo(&self.hl_fg, 0) }) catch return;
@@ -1633,11 +1650,14 @@ fn showContentDetail(self: *Ui, it: *const Item) void {
     c.gtk_label_set_text(@ptrCast(self.meta_values[3]), it.where.ptr);
 }
 
+/// Lines shown after the matching one in a content preview.
+const context_after = 14;
+
 /// Pango markup of the lines around `line` (1-based), with line numbers and
 /// every occurrence of `words` highlighted.
 fn contextMarkup(a: std.mem.Allocator, text: []const u8, line: u32, words: []const []const u8, hl_open: []const u8) [:0]const u8 {
     const before = 6;
-    const after = 14;
+    const after = context_after;
     const first = if (line > before) line - before else 1;
     var out: std.ArrayList(u8) = .empty;
     var n: u32 = 1;
@@ -1901,7 +1921,8 @@ fn perform(self: *Ui, op: item_mod.Op) void {
         return;
     }
     self.closePanel();
-    if (it.key.len > 0 and it.action != .setting and (op == .run or op == .open)) self.db.recordUse(it.key, now());
+    // Ranking only (Db logs failures): the action goes ahead regardless.
+    if (it.key.len > 0 and it.action != .setting and (op == .run or op == .open)) self.db.recordUse(it.key, now()) catch {};
 
     const outcome = run.perform(self.actionCtx(), it, op);
     switch (outcome) {
@@ -1911,6 +1932,10 @@ fn perform(self: *Ui, op: item_mod.Op) void {
         .open_view => |v| self.navigate(v),
         .setting => |sa| self.performSetting(sa.setting, sa.op),
         .choose_app => |path| self.chooseAppFor(path),
+        .failed => |msg| {
+            self.primary = msg;
+            self.setHint(msg, true);
+        },
     }
 }
 
@@ -1989,8 +2014,13 @@ pub fn injectKey(self: *Ui, name: []const u8) bool {
 }
 
 /// `lumen --dump`: what the window shows, as text (for end-to-end tests).
-pub fn dump(self: *Ui, a: std.mem.Allocator) ![:0]u8 {
-    var out: std.Io.Writer.Allocating = .init(a);
+/// Caller owns the result, allocated with `gpa`.
+pub fn dump(self: *Ui, gpa: std.mem.Allocator) (std.Io.Writer.Error || std.mem.Allocator.Error)![:0]u8 {
+    var scratch_state: std.heap.ArenaAllocator = .init(gpa);
+    defer scratch_state.deinit();
+    const a = scratch_state.allocator();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
     const w = &out.writer;
     try w.print("view: {t}\nvisible: {}\nquery: {s}\n", .{ self.view, c.gtk_widget_get_visible(self.window) != 0, self.query() });
     try w.print("title: {s}\nprimary: {s}\n", .{ self.viewTitle(), self.primary });
@@ -2022,9 +2052,7 @@ pub fn dump(self: *Ui, a: std.mem.Allocator) ![:0]u8 {
         try w.print("panel:\n", .{});
         for (self.panel_entries, 0..) |e, i| try w.print("  {s} {s} [{s}]\n", .{ if (i == self.panel_selected) ">" else " ", e.label, e.keys });
     }
-    try w.writeByte(0);
-    const bytes = out.written();
-    return bytes[0 .. bytes.len - 1 :0];
+    return out.toOwnedSliceSentinel(0);
 }
 
 /// The placeholder row's text when nothing is listed.
@@ -2033,6 +2061,8 @@ fn emptyText(self: *Ui, a: std.mem.Allocator) [:0]const u8 {
     if (self.view == .files and q.len == 0) return self.filesHint(a);
     if (self.view == .contents and q.len < 3) return self.contentsHint(a, q.len);
     if (self.view == .contents and self.content_pending) return "Searching...";
+    if (self.view == .contents) if (self.content_result) |r| if (r.err) |err|
+        return std.fmt.allocPrintSentinel(a, "Content search failed ({t})", .{err}, 0) catch "Content search failed";
     if (self.view == .clipboard and q.len == 0 and !self.settings.clipboard) return "Clipboard history is off: turn it on in Settings";
     return "No Results";
 }
@@ -2142,9 +2172,10 @@ fn now() i64 {
 }
 
 fn startOfToday() i64 {
-    const dt = c.g_date_time_new_now_local();
+    // Null only for a date GLib cannot represent: then everything is "Earlier".
+    const dt = c.g_date_time_new_now_local() orelse return std.math.maxInt(i64);
     defer c.g_date_time_unref(dt);
-    const midnight = c.g_date_time_new_local(c.g_date_time_get_year(dt), c.g_date_time_get_month(dt), c.g_date_time_get_day_of_month(dt), 0, 0, 0);
+    const midnight = c.g_date_time_new_local(c.g_date_time_get_year(dt), c.g_date_time_get_month(dt), c.g_date_time_get_day_of_month(dt), 0, 0, 0) orelse return std.math.maxInt(i64);
     defer c.g_date_time_unref(midnight);
     return c.g_date_time_to_unix(midnight);
 }

@@ -22,6 +22,8 @@ const sys = @import("sys.zig");
 
 const Service = @This();
 
+const log = std.log.scoped(.files);
+
 /// Watches per batch: ~2.3 us each, so a search waits ~4.6 ms at worst.
 const arm_batch = 2_000;
 /// How long the thread blocks on inotify before checking for `stop`.
@@ -41,34 +43,46 @@ scan_pool: *Pool,
 cfg: scan.Config,
 roots: [1][]const u8,
 cache_path: [:0]u8,
-/// For `lumen --stats`.
-rescans: u32 = 0,
-last_rescan_ns: u64 = 0,
+/// For `lumen --stats`, read from other threads.
+rescans: std.atomic.Value(u32) = .init(0),
+last_rescan_ns: std.atomic.Value(u64) = .init(0),
 
-/// Starts on `root`, mapping `cache_path` if it exists.
+/// Starts on `root`, mapping `cache_path` if it exists. Thread-safe once
+/// started: searches and `status` may come from any thread.
 pub fn start(gpa: std.mem.Allocator, io: Io, root: []const u8, cache_path: []const u8) !*Service {
     const s = try gpa.create(Service);
     errdefer gpa.destroy(s);
-    s.gpa = gpa;
-    s.io = io;
-    s.lock = .init;
-    s.stop = .init(false);
-    s.thread = null;
-    s.roots = .{try gpa.dupe(u8, root)};
+    const root_copy = try gpa.dupe(u8, root);
+    errdefer gpa.free(root_copy);
+    const cache = try gpa.dupeZ(u8, cache_path);
+    errdefer gpa.free(cache);
+    const search_pool = try Pool.create(gpa, io, Pool.allCores());
+    errdefer search_pool.destroy();
+    const scan_pool = try Pool.create(gpa, io, Pool.halfCores());
+    errdefer scan_pool.destroy();
+    search_pool.nameThreads("lm-search");
+    scan_pool.nameThreads("lm-scan");
+    s.* = .{
+        .gpa = gpa,
+        .io = io,
+        .live = undefined, // set below, once `cfg` has its final address
+        .search_pool = search_pool,
+        .scan_pool = scan_pool,
+        .cfg = undefined,
+        .roots = .{root_copy},
+        .cache_path = cache,
+    };
     s.cfg = .{ .roots = &s.roots };
-    s.cache_path = try gpa.dupeZ(u8, cache_path);
-    s.search_pool = try Pool.create(gpa, io, Pool.allCores());
-    s.search_pool.nameThreads("lm-search");
-    s.scan_pool = try Pool.create(gpa, io, Pool.halfCores());
-    s.scan_pool.nameThreads("lm-scan");
-    s.rescans = 0;
-    s.last_rescan_ns = 0;
 
-    const base = Store.open(s.cache_path) catch blk: {
+    var base = Store.open(s.cache_path) catch blk: {
         var b: store_mod.Builder = .{};
         break :blk try b.finish(gpa);
     };
-    s.live = try Live.initUnarmed(gpa, base, &s.cfg, s.cache_path, s.scan_pool);
+    s.live = Live.initUnarmed(gpa, base, &s.cfg, s.cache_path, s.scan_pool) catch |err| {
+        base.deinit(gpa);
+        return err;
+    };
+    errdefer s.live.deinit();
     s.live.pending_resync = true;
     s.thread = try std.Thread.spawn(.{}, run, .{s});
     s.thread.?.setName(io, "lm-files") catch {};
@@ -82,8 +96,11 @@ pub fn shutdown(s: *Service) void {
     if (s.thread) |t| t.join();
     if (s.live.dirty or s.live.pending_resync) {
         if (Live.prepareCompaction(s.gpa, s.scan_pool, &s.cfg, s.cache_path)) |fresh| {
-            if (s.live.adopt(fresh.base, fresh.watcher)) |old| freeReplaced(s.gpa, old) else |_| {}
-        } else |_| {}
+            if (s.live.adopt(fresh.base, fresh.watcher)) |old| freeReplaced(s.gpa, old) else |err| {
+                log.warn("saving the file index: {t}", .{err});
+                freeReplaced(s.gpa, fresh);
+            }
+        } else |err| log.warn("saving the file index: {t}", .{err});
     }
     s.live.deinit();
     s.search_pool.destroy();
@@ -102,7 +119,7 @@ pub fn search(s: *Service, arena: std.mem.Allocator, query: []const u8, limit: u
     try s.live.search(arena, s.search_pool, query, limit, .{}, out);
 }
 
-pub const Status = struct { entries: usize, watches: usize, armed: bool, rescanning: bool, index_bytes: usize = 0, rescans: u32 = 0, last_rescan_ns: u64 = 0 };
+pub const Status = struct { entries: usize, watches: usize, unwatched: u32 = 0, armed: bool, rescanning: bool, index_bytes: usize = 0, rescans: u32 = 0, last_rescan_ns: u64 = 0 };
 
 pub fn status(s: *Service) Status {
     s.lock.lockSharedUncancelable(s.io);
@@ -111,11 +128,12 @@ pub fn status(s: *Service) Status {
         // Live entries: the delta also holds scaffolding and its own graves.
         .entries = s.live.base.liveLen() + s.live.delta.liveLen(),
         .watches = s.live.stats.watches,
+        .unwatched = s.live.watcher.unwatched,
         .armed = s.live.fullyArmed(),
         .rescanning = s.live.pending_resync,
         .index_bytes = s.live.base.buf.len + s.live.delta.buf.len,
-        .rescans = s.rescans,
-        .last_rescan_ns = s.last_rescan_ns,
+        .rescans = s.rescans.load(.monotonic),
+        .last_rescan_ns = s.last_rescan_ns.load(.monotonic),
     };
 }
 
@@ -128,23 +146,29 @@ fn freeReplaced(gpa: std.mem.Allocator, old: Live.Replaced) void {
 fn rescan(s: *Service) void {
     const t0 = sys.monotonicNs();
     defer {
-        s.last_rescan_ns = sys.monotonicNs() - t0;
-        s.rescans += 1;
+        s.last_rescan_ns.store(sys.monotonicNs() - t0, .monotonic);
+        _ = s.rescans.fetchAdd(1, .monotonic);
         sys.trimHeap();
     }
-    const fresh = Live.prepareCompaction(s.gpa, s.scan_pool, &s.cfg, s.cache_path) catch {
+    const fresh = Live.prepareCompaction(s.gpa, s.scan_pool, &s.cfg, s.cache_path) catch |err| {
+        log.warn("rescan: {t}", .{err});
         // Clear the request so a failing rescan does not spin the CPU.
         s.lock.lockUncancelable(s.io);
+        defer s.lock.unlock(s.io);
         s.live.pending_resync = false;
-        s.lock.unlock(s.io);
         return;
     };
-    s.lock.lockUncancelable(s.io);
-    const old = s.live.adopt(fresh.base, fresh.watcher);
-    s.lock.unlock(s.io);
+    const old = blk: {
+        s.lock.lockUncancelable(s.io);
+        defer s.lock.unlock(s.io);
+        break :blk s.live.adopt(fresh.base, fresh.watcher);
+    };
     // Outside the lock: closing tens of thousands of watches is kernel time
     // no search should pay.
-    if (old) |o| freeReplaced(s.gpa, o) else |_| {}
+    if (old) |o| freeReplaced(s.gpa, o) else |err| {
+        log.warn("rescan: {t}", .{err});
+        freeReplaced(s.gpa, fresh);
+    }
 }
 
 fn run(s: *Service) void {
@@ -179,11 +203,21 @@ fn run(s: *Service) void {
         _ = arena_state.reset(.retain_capacity);
         const arena = arena_state.allocator();
         var changes: std.ArrayList(Watcher.Change) = .empty;
-        s.lock.lockUncancelable(s.io);
-        s.live.watcher.drain(arena, &changes) catch {};
-        _ = s.live.apply(changes.items) catch {};
-        const needs = s.live.pending_resync or s.live.needsCompaction();
-        s.lock.unlock(s.io);
+        const needs = blk: {
+            s.lock.lockUncancelable(s.io);
+            defer s.lock.unlock(s.io);
+            // Events drained from the kernel and then lost would leave the
+            // index wrong for good: a failure asks for a rescan instead.
+            s.live.watcher.drain(arena, &changes) catch |err| {
+                log.warn("reading file events: {t}", .{err});
+                s.live.pending_resync = true;
+            };
+            _ = s.live.apply(changes.items) catch |err| {
+                log.warn("applying file events: {t}", .{err});
+                s.live.pending_resync = true;
+            };
+            break :blk s.live.pending_resync or s.live.needsCompaction();
+        };
         if (needs) s.rescan();
     }
 }

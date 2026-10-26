@@ -104,8 +104,10 @@ fn procField(status: []const u8, key: []const u8) f64 {
     return @as(f64, @floatFromInt(kb)) / 1024;
 }
 
-pub fn report(a: std.mem.Allocator, files: ?*index.Service, contents: ?*index.ContentService) ![:0]u8 {
-    var out: std.Io.Writer.Allocating = .init(a);
+/// The `lumen --stats` text. Caller owns the result, allocated with `gpa`.
+pub fn report(gpa: std.mem.Allocator, files: ?*index.Service, contents: ?*index.ContentService) (std.Io.Writer.Error || std.mem.Allocator.Error)![:0]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
     const w = &out.writer;
     const up_s = (now() - started_ns) / std.time.ns_per_s;
     try w.print("Lumen  pid {d}  up {d}h{d:0>2}m  started in {d:.0} ms\n\n", .{ std.os.linux.getpid(), up_s / 3600, up_s / 60 % 60, @as(f64, @floatFromInt(startup_ns)) / 1e6 });
@@ -126,9 +128,11 @@ pub fn report(a: std.mem.Allocator, files: ?*index.Service, contents: ?*index.Co
 
     if (files) |f| {
         const st = f.status();
-        try w.print("File index\n  {d} entries, {d} inotify watches{s}, index {d:.1} MB, {d} rescans (last {d:.0} ms)\n\n", .{
+        try w.print("File index\n  {d} entries, {d} inotify watches{s}, index {d:.1} MB, {d} rescans (last {d:.0} ms)\n", .{
             st.entries, st.watches, if (st.armed) "" else " (arming)", mb(st.index_bytes), st.rescans, @as(f64, @floatFromInt(st.last_rescan_ns)) / 1e6,
         });
+        if (st.unwatched > 0) try w.print("  {d} folders unwatched: inotify limit (fs.inotify.max_user_watches)\n", .{st.unwatched});
+        try w.writeByte('\n');
     }
     if (contents) |cs| {
         const st = cs.status();
@@ -151,7 +155,5 @@ pub fn report(a: std.mem.Allocator, files: ?*index.Service, contents: ?*index.Co
     }
     const sh = show.summary();
     if (sh.n > 0) try w.print("  {s:<10} {d:>6} {d:>8.2} {d:>8.2} {d:>8.2}   (window shown -> first frame)\n", .{ "show", sh.n, sh.p50, sh.p95, sh.max });
-    try w.writeByte(0);
-    const bytes = out.written();
-    return bytes[0 .. bytes.len - 1 :0];
+    return out.toOwnedSliceSentinel(0);
 }

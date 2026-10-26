@@ -110,7 +110,7 @@ fn ms(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1e6;
 }
 
-fn plainText(_: *anyopaque, d: index.content.DocIn, buf: *std.ArrayList(u8), gpa: std.mem.Allocator) bool {
+fn plainText(_: *anyopaque, d: index.content.DocIn, buf: *std.ArrayList(u8), gpa: std.mem.Allocator) std.mem.Allocator.Error!bool {
     if (d.source != .plain) return false;
     return index.content.readPlain(gpa, d.path, buf);
 }

@@ -19,6 +19,8 @@ const extract = @import("extract.zig");
 const Pool = @import("Pool.zig");
 const sys = @import("sys.zig");
 
+const log = std.log.scoped(.content);
+
 const ContentService = @This();
 
 pub const Options = struct {
@@ -44,27 +46,36 @@ wake: std.atomic.Value(u32) = .init(0),
 last_check_ns: std.atomic.Value(u64) = .init(0),
 thread: ?std.Thread = null,
 building: std.atomic.Value(bool) = .init(false),
-/// For `lumen --stats` (and tests: `checks` counts finished checks).
+/// For `lumen --stats` (and tests: `checks` counts finished checks). Read
+/// from other threads.
 builds: std.atomic.Value(u32) = .init(0),
 checks: std.atomic.Value(u32) = .init(0),
 extractions: std.atomic.Value(u32) = .init(0),
-last_list_ns: u64 = 0,
-last_build_ns: u64 = 0,
-last_extract_ns: u64 = 0,
+last_list_ns: std.atomic.Value(u64) = .init(0),
+last_build_ns: std.atomic.Value(u64) = .init(0),
+last_extract_ns: std.atomic.Value(u64) = .init(0),
 
 pub fn start(gpa: std.mem.Allocator, io: Io, root: []const u8, cache_dir: []const u8, search_pool: *Pool, build_pool: *Pool) !*ContentService {
     return startWith(gpa, io, root, cache_dir, search_pool, build_pool, .{});
 }
 
+/// Starts the background thread. Borrows the pools, which must outlive it.
+/// Thread-safe once started.
 pub fn startWith(gpa: std.mem.Allocator, io: Io, root: []const u8, cache_dir: []const u8, search_pool: *Pool, build_pool: *Pool, opts: Options) !*ContentService {
     const s = try gpa.create(ContentService);
     errdefer gpa.destroy(s);
+    const root_copy = try gpa.dupe(u8, root);
+    errdefer gpa.free(root_copy);
+    const cache_path = try std.fmt.allocPrintSentinel(gpa, "{s}/content.idx", .{cache_dir}, 0);
+    errdefer gpa.free(cache_path);
+    const text_dir = try std.fmt.allocPrint(gpa, "{s}/text", .{cache_dir});
+    errdefer gpa.free(text_dir);
     s.* = .{
         .gpa = gpa,
         .io = io,
-        .root = try gpa.dupe(u8, root),
-        .cache_path = try std.fmt.allocPrintSentinel(gpa, "{s}/content.idx", .{cache_dir}, 0),
-        .text_dir = try std.fmt.allocPrint(gpa, "{s}/text", .{cache_dir}),
+        .root = root_copy,
+        .cache_path = cache_path,
+        .text_dir = text_dir,
         .search_pool = search_pool,
         .build_pool = build_pool,
         .opts = opts,
@@ -74,7 +85,9 @@ pub fn startWith(gpa: std.mem.Allocator, io: Io, root: []const u8, cache_dir: []
     // user's documents, so close it before anything else.
     sys.makePrivate(cache_dir);
     sys.makePrivate(s.text_dir);
+    // Absent or unreadable: built from scratch by the first refresh.
     s.index = content.Index.open(s.cache_path) catch null;
+    errdefer if (s.index) |*ix| ix.deinit(gpa);
     s.thread = try std.Thread.spawn(.{}, run, .{s});
     s.thread.?.setName(io, "lm-content") catch {};
     return s;
@@ -130,9 +143,9 @@ pub fn status(s: *ContentService) Status {
         .builds = s.builds.load(.acquire),
         .checks = s.checks.load(.acquire),
         .extractions = s.extractions.load(.acquire),
-        .last_list_ns = s.last_list_ns,
-        .last_build_ns = s.last_build_ns,
-        .last_extract_ns = s.last_extract_ns,
+        .last_list_ns = s.last_list_ns.load(.monotonic),
+        .last_build_ns = s.last_build_ns.load(.monotonic),
+        .last_extract_ns = s.last_extract_ns.load(.monotonic),
     };
 }
 
@@ -173,16 +186,34 @@ fn pathOf(ctx: *anyopaque, d: content.DocIn, buf: []u8) ?[:0]const u8 {
     return s.textPath(buf, d);
 }
 
-/// A hit's whole text (for the preview), in `arena`.
-pub fn readText(s: *ContentService, arena: std.mem.Allocator, path: []const u8, mtime: i64, extracted: bool) ?[]const u8 {
+/// The first `lines` lines of a hit's text (for the preview), in `arena`;
+/// null if it cannot be read. Reads no further than that: the preview runs
+/// on the UI thread, and a match near the top of a 4 MB extraction needs a
+/// few KB of it.
+pub fn readText(s: *ContentService, arena: std.mem.Allocator, path: []const u8, mtime: i64, extracted: bool, lines: u32) ?[]const u8 {
+    var pbuf: [4096]u8 = undefined;
+    const p: [:0]const u8 = if (extracted)
+        s.textPath(&pbuf, .{ .path = path, .mtime = mtime, .size = 0, .source = .extracted }) orelse return null
+    else
+        std.fmt.bufPrintSentinel(&pbuf, "{s}", .{path}, 0) catch return null;
+    const fd = sys.openRegular(p) catch return null;
+    defer sys.close(fd);
+    const cap: usize = if (extracted) max_extracted else content.max_text;
     var buf: std.ArrayList(u8) = .empty;
-    const d: content.DocIn = .{ .path = path, .mtime = mtime, .size = 0, .source = if (extracted) .extracted else .plain };
-    if (!textOf(s, d, &buf, arena)) return null;
+    var seen: u32 = 0;
+    while (buf.items.len < cap and seen < lines) {
+        buf.ensureUnusedCapacity(arena, 16 * 1024) catch return null;
+        const spare = buf.unusedCapacitySlice();
+        const n = std.os.linux.read(fd, spare.ptr, @min(spare.len, cap - buf.items.len));
+        if (std.os.linux.errno(n) != .SUCCESS or n == 0) break;
+        seen += @intCast(std.mem.count(u8, spare[0..n], "\n"));
+        buf.items.len += n;
+    }
     return buf.items;
 }
 
 /// Text of a document: the file itself, or its cached extraction.
-fn textOf(ctx: *anyopaque, d: content.DocIn, buf: *std.ArrayList(u8), gpa: std.mem.Allocator) bool {
+fn textOf(ctx: *anyopaque, d: content.DocIn, buf: *std.ArrayList(u8), gpa: std.mem.Allocator) std.mem.Allocator.Error!bool {
     const s: *ContentService = @ptrCast(@alignCast(ctx));
     if (d.source == .plain) return content.readPlain(gpa, d.path, buf);
     var pbuf: [4096]u8 = undefined;
@@ -191,7 +222,7 @@ fn textOf(ctx: *anyopaque, d: content.DocIn, buf: *std.ArrayList(u8), gpa: std.m
     const fd = sys.openRegular(p) catch return false;
     defer sys.close(fd);
     while (buf.items.len < max_extracted) {
-        buf.ensureUnusedCapacity(gpa, 64 * 1024) catch return false;
+        try buf.ensureUnusedCapacity(gpa, 64 * 1024);
         const spare = buf.unusedCapacitySlice();
         const n = std.os.linux.read(fd, spare.ptr, spare.len);
         if (std.os.linux.errno(n) != .SUCCESS or n == 0) break;
@@ -205,8 +236,10 @@ fn textPath(s: *ContentService, buf: []u8, d: content.DocIn) ?[:0]const u8 {
 }
 
 /// Extracts what is missing from the text cache, on the background pool
-/// (a PDF takes 10-40 ms, a whole book up to ~0.7 s). Documents that fail to
-/// extract get an empty file, so they are not retried every refresh.
+/// (a PDF takes 10-40 ms, a whole book up to ~0.7 s). Documents that cannot
+/// be extracted (a corrupt file, a tool error) get an empty file, so they
+/// are not retried every refresh; passing failures (out of memory, a
+/// timeout, a missing tool) leave nothing, so the next refresh tries again.
 fn extractMissing(s: *ContentService, docs: []const content.DocIn) void {
     var missing: std.ArrayList(content.DocIn) = .empty;
     defer missing.deinit(s.gpa);
@@ -229,9 +262,15 @@ fn extractMissing(s: *ContentService, docs: []const content.DocIn) void {
             const tp = svc.textPath(&tbuf, d) orelse return;
             const kind = extract.kindOf(d.path) orelse return;
             const src = std.fmt.bufPrintZ(&zbuf, "{s}", .{d.path}) catch return;
-            const text = extract.extractText(svc.gpa, svc.io, src, kind, max_extracted) catch "";
+            const text = extract.extractText(svc.gpa, svc.io, src, kind, max_extracted) catch |err| switch (err) {
+                error.ToolFailed, error.NotRegular, error.Access, error.NotFound => "",
+                else => {
+                    log.warn("extracting {s}: {t}, will retry", .{ d.path, err });
+                    return;
+                },
+            };
             defer if (text.len > 0) svc.gpa.free(text);
-            sys.writeFile(tp, text) catch {};
+            sys.writeFileAtomic(tp, text) catch |err| log.warn("caching text of {s}: {t}", .{ d.path, err });
             _ = svc.extractions.fetchAdd(1, .release);
         }
     };
@@ -259,8 +298,11 @@ fn refresh(s: *ContentService) void {
     var arena_state = std.heap.ArenaAllocator.init(s.gpa);
     defer arena_state.deinit();
     var t = sys.monotonicNs();
-    const docs = content_list.list(arena_state.allocator(), s.gpa, s.io, s.root, true) catch return;
-    s.last_list_ns = sys.monotonicNs() - t;
+    const docs = content_list.list(arena_state.allocator(), s.gpa, s.io, s.root, true) catch |err| {
+        log.warn("listing files: {t}", .{err});
+        return;
+    };
+    s.last_list_ns.store(sys.monotonicNs() - t, .monotonic);
     if (s.unchanged(docs)) return;
 
     s.building.store(true, .release);
@@ -268,26 +310,34 @@ fn refresh(s: *ContentService) void {
     defer sys.trimHeap();
     t = sys.monotonicNs();
     s.extractMissing(docs);
-    s.last_extract_ns = sys.monotonicNs() - t;
+    s.last_extract_ns.store(sys.monotonicNs() - t, .monotonic);
     if (s.stop.load(.acquire)) return;
     t = sys.monotonicNs();
-    var fresh = content.build(s.gpa, s.build_pool, docs, textOf, s, null) catch return;
-    s.last_build_ns = sys.monotonicNs() - t;
+    var fresh = content.build(s.gpa, s.build_pool, docs, textOf, s, null) catch |err| {
+        log.warn("building the content index: {t}", .{err});
+        return;
+    };
+    s.last_build_ns.store(sys.monotonicNs() - t, .monotonic);
     _ = s.builds.fetchAdd(1, .release);
     // Save, then serve the mapping of what was saved: clean page cache
     // instead of tens of MB of heap.
     if (std.mem.lastIndexOfScalar(u8, s.cache_path, '/')) |slash| sys.mkdirP(s.cache_path[0..slash]);
+    // Not saved: still served from memory, and saved again next start (the
+    // check finds the file older than the documents).
     if (fresh.save(s.cache_path)) |_| {
         if (content.Index.open(s.cache_path)) |mapped| {
             fresh.deinit(s.gpa);
             fresh = mapped;
         } else |_| {}
-    } else |_| {}
+    } else |err| log.warn("saving the content index: {t}", .{err});
 
-    s.lock.lockUncancelable(s.io);
-    var old = s.index;
-    s.index = fresh;
-    s.lock.unlock(s.io);
+    var old = blk: {
+        s.lock.lockUncancelable(s.io);
+        defer s.lock.unlock(s.io);
+        const o = s.index;
+        s.index = fresh;
+        break :blk o;
+    };
     if (old) |*o| {
         s.dropStaleText(o, docs);
         o.deinit(s.gpa);
@@ -318,8 +368,8 @@ fn run(s: *ContentService) void {
     s.refresh();
     while (!s.stop.load(.acquire)) {
         // Sleep until poked or until the next periodic check.
-        var ts: std.os.linux.timespec = .{ .sec = 5, .nsec = 0 };
-        _ = std.os.linux.futex_4arg(&s.wake.raw, .{ .cmd = .WAIT, .private = true }, seen, &ts);
+        // Canceled never happens: this thread is joined, not canceled.
+        s.io.futexWaitTimeout(u32, &s.wake.raw, seen, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } }) catch {};
         if (s.stop.load(.acquire)) return;
         const since = sys.monotonicNs() - s.last_check_ns.load(.acquire);
         const now_wake = s.wake.load(.acquire);
@@ -439,7 +489,7 @@ test "content service: finds, follows edits and deletions, rebuilds only on chan
         try testing.expect(std.mem.endsWith(u8, hits[0].path, "/notes/alpha.txt"));
         try testing.expect(!hits[0].extracted);
         try testing.expectEqual(@as(u32, 1), hits[0].line);
-        const text = s.readText(f.arena_state.allocator(), hits[0].path, hits[0].mtime, false).?;
+        const text = s.readText(f.arena_state.allocator(), hits[0].path, hits[0].mtime, false, std.math.maxInt(u32)).?;
         try testing.expectEqualStrings("the quick zanzibar fox\n", text);
 
         // Nothing changed: listed again, not rebuilt.
@@ -534,10 +584,10 @@ test "content service: Office documents are extracted once per version" {
         try testing.expectEqual(@as(usize, 1), hits.len);
         try testing.expectEqualStrings(report, hits[0].path);
         try testing.expect(hits[0].extracted);
-        const text = s.readText(f.arena_state.allocator(), hits[0].path, hits[0].mtime, true).?;
+        const text = s.readText(f.arena_state.allocator(), hits[0].path, hits[0].mtime, true, std.math.maxInt(u32)).?;
         try testing.expectEqualStrings("Minutes about the wombat project", text);
         // Asked as plain text, the zip is not the text.
-        if (s.readText(f.arena_state.allocator(), hits[0].path, hits[0].mtime, false)) |raw| {
+        if (s.readText(f.arena_state.allocator(), hits[0].path, hits[0].mtime, false, std.math.maxInt(u32))) |raw| {
             try testing.expect(std.mem.indexOf(u8, raw, "wombat") == null);
         }
 

@@ -57,13 +57,17 @@ pub const Settings = struct {
     open_with: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
     /// `key = value` lines this version does not know, kept as they were.
     unknown: std.ArrayList([]const u8) = .empty,
+    /// Memory ran out while reading the file: some of it is missing here,
+    /// so `save` refuses to write this back over it.
+    incomplete: bool = false,
 
     pub fn init(gpa: std.mem.Allocator) Settings {
-        return .{ .arena = std.heap.ArenaAllocator.init(gpa) };
+        return .{ .arena = .init(gpa) };
     }
 
     pub fn deinit(s: *Settings) void {
         s.arena.deinit();
+        s.* = undefined;
     }
 
     fn alloc(s: *Settings) std.mem.Allocator {
@@ -87,12 +91,23 @@ pub const Settings = struct {
             const key = std.mem.trim(u8, line[0..eq], " \t");
             const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
             if (section_open_with) {
-                s.setOpenWith(key, value) catch {};
+                s.setOpenWith(key, value) catch |err| switch (err) {
+                    // A bad line is ignored, like a bad value anywhere else.
+                    error.BadKey, error.BadApp => {},
+                    error.OutOfMemory => s.incomplete = true,
+                };
             } else if (!s.set(key, value)) {
-                if (isToken(key)) s.unknown.append(s.alloc(), s.alloc().dupe(u8, line) catch continue) catch {};
+                if (isToken(key)) s.keepUnknown(line) catch {
+                    s.incomplete = true;
+                };
             }
         }
         return s;
+    }
+
+    fn keepUnknown(s: *Settings, line: []const u8) std.mem.Allocator.Error!void {
+        const a = s.alloc();
+        try s.unknown.append(a, try a.dupe(u8, line));
     }
 
     /// Sets a top-level key from its text value. False when the key is not
@@ -107,7 +122,10 @@ pub const Settings = struct {
             return true;
         }
         if (std.mem.eql(u8, key, "theme")) {
-            if (isToken(value)) s.theme = s.alloc().dupe(u8, value) catch s.theme;
+            if (isToken(value)) s.theme = s.alloc().dupe(u8, value) catch blk: {
+                s.incomplete = true;
+                break :blk s.theme;
+            };
             return true;
         }
         return false;
@@ -147,7 +165,10 @@ pub const Settings = struct {
             },
             .terminal, .editor => {
                 if (value.len > 0 and !isToken(value)) return false;
-                const owned = s.alloc().dupe(u8, value) catch return false;
+                const owned = s.alloc().dupe(u8, value) catch {
+                    s.incomplete = true;
+                    return false;
+                };
                 if (ch == .terminal) s.terminal = owned else s.editor = owned;
             },
         }
@@ -168,7 +189,9 @@ pub const Settings = struct {
 
     /// `key` is a kind name or ".ext"; an empty `app` removes the entry
     /// (back to the system default).
-    pub fn setOpenWith(s: *Settings, key: []const u8, app: []const u8) !void {
+    pub const OpenWithError = error{ BadKey, BadApp } || std.mem.Allocator.Error;
+
+    pub fn setOpenWith(s: *Settings, key: []const u8, app: []const u8) OpenWithError!void {
         const valid_key = std.meta.stringToEnum(Kind, key) != null or
             (key.len >= 2 and key.len <= 16 and key[0] == '.' and isToken(key[1..]));
         if (!valid_key) return error.BadKey;
@@ -242,19 +265,18 @@ pub const Settings = struct {
         return parse(gpa, sys.readHead(path, &buf));
     }
 
-    /// Writes `path` whole and renames it into place: a crash never leaves
-    /// half a file. Owner-only, like Lumen's other files.
-    pub fn save(s: *const Settings, gpa: std.mem.Allocator, path: []const u8) !void {
-        if (std.mem.lastIndexOfScalar(u8, path, '/')) |slash| sys.mkdirP(path[0..slash]);
+    pub const SaveError = sys.Error || std.Io.Writer.Error || error{Incomplete};
+
+    /// Writes `path` atomically (temporary file, fsync, rename): a crash or a
+    /// full disk never leaves half a file. Owner-only, like Lumen's other
+    /// files.
+    pub fn save(s: *const Settings, gpa: std.mem.Allocator, path: []const u8) SaveError!void {
+        if (s.incomplete) return error.Incomplete;
+        if (std.mem.findScalarLast(u8, path, '/')) |slash| sys.mkdirP(path[0..slash]);
         var out: std.Io.Writer.Allocating = .init(gpa);
         defer out.deinit();
         try s.write(&out.writer);
-        var pbuf: [4096]u8 = undefined;
-        var tbuf: [4096]u8 = undefined;
-        const final = try std.fmt.bufPrintZ(&pbuf, "{s}", .{path});
-        const tmp = try std.fmt.bufPrintZ(&tbuf, "{s}.tmp", .{path});
-        try sys.writeFile(tmp, out.written());
-        try sys.rename(tmp, final);
+        try sys.writeFileAtomic(path, out.written());
     }
 };
 

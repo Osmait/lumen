@@ -164,11 +164,9 @@ pub const Index = struct {
         };
     }
 
-    pub fn save(ix: *const Index, path_z: [:0]const u8) !void {
-        var tmp_buf: [4096]u8 = undefined;
-        const tmp = try std.fmt.bufPrintZ(&tmp_buf, "{s}.tmp", .{path_z});
-        try sys.writeFile(tmp, ix.buf);
-        try sys.rename(tmp, path_z);
+    /// Writes the index to `path_z` atomically (see `sys.writeFileAtomic`).
+    pub fn save(ix: *const Index, path_z: [:0]const u8) sys.Error!void {
+        try sys.writeFileAtomic(path_z, ix.buf);
     }
 
     pub fn open(path_z: [:0]const u8) !Index {
@@ -387,22 +385,25 @@ fn intersect(gpa: std.mem.Allocator, a: []const u32, b: []const u8, n_docs: usiz
 
 // --------------------------------------------------------------- building
 
-/// Reads a document's text for indexing or verifying. `extracted` documents
-/// are read from the text cache by the caller-provided resolver.
-pub const TextFn = *const fn (ctx: *anyopaque, doc: DocIn, buf: *std.ArrayList(u8), gpa: std.mem.Allocator) bool;
+/// Reads a document's text into `buf` for indexing or verifying: false when
+/// it has none to index (gone, binary, too big). `extracted` documents are
+/// read from the text cache by the caller-provided resolver. Running out of
+/// memory is an error, never "no text": the index would keep the document
+/// empty until it changed.
+pub const TextFn = *const fn (ctx: *anyopaque, doc: DocIn, buf: *std.ArrayList(u8), gpa: std.mem.Allocator) std.mem.Allocator.Error!bool;
 
 /// Plain text of a file: up to `max_text` bytes, rejected if binary (a NUL in
 /// the first 8 KB, git's rule).
-pub fn readPlain(gpa: std.mem.Allocator, path: []const u8, buf: *std.ArrayList(u8)) bool {
+pub fn readPlain(gpa: std.mem.Allocator, path: []const u8, buf: *std.ArrayList(u8)) std.mem.Allocator.Error!bool {
     buf.clearRetainingCapacity();
     var zbuf: [4096]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&zbuf, "{s}", .{path}) catch return false;
+    const z = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{path}, 0) catch return false;
     // Not a plain open: the path may have become a FIFO since it was indexed.
     const fd = sys.openRegular(z) catch return false;
     defer sys.close(fd);
-    buf.ensureTotalCapacity(gpa, 16 * 1024) catch return false;
+    try buf.ensureTotalCapacity(gpa, 16 * 1024);
     while (buf.items.len <= max_text) {
-        buf.ensureUnusedCapacity(gpa, 64 * 1024) catch return false;
+        try buf.ensureUnusedCapacity(gpa, 64 * 1024);
         const spare = buf.unusedCapacitySlice();
         const n = linux.read(fd, spare.ptr, spare.len);
         if (linux.errno(n) != .SUCCESS or n == 0) break;
@@ -410,7 +411,7 @@ pub fn readPlain(gpa: std.mem.Allocator, path: []const u8, buf: *std.ArrayList(u
     }
     if (buf.items.len > max_text) return false;
     const head = buf.items[0..@min(buf.items.len, 8000)];
-    return std.mem.indexOfScalar(u8, head, 0) == null;
+    return std.mem.findScalar(u8, head, 0) == null;
 }
 
 const ExtractCtx = struct {
@@ -423,17 +424,24 @@ const ExtractCtx = struct {
     out: []std.ArrayList(u64),
     tasks: usize,
     batch_hi: usize,
+    /// Set by a task that ran out of memory: the build fails (and is retried
+    /// later) instead of indexing its documents as empty.
+    oom: std.atomic.Value(bool) = .init(false),
 };
 
 fn extractTask(ctx: *ExtractCtx, t: usize) void {
+    extractTaskOrFail(ctx, t) catch ctx.oom.store(true, .release);
+}
+
+fn extractTaskOrFail(ctx: *ExtractCtx, t: usize) std.mem.Allocator.Error!void {
     const gpa = ctx.gpa;
     const n = ctx.batch_hi - ctx.lo;
-    const per = std.math.divCeil(usize, n, ctx.tasks) catch return;
+    const per = std.math.divCeil(usize, n, ctx.tasks) catch unreachable; // tasks > 0
     const from = ctx.lo + t * per;
     const to = @min(from + per, ctx.batch_hi);
     if (from >= to) return;
     // One bit per possible trigram: dedup in O(n) without sorting.
-    const seen = gpa.alloc(u64, (1 << 24) / 64) catch return;
+    const seen = try gpa.alloc(u64, (1 << 24) / 64);
     defer gpa.free(seen);
     @memset(seen, 0);
     var keys: std.ArrayList(u32) = .empty;
@@ -441,7 +449,7 @@ fn extractTask(ctx: *ExtractCtx, t: usize) void {
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(gpa);
     for (from..to) |d| {
-        if (!ctx.text(ctx.text_ctx, ctx.docs[d], &text, gpa)) continue;
+        if (!try ctx.text(ctx.text_ctx, ctx.docs[d], &text, gpa)) continue;
         keys.clearRetainingCapacity();
         var it: Trigrams = .{ .s = text.items };
         while (it.next()) |k| {
@@ -449,10 +457,10 @@ fn extractTask(ctx: *ExtractCtx, t: usize) void {
             const bit = @as(u64, 1) << @intCast(k & 63);
             if (seen[word] & bit != 0) continue;
             seen[word] |= bit;
-            keys.append(gpa, k) catch return;
+            try keys.append(gpa, k);
         }
         for (keys.items) |k| seen[k >> 6] &= ~(@as(u64, 1) << @intCast(k & 63));
-        ctx.out[t].ensureUnusedCapacity(gpa, keys.items.len) catch return;
+        try ctx.out[t].ensureUnusedCapacity(gpa, keys.items.len);
         for (keys.items) |k| ctx.out[t].appendAssumeCapacity(@as(u64, k) << 32 | d);
     }
 }
@@ -474,7 +482,7 @@ pub fn build(gpa: std.mem.Allocator, pool: *Pool, docs: []const DocIn, text: Tex
     for (docs) |d| paths_len += d.path.len;
     const docs_off = out.items.len;
     const n = docs.len;
-    try out.appendNTimes(gpa, 0, align8(n * (8 + 8 + 4 + 2 + 1) + paths_len) + 0);
+    try out.appendNTimes(gpa, 0, align8(n * doc_bytes + paths_len));
     {
         var o = docs_off;
         for (docs) |d| {
@@ -525,6 +533,7 @@ pub fn build(gpa: std.mem.Allocator, pool: *Pool, docs: []const DocIn, text: Tex
         const hi = @min(lo + batch_docs, n);
         var ctx: ExtractCtx = .{ .gpa = gpa, .docs = docs, .lo = lo, .text = text, .text_ctx = text_ctx, .out = task_out, .tasks = tasks, .batch_hi = hi };
         pool.run(tasks, &ctx, extractTask);
+        if (ctx.oom.load(.acquire)) return error.OutOfMemory;
         // Task ranges are contiguous and in order: concatenating keeps pairs
         // in doc order, which the stable radix sort turns into (key, doc).
         for (task_out) |*t| {
@@ -606,7 +615,7 @@ fn radixByKey(a: []u64, tmp: []u64) void {
     var src = a;
     var dst = tmp;
     inline for (.{ 32, 44 }) |shift| {
-        var count = [_]usize{0} ** 4097;
+        var count: [4097]usize = @splat(0);
         for (src) |v| count[@as(usize, @intCast((v >> shift) & 0xfff)) + 1] += 1;
         for (1..4097) |j| count[j] += count[j - 1];
         for (src) |v| {
@@ -802,11 +811,11 @@ const testing = std.testing;
 
 const TestDocs = struct {
     texts: []const []const u8,
-    fn text(ctx: *anyopaque, d: DocIn, buf: *std.ArrayList(u8), gpa: std.mem.Allocator) bool {
+    fn text(ctx: *anyopaque, d: DocIn, buf: *std.ArrayList(u8), gpa: std.mem.Allocator) std.mem.Allocator.Error!bool {
         const self: *TestDocs = @ptrCast(@alignCast(ctx));
         const i = std.fmt.parseInt(usize, d.path, 10) catch return false;
         buf.clearRetainingCapacity();
-        buf.appendSlice(gpa, self.texts[i]) catch return false;
+        try buf.appendSlice(gpa, self.texts[i]);
         return true;
     }
 };
@@ -925,6 +934,7 @@ pub fn plainPath(_: *anyopaque, doc: DocIn, buf: []u8) ?[:0]const u8 {
 }
 
 const VerifyCtx = struct {
+    gpa: std.mem.Allocator,
     ix: *const Index,
     words: []const []const u8,
     phrase: []const u8,
@@ -941,7 +951,7 @@ fn verifyTask(ctx: *VerifyCtx, t: usize) void {
     const a = ctx.arenas[t].allocator();
     var pbuf: [4096]u8 = undefined;
     var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(std.heap.c_allocator);
+    defer buf.deinit(ctx.gpa);
     const from = t * ctx.chunk;
     const to = @min(from + ctx.chunk, ctx.cands.len);
     var i = from;
@@ -958,7 +968,8 @@ fn verifyTask(ctx: *VerifyCtx, t: usize) void {
             _ = linux.munmap(m.ptr, m.len);
         };
         const text: []const u8 = if (d.source == .plain) blk: {
-            if (!readPlain(std.heap.c_allocator, p, &buf)) continue;
+            // Out of memory: this candidate is left out of the results.
+            if (!(readPlain(ctx.gpa, p, &buf) catch false)) continue;
             break :blk buf.items;
         } else blk: {
             mapped = sys.mapPrivate(p) catch continue;
@@ -985,12 +996,13 @@ fn rank(d: DocIn, count: u32, words: []const []const u8, now: i64) i32 {
 /// The part of the score known without opening the file.
 fn staticScore(d: DocIn, words: []const []const u8, now: i64) i32 {
     var s: i32 = 0;
-    const slash = std.mem.lastIndexOfScalar(u8, d.path, '/') orelse 0;
+    const slash = std.mem.findScalarLast(u8, d.path, '/') orelse 0;
     const name = d.path[slash + 1 ..];
     for (words) |w| if (findFold(name, w, 0) != null) {
         s += 150;
     };
-    const age_days = @divTrunc(now - d.mtime, 86_400);
+    // Saturating: mtimes come from the index file, which may be damaged.
+    const age_days = @divTrunc(now -| d.mtime, 86_400);
     s += if (age_days < 1) 300 else if (age_days < 7) 220 else if (age_days < 30) 140 else if (age_days < 180) 60 else if (age_days < 365) 20 else 0;
     s -= @intCast(std.mem.count(u8, d.path, "/") * 5);
     return s;
@@ -1002,6 +1014,7 @@ pub const max_candidates = 4000;
 /// reading each file, ranked. Snippets live in `arena`; at most `limit`.
 pub fn search(ix: *const Index, gpa: std.mem.Allocator, arena: std.mem.Allocator, pool: *Pool, query: []const u8, limit: usize, text_path: PathFn, text_ctx: *anyopaque, out: *std.ArrayList(Match)) !void {
     out.clearRetainingCapacity();
+    if (limit == 0) return;
     const words = try splitWords(arena, query);
     const phrase = try fold.foldAlloc(arena, std.mem.trim(u8, query, " \t"));
     var longest: usize = 0;
@@ -1058,7 +1071,7 @@ pub fn search(ix: *const Index, gpa: std.mem.Allocator, arena: std.mem.Allocator
         const hi = @min(lo + batch, n_cands);
         const slice = docs[lo..hi];
         @memset(results[0..slice.len], null);
-        var ctx: VerifyCtx = .{ .ix = ix, .words = words, .phrase = phrase, .cands = slice, .text_path = text_path, .text_ctx = text_ctx, .results = results[0..slice.len], .arenas = arenas, .chunk = std.math.divCeil(usize, slice.len, tasks) catch slice.len, .now = now };
+        var ctx: VerifyCtx = .{ .gpa = gpa, .ix = ix, .words = words, .phrase = phrase, .cands = slice, .text_path = text_path, .text_ctx = text_ctx, .results = results[0..slice.len], .arenas = arenas, .chunk = std.math.divCeil(usize, slice.len, tasks) catch slice.len, .now = now };
         pool.run(@min(tasks, slice.len), &ctx, verifyTask);
         for (results[0..slice.len]) |r| if (r) |m| {
             var copy = m;
@@ -1153,7 +1166,7 @@ test "folded search: accents and case, both ways, positions in the original" {
 }
 
 const FileDocs = struct {
-    fn text(_: *anyopaque, d: DocIn, buf: *std.ArrayList(u8), gpa: std.mem.Allocator) bool {
+    fn text(_: *anyopaque, d: DocIn, buf: *std.ArrayList(u8), gpa: std.mem.Allocator) std.mem.Allocator.Error!bool {
         return readPlain(gpa, d.path, buf);
     }
 };

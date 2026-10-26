@@ -16,8 +16,12 @@ const sys = @import("sys.zig");
 
 const Watcher = @This();
 
+const log = std.log.scoped(.watcher);
+
 fd: i32,
 wd_to_id: std.AutoHashMapUnmanaged(i32, u32) = .empty,
+/// Directories left unwatched because the inotify limit was reached.
+unwatched: u32 = 0,
 buf: [64 * 1024]u8 align(@alignOf(linux.inotify_event)) = undefined,
 
 const mask: u32 = linux.IN.CREATE | linux.IN.DELETE | linux.IN.MOVED_FROM | linux.IN.MOVED_TO |
@@ -58,11 +62,19 @@ pub fn count(w: *const Watcher) usize {
 /// Watches `path`, attributing its events to index entry `id`. The kernel
 /// keys watches by inode: watching the same directory again returns the same
 /// descriptor and only the id it maps to changes.
-pub fn watch(w: *Watcher, gpa: std.mem.Allocator, path: [*:0]const u8, id: u32) !void {
+/// Watches `path` as entry `id`. Failing is not fatal for the caller (the
+/// directory just goes unwatched until the next rescan), but hitting the
+/// kernel's limit is counted in `unwatched` and logged once.
+pub fn watch(w: *Watcher, gpa: std.mem.Allocator, path: [*:0]const u8, id: u32) error{ WatchLimit, Watch, OutOfMemory }!void {
     const rc = linux.inotify_add_watch(w.fd, path, mask);
     switch (linux.errno(rc)) {
         .SUCCESS => {},
-        .NOSPC => return error.WatchLimit,
+        .NOSPC => {
+            if (w.unwatched == 0) log.warn("inotify watch limit reached: raise fs.inotify.max_user_watches to watch every folder", .{});
+            w.unwatched += 1;
+            return error.WatchLimit;
+        },
+        // Gone since it was listed, or not ours to read: nothing to watch.
         else => return error.Watch,
     }
     try w.wd_to_id.put(gpa, @intCast(rc), id);

@@ -85,14 +85,18 @@ stats: Stats = .{},
 limits: Limits = .{},
 
 /// Takes a store (mapped or fresh) with no watches armed yet: searchable
-/// right away, watches armed in batches by `armProgress`.
+/// right away, watches armed in batches by `armProgress`. Owns `base` once
+/// it returns; on error `base` is still the caller's.
 pub fn initUnarmed(gpa: std.mem.Allocator, base: Store, cfg: *const scan.Config, cache_path: ?[:0]const u8, scan_pool: *Pool) !Live {
     var b: Builder = .{};
+    var delta = try b.finish(gpa);
+    errdefer delta.deinit(gpa);
+    const watcher = try Watcher.create(gpa);
     return .{
         .gpa = gpa,
         .base = base,
-        .delta = try b.finish(gpa),
-        .watcher = try Watcher.create(gpa),
+        .delta = delta,
+        .watcher = watcher,
         .cfg = cfg,
         .cache_path = cache_path,
         .scan_pool = scan_pool,
@@ -169,7 +173,7 @@ pub fn apply(l: *Live, changes: []const Watcher.Change) !usize {
             l.stats.removed += if (isDelta(id)) l.tombstoneDeltaTree(deltaIdx(id)) else l.tombstoneBaseTree(id);
             n += 1;
         },
-        .overflow => unreachable,
+        .overflow => unreachable, // returned above: an overflow resyncs instead
     };
     if (n > 0) {
         l.dirty = true;
@@ -237,7 +241,7 @@ fn pathExists(l: *const Live, id: u32) bool {
     const p = l.pathOf(id, buf[0 .. buf.len - 1]) orelse return false;
     if (p.len == 0) return false;
     buf[p.len] = 0;
-    return sys.exists(@ptrCast(&buf));
+    return sys.exists(buf[0..p.len :0]);
 }
 
 /// Hidden as the scan sets it: by name, and inherited from the parent.
@@ -274,14 +278,21 @@ fn descends(l: *const Live, parent: []const u8, name: []const u8) bool {
 fn tombstoneBaseTree(l: *Live, root: u32) usize {
     var stack: std.ArrayList(u32) = .empty;
     defer stack.deinit(l.gpa);
-    stack.append(l.gpa, root) catch return 0;
+    // Out of memory: part of the subtree would stay searchable under dead
+    // paths, so the index is rebuilt instead.
+    stack.append(l.gpa, root) catch {
+        l.pending_resync = true;
+        return 0;
+    };
     var n: usize = 0;
     while (stack.pop()) |id| {
         if (l.base.isTombstoned(id)) continue;
         if (l.base.isDir(id)) {
             const r = l.base.children(id);
             var c = r.lo;
-            while (c < r.hi) : (c += 1) stack.append(l.gpa, c) catch {};
+            while (c < r.hi) : (c += 1) stack.append(l.gpa, c) catch {
+                l.pending_resync = true;
+            };
         }
         l.base.tombstone(id);
         n += 1;
@@ -295,13 +306,18 @@ fn tombstoneBaseTree(l: *Live, root: u32) usize {
 fn tombstoneDeltaTree(l: *Live, root: u32) usize {
     var stack: std.ArrayList(u32) = .empty;
     defer stack.deinit(l.gpa);
-    stack.append(l.gpa, root) catch return 0;
+    stack.append(l.gpa, root) catch {
+        l.pending_resync = true;
+        return 0;
+    };
     var n: usize = 0;
     const b = &l.delta_b;
     while (stack.pop()) |id| {
         if (b.masks.items[id] == 0) continue;
         if (b.flags.items[id] & store_mod.flag_dir != 0) {
-            for (b.parent.items, 0..) |p, c| if (p == id) stack.append(l.gpa, @intCast(c)) catch {};
+            for (b.parent.items, 0..) |p, c| if (p == id) stack.append(l.gpa, @intCast(c)) catch {
+                l.pending_resync = true;
+            };
         }
         b.tombstone(id);
         if (id < l.delta.len()) l.delta.tombstone(id);
@@ -381,7 +397,9 @@ fn appendStore(l: *Live, sub: *const Store, parent: u32, basename: []const u8, b
 fn deltaRoot(l: *Live, dir_path: []const u8, depth: u16) !u32 {
     if (l.delta_roots.get(dir_path)) |id| return id;
     const id = try l.delta_b.pushStructural(l.gpa, dir_path, store_mod.no_parent, store_mod.flag_dir, depth);
-    try l.delta_roots.put(l.gpa, try l.gpa.dupe(u8, dir_path), id);
+    const key = try l.gpa.dupe(u8, dir_path);
+    errdefer l.gpa.free(key);
+    try l.delta_roots.put(l.gpa, key, id);
     return id;
 }
 
@@ -402,26 +420,30 @@ fn depthOf(l: *const Live, id: u32) u16 {
 }
 
 /// The delta is small by construction (compaction keeps it so): rebuilding
-/// it whole is cheaper and simpler than keeping it mutable.
+/// it whole is cheaper and simpler than keeping it mutable. On error the
+/// builder may be partly consumed: the caller asks for a rescan.
 fn rebuildDelta(l: *Live) !void {
-    const fresh = try l.delta_b.finish(l.gpa);
+    // Refill a builder from the new store so more can be added; scaffolding
+    // stays mask 0. Both are complete before anything is replaced.
+    var fresh = try l.delta_b.finish(l.gpa);
+    errdefer fresh.deinit(l.gpa);
+    var nb: Builder = .{};
+    errdefer nb.deinit(l.gpa);
+    const ps = fresh.parents();
+    const fl = fresh.flags();
+    const ds = fresh.depths();
+    for (0..fresh.len()) |i| {
+        const id: u32 = @intCast(i);
+        if (fresh.isTombstoned(id))
+            _ = try nb.pushStructural(l.gpa, fresh.name(id), ps[i], fl[i], ds[i])
+        else
+            _ = try nb.push(l.gpa, fresh.name(id), ps[i], fl[i], ds[i]);
+    }
     l.delta.deinit(l.gpa);
     l.delta = fresh;
+    l.delta_b = nb;
     // Ids changed: the delta engine's cached candidates mean nothing now.
     l.engine_delta.reset();
-    // Refill the builder so more can be added; scaffolding stays mask 0.
-    var nb: Builder = .{};
-    const ps = l.delta.parents();
-    const fl = l.delta.flags();
-    const ds = l.delta.depths();
-    for (0..l.delta.len()) |i| {
-        const id: u32 = @intCast(i);
-        if (l.delta.isTombstoned(id))
-            _ = try nb.pushStructural(l.gpa, l.delta.name(id), ps[i], fl[i], ds[i])
-        else
-            _ = try nb.push(l.gpa, l.delta.name(id), ps[i], fl[i], ds[i]);
-    }
-    l.delta_b = nb;
 }
 
 /// Searches base and delta and merges by score. Paths are allocated in
@@ -461,8 +483,12 @@ pub const Replaced = struct { base: Store, watcher: *Watcher };
 /// Swaps in a freshly built index and returns the old one. Returning it
 /// matters: dropping a watcher with 72k watches takes the kernel
 /// milliseconds; done here it would be done with the lock held (worst
-/// search went from 1.7 to 19.8 ms in the Rust version).
-pub fn adopt(l: *Live, base: Store, watcher: *Watcher) !Replaced {
+/// search went from 1.7 to 19.8 ms in the Rust version). On error nothing
+/// changed and `base` and `watcher` are still the caller's.
+pub fn adopt(l: *Live, base: Store, watcher: *Watcher) std.mem.Allocator.Error!Replaced {
+    // The only fallible step, first: the new index starts with an empty delta.
+    var empty: Builder = .{};
+    const delta = try empty.finish(l.gpa);
     const old: Replaced = .{ .base = l.base, .watcher = l.watcher };
     l.base = base;
     l.watcher = watcher;
@@ -470,10 +496,12 @@ pub fn adopt(l: *Live, base: Store, watcher: *Watcher) !Replaced {
     l.arm_cursor = std.math.maxInt(u32);
     l.delta_b.deinit(l.gpa);
     l.freeRoots();
+    l.delta.deinit(l.gpa);
+    l.delta = delta;
     l.pending_resync = false;
     l.dirty = false;
     l.last_compact_ns = sys.monotonicNs();
-    try l.rebuildDelta();
+    l.engine_delta.reset();
     l.engine_base.reset();
     return old;
 }
@@ -513,7 +541,7 @@ fn pathZ(s: *const Store, id: u32, buf: *[4096]u8) ?[*:0]const u8 {
     const p = s.path(id, buf[0 .. buf.len - 1]);
     if (p.len == 0) return null;
     buf[p.len] = 0;
-    return @ptrCast(buf);
+    return buf[0..p.len :0];
 }
 
 // ---------------------------------------------------------------- tests

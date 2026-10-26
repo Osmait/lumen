@@ -5,12 +5,14 @@ const std = @import("std");
 const c = @import("c");
 const item_mod = @import("item.zig");
 const Item = item_mod.Item;
-const Db = @import("sys/db.zig").Db;
+const Db = @import("sys/Db.zig");
 const proc = @import("sys/proc.zig");
 const hypr = @import("sys/hypr.zig");
 const core = @import("core");
 const settings_mod = @import("settings.zig");
 const Settings = settings_mod.Settings;
+
+const log = std.log.scoped(.actions);
 
 pub const Outcome = union(enum) {
     hide,
@@ -21,6 +23,8 @@ pub const Outcome = union(enum) {
     setting: struct { setting: item_mod.Setting, op: item_mod.Op },
     /// Show the apps that can open this file.
     choose_app: [:0]const u8,
+    /// It did not work: the UI says so on the row and stays.
+    failed: [:0]const u8,
 };
 
 pub const Ctx = struct {
@@ -49,11 +53,18 @@ pub fn perform(ctx: Ctx, it: *const Item, op: item_mod.Op) Outcome {
         .trash => if (it.action == .file) {
             const f = c.g_file_new_for_path(it.action.file.path);
             defer c.g_object_unref(f);
-            _ = c.g_file_trash(f, null, null);
+            var err: ?*c.GError = null;
+            if (c.g_file_trash(f, null, &err) == 0) {
+                if (err) |e| {
+                    log.warn("trash {s}: {s}", .{ it.action.file.path, e.message });
+                    c.g_error_free(e);
+                }
+                return .{ .failed = "Could not move it to the trash" };
+            }
             return .refresh_view;
         },
         .reset_ranking => {
-            ctx.db.forget(it.key);
+            ctx.db.forget(it.key) catch return .{ .failed = "Could not reset the ranking" };
             return .stay;
         },
         .focus => focusWindow(ctx, it),
@@ -66,19 +77,20 @@ pub fn perform(ctx: Ctx, it: *const Item, op: item_mod.Op) Outcome {
             return .refresh_view;
         },
         .clip_paste => {
-            ctx.db.touchClip(it.action.clip, now());
+            // Recency only: the paste goes ahead even if this fails.
+            ctx.db.touchClip(it.action.clip, now()) catch {};
             pasteText(it.detail);
         },
         .clip_copy => {
-            ctx.db.touchClip(it.action.clip, now());
+            ctx.db.touchClip(it.action.clip, now()) catch {};
             copy(it.detail);
         },
         .clip_delete => {
-            ctx.db.deleteClip(it.action.clip);
+            ctx.db.deleteClip(it.action.clip) catch return .{ .failed = "Could not delete the entry" };
             return .refresh_view;
         },
         .clip_clear => {
-            ctx.db.clearClips();
+            ctx.db.clearClips() catch return .{ .failed = "Could not clear the history" };
             return .refresh_view;
         },
         .calc_copy => copy(it.detail),
@@ -96,7 +108,7 @@ fn primary(ctx: Ctx, it: *const Item) Outcome {
         .window_op => |w| windowOp(ctx, w),
         .focus_window => focusWindow(ctx, it),
         .clip => {
-            ctx.db.touchClip(it.action.clip, now());
+            ctx.db.touchClip(it.action.clip, now()) catch {};
             pasteText(it.detail);
         },
         .script => |s| runScript(s.path, s.mode, it.title),
@@ -127,7 +139,7 @@ pub fn openFile(ctx: Ctx, path: [:0]const u8, is_dir: bool) void {
     }
     const uri = c.g_filename_to_uri(path, null, null) orelse return;
     defer c.g_free(uri);
-    const lctx = c.gdk_display_get_app_launch_context(c.gdk_display_get_default());
+    const lctx = c.gdk_display_get_app_launch_context(c.gdk_display_get_default() orelse return);
     defer c.g_object_unref(lctx);
     _ = c.g_app_info_launch_default_for_uri(uri, @ptrCast(lctx), null);
 }
@@ -141,7 +153,7 @@ pub fn openWith(path: [:0]const u8, app_id: [:0]const u8) bool {
     defer c.g_free(uri);
     const uris = c.g_list_append(null, uri);
     defer c.g_list_free(uris);
-    const lctx = c.gdk_display_get_app_launch_context(c.gdk_display_get_default());
+    const lctx = c.gdk_display_get_app_launch_context(c.gdk_display_get_default() orelse return false);
     defer c.g_object_unref(lctx);
     var err: ?*c.GError = null;
     if (c.g_app_info_launch_uris(@ptrCast(dai), uris, @ptrCast(lctx), &err) == 0) {
@@ -244,7 +256,7 @@ fn copyFile(ctx: Ctx, path: [:0]const u8) void {
 }
 
 fn launch(info: *c.GAppInfo) void {
-    const ctx = c.gdk_display_get_app_launch_context(c.gdk_display_get_default());
+    const ctx = c.gdk_display_get_app_launch_context(c.gdk_display_get_default() orelse return);
     defer c.g_object_unref(ctx);
     var err: ?*c.GError = null;
     if (c.g_app_info_launch(info, null, @ptrCast(ctx), &err) == 0) {
@@ -334,9 +346,11 @@ fn pasteText(text: []const u8) void {
 /// window decides the chord (terminals paste with Ctrl+Shift+V; Ctrl+V there
 /// is a literal ^V or a terminal's own binding).
 fn sendPaste(_: ?*anyopaque) callconv(.c) c.gboolean {
-    var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-    defer arena_state.deinit();
-    const class = if (hypr.activeWindow(arena_state.allocator())) |w| w.class else "";
+    // hyprctl's answer for one window is a few KB; larger and it is parsed
+    // as unknown, which pastes with Ctrl+V.
+    var buf: [64 * 1024]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    const class = if (hypr.activeWindow(fba.allocator())) |w| w.class else "";
     switch (pasteChord(class)) {
         .ctrl_v => proc.spawn(&.{ "wtype", "-M", "ctrl", "-k", "v", "-m", "ctrl" }),
         .ctrl_shift_v => proc.spawn(&.{ "wtype", "-M", "ctrl", "-M", "shift", "-k", "v", "-m", "shift", "-m", "ctrl" }),

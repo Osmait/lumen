@@ -3,7 +3,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 
-pub const Error = error{ Syscall, NotFound, Access, NotRegular };
+pub const Error = error{ Syscall, NotFound, Access, NotRegular, NameTooLong };
 
 fn check(rc: usize) Error!usize {
     return switch (linux.errno(rc)) {
@@ -164,6 +164,26 @@ pub fn rename(from: [*:0]const u8, to: [*:0]const u8) Error!void {
     _ = try check(linux.rename(from, to));
 }
 
+/// Writes `path` whole through `<path>.tmp`, fsync and rename: a crash or a
+/// full disk never leaves a truncated `path` behind, and a failed write
+/// leaves no `.tmp`. Owner-only.
+pub fn writeFileAtomic(path: []const u8, data: []const u8) Error!void {
+    var pbuf: [4096]u8 = undefined;
+    var tbuf: [4096]u8 = undefined;
+    const final = std.fmt.bufPrintSentinel(&pbuf, "{s}", .{path}, 0) catch return error.NameTooLong;
+    const tmp = std.fmt.bufPrintSentinel(&tbuf, "{s}.tmp", .{path}, 0) catch return error.NameTooLong;
+    {
+        const fd: i32 = @intCast(try check(linux.open(tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600)));
+        defer close(fd);
+        errdefer _ = linux.unlink(tmp);
+        var off: usize = 0;
+        while (off < data.len) off += try check(linux.write(fd, data[off..].ptr, data.len - off));
+        _ = try check(linux.fsync(fd));
+    }
+    errdefer _ = linux.unlink(tmp);
+    try rename(tmp, final);
+}
+
 /// Creates missing directories, owner-only (existing ones are untouched).
 pub fn mkdirP(path: []const u8) void {
     var buf: [4096]u8 = undefined;
@@ -223,6 +243,24 @@ test "special files are refused without blocking" {
     try std.testing.expect(!isRegular(fifo));
     try std.testing.expectEqualStrings("", readHead("/dev/null", &buf));
     try std.testing.expect(isRegular("/proc/self/status"));
+}
+
+test "atomic writes replace the file and leave no temporary behind" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dbuf: [4096]u8 = undefined;
+    const dir = try tmpDirPath(&tmp, &dbuf);
+    var pbuf: [4096]u8 = undefined;
+    const p = try std.fmt.bufPrint(&pbuf, "{s}/f.conf", .{dir});
+    try writeFileAtomic(p, "old");
+    try writeFileAtomic(p, "new");
+    var rbuf: [16]u8 = undefined;
+    var zbuf: [4096]u8 = undefined;
+    try std.testing.expectEqualStrings("new", readHead(try std.fmt.bufPrintSentinel(&zbuf, "{s}", .{p}, 0), &rbuf));
+    try std.testing.expect(!exists(try std.fmt.bufPrintSentinel(&zbuf, "{s}.tmp", .{p}, 0)));
+    // A directory that is not there: an error, and nothing left over.
+    const bad = try std.fmt.bufPrint(&pbuf, "{s}/missing/f.conf", .{dir});
+    try std.testing.expectError(error.NotFound, writeFileAtomic(bad, "x"));
 }
 
 test "Lumen's files and directories are owner-only" {

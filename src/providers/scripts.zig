@@ -22,9 +22,10 @@ pub fn load(a: std.mem.Allocator) []Item {
         if (name.len == 0 or name[0] == '.') continue;
         const full = std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ path, name }, 0) catch continue;
 
-        var contents: [*c]u8 = null;
+        var contents_c: ?[*:0]u8 = null;
         var len: usize = 0;
-        if (c.g_file_get_contents(full.ptr, &contents, &len, null) == 0) continue;
+        if (c.g_file_get_contents(full.ptr, &contents_c, &len, null) == 0) continue;
+        const contents = contents_c orelse continue;
         defer c.g_free(contents);
         const head = contents[0..@min(len, 4096)];
         const meta = script_meta.parse(head) orelse continue;

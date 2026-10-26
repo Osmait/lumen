@@ -54,6 +54,13 @@ const svgs = .{
     .{ "zsh", @embedFile("icons/devicon/zsh.svg") },
 };
 
+fn find(name: []const u8) ?usize {
+    inline for (svgs, 0..) |entry, i| {
+        if (std.mem.eql(u8, entry[0], name)) return i;
+    }
+    return null;
+}
+
 pub fn svg(name: []const u8) ?[]const u8 {
     inline for (svgs) |entry| {
         if (std.mem.eql(u8, entry[0], name)) return entry[1];
@@ -61,17 +68,19 @@ pub fn svg(name: []const u8) ?[]const u8 {
     return null;
 }
 
-var cache: std.StringHashMapUnmanaged(*c.GdkTexture) = .empty;
+/// Textures made so far, by position in `svgs`: kept for the process. Main
+/// thread only (GTK).
+var cache: [svgs.len]?*c.GdkTexture = @splat(null);
 
 /// The logo as a texture, made on first use and kept for the process.
-pub fn texture(gpa: std.mem.Allocator, name: []const u8) ?*c.GdkTexture {
-    if (cache.get(name)) |t| return t;
+pub fn texture(name: []const u8) ?*c.GdkTexture {
+    const i = find(name) orelse return null;
+    if (cache[i]) |t| return t;
     const data = svg(name) orelse return null;
     const bytes = c.g_bytes_new_static(data.ptr, data.len);
     defer c.g_bytes_unref(bytes);
-    const t = c.gdk_texture_new_from_bytes(bytes, null) orelse return null;
-    cache.put(gpa, name, t) catch {};
-    return t;
+    cache[i] = c.gdk_texture_new_from_bytes(bytes, null) orelse return null;
+    return cache[i];
 }
 
 test "every logo the mapping names is embedded" {

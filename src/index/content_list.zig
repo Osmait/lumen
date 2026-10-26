@@ -6,6 +6,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const content = @import("content.zig");
+const extract = @import("extract.zig");
 
 /// Package caches and build output: other people's code, or generated.
 /// Globs with a slash need `**/` to match below the search root.
@@ -69,9 +70,10 @@ pub fn list(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, root: 
 }
 
 pub fn documentKind(path: []const u8) bool {
-    const exts = [_][]const u8{ ".pdf", ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp" };
-    for (exts) |e| if (std.ascii.endsWithIgnoreCase(path, e)) return true;
-    return false;
+    // The extractor's own test: a document it refuses (an Office lock file,
+    // `~$x.docx`) was listed as extracted, never extracted, and checked
+    // again on every refresh.
+    return extract.kindOf(path) != null;
 }
 
 /// Obviously binary by extension: skips opening them at all.

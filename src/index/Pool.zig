@@ -19,6 +19,10 @@ threads: []std.Thread,
 generation: std.atomic.Value(u32) = .init(0),
 next: std.atomic.Value(u32) = .init(0),
 done: std.atomic.Value(u32) = .init(0),
+/// Workers that have finished the current generation. A run returns only
+/// once every worker has, so none is still inside `work` (reading `total`,
+/// `ctx`, `func`) when the next run rewrites them.
+acked: std.atomic.Value(u32) = .init(0),
 total: u32 = 0,
 ctx: *anyopaque = undefined,
 func: *const fn (*anyopaque, usize) void = undefined,
@@ -26,14 +30,19 @@ stopping: std.atomic.Value(bool) = .init(false),
 /// One run at a time.
 run_lock: Io.Mutex = .init,
 
+pub const CreateError = std.mem.Allocator.Error || std.Thread.SpawnError;
+
 /// `workers` extra threads; 0 runs everything on the caller.
-pub fn create(gpa: std.mem.Allocator, io: Io, workers: usize) !*Pool {
+/// Thread-safe once created: `run` serializes concurrent callers.
+pub fn create(gpa: std.mem.Allocator, io: Io, workers: usize) CreateError!*Pool {
     const pool = try gpa.create(Pool);
-    pool.* = .{ .io = io, .gpa = gpa, .threads = try gpa.alloc(std.Thread, workers) };
-    for (pool.threads, 0..) |*t, i| {
+    errdefer gpa.destroy(pool);
+    const threads = try gpa.alloc(std.Thread, workers);
+    errdefer gpa.free(threads);
+    pool.* = .{ .io = io, .gpa = gpa, .threads = threads };
+    for (threads, 0..) |*t, i| {
         t.* = std.Thread.spawn(.{}, workerMain, .{pool}) catch |err| {
-            pool.threads = pool.threads[0..i];
-            pool.destroy();
+            pool.stop(threads[0..i]);
             return err;
         };
     }
@@ -62,16 +71,25 @@ pub fn allCores() usize {
     return @max(n, 1) - 1;
 }
 
+/// Stops and joins the workers, then frees the pool. No `run` may be in
+/// progress.
 pub fn destroy(pool: *Pool) void {
+    pool.stop(pool.threads);
+    const gpa = pool.gpa;
+    gpa.free(pool.threads);
+    pool.* = undefined;
+    gpa.destroy(pool);
+}
+
+fn stop(pool: *Pool, started: []std.Thread) void {
     pool.stopping.store(true, .release);
     _ = pool.generation.fetchAdd(1, .release);
     pool.io.futexWake(u32, &pool.generation.raw, std.math.maxInt(u32));
-    for (pool.threads) |t| t.join();
-    const all = pool.threads.ptr[0..pool.threads.len];
-    pool.gpa.free(all);
-    pool.gpa.destroy(pool);
+    for (started) |t| t.join();
 }
 
+/// Calls `f(ctx, i)` for every `i < n` and returns when all calls are done.
+/// Callers on other threads wait their turn.
 pub fn run(pool: *Pool, n: usize, ctx: anytype, comptime f: fn (@TypeOf(ctx), usize) void) void {
     if (n == 0) return;
     const Ctx = @TypeOf(ctx);
@@ -92,6 +110,7 @@ pub fn run(pool: *Pool, n: usize, ctx: anytype, comptime f: fn (@TypeOf(ctx), us
     pool.total = @intCast(n);
     pool.done.store(0, .seq_cst);
     pool.next.store(0, .seq_cst);
+    pool.acked.store(0, .seq_cst);
     _ = pool.generation.fetchAdd(1, .seq_cst);
     pool.io.futexWake(u32, &pool.generation.raw, std.math.maxInt(u32));
 
@@ -100,6 +119,14 @@ pub fn run(pool: *Pool, n: usize, ctx: anytype, comptime f: fn (@TypeOf(ctx), us
         const d = pool.done.load(.seq_cst);
         if (d == pool.total) break;
         pool.io.futexWaitUncancelable(u32, &pool.done.raw, d);
+    }
+    // Every worker wakes for every generation (none can skip one: the next
+    // run waits here first), so this count always reaches the total.
+    const workers: u32 = @intCast(pool.threads.len);
+    while (true) {
+        const a = pool.acked.load(.seq_cst);
+        if (a == workers) break;
+        pool.io.futexWaitUncancelable(u32, &pool.acked.raw, a);
     }
 }
 
@@ -123,6 +150,9 @@ fn workerMain(pool: *Pool) void {
         seen = pool.generation.load(.acquire);
         if (pool.stopping.load(.acquire)) return;
         pool.work();
+        if (pool.acked.fetchAdd(1, .seq_cst) + 1 == pool.threads.len) {
+            pool.io.futexWake(u32, &pool.acked.raw, 1);
+        }
     }
 }
 
@@ -139,4 +169,32 @@ test "every index runs exactly once" {
         }.f);
     }
     for (hits) |h| try std.testing.expectEqual(@as(u32, 20), h.load(.monotonic));
+}
+
+test "runs from two threads back to back never overlap" {
+    // The pools are shared (UI and content search, two services): a worker
+    // still finishing one run must not pick up indices of the next. Jobs of
+    // different sizes: with equal ones a late worker's stale claim always
+    // fails the bound check, and the race stays hidden.
+    const pool = try Pool.create(std.testing.allocator, std.testing.io, 3);
+    defer pool.destroy();
+    const rounds = 3000;
+    const Job = struct {
+        hits: []std.atomic.Value(u32),
+        fn f(j: *@This(), i: usize) void {
+            _ = j.hits[i].fetchAdd(1, .monotonic);
+        }
+        fn loop(p: *Pool, j: *@This()) void {
+            for (0..rounds) |_| p.run(j.hits.len, j, f);
+        }
+    };
+    var small: [3]std.atomic.Value(u32) = @splat(.init(0));
+    var big: [256]std.atomic.Value(u32) = @splat(.init(0));
+    var a: Job = .{ .hits = &small };
+    var b: Job = .{ .hits = &big };
+    const t = try std.Thread.spawn(.{}, Job.loop, .{ pool, &a });
+    Job.loop(pool, &b);
+    t.join();
+    for (small) |x| try std.testing.expectEqual(@as(u32, rounds), x.load(.monotonic));
+    for (big) |x| try std.testing.expectEqual(@as(u32, rounds), x.load(.monotonic));
 }
