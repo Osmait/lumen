@@ -318,7 +318,7 @@ grep -q 'pdf-viewer-e2e .*quarterly-report.pdf' "$T/opened" 2>/dev/null && ok "f
 
 query files "zebrafish.md"
 L --key ctrl+o; sleep 0.2
-expect "open with lists apps for one file" 'footer: Open zebrafish.md With'
+expect "open with lists apps for one file" 'title: Open zebrafish.md With'
 query choose "text opener"
 L --key enter
 for _ in $(seq 30); do [[ $(opened zebrafish.md) -gt 0 ]] && break; sleep 0.1; done
@@ -341,7 +341,7 @@ L --key enter; sleep 0.2
 
 query settings "reset all"
 L --key enter; sleep 0.1
-expect "reset asks for a second enter" 'footer: Press ↵ again'
+expect "reset asks for a second enter" 'primary: Press ↵ again'
 L --key enter; sleep 0.2
 grep -q '^theme = lumen-dark' "$C" && ! grep -q '^pdf' "$C" && ok "reset restores the defaults" || ko "reset restores the defaults" "$(cat "$C")"
 L --key escape; L --key backspace; sleep 0.1

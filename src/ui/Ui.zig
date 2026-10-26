@@ -1,5 +1,6 @@
-//! The launcher window: a gtk4-layer-shell overlay with a search bar, a list
-//! of results, an optional detail pane, a footer and the action panel.
+//! The launcher window: a gtk4-layer-shell overlay with two floating pieces,
+//! the search bar and the results (with an optional detail pane), plus the
+//! action panel.
 //!
 //! One instance lives for the whole daemon; showing and hiding the window is
 //! what the global hotkey does.
@@ -30,6 +31,9 @@ const Ui = @This();
 
 const panel_w = 750;
 const panel_h = 474;
+/// The list's height limit: what is left under the search bar (56), the gap
+/// (10) and the results' padding and border (18).
+const list_max_h = panel_h - 56 - 10 - 18;
 const max_results = 60;
 
 gpa: std.mem.Allocator,
@@ -63,10 +67,12 @@ search_ns: u64 = 0,
 frame_clock_hooked: bool = false,
 /// Icons made for the current rows; released on the next refresh.
 icons: std.ArrayList(*c.GIcon) = .empty,
-footer_icon: *c.GtkWidget = undefined,
-footer_title: *c.GtkWidget = undefined,
-primary_label: *c.GtkWidget = undefined,
-primary_keys: *c.GtkWidget = undefined,
+/// The view's name, a chip in the search bar (hidden in the root view).
+scope: *c.GtkWidget = undefined,
+/// The island holding the results (and the detail pane).
+results: *c.GtkWidget = undefined,
+/// What Enter does on the selected row, shown inside it.
+primary: [:0]const u8 = "",
 panel: *c.GtkWidget = undefined,
 panel_list: *c.GtkWidget = undefined,
 
@@ -126,7 +132,9 @@ const Choosing = union(enum) {
     file: struct { path: [:0]u8, mime: [:0]u8 },
 };
 
-const Row = struct { widget: *c.GtkWidget, item: ?usize, section: [:0]const u8 = "" };
+/// `hint` shows the primary action while the row is selected, in place of
+/// `accessory`.
+const Row = struct { widget: *c.GtkWidget, item: ?usize, section: [:0]const u8 = "", hint: ?*c.GtkWidget = null, accessory: ?*c.GtkWidget = null };
 
 /// End-to-end tests run a second, isolated Lumen (LUMEN_TEST=1): it must not
 /// take the keyboard from the session, nor ask Hyprland where to go.
@@ -179,10 +187,12 @@ pub fn build(self: *Ui) void {
     const overlay = c.gtk_overlay_new();
     c.gtk_window_set_child(w, overlay);
 
-    const panel = vbox(0);
-    c.gtk_widget_add_css_class(panel, "panel");
-    c.gtk_widget_set_size_request(panel, panel_w, panel_h);
-    c.gtk_overlay_set_child(@ptrCast(overlay), panel);
+    // Two pieces on a transparent surface: the search bar and, below it, the
+    // results, as tall as their rows (the rest of the surface stays clear).
+    const column = vbox(10);
+    c.gtk_widget_add_css_class(column, "shell");
+    c.gtk_widget_set_size_request(column, panel_w, panel_h);
+    c.gtk_overlay_set_child(@ptrCast(overlay), column);
 
     // search bar
     const search = hbox(0);
@@ -196,20 +206,31 @@ pub fn build(self: *Ui) void {
     connect(back_click, "released", &onBackClicked, self);
     c.gtk_widget_add_controller(self.back, back_click);
     c.gtk_box_append(@ptrCast(search), self.back);
+    self.scope = label("", "scope");
+    c.gtk_widget_set_valign(self.scope, c.GTK_ALIGN_CENTER);
+    c.gtk_widget_set_visible(self.scope, 0);
+    c.gtk_box_append(@ptrCast(search), self.scope);
     self.entry = c.gtk_text_new();
     c.gtk_widget_add_css_class(self.entry, "query");
     c.gtk_widget_set_hexpand(self.entry, 1);
     c.gtk_widget_set_valign(self.entry, c.GTK_ALIGN_CENTER);
     c.gtk_box_append(@ptrCast(search), self.entry);
     connect(self.entry, "changed", &onChanged, self);
-    c.gtk_box_append(@ptrCast(panel), search);
-    c.gtk_box_append(@ptrCast(panel), c.gtk_separator_new(c.GTK_ORIENTATION_HORIZONTAL));
+    const k = label("⌃ K", "kbd");
+    c.gtk_widget_set_valign(k, c.GTK_ALIGN_CENTER);
+    c.gtk_widget_set_tooltip_text(k, "Actions");
+    c.gtk_box_append(@ptrCast(search), k);
+    c.gtk_box_append(@ptrCast(column), search);
 
-    // body: results + detail
+    // results + detail
     const body = hbox(0);
-    c.gtk_widget_set_vexpand(body, 1);
+    c.gtk_widget_add_css_class(body, "results-island");
+    self.results = body;
     self.scroller = c.gtk_scrolled_window_new();
     c.gtk_scrolled_window_set_policy(@ptrCast(self.scroller), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
+    // As tall as the rows, up to the space left under the search bar.
+    c.gtk_scrolled_window_set_propagate_natural_height(@ptrCast(self.scroller), 1);
+    c.gtk_scrolled_window_set_max_content_height(@ptrCast(self.scroller), list_max_h);
     c.gtk_widget_set_hexpand(self.scroller, 1);
     self.list = c.gtk_list_box_new();
     c.gtk_widget_add_css_class(self.list, "results");
@@ -220,40 +241,13 @@ pub fn build(self: *Ui) void {
     c.gtk_box_append(@ptrCast(body), self.scroller);
     self.buildDetail();
     c.gtk_box_append(@ptrCast(body), self.detail);
-    c.gtk_box_append(@ptrCast(panel), body);
+    c.gtk_box_append(@ptrCast(column), body);
 
-    // footer
-    const footer = hbox(8);
-    c.gtk_widget_add_css_class(footer, "footer");
-    self.footer_icon = c.gtk_image_new_from_icon_name("system-search-symbolic");
-    c.gtk_image_set_pixel_size(@ptrCast(self.footer_icon), 12);
-    c.gtk_widget_add_css_class(self.footer_icon, "tile");
-    c.gtk_widget_add_css_class(self.footer_icon, "tile-red");
-    c.gtk_widget_set_valign(self.footer_icon, c.GTK_ALIGN_CENTER);
-    c.gtk_box_append(@ptrCast(footer), self.footer_icon);
-    self.footer_title = label("Lumen", null);
-    c.gtk_widget_set_hexpand(self.footer_title, 1);
-    c.gtk_box_append(@ptrCast(footer), self.footer_title);
-    self.primary_label = label("Open", "primary");
-    c.gtk_box_append(@ptrCast(footer), self.primary_label);
-    self.primary_keys = label("↵", "kbd");
-    c.gtk_widget_set_valign(self.primary_keys, c.GTK_ALIGN_CENTER);
-    c.gtk_box_append(@ptrCast(footer), self.primary_keys);
-    const vsep = c.gtk_separator_new(c.GTK_ORIENTATION_VERTICAL);
-    c.gtk_widget_set_margin_top(vsep, 12);
-    c.gtk_widget_set_margin_bottom(vsep, 12);
-    c.gtk_box_append(@ptrCast(footer), vsep);
-    c.gtk_box_append(@ptrCast(footer), label("Actions", null));
-    const k = label("⌃ K", "kbd");
-    c.gtk_widget_set_valign(k, c.GTK_ALIGN_CENTER);
-    c.gtk_box_append(@ptrCast(footer), k);
-    c.gtk_box_append(@ptrCast(panel), footer);
-
-    // action panel, floating over the bottom right corner
+    // action panel, floating over the top right corner of the results
     self.panel = vbox(0);
     c.gtk_widget_add_css_class(self.panel, "actions");
     c.gtk_widget_set_halign(self.panel, c.GTK_ALIGN_END);
-    c.gtk_widget_set_valign(self.panel, c.GTK_ALIGN_END);
+    c.gtk_widget_set_valign(self.panel, c.GTK_ALIGN_START);
     c.gtk_box_append(@ptrCast(self.panel), label("Actions", "actions-title"));
     self.panel_list = c.gtk_list_box_new();
     c.gtk_widget_set_focusable(self.panel_list, 0);
@@ -932,6 +926,8 @@ fn setView(self: *Ui, view: View) void {
     const has_detail = view == .clipboard or view == .files or view == .contents;
     c.gtk_widget_set_visible(self.back, @intFromBool(view != .root));
     c.gtk_widget_set_visible(self.detail, @intFromBool(has_detail));
+    // A preview needs room: the results take the full height then.
+    c.gtk_widget_set_vexpand(self.results, @intFromBool(has_detail));
     // With the detail pane, the list takes ~40%.
     c.gtk_widget_set_size_request(self.scroller, if (has_detail) 300 else -1, -1);
     c.gtk_widget_set_hexpand(self.scroller, @intFromBool(!has_detail));
@@ -959,21 +955,8 @@ fn setView(self: *Ui, view: View) void {
         .default_apps => "Search file kinds...",
         .choose => if (self.choosing == .setting) "Filter values..." else "Search apps...",
     });
-    const tile: struct { [:0]const u8, [:0]const u8, [:0]const u8 } = switch (view) {
-        .root => .{ "system-search-symbolic", "tile-red", "Lumen" },
-        .clipboard => .{ "edit-paste-symbolic", "tile-red", "Clipboard History" },
-        .windows => .{ "focus-windows-symbolic", "tile-blue", "Search Windows" },
-        .files => .{ "folder-saved-search-symbolic", "tile-orange", "Search Files" },
-        .contents => .{ "edit-find-symbolic", "tile-purple", "Search File Contents" },
-        .settings, .choose => .{ "emblem-system-symbolic", "tile-gray", "Settings" },
-        .themes => .{ "applications-graphics-symbolic", "tile-purple", "Change Theme" },
-        .default_apps => .{ "applications-system-symbolic", "tile-blue", "Default Apps" },
-    };
-    c.gtk_image_set_from_icon_name(@ptrCast(self.footer_icon), tile[0]);
-    inline for (.{ "tile-red", "tile-blue", "tile-orange", "tile-purple", "tile-gray" }) |cls| c.gtk_widget_remove_css_class(self.footer_icon, cls);
-    c.gtk_widget_add_css_class(self.footer_icon, tile[1]);
-    c.gtk_label_set_text(@ptrCast(self.footer_title), tile[2]);
-    c.gtk_widget_remove_css_class(self.footer_title, "warn");
+    c.gtk_label_set_text(@ptrCast(self.scope), self.viewTitle());
+    c.gtk_widget_set_visible(self.scope, @intFromBool(view != .root));
 
     // Setting the text triggers `changed`, which refreshes.
     if (c.gtk_editable_get_text(@ptrCast(self.entry))[0] == 0) self.refresh() else c.gtk_editable_set_text(@ptrCast(self.entry), "");
@@ -1083,6 +1066,8 @@ fn refresh(self: *Ui) void {
         c.gtk_list_box_row_set_child(@ptrCast(row), label(empty, "empty"));
         c.gtk_list_box_append(@ptrCast(self.list), row);
     }
+    // Nothing typed and nothing to suggest: only the search bar shows.
+    c.gtk_widget_set_visible(self.results, @intFromBool(!(self.view == .root and q.len == 0 and self.items.items.len == 0)));
 
     const adj = c.gtk_scrolled_window_get_vadjustment(@ptrCast(self.scroller));
     c.gtk_adjustment_set_value(adj, 0);
@@ -1124,7 +1109,6 @@ fn fillSectioned(self: *Ui, a: std.mem.Allocator, q: []const u8) void {
         hits.append(a, copy) catch break;
     }
     sortByScore(hits.items);
-    if (hits.items.len > 0) self.addSection("Results");
     for (hits.items) |it| self.addItem(it);
 }
 
@@ -1180,7 +1164,6 @@ fn fillRoot(self: *Ui, a: std.mem.Allocator, q: []const u8) void {
     const files = if (q.len >= 3 and self.settings.files_in_root) self.fileItems(a, q, 5) else &.{};
     const shown = @min(hits.items.len, max_results);
     const head = if (files.len > 0) @min(shown, 6) else shown;
-    if (head > 0) self.addSection("Results");
     for (hits.items[0..head]) |it| self.addItem(it);
     if (files.len > 0) {
         self.addSection("Files");
@@ -1205,7 +1188,6 @@ fn fillFiltered(self: *Ui, a: std.mem.Allocator, q: []const u8, by_day: bool) vo
                 self.addItem(it);
             }
         } else {
-            self.addSection("Windows");
             for (self.base) |it| self.addItem(it);
         }
         return;
@@ -1223,7 +1205,6 @@ fn fillFiltered(self: *Ui, a: std.mem.Allocator, q: []const u8, by_day: bool) vo
         hits.append(a, copy) catch break;
     }
     sortByScore(hits.items);
-    self.addSection("Results");
     for (hits.items[0..@min(hits.items.len, 200)]) |it| self.addItem(it);
 }
 
@@ -1252,32 +1233,42 @@ fn addItem(self: *Ui, it: Item) void {
     const a = self.query_arena.allocator();
     const item_index = self.items.items.len;
     self.items.append(a, it) catch return;
-    const row = if (it.action == .calc) calcRow(it) else itemRow(it);
+    var parts: RowParts = .{};
+    const row = if (it.action == .calc) calcRow(it) else itemRow(it, &parts);
     c.g_object_set_data(@ptrCast(row), "lumen-row", @ptrFromInt(self.rows.items.len + 1));
     c.gtk_list_box_append(@ptrCast(self.list), row);
-    self.rows.append(a, .{ .widget = row, .item = item_index }) catch {};
+    self.rows.append(a, .{ .widget = row, .item = item_index, .hint = parts.hint, .accessory = parts.accessory }) catch {};
 }
 
-fn itemRow(it: Item) *c.GtkWidget {
+/// Icon, title over subtitle, accessory, and the hidden hint that shows
+/// the primary action while the row is selected.
+const RowParts = struct { hint: ?*c.GtkWidget = null, accessory: ?*c.GtkWidget = null };
+
+fn itemRow(it: Item, parts: *RowParts) *c.GtkWidget {
     const row = c.gtk_list_box_row_new();
-    const box = hbox(10);
-    c.gtk_box_append(@ptrCast(box), iconWidget(it.icon, 22));
+    const box = hbox(12);
+    c.gtk_box_append(@ptrCast(box), iconWidget(it.icon, 28));
+    const text = vbox(1);
+    c.gtk_widget_set_valign(text, c.GTK_ALIGN_CENTER);
+    c.gtk_widget_set_hexpand(text, 1);
     const title = label(it.title, "title");
     c.gtk_label_set_ellipsize(@ptrCast(title), c.PANGO_ELLIPSIZE_END);
-    c.gtk_label_set_max_width_chars(@ptrCast(title), 48);
-    // Without a subtitle the title may use the whole row (clipboard list).
-    if (it.subtitle.len == 0 and it.accessory.len == 0) c.gtk_widget_set_hexpand(title, 1);
-    c.gtk_box_append(@ptrCast(box), title);
+    c.gtk_label_set_max_width_chars(@ptrCast(title), 60);
+    c.gtk_box_append(@ptrCast(text), title);
     if (it.subtitle.len > 0) {
         const sub = label(it.subtitle, "subtitle");
         c.gtk_label_set_ellipsize(@ptrCast(sub), c.PANGO_ELLIPSIZE_END);
-        c.gtk_label_set_max_width_chars(@ptrCast(sub), 40);
-        c.gtk_box_append(@ptrCast(box), sub);
+        c.gtk_label_set_max_width_chars(@ptrCast(sub), 60);
+        c.gtk_box_append(@ptrCast(text), sub);
     }
-    const spacer = hbox(0);
-    c.gtk_widget_set_hexpand(spacer, 1);
-    c.gtk_box_append(@ptrCast(box), spacer);
-    if (it.accessory.len > 0) c.gtk_box_append(@ptrCast(box), label(it.accessory, "accessory"));
+    c.gtk_box_append(@ptrCast(box), text);
+    if (it.accessory.len > 0) {
+        parts.accessory = label(it.accessory, "accessory");
+        c.gtk_box_append(@ptrCast(box), parts.accessory.?);
+    }
+    parts.hint = label("", "hint");
+    c.gtk_widget_set_visible(parts.hint.?, 0);
+    c.gtk_box_append(@ptrCast(box), parts.hint.?);
     c.gtk_list_box_row_set_child(@ptrCast(row), box);
     return row;
 }
@@ -1382,14 +1373,16 @@ fn nextSelectable(self: *Ui, from: ?usize, dir: i32) ?usize {
 }
 
 fn select(self: *Ui, row_index: ?usize) void {
+    if (self.selected) |old| if (old < self.rows.items.len) {
+        const r = self.rows.items[old];
+        if (r.hint) |h| c.gtk_widget_set_visible(h, 0);
+        if (r.accessory) |acc| c.gtk_widget_set_visible(acc, 1);
+    };
     self.selected = row_index;
     self.confirm_key = "";
-    c.gtk_widget_remove_css_class(self.footer_title, "warn");
-    c.gtk_label_set_text(@ptrCast(self.footer_title), self.viewTitle());
+    self.primary = "";
     const ri = row_index orelse {
         c.gtk_list_box_unselect_all(@ptrCast(self.list));
-        c.gtk_widget_set_visible(self.primary_label, 0);
-        c.gtk_widget_set_visible(self.primary_keys, 0);
         self.showDetail(null);
         return;
     };
@@ -1397,14 +1390,25 @@ fn select(self: *Ui, row_index: ?usize) void {
     c.gtk_list_box_select_row(@ptrCast(self.list), @ptrCast(row.widget));
     self.scrollTo(row.widget);
     const it = &self.items.items[row.item.?];
-    const actions = item_mod.actionsFor(it);
-    c.gtk_label_set_text(@ptrCast(self.primary_label), actions[0].label);
-    c.gtk_widget_set_visible(self.primary_label, 1);
-    c.gtk_widget_set_visible(self.primary_keys, 1);
+    self.primary = item_mod.actionsFor(it)[0].label;
+    self.setHint(self.primary, false);
     self.showDetail(it);
     // Change Theme shows each theme as the selection moves over it.
     if (self.view == .themes and it.action == .setting and it.action.setting == .theme)
         self.applyAppearance(themes.find(it.action.setting.theme, self.preferDark()));
+}
+
+/// The selected row's hint: "Open ↵", or a warning waiting for Enter.
+fn setHint(self: *Ui, text: []const u8, warn: bool) void {
+    const ri = self.selected orelse return;
+    const row = self.rows.items[ri];
+    const h = row.hint orelse return;
+    if (row.accessory) |acc| c.gtk_widget_set_visible(acc, 0);
+    const shown = if (warn) text else std.fmt.allocPrint(self.query_arena.allocator(), "{s}  ↵", .{text}) catch return;
+    const z = self.query_arena.allocator().dupeZ(u8, shown) catch return;
+    c.gtk_label_set_text(@ptrCast(h), z.ptr);
+    if (warn) c.gtk_widget_add_css_class(h, "warn") else c.gtk_widget_remove_css_class(h, "warn");
+    c.gtk_widget_set_visible(h, 1);
 }
 
 fn scrollTo(self: *Ui, row: *c.GtkWidget) void {
@@ -1824,8 +1828,8 @@ fn perform(self: *Ui, op: item_mod.Op) void {
     // Destructive commands need a second Enter.
     if (it.confirm and (op == .run or op == .open) and !std.mem.eql(u8, self.confirm_key, it.key)) {
         self.confirm_key = it.key;
-        c.gtk_label_set_text(@ptrCast(self.footer_title), (std.fmt.allocPrintSentinel(self.query_arena.allocator(), "Press ↵ again to {s}", .{it.title}, 0) catch return).ptr);
-        c.gtk_widget_add_css_class(self.footer_title, "warn");
+        self.primary = std.fmt.allocPrintSentinel(self.query_arena.allocator(), "Press ↵ again to {s}", .{it.title}, 0) catch return;
+        self.setHint(self.primary, true);
         return;
     }
     self.closePanel();
@@ -1905,7 +1909,7 @@ pub fn dump(self: *Ui, a: std.mem.Allocator) ![:0]u8 {
     var out: std.Io.Writer.Allocating = .init(a);
     const w = &out.writer;
     try w.print("view: {t}\nvisible: {}\nquery: {s}\n", .{ self.view, c.gtk_widget_get_visible(self.window) != 0, self.query() });
-    try w.print("footer: {s}\nprimary: {s}\n", .{ c.gtk_label_get_text(@ptrCast(self.footer_title)), if (self.selected != null) c.gtk_label_get_text(@ptrCast(self.primary_label)) else "" });
+    try w.print("title: {s}\nprimary: {s}\n", .{ self.viewTitle(), self.primary });
     try w.print("rows:\n", .{});
     if (self.rows.items.len == 0) try w.print("  (empty) {s}\n", .{self.emptyText(a)});
     for (self.rows.items, 0..) |row, i| {

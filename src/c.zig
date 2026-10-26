@@ -336,6 +336,8 @@ pub extern fn gtk_list_box_row_get_index(row: *GtkListBoxRow) c_int;
 pub extern fn gtk_scrolled_window_new() *GtkWidget;
 pub extern fn gtk_scrolled_window_set_child(sw: *GtkScrolledWindow, child: *GtkWidget) void;
 pub extern fn gtk_scrolled_window_set_policy(sw: *GtkScrolledWindow, h: c_int, v: c_int) void;
+pub extern fn gtk_scrolled_window_set_propagate_natural_height(sw: *GtkScrolledWindow, propagate: gboolean) void;
+pub extern fn gtk_scrolled_window_set_max_content_height(sw: *GtkScrolledWindow, height: c_int) void;
 pub extern fn gtk_scrolled_window_get_vadjustment(sw: *GtkScrolledWindow) *GtkAdjustment;
 pub extern fn gtk_adjustment_get_value(adj: *GtkAdjustment) f64;
 pub extern fn gtk_adjustment_set_value(adj: *GtkAdjustment, v: f64) void;
@@ -348,6 +350,7 @@ pub extern fn gtk_style_context_add_provider_for_display(display: *GdkDisplay, p
 pub extern fn gtk_event_controller_key_new() *GtkEventController;
 pub extern fn gtk_gesture_click_new() *GtkEventController;
 pub extern fn gtk_widget_set_cursor_from_name(w: *GtkWidget, name: ?[*:0]const u8) void;
+pub extern fn gtk_widget_set_tooltip_text(w: *GtkWidget, text: ?[*:0]const u8) void;
 pub extern fn gtk_event_controller_set_propagation_phase(c: *GtkEventController, phase: c_int) void;
 
 // ------------------------------------------------------- gtk4-layer-shell

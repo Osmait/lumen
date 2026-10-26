@@ -1,37 +1,47 @@
-/* Lumen: translucent. Loaded at USER priority so the
-   desktop's GTK theme does not leak in. Colours and sizes are variables
-   set by the theme (themes.zig), loaded in front of this file. */
+/* Lumen: two floating pieces, the search bar and the results. Loaded at
+   USER priority so the desktop's GTK theme does not leak in. Colours and
+   sizes are variables set by the theme (themes.zig), loaded in front of
+   this file. */
 
 window.lumen {
   background: none;
 }
 
-.panel {
+.shell {
   margin: 18px;
-  background-color: var(--bg);
-  border: 1px solid alpha(var(--ink), 0.09);
-  border-radius: 14px;
-  box-shadow: 0 18px 44px var(--shadow), inset 0 1px alpha(var(--ink), 0.05);
   color: var(--fg);
-  font-family: "Inter", sans-serif;
+  font-family: "Outfit", "Inter", sans-serif;
   font-size: var(--font);
 }
 
 /* search bar */
 .search {
   min-height: 56px;
-  padding: 0 18px;
+  padding: 0 12px 0 20px;
+  background-color: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 28px;
+  box-shadow: 0 0 0 4px var(--accent-ring), 0 16px 40px var(--shadow);
 }
 .search .back {
-  color: alpha(var(--ink), 0.55);
+  color: alpha(var(--ink), 0.6);
   background: alpha(var(--ink), 0.08);
-  border-radius: 6px;
-  padding: 4px;
+  border-radius: 14px;
+  padding: 5px;
   margin-right: 10px;
 }
 .search .back:hover {
   color: var(--fg);
   background: alpha(var(--ink), 0.14);
+}
+.scope {
+  background-color: alpha(var(--accent), 0.16);
+  color: var(--fg);
+  border-radius: 14px;
+  padding: 3px 12px;
+  margin-right: 10px;
+  font-size: var(--font-small);
+  font-weight: 600;
 }
 .query {
   font-size: var(--font-query);
@@ -40,39 +50,46 @@ window.lumen {
   caret-color: var(--accent);
 }
 .query > placeholder {
-  color: alpha(var(--ink), 0.32);
+  color: alpha(var(--ink), 0.38);
 }
 .query > selection {
   background-color: var(--accent-soft);
 }
-
-.panel separator {
-  background-color: alpha(var(--ink), 0.07);
-  min-height: 1px;
-  min-width: 1px;
+.kbd {
+  background-color: alpha(var(--ink), 0.08);
+  border-radius: 6px;
+  padding: 2px 7px;
+  font-size: var(--font-tiny);
+  color: alpha(var(--ink), 0.62);
 }
 
 /* results */
+.results-island {
+  padding: 8px;
+  background-color: var(--bg);
+  border: 1px solid alpha(var(--ink), 0.12);
+  border-radius: 28px;
+  box-shadow: 0 16px 40px var(--shadow);
+}
 .results {
   background: none;
-  padding: 6px 8px;
 }
 .results > row {
-  border-radius: 8px;
-  padding: 0 10px;
-  min-height: 40px;
+  border-radius: 24px;
+  padding: 0 16px 0 10px;
+  min-height: 48px;
   background: none;
   outline: none;
 }
-.results > row:selected {
-  background-color: alpha(var(--ink), 0.09);
-}
 .results > row:hover:not(:selected) {
-  background-color: alpha(var(--ink), 0.035);
+  background-color: alpha(var(--ink), 0.06);
+}
+.results > row:selected {
+  background-color: var(--accent);
 }
 .results > row.section {
-  min-height: 26px;
-  padding-top: 6px;
+  min-height: 28px;
+  padding: 8px 16px 2px 16px;
 }
 .results > row.section:hover {
   background: none;
@@ -80,55 +97,72 @@ window.lumen {
 .section-title {
   font-size: var(--font-tiny);
   font-weight: 600;
-  color: alpha(var(--ink), 0.42);
+  color: alpha(var(--ink), 0.45);
 }
 .title {
   color: var(--fg);
 }
 .subtitle {
-  color: alpha(var(--ink), 0.42);
+  color: alpha(var(--ink), 0.5);
+  font-size: var(--font-small);
 }
 .accessory {
-  color: alpha(var(--ink), 0.38);
+  color: alpha(var(--ink), 0.45);
   font-size: var(--font-small);
 }
-.empty {
-  color: alpha(var(--ink), 0.35);
+.hint {
   font-size: var(--font-small);
-  padding: 40px;
+  font-weight: 600;
+  margin-left: 12px;
+}
+.results > row:selected .title,
+.results > row:selected .hint {
+  color: var(--on-accent);
+}
+.results > row:selected .title {
+  font-weight: 600;
+}
+.results > row:selected .subtitle,
+.results > row:selected .accessory {
+  color: alpha(var(--on-accent), 0.75);
+}
+.empty {
+  color: alpha(var(--ink), 0.45);
+  font-size: var(--font-small);
+  padding: 28px;
 }
 
 /* icons */
 .tile {
-  border-radius: 6px;
-  min-width: 22px;
-  min-height: 22px;
+  border-radius: 50%;
+  min-width: 30px;
+  min-height: 30px;
   color: #ffffff;
 }
-.tile-red { background-image: linear-gradient(#ff7b7b, #e5484d); }
-.tile-orange { background-image: linear-gradient(#ffad5c, #f76b15); }
-.tile-yellow { background-image: linear-gradient(#ffe066, #f5b800); color: #3a2c00; }
-.tile-green { background-image: linear-gradient(#5ee08a, #2f9e55); }
-.tile-blue { background-image: linear-gradient(#6cb2ff, #2f6fe0); }
-.tile-purple { background-image: linear-gradient(#b48cff, #7a4fe0); }
-.tile-pink { background-image: linear-gradient(#ff8ac0, #e0457f); }
-.tile-gray { background-image: linear-gradient(#8a8a92, #5c5c64); }
+.tile-red { background-color: #e5484d; }
+.tile-orange { background-color: #e8642c; }
+.tile-yellow { background-color: #f5b800; color: #3a2c00; }
+.tile-green { background-color: #2f9e6a; }
+.tile-blue { background-color: #3b74d6; }
+.tile-purple { background-color: #7a5af0; }
+.tile-pink { background-color: #e0457f; }
+.tile-gray { background-color: #5c6070; }
 /* Dark logos (Rust, Markdown, Bash...) on a light plate, colours intact. */
 .logo-plate {
   background-color: #ececf0;
-  border-radius: 5px;
+  border-radius: 8px;
   padding: 3px;
 }
 .badge {
-  min-width: 22px;
-  min-height: 22px;
-  border-radius: 6px;
+  min-width: 30px;
+  min-height: 30px;
+  border-radius: 9px;
   font-family: "JetBrains Mono", monospace;
-  font-size: 8.5px;
+  font-size: 9px;
   font-weight: 800;
   color: #ffffff;
 }
-.badge-long { font-size: 7px; }
+.badge-long { font-size: 7.5px; }
 .badge-cyan { background-color: #00a7c7; }
 .badge-blue { background-color: #3178c6; }
 .badge-yellow { background-color: #d9b400; color: #2b2300; }
@@ -141,7 +175,7 @@ window.lumen {
 .badge-gray { background-color: #5e5e66; }
 .emoji {
   font-size: var(--font-emoji);
-  min-width: 22px;
+  min-width: 30px;
 }
 
 /* calculator card */
@@ -156,41 +190,50 @@ window.lumen {
 }
 .calc-label {
   font-size: var(--font-tiny);
-  color: alpha(var(--ink), 0.55);
-  background: alpha(var(--ink), 0.07);
+  color: alpha(var(--ink), 0.6);
+  background: alpha(var(--ink), 0.08);
   border-radius: 10px;
   padding: 2px 10px;
 }
 .calc-arrow {
   font-size: 20px;
-  color: alpha(var(--ink), 0.30);
+  color: alpha(var(--ink), 0.35);
+}
+.results > row:selected .calc-value,
+.results > row:selected .calc-arrow {
+  color: var(--on-accent);
+}
+.results > row:selected .calc-label {
+  color: var(--on-accent);
+  background: alpha(var(--on-accent), 0.14);
 }
 
-/* detail pane (clipboard) */
+/* detail pane (clipboard, files) */
 .detail {
-  border-left: 1px solid alpha(var(--ink), 0.07);
+  border-left: 1px solid alpha(var(--ink), 0.1);
+  margin-left: 8px;
 }
 .detail-text {
   font-family: "JetBrains Mono", monospace;
   font-size: var(--font-mono);
   color: var(--fg);
-  padding: 14px 16px;
+  padding: 10px 14px;
 }
 .preview {
-  margin: 14px 16px 0 16px;
+  margin: 10px 14px 0 14px;
 }
 .meta {
-  padding: 10px 16px 14px 16px;
-  border-top: 1px solid alpha(var(--ink), 0.07);
+  padding: 10px 14px 6px 14px;
+  border-top: 1px solid alpha(var(--ink), 0.1);
 }
 .meta-header {
   font-size: var(--font-tiny);
   font-weight: 600;
-  color: alpha(var(--ink), 0.42);
+  color: alpha(var(--ink), 0.45);
   margin-bottom: 4px;
 }
 .meta-key {
-  color: alpha(var(--ink), 0.45);
+  color: alpha(var(--ink), 0.5);
   font-size: var(--font-small);
 }
 .meta-value {
@@ -198,63 +241,38 @@ window.lumen {
   font-size: var(--font-small);
 }
 
-/* footer */
-.footer {
-  min-height: 40px;
-  padding: 0 10px 0 14px;
-  border-top: 1px solid alpha(var(--ink), 0.07);
-  background-color: alpha(var(--ink), 0.025);
-  border-radius: 0 0 14px 14px;
-  font-size: var(--font-small);
-  color: alpha(var(--ink), 0.55);
-}
-.footer .tile {
-  min-width: 18px;
-  min-height: 18px;
-  border-radius: 5px;
-}
-.footer .primary {
-  color: var(--fg);
-  font-weight: 500;
-}
-.footer .warn {
-  color: var(--accent);
-  font-weight: 500;
-}
-.kbd {
-  background-color: alpha(var(--ink), 0.08);
-  border-radius: 5px;
-  padding: 1px 6px;
-  font-size: var(--font-tiny);
-  color: alpha(var(--ink), 0.70);
-}
-
-/* action panel (Ctrl+K) */
+/* action panel (Ctrl+K), over the top right corner of the results */
 .actions {
-  margin: 0 28px 62px 0;
-  min-width: 320px;
+  margin: 92px 28px 0 0;
+  min-width: 300px;
   background-color: var(--surface);
-  border: 1px solid alpha(var(--ink), 0.11);
-  border-radius: 12px;
+  border: 1px solid alpha(var(--ink), 0.14);
+  border-radius: 22px;
   padding: 6px;
-  box-shadow: 0 14px 34px var(--shadow);
+  box-shadow: 0 16px 40px var(--shadow);
 }
 .actions-title {
   font-size: var(--font-tiny);
   font-weight: 600;
-  color: alpha(var(--ink), 0.42);
-  padding: 4px 8px 6px 8px;
+  color: alpha(var(--ink), 0.45);
+  padding: 6px 12px 6px 12px;
 }
 .actions list {
   background: none;
 }
 .actions row {
-  border-radius: 7px;
-  padding: 0 8px;
-  min-height: 34px;
+  border-radius: 16px;
+  padding: 0 8px 0 12px;
+  min-height: 36px;
   background: none;
   outline: none;
+  color: var(--fg);
 }
 .actions row:selected {
-  background-color: alpha(var(--ink), 0.10);
+  background-color: var(--accent);
+  color: var(--on-accent);
+}
+.actions row:selected .kbd {
+  color: var(--on-accent);
+  background-color: alpha(var(--on-accent), 0.14);
 }

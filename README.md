@@ -22,6 +22,10 @@ commands, behind one keystroke.
 | **Themes** | 13 built in (Lumen Dark/Light, Catppuccin Mocha/Latte, Dracula, Nord, Gruvbox Dark/Light, Tokyo Night, Rosé Pine, One Dark, Solarized Dark/Light) plus Automatic (follows the desktop's light/dark); previewed live as you move through them |
 | **Default Apps** | an app per file kind (folders, PDF, images, video, audio, Markdown, web pages, text & code, Office, archives) or per extension, used when Lumen opens a file; `Ctrl+O` is Open With for one file (`Ctrl+↵` there: and always use it) |
 
+The window is two floating pieces over a clear surface: the search bar and,
+under it, the results, as tall as their rows. The selected row is filled
+with the theme's accent and says what Enter does there.
+
 Keys: `↑↓` / `Ctrl+N/P` move, `↵` primary action, `Ctrl+↵` secondary,
 `Ctrl+K` action panel, `Esc` clears / goes back / hides, `Backspace` on an
 empty search goes back, `Ctrl+X` deletes a clipboard entry, `Ctrl+O` Open

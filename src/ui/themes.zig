@@ -28,8 +28,8 @@ pub const Theme = struct {
 pub const auto_id = "auto";
 
 pub const all = [_]Theme{
-    .{ .id = "lumen-dark", .name = "Lumen Dark", .dark = true, .bg = 0x1b1b1e, .surface = 0x28282c, .fg = 0xececee, .ink = 0xffffff, .accent = 0xff6363 },
-    .{ .id = "lumen-light", .name = "Lumen Light", .dark = false, .bg = 0xf7f7f8, .surface = 0xffffff, .fg = 0x1d1d1f, .ink = 0x000000, .accent = 0xe5484d },
+    .{ .id = "lumen-dark", .name = "Lumen Dark", .dark = true, .bg = 0x121826, .surface = 0x1c2333, .fg = 0xeef1f7, .ink = 0xffffff, .accent = 0x8fe3ff },
+    .{ .id = "lumen-light", .name = "Lumen Light", .dark = false, .bg = 0xf5f7fb, .surface = 0xffffff, .fg = 0x10131a, .ink = 0x000000, .accent = 0x3a5bd9 },
     .{ .id = "catppuccin-mocha", .name = "Catppuccin Mocha", .dark = true, .bg = 0x1e1e2e, .surface = 0x313244, .fg = 0xcdd6f4, .ink = 0xcdd6f4, .accent = 0xcba6f7 },
     .{ .id = "catppuccin-latte", .name = "Catppuccin Latte", .dark = false, .bg = 0xeff1f5, .surface = 0xe6e9ef, .fg = 0x4c4f69, .ink = 0x11111b, .accent = 0x8839ef },
     .{ .id = "dracula", .name = "Dracula", .dark = true, .bg = 0x282a36, .surface = 0x343746, .fg = 0xf8f8f2, .ink = 0xf8f8f2, .accent = 0xbd93f9 },
@@ -73,6 +73,8 @@ pub fn css(w: *std.Io.Writer, t: *const Theme, s: *const settings.Settings) !voi
     try rgba(w, "ink", t.ink, 1);
     try rgba(w, "accent", t.accent, 1);
     try rgba(w, "accent-soft", t.accent, 0.35);
+    try rgba(w, "accent-ring", t.accent, 0.18);
+    try rgba(w, "on-accent", onAccent(t), 1);
     try rgba(w, "shadow", 0, if (t.dark) 0.45 else 0.18);
     const sizes = [_]struct { []const u8, f32 }{ .{ "font", 14 }, .{ "font-query", 18 }, .{ "font-small", 13 }, .{ "font-tiny", 12 }, .{ "font-mono", 12.5 }, .{ "font-calc", 26 }, .{ "font-emoji", 17 } };
     for (sizes) |sz| try w.print("  --{s}: {d:.1}px;\n", .{ sz[0], sz[1] * scale });
@@ -81,6 +83,13 @@ pub fn css(w: *std.Io.Writer, t: *const Theme, s: *const settings.Settings) !voi
 
 fn rgba(w: *std.Io.Writer, name: []const u8, color: u24, a: f32) !void {
     try w.print("  --{s}: rgba({d}, {d}, {d}, {d:.2});\n", .{ name, color >> 16, (color >> 8) & 0xff, color & 0xff, a });
+}
+
+/// Text on an accent fill (the selected row): near-black or white,
+/// whichever reads better.
+pub fn onAccent(t: *const Theme) u24 {
+    const dark: u24 = 0x10131a;
+    return if (contrast(t.accent, dark) >= contrast(t.accent, 0xffffff)) dark else 0xffffff;
 }
 
 /// "#rrggbb" for Pango markup.
@@ -111,6 +120,8 @@ test "every theme is readable" {
     for (all) |t| {
         // Body text: WCAG AA for normal text.
         try std.testing.expect(contrast(t.fg, t.bg) >= 4.5);
+        // The selected row is an accent fill with text on it.
+        try std.testing.expect(contrast(onAccent(&t), t.accent) >= 4.5);
         // The caret and highlights must stand out from the background.
         try std.testing.expect(contrast(t.accent, t.bg) >= 2.5);
         // Secondary text is ink at 42%: it must still be legible.
