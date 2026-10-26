@@ -139,7 +139,7 @@ pub fn status(s: *ContentService) Status {
     defer s.lock.unlockShared(s.io);
     var extracted: usize = 0;
     if (s.index) |ix| {
-        for (ix.sources) |src| extracted += @intFromBool(src == @intFromEnum(content.Source.extracted));
+        for (ix.sources) |src| extracted += @intFromBool(src == @backingInt(content.Source.extracted));
     }
     return .{
         .docs = if (s.index) |ix| ix.n_docs else 0,
@@ -183,7 +183,7 @@ pub fn search(s: *ContentService, arena: std.mem.Allocator, query: []const u8, l
         .snippet = m.snippet,
         .mtime = ix.mtimes[m.doc],
         .size = ix.sizes[m.doc],
-        .extracted = ix.sources[m.doc] == @intFromEnum(content.Source.extracted),
+        .extracted = ix.sources[m.doc] == @backingInt(content.Source.extracted),
     });
 }
 
@@ -377,7 +377,7 @@ fn dropStaleText(s: *ContentService, old: *const content.Index, docs: []const co
     var j: usize = 0;
     var pbuf: [4096]u8 = undefined;
     for (0..old.n_docs) |i| {
-        if (old.sources[i] != @intFromEnum(content.Source.extracted)) continue;
+        if (old.sources[i] != @backingInt(content.Source.extracted)) continue;
         const p = old.path(@intCast(i));
         while (j < docs.len and std.mem.order(u8, docs[j].path, p) == .lt) j += 1;
         if (j < docs.len and std.mem.eql(u8, docs[j].path, p) and docs[j].mtime == old.mtimes[i]) continue;

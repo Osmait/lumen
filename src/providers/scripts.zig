@@ -34,13 +34,13 @@ pub fn load(a: std.mem.Allocator) []Item {
         const emoji = meta.icon.len > 0 and meta.icon.len <= 8 and meta.icon[0] >= 0x80;
         items.append(a, .{
             .key = std.fmt.allocPrint(a, "script:{s}", .{name}) catch continue,
-            .title = a.dupeZ(u8, meta.title) catch continue,
-            .subtitle = a.dupeZ(u8, if (meta.package_name.len > 0) meta.package_name else "Script Command") catch continue,
+            .title = a.dupeSentinel(u8, meta.title, 0) catch continue,
+            .subtitle = a.dupeSentinel(u8, if (meta.package_name.len > 0) meta.package_name else "Script Command", 0) catch continue,
             .accessory = "Script",
             .keywords = a.dupe(u8, meta.description) catch "",
             .confirm = meta.needs_confirmation,
             .icon = if (emoji)
-                .{ .emoji = a.dupeZ(u8, meta.icon) catch "" }
+                .{ .emoji = a.dupeSentinel(u8, meta.icon, 0) catch "" }
             else
                 .{ .tile = .{ .name = "utilities-terminal-symbolic", .color = .gray } },
             .action = .{ .script = .{ .path = full, .mode = meta.mode } },

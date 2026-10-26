@@ -507,7 +507,7 @@ pub fn build(gpa: std.mem.Allocator, pool: *Pool, docs: []const DocIn, text: Tex
             o += 2;
         }
         for (docs) |d| {
-            out.items[o] = @intFromEnum(d.source);
+            out.items[o] = @backingInt(d.source);
             o += 1;
         }
         for (docs) |d| {
@@ -968,7 +968,7 @@ fn verifyTask(ctx: *VerifyCtx, t: usize) void {
     var i = from;
     while (i < to) : (i += 1) {
         const doc = ctx.cands[i];
-        const d: DocIn = .{ .path = ctx.ix.path(doc), .mtime = ctx.ix.mtimes[doc], .size = ctx.ix.sizes[doc], .source = @enumFromInt(ctx.ix.sources[doc]) };
+        const d: DocIn = .{ .path = ctx.ix.path(doc), .mtime = ctx.ix.mtimes[doc], .size = ctx.ix.sizes[doc], .source = @fromBackingInt(@intCast(ctx.ix.sources[doc])) };
         const p = ctx.text_path(ctx.text_ctx, d, &pbuf) orelse continue;
         // Plain files (1 MB at most) are read into a reused buffer: cheaper
         // than map + unmap, whose TLB shootdown hits every core of a
@@ -1294,8 +1294,8 @@ fn exerciseIndex(ix: *const Index, gpa: std.mem.Allocator) !void {
         try ix.candidates(gpa, q, &got);
         for (got.items) |d| {
             try testing.expect(d < ix.n_docs);
-            const src: Source = @enumFromInt(ix.sources[d]);
-            sum +%= ix.path(d).len +% @as(usize, @bitCast(ix.mtimes[d])) +% ix.sizes[d] +% @intFromEnum(src);
+            const src: Source = @fromBackingInt(@intCast(ix.sources[d]));
+            sum +%= ix.path(d).len +% @as(usize, @bitCast(ix.mtimes[d])) +% ix.sizes[d] +% @backingInt(src);
         }
     }
     for (0..ix.n_docs) |d| sum +%= ix.path(@intCast(d)).len;

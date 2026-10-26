@@ -49,7 +49,7 @@ pub fn onContentResult(result: *Ui.ContentSearch.Result, ctx: ?*anyopaque) void 
 pub fn itemsFromHits(ui: *Ui, a: std.mem.Allocator, hits: []const index.ContentService.Hit) []Item {
     var out: std.ArrayList(Item) = .empty;
     for (hits) |h| {
-        const path = a.dupeZ(u8, h.path) catch continue;
+        const path = a.dupeSentinel(u8, h.path, 0) catch continue;
         const slash = std.mem.findScalarLast(u8, h.path, '/') orelse 0;
         out.append(a, .{
             .title = labels.displayText(a, h.path[slash + 1 ..]),
@@ -91,7 +91,7 @@ pub fn fileItems(self: *Ui, a: std.mem.Allocator, q: []const u8, limit: usize) [
     service.search(a, q, limit, &hits) catch return &.{};
     var out: std.ArrayList(Item) = .empty;
     for (hits.items) |h| {
-        const path = a.dupeZ(u8, h.path) catch continue;
+        const path = a.dupeSentinel(u8, h.path, 0) catch continue;
         const slash = std.mem.findScalarLast(u8, h.path, '/') orelse 0;
         const where = labels.homeRelative(a, h.path[0..slash]);
         out.append(a, .{
@@ -115,7 +115,7 @@ pub fn fileIcon(ui: *Ui, path: [:0]const u8, is_dir: bool) item_mod.Icon {
         if (core.file_badge.logoOf(name)) |l| return .{ .logo = l };
         var upper: [4]u8 = undefined;
         if (core.file_badge.of(name, &upper)) |b| {
-            const text = ui.query_arena.allocator().dupeZ(u8, b.text) catch return .none;
+            const text = ui.query_arena.allocator().dupeSentinel(u8, b.text, 0) catch return .none;
             return .{ .badge = .{ .text = text, .color = b.color } };
         }
     }

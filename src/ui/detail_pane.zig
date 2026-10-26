@@ -108,7 +108,7 @@ pub fn showFileDetail(ui: *Ui, it: *const Item) void {
         const valid = labels.validUtf8Prefix(head);
         if (valid.len + 4 >= head.len and std.mem.findScalar(u8, valid, 0) == null) text = labels.firstLines(valid, preview_lines);
     }
-    c.gtk_label_set_text(@ptrCast(ui.detail_text), (a.dupeZ(u8, text) catch return).ptr);
+    c.gtk_label_set_text(@ptrCast(ui.detail_text), (a.dupeSentinel(u8, text, 0) catch return).ptr);
 
     c.gtk_label_set_text(@ptrCast(ui.meta_values[0]), labels.kindLabel(a, f.path, f.is_dir, ct).ptr);
     if (info) |inf| {
@@ -146,7 +146,7 @@ pub fn showDetail(ui: *Ui, it: ?*const Item) void {
     defer arena.deinit();
     const a = arena.allocator();
     const text = i.detail[0..@min(i.detail.len, 20_000)];
-    c.gtk_label_set_text(@ptrCast(ui.detail_text), (a.dupeZ(u8, labels.validUtf8Prefix(text)) catch return).ptr);
+    c.gtk_label_set_text(@ptrCast(ui.detail_text), (a.dupeSentinel(u8, labels.validUtf8Prefix(text), 0) catch return).ptr);
     c.gtk_label_set_text(@ptrCast(ui.meta_values[0]), "Text");
     const chars = std.unicode.utf8CountCodepoints(i.detail) catch i.detail.len;
     var words: usize = 0;

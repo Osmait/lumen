@@ -185,10 +185,10 @@ zig build e2e       # end-to-end: an isolated instance (own app id, fake $HOME,
 
 Fuzz tests (index files, calculator, Office XML, case-insensitive search) run
 on their seed corpus as part of `zig build test`. Exploring with `--fuzz`
-does not work with Zig 0.16.0 as shipped: its test runner does not compile in
-fuzz mode (`writeStackTrace` called with an error trace) and the self-hosted
-x86 backend has no coverage instrumentation; a patched lib dir and
-`use_llvm = true` make it run (3.5M + 4.9M iterations found nothing).
+builds with Zig 0.17.0 but does not run yet: the test runner's input poller
+panics (`start index 1 is larger than end index 0`) in every worker as soon
+as fuzzing starts, in std, not in Lumen's targets. Under 0.16, with a patched
+lib dir and `use_llvm = true`, 3.5M + 4.9M iterations found nothing.
 
 The end-to-end runner (`tools/e2e.sh`) checks every view, the keyboard, the
 action panel, live file changes, the clipboard store and latency, then quits
@@ -198,7 +198,7 @@ presses a key, so the UI is tested without screenshots.
 
 ## Build
 
-Needs Zig 0.16, `gtk4`, `gtk4-layer-shell`, `sqlite`, and at run time
+Needs Zig 0.17, `gtk4`, `gtk4-layer-shell`, `sqlite`, and at run time
 `wl-clipboard`, `wtype`, `hyprctl`, `wpctl`, `playerctl`, `rg`, and for
 documents `pdftotext` (poppler) and `unzip`.
 
@@ -242,9 +242,11 @@ src/index/      file index (std + Linux syscalls only): store, scan, search, liv
                 content index: content, content_list, extract, ContentService
 src/sys/        SQLite store, process spawning (GLib), hyprctl
 src/providers/  apps (GIO), built-in commands, script commands
-src/ui/         the GTK window (Ui.zig) and its stylesheet
+src/ui/         the GTK window: Ui.zig (state and flow), widgets, labels,
+                settings_view, file_results, detail_pane, backdrop, keyboard,
+                themes and the stylesheet
 src/actions.zig what each action does
-src/c.zig       hand-written GTK/GLib bindings (Zig 0.16's translate-c chokes on GLib)
+src/c.zig       hand-written GTK/GLib bindings (Zig 0.16's translate-c choked on GLib)
 ```
 
 ## License

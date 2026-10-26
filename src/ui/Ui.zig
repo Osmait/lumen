@@ -594,7 +594,7 @@ fn windowCandidates(self: *Ui, a: std.mem.Allocator) []Item {
             .subtitle = labels.displayText(a, cl.class),
             .accessory = std.fmt.allocPrintSentinel(a, "Workspace {s}", .{cl.workspace.name}, 0) catch "",
             .icon = icon,
-            .action = .{ .focus_window = a.dupeZ(u8, cl.address) catch continue },
+            .action = .{ .focus_window = a.dupeSentinel(u8, cl.address, 0) catch continue },
         }) catch break;
     }
     return out.items;
@@ -737,9 +737,9 @@ fn fillRoot(self: *Ui, a: std.mem.Allocator, q: []const u8) void {
         var buf: [64]u8 = undefined;
         const plain = a.dupe(u8, core.calc.formatPlain(&buf, r.value)) catch "";
         self.addItem(.{
-            .title = a.dupeZ(u8, q) catch "",
-            .subtitle = a.dupeZ(u8, r.from_unit) catch "",
-            .accessory = a.dupeZ(u8, r.unit) catch "",
+            .title = a.dupeSentinel(u8, q, 0) catch "",
+            .subtitle = a.dupeSentinel(u8, r.from_unit, 0) catch "",
+            .accessory = a.dupeSentinel(u8, r.unit, 0) catch "",
             .action = .calc,
             .detail = plain,
         });
@@ -889,7 +889,7 @@ fn setHint(self: *Ui, text: []const u8, warn: bool) void {
     const h = row.hint orelse return;
     if (row.accessory) |acc| c.gtk_widget_set_visible(acc, 0);
     const shown = if (warn) text else std.fmt.allocPrint(self.query_arena.allocator(), "{s}  ↵", .{text}) catch return;
-    const z = self.query_arena.allocator().dupeZ(u8, shown) catch return;
+    const z = self.query_arena.allocator().dupeSentinel(u8, shown, 0) catch return;
     c.gtk_label_set_text(@ptrCast(h), z.ptr);
     if (warn) c.gtk_widget_add_css_class(h, "warn") else c.gtk_widget_remove_css_class(h, "warn");
     c.gtk_widget_set_visible(h, 1);

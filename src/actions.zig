@@ -172,7 +172,7 @@ fn openAtLine(ctx: Ctx, path: [:0]const u8, line: u32) void {
     var arena_state: std.heap.ArenaAllocator = .init(ctx.gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const editor = a.dupeZ(u8, resolveEditor(ctx.settings)) catch return;
+    const editor = a.dupeSentinel(u8, resolveEditor(ctx.settings), 0) catch return;
     var argv: std.ArrayList([:0]const u8) = .empty;
     const cmd = editorCommand(a, editor, path, line) catch return;
     if (cmd.in_terminal) argv.appendSlice(a, terminalPrefix(a, resolveTerminal(ctx.settings)) catch return) catch return;
@@ -385,7 +385,7 @@ test "editors open at a line, terminal ones inside a terminal" {
         .{ "gnome-text-editor", &.{ "gnome-text-editor", "+12", "/x/a.zig" }, false },
     };
     for (cases) |case| {
-        const ed = try a.dupeZ(u8, case[0]);
+        const ed = try a.dupeSentinel(u8, case[0], 0);
         const cmd = try editorCommand(a, ed, "/x/a.zig", 12);
         try std.testing.expectEqual(case[2], cmd.in_terminal);
         try std.testing.expectEqual(case[1].len, cmd.argv.len);

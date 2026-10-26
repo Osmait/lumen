@@ -179,7 +179,7 @@ fn xmlToText(gpa: std.mem.Allocator, xml: []const u8) ![]u8 {
         gap: Gap = .none,
 
         fn sep(w: *@This(), g: Gap) void {
-            if (@intFromEnum(g) > @intFromEnum(w.gap)) w.gap = g;
+            if (@backingInt(g) > @backingInt(w.gap)) w.gap = g;
         }
         fn text(w: *@This(), s: []const u8) !void {
             if (w.gap != .none and w.out.items.len > 0)

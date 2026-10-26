@@ -1,7 +1,7 @@
 //! Hand-written bindings for the GLib/GIO/GTK4/gtk4-layer-shell calls Lumen
-//! makes. Zig 0.16's translate-c cannot digest GLib's headers (`_Pragma`
-//! inside macros), so only what is used is declared here; enum values were
-//! checked against the installed headers. SQLite still goes through
+//! makes. Zig 0.16's translate-c could not digest GLib's headers (`_Pragma`
+//! inside macros; 0.17's can), so only what is used is declared here; enum
+//! values were checked against the installed headers. SQLite still goes through
 //! translate-c (see src/sqlite.h).
 
 // ---------------------------------------------------------------- types

@@ -83,7 +83,7 @@ pub fn scan(gpa: std.mem.Allocator, pool: *Pool, cfg: *const Config, watcher: ?*
     for (cfg.roots) |root| {
         const id = try b.push(gpa, root, store_mod.no_parent, store_mod.flag_dir, 0);
         st.dirs += 1;
-        try frontier.append(gpa, .{ .id = id, .path = try gpa.dupeZ(u8, root), .hidden = false });
+        try frontier.append(gpa, .{ .id = id, .path = try gpa.dupeSentinel(u8, root, 0), .hidden = false });
     }
 
     var depth: u16 = 1;

@@ -56,7 +56,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, root: []const u8, cache_path: []con
     errdefer gpa.destroy(s);
     const root_copy = try gpa.dupe(u8, root);
     errdefer gpa.free(root_copy);
-    const cache = try gpa.dupeZ(u8, cache_path);
+    const cache = try gpa.dupeSentinel(u8, cache_path, 0);
     errdefer gpa.free(cache);
     const search_pool = try Pool.create(gpa, io, Pool.allCores());
     errdefer search_pool.destroy();

@@ -27,8 +27,8 @@ pub fn build(b: *std.Build) void {
     // Accent and case folding (core.fold) is shared by every search.
     index.addImport("core", core);
 
-    // Zig 0.16's translate-c cannot parse GLib's headers, so GTK & co. are
-    // declared by hand in src/c.zig.
+    // GTK & co. are declared by hand in src/c.zig: Zig 0.16's translate-c
+    // could not parse GLib's headers (0.17's can, so this could move).
     const c_mod = b.createModule(.{
         .root_source_file = b.path("src/c.zig"),
         .target = target,
@@ -60,7 +60,7 @@ pub fn build(b: *std.Build) void {
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     b.step("run", "Run lumen").dependOn(&run.step);
 
     // `lumen-find`: the file index from the command line, and its numbers.

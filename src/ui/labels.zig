@@ -81,7 +81,7 @@ pub fn contextMarkup(a: std.mem.Allocator, text: []const u8, line: u32, words: [
         if (n == line) out.appendSlice(a, "</b>") catch return "";
         out.append(a, '\n') catch return "";
     }
-    return a.dupeZ(u8, out.items) catch "";
+    return a.dupeSentinel(u8, out.items, 0) catch "";
 }
 
 pub fn appendEscaped(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) void {
@@ -107,7 +107,7 @@ pub fn kindLabel(a: std.mem.Allocator, path: []const u8, is_dir: bool, ctype: ?[
         const unknown = desc == null or std.ascii.eqlIgnoreCase(std.mem.span(desc.?), "unknown");
         if (media or unknown) return std.fmt.allocPrintSentinel(a, "{s} file", .{b.text}, 0) catch "File";
     }
-    return if (desc) |d| a.dupeZ(u8, std.mem.span(d)) catch "File" else "File";
+    return if (desc) |d| a.dupeSentinel(u8, std.mem.span(d), 0) catch "File" else "File";
 }
 
 pub fn firstLines(text: []const u8, n: usize) []const u8 {
@@ -151,7 +151,7 @@ pub fn formatWhen(a: std.mem.Allocator, unix: i64) [:0]const u8 {
     const fmt: [*:0]const u8 = if (unix >= today) "Today at %H:%M" else if (unix >= today - 86400) "Yesterday at %H:%M" else "%b %e at %H:%M";
     const s = c.g_date_time_format(dt, fmt) orelse return "";
     defer c.g_free(s);
-    return a.dupeZ(u8, std.mem.span(s)) catch "";
+    return a.dupeSentinel(u8, std.mem.span(s), 0) catch "";
 }
 
 /// First non-blank line, collapsed and capped, for a clipboard row title.
@@ -160,7 +160,7 @@ pub fn firstLine(a: std.mem.Allocator, text: []const u8) [:0]const u8 {
     while (lines.next()) |l| {
         const t = std.mem.trim(u8, l, " \t\r");
         if (t.len == 0) continue;
-        return a.dupeZ(u8, validUtf8Prefix(t[0..@min(t.len, 120)])) catch "";
+        return a.dupeSentinel(u8, validUtf8Prefix(t[0..@min(t.len, 120)]), 0) catch "";
     }
     return "";
 }

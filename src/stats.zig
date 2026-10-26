@@ -49,10 +49,12 @@ pub const Ring = struct {
 
 pub const ViewStats = struct { painted: Ring = .{}, search: Ring = .{}, rows: Ring = .{} };
 
+const view_names = @typeInfo(View).@"enum".field_names;
+
 // The latency figures below are written and read on the GTK main thread
 // only (refresh, frame clock, `--stats`): plain globals are enough.
 
-pub var views: [std.meta.fields(View).len]ViewStats = @splat(.{});
+pub var views: [view_names.len]ViewStats = @splat(.{});
 /// Window shown -> first painted frame.
 pub var show: Ring = .{};
 pub var started_ns: u64 = 0;
@@ -75,7 +77,7 @@ pub fn onPainted() void {
         show.add(dt);
         return;
     }
-    const v = &views[@intFromEnum(p.view)];
+    const v = &views[@backingInt(p.view)];
     v.painted.add(dt);
     v.search.add(p.search);
     v.rows.add(p.rows);
@@ -147,13 +149,13 @@ pub fn report(gpa: std.mem.Allocator, files: ?*index.Service, contents: ?*index.
 
     try w.print("Latency, keystroke -> painted frame (ms)\n", .{});
     try w.print("  {s:<10} {s:>6} {s:>8} {s:>8} {s:>8}   {s:>13} {s:>13}\n", .{ "view", "n", "p50", "p95", "max", "search p50/95", "rows p50/95" });
-    inline for (std.meta.fields(View), 0..) |field, i| {
+    for (view_names, 0..) |name, i| {
         const v = &views[i];
         const s = v.painted.summary();
         if (s.n > 0) {
             const se = v.search.summary();
             const ro = v.rows.summary();
-            try w.print("  {s:<10} {d:>6} {d:>8.2} {d:>8.2} {d:>8.2}   {d:>6.2}/{d:<6.2} {d:>6.2}/{d:<6.2}\n", .{ field.name, s.n, s.p50, s.p95, s.max, se.p50, se.p95, ro.p50, ro.p95 });
+            try w.print("  {s:<10} {d:>6} {d:>8.2} {d:>8.2} {d:>8.2}   {d:>6.2}/{d:<6.2} {d:>6.2}/{d:<6.2}\n", .{ name, s.n, s.p50, s.p95, s.max, se.p50, se.p95, ro.p50, ro.p95 });
         }
     }
     const sh = show.summary();

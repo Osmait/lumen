@@ -104,7 +104,7 @@ pub fn choiceLabel(ui: *Ui, a: std.mem.Allocator, ch: settings_mod.Choice) [:0]c
     const value = ui.settings.choiceValue(ch, &buf);
     for (choiceOptions(ui, a, ch)) |o| if (std.mem.eql(u8, o.value, value)) return o.label;
     // Set by hand to something not offered (not installed, unusual value).
-    return a.dupeZ(u8, value) catch "";
+    return a.dupeSentinel(u8, value, 0) catch "";
 }
 
 pub fn chooseTitle(ch: settings_mod.Choice) []const u8 {
@@ -167,7 +167,7 @@ pub fn appOptions(self: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item), mi
     if (!open_now) {
         const def = c.g_app_info_get_default_for_type(mime, 0);
         defer if (def) |d| c.g_object_unref(d);
-        const name: [:0]const u8 = if (def) |d| (a.dupeZ(u8, std.mem.span(c.g_app_info_get_display_name(d) orelse "")) catch "") else "none set";
+        const name: [:0]const u8 = if (def) |d| (a.dupeSentinel(u8, std.mem.span(c.g_app_info_get_display_name(d) orelse ""), 0) catch "") else "none set";
         out.append(a, .{
             .key = "pick:",
             .title = "System Default",
@@ -192,7 +192,7 @@ pub fn appOptions(self: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item), mi
             const info = app.action.app;
             const id = std.mem.span(c.g_app_info_get_id(info) orelse continue);
             if (declared.contains(id) != want_declared) continue;
-            const idz = a.dupeZ(u8, id) catch continue;
+            const idz = a.dupeSentinel(u8, id, 0) catch continue;
             out.append(a, .{
                 .key = std.fmt.allocPrint(a, "pick:{s}", .{id}) catch "",
                 .section = if (want_declared) "Recommended" else "Other Apps",
@@ -212,7 +212,7 @@ pub fn appName(ui: *Ui, a: std.mem.Allocator, id: []const u8) [:0]const u8 {
         const aid = std.mem.span(c.g_app_info_get_id(app.action.app) orelse continue);
         if (std.mem.eql(u8, aid, id)) return app.title;
     }
-    return a.dupeZ(u8, id) catch "";
+    return a.dupeSentinel(u8, id, 0) catch "";
 }
 
 pub fn defaultAppsSummary(ui: *Ui, a: std.mem.Allocator) [:0]const u8 {
@@ -246,7 +246,7 @@ pub fn defaultAppsCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
         if (e.key_ptr.*[0] != '.') continue;
         out.append(a, .{
             .section = "Extensions (edit in the settings file)",
-            .title = a.dupeZ(u8, e.key_ptr.*) catch continue,
+            .title = a.dupeSentinel(u8, e.key_ptr.*, 0) catch continue,
             .accessory = appName(ui, a, e.value_ptr.*),
             .icon = .{ .tile = .{ .name = "text-x-generic-symbolic", .color = .blue } },
             .action = .{ .setting = .open_file },
@@ -362,8 +362,8 @@ pub fn performSetting(ui: *Ui, s: item_mod.Setting, op: item_mod.Op) void {
 pub fn chooseAppFor(ui: *Ui, path: [:0]const u8) void {
     const guessed = c.g_content_type_guess(path, null, 0, null);
     defer if (guessed) |g| c.g_free(g);
-    const mime = ui.gpa.dupeZ(u8, if (guessed) |g| std.mem.span(g) else "application/octet-stream") catch return;
-    const owned = ui.gpa.dupeZ(u8, path) catch {
+    const mime = ui.gpa.dupeSentinel(u8, if (guessed) |g| std.mem.span(g) else "application/octet-stream", 0) catch return;
+    const owned = ui.gpa.dupeSentinel(u8, path, 0) catch {
         ui.gpa.free(mime);
         return;
     };
