@@ -133,7 +133,7 @@ pub const Op = enum {
 
 pub const Entry = struct {
     label: [:0]const u8,
-    /// Shown as key caps, e.g. "↵", "⌃ ↵", "⌃ X".
+    /// Shown as key caps, e.g. "↵", "Ctrl ↵", "Ctrl X".
     keys: [:0]const u8,
     op: Op,
 };
@@ -144,8 +144,8 @@ pub fn actionsFor(item: *const Item) []const Entry {
     return switch (item.action) {
         .app => &.{
             .{ .label = "Open Application", .keys = "↵", .op = .open },
-            .{ .label = "Copy Name", .keys = "⌃ ↵", .op = .copy_name },
-            .{ .label = "Copy Desktop File Path", .keys = "⌃ ⇧ C", .op = .copy_path },
+            .{ .label = "Copy Name", .keys = "Ctrl ↵", .op = .copy_name },
+            .{ .label = "Copy Desktop File Path", .keys = "Ctrl Shift C", .op = .copy_path },
             .{ .label = "Reset Ranking", .keys = "", .op = .reset_ranking },
         },
         .view => &.{
@@ -158,28 +158,28 @@ pub fn actionsFor(item: *const Item) []const Entry {
         },
         .focus_window => &.{
             .{ .label = "Switch to Window", .keys = "↵", .op = .focus },
-            .{ .label = "Close Window", .keys = "⌃ ↵", .op = .close_window },
+            .{ .label = "Close Window", .keys = "Ctrl ↵", .op = .close_window },
         },
         .clip => &.{
             .{ .label = "Paste to Active App", .keys = "↵", .op = .clip_paste },
-            .{ .label = "Copy to Clipboard", .keys = "⌃ ↵", .op = .clip_copy },
-            .{ .label = "Delete Entry", .keys = "⌃ X", .op = .clip_delete },
-            .{ .label = "Delete All Entries", .keys = "⌃ ⇧ X", .op = .clip_clear },
+            .{ .label = "Copy to Clipboard", .keys = "Ctrl ↵", .op = .clip_copy },
+            .{ .label = "Delete Entry", .keys = "Ctrl X", .op = .clip_delete },
+            .{ .label = "Delete All Entries", .keys = "Ctrl Shift X", .op = .clip_clear },
         },
         .file => |f| if (f.line > 0 and !f.extracted) &.{
             .{ .label = "Open at Line", .keys = "↵", .op = .open_at_line },
-            .{ .label = "Open", .keys = "⌃ ↵", .op = .open },
-            .{ .label = "Open With...", .keys = "⌃ O", .op = .open_with },
+            .{ .label = "Open", .keys = "Ctrl ↵", .op = .open },
+            .{ .label = "Open With...", .keys = "Ctrl O", .op = .open_with },
             .{ .label = "Show in Folder", .keys = "", .op = .show_in_folder },
-            .{ .label = "Copy Path", .keys = "⌃ ⇧ C", .op = .copy_path },
-            .{ .label = "Copy File", .keys = "⌃ ⇧ F", .op = .copy_file },
+            .{ .label = "Copy Path", .keys = "Ctrl Shift C", .op = .copy_path },
+            .{ .label = "Copy File", .keys = "Ctrl Shift F", .op = .copy_file },
         } else &.{
             .{ .label = "Open", .keys = "↵", .op = .open },
-            .{ .label = "Show in Folder", .keys = "⌃ ↵", .op = .show_in_folder },
-            .{ .label = "Open With...", .keys = "⌃ O", .op = .open_with },
-            .{ .label = "Copy Path", .keys = "⌃ ⇧ C", .op = .copy_path },
-            .{ .label = "Copy File", .keys = "⌃ ⇧ F", .op = .copy_file },
-            .{ .label = "Move to Trash", .keys = "⌃ X", .op = .trash },
+            .{ .label = "Show in Folder", .keys = "Ctrl ↵", .op = .show_in_folder },
+            .{ .label = "Open With...", .keys = "Ctrl O", .op = .open_with },
+            .{ .label = "Copy Path", .keys = "Ctrl Shift C", .op = .copy_path },
+            .{ .label = "Copy File", .keys = "Ctrl Shift F", .op = .copy_file },
+            .{ .label = "Move to Trash", .keys = "Ctrl X", .op = .trash },
         },
         .setting => |s| switch (s) {
             .toggle => &.{.{ .label = "Toggle", .keys = "↵", .op = .run }},
@@ -188,14 +188,14 @@ pub fn actionsFor(item: *const Item) []const Entry {
             .theme => &.{.{ .label = "Use Theme", .keys = "↵", .op = .run }},
             .open_with => &.{
                 .{ .label = "Open", .keys = "↵", .op = .run },
-                .{ .label = "Open and Always Use", .keys = "⌃ ↵", .op = .always_use },
+                .{ .label = "Open and Always Use", .keys = "Ctrl ↵", .op = .always_use },
             },
             .open_file => &.{.{ .label = "Open Settings File", .keys = "↵", .op = .run }},
             .reset => &.{.{ .label = "Reset All Settings", .keys = "↵", .op = .run }},
         },
         .calc => &.{
             .{ .label = "Copy Answer", .keys = "↵", .op = .calc_copy },
-            .{ .label = "Paste Answer", .keys = "⌃ ↵", .op = .calc_paste },
+            .{ .label = "Paste Answer", .keys = "Ctrl ↵", .op = .calc_paste },
         },
     };
 }

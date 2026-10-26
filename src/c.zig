@@ -120,7 +120,10 @@ pub const GTK_SELECTION_SINGLE: c_int = 1;
 pub const GTK_STYLE_PROVIDER_PRIORITY_USER: c_uint = 800;
 
 pub const GTK_LAYER_SHELL_LAYER_OVERLAY: c_int = 3;
+pub const GTK_LAYER_SHELL_EDGE_LEFT: c_int = 0;
+pub const GTK_LAYER_SHELL_EDGE_RIGHT: c_int = 1;
 pub const GTK_LAYER_SHELL_EDGE_TOP: c_int = 2;
+pub const GTK_LAYER_SHELL_EDGE_BOTTOM: c_int = 3;
 pub const GTK_LAYER_SHELL_KEYBOARD_MODE_NONE: c_int = 0;
 pub const GTK_LAYER_SHELL_KEYBOARD_MODE_EXCLUSIVE: c_int = 1;
 
@@ -264,6 +267,7 @@ pub extern fn gtk_window_set_resizable(w: *GtkWindow, v: gboolean) void;
 pub extern fn gtk_window_set_decorated(w: *GtkWindow, v: gboolean) void;
 pub extern fn gtk_window_set_default_size(w: *GtkWindow, width: c_int, height: c_int) void;
 pub extern fn gtk_window_set_child(w: *GtkWindow, child: *GtkWidget) void;
+pub extern fn gtk_window_new() *GtkWidget;
 pub extern fn gtk_window_present(w: *GtkWindow) void;
 
 pub extern fn gtk_widget_set_visible(w: *GtkWidget, v: gboolean) void;
@@ -362,3 +366,4 @@ pub extern fn gtk_layer_set_namespace(w: *GtkWindow, ns: [*:0]const u8) void;
 pub extern fn gtk_layer_set_anchor(w: *GtkWindow, edge: c_int, anchor: gboolean) void;
 pub extern fn gtk_layer_set_margin(w: *GtkWindow, edge: c_int, margin: c_int) void;
 pub extern fn gtk_layer_set_monitor(w: *GtkWindow, monitor: ?*GdkMonitor) void;
+pub extern fn gtk_layer_set_exclusive_zone(w: *GtkWindow, zone: c_int) void;

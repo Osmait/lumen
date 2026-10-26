@@ -73,7 +73,6 @@ pub fn css(w: *std.Io.Writer, t: *const Theme, s: *const settings.Settings) !voi
     try rgba(w, "ink", t.ink, 1);
     try rgba(w, "accent", t.accent, 1);
     try rgba(w, "accent-soft", t.accent, 0.35);
-    try rgba(w, "accent-ring", t.accent, 0.18);
     try rgba(w, "on-accent", onAccent(t), 1);
     try rgba(w, "shadow", 0, if (t.dark) 0.45 else 0.18);
     const sizes = [_]struct { []const u8, f32 }{ .{ "font", 14 }, .{ "font-query", 18 }, .{ "font-small", 13 }, .{ "font-tiny", 12 }, .{ "font-mono", 12.5 }, .{ "font-calc", 26 }, .{ "font-emoji", 17 } };

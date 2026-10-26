@@ -32,8 +32,10 @@ const Ui = @This();
 const panel_w = 750;
 const panel_h = 474;
 /// The list's height limit: what is left under the search bar (56), the gap
-/// (10) and the results' padding and border (18).
-const list_max_h = panel_h - 56 - 10 - 18;
+/// (10) and the results' padding and border (14).
+const list_max_h = panel_h - 56 - 10 - 14;
+/// Clear space around the pieces for their shadows (`.shell` in style.css).
+const shell_margin = 48;
 const max_results = 60;
 
 gpa: std.mem.Allocator,
@@ -71,6 +73,10 @@ icons: std.ArrayList(*c.GIcon) = .empty,
 scope: *c.GtkWidget = undefined,
 /// The island holding the results (and the detail pane).
 results: *c.GtkWidget = undefined,
+search_bar: *c.GtkWidget = undefined,
+/// Clear full-screen layers under the window, one per monitor: a click on
+/// one (anywhere outside Lumen) hides it.
+backdrops: [8]?*c.GtkWidget = @splat(null),
 /// What Enter does on the selected row, shown inside it.
 primary: [:0]const u8 = "",
 panel: *c.GtkWidget = undefined,
@@ -175,7 +181,7 @@ pub fn build(self: *Ui) void {
     c.gtk_window_set_decorated(@ptrCast(win), 0);
     // A fixed size: the layer surface would otherwise grow to its content's
     // natural size (a large image preview, a long path).
-    c.gtk_window_set_default_size(@ptrCast(win), panel_w + 36, panel_h + 36);
+    c.gtk_window_set_default_size(@ptrCast(win), panel_w + 2 * shell_margin, panel_h + 2 * shell_margin);
 
     const w: *c.GtkWindow = @ptrCast(win);
     c.gtk_layer_init_for_window(w);
@@ -197,6 +203,7 @@ pub fn build(self: *Ui) void {
     // search bar
     const search = hbox(0);
     c.gtk_widget_add_css_class(search, "search");
+    self.search_bar = search;
     self.back = c.gtk_image_new_from_icon_name("go-previous-symbolic");
     c.gtk_widget_add_css_class(self.back, "back");
     c.gtk_widget_set_valign(self.back, c.GTK_ALIGN_CENTER);
@@ -216,7 +223,7 @@ pub fn build(self: *Ui) void {
     c.gtk_widget_set_valign(self.entry, c.GTK_ALIGN_CENTER);
     c.gtk_box_append(@ptrCast(search), self.entry);
     connect(self.entry, "changed", &onChanged, self);
-    const k = label("⌃ K", "kbd");
+    const k = label("Ctrl K", "kbd");
     c.gtk_widget_set_valign(k, c.GTK_ALIGN_CENTER);
     c.gtk_widget_set_tooltip_text(k, "Actions");
     c.gtk_box_append(@ptrCast(search), k);
@@ -260,6 +267,63 @@ pub fn build(self: *Ui) void {
     c.gtk_event_controller_set_propagation_phase(keys, c.GTK_PHASE_CAPTURE);
     connect(keys, "key-pressed", &onKey, self);
     c.gtk_widget_add_controller(win, keys);
+
+    // A click on the clear part of the surface hides the window, like one on
+    // the backdrop. Capture phase: it sees every press, and claims none.
+    const click = c.gtk_gesture_click_new();
+    c.gtk_event_controller_set_propagation_phase(click, c.GTK_PHASE_CAPTURE);
+    connect(click, "pressed", &onWindowPressed, self);
+    c.gtk_widget_add_controller(win, click);
+}
+
+fn makeBackdrop(self: *Ui) *c.GtkWidget {
+    const win = c.gtk_window_new();
+    c.gtk_widget_add_css_class(win, "lumen-backdrop");
+    c.gtk_window_set_decorated(@ptrCast(win), 0);
+    const w: *c.GtkWindow = @ptrCast(win);
+    c.gtk_layer_init_for_window(w);
+    c.gtk_layer_set_layer(w, c.GTK_LAYER_SHELL_LAYER_OVERLAY);
+    c.gtk_layer_set_keyboard_mode(w, c.GTK_LAYER_SHELL_KEYBOARD_MODE_NONE);
+    c.gtk_layer_set_namespace(w, "lumen-backdrop");
+    inline for (.{ c.GTK_LAYER_SHELL_EDGE_LEFT, c.GTK_LAYER_SHELL_EDGE_RIGHT, c.GTK_LAYER_SHELL_EDGE_TOP, c.GTK_LAYER_SHELL_EDGE_BOTTOM }) |edge|
+        c.gtk_layer_set_anchor(w, edge, 1);
+    // Over the bars too: a click on them closes Lumen as well.
+    c.gtk_layer_set_exclusive_zone(w, -1);
+    const click = c.gtk_gesture_click_new();
+    connect(click, "pressed", &onBackdropPressed, self);
+    c.gtk_widget_add_controller(win, click);
+    return win;
+}
+
+/// One backdrop per monitor, mapped before the window so they stack under it.
+fn showBackdrops(self: *Ui) void {
+    if (testMode()) return;
+    const monitors = c.gdk_display_get_monitors(c.gdk_display_get_default());
+    const n = @min(c.g_list_model_get_n_items(monitors), self.backdrops.len);
+    for (&self.backdrops, 0..) |*slot, i| {
+        if (i >= n) {
+            if (slot.*) |b| c.gtk_widget_set_visible(b, 0);
+            continue;
+        }
+        const obj = c.g_list_model_get_item(monitors, @intCast(i)) orelse continue;
+        defer c.g_object_unref(obj);
+        const b = slot.* orelse self.makeBackdrop();
+        slot.* = b;
+        c.gtk_layer_set_monitor(@ptrCast(b), @ptrCast(obj));
+        c.gtk_widget_set_visible(b, 1);
+    }
+}
+
+fn hideBackdrops(self: *Ui) void {
+    for (self.backdrops) |slot| if (slot) |b| c.gtk_widget_set_visible(b, 0);
+}
+
+/// Whether the window point (x, y) falls on `w` (shown).
+fn isOn(self: *Ui, w: *c.GtkWidget, x: f64, y: f64) bool {
+    if (c.gtk_widget_get_visible(w) == 0) return false;
+    var b: c.graphene_rect_t = undefined;
+    if (c.gtk_widget_compute_bounds(w, self.window, &b) == 0) return false;
+    return x >= b.origin.x and x < b.origin.x + b.size.width and y >= b.origin.y and y < b.origin.y + b.size.height;
 }
 
 fn buildDetail(self: *Ui) void {
@@ -806,6 +870,7 @@ pub fn showWith(self: *Ui, view: View, text: ?[*:0]const u8) void {
     // The choose view only means something reached from a setting.
     self.setView(if (view == .choose and self.choosing == .none) .settings else view);
     if (text) |t| c.gtk_editable_set_text(@ptrCast(self.entry), t);
+    if (was_hidden) self.showBackdrops();
     c.gtk_widget_set_visible(self.window, 1);
     c.gtk_window_present(@ptrCast(self.window));
     _ = c.gtk_widget_grab_focus(self.entry);
@@ -838,6 +903,7 @@ pub fn hide(self: *Ui) void {
     self.closePanel();
     self.confirm_key = "";
     c.gtk_widget_set_visible(self.window, 0);
+    self.hideBackdrops();
 }
 
 /// Puts the window on the monitor Hyprland has focused, a bit above centre.
@@ -859,7 +925,7 @@ fn placeOnFocusedMonitor(self: *Ui) void {
         var geo: c.GdkRectangle = undefined;
         c.gdk_monitor_get_geometry(mon, &geo);
         const tenths: c_int = if (self.settings.position == .center) 5 else 3;
-        const margin = @max(@divTrunc((geo.height - panel_h) * tenths, 10), 40);
+        const margin = @max(@divTrunc((geo.height - panel_h) * tenths, 10) - shell_margin, 0);
         c.gtk_layer_set_margin(@ptrCast(self.window), c.GTK_LAYER_SHELL_EDGE_TOP, margin);
         return;
     }
@@ -1420,8 +1486,9 @@ fn scrollTo(self: *Ui, row: *c.GtkWidget) void {
     const page = c.gtk_adjustment_get_page_size(adj);
     const top: f64 = b.origin.y;
     const bottom: f64 = top + b.size.height;
-    // Keep a section header above the first item visible.
-    if (top < value + 4) c.gtk_adjustment_set_value(adj, @max(top - 30, 0)) else if (bottom > value + page) c.gtk_adjustment_set_value(adj, bottom - page + 6);
+    // Keep a section header above the first item visible, and the selection
+    // clear of the fade at the bottom edge (style.css, undershoot).
+    if (top < value + 4) c.gtk_adjustment_set_value(adj, @max(top - 30, 0)) else if (bottom > value + page - 20) c.gtk_adjustment_set_value(adj, bottom - page + 20);
 }
 
 fn selectedItem(self: *Ui) ?*Item {
@@ -1867,6 +1934,22 @@ fn onPanelRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, data: ?*anyopaqu
     const self: *Ui = @ptrCast(@alignCast(data));
     const i: usize = @intCast(c.gtk_list_box_row_get_index(row));
     if (i < self.panel_entries.len) self.perform(self.panel_entries[i].op);
+}
+
+fn onWindowPressed(_: *c.GtkEventController, _: c_int, x: f64, y: f64, data: ?*anyopaque) callconv(.c) void {
+    const self: *Ui = @ptrCast(@alignCast(data));
+    const on_pieces = self.isOn(self.search_bar, x, y) or self.isOn(self.results, x, y);
+    if (self.panel_open) {
+        if (self.isOn(self.panel, x, y)) return;
+        // Outside the action panel but on Lumen: only the panel closes.
+        if (on_pieces) return self.closePanel();
+    }
+    if (!on_pieces) self.hide();
+}
+
+fn onBackdropPressed(_: *c.GtkEventController, _: c_int, _: f64, _: f64, data: ?*anyopaque) callconv(.c) void {
+    const self: *Ui = @ptrCast(@alignCast(data));
+    self.hide();
 }
 
 fn onBackClicked(_: *c.GtkEventController, _: c_int, _: f64, _: f64, data: ?*anyopaque) callconv(.c) void {

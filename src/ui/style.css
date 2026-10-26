@@ -7,10 +7,12 @@ window.lumen {
   background: none;
 }
 
+/* The margin is room for the shadows: cut at the surface's edge they show
+   as a grey rectangle. Keep it in step with shell_margin in Ui.zig. */
 .shell {
-  margin: 18px;
+  margin: 48px;
   color: var(--fg);
-  font-family: "Outfit", "Inter", sans-serif;
+  font-family: "Inter", sans-serif;
   font-size: var(--font);
 }
 
@@ -19,10 +21,10 @@ window.lumen {
   min-height: 56px;
   padding: 0 12px 0 20px;
   background-color: var(--bg);
-  border: 1px solid var(--accent);
+  border: 1px solid alpha(var(--ink), 0.16);
   border-radius: 28px;
-  box-shadow: inset 0 1px alpha(var(--ink), 0.10), 0 0 0 4px var(--accent-ring),
-    0 2px 4px var(--shadow), 0 18px 44px var(--shadow);
+  box-shadow: inset 0 1px alpha(var(--ink), 0.10), 0 2px 4px var(--shadow),
+    0 12px 30px var(--shadow);
 }
 .search .back {
   color: alpha(var(--ink), 0.6);
@@ -51,7 +53,7 @@ window.lumen {
   caret-color: var(--accent);
 }
 .query > placeholder {
-  color: alpha(var(--ink), 0.38);
+  color: alpha(var(--ink), 0.5);
 }
 .query > selection {
   background-color: var(--accent-soft);
@@ -66,15 +68,65 @@ window.lumen {
 
 /* results */
 .results-island {
-  padding: 8px;
+  padding: 6px;
   background-color: var(--bg);
   border: 1px solid alpha(var(--ink), 0.16);
   border-radius: 28px;
   box-shadow: inset 0 1px alpha(var(--ink), 0.08), 0 2px 4px var(--shadow),
-    0 18px 44px var(--shadow);
+    0 12px 30px var(--shadow);
 }
+/* Side padding leaves the scrollbar a lane of its own, clear of the rows. */
 .results {
   background: none;
+  padding: 0 6px;
+}
+
+/* scrolling: a slim slider, no track, and the edges fade instead of cutting
+   rows in half. */
+.results-island scrollbar,
+.results-island scrollbar trough {
+  background: none;
+  border: none;
+  box-shadow: none;
+}
+.results-island scrollbar {
+  margin: 6px 1px;
+}
+.results-island scrollbar slider {
+  min-width: 4px;
+  min-height: 32px;
+  margin: 0;
+  border: none;
+  border-radius: 999px;
+  background-color: alpha(var(--ink), 0.22);
+}
+.results-island scrollbar.hovering slider,
+.results-island scrollbar.dragging slider {
+  min-width: 6px;
+  background-color: alpha(var(--ink), 0.34);
+}
+.results-island scrollbar slider:active {
+  background-color: alpha(var(--ink), 0.46);
+}
+.results-island scrolledwindow > undershoot.top,
+.results-island scrolledwindow > undershoot.bottom {
+  background-color: transparent;
+  background-repeat: no-repeat;
+  background-size: 100% 20px;
+  box-shadow: none;
+}
+.results-island scrolledwindow > undershoot.top {
+  background-image: linear-gradient(to bottom, var(--bg), alpha(var(--bg), 0));
+  background-position: top;
+}
+.results-island scrolledwindow > undershoot.bottom {
+  background-image: linear-gradient(to top, var(--bg), alpha(var(--bg), 0));
+  background-position: bottom;
+}
+.results-island scrolledwindow > overshoot.top,
+.results-island scrolledwindow > overshoot.bottom {
+  background: none;
+  box-shadow: none;
 }
 .results > row {
   border-radius: 24px;
@@ -102,7 +154,7 @@ window.lumen {
 .section-title {
   font-size: var(--font-tiny);
   font-weight: 600;
-  color: alpha(var(--ink), 0.45);
+  color: alpha(var(--ink), 0.55);
 }
 .title {
   color: var(--fg);
@@ -112,7 +164,7 @@ window.lumen {
   font-size: var(--font-small);
 }
 .accessory {
-  color: alpha(var(--ink), 0.45);
+  color: alpha(var(--ink), 0.55);
   font-size: var(--font-small);
 }
 .hint {
@@ -132,7 +184,7 @@ window.lumen {
   color: alpha(var(--on-accent), 0.75);
 }
 .empty {
-  color: alpha(var(--ink), 0.45);
+  color: alpha(var(--ink), 0.55);
   font-size: var(--font-small);
   padding: 28px;
 }
@@ -246,11 +298,11 @@ window.lumen {
 .meta-header {
   font-size: var(--font-tiny);
   font-weight: 600;
-  color: alpha(var(--ink), 0.45);
+  color: alpha(var(--ink), 0.55);
   margin-bottom: 4px;
 }
 .meta-key {
-  color: alpha(var(--ink), 0.5);
+  color: alpha(var(--ink), 0.55);
   font-size: var(--font-small);
 }
 .meta-value {
@@ -260,19 +312,19 @@ window.lumen {
 
 /* action panel (Ctrl+K), over the top right corner of the results */
 .actions {
-  margin: 92px 28px 0 0;
+  margin: 120px 58px 0 0;
   min-width: 300px;
   background-color: var(--surface);
   border: 1px solid alpha(var(--ink), 0.18);
   border-radius: 22px;
   padding: 6px;
   box-shadow: inset 0 1px alpha(var(--ink), 0.10), 0 2px 4px var(--shadow),
-    0 18px 44px var(--shadow);
+    0 12px 30px var(--shadow);
 }
 .actions-title {
   font-size: var(--font-tiny);
   font-weight: 600;
-  color: alpha(var(--ink), 0.45);
+  color: alpha(var(--ink), 0.55);
   padding: 6px 12px 6px 12px;
 }
 .actions list {
@@ -286,6 +338,9 @@ window.lumen {
   outline: none;
   color: var(--fg);
 }
+.actions row:hover:not(:selected) {
+  background-color: alpha(var(--ink), 0.06);
+}
 .actions row:selected {
   background-color: var(--accent);
   background-image: linear-gradient(alpha(#ffffff, 0.14), alpha(#ffffff, 0));
@@ -295,4 +350,19 @@ window.lumen {
 .actions row:selected .kbd {
   color: var(--on-accent);
   background-color: alpha(var(--on-accent), 0.14);
+}
+
+/* the "Actions" tooltip on the Ctrl K hint */
+tooltip,
+tooltip.background {
+  background-color: var(--surface);
+  color: var(--fg);
+  border: 1px solid alpha(var(--ink), 0.14);
+  border-radius: 8px;
+  box-shadow: 0 4px 12px var(--shadow);
+}
+
+/* the clear layer under the window that catches clicks outside it */
+window.lumen-backdrop {
+  background: none;
 }
