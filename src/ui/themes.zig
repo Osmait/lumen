@@ -28,7 +28,7 @@ pub const Theme = struct {
 pub const auto_id = "auto";
 
 pub const all = [_]Theme{
-    .{ .id = "lumen-dark", .name = "Lumen Dark", .dark = true, .bg = 0x121826, .surface = 0x1c2333, .fg = 0xeef1f7, .ink = 0xffffff, .accent = 0x8fe3ff },
+    .{ .id = "lumen-dark", .name = "Lumen Dark", .dark = true, .bg = 0x1b1b1e, .surface = 0x28282c, .fg = 0xececee, .ink = 0xffffff, .accent = 0xff6363 },
     .{ .id = "lumen-light", .name = "Lumen Light", .dark = false, .bg = 0xf5f7fb, .surface = 0xffffff, .fg = 0x10131a, .ink = 0x000000, .accent = 0x3a5bd9 },
     .{ .id = "catppuccin-mocha", .name = "Catppuccin Mocha", .dark = true, .bg = 0x1e1e2e, .surface = 0x313244, .fg = 0xcdd6f4, .ink = 0xcdd6f4, .accent = 0xcba6f7 },
     .{ .id = "catppuccin-latte", .name = "Catppuccin Latte", .dark = false, .bg = 0xeff1f5, .surface = 0xe6e9ef, .fg = 0x4c4f69, .ink = 0x11111b, .accent = 0x8839ef },

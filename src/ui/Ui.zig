@@ -1247,7 +1247,7 @@ const RowParts = struct { hint: ?*c.GtkWidget = null, accessory: ?*c.GtkWidget =
 fn itemRow(it: Item, parts: *RowParts) *c.GtkWidget {
     const row = c.gtk_list_box_row_new();
     const box = hbox(12);
-    c.gtk_box_append(@ptrCast(box), iconWidget(it.icon, 28));
+    c.gtk_box_append(@ptrCast(box), iconWidget(it.icon, 32));
     const text = vbox(1);
     c.gtk_widget_set_valign(text, c.GTK_ALIGN_CENTER);
     c.gtk_widget_set_hexpand(text, 1);
@@ -1321,11 +1321,12 @@ fn iconWidget(icon: item_mod.Icon, size: c_int) *c.GtkWidget {
         .gicon => |g| {
             const img = c.gtk_image_new_from_gicon(g);
             c.gtk_image_set_pixel_size(@ptrCast(img), size);
+            c.gtk_widget_add_css_class(img, "app-icon");
             return img;
         },
         .tile => |t| {
             const img = c.gtk_image_new_from_icon_name(t.name);
-            c.gtk_image_set_pixel_size(@ptrCast(img), @divTrunc(size * 6, 10));
+            c.gtk_image_set_pixel_size(@ptrCast(img), @divTrunc(size, 2) + 2);
             c.gtk_widget_add_css_class(img, "tile");
             var cls: [24:0]u8 = undefined;
             const name = std.fmt.bufPrintZ(&cls, "tile-{t}", .{t.color}) catch "tile-gray";
