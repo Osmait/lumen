@@ -1,0 +1,158 @@
+//! The detail pane: clipboard text, file previews, content context.
+
+const std = @import("std");
+const c = @import("c");
+const item_mod = @import("../item.zig");
+const Item = item_mod.Item;
+const index = @import("index");
+const stats = @import("../stats.zig");
+const Ui = @import("Ui.zig");
+const widgets = @import("widgets.zig");
+const labels = @import("labels.zig");
+
+pub fn buildDetail(ui: *Ui) void {
+    ui.detail = widgets.vbox(0);
+    c.gtk_widget_add_css_class(ui.detail, "detail");
+    c.gtk_widget_set_hexpand(ui.detail, 1);
+
+    // Image previews (files view).
+    ui.detail_picture = c.gtk_picture_new();
+    c.gtk_picture_set_content_fit(@ptrCast(ui.detail_picture), c.GTK_CONTENT_FIT_SCALE_DOWN);
+    c.gtk_widget_set_vexpand(ui.detail_picture, 1);
+    c.gtk_widget_add_css_class(ui.detail_picture, "preview");
+    c.gtk_box_append(@ptrCast(ui.detail), ui.detail_picture);
+
+    const sc = c.gtk_scrolled_window_new();
+    c.gtk_scrolled_window_set_policy(@ptrCast(sc), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
+    c.gtk_widget_set_vexpand(sc, 1);
+    ui.detail_text = widgets.label("", "detail-text");
+    c.gtk_label_set_wrap(@ptrCast(ui.detail_text), 1);
+    c.gtk_label_set_wrap_mode(@ptrCast(ui.detail_text), c.PANGO_WRAP_WORD_CHAR);
+    // A wrapping widgets.label asks for its unwrapped width unless told otherwise;
+    // this lets the list keep its share of the row.
+    c.gtk_label_set_max_width_chars(@ptrCast(ui.detail_text), 1);
+    c.gtk_widget_set_hexpand(ui.detail_text, 1);
+    c.gtk_label_set_yalign(@ptrCast(ui.detail_text), 0);
+    c.gtk_widget_set_valign(ui.detail_text, c.GTK_ALIGN_START);
+    c.gtk_scrolled_window_set_child(@ptrCast(sc), ui.detail_text);
+    c.gtk_box_append(@ptrCast(ui.detail), sc);
+
+    const meta = widgets.vbox(4);
+    c.gtk_widget_add_css_class(meta, "meta");
+    c.gtk_box_append(@ptrCast(meta), widgets.label("Information", "meta-header"));
+    const keys = [_][:0]const u8{ "Content type", "Characters", "Words", "Copied" };
+    for (keys, 0..) |key, i| {
+        const line = widgets.hbox(12);
+        ui.meta_keys[i] = widgets.label(key, "meta-key");
+        c.gtk_box_append(@ptrCast(line), ui.meta_keys[i]);
+        const spacer = widgets.hbox(0);
+        c.gtk_widget_set_hexpand(spacer, 1);
+        c.gtk_box_append(@ptrCast(line), spacer);
+        ui.meta_values[i] = widgets.label("", "meta-value");
+        c.gtk_label_set_ellipsize(@ptrCast(ui.meta_values[i]), c.PANGO_ELLIPSIZE_START);
+        // The layer surface grows to its content's natural width; a long path
+        // here would widen the whole window.
+        c.gtk_label_set_max_width_chars(@ptrCast(ui.meta_values[i]), 30);
+        c.gtk_box_append(@ptrCast(line), ui.meta_values[i]);
+        c.gtk_box_append(@ptrCast(meta), line);
+    }
+    c.gtk_box_append(@ptrCast(ui.detail), meta);
+    c.gtk_widget_set_visible(ui.detail, 0);
+}
+
+/// The lines around the match, words highlighted.
+pub fn showContentDetail(ui: *Ui, it: *const Item) void {
+    const f = it.action.file;
+    var arena: std.heap.ArenaAllocator = .init(ui.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    c.gtk_widget_set_visible(ui.detail_picture, 0);
+
+    const info = index.sys.info(f.path);
+    const service = ui.contents orelse return;
+    const text = service.readText(a, f.path, if (info) |i| i.mtime else 0, f.extracted, f.line + labels.context_after) orelse it.detail;
+    const words = index.content.splitWords(a, ui.query()) catch return;
+    // The theme's accent behind matches, its text colour on top.
+    const hl_open = std.fmt.allocPrint(a, "<span background=\"{s}\" bgalpha=\"40%\" foreground=\"{s}\">", .{ std.mem.sliceTo(&ui.hl_bg, 0), std.mem.sliceTo(&ui.hl_fg, 0) }) catch return;
+    c.gtk_label_set_markup(@ptrCast(ui.detail_text), labels.contextMarkup(a, text, f.line, words, hl_open).ptr);
+
+    const ctype = c.g_content_type_guess(f.path, null, 0, null);
+    defer if (ctype) |t| c.g_free(t);
+    c.gtk_label_set_text(@ptrCast(ui.meta_values[0]), labels.kindLabel(a, f.path, false, ctype).ptr);
+    c.gtk_label_set_text(@ptrCast(ui.meta_values[1]), it.fact.ptr);
+    c.gtk_label_set_text(@ptrCast(ui.meta_values[2]), if (info) |i| labels.formatWhen(a, i.mtime).ptr else "—");
+    c.gtk_label_set_text(@ptrCast(ui.meta_values[3]), it.where.ptr);
+}
+
+pub fn showFileDetail(ui: *Ui, it: *const Item) void {
+    const f = it.action.file;
+    var arena: std.heap.ArenaAllocator = .init(ui.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const ctype = if (f.is_dir) null else c.g_content_type_guess(f.path, null, 0, null);
+    defer if (ctype) |t| c.g_free(t);
+    const ct: [*:0]const u8 = if (ctype) |t| t else "inode/directory";
+
+    // Only regular files: GTK reads the picture synchronously, and a FIFO
+    // named *.png would block the UI.
+    const image = (c.g_content_type_is_a(ct, "image/*") != 0 or std.mem.startsWith(u8, std.mem.span(ct), "image/")) and index.sys.isRegular(f.path);
+    const info = index.sys.info(f.path);
+    c.gtk_widget_set_visible(ui.detail_picture, @intFromBool(image));
+    c.gtk_picture_set_filename(@ptrCast(ui.detail_picture), if (image) f.path.ptr else null);
+
+    // Text preview: the head of anything that is valid UTF-8.
+    var text: []const u8 = "";
+    if (!image and !f.is_dir) {
+        const head = index.sys.readHead(f.path, a.alloc(u8, 4096) catch return);
+        const valid = labels.validUtf8Prefix(head);
+        if (valid.len + 4 >= head.len and std.mem.findScalar(u8, valid, 0) == null) text = labels.firstLines(valid, preview_lines);
+    }
+    c.gtk_label_set_text(@ptrCast(ui.detail_text), (a.dupeZ(u8, text) catch return).ptr);
+
+    c.gtk_label_set_text(@ptrCast(ui.meta_values[0]), labels.kindLabel(a, f.path, f.is_dir, ct).ptr);
+    if (info) |inf| {
+        c.gtk_label_set_text(@ptrCast(ui.meta_values[1]), if (f.is_dir) "—" else labels.formatSize(a, inf.size).ptr);
+        c.gtk_label_set_text(@ptrCast(ui.meta_values[2]), labels.formatWhen(a, inf.mtime).ptr);
+    } else {
+        c.gtk_label_set_text(@ptrCast(ui.meta_values[1]), "—");
+        c.gtk_label_set_text(@ptrCast(ui.meta_values[2]), "—");
+    }
+    c.gtk_label_set_text(@ptrCast(ui.meta_values[3]), it.subtitle.ptr);
+}
+
+/// Lines of a file preview. The pane shows ~14; GTK wraps and measures all
+/// of the label's text at several widths, and 4 KB (~100 lines) of it cost
+/// ~50 ms per frame (measured with `lumen --stats`).
+const preview_lines = 40;
+
+pub fn showDetail(ui: *Ui, it: ?*const Item) void {
+    if (ui.view == .files or ui.view == .contents) {
+        if (it) |i| if (i.action == .file) {
+            return if (ui.view == .contents) showContentDetail(ui, i) else showFileDetail(ui, i);
+        };
+        c.gtk_widget_set_visible(ui.detail_picture, 0);
+        c.gtk_label_set_text(@ptrCast(ui.detail_text), "");
+        for (ui.meta_values) |v| c.gtk_label_set_text(@ptrCast(v), "");
+        return;
+    }
+    if (ui.view != .clipboard) return;
+    const i = it orelse {
+        c.gtk_label_set_text(@ptrCast(ui.detail_text), "");
+        for (ui.meta_values) |v| c.gtk_label_set_text(@ptrCast(v), "");
+        return;
+    };
+    var arena: std.heap.ArenaAllocator = .init(ui.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = i.detail[0..@min(i.detail.len, 20_000)];
+    c.gtk_label_set_text(@ptrCast(ui.detail_text), (a.dupeZ(u8, labels.validUtf8Prefix(text)) catch return).ptr);
+    c.gtk_label_set_text(@ptrCast(ui.meta_values[0]), "Text");
+    const chars = std.unicode.utf8CountCodepoints(i.detail) catch i.detail.len;
+    var words: usize = 0;
+    var tok = std.mem.tokenizeAny(u8, i.detail, " \t\r\n");
+    while (tok.next()) |_| words += 1;
+    c.gtk_label_set_text(@ptrCast(ui.meta_values[1]), (std.fmt.allocPrintSentinel(a, "{d}", .{chars}, 0) catch return).ptr);
+    c.gtk_label_set_text(@ptrCast(ui.meta_values[2]), (std.fmt.allocPrintSentinel(a, "{d}", .{words}, 0) catch return).ptr);
+    c.gtk_label_set_text(@ptrCast(ui.meta_values[3]), labels.formatWhen(a, i.score).ptr);
+}

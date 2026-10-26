@@ -335,6 +335,13 @@ test {
     _ = @import("sys/proc.zig");
     _ = @import("sys/hypr.zig");
     _ = @import("ui/Ui.zig");
+    _ = @import("ui/labels.zig");
+    _ = @import("ui/widgets.zig");
+    _ = @import("ui/settings_view.zig");
+    _ = @import("ui/file_results.zig");
+    _ = @import("ui/detail_pane.zig");
+    _ = @import("ui/backdrop.zig");
+    _ = @import("ui/keyboard.zig");
     _ = @import("actions.zig");
     _ = @import("settings.zig");
     _ = @import("ui/themes.zig");
