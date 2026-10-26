@@ -5,6 +5,7 @@ const c = @import("c");
 const script_meta = @import("core").script_meta;
 const Item = @import("../item.zig").Item;
 
+/// ~/.config/lumen/scripts, in `a`; null only when out of memory.
 pub fn dir(a: std.mem.Allocator) ?[:0]const u8 {
     const config = std.mem.span(c.g_get_user_config_dir());
     return std.fmt.allocPrintSentinel(a, "{s}/lumen/scripts", .{config}, 0) catch null;

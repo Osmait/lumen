@@ -78,7 +78,7 @@ pub fn iconForClass(self: *const Apps, class: []const u8) ?*c.GIcon {
         const stem = if (std.mem.endsWith(u8, id, ".desktop")) id[0 .. id.len - 8] else id;
         if (std.ascii.eqlIgnoreCase(stem, class)) return iconOf(item);
         // Reverse-DNS ids: org.mozilla.firefox vs class "firefox".
-        if (std.mem.lastIndexOfScalar(u8, stem, '.')) |dot| {
+        if (std.mem.findScalarLast(u8, stem, '.')) |dot| {
             if (std.ascii.eqlIgnoreCase(stem[dot + 1 ..], class)) return iconOf(item);
         }
     }
@@ -104,7 +104,7 @@ fn keywords(a: std.mem.Allocator, dai: *c.GDesktopAppInfo, info: *c.GAppInfo) []
     }
     if (c.g_app_info_get_executable(info)) |exe| {
         const e = std.mem.span(exe);
-        const base = if (std.mem.lastIndexOfScalar(u8, e, '/')) |s| e[s + 1 ..] else e;
+        const base = if (std.mem.findScalarLast(u8, e, '/')) |s| e[s + 1 ..] else e;
         out.appendSlice(a, base) catch {};
     }
     return out.items;

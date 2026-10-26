@@ -24,9 +24,9 @@ pub const timeout_ms = 15_000;
 /// Kind from the file name's extension (case-insensitive), or null if not supported.
 /// Office's `~$name.docx` owner files (not zips) are not documents.
 pub fn kindOf(path: []const u8) ?Kind {
-    const base = path[if (std.mem.lastIndexOfScalar(u8, path, '/')) |s| s + 1 else 0..];
+    const base = path[if (std.mem.findScalarLast(u8, path, '/')) |s| s + 1 else 0..];
     if (std.mem.startsWith(u8, base, "~$")) return null;
-    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return null;
+    const dot = std.mem.findScalarLast(u8, base, '.') orelse return null;
     const ext = base[dot + 1 ..];
     if (dot == 0 or ext.len == 0 or ext.len > 4) return null;
     var buf: [4]u8 = undefined;
@@ -120,7 +120,7 @@ fn runTool(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, input: 
         return out.toOwnedSlice(gpa);
     }
     switch (try child.wait(io)) {
-        .exited => |code| if (std.mem.indexOfScalar(u8, ok_codes, code) == null) return error.ToolFailed,
+        .exited => |code| if (std.mem.findScalar(u8, ok_codes, code) == null) return error.ToolFailed,
         else => return error.ToolFailed,
     }
     return out.toOwnedSlice(gpa);
@@ -208,7 +208,7 @@ fn xmlToText(gpa: std.mem.Allocator, xml: []const u8) ![]u8 {
     while (i < xml.len) {
         const rest = xml[i..];
         if (rest[0] != '<') {
-            const end = i + (std.mem.indexOfAny(u8, rest, "<&") orelse rest.len);
+            const end = i + (std.mem.findAny(u8, rest, "<&") orelse rest.len);
             if (skip_name == null) try w.raw(xml[i..end]);
             i = end;
             if (i < xml.len and xml[i] == '&') {
@@ -230,11 +230,11 @@ fn xmlToText(gpa: std.mem.Allocator, xml: []const u8) ![]u8 {
             continue;
         }
         if (std.mem.startsWith(u8, rest, "<!--")) {
-            i = if (std.mem.indexOfPos(u8, xml, i + 4, "-->")) |e| e + 3 else xml.len;
+            i = if (std.mem.findPos(u8, xml, i + 4, "-->")) |e| e + 3 else xml.len;
             continue;
         }
         if (std.mem.startsWith(u8, rest, "<![CDATA[")) {
-            const e = std.mem.indexOfPos(u8, xml, i + 9, "]]>") orelse xml.len;
+            const e = std.mem.findPos(u8, xml, i + 9, "]]>") orelse xml.len;
             if (skip_name == null) try w.raw(xml[i + 9 .. e]);
             i = @min(e + 3, xml.len);
             continue;
@@ -242,11 +242,11 @@ fn xmlToText(gpa: std.mem.Allocator, xml: []const u8) ![]u8 {
         if (std.mem.startsWith(u8, rest, "<?")) {
             // A declaration starts each concatenated member (pptx slides).
             w.sep(.newline);
-            i = if (std.mem.indexOfPos(u8, xml, i + 2, "?>")) |e| e + 2 else xml.len;
+            i = if (std.mem.findPos(u8, xml, i + 2, "?>")) |e| e + 2 else xml.len;
             continue;
         }
         if (std.mem.startsWith(u8, rest, "<!")) {
-            i = if (std.mem.indexOfScalarPos(u8, xml, i + 2, '>')) |e| e + 1 else xml.len;
+            i = if (std.mem.findScalarPos(u8, xml, i + 2, '>')) |e| e + 1 else xml.len;
             continue;
         }
 
@@ -268,7 +268,7 @@ fn xmlToText(gpa: std.mem.Allocator, xml: []const u8) ![]u8 {
         var name_end = name_start;
         while (name_end < e and !isSpace(xml[name_end]) and xml[name_end] != '/') name_end += 1;
         const name = xml[name_start..name_end];
-        const local = name[if (std.mem.lastIndexOfScalar(u8, name, ':')) |c| c + 1 else 0..];
+        const local = name[if (std.mem.findScalarLast(u8, name, ':')) |c| c + 1 else 0..];
         i = e + 1;
 
         if (skip_name) |s| {
@@ -297,7 +297,7 @@ fn isSpace(c: u8) bool {
 /// `&...;` at the start of `s`: bytes consumed (0 if not an entity) and the
 /// code point (null for an invalid numeric reference, which is dropped).
 fn decodeEntity(s: []const u8) struct { len: usize, cp: ?u21 } {
-    const semi = std.mem.indexOfScalar(u8, s[0..@min(s.len, 12)], ';') orelse return .{ .len = 0, .cp = null };
+    const semi = std.mem.findScalar(u8, s[0..@min(s.len, 12)], ';') orelse return .{ .len = 0, .cp = null };
     const body = s[1..semi];
     const named = [_]struct { []const u8, u21 }{ .{ "amp", '&' }, .{ "lt", '<' }, .{ "gt", '>' }, .{ "quot", '"' }, .{ "apos", '\'' } };
     for (named) |n| if (std.mem.eql(u8, body, n[0])) return .{ .len = semi + 1, .cp = n[1] };
@@ -450,8 +450,8 @@ const TestDir = struct {
     }
     fn write(td: *TestDir, name: []const u8, data: []const u8) !void {
         var buf: [512]u8 = undefined;
-        const p = try std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ td.rel, name });
-        if (std.mem.lastIndexOfScalar(u8, p, '/')) |s| sys.mkdirP(p[0..s]);
+        const p = try std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ td.rel, name }, 0);
+        if (std.mem.findScalarLast(u8, p, '/')) |s| sys.mkdirP(p[0..s]);
         try sys.writeFile(p, data);
     }
     fn absZ(td: *TestDir, name: []const u8) ![:0]u8 {

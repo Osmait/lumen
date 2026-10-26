@@ -81,13 +81,13 @@ pub const Settings = struct {
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |raw| {
             var line = std.mem.trim(u8, raw, " \t\r");
-            if (std.mem.indexOf(u8, line, " #")) |h| line = std.mem.trimEnd(u8, line[0..h], " \t");
+            if (std.mem.find(u8, line, " #")) |h| line = std.mem.trimEnd(u8, line[0..h], " \t");
             if (line.len == 0 or line[0] == '#' or line[0] == ';') continue;
             if (line[0] == '[') {
                 section_open_with = std.mem.eql(u8, line, "[open-with]");
                 continue;
             }
-            const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+            const eq = std.mem.findScalar(u8, line, '=') orelse continue;
             const key = std.mem.trim(u8, line[0..eq], " \t");
             const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
             if (section_open_with) {
@@ -283,6 +283,9 @@ pub const Settings = struct {
 /// A file's identity for "did it change?": modification time to the
 /// nanosecond, size and inode (editors that save by renaming a new file).
 pub const Stamp = struct {
+    /// What no file has: the first look always counts as a change.
+    pub const none: Stamp = .{};
+
     sec: i64 = -1,
     nsec: u32 = 0,
     size: u64 = 0,
@@ -429,7 +432,7 @@ test "save is atomic and owner-only; load survives a missing file" {
     var rel: [4096]u8 = undefined;
     var buf: [4096]u8 = undefined;
     const dir = try sys.tmpDirPath(&tmp, &rel);
-    const path = try std.fmt.bufPrintZ(&buf, "{s}/sub/settings.conf", .{dir});
+    const path = try std.fmt.bufPrintSentinel(&buf, "{s}/sub/settings.conf", .{dir}, 0);
 
     var missing = Settings.load(testing.allocator, path);
     defer missing.deinit();

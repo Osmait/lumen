@@ -123,7 +123,7 @@ fn primary(ctx: Ctx, it: *const Item) Outcome {
 /// extension or kind, else the system default for its type (directories in
 /// the file manager).
 pub fn openFile(ctx: Ctx, path: [:0]const u8, is_dir: bool) void {
-    const slash = std.mem.lastIndexOfScalar(u8, path, '/');
+    const slash = std.mem.findScalarLast(u8, path, '/');
     const name = if (slash) |s| path[s + 1 ..] else path;
     const mime = if (is_dir) null else c.g_content_type_guess(path, null, 0, null);
     defer if (mime) |m| c.g_free(m);
@@ -132,10 +132,10 @@ pub fn openFile(ctx: Ctx, path: [:0]const u8, is_dir: bool) void {
     const ext = if (is_dir) "" else core.file_kind.extKey(&ebuf, name);
     if (ctx.settings.appFor(ext, kind)) |app| {
         var idbuf: [256]u8 = undefined;
-        const id = std.fmt.bufPrintZ(&idbuf, "{s}", .{app}) catch "";
+        const id = std.fmt.bufPrintSentinel(&idbuf, "{s}", .{app}, 0) catch "";
         if (openWith(path, id)) return;
         // Uninstalled since it was chosen: the system default still works.
-        std.log.warn("open with {s}: app not found, using the default", .{app});
+        log.warn("open with {s}: app not found, using the default", .{app});
     }
     const uri = c.g_filename_to_uri(path, null, null) orelse return;
     defer c.g_free(uri);
@@ -158,7 +158,7 @@ pub fn openWith(path: [:0]const u8, app_id: [:0]const u8) bool {
     var err: ?*c.GError = null;
     if (c.g_app_info_launch_uris(@ptrCast(dai), uris, @ptrCast(lctx), &err) == 0) {
         if (err) |e| {
-            std.log.warn("open with {s}: {s}", .{ app_id, e.message });
+            log.warn("open with {s}: {s}", .{ app_id, e.message });
             c.g_error_free(e);
         }
     }
@@ -169,7 +169,7 @@ pub fn openWith(path: [:0]const u8, app_id: [:0]const u8) bool {
 /// GUI editors directly, terminal ones inside the terminal from Settings
 /// (else $TERMINAL, else the first one installed).
 fn openAtLine(ctx: Ctx, path: [:0]const u8, line: u32) void {
-    var arena_state = std.heap.ArenaAllocator.init(ctx.gpa);
+    var arena_state: std.heap.ArenaAllocator = .init(ctx.gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const editor = a.dupeZ(u8, resolveEditor(ctx.settings)) catch return;
@@ -207,7 +207,7 @@ pub const EditorCommand = struct { argv: []const [:0]const u8, in_terminal: bool
 
 /// How each editor is told to open a file at a line.
 pub fn editorCommand(a: std.mem.Allocator, editor: [:0]const u8, path: [:0]const u8, line: u32) !EditorCommand {
-    const base = if (std.mem.lastIndexOfScalar(u8, editor, '/')) |s| editor[s + 1 ..] else editor;
+    const base = if (std.mem.findScalarLast(u8, editor, '/')) |s| editor[s + 1 ..] else editor;
     const at = try std.fmt.allocPrintSentinel(a, "{s}:{d}", .{ path, line }, 0);
     const plus = try std.fmt.allocPrintSentinel(a, "+{d}", .{line}, 0);
     const n = try std.fmt.allocPrintSentinel(a, "{d}", .{line}, 0);
@@ -226,9 +226,9 @@ pub fn editorCommand(a: std.mem.Allocator, editor: [:0]const u8, path: [:0]const
     return .{ .argv = try a.dupe([:0]const u8, &.{ editor, plus, path }), .in_terminal = true };
 }
 
-/// The words that make a terminal run a command (most take `-e`).
-pub fn terminalPrefix(a: std.mem.Allocator, term: [:0]const u8) ![]const [:0]const u8 {
-    const base = if (std.mem.lastIndexOfScalar(u8, term, '/')) |s| term[s + 1 ..] else term;
+/// The words that make a terminal run a command (most take `-e`), in `a`.
+pub fn terminalPrefix(a: std.mem.Allocator, term: [:0]const u8) std.mem.Allocator.Error![]const [:0]const u8 {
+    const base = if (std.mem.findScalarLast(u8, term, '/')) |s| term[s + 1 ..] else term;
     if (std.mem.eql(u8, base, "kitty") or std.mem.eql(u8, base, "foot")) return a.dupe([:0]const u8, &.{term});
     if (std.mem.eql(u8, base, "wezterm")) return a.dupe([:0]const u8, &.{ term, "start", "--" });
     if (std.mem.eql(u8, base, "gnome-terminal")) return a.dupe([:0]const u8, &.{ term, "--" });
@@ -261,7 +261,7 @@ fn launch(info: *c.GAppInfo) void {
     var err: ?*c.GError = null;
     if (c.g_app_info_launch(info, null, @ptrCast(ctx), &err) == 0) {
         if (err) |e| {
-            std.log.warn("launch: {s}", .{e.message});
+            log.warn("launch: {s}", .{e.message});
             c.g_error_free(e);
         }
     }
@@ -321,7 +321,7 @@ fn runScript(path: [:0]const u8, mode: @import("core").script_meta.Mode, title: 
     }
     // Other modes show the output: last lines as a desktop notification.
     var buf: [512:0]u8 = undefined;
-    const t = std.fmt.bufPrintZ(&buf, "{s}", .{title}) catch "Script";
+    const t = std.fmt.bufPrintSentinel(&buf, "{s}", .{title}, 0) catch "Script";
     proc.spawn(&.{
         "sh",           "-c",
         \\out=$("$1" 2>&1); notify-send -a Lumen "$2" "$(printf '%s' "$out" | tail -n 5)"
@@ -366,12 +366,12 @@ pub fn pasteChord(class: []const u8) Chord {
     var buf: [128]u8 = undefined;
     if (class.len > buf.len) return .ctrl_v;
     const lower = std.ascii.lowerString(&buf, class);
-    for (terminals) |t| if (std.mem.indexOf(u8, lower, t) != null) return .ctrl_shift_v;
+    for (terminals) |t| if (std.mem.find(u8, lower, t) != null) return .ctrl_shift_v;
     return .ctrl_v;
 }
 
 test "editors open at a line, terminal ones inside a terminal" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const Case = struct { []const u8, []const []const u8, bool };

@@ -71,7 +71,7 @@ const LevelCtx = struct {
 pub fn scan(gpa: std.mem.Allocator, pool: *Pool, cfg: *const Config, watcher: ?*Watcher, stats: ?*Stats) !Store {
     const t0 = sys.monotonicNs();
     var st: Stats = .{};
-    var b: Builder = .{};
+    var b: Builder = .empty;
     errdefer b.deinit(gpa);
 
     var frontier: std.ArrayList(Frontier) = .empty;
@@ -152,14 +152,14 @@ fn readDir(gpa: std.mem.Allocator, path: [:0]const u8, cfg: *const Config, batch
         var kind = e.kind;
         if (kind == sys.Kind.unknown) {
             var buf: [4096]u8 = undefined;
-            const full = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ path, e.name }) catch continue;
+            const full = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ path, e.name }, 0) catch continue;
             kind = sys.kindOf(full);
         }
         var fl: u8 = 0;
         // Dot-dirs and caches are noise: searchable, ranked low, and the
         // flag is inherited by everything below ("~/orca/skein-zig-pkg-cache"
         // READMEs outranked the user's own).
-        if (e.name[0] == '.' or std.ascii.indexOfIgnoreCase(e.name, "cache") != null) fl |= store_mod.flag_hidden;
+        if (e.name[0] == '.' or std.ascii.findIgnoreCase(e.name, "cache") != null) fl |= store_mod.flag_hidden;
         if (kind == sys.Kind.symlink) fl |= store_mod.flag_symlink;
         // A skipped directory is still indexed (searchable), just not opened.
         if (kind == sys.Kind.dir and shouldDescend(path, e.name, cfg)) fl |= store_mod.flag_dir;
@@ -171,7 +171,7 @@ fn readDir(gpa: std.mem.Allocator, path: [:0]const u8, cfg: *const Config, batch
 
 fn shouldDescend(parent: []const u8, name: []const u8, cfg: *const Config) bool {
     for (cfg.skip) |rule| {
-        if (std.mem.lastIndexOfScalar(u8, rule, '/')) |slash| {
+        if (std.mem.findScalarLast(u8, rule, '/')) |slash| {
             if (std.mem.eql(u8, rule[slash + 1 ..], name) and std.mem.endsWith(u8, parent, rule[0..slash])) return false;
         } else if (std.mem.eql(u8, rule, name)) return false;
     }
@@ -179,7 +179,7 @@ fn shouldDescend(parent: []const u8, name: []const u8, cfg: *const Config) bool 
         if (!std.mem.eql(u8, probe, name)) continue;
         // One stat, only for the handful of suspicious names.
         var buf: [4096]u8 = undefined;
-        const tag = std.fmt.bufPrintZ(&buf, "{s}/{s}/CACHEDIR.TAG", .{ parent, name }) catch return true;
+        const tag = std.fmt.bufPrintSentinel(&buf, "{s}/{s}/CACHEDIR.TAG", .{ parent, name }, 0) catch return true;
         if (sys.exists(tag)) return false;
     }
     return true;

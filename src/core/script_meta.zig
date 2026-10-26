@@ -42,7 +42,7 @@ pub fn parse(source: []const u8) ?Meta {
         else
             continue;
         const rest = body[key_start..];
-        const sp = std.mem.indexOfAny(u8, rest, " \t") orelse continue;
+        const sp = std.mem.findAny(u8, rest, " \t") orelse continue;
         const key = rest[0..sp];
         const value = std.mem.trim(u8, rest[sp..], " \t");
 

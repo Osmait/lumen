@@ -68,7 +68,7 @@ const named = [_]struct { []const u8, []const u8, Color }{
 /// gray badge: still more telling than a blank page.
 pub fn of(name: []const u8, upper_buf: *[4]u8) ?Badge {
     for (named) |n| if (std.mem.eql(u8, name, n[0])) return .{ .text = n[1], .color = n[2] };
-    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return null;
+    const dot = std.mem.findScalarLast(u8, name, '.') orelse return null;
     if (dot == 0 or dot + 1 >= name.len) return null;
     const ext = name[dot + 1 ..];
     var lower_buf: [16]u8 = undefined;
@@ -91,7 +91,7 @@ pub fn of(name: []const u8, upper_buf: *[4]u8) ?Badge {
 /// extension (those get a gray badge but may be anything, binaries too).
 pub fn isKnown(name: []const u8) bool {
     for (named) |n| if (std.mem.eql(u8, name, n[0])) return true;
-    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return false;
+    const dot = std.mem.findScalarLast(u8, name, '.') orelse return false;
     var lower_buf: [16]u8 = undefined;
     if (dot == 0 or name.len - dot - 1 > lower_buf.len) return false;
     const lower = std.ascii.lowerString(&lower_buf, name[dot + 1 ..]);
@@ -175,7 +175,7 @@ pub const logo_names = [_]struct { []const u8, Logo }{
 /// The official logo for a file name, or null (then `of` gives a badge).
 pub fn logoOf(name: []const u8) ?Logo {
     for (logo_names) |n| if (std.mem.eql(u8, name, n[0])) return n[1];
-    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return null;
+    const dot = std.mem.findScalarLast(u8, name, '.') orelse return null;
     if (dot == 0 or dot + 1 >= name.len) return null;
     var lower_buf: [16]u8 = undefined;
     const ext = name[dot + 1 ..];

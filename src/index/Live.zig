@@ -1,4 +1,5 @@
 //! Live index: the mapped base plus what inotify reports (port of `live.rs`).
+//! Not thread-safe: `Service` serializes every access with its lock.
 //!
 //! The base store is immutable and packed in one buffer, which is what makes
 //! start-up a 1 ms mmap. Rebuilding it per new file would throw that away, so
@@ -21,6 +22,8 @@ const engine = @import("search.zig");
 const Pool = @import("Pool.zig");
 const Watcher = @import("Watcher.zig");
 const sys = @import("sys.zig");
+
+const log = std.log.scoped(.files);
 
 const Live = @This();
 
@@ -59,7 +62,7 @@ gpa: std.mem.Allocator,
 base: Store,
 /// Searchable version of the delta, rebuilt after each batch of changes.
 delta: Store,
-delta_b: Builder = .{},
+delta_b: Builder = .empty,
 /// Absolute directory path -> its scaffolding root in the delta, so every new
 /// file of one directory hangs from the same root.
 delta_roots: std.StringHashMapUnmanaged(u32) = .empty,
@@ -74,8 +77,8 @@ scan_pool: *Pool,
 arm_cursor: u32 = std.math.maxInt(u32),
 /// Persistent engines: what enables refinement while typing (measured in the
 /// Rust version: 503 us cold vs 14 us reusing the engine).
-engine_base: engine.Engine = .{},
-engine_delta: engine.Engine = .{},
+engine_base: engine.Engine = .empty,
+engine_delta: engine.Engine = .empty,
 pending_resync: bool = false,
 /// Changes not yet in the index file. Without this, what was learned while
 /// running lived only in the delta and died with the process.
@@ -88,7 +91,7 @@ limits: Limits = .{},
 /// right away, watches armed in batches by `armProgress`. Owns `base` once
 /// it returns; on error `base` is still the caller's.
 pub fn initUnarmed(gpa: std.mem.Allocator, base: Store, cfg: *const scan.Config, cache_path: ?[:0]const u8, scan_pool: *Pool) !Live {
-    var b: Builder = .{};
+    var b: Builder = .empty;
     var delta = try b.finish(gpa);
     errdefer delta.deinit(gpa);
     const watcher = try Watcher.create(gpa);
@@ -113,6 +116,7 @@ pub fn deinit(l: *Live) void {
     l.watcher.destroy(l.gpa);
     l.engine_base.deinit(l.gpa);
     l.engine_delta.deinit(l.gpa);
+    l.* = undefined;
 }
 
 fn freeRoots(l: *Live) void {
@@ -250,7 +254,7 @@ fn pathExists(l: *const Live, id: u32) bool {
 fn hiddenFlag(l: *const Live, parent: u32, name: []const u8) u8 {
     const parent_fl = if (isDelta(parent)) l.delta_b.flags.items[deltaIdx(parent)] else l.base.flags()[parent];
     const hidden = parent_fl & store_mod.flag_hidden != 0 or name[0] == '.' or
-        std.ascii.indexOfIgnoreCase(name, "cache") != null;
+        std.ascii.findIgnoreCase(name, "cache") != null;
     return if (hidden) store_mod.flag_hidden else 0;
 }
 
@@ -259,14 +263,14 @@ fn hiddenFlag(l: *const Live, parent: u32, name: []const u8) u8 {
 /// watched the whole new node_modules.
 fn descends(l: *const Live, parent: []const u8, name: []const u8) bool {
     for (l.cfg.skip) |rule| {
-        if (std.mem.lastIndexOfScalar(u8, rule, '/')) |slash| {
+        if (std.mem.findScalarLast(u8, rule, '/')) |slash| {
             if (std.mem.eql(u8, rule[slash + 1 ..], name) and std.mem.endsWith(u8, parent, rule[0..slash])) return false;
         } else if (std.mem.eql(u8, rule, name)) return false;
     }
     for (l.cfg.cachedir_probe) |probe| {
         if (!std.mem.eql(u8, probe, name)) continue;
         var buf: [4096]u8 = undefined;
-        const tag = std.fmt.bufPrintZ(&buf, "{s}/{s}/CACHEDIR.TAG", .{ parent, name }) catch return true;
+        const tag = std.fmt.bufPrintSentinel(&buf, "{s}/{s}/CACHEDIR.TAG", .{ parent, name }, 0) catch return true;
         if (sys.exists(tag)) return false;
     }
     return true;
@@ -427,7 +431,7 @@ fn rebuildDelta(l: *Live) !void {
     // stays mask 0. Both are complete before anything is replaced.
     var fresh = try l.delta_b.finish(l.gpa);
     errdefer fresh.deinit(l.gpa);
-    var nb: Builder = .{};
+    var nb: Builder = .empty;
     errdefer nb.deinit(l.gpa);
     const ps = fresh.parents();
     const fl = fresh.flags();
@@ -487,7 +491,7 @@ pub const Replaced = struct { base: Store, watcher: *Watcher };
 /// changed and `base` and `watcher` are still the caller's.
 pub fn adopt(l: *Live, base: Store, watcher: *Watcher) std.mem.Allocator.Error!Replaced {
     // The only fallible step, first: the new index starts with an empty delta.
-    var empty: Builder = .{};
+    var empty: Builder = .empty;
     const delta = try empty.finish(l.gpa);
     const old: Replaced = .{ .base = l.base, .watcher = l.watcher };
     l.base = base;
@@ -524,8 +528,12 @@ pub fn prepareCompaction(gpa: std.mem.Allocator, pool: *Pool, cfg: *const scan.C
     var base = try scan.scan(gpa, pool, cfg, w, null);
     errdefer base.deinit(gpa);
     if (cache_path) |p| {
-        if (std.mem.lastIndexOfScalar(u8, p, '/')) |slash| sys.mkdirP(p[0..slash]);
-        base.save(p) catch return .{ .base = base, .watcher = w };
+        if (std.mem.findScalarLast(u8, p, '/')) |slash| sys.mkdirP(p[0..slash]);
+        base.save(p) catch |err| {
+            // Served from memory; the next rescan saves again.
+            log.warn("saving the file index: {t}", .{err});
+            return .{ .base = base, .watcher = w };
+        };
         // Swap the heap copy for a mapping of what was just written: same
         // bytes, but clean page cache the kernel can reclaim instead of
         // ~80 MB of anonymous memory.
@@ -600,7 +608,7 @@ const Tree = struct {
 
     /// Absolute path of `rel`, relative to the temp dir.
     fn abs(t: *Tree, rel: []const u8, buf: *[4096]u8) [:0]const u8 {
-        return std.fmt.bufPrintZ(buf, "{s}/{s}", .{ t.dir, std.mem.trimEnd(u8, rel, "/") }) catch unreachable;
+        return std.fmt.bufPrintSentinel(buf, "{s}/{s}", .{ t.dir, std.mem.trimEnd(u8, rel, "/") }, 0) catch unreachable;
     }
 
     fn mkAbs(t: *Tree, rel: []const u8) void {
@@ -608,7 +616,7 @@ const Tree = struct {
         if (std.mem.endsWith(u8, rel, "/")) {
             sys.mkdirP(t.abs(rel, &buf));
         } else {
-            if (std.mem.lastIndexOfScalar(u8, rel, '/')) |slash| sys.mkdirP(t.abs(rel[0..slash], &buf));
+            if (std.mem.findScalarLast(u8, rel, '/')) |slash| sys.mkdirP(t.abs(rel[0..slash], &buf));
             sys.writeFile(t.abs(rel, &buf), "x") catch unreachable;
         }
     }
@@ -845,7 +853,7 @@ test "live: an event for something already indexed adds no duplicate" {
     // is read: it is in the scan *and* queued as an event.
     const w = try Watcher.create(gpa);
     var buf: [4096]u8 = undefined;
-    try w.watch(gpa, try std.fmt.bufPrintZ(&buf, "{s}", .{t.root}), 0);
+    try w.watch(gpa, try std.fmt.bufPrintSentinel(&buf, "{s}", .{t.root}, 0), 0);
     t.mk("durante.rs");
     const base = try scan.scan(gpa, t.pool, &t.cfg, w, null);
     const old = try t.live.adopt(base, w);

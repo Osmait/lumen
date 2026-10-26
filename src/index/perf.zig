@@ -36,7 +36,7 @@ fn checkMB(name: []const u8, got: f64, limit: f64) void {
 fn peakRssMB() f64 {
     var buf: [4096]u8 = undefined;
     const status = sys.readHead("/proc/self/status", &buf);
-    const at = std.mem.indexOf(u8, status, "VmHWM:") orelse return 0;
+    const at = std.mem.find(u8, status, "VmHWM:") orelse return 0;
     var it = std.mem.tokenizeAny(u8, status[at + 6 ..], " \t");
     return @as(f64, @floatFromInt(std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0)) / 1024;
 }
@@ -48,7 +48,7 @@ const exts = [_][]const u8{ ".toml", ".rs", ".md", ".zig", ".json", ".png", ".go
 fn syntheticNames(gpa: std.mem.Allocator) !store_mod.Store {
     var prng = std.Random.DefaultPrng.init(1);
     const r = prng.random();
-    var b: store_mod.Builder = .{};
+    var b: store_mod.Builder = .empty;
     const root = try b.push(gpa, "/home/perf", store_mod.no_parent, store_mod.flag_dir, 0);
     var level: std.ArrayList(u32) = .empty;
     defer level.deinit(gpa);
@@ -86,7 +86,7 @@ fn names(gpa: std.mem.Allocator, pool: *index.Pool, dir: []const u8) !void {
     std.debug.print("       {d} entries built in {d:.0} ms\n", .{ s.len(), ms(sys.monotonicNs() - t) });
 
     var pbuf: [4096]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&pbuf, "{s}/names.idx", .{dir});
+    const path = try std.fmt.bufPrintSentinel(&pbuf, "{s}/names.idx", .{dir}, 0);
     try s.save(path);
     t = sys.monotonicNs();
     var m = try store_mod.Store.open(path);
@@ -100,7 +100,7 @@ fn names(gpa: std.mem.Allocator, pool: *index.Pool, dir: []const u8) !void {
     // Worst cases are 1-2 letters (almost everything passes the mask).
     const cold = [_]struct { []const u8, f64 }{ .{ "c", 20 }, .{ "ca", 25 }, .{ "cargo", 15 }, .{ "cargo.toml", 10 }, .{ "hndlr", 15 } };
     for (cold) |q| {
-        var e: index.search.Engine = .{};
+        var e: index.search.Engine = .empty;
         defer e.deinit(gpa);
         t = sys.monotonicNs();
         try e.search(gpa, pool, &m, q[0], 20, .{ .recency = false }, &hits);
@@ -132,7 +132,7 @@ fn names(gpa: std.mem.Allocator, pool: *index.Pool, dir: []const u8) !void {
         }
     }
     // Typing: each keystroke refines the previous candidates.
-    var e: index.search.Engine = .{};
+    var e: index.search.Engine = .empty;
     defer e.deinit(gpa);
     const typed = "handler.rs";
     var worst: u64 = 0;
@@ -154,7 +154,7 @@ fn contents(gpa: std.mem.Allocator, pool: *index.Pool, dir: []const u8) !void {
     std.debug.print("content index\n", .{});
     var prng = std.Random.DefaultPrng.init(2);
     const r = prng.random();
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
     var docs: std.ArrayList(content.DocIn) = .empty;

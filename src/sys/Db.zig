@@ -219,7 +219,7 @@ test "clipboard dedupes and orders by recency" {
     try db.addClip("two", 2, Db.max_entries);
     try db.addClip("one", 3, Db.max_entries);
     try db.addClip("   ", 4, Db.max_entries);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const clips = try db.recentClips(arena.allocator(), 10);
     try std.testing.expectEqual(@as(usize, 2), clips.len);
@@ -232,7 +232,7 @@ test "copies within the same second keep their order" {
     try db.addClip("first", 50, Db.max_entries);
     try db.addClip("second", 50, Db.max_entries);
     try db.addClip("third", 50, Db.max_entries);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const clips = try db.recentClips(arena.allocator(), 10);
     try std.testing.expectEqualStrings("third", clips[0].content);
@@ -246,7 +246,7 @@ test "the history keeps as many entries as the setting says" {
         var buf: [16]u8 = undefined;
         try db.addClip(try std.fmt.bufPrint(&buf, "clip {d}", .{i}), @intCast(i), 5);
     }
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const clips = try db.recentClips(arena.allocator(), 100);
     try std.testing.expectEqual(@as(usize, 5), clips.len);
@@ -260,7 +260,7 @@ test "frecency accumulates" {
     try db.recordUse("app:a", 100);
     try db.recordUse("app:a", 100);
     try db.recordUse("app:b", 100);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     var map = try db.loadFrecency(arena.allocator(), 100);
     try std.testing.expect(map.get("app:a").? > map.get("app:b").?);

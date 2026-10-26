@@ -763,7 +763,7 @@ fn findFoldNaive(gpa: std.mem.Allocator, hay: []const u8, needle: []const u8, fr
     try origin.append(gpa, hay.len);
     const fneedle = try fold.foldAlloc(gpa, needle);
     defer gpa.free(fneedle);
-    const at = std.mem.indexOf(u8, folded.items, fneedle) orelse return null;
+    const at = std.mem.find(u8, folded.items, fneedle) orelse return null;
     return .{ .start = origin.items[at], .end = origin.items[at + fneedle.len] };
 }
 
@@ -788,8 +788,8 @@ pub fn verify(text: []const u8, words: []const []const u8, phrase: []const u8, a
         count += 1;
         p = findFold(text, w0, p.end) orelse break;
     }
-    const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..at], '\n')) |nl| nl + 1 else 0;
-    const line_end = std.mem.indexOfScalarPos(u8, text, at, '\n') orelse text.len;
+    const line_start = if (std.mem.findScalarLast(u8, text[0..at], '\n')) |nl| nl + 1 else 0;
+    const line_end = std.mem.findScalarPos(u8, text, at, '\n') orelse text.len;
     const line_no: u32 = @intCast(std.mem.count(u8, text[0..at], "\n") + 1);
     // Keep the hit visible: start the snippet a little before it.
     const start = if (at - line_start > 60) at - 40 else line_start;
@@ -875,7 +875,7 @@ test "candidates equal a brute-force scan, across segments, after save/open" {
     var dbuf: [4096]u8 = undefined;
     const dir = try sys.tmpDirPath(&tmp, &dbuf);
     var pbuf: [4096]u8 = undefined;
-    const p = try std.fmt.bufPrintZ(&pbuf, "{s}/content.idx", .{dir});
+    const p = try std.fmt.bufPrintSentinel(&pbuf, "{s}/content.idx", .{dir}, 0);
     try ix.save(p);
     var mapped = try Index.open(p);
     defer mapped.deinit(gpa);
@@ -892,13 +892,13 @@ test "candidates equal a brute-force scan, across segments, after save/open" {
             for (words) |w| if (findCI(t, w, 0) == null) {
                 all = false;
             };
-            if (all) try testing.expect(std.mem.indexOfScalar(u32, got.items, @intCast(i)) != null);
+            if (all) try testing.expect(std.mem.findScalar(u32, got.items, @intCast(i)) != null);
         }
     }
 }
 
 test "verify finds the line and counts hits" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const text = "first line\n  const a = ArenaAllocator.init(gpa);\nArenaAllocator again\n";
     const v = verify(text, &.{"arenaallocator"}, "arenaallocator", arena.allocator()).?;
@@ -915,7 +915,7 @@ test "verify finds the line and counts hits" {
 // ---------------------------------------------------------------- search
 
 /// Words of a query: split on spaces, folded (`core.fold`) into `arena`.
-pub fn splitWords(arena: std.mem.Allocator, q: []const u8) ![]const []const u8 {
+pub fn splitWords(arena: std.mem.Allocator, q: []const u8) std.mem.Allocator.Error![]const []const u8 {
     var words: std.ArrayList([]const u8) = .empty;
     var it = std.mem.tokenizeAny(u8, q, " \t");
     while (it.next()) |w| try words.append(arena, try fold.foldAlloc(arena, w));
@@ -930,7 +930,7 @@ pub const PathFn = *const fn (ctx: *anyopaque, doc: DocIn, buf: []u8) ?[:0]const
 /// For plain documents only (benchmarks, tests).
 pub fn plainPath(_: *anyopaque, doc: DocIn, buf: []u8) ?[:0]const u8 {
     if (doc.source != .plain) return null;
-    return std.fmt.bufPrintZ(buf, "{s}", .{doc.path}) catch null;
+    return std.fmt.bufPrintSentinel(buf, "{s}", .{doc.path}, 0) catch null;
 }
 
 const VerifyCtx = struct {
@@ -1056,7 +1056,7 @@ pub fn search(ix: *const Index, gpa: std.mem.Allocator, arena: std.mem.Allocator
         for (arenas) |*x| x.deinit();
         gpa.free(arenas);
     }
-    for (arenas) |*x| x.* = std.heap.ArenaAllocator.init(gpa);
+    for (arenas) |*x| x.* = .init(gpa);
     const batch = @max(tasks * 16, limit * 2);
     const results = try gpa.alloc(?Match, batch);
     defer gpa.free(results);
@@ -1149,7 +1149,7 @@ test "folded search: accents and case, both ways, positions in the original" {
     try testing.expectEqual(@as(?Span, .{ .start = 50, .end = 201 }), findFold(long_hay, long_needle, 0));
     try testing.expectEqual(@as(?Span, .{ .start = 201, .end = long_hay.len }), findFold(long_hay, long_needle, 51));
 
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     for ([_][]const u8{ "accion", "ACCIÓN", "acción" }) |q| {
@@ -1188,7 +1188,7 @@ test "search: unaccented and capital queries find accented text" {
     for (texts, 0..) |t, i| {
         paths[i] = try std.fmt.allocPrint(gpa, "{s}/doc{d}.txt", .{ dir, i });
         var zb: [4096]u8 = undefined;
-        try sys.writeFile(try std.fmt.bufPrintZ(&zb, "{s}", .{paths[i]}), t);
+        try sys.writeFile(try std.fmt.bufPrintSentinel(&zb, "{s}", .{paths[i]}, 0), t);
         docs[i] = .{ .path = paths[i], .mtime = 0, .size = t.len };
     }
     defer for (paths) |p| gpa.free(p);
@@ -1198,7 +1198,7 @@ test "search: unaccented and capital queries find accented text" {
     var ix = try build(gpa, pool, &docs, FileDocs.text, &dummy, null);
     defer ix.deinit(gpa);
 
-    var arena = std.heap.ArenaAllocator.init(gpa);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     var out: std.ArrayList(Match) = .empty;
     const cases = [_]struct { q: []const u8, doc: u32, line: u32, snippet: []const u8 }{
@@ -1497,7 +1497,7 @@ test "fuzz: findFold agrees with the naive folded scan" {
 }
 
 fn fuzzVerify(_: void, smith: *testing.Smith) anyerror!void {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const w: []const testing.Smith.Weight = &.{ .value(u8, 'a', 20), .value(u8, 'b', 10), .value(u8, ' ', 8), .value(u8, '\n', 4), .rangeAtMost(u8, 0x80, 0xff, 1), .rangeAtMost(u8, 0, 255, 1) };

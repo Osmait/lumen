@@ -202,7 +202,7 @@ pub fn mkdirP(path: []const u8) void {
 /// earlier versions were 0755, with world-readable files inside.
 pub fn makePrivate(path: []const u8) void {
     var buf: [4096]u8 = undefined;
-    const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return;
+    const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{path}, 0) catch return;
     _ = linux.chmod(z, 0o700);
 }
 
@@ -234,7 +234,7 @@ test "special files are refused without blocking" {
     var dbuf: [4096]u8 = undefined;
     const dir = try tmpDirPath(&tmp, &dbuf);
     var pbuf: [4096]u8 = undefined;
-    const fifo = try std.fmt.bufPrintZ(&pbuf, "{s}/pipe", .{dir});
+    const fifo = try std.fmt.bufPrintSentinel(&pbuf, "{s}/pipe", .{dir}, 0);
     _ = linux.mknodat(linux.AT.FDCWD, fifo, linux.S.IFIFO | 0o600, 0);
     var buf: [64]u8 = undefined;
     // Each of these used to block forever on a FIFO with no writer.
@@ -272,7 +272,7 @@ test "Lumen's files and directories are owner-only" {
     const sub = try std.fmt.bufPrint(&pbuf, "{s}/cache/lumen", .{dir});
     mkdirP(sub);
     var fbuf: [4096]u8 = undefined;
-    const f = try std.fmt.bufPrintZ(&fbuf, "{s}/x.idx", .{sub});
+    const f = try std.fmt.bufPrintSentinel(&fbuf, "{s}/x.idx", .{sub}, 0);
     try writeFile(f, "data");
     const mode = struct {
         fn of(p: [*:0]const u8) u32 {
@@ -282,9 +282,9 @@ test "Lumen's files and directories are owner-only" {
         }
     }.of;
     var zbuf: [4096]u8 = undefined;
-    try std.testing.expectEqual(@as(u32, 0o700), mode(try std.fmt.bufPrintZ(&zbuf, "{s}", .{sub})));
+    try std.testing.expectEqual(@as(u32, 0o700), mode(try std.fmt.bufPrintSentinel(&zbuf, "{s}", .{sub}, 0)));
     try std.testing.expectEqual(@as(u32, 0o600), mode(f));
-    _ = linux.chmod(try std.fmt.bufPrintZ(&zbuf, "{s}", .{sub}), 0o755);
+    _ = linux.chmod(try std.fmt.bufPrintSentinel(&zbuf, "{s}", .{sub}, 0), 0o755);
     makePrivate(sub);
-    try std.testing.expectEqual(@as(u32, 0o700), mode(try std.fmt.bufPrintZ(&zbuf, "{s}", .{sub})));
+    try std.testing.expectEqual(@as(u32, 0o700), mode(try std.fmt.bufPrintSentinel(&zbuf, "{s}", .{sub}, 0)));
 }

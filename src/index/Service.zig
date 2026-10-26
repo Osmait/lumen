@@ -75,7 +75,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, root: []const u8, cache_path: []con
     s.cfg = .{ .roots = &s.roots };
 
     var base = Store.open(s.cache_path) catch blk: {
-        var b: store_mod.Builder = .{};
+        var b: store_mod.Builder = .empty;
         break :blk try b.finish(gpa);
     };
     s.live = Live.initUnarmed(gpa, base, &s.cfg, s.cache_path, s.scan_pool) catch |err| {
@@ -172,7 +172,7 @@ fn rescan(s: *Service) void {
 }
 
 fn run(s: *Service) void {
-    var arena_state = std.heap.ArenaAllocator.init(s.gpa);
+    var arena_state: std.heap.ArenaAllocator = .init(s.gpa);
     defer arena_state.deinit();
     while (!s.stop.load(.acquire)) {
         // A pending rescan goes first: arming watches on an index about to be
@@ -228,7 +228,7 @@ const testing = std.testing;
 
 fn touch(dir: []const u8, name: []const u8) !void {
     var buf: [4096]u8 = undefined;
-    const p = try std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, name });
+    const p = try std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ dir, name }, 0);
     try sys.writeFile(p, "x");
 }
 
@@ -259,7 +259,7 @@ test "live: new, nested and deleted files show up without a rescan" {
     const idx = try std.fmt.bufPrint(&idx_buf, "{s}/../lumen-test-{s}.idx", .{ abs, tmp.sub_path });
     const s = try Service.start(gpa, testing.io, abs, idx);
     defer s.shutdown();
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
@@ -273,20 +273,20 @@ test "live: new, nested and deleted files show up without a rescan" {
 
     // A new directory with content inside (scanned whole on creation).
     var dbuf: [4096]u8 = undefined;
-    const sub = try std.fmt.bufPrintZ(&dbuf, "{s}/fresh_dir", .{abs});
+    const sub = try std.fmt.bufPrintSentinel(&dbuf, "{s}/fresh_dir", .{abs}, 0);
     _ = std.os.linux.mkdir(sub, 0o755);
     try touch(sub, "inner_walrus.txt");
     try testing.expect(try waitFor(s, arena, "inner_walrus", true));
 
     // Deleting the base file and the delta file removes both.
     var fbuf: [4096]u8 = undefined;
-    _ = std.os.linux.unlink(try std.fmt.bufPrintZ(&fbuf, "{s}/first_note.md", .{abs}));
+    _ = std.os.linux.unlink(try std.fmt.bufPrintSentinel(&fbuf, "{s}/first_note.md", .{abs}, 0));
     try testing.expect(try waitFor(s, arena, "first_note", false));
-    _ = std.os.linux.unlink(try std.fmt.bufPrintZ(&fbuf, "{s}/inner_walrus.txt", .{sub}));
+    _ = std.os.linux.unlink(try std.fmt.bufPrintSentinel(&fbuf, "{s}/inner_walrus.txt", .{sub}, 0));
     try testing.expect(try waitFor(s, arena, "inner_walrus", false));
 
     var cbuf: [4096]u8 = undefined;
-    _ = std.os.linux.unlink(try std.fmt.bufPrintZ(&cbuf, "{s}", .{idx}));
+    _ = std.os.linux.unlink(try std.fmt.bufPrintSentinel(&cbuf, "{s}", .{idx}, 0));
 }
 
 /// Absolute path of a testing tmp dir.
@@ -324,7 +324,7 @@ fn waitHas(s: *Service, arena: std.mem.Allocator, query: []const u8, suffix: []c
 
 fn mkdirAbs(dir: []const u8, name: []const u8) !void {
     var buf: [4096]u8 = undefined;
-    _ = std.os.linux.mkdir(try std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, name }), 0o755);
+    _ = std.os.linux.mkdir(try std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ dir, name }, 0), 0o755);
 }
 
 test "service: a flooded queue ends in a rescan that finds everything" {
@@ -344,7 +344,7 @@ test "service: a flooded queue ends in a rescan that finds everything" {
     var ibuf: [4096]u8 = undefined;
     const s = try Service.start(gpa, testing.io, root, try std.fmt.bufPrint(&ibuf, "{s}/files.idx", .{dir}));
     defer s.shutdown();
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     try settle(s);
@@ -405,7 +405,7 @@ test "service: files created while the first rescan runs are not lost" {
     var ibuf: [4096]u8 = undefined;
     const s = try Service.start(gpa, testing.io, root, try std.fmt.bufPrint(&ibuf, "{s}/files.idx", .{dir}));
     defer s.shutdown();
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
@@ -436,8 +436,8 @@ test "service: shutdown saves what was learned and the next start maps it" {
     const root = try std.fmt.bufPrint(&rbuf, "{s}/root", .{dir});
     try touch(root, "Cargo.toml");
     var ibuf: [4096]u8 = undefined;
-    const idx = try std.fmt.bufPrintZ(&ibuf, "{s}/files.idx", .{dir});
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    const idx = try std.fmt.bufPrintSentinel(&ibuf, "{s}/files.idx", .{dir}, 0);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
@@ -459,7 +459,7 @@ test "service: shutdown saves what was learned and the next start maps it" {
     defer saved.deinit(gpa);
     const pool = try Pool.create(gpa, testing.io, 0);
     defer pool.destroy();
-    var e: engine.Engine = .{};
+    var e: engine.Engine = .empty;
     defer e.deinit(gpa);
     var hits: std.ArrayList(engine.Hit) = .empty;
     defer hits.deinit(gpa);
@@ -485,7 +485,7 @@ test "service: the delta threshold triggers a compaction" {
     var ibuf: [4096]u8 = undefined;
     const s = try Service.start(gpa, testing.io, root, try std.fmt.bufPrint(&ibuf, "{s}/files.idx", .{dir}));
     defer s.shutdown();
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     try settle(s);

@@ -38,7 +38,7 @@ pub fn main(init: std.process.Init) !void {
     });
 
     if (!std.mem.eql(u8, cmd, "bench")) {
-        var e: index.search.Engine = .{};
+        var e: index.search.Engine = .empty;
         defer e.deinit(gpa);
         var hits: std.ArrayList(index.search.Hit) = .empty;
         defer hits.deinit(gpa);
@@ -68,7 +68,7 @@ pub fn main(init: std.process.Init) !void {
     defer want.deinit(gpa);
     std.debug.print("\n{s:<12} {s:>10} {s:>10} {s:>10} {s:>8}\n", .{ "query", "cold ms", "+recency", "exhaust.", "recall" });
     for (queries) |q| {
-        var e: index.search.Engine = .{};
+        var e: index.search.Engine = .empty;
         defer e.deinit(gpa);
         t = sys.monotonicNs();
         try e.search(gpa, pool, &mapped, q, 20, .{ .recency = false }, &hits);
@@ -93,7 +93,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     std.debug.print("\ntyping \"cargo.toml\" letter by letter (engine reused):\n", .{});
-    var e: index.search.Engine = .{};
+    var e: index.search.Engine = .empty;
     defer e.deinit(gpa);
     const typed = "cargo.toml";
     for (1..typed.len + 1) |n| {
@@ -116,7 +116,7 @@ fn plainText(_: *anyopaque, d: index.content.DocIn, buf: *std.ArrayList(u8), gpa
 }
 
 fn contentBench(gpa: std.mem.Allocator, io: std.Io, pool: *index.Pool, root: []const u8, one_query: ?[]const u8) !void {
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var t = sys.monotonicNs();
@@ -164,13 +164,15 @@ fn contentLive(gpa: std.mem.Allocator, io: std.Io, pool: *index.Pool, xdg_cache:
     const cs = try index.ContentService.start(gpa, io, home, cache, pool, build_pool);
     defer cs.shutdown();
     while (!cs.status().ready) sys.sleepUs(10_000);
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     var hits: std.ArrayList(index.ContentService.Hit) = .empty;
     const queries = [_][]const u8{ "Arena", "ArenaAlloc", "ArenaAllocator", "TODO", "useState", "fn main", "the", "binary search", "zzqxjv" };
     std.debug.print("{s:<16} {s:>9} {s:>9} {s:>9}\n", .{ "query", "hits", "1st ms", "2nd ms" });
     for (queries) |q| {
         _ = arena_state.reset(.retain_capacity);
+        // Its buffer lived in the arena just reset.
+        hits = .empty;
         var t = sys.monotonicNs();
         try cs.search(arena_state.allocator(), q, 50, &hits);
         const first = ms(sys.monotonicNs() - t);

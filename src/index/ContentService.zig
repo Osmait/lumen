@@ -54,6 +54,9 @@ extractions: std.atomic.Value(u32) = .init(0),
 last_list_ns: std.atomic.Value(u64) = .init(0),
 last_build_ns: std.atomic.Value(u64) = .init(0),
 last_extract_ns: std.atomic.Value(u64) = .init(0),
+/// The index in use could not be saved: retried on the next check even if
+/// nothing changed. Service thread only.
+unsaved: bool = false,
 
 pub fn start(gpa: std.mem.Allocator, io: Io, root: []const u8, cache_dir: []const u8, search_pool: *Pool, build_pool: *Pool) !*ContentService {
     return startWith(gpa, io, root, cache_dir, search_pool, build_pool, .{});
@@ -182,7 +185,7 @@ pub fn search(s: *ContentService, arena: std.mem.Allocator, query: []const u8, l
 /// The file holding a document's text, for verification (see PathFn).
 fn pathOf(ctx: *anyopaque, d: content.DocIn, buf: []u8) ?[:0]const u8 {
     const s: *ContentService = @ptrCast(@alignCast(ctx));
-    if (d.source == .plain) return std.fmt.bufPrintZ(buf, "{s}", .{d.path}) catch null;
+    if (d.source == .plain) return std.fmt.bufPrintSentinel(buf, "{s}", .{d.path}, 0) catch null;
     return s.textPath(buf, d);
 }
 
@@ -232,7 +235,7 @@ fn textOf(ctx: *anyopaque, d: content.DocIn, buf: *std.ArrayList(u8), gpa: std.m
 }
 
 fn textPath(s: *ContentService, buf: []u8, d: content.DocIn) ?[:0]const u8 {
-    return std.fmt.bufPrintZ(buf, "{s}/{x:0>16}-{d}.txt", .{ s.text_dir, std.hash.Wyhash.hash(0, d.path), d.mtime }) catch null;
+    return std.fmt.bufPrintSentinel(buf, "{s}/{x:0>16}-{d}.txt", .{ s.text_dir, std.hash.Wyhash.hash(0, d.path), d.mtime }, 0) catch null;
 }
 
 /// Extracts what is missing from the text cache, on the background pool
@@ -261,7 +264,7 @@ fn extractMissing(s: *ContentService, docs: []const content.DocIn) void {
             var zbuf: [4096]u8 = undefined;
             const tp = svc.textPath(&tbuf, d) orelse return;
             const kind = extract.kindOf(d.path) orelse return;
-            const src = std.fmt.bufPrintZ(&zbuf, "{s}", .{d.path}) catch return;
+            const src = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{d.path}, 0) catch return;
             const text = extract.extractText(svc.gpa, svc.io, src, kind, max_extracted) catch |err| switch (err) {
                 error.ToolFailed, error.NotRegular, error.Access, error.NotFound => "",
                 else => {
@@ -295,7 +298,7 @@ fn refresh(s: *ContentService) void {
     s.last_check_ns.store(sys.monotonicNs(), .release);
     // Counted when done, so `checks` going up means its result is visible.
     defer _ = s.checks.fetchAdd(1, .release);
-    var arena_state = std.heap.ArenaAllocator.init(s.gpa);
+    var arena_state: std.heap.ArenaAllocator = .init(s.gpa);
     defer arena_state.deinit();
     var t = sys.monotonicNs();
     const docs = content_list.list(arena_state.allocator(), s.gpa, s.io, s.root, true) catch |err| {
@@ -303,7 +306,10 @@ fn refresh(s: *ContentService) void {
         return;
     };
     s.last_list_ns.store(sys.monotonicNs() - t, .monotonic);
-    if (s.unchanged(docs)) return;
+    if (s.unchanged(docs)) {
+        if (s.unsaved) s.retrySave();
+        return;
+    }
 
     s.building.store(true, .release);
     defer s.building.store(false, .release);
@@ -321,15 +327,19 @@ fn refresh(s: *ContentService) void {
     _ = s.builds.fetchAdd(1, .release);
     // Save, then serve the mapping of what was saved: clean page cache
     // instead of tens of MB of heap.
-    if (std.mem.lastIndexOfScalar(u8, s.cache_path, '/')) |slash| sys.mkdirP(s.cache_path[0..slash]);
-    // Not saved: still served from memory, and saved again next start (the
-    // check finds the file older than the documents).
+    if (std.mem.findScalarLast(u8, s.cache_path, '/')) |slash| sys.mkdirP(s.cache_path[0..slash]);
+    // Not saved: still served from memory, and saving is retried on the
+    // next check (a full disk, a read-only cache).
     if (fresh.save(s.cache_path)) |_| {
+        s.unsaved = false;
         if (content.Index.open(s.cache_path)) |mapped| {
             fresh.deinit(s.gpa);
             fresh = mapped;
         } else |_| {}
-    } else |err| log.warn("saving the content index: {t}", .{err});
+    } else |err| {
+        s.unsaved = true;
+        log.warn("saving the content index: {t}", .{err});
+    }
 
     var old = blk: {
         s.lock.lockUncancelable(s.io);
@@ -342,6 +352,17 @@ fn refresh(s: *ContentService) void {
         s.dropStaleText(o, docs);
         o.deinit(s.gpa);
     }
+}
+
+fn retrySave(s: *ContentService) void {
+    s.lock.lockSharedUncancelable(s.io);
+    defer s.lock.unlockShared(s.io);
+    const ix = s.index orelse return;
+    ix.save(s.cache_path) catch |err| {
+        log.warn("saving the content index: {t}", .{err});
+        return;
+    };
+    s.unsaved = false;
 }
 
 /// Deletes the cached text of document versions that are gone (edited or
@@ -459,7 +480,7 @@ fn setMtime(path: [:0]const u8, sec: i64) !void {
 /// Files in the text cache whose name starts with `prefix`.
 fn countText(s: *ContentService, prefix: []const u8) !usize {
     var buf: [4096]u8 = undefined;
-    const fd = try sys.openDir(try std.fmt.bufPrintZ(&buf, "{s}", .{s.text_dir}));
+    const fd = try sys.openDir(try std.fmt.bufPrintSentinel(&buf, "{s}", .{s.text_dir}, 0));
     defer sys.close(fd);
     var it: sys.DirIter = .{ .fd = fd };
     var n: usize = 0;
@@ -588,7 +609,7 @@ test "content service: Office documents are extracted once per version" {
         try testing.expectEqualStrings("Minutes about the wombat project", text);
         // Asked as plain text, the zip is not the text.
         if (s.readText(f.arena_state.allocator(), hits[0].path, hits[0].mtime, false, std.math.maxInt(u32))) |raw| {
-            try testing.expect(std.mem.indexOf(u8, raw, "wombat") == null);
+            try testing.expect(std.mem.find(u8, raw, "wombat") == null);
         }
 
         // Unchanged: neither extracted nor rebuilt again (the broken one too).

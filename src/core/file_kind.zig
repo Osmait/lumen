@@ -98,7 +98,7 @@ pub fn of(mime: []const u8, name: []const u8, is_dir: bool) ?Kind {
 /// ".log" for "server.LOG": the key an extension override is stored under
 /// (lowercase, with the dot). Empty when the name has no extension.
 pub fn extKey(buf: []u8, name: []const u8) []const u8 {
-    const dot = std.mem.lastIndexOfScalar(u8, name, '.') orelse return "";
+    const dot = std.mem.findScalarLast(u8, name, '.') orelse return "";
     if (dot == 0 or name.len - dot > buf.len or name.len - dot < 2) return "";
     return std.ascii.lowerString(buf, name[dot..]);
 }

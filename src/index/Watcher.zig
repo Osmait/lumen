@@ -9,6 +9,8 @@
 //!
 //! fanotify with FAN_MARK_FILESYSTEM would need one mark, but requires
 //! CAP_SYS_ADMIN: not for a user launcher.
+//!
+//! Not thread-safe: its owner (`Live`) is used under the service's lock.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -42,8 +44,10 @@ pub const Change = union(enum) {
 pub fn create(gpa: std.mem.Allocator) !*Watcher {
     const rc = linux.inotify_init1(linux.IN.NONBLOCK | linux.IN.CLOEXEC);
     if (linux.errno(rc) != .SUCCESS) return error.Inotify;
+    const fd: i32 = @intCast(rc);
+    errdefer sys.close(fd);
     const w = try gpa.create(Watcher);
-    w.* = .{ .fd = @intCast(rc) };
+    w.* = .{ .fd = fd };
     return w;
 }
 
@@ -157,18 +161,18 @@ test "watcher: events become changes attributed to the watched entry" {
     const dir = try tmpAbs(&tmp, &dbuf);
     const w = try create(gpa);
     defer w.destroy(gpa);
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     var b1: [4096]u8 = undefined;
     var b2: [4096]u8 = undefined;
-    try w.watch(gpa, try std.fmt.bufPrintZ(&b1, "{s}", .{dir}), 7);
-    try sys.writeFile(try std.fmt.bufPrintZ(&b1, "{s}/f", .{dir}), "x");
-    const d = try std.fmt.bufPrintZ(&b2, "{s}/d", .{dir});
+    try w.watch(gpa, try std.fmt.bufPrintSentinel(&b1, "{s}", .{dir}, 0), 7);
+    try sys.writeFile(try std.fmt.bufPrintSentinel(&b1, "{s}/f", .{dir}, 0), "x");
+    const d = try std.fmt.bufPrintSentinel(&b2, "{s}/d", .{dir}, 0);
     _ = linux.mkdir(d, 0o755);
-    try sys.rename(try std.fmt.bufPrintZ(&b1, "{s}/f", .{dir}), try std.fmt.bufPrintZ(&b2, "{s}/g", .{dir}));
-    _ = linux.unlink(try std.fmt.bufPrintZ(&b1, "{s}/g", .{dir}));
+    try sys.rename(try std.fmt.bufPrintSentinel(&b1, "{s}/f", .{dir}, 0), try std.fmt.bufPrintSentinel(&b2, "{s}/g", .{dir}, 0));
+    _ = linux.unlink(try std.fmt.bufPrintSentinel(&b1, "{s}/g", .{dir}, 0));
 
     var changes: std.ArrayList(Change) = .empty;
     try w.drain(arena, &changes);
@@ -186,9 +190,9 @@ test "watcher: events become changes attributed to the watched entry" {
     try testing.expectEqualStrings("g", c[4].removed.name);
 
     // The directory itself going away, and its watch with it.
-    try w.watch(gpa, try std.fmt.bufPrintZ(&b2, "{s}/d", .{dir}), 8);
+    try w.watch(gpa, try std.fmt.bufPrintSentinel(&b2, "{s}/d", .{dir}, 0), 8);
     try testing.expectEqual(2, w.count());
-    _ = linux.rmdir(try std.fmt.bufPrintZ(&b2, "{s}/d", .{dir}));
+    _ = linux.rmdir(try std.fmt.bufPrintSentinel(&b2, "{s}/d", .{dir}, 0));
     changes.clearRetainingCapacity();
     try w.drain(arena, &changes);
     var gone = false;
@@ -197,9 +201,9 @@ test "watcher: events become changes attributed to the watched entry" {
     try testing.expectEqual(1, w.count());
 
     // Watching an inode again re-points it: one watch, the new id.
-    try w.watch(gpa, try std.fmt.bufPrintZ(&b1, "{s}", .{dir}), 9);
+    try w.watch(gpa, try std.fmt.bufPrintSentinel(&b1, "{s}", .{dir}, 0), 9);
     try testing.expectEqual(1, w.count());
-    try sys.writeFile(try std.fmt.bufPrintZ(&b1, "{s}/h", .{dir}), "x");
+    try sys.writeFile(try std.fmt.bufPrintSentinel(&b1, "{s}/h", .{dir}, 0), "x");
     changes.clearRetainingCapacity();
     try w.drain(arena, &changes);
     try testing.expect(changes.items.len == 1 and changes.items[0].created.parent == 9);
@@ -219,18 +223,18 @@ test "watcher: a flooded queue reports the overflow in one drain" {
     defer w.destroy(gpa);
     var a: [4096]u8 = undefined;
     var b: [4096]u8 = undefined;
-    try w.watch(gpa, try std.fmt.bufPrintZ(&a, "{s}", .{dir}), 0);
+    try w.watch(gpa, try std.fmt.bufPrintSentinel(&a, "{s}", .{dir}, 0), 0);
     // 48-byte events: 64 KiB is not a whole number of them, so read() never
     // fills the buffer to the byte.
-    const pa = try std.fmt.bufPrintZ(&a, "{s}/rename_target_a_xx", .{dir});
-    const pb = try std.fmt.bufPrintZ(&b, "{s}/rename_target_b_xx", .{dir});
+    const pa = try std.fmt.bufPrintSentinel(&a, "{s}/rename_target_a_xx", .{dir}, 0);
+    const pb = try std.fmt.bufPrintSentinel(&b, "{s}/rename_target_b_xx", .{dir}, 0);
     try sys.writeFile(pa, "x");
     // Two events per rename, never coalesced (different cookies).
     for (0..max_queued / 2 + 100) |i| {
         if (i % 2 == 0) try sys.rename(pa, pb) else try sys.rename(pb, pa);
     }
 
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     var changes: std.ArrayList(Change) = .empty;
     try w.drain(arena_state.allocator(), &changes);

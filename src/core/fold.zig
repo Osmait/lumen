@@ -128,8 +128,8 @@ pub fn foldCase(buf: []u8, upper: []bool, s: []const u8) usize {
     return n;
 }
 
-/// The folded string, allocated.
-pub fn foldAlloc(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
+/// The folded string. Caller owns it.
+pub fn foldAlloc(gpa: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error![]u8 {
     const buf = try gpa.alloc(u8, s.len);
     errdefer gpa.free(buf);
     return gpa.realloc(buf, foldInto(buf, s).len);

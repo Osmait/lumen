@@ -29,7 +29,7 @@ pub fn score(query_in: []const u8, text_in: []const u8) i32 {
     if (query.len > text.len) return no_match;
 
     // A plain substring is the strongest signal; a prefix more so.
-    if (std.mem.indexOf(u8, text, query)) |at| {
+    if (std.mem.find(u8, text, query)) |at| {
         var s: i32 = 1000 - @as(i32, @intCast(@min(at, 200)));
         if (at == 0) s += 500 else if (isBoundary(text, upper, at)) s += 250;
         if (query.len == text.len) s += 300;

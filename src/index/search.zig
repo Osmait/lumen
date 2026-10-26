@@ -58,7 +58,11 @@ const Pair = struct {
 };
 
 /// Stateful: remembers the previous query's candidates to refine them.
+/// One query's refinement cache. Not thread-safe: the owner serializes
+/// searches (Service holds its lock).
 pub const Engine = struct {
+    pub const empty: Engine = .{};
+
     last_query: std.ArrayList(u8) = .empty,
     last_candidates: std.ArrayList(u32) = .empty,
     cache_valid: bool = false,
@@ -66,6 +70,7 @@ pub const Engine = struct {
     pub fn deinit(e: *Engine, gpa: std.mem.Allocator) void {
         e.last_query.deinit(gpa);
         e.last_candidates.deinit(gpa);
+        e.* = undefined;
     }
 
     pub fn reset(e: *Engine) void {
@@ -399,7 +404,7 @@ fn cheapCore(comptime mode: CheapMode, name: []const u8, upper: []const bool, q:
     s -= @as(i32, @intCast(name.len / 4));
     // The name IS the query, with or without its extension: people type
     // "readme" for README.md as much as for README.
-    const stem_len = std.mem.lastIndexOfScalar(u8, name, '.') orelse name.len;
+    const stem_len = std.mem.findScalarLast(u8, name, '.') orelse name.len;
     if (name.len == q.len or (stem_len > 0 and stem_len == q.len)) s += 120;
     return s;
 }
@@ -473,7 +478,7 @@ test "selectTop keeps the best k" {
 }
 
 fn synthetic(gpa: std.mem.Allocator, n_dirs: usize) !Store {
-    var b: store_mod.Builder = .{};
+    var b: store_mod.Builder = .empty;
     const words = [_][]const u8{ "cargo", "config", "main", "readme", "notes", "src", "test", "build", "lib", "index", "photo", "draft", "Configuración", "español", "ÑANDÚ", "über", "AñoNuevo" };
     const exts = [_][]const u8{ ".toml", ".rs", ".md", ".zig", ".json", ".png", "" };
     var prng = std.Random.DefaultPrng.init(42);
@@ -503,7 +508,7 @@ test "cascade matches the exhaustive reference (recall 100%)" {
     defer s.deinit(gpa);
     const pool = try Pool.create(gpa, testing.io, 3);
     defer pool.destroy();
-    var e: Engine = .{};
+    var e: Engine = .empty;
     defer e.deinit(gpa);
     var got: std.ArrayList(Hit) = .empty;
     defer got.deinit(gpa);
@@ -523,14 +528,14 @@ test "cascade matches the exhaustive reference (recall 100%)" {
 }
 
 fn smallStore(gpa: std.mem.Allocator, names: []const []const u8) !Store {
-    var b: store_mod.Builder = .{};
+    var b: store_mod.Builder = .empty;
     const root = try b.push(gpa, "/r", store_mod.no_parent, store_mod.flag_dir, 0);
     for (names) |n| _ = try b.push(gpa, n, root, 0, 1);
     return b.finish(gpa);
 }
 
 fn topName(gpa: std.mem.Allocator, pool: *Pool, s: *const Store, q: []const u8) ![]const u8 {
-    var e: Engine = .{};
+    var e: Engine = .empty;
     defer e.deinit(gpa);
     var got: std.ArrayList(Hit) = .empty;
     defer got.deinit(gpa);

@@ -111,7 +111,7 @@ settings: Settings,
 settings_path: [:0]const u8 = "",
 /// The settings file as last read or written: a different one on disk was
 /// edited by hand.
-settings_stamp: settings_mod.Stamp = .{},
+settings_stamp: settings_mod.Stamp = .none,
 /// Called after the settings change (main starts or stops the clipboard
 /// watcher).
 on_settings_changed: ?*const fn () void = null,
@@ -291,8 +291,8 @@ fn makeBackdrop(self: *Ui) *c.GtkWidget {
     c.gtk_layer_set_layer(w, c.GTK_LAYER_SHELL_LAYER_OVERLAY);
     c.gtk_layer_set_keyboard_mode(w, c.GTK_LAYER_SHELL_KEYBOARD_MODE_NONE);
     c.gtk_layer_set_namespace(w, "lumen-backdrop");
-    inline for (.{ c.GTK_LAYER_SHELL_EDGE_LEFT, c.GTK_LAYER_SHELL_EDGE_RIGHT, c.GTK_LAYER_SHELL_EDGE_TOP, c.GTK_LAYER_SHELL_EDGE_BOTTOM }) |edge|
-        c.gtk_layer_set_anchor(w, edge, 1);
+    const edges = [_]c_int{ c.GTK_LAYER_SHELL_EDGE_LEFT, c.GTK_LAYER_SHELL_EDGE_RIGHT, c.GTK_LAYER_SHELL_EDGE_TOP, c.GTK_LAYER_SHELL_EDGE_BOTTOM };
+    for (edges) |edge| c.gtk_layer_set_anchor(w, edge, 1);
     // Over the bars too: a click on them closes Lumen as well.
     c.gtk_layer_set_exclusive_zone(w, -1);
     const click = c.gtk_gesture_click_new();
@@ -513,7 +513,7 @@ fn choiceOptions(self: *Ui, a: std.mem.Allocator, ch: settings_mod.Choice) []con
             var out: std.ArrayList(Option) = .empty;
             const list: []const [2][:0]const u8 = if (ch == .terminal) &settings_mod.terminals else &settings_mod.editors;
             const auto_cmd: []const u8 = if (ch == .terminal) run.autoTerminal() else run.autoEditor();
-            const auto_base = std.fs.path.basename(auto_cmd);
+            const auto_base = std.Io.Dir.path.basename(auto_cmd);
             var auto_name: []const u8 = auto_base;
             for (list) |e| if (std.mem.eql(u8, e[0], auto_base)) {
                 auto_name = e[1];
@@ -806,7 +806,7 @@ fn performSetting(self: *Ui, s: item_mod.Setting, op: item_mod.Op) void {
             if (self.choosing != .file) return;
             const f = self.choosing.file;
             if (op == .always_use) {
-                const name = std.fs.path.basename(f.path);
+                const name = std.Io.Dir.path.basename(f.path);
                 var ebuf: [16]u8 = undefined;
                 const key: []const u8 = if (core.file_kind.of(f.mime, name, false)) |k| @tagName(k) else core.file_kind.extKey(&ebuf, name);
                 if (key.len > 0) {
@@ -917,7 +917,7 @@ pub fn hide(self: *Ui) void {
 /// Puts the window on the monitor Hyprland has focused, a bit above centre.
 fn placeOnFocusedMonitor(self: *Ui) void {
     if (testMode()) return;
-    var arena = std.heap.ArenaAllocator.init(self.gpa);
+    var arena: std.heap.ArenaAllocator = .init(self.gpa);
     defer arena.deinit();
     const name = hypr.focusedMonitorName(arena.allocator()) orelse return;
     const monitors = c.gdk_display_get_monitors(c.gdk_display_get_default() orelse return);
@@ -1411,7 +1411,7 @@ fn iconWidget(icon: item_mod.Icon, size: c_int) *c.GtkWidget {
             c.gtk_image_set_pixel_size(@ptrCast(img), @divTrunc(size, 2) + 2);
             c.gtk_widget_add_css_class(img, "tile");
             var cls: [24:0]u8 = undefined;
-            const name = std.fmt.bufPrintZ(&cls, "tile-{t}", .{t.color}) catch "tile-gray";
+            const name = std.fmt.bufPrintSentinel(&cls, "tile-{t}", .{t.color}, 0) catch "tile-gray";
             c.gtk_widget_add_css_class(img, name.ptr);
             c.gtk_widget_set_valign(img, c.GTK_ALIGN_CENTER);
             return img;
@@ -1428,7 +1428,7 @@ fn iconWidget(icon: item_mod.Icon, size: c_int) *c.GtkWidget {
             const l = label(b.text, "badge");
             c.gtk_label_set_xalign(@ptrCast(l), 0.5);
             var cls: [24:0]u8 = undefined;
-            const name = std.fmt.bufPrintZ(&cls, "badge-{t}", .{b.color}) catch "badge-gray";
+            const name = std.fmt.bufPrintSentinel(&cls, "badge-{t}", .{b.color}, 0) catch "badge-gray";
             c.gtk_widget_add_css_class(l, name.ptr);
             // Longer extensions get a smaller font so the tile keeps its size.
             if (b.text.len >= 4) c.gtk_widget_add_css_class(l, "badge-long");
@@ -1564,7 +1564,7 @@ fn itemsFromHits(self: *Ui, a: std.mem.Allocator, hits: []const index.ContentSer
     var out: std.ArrayList(Item) = .empty;
     for (hits) |h| {
         const path = a.dupeZ(u8, h.path) catch continue;
-        const slash = std.mem.lastIndexOfScalar(u8, h.path, '/') orelse 0;
+        const slash = std.mem.findScalarLast(u8, h.path, '/') orelse 0;
         out.append(a, .{
             .title = displayText(a, h.path[slash + 1 ..]),
             // The list is narrow beside the preview: the folder goes to the
@@ -1629,7 +1629,7 @@ fn displayText(a: std.mem.Allocator, raw: []const u8) [:0]const u8 {
 /// The lines around the match, words highlighted.
 fn showContentDetail(self: *Ui, it: *const Item) void {
     const f = it.action.file;
-    var arena = std.heap.ArenaAllocator.init(self.gpa);
+    var arena: std.heap.ArenaAllocator = .init(self.gpa);
     defer arena.deinit();
     const a = arena.allocator();
     c.gtk_widget_set_visible(self.detail_picture, 0);
@@ -1713,7 +1713,7 @@ fn fileItems(self: *Ui, a: std.mem.Allocator, q: []const u8, limit: usize) []Ite
     var out: std.ArrayList(Item) = .empty;
     for (hits.items) |h| {
         const path = a.dupeZ(u8, h.path) catch continue;
-        const slash = std.mem.lastIndexOfScalar(u8, h.path, '/') orelse 0;
+        const slash = std.mem.findScalarLast(u8, h.path, '/') orelse 0;
         const where = homeRelative(a, h.path[0..slash]);
         out.append(a, .{
             .key = std.fmt.allocPrint(a, "file:{s}", .{h.path}) catch "",
@@ -1731,7 +1731,7 @@ fn fileItems(self: *Ui, a: std.mem.Allocator, q: []const u8, limit: usize) []Ite
 /// badge for code and text, the theme's icon for the rest.
 fn fileIcon(self: *Ui, path: [:0]const u8, is_dir: bool) item_mod.Icon {
     if (!is_dir) {
-        const slash = std.mem.lastIndexOfScalar(u8, path, '/');
+        const slash = std.mem.findScalarLast(u8, path, '/');
         const name = if (slash) |s| path[s + 1 ..] else path;
         if (core.file_badge.logoOf(name)) |l| return .{ .logo = l };
         var upper: [4]u8 = undefined;
@@ -1761,7 +1761,7 @@ fn filesHint(self: *Ui, a: std.mem.Allocator) [:0]const u8 {
 
 fn showFileDetail(self: *Ui, it: *const Item) void {
     const f = it.action.file;
-    var arena = std.heap.ArenaAllocator.init(self.gpa);
+    var arena: std.heap.ArenaAllocator = .init(self.gpa);
     defer arena.deinit();
     const a = arena.allocator();
 
@@ -1781,7 +1781,7 @@ fn showFileDetail(self: *Ui, it: *const Item) void {
     if (!image and !f.is_dir) {
         const head = index.sys.readHead(f.path, a.alloc(u8, 4096) catch return);
         const valid = validUtf8Prefix(head);
-        if (valid.len + 4 >= head.len and std.mem.indexOfScalar(u8, valid, 0) == null) text = firstLines(valid, preview_lines);
+        if (valid.len + 4 >= head.len and std.mem.findScalar(u8, valid, 0) == null) text = firstLines(valid, preview_lines);
     }
     c.gtk_label_set_text(@ptrCast(self.detail_text), (a.dupeZ(u8, text) catch return).ptr);
 
@@ -1803,7 +1803,7 @@ fn kindLabel(a: std.mem.Allocator, path: []const u8, is_dir: bool, ctype: ?[*:0]
     if (is_dir) return "Folder";
     const desc = if (ctype) |t| c.g_content_type_get_description(t) else null;
     defer if (desc) |d| c.g_free(d);
-    const name = if (std.mem.lastIndexOfScalar(u8, path, '/')) |s| path[s + 1 ..] else path;
+    const name = if (std.mem.findScalarLast(u8, path, '/')) |s| path[s + 1 ..] else path;
     var upper: [4]u8 = undefined;
     if (core.file_badge.of(name, &upper)) |b| {
         const t = if (ctype) |t| std.mem.span(t) else "";
@@ -1857,7 +1857,7 @@ fn showDetail(self: *Ui, it: ?*const Item) void {
         for (self.meta_values) |v| c.gtk_label_set_text(@ptrCast(v), "");
         return;
     };
-    var arena = std.heap.ArenaAllocator.init(self.gpa);
+    var arena: std.heap.ArenaAllocator = .init(self.gpa);
     defer arena.deinit();
     const a = arena.allocator();
     const text = i.detail[0..@min(i.detail.len, 20_000)];
@@ -2209,7 +2209,7 @@ fn validUtf8Prefix(s: []const u8) []const u8 {
 }
 
 test "displayText makes any file name safe for a label" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     try std.testing.expectEqualStrings("bad-\u{FFFD}\u{FFFD}-name.txt", displayText(a, "bad-\xff\xfe-name.txt"));

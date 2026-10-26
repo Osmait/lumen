@@ -49,6 +49,9 @@ pub const Ring = struct {
 
 pub const ViewStats = struct { painted: Ring = .{}, search: Ring = .{}, rows: Ring = .{} };
 
+// The latency figures below are written and read on the GTK main thread
+// only (refresh, frame clock, `--stats`): plain globals are enough.
+
 pub var views: [std.meta.fields(View).len]ViewStats = @splat(.{});
 /// Window shown -> first painted frame.
 pub var show: Ring = .{};
@@ -98,7 +101,7 @@ fn mb(bytes: usize) f64 {
 
 /// `VmRSS:  1234 kB` style fields of /proc/self/status, in MB.
 fn procField(status: []const u8, key: []const u8) f64 {
-    const at = std.mem.indexOf(u8, status, key) orelse return 0;
+    const at = std.mem.find(u8, status, key) orelse return 0;
     var it = std.mem.tokenizeAny(u8, status[at + key.len ..], " \t:");
     const kb = std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0;
     return @as(f64, @floatFromInt(kb)) / 1024;
@@ -119,8 +122,8 @@ pub fn report(gpa: std.mem.Allocator, files: ?*index.Service, contents: ?*index.
     try w.print("  RSS {d:.1} MB (anon {d:.1}, files {d:.1}, shmem {d:.1})   peak {d:.1} MB   threads {s}\n", .{
         procField(status, "VmRSS"), procField(status, "RssAnon"), procField(status, "RssFile"), procField(status, "RssShmem"), procField(status, "VmHWM"),
         std.mem.trim(u8, blk: {
-            const at = std.mem.indexOf(u8, status, "Threads:") orelse break :blk "?";
-            const end = std.mem.indexOfScalarPos(u8, status, at, '\n') orelse status.len;
+            const at = std.mem.find(u8, status, "Threads:") orelse break :blk "?";
+            const end = std.mem.findScalarPos(u8, status, at, '\n') orelse status.len;
             break :blk status[at + 8 .. end];
         }, " \t"),
     });

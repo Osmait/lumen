@@ -7,6 +7,8 @@ const std = @import("std");
 const proc = @import("proc.zig");
 const geometry = @import("core").geometry;
 
+const log = std.log.scoped(.hypr);
+
 pub const Client = struct {
     address: []const u8,
     title: []const u8,
@@ -49,7 +51,7 @@ fn query(arena: std.mem.Allocator, comptime T: type, what: [:0]const u8) ?T {
     const out = proc.output(&.{ "hyprctl", "-j", what }) orelse return null;
     defer proc.free(out);
     return parse(T, arena, out) orelse {
-        std.log.warn("hyprctl {s}: unexpected JSON", .{what});
+        log.warn("hyprctl {s}: unexpected JSON", .{what});
         return null;
     };
 }
@@ -63,7 +65,7 @@ pub fn sortByFocus(all: []Client) void {
     }.lt);
 }
 
-/// Windows ordered by last focus, most recent first.
+/// Windows ordered by last focus, most recent first; they live in `arena`.
 pub fn clients(arena: std.mem.Allocator) []Client {
     const all = query(arena, []Client, "clients") orelse return &.{};
     sortByFocus(all);
@@ -108,8 +110,9 @@ pub fn focusedName(all: []const MonitorJson) ?[]const u8 {
     return null;
 }
 
-/// The argument of `hyprctl --batch`: "dispatch a ; dispatch b".
-pub fn batchString(gpa: std.mem.Allocator, commands: []const []const u8) ![:0]u8 {
+/// The argument of `hyprctl --batch`: "dispatch a ; dispatch b". Caller owns
+/// it.
+pub fn batchString(gpa: std.mem.Allocator, commands: []const []const u8) std.mem.Allocator.Error![:0]u8 {
     var cmd: std.ArrayList(u8) = .empty;
     errdefer cmd.deinit(gpa);
     for (commands, 0..) |command, i| {
@@ -132,7 +135,7 @@ pub fn dispatch(gpa: std.mem.Allocator, command: []const u8) void {
 
 /// Moves and resizes the active window for `layout`, floating it first.
 pub fn applyLayout(gpa: std.mem.Allocator, layout: geometry.Layout) void {
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const win = activeWindow(arena) orelse return;
@@ -143,7 +146,8 @@ pub fn applyLayout(gpa: std.mem.Allocator, layout: geometry.Layout) void {
 /// The dispatches that put `win` where `layout` says on `mon`. Pixel moves
 /// need a floating window (and fullscreen windows ignore them), hence the
 /// first two. `fullscreen` only acts on the active window, which `win` is.
-pub fn layoutCommands(arena: std.mem.Allocator, win: Client, mon: geometry.Monitor, layout: geometry.Layout) ![]const []const u8 {
+/// The commands live in `arena`.
+pub fn layoutCommands(arena: std.mem.Allocator, win: Client, mon: geometry.Monitor, layout: geometry.Layout) std.mem.Allocator.Error![]const []const u8 {
     const r = geometry.place(layout, mon.usable(), win.size[0], win.size[1], 8);
     var cmds: std.ArrayList([]const u8) = .empty;
     if (win.fullscreen != 0) try cmds.append(arena, "fullscreen 0");
@@ -158,7 +162,7 @@ pub fn layoutCommands(arena: std.mem.Allocator, win: Client, mon: geometry.Monit
 const testing = std.testing;
 
 test "clients: recorded output, extra fields ignored, ordered by focus" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const all = parse([]Client, arena.allocator(), @embedFile("testdata/hypr_clients.json")).?;
     try testing.expectEqual(@as(usize, 3), all.len);
@@ -170,7 +174,7 @@ test "clients: recorded output, extra fields ignored, ordered by focus" {
 }
 
 test "monitors: rotation and scale give the usable area" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const mons = parse([]MonitorJson, arena.allocator(), @embedFile("testdata/hypr_monitors.json")).?;
     try testing.expectEqualStrings("DP-1", focusedName(mons).?);
@@ -184,7 +188,7 @@ test "monitors: rotation and scale give the usable area" {
 }
 
 test "layout commands: tiled window floats first, fullscreen leaves first" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const mons = parse([]MonitorJson, a, @embedFile("testdata/hypr_monitors.json")).?;
@@ -209,7 +213,7 @@ test "layout commands: tiled window floats first, fullscreen leaves first" {
 }
 
 test "garbage or a changed shape does not crash" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     try testing.expect(parse([]Client, arena.allocator(), "not json") == null);
     try testing.expect(parse([]Client, arena.allocator(), "{\"address\": 3}") == null);

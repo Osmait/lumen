@@ -336,6 +336,8 @@ fn upperBound(xs: []const u32, v: u32) usize {
 
 /// Collects entries, then lays them out in the final buffer.
 pub const Builder = struct {
+    pub const empty: Builder = .{};
+
     names: std.ArrayList(u8) = .empty,
     name_off: std.ArrayList(u32) = .empty,
     name_len: std.ArrayList(u16) = .empty,
@@ -346,7 +348,7 @@ pub const Builder = struct {
 
     pub fn deinit(b: *Builder, gpa: std.mem.Allocator) void {
         inline for (.{ "names", "name_off", "name_len", "parent", "flags", "masks", "depth" }) |f| @field(b, f).deinit(gpa);
-        b.* = .{};
+        b.* = .empty; // reusable: `finish` leaves an empty builder
     }
 
     pub fn len(b: *const Builder) u32 {
@@ -409,7 +411,7 @@ fn put(buf: []u8, off: usize, src: anytype) void {
 const testing = std.testing;
 
 fn sample(gpa: std.mem.Allocator) !Store {
-    var b: Builder = .{};
+    var b: Builder = .empty;
     const root = try b.push(gpa, "/home/u", no_parent, flag_dir, 0);
     const proj = try b.push(gpa, "proj", root, flag_dir, 1);
     _ = try b.push(gpa, "notes.md", root, 0, 1);
@@ -447,7 +449,7 @@ test "save and map give the same index; tombstones stay in memory" {
     var dir_buf: [4096]u8 = undefined;
     const dir = try sys.tmpDirPath(&tmp, &dir_buf);
     var p_buf: [4096]u8 = undefined;
-    const p = try std.fmt.bufPrintZ(&p_buf, "{s}/idx", .{dir});
+    const p = try std.fmt.bufPrintSentinel(&p_buf, "{s}/idx", .{dir}, 0);
     try s.save(p);
 
     var m = try Store.open(p);
@@ -569,7 +571,7 @@ test "a truncated index file fails to open" {
     var dir_buf: [4096]u8 = undefined;
     const dir = try sys.tmpDirPath(&tmp, &dir_buf);
     var p_buf: [4096]u8 = undefined;
-    const p = try std.fmt.bufPrintZ(&p_buf, "{s}/idx", .{dir});
+    const p = try std.fmt.bufPrintSentinel(&p_buf, "{s}/idx", .{dir}, 0);
     try sys.writeFile(p, good[0 .. good.len - 5]);
     try testing.expectError(error.BadIndex, Store.open(p));
     try sys.writeFile(p, "not an index at all, just text");
@@ -632,7 +634,7 @@ test "fuzz: parsing arbitrary bytes never crashes" {
 
 fn fuzzBuilt(_: void, smith: *testing.Smith) anyerror!void {
     const gpa = testing.allocator;
-    var b: Builder = .{};
+    var b: Builder = .empty;
     defer b.deinit(gpa);
     const roots = smith.valueRangeAtMost(u8, 1, 3);
     for (0..roots) |_| _ = try b.push(gpa, "/r", no_parent, flag_dir, 0);

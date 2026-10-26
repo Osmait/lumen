@@ -49,7 +49,7 @@ pub fn list(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, root: 
     var zbuf: [4096]u8 = undefined;
     while (it.next()) |line| {
         const rel = if (std.mem.startsWith(u8, line, "./")) line[2..] else line;
-        const z = std.fmt.bufPrintZ(&zbuf, "{s}{s}{s}", .{ root, sep, rel }) catch continue;
+        const z = std.fmt.bufPrintSentinel(&zbuf, "{s}{s}{s}", .{ root, sep, rel }, 0) catch continue;
         const p: []const u8 = z;
         const doc_kind = documentKind(p);
         if (doc_kind and !with_documents) continue;
@@ -111,14 +111,14 @@ pub const TestTree = struct {
 
     /// Absolute path of `name` (static buffer per call site is the caller's).
     pub fn path(t: *const TestTree, buf: []u8, name: []const u8) ![:0]u8 {
-        return std.fmt.bufPrintZ(buf, "{s}/{s}", .{ t.abs, name });
+        return std.fmt.bufPrintSentinel(buf, "{s}/{s}", .{ t.abs, name }, 0);
     }
 
     /// Writes `name` (creating parent dirs) with `data`.
     pub fn write(t: *const TestTree, name: []const u8, data: []const u8) !void {
         var buf: [4096]u8 = undefined;
         const p = try t.path(&buf, name);
-        if (std.mem.lastIndexOfScalar(u8, p, '/')) |slash| sys.mkdirP(p[0..slash]);
+        if (std.mem.findScalarLast(u8, p, '/')) |slash| sys.mkdirP(p[0..slash]);
         try sys.writeFile(p, data);
     }
 
@@ -139,7 +139,7 @@ fn listRel(arena: std.mem.Allocator, t: *const TestTree, with_documents: bool) !
 test "list: what is indexed and what is excluded" {
     var t = try TestTree.init();
     defer t.deinit();
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
@@ -225,7 +225,7 @@ test "list: what is indexed and what is excluded" {
     for (got) |d| {
         try testing.expectEqual(documentKind(d.path), d.source == .extracted);
         try testing.expect(d.mtime > now - 3600 and d.mtime <= now + 1);
-        const info = sys.info(try std.fmt.bufPrintZ(&buf, "{s}", .{d.path})).?;
+        const info = sys.info(try std.fmt.bufPrintSentinel(&buf, "{s}", .{d.path}, 0)).?;
         try testing.expectEqual(info.size, d.size);
         try testing.expectEqual(info.mtime, d.mtime);
     }
@@ -246,7 +246,7 @@ test "list: a root below an excluded name still lists" {
     var t = try TestTree.init();
     defer t.deinit();
     try t.write("build/target/node_modules/me/note.txt", "x");
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const sub = try std.fmt.allocPrint(arena_state.allocator(), "{s}/build/target/node_modules/me/", .{t.abs});
     const got = list(arena_state.allocator(), testing.allocator, testing.io, sub, true) catch |err| switch (err) {
@@ -259,7 +259,7 @@ test "list: a root below an excluded name still lists" {
     try testing.expectEqual(@as(usize, 1), again.len);
     // A trailing slash on the root does not double it.
     try testing.expect(std.mem.endsWith(u8, again[0].path, "/me/note.txt"));
-    try testing.expect(std.mem.indexOf(u8, again[0].path, "//") == null);
+    try testing.expect(std.mem.find(u8, again[0].path, "//") == null);
 }
 
 test "list: file names with newlines and invalid UTF-8 come back whole" {
@@ -267,7 +267,7 @@ test "list: file names with newlines and invalid UTF-8 come back whole" {
     defer t.deinit();
     try t.write("line1\nline2.txt", "newline in the name");
     try t.write("bad-\xff\xfe.txt", "not utf-8 in the name");
-    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const got = list(arena_state.allocator(), testing.allocator, testing.io, t.abs, true) catch |err| switch (err) {
         error.FileNotFound => return error.SkipZigTest,

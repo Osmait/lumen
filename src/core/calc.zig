@@ -41,10 +41,10 @@ pub fn formatDisplay(buf: []u8, v: f64) []const u8 {
     // fixed point with 4 decimals, rounded from the exact value.
     const plain = if (@abs(v) >= 1e-4 and @abs(v) < 1e15) fixed4(&raw, v) else formatPlain(&raw, v);
     // Exponents, inf and nan are left alone.
-    if (std.mem.indexOfAny(u8, plain, "ein") != null) return copyInto(buf, plain);
+    if (std.mem.findAny(u8, plain, "ein") != null) return copyInto(buf, plain);
     const neg = plain.len > 0 and plain[0] == '-';
     const digits = if (neg) plain[1..] else plain;
-    const dot = std.mem.indexOfScalar(u8, digits, '.') orelse digits.len;
+    const dot = std.mem.findScalar(u8, digits, '.') orelse digits.len;
     const commas = if (dot > 0) (dot - 1) / 3 else 0;
     if (plain.len + commas > buf.len) return copyInto(buf, plain);
 
@@ -70,7 +70,7 @@ pub fn formatDisplay(buf: []u8, v: f64) []const u8 {
 fn fixed4(buf: []u8, v: f64) []const u8 {
     const s = std.fmt.bufPrint(buf, "{d:.4}", .{v}) catch return "?";
     var end = s.len;
-    if (std.mem.indexOfScalar(u8, s, '.') != null) {
+    if (std.mem.findScalar(u8, s, '.') != null) {
         while (s[end - 1] == '0') end -= 1;
         if (s[end - 1] == '.') end -= 1;
     }

@@ -93,7 +93,7 @@ pub fn onAccent(t: *const Theme) u24 {
 
 /// "#rrggbb" for Pango markup.
 pub fn hex(buf: *[8]u8, color: u24) [:0]const u8 {
-    return std.fmt.bufPrintZ(buf, "#{x:0>6}", .{color}) catch "#ffffff";
+    return std.fmt.bufPrintSentinel(buf, "#{x:0>6}", .{color}, 0) catch "#ffffff";
 }
 
 /// WCAG contrast ratio between two colours (1 to 21).
@@ -158,12 +158,12 @@ test "style.css only uses variables the themes define" {
     const style = @embedFile("style.css");
     var pos: usize = 0;
     var used: usize = 0;
-    while (std.mem.indexOfPos(u8, style, pos, "var(--")) |at| {
+    while (std.mem.findPos(u8, style, pos, "var(--")) |at| {
         const start = at + 4;
-        const end = std.mem.indexOfScalarPos(u8, style, start, ')') orelse break;
+        const end = std.mem.findScalarPos(u8, style, start, ')') orelse break;
         var buf: [64]u8 = undefined;
         const decl = try std.fmt.bufPrint(&buf, "{s}:", .{style[start..end]});
-        if (std.mem.indexOf(u8, vars, decl) == null) {
+        if (std.mem.find(u8, vars, decl) == null) {
             std.debug.print("style.css uses undefined {s}\n", .{style[start..end]});
             return error.UndefinedVariable;
         }
@@ -172,7 +172,7 @@ test "style.css only uses variables the themes define" {
     }
     try std.testing.expect(used > 20);
     // No hard-coded text colours left behind: they would ignore the theme.
-    try std.testing.expect(std.mem.indexOf(u8, style, "rgba(255, 255, 255") == null);
+    try std.testing.expect(std.mem.find(u8, style, "rgba(255, 255, 255") == null);
 }
 
 test "text size and opacity reach the CSS" {
@@ -183,6 +183,6 @@ test "text size and opacity reach the CSS" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     try css(&out.writer, find("nord", true), &s);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "--bg: rgba(46, 52, 64, 0.80);") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "--font: 16.1px;") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "--bg: rgba(46, 52, 64, 0.80);") != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), "--font: 16.1px;") != null);
 }
