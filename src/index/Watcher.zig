@@ -41,7 +41,9 @@ pub const Change = union(enum) {
     overflow,
 };
 
-pub fn create(gpa: std.mem.Allocator) !*Watcher {
+pub const CreateError = error{Inotify} || std.mem.Allocator.Error;
+
+pub fn create(gpa: std.mem.Allocator) CreateError!*Watcher {
     const rc = linux.inotify_init1(linux.IN.NONBLOCK | linux.IN.CLOEXEC);
     if (linux.errno(rc) != .SUCCESS) return error.Inotify;
     const fd: i32 = @intCast(rc);

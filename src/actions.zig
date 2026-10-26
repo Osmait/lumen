@@ -206,7 +206,7 @@ pub fn autoTerminal() [:0]const u8 {
 pub const EditorCommand = struct { argv: []const [:0]const u8, in_terminal: bool };
 
 /// How each editor is told to open a file at a line.
-pub fn editorCommand(a: std.mem.Allocator, editor: [:0]const u8, path: [:0]const u8, line: u32) !EditorCommand {
+pub fn editorCommand(a: std.mem.Allocator, editor: [:0]const u8, path: [:0]const u8, line: u32) std.mem.Allocator.Error!EditorCommand {
     const base = if (std.mem.findScalarLast(u8, editor, '/')) |s| editor[s + 1 ..] else editor;
     const at = try std.fmt.allocPrintSentinel(a, "{s}:{d}", .{ path, line }, 0);
     const plus = try std.fmt.allocPrintSentinel(a, "+{d}", .{line}, 0);

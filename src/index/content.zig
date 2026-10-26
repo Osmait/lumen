@@ -169,7 +169,7 @@ pub const Index = struct {
         try sys.writeFileAtomic(path_z, ix.buf);
     }
 
-    pub fn open(path_z: [:0]const u8) !Index {
+    pub fn open(path_z: [:0]const u8) (sys.Error || error{BadIndex})!Index {
         const buf = try sys.mapPrivate(path_z);
         errdefer _ = linux.munmap(buf.ptr, buf.len);
         return parse(buf, true);
@@ -473,7 +473,7 @@ pub const BuildStats = struct { docs_indexed: usize = 0, pairs: usize = 0, segme
 /// Builds the index of `docs` (their order defines doc ids). `text` gives
 /// each document's text; documents it rejects are kept (their path still
 /// resolves) but have no postings.
-pub fn build(gpa: std.mem.Allocator, pool: *Pool, docs: []const DocIn, text: TextReader, stats: ?*BuildStats) !Index {
+pub fn build(gpa: std.mem.Allocator, pool: *Pool, docs: []const DocIn, text: TextReader, stats: ?*BuildStats) (std.mem.Allocator.Error || error{BadIndex})!Index {
     const t0 = sys.monotonicNs();
     var st: BuildStats = .{};
 
@@ -1023,7 +1023,7 @@ pub const max_candidates = 4000;
 
 /// Full query: candidates from the trigram lists, verified in parallel by
 /// reading each file, ranked. Snippets live in `arena`; at most `limit`.
-pub fn search(ix: *const Index, gpa: std.mem.Allocator, arena: std.mem.Allocator, pool: *Pool, query: []const u8, opts: SearchOptions, out: *std.ArrayList(Match)) !void {
+pub fn search(ix: *const Index, gpa: std.mem.Allocator, arena: std.mem.Allocator, pool: *Pool, query: []const u8, opts: SearchOptions, out: *std.ArrayList(Match)) std.mem.Allocator.Error!void {
     const limit = opts.limit;
     const text_path = opts.text_path;
     const text_ctx = opts.text_ctx;
@@ -1131,6 +1131,17 @@ test "SIMD findFold agrees with the naive folded scan" {
     }
 }
 
+/// `s` repeated `n` times, at comptime (Zig 0.17 has no `**`).
+fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    const done = comptime blk: {
+        @setEvalBranchQuota(n * 10 + 1000);
+        var out: [s.len * n]u8 = undefined;
+        for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
+        break :blk out;
+    };
+    return &done;
+}
+
 test "folded search: accents and case, both ways, positions in the original" {
     const text = "Primera línea\nUna ACCIÓN rápida\nel Ñandú corre\n3×4 y 3x4\n";
     for ([_][]const u8{ "accion", "ACCIÓN", "acción", "Accion" }) |q| {
@@ -1157,8 +1168,8 @@ test "folded search: accents and case, both ways, positions in the original" {
     // Never from inside a two-byte letter.
     try testing.expectEqual(@as(?Span, null), findFold("á", "\xA1", 0));
     // A needle too long to fold up front (> 256 bytes) is folded on the fly.
-    const long_needle = "Á" ** 150 ++ "B";
-    const long_hay = "x" ** 40 ++ "a" ** 160 ++ "b" ++ "á" ** 150 ++ "b";
+    const long_needle = repeat("Á", 150) ++ "B";
+    const long_hay = repeat("x", 40) ++ repeat("a", 160) ++ "b" ++ repeat("á", 150) ++ "b";
     try testing.expectEqual(try findFoldNaive(testing.allocator, long_hay, long_needle, 0), findFold(long_hay, long_needle, 0));
     try testing.expectEqual(@as(?Span, .{ .start = 50, .end = 201 }), findFold(long_hay, long_needle, 0));
     try testing.expectEqual(@as(?Span, .{ .start = 201, .end = long_hay.len }), findFold(long_hay, long_needle, 51));

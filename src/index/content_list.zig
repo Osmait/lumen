@@ -19,7 +19,9 @@ const excludes = [_][]const u8{
 
 /// Documents to index, sorted by path (stable doc ids between builds).
 /// Paths are owned by `arena`.
-pub fn list(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, root: []const u8, with_documents: bool) ![]content.DocIn {
+pub const ListError = std.process.RunError || std.mem.Allocator.Error;
+
+pub fn list(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, root: []const u8, with_documents: bool) ListError![]content.DocIn {
     var argv: std.ArrayList([]const u8) = .empty;
     // --no-ignore-parent: ignore files above the root are not about it (and
     // a checkout's .gitignore patterns like `build/` would hit any dir

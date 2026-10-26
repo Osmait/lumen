@@ -217,7 +217,7 @@ pub const Settings = struct {
         }
     }
 
-    pub fn write(s: *const Settings, w: *std.Io.Writer) !void {
+    pub fn write(s: *const Settings, w: *std.Io.Writer) std.Io.Writer.Error!void {
         try w.print(
             \\# Lumen settings. Change them from Lumen (search "Settings") or here:
             \\# Lumen reads this file again when its window opens.

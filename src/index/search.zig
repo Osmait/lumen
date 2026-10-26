@@ -85,7 +85,7 @@ pub const Engine = struct {
     }
 
     /// Top `limit` hits for `query`, appended to `out` (cleared first).
-    pub fn search(e: *Engine, gpa: std.mem.Allocator, pool: *Pool, store: *const Store, query_in: []const u8, opts: Options, out: *std.ArrayList(Hit)) !void {
+    pub fn search(e: *Engine, gpa: std.mem.Allocator, pool: *Pool, store: *const Store, query_in: []const u8, opts: Options, out: *std.ArrayList(Hit)) std.mem.Allocator.Error!void {
         const limit = opts.limit;
         out.clearRetainingCapacity();
         var packed_buf: [max_query]u8 = undefined;

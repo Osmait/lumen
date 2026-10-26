@@ -59,7 +59,7 @@ pub fn displayName(a: std.mem.Allocator, id: []const u8, prefer_dark: bool) [:0]
 }
 
 /// The variables block `style.css` is painted with.
-pub fn css(w: *std.Io.Writer, t: *const Theme, s: *const settings.Settings) !void {
+pub fn css(w: *std.Io.Writer, t: *const Theme, s: *const settings.Settings) std.Io.Writer.Error!void {
     const scale: f32 = switch (s.text_size) {
         .small => 0.9,
         .default => 1,

@@ -258,7 +258,7 @@ pub const Store = struct {
 
     /// Maps an index file. PROT_WRITE with MAP_PRIVATE is copy-on-write, so
     /// tombstones never reach the file.
-    pub fn open(path_z: [:0]const u8) !Store {
+    pub fn open(path_z: [:0]const u8) (sys.Error || error{BadIndex})!Store {
         const buf = try sys.mapPrivate(path_z);
         errdefer _ = linux.munmap(buf.ptr, buf.len);
         return parse(buf, true);
@@ -355,7 +355,7 @@ pub const Builder = struct {
         return @intCast(b.name_off.items.len);
     }
 
-    pub fn push(b: *Builder, gpa: std.mem.Allocator, n: []const u8, parent: u32, fl: u8, depth: u16) !u32 {
+    pub fn push(b: *Builder, gpa: std.mem.Allocator, n: []const u8, parent: u32, fl: u8, depth: u16) std.mem.Allocator.Error!u32 {
         const id = b.len();
         const short = n[0..@min(n.len, std.math.maxInt(u16))];
         try b.name_off.append(gpa, @intCast(b.names.items.len));
@@ -370,7 +370,7 @@ pub const Builder = struct {
 
     /// Scaffolding: rebuilds paths but never shows up (mask 0, like a
     /// tombstone; `path()` does not look at masks).
-    pub fn pushStructural(b: *Builder, gpa: std.mem.Allocator, n: []const u8, parent: u32, fl: u8, depth: u16) !u32 {
+    pub fn pushStructural(b: *Builder, gpa: std.mem.Allocator, n: []const u8, parent: u32, fl: u8, depth: u16) std.mem.Allocator.Error!u32 {
         const id = try b.push(gpa, n, parent, fl, depth);
         b.masks.items[id] = 0;
         return id;

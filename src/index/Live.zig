@@ -90,7 +90,7 @@ limits: Limits = .{},
 /// Takes a store (mapped or fresh) with no watches armed yet: searchable
 /// right away, watches armed in batches by `armProgress`. Owns `base` once
 /// it returns; on error `base` is still the caller's.
-pub fn initUnarmed(gpa: std.mem.Allocator, base: Store, cfg: *const scan.Config, cache_path: ?[:0]const u8, scan_pool: *Pool) !Live {
+pub fn initUnarmed(gpa: std.mem.Allocator, base: Store, cfg: *const scan.Config, cache_path: ?[:0]const u8, scan_pool: *Pool) (std.mem.Allocator.Error || Watcher.CreateError)!Live {
     var b: Builder = .empty;
     var delta = try b.finish(gpa);
     errdefer delta.deinit(gpa);
@@ -154,7 +154,7 @@ pub fn fullyArmed(l: *const Live) bool {
 }
 
 /// Applies a batch of changes; returns how many took effect.
-pub fn apply(l: *Live, changes: []const Watcher.Change) !usize {
+pub fn apply(l: *Live, changes: []const Watcher.Change) std.mem.Allocator.Error!usize {
     // An overflow cannot be patched: something was missed. The rescan is
     // only requested here (this runs with exclusive access; ~0.3 s of
     // scanning would stall every search); the service does it unlocked.
@@ -452,7 +452,7 @@ fn rebuildDelta(l: *Live) !void {
 
 /// Searches base and delta and merges by score. Paths are allocated in
 /// `arena`.
-pub fn search(l: *Live, arena: std.mem.Allocator, pool: *Pool, query: []const u8, opts: engine.Options, out: *std.ArrayList(Hit)) !void {
+pub fn search(l: *Live, arena: std.mem.Allocator, pool: *Pool, query: []const u8, opts: engine.Options, out: *std.ArrayList(Hit)) std.mem.Allocator.Error!void {
     const limit = opts.limit;
     out.clearRetainingCapacity();
     var hits: std.ArrayList(engine.Hit) = .empty;
@@ -523,7 +523,7 @@ pub fn needsCompaction(l: *const Live) bool {
 /// Builds the replacement index without touching the current one: the
 /// expensive part runs unlocked, alongside searches. Watching while scanning
 /// means nothing that changes meanwhile is lost.
-pub fn prepareCompaction(gpa: std.mem.Allocator, pool: *Pool, cfg: *const scan.Config, cache_path: ?[:0]const u8) !Replaced {
+pub fn prepareCompaction(gpa: std.mem.Allocator, pool: *Pool, cfg: *const scan.Config, cache_path: ?[:0]const u8) (std.mem.Allocator.Error || Watcher.CreateError)!Replaced {
     const w = try Watcher.create(gpa);
     errdefer w.destroy(gpa);
     var base = try scan.scan(gpa, pool, cfg, w, null);

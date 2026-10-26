@@ -68,7 +68,7 @@ const LevelCtx = struct {
 /// is read: a change is then either in the read or arrives as an event,
 /// never lost in between (scanning first and arming later leaves a blind
 /// window as long as the arming).
-pub fn scan(gpa: std.mem.Allocator, pool: *Pool, cfg: *const Config, watcher: ?*Watcher, stats: ?*Stats) !Store {
+pub fn scan(gpa: std.mem.Allocator, pool: *Pool, cfg: *const Config, watcher: ?*Watcher, stats: ?*Stats) std.mem.Allocator.Error!Store {
     const t0 = sys.monotonicNs();
     var st: Stats = .{};
     var b: Builder = .empty;

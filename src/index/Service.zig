@@ -49,7 +49,9 @@ last_rescan_ns: std.atomic.Value(u64) = .init(0),
 
 /// Starts on `root`, mapping `cache_path` if it exists. Thread-safe once
 /// started: searches and `status` may come from any thread.
-pub fn start(gpa: std.mem.Allocator, io: Io, root: []const u8, cache_path: []const u8) !*Service {
+pub const StartError = std.mem.Allocator.Error || std.Thread.SpawnError || Watcher.CreateError;
+
+pub fn start(gpa: std.mem.Allocator, io: Io, root: []const u8, cache_path: []const u8) StartError!*Service {
     const s = try gpa.create(Service);
     errdefer gpa.destroy(s);
     const root_copy = try gpa.dupe(u8, root);
@@ -111,7 +113,7 @@ pub fn shutdown(s: *Service) void {
 }
 
 /// Top `limit` files for `query`; paths live in `arena`.
-pub fn search(s: *Service, arena: std.mem.Allocator, query: []const u8, limit: usize, out: *std.ArrayList(Live.Hit)) !void {
+pub fn search(s: *Service, arena: std.mem.Allocator, query: []const u8, limit: usize, out: *std.ArrayList(Live.Hit)) std.mem.Allocator.Error!void {
     // Exclusive, not shared: a search mutates the engines' refinement cache.
     // Only the UI thread searches, so readers never queue behind each other.
     s.lock.lockUncancelable(s.io);

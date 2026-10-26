@@ -555,13 +555,24 @@ test "formatting" {
     try std.testing.expectEqualStrings("42", formatPlain(&buf, 42));
 }
 
+/// `s` repeated `n` times, at comptime (Zig 0.17 has no `**`).
+fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+    const done = comptime blk: {
+        @setEvalBranchQuota(n * 10 + 1000);
+        var out: [s.len * n]u8 = undefined;
+        for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
+        break :blk out;
+    };
+    return &done;
+}
+
 test "hostile input: deep nesting, overflowing conversions, huge values" {
     // Pasting thousands of "(" or "-" must not overflow the stack.
-    const deep = "(" ** 5000 ++ "1+1" ++ ")" ** 5000;
+    const deep = repeat("(", 5000) ++ "1+1" ++ repeat(")", 5000);
     try std.testing.expect(evaluate(deep) == null);
-    try std.testing.expect(evaluate("-" ** 5000 ++ "1+1") == null);
-    try std.testing.expect(evaluate("2" ++ "^2" ** 5000) == null);
-    try expectValue("(" ** 20 ++ "1+1" ++ ")" ** 20, 2);
+    try std.testing.expect(evaluate(repeat("-", 5000) ++ "1+1") == null);
+    try std.testing.expect(evaluate("2" ++ repeat("^2", 5000)) == null);
+    try expectValue(repeat("(", 20) ++ "1+1" ++ repeat(")", 20), 2);
     // Conversions whose result is not finite are not results.
     try std.testing.expect(evaluate("1e308 km to mm") == null);
     try std.testing.expect(evaluate("(-8)^(1/3) m to ft") == null);

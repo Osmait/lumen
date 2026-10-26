@@ -36,7 +36,9 @@ pub fn kindOf(path: []const u8) ?Kind {
 /// Extracted UTF-8 text of the document at `path` (absolute), owned by `gpa`, at most `max_bytes` long (truncate, never fail for size).
 /// Returns error on unreadable/corrupt files; callers skip those.
 /// error.ToolMissing: pdftotext/unzip is not installed.
-pub fn extractText(gpa: std.mem.Allocator, io: std.Io, path: [:0]const u8, kind: Kind, max_bytes: usize) ![]u8 {
+pub const ExtractError = Error || std.mem.Allocator.Error || std.process.SpawnError || std.process.Child.WaitError;
+
+pub fn extractText(gpa: std.mem.Allocator, io: std.Io, path: [:0]const u8, kind: Kind, max_bytes: usize) ExtractError![]u8 {
     const fd = try sys.openRegular(path);
     defer sys.close(fd);
 

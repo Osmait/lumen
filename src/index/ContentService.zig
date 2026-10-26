@@ -61,13 +61,15 @@ unsaved: bool = false,
 /// The thread pools it borrows: they must outlive the service.
 pub const Pools = struct { search: *Pool, build: *Pool };
 
-pub fn start(gpa: std.mem.Allocator, io: Io, root: []const u8, cache_dir: []const u8, pools: Pools) !*ContentService {
+pub const StartError = std.mem.Allocator.Error || std.Thread.SpawnError;
+
+pub fn start(gpa: std.mem.Allocator, io: Io, root: []const u8, cache_dir: []const u8, pools: Pools) StartError!*ContentService {
     return startWith(gpa, io, root, cache_dir, pools, .{});
 }
 
 /// Starts the background thread. Borrows the pools, which must outlive it.
 /// Thread-safe once started.
-pub fn startWith(gpa: std.mem.Allocator, io: Io, root: []const u8, cache_dir: []const u8, pools: Pools, opts: Options) !*ContentService {
+pub fn startWith(gpa: std.mem.Allocator, io: Io, root: []const u8, cache_dir: []const u8, pools: Pools, opts: Options) StartError!*ContentService {
     const s = try gpa.create(ContentService);
     errdefer gpa.destroy(s);
     const root_copy = try gpa.dupe(u8, root);
@@ -167,7 +169,7 @@ pub const Hit = struct {
 
 /// Files whose text contains every word of `query` (3+ letters needed).
 /// Everything returned lives in `arena`.
-pub fn search(s: *ContentService, arena: std.mem.Allocator, query: []const u8, limit: usize, out: *std.ArrayList(Hit)) !void {
+pub fn search(s: *ContentService, arena: std.mem.Allocator, query: []const u8, limit: usize, out: *std.ArrayList(Hit)) std.mem.Allocator.Error!void {
     out.clearRetainingCapacity();
     s.lock.lockSharedUncancelable(s.io);
     defer s.lock.unlockShared(s.io);
