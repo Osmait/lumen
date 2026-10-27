@@ -8,8 +8,14 @@
 //!
 //! One file, mapped like `files.idx`:
 //!
-//!   header | docs (mtime, size, path, kind) | paths | segment directory |
-//!   segments: sorted trigram keys, offsets, posting lists (varint deltas)
+//!   header | docs (mtime, size, path, kind, flags) | paths |
+//!   segments: sorted trigram keys, offsets, posting lists (varint deltas) |
+//!   segment directory
+//!
+//! A few changed files do not rebuild it (`update`): their old versions are
+//! flagged removed and skipped by queries, the new ones are appended with
+//! new ids in a segment of their own. The service rebuilds it whole once
+//! removed documents or segments pile up.
 //!
 //! Segments keep the build's memory bounded: pairs (trigram, doc) are
 //! collected for a run of documents, radix-sorted, encoded, dropped. Doc ids
@@ -23,7 +29,8 @@ const sys = @import("sys.zig");
 const fold = @import("core").fold;
 
 /// 02: trigrams of folded text (accents and case, `core.fold`).
-const magic = "LUMCTX02";
+/// 03: a flags column (documents removed by an incremental update).
+const magic = "LUMCTX03";
 const header_len = 64;
 
 /// Plain text files above this are not indexed (logs, dumps, data).
@@ -88,8 +95,11 @@ pub const Index = struct {
     path_off: []const u32,
     path_len: []const u16,
     sources: []const u8,
+    flags: []const u8,
     paths: []const u8,
     segs: []const SegEntry,
+    /// Documents flagged removed: their ids stay, queries skip them.
+    n_removed: usize,
 
     pub fn deinit(ix: *Index, gpa: std.mem.Allocator) void {
         if (ix.mapped) _ = linux.munmap(ix.buf.ptr, ix.buf.len) else gpa.free(ix.buf);
@@ -98,6 +108,19 @@ pub const Index = struct {
 
     pub fn path(ix: *const Index, doc: u32) []const u8 {
         return ix.paths[ix.path_off[doc]..][0..ix.path_len[doc]];
+    }
+
+    pub fn removed(ix: *const Index, doc: u32) bool {
+        return ix.flags[doc] & flag_removed != 0;
+    }
+
+    /// Documents a query can find.
+    pub fn live(ix: *const Index) usize {
+        return ix.n_docs - ix.n_removed;
+    }
+
+    pub fn docIn(ix: *const Index, d: u32) DocIn {
+        return .{ .path = ix.path(d), .mtime = ix.mtimes[d], .size = ix.sizes[d], .source = @fromBackingInt(@intCast(ix.sources[d])) };
     }
 
     /// Checks that `buf` is a well-formed index and wraps it without copying
@@ -145,9 +168,16 @@ pub const Index = struct {
         o += n * 2;
         const src = buf[o..][0..n];
         o += n;
+        const fl = buf[o..][0..n];
+        o += n;
         const paths = buf[o..][0..paths_len];
         for (po, pl) |off, l| if (@as(u64, off) + l > paths_len) return error.BadIndex;
         for (src) |k| if (std.enums.fromInt(Source, k) == null) return error.BadIndex;
+        var n_removed: usize = 0;
+        for (fl) |f| {
+            if (f & ~flag_removed != 0) return error.BadIndex;
+            n_removed += f & flag_removed;
+        }
 
         const segs = sliceAt(SegEntry, buf, dir_off, n_segs);
         for (segs) |seg| try checkSegment(buf, seg);
@@ -162,8 +192,10 @@ pub const Index = struct {
             .path_off = po,
             .path_len = pl,
             .sources = src,
+            .flags = fl,
             .paths = paths,
             .segs = segs,
+            .n_removed = n_removed,
         };
     }
 
@@ -237,7 +269,7 @@ pub const Index = struct {
                 try intersect(gpa, cur.items, l, ix.n_docs, &next);
                 std.mem.swap(std.ArrayList(u32), &cur, &next);
             }
-            try out.appendSlice(gpa, cur.items);
+            for (cur.items) |d| if (!ix.removed(d)) try out.append(gpa, d);
         }
     }
 
@@ -249,8 +281,11 @@ pub const Index = struct {
 };
 
 /// Bytes per document in the doc table (mtime, size, path_off, path_len,
-/// source).
-const doc_bytes = 8 + 8 + 4 + 2 + 1;
+/// source, flags).
+const doc_bytes = 8 + 8 + 4 + 2 + 1 + 1;
+
+/// A document whose old version an update replaced, or that is gone.
+const flag_removed: u8 = 1;
 
 /// Checks that `count` items of `size` bytes at `off` fit in a buffer of
 /// `len` bytes, with `off` a multiple of `alignment`; returns `off`. Done in
@@ -479,54 +514,95 @@ pub const BuildStats = struct { docs_indexed: usize = 0, pairs: usize = 0, segme
 pub fn build(gpa: std.mem.Allocator, pool: *Pool, docs: []const DocIn, text: TextReader, stats: ?*BuildStats) (std.mem.Allocator.Error || error{BadIndex})!Index {
     const t0 = sys.monotonicNs();
     var st: BuildStats = .{};
-
-    // Header, documents and paths first; segments are appended as they close.
     // Aligned as the index needs, so it becomes the index without a copy.
     var out: Out = .empty;
     defer out.deinit(gpa);
+    var dir: std.ArrayList(SegEntry) = .empty;
+    defer dir.deinit(gpa);
+    const docs_off = try writeDocs(gpa, &out, docs, null);
+    try indexDocs(gpa, pool, &out, &dir, docs, 0, text, &st);
+    st.docs_indexed = docs.len;
+    return finish(gpa, &out, dir.items, docs, docs_off, t0, &st, stats);
+}
+
+/// `old` with the documents `gone` (ids) marked removed and `added`
+/// appended, indexed in segments of their own; `old`'s segments are copied
+/// as they are. A few edited files cost reading those files, not the
+/// thousands of others (a full build: ~1.1 s and ~270 MB for 49 k). Doc ids
+/// of `old` keep their meaning, so lists stay ascending across segments.
+pub fn update(gpa: std.mem.Allocator, pool: *Pool, old: *const Index, gone: []const u32, added: []const DocIn, text: TextReader, stats: ?*BuildStats) (std.mem.Allocator.Error || error{BadIndex})!Index {
+    const t0 = sys.monotonicNs();
+    var st: BuildStats = .{};
+    const n = old.n_docs + added.len;
+    if (n > std.math.maxInt(u32)) return error.OutOfMemory;
+    const docs = try gpa.alloc(DocIn, n);
+    defer gpa.free(docs);
+    for (docs[0..old.n_docs], 0..) |*d, i| d.* = old.docIn(@intCast(i));
+    @memcpy(docs[old.n_docs..], added);
+    const flags = try gpa.alloc(u8, n);
+    defer gpa.free(flags);
+    @memcpy(flags[0..old.n_docs], old.flags);
+    @memset(flags[old.n_docs..], 0);
+    for (gone) |id| flags[id] |= flag_removed;
+
+    var out: Out = .empty;
+    defer out.deinit(gpa);
+    var dir: std.ArrayList(SegEntry) = .empty;
+    defer dir.deinit(gpa);
+    const docs_off = try writeDocs(gpa, &out, docs, flags);
+    for (old.segs) |seg| try copySegment(gpa, &out, &dir, old.buf, seg);
+    try indexDocs(gpa, pool, &out, &dir, docs, old.n_docs, text, &st);
+    st.docs_indexed = added.len;
+    return finish(gpa, &out, dir.items, docs, docs_off, t0, &st, stats);
+}
+
+/// Header room, then the doc table and paths; returns where the table
+/// starts. `flags` null: none set.
+fn writeDocs(gpa: std.mem.Allocator, out: *Out, docs: []const DocIn, flags: ?[]const u8) std.mem.Allocator.Error!usize {
     try out.appendNTimes(gpa, 0, header_len);
     var paths_len: usize = 0;
     for (docs) |d| paths_len += d.path.len;
     const docs_off = out.items.len;
-    const n = docs.len;
-    try out.appendNTimes(gpa, 0, align8(n * doc_bytes + paths_len));
-    {
-        var o = docs_off;
-        for (docs) |d| {
-            std.mem.writeInt(i64, out.items[o..][0..8], d.mtime, .little);
-            o += 8;
-        }
-        for (docs) |d| {
-            std.mem.writeInt(u64, out.items[o..][0..8], d.size, .little);
-            o += 8;
-        }
-        var po: u32 = 0;
-        for (docs) |d| {
-            std.mem.writeInt(u32, out.items[o..][0..4], po, .little);
-            po += @intCast(d.path.len);
-            o += 4;
-        }
-        for (docs) |d| {
-            std.mem.writeInt(u16, out.items[o..][0..2], @intCast(@min(d.path.len, std.math.maxInt(u16))), .little);
-            o += 2;
-        }
-        for (docs) |d| {
-            out.items[o] = @backingInt(d.source);
-            o += 1;
-        }
-        for (docs) |d| {
-            @memcpy(out.items[o..][0..d.path.len], d.path);
-            o += d.path.len;
-        }
+    try out.appendNTimes(gpa, 0, align8(docs.len * doc_bytes + paths_len));
+    var o = docs_off;
+    for (docs) |d| {
+        std.mem.writeInt(i64, out.items[o..][0..8], d.mtime, .little);
+        o += 8;
     }
+    for (docs) |d| {
+        std.mem.writeInt(u64, out.items[o..][0..8], d.size, .little);
+        o += 8;
+    }
+    var po: u32 = 0;
+    for (docs) |d| {
+        std.mem.writeInt(u32, out.items[o..][0..4], po, .little);
+        po += @intCast(d.path.len);
+        o += 4;
+    }
+    for (docs) |d| {
+        std.mem.writeInt(u16, out.items[o..][0..2], @intCast(@min(d.path.len, std.math.maxInt(u16))), .little);
+        o += 2;
+    }
+    for (docs) |d| {
+        out.items[o] = @backingInt(d.source);
+        o += 1;
+    }
+    if (flags) |f| @memcpy(out.items[o..][0..docs.len], f);
+    o += docs.len;
+    for (docs) |d| {
+        @memcpy(out.items[o..][0..d.path.len], d.path);
+        o += d.path.len;
+    }
+    return docs_off;
+}
 
-    var dir: std.ArrayList(SegEntry) = .empty;
-    defer dir.deinit(gpa);
+/// Indexes `docs[from..]` (ids are positions in `docs`), closing segments as
+/// they fill.
+fn indexDocs(gpa: std.mem.Allocator, pool: *Pool, out: *Out, dir: *std.ArrayList(SegEntry), docs: []const DocIn, from: usize, text: TextReader, st: *BuildStats) std.mem.Allocator.Error!void {
     var pairs: std.ArrayList(u64) = .empty;
     defer pairs.deinit(gpa);
     var scratch: std.ArrayList(u64) = .empty;
     defer scratch.deinit(gpa);
-
     const tasks = pool.threads.len + 1;
     const task_out = try gpa.alloc(std.ArrayList(u64), tasks);
     defer {
@@ -535,7 +611,8 @@ pub fn build(gpa: std.mem.Allocator, pool: *Pool, docs: []const DocIn, text: Tex
     }
     for (task_out) |*t| t.* = .empty;
 
-    var lo: usize = 0;
+    const n = docs.len;
+    var lo = from;
     while (lo < n) {
         const hi = @min(lo + batch_docs, n);
         var ctx: ExtractCtx = .{ .gpa = gpa, .docs = docs, .lo = lo, .text = text.read, .text_ctx = text.ctx, .out = task_out, .tasks = tasks, .batch_hi = hi };
@@ -551,21 +628,39 @@ pub fn build(gpa: std.mem.Allocator, pool: *Pool, docs: []const DocIn, text: Tex
         if (pairs.items.len >= segment_pairs or lo == n) {
             if (pairs.items.len > 0) {
                 st.pairs += pairs.items.len;
-                try closeSegment(gpa, &out, &dir, pairs.items, &scratch);
+                try closeSegment(gpa, out, dir, pairs.items, &scratch);
+                st.segments += 1;
                 pairs.clearRetainingCapacity();
             }
         }
     }
-    st.segments = dir.items.len;
+}
 
-    // Segment directory, then the header.
+/// A segment of another index, as it is, at the end of `out`.
+fn copySegment(gpa: std.mem.Allocator, out: *Out, dir: *std.ArrayList(SegEntry), from: []align(8) const u8, seg: SegEntry) std.mem.Allocator.Error!void {
+    const n_keys: usize = @intCast(seg.n_keys);
+    while (out.items.len % 8 != 0) try out.append(gpa, 0);
+    const keys_off = out.items.len;
+    try out.appendSlice(gpa, from[@intCast(seg.keys_off)..][0 .. n_keys * 4]);
+    while (out.items.len % 8 != 0) try out.append(gpa, 0);
+    const offs_off = out.items.len;
+    try out.appendSlice(gpa, from[@intCast(seg.offs_off)..][0 .. (n_keys + 1) * 4]);
+    const post_off = out.items.len;
+    try out.appendSlice(gpa, from[@intCast(seg.post_off)..][0..@intCast(seg.post_len)]);
+    try dir.append(gpa, .{ .n_keys = seg.n_keys, .keys_off = keys_off, .offs_off = offs_off, .post_off = post_off, .post_len = seg.post_len });
+}
+
+/// The segment directory and the header; `out`'s buffer becomes the index.
+fn finish(gpa: std.mem.Allocator, out: *Out, dir: []const SegEntry, docs: []const DocIn, docs_off: usize, t0: u64, st: *BuildStats, stats: ?*BuildStats) (std.mem.Allocator.Error || error{BadIndex})!Index {
+    var paths_len: usize = 0;
+    for (docs) |d| paths_len += d.path.len;
     while (out.items.len % 8 != 0) try out.append(gpa, 0);
     const dir_off = out.items.len;
-    try out.appendSlice(gpa, std.mem.sliceAsBytes(dir.items));
+    try out.appendSlice(gpa, std.mem.sliceAsBytes(dir));
     const total = out.items.len;
     @memcpy(out.items[0..8], magic);
-    std.mem.writeInt(u64, out.items[8..16], n, .little);
-    std.mem.writeInt(u64, out.items[16..24], dir.items.len, .little);
+    std.mem.writeInt(u64, out.items[8..16], docs.len, .little);
+    std.mem.writeInt(u64, out.items[16..24], dir.len, .little);
     std.mem.writeInt(u64, out.items[24..32], paths_len, .little);
     std.mem.writeInt(u64, out.items[32..40], docs_off, .little);
     std.mem.writeInt(u64, out.items[40..48], dir_off, .little);
@@ -573,9 +668,8 @@ pub fn build(gpa: std.mem.Allocator, pool: *Pool, docs: []const DocIn, text: Tex
 
     const buf = try out.toOwnedSlice(gpa);
     errdefer gpa.free(buf);
-    st.docs_indexed = n;
     st.ns = sys.monotonicNs() - t0;
-    if (stats) |s| s.* = st;
+    if (stats) |s| s.* = st.*;
     return Index.parse(buf, false);
 }
 
@@ -903,6 +997,62 @@ test "candidates equal a brute-force scan, across segments, after save/open" {
             if (all) try testing.expect(std.mem.findScalar(u32, got.items, @intCast(i)) != null);
         }
     }
+}
+
+test "update: edited and deleted documents leave, new ones join, old ids keep their meaning" {
+    const gpa = testing.allocator;
+    const pool = try Pool.create(gpa, testing.io, 2);
+    defer pool.destroy();
+    var before: TestDocs = .{ .texts = &.{ "alpha zanzibar", "bravo kilimanjaro", "charlie zanzibar" } };
+    const docs = [_]DocIn{ .{ .path = "0", .mtime = 1, .size = 1 }, .{ .path = "1", .mtime = 1, .size = 1 }, .{ .path = "2", .mtime = 1, .size = 1 } };
+    var ix = try build(gpa, pool, &docs, .{ .read = TestDocs.text, .ctx = &before }, null);
+    defer ix.deinit(gpa);
+
+    // "1" edited, "2" deleted, "3" new. TestDocs reads a path's number as
+    // the index of its text, so the edit is "1" with another text.
+    var after: TestDocs = .{ .texts = &.{ "alpha zanzibar", "delta okavango", "charlie zanzibar", "echo okavango" } };
+    const added = [_]DocIn{ .{ .path = "1", .mtime = 2, .size = 1 }, .{ .path = "3", .mtime = 2, .size = 1 } };
+    var st: BuildStats = .{};
+    var up = try update(gpa, pool, &ix, &.{ 1, 2 }, &added, .{ .read = TestDocs.text, .ctx = &after }, &st);
+    defer up.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), st.docs_indexed);
+    try testing.expectEqual(ix.n_segs + 1, up.n_segs);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dbuf: [4096]u8 = undefined;
+    const dir = try sys.tmpDirPath(&tmp, &dbuf);
+    var pbuf: [4096]u8 = undefined;
+    const p = try std.fmt.bufPrintSentinel(&pbuf, "{s}/content.idx", .{dir}, 0);
+    try up.save(p);
+    var mapped = try Index.open(p);
+    defer mapped.deinit(gpa);
+
+    var got: std.ArrayList(u32) = .empty;
+    defer got.deinit(gpa);
+    for ([_]*const Index{ &up, &mapped }) |x| {
+        try testing.expectEqual(@as(usize, 5), x.n_docs);
+        try testing.expectEqual(@as(usize, 3), x.live());
+        try testing.expect(x.removed(1) and x.removed(2) and !x.removed(0));
+        try testing.expectEqualStrings("1", x.path(3));
+        try testing.expectEqual(@as(i64, 2), x.mtimes[3]);
+        try x.candidates(gpa, &.{"zanzibar"}, &got);
+        try testing.expectEqualSlices(u32, &.{0}, got.items);
+        try x.candidates(gpa, &.{"kilimanjaro"}, &got);
+        try testing.expectEqual(@as(usize, 0), got.items.len);
+        try x.candidates(gpa, &.{"okavango"}, &got);
+        try testing.expectEqualSlices(u32, &.{ 3, 4 }, got.items);
+    }
+
+    // Updated again, with only a removal: no new segment.
+    var again = try update(gpa, pool, &mapped, &.{0}, &.{}, .{ .read = TestDocs.text, .ctx = &after }, null);
+    defer again.deinit(gpa);
+    try testing.expectEqual(mapped.n_segs, again.n_segs);
+    try testing.expectEqual(@as(usize, 2), again.live());
+    try again.candidates(gpa, &.{"zanzibar"}, &got);
+    try testing.expectEqual(@as(usize, 0), got.items.len);
+    try again.candidates(gpa, &.{"okavango"}, &got);
+    try testing.expectEqualSlices(u32, &.{ 3, 4 }, got.items);
 }
 
 test "verify finds the line and counts hits" {

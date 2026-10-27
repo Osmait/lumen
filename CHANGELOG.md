@@ -51,6 +51,11 @@ All notable changes are listed here. The format follows
   of ~58 ms, and each copy
   into the clipboard history no longer starts a GTK process. Install both
   files (see the README).
+- The content index follows edits incrementally: changed files are read
+  again and added, the rest is left alone (two edits: 23 ms instead of a
+  1.6 s rebuild, and ~100 MB less memory at the peak). It is rebuilt whole
+  once 20 % of it is outdated. The index format changes (LUMCTX03): the
+  first start rebuilds it once.
 - Rebuilding the content index peaks at less than half the memory (585 →
   268 MB on 49 k documents; the daemon's peak at start 702 → 445 MB), with
   the same search times.

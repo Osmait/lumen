@@ -175,8 +175,13 @@ directory (2.8 s cold) and every core.
   unread candidate can still enter the top 50. With several words, the exact
   phrase ranks first. Queries run on a worker thread; the newest one wins.
 - **Freshness**: re-listing takes ~150 ms; on start, every 5 minutes and when
-  the window opens, changed (path, mtime, size) trigger a rebuild in the
-  background, swapped in under a lock.
+  the window opens, the listing is compared with the index by (path, mtime,
+  size). Changed and new files are read and added in a segment of their own,
+  the old versions and deleted files are flagged removed (queries skip
+  them), and the other segments are copied as they are (`content.update`):
+  two edited files cost 23 ms instead of a 1.6 s rebuild, on 49 k
+  documents. Past 20 % removed or 32 segments it is rebuilt whole, which
+  leaves it clean again. Either way the result is swapped in under a lock.
 
 Measured on the same desktop: 43k files / 438 MB of text → 66 MB index, built
 in 0.9 s (first run with extraction of 274 documents: ~38 s, once); queries
