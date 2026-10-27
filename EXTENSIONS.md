@@ -43,8 +43,8 @@ return lumen.extension {
 Open Lumen and type "greetings". [`examples/`](examples) has more: a GitHub
 extension (pull requests, issues and repositories through `gh`), a process
 list that can quit processes, quick notes (storage and preferences), a world
-clock that answers "time tokyo" in the main search, and a sample `init.lua`
-and `style.css`.
+clock that answers "time tokyo" in the main search, a "New File" form, and a
+sample `init.lua` and `style.css`.
 
 ## Commands
 
@@ -58,6 +58,7 @@ Each command has one of `items`, `search` or `run`:
 | `items` | A list of rows, or a function returning one. It runs when the command opens; Lumen filters the rows as you type. |
 | `search` | `function(query)` returning rows. It runs again for every query; Lumen shows what it returns as it is. |
 | `run` | `function()` with no list: Enter runs it. |
+| `fields` + `submit` | A form: see [Forms](#forms). |
 
 A command can also have `root = function(query)`: its rows then show in the
 main search, in a section of their own right after the calculator, while you
@@ -203,6 +204,32 @@ Keys are strings. It is a JSON file written atomically, in
 `~/.local/share/lumen/extensions/<id>/storage.json`, so keep it to settings,
 lists and small caches, not megabytes. `lumen.data_dir` is that folder, for
 files of your own.
+
+## Forms
+
+A command with `fields` and `submit` is a form: a row per field showing its
+value, and a last row that submits. Fields take the same keys as
+[preferences](#preferences), plus `required = true`. Enter on a text field
+opens a box to type in, on a choice lists its values, on a toggle flips it.
+
+```lua
+{
+  name = "create", title = "New File",
+  fields = {
+    { name = "name", title = "File Name", required = true },
+    { name = "folder", title = "Folder", type = "choice", choices = { "Documents", "Desktop" } },
+    { name = "open", title = "Open It", type = "toggle", default = true },
+  },
+  submit_title = "Create File",   -- the last row, "Submit" by default
+  submit = function(values)
+    -- values.name, values.folder (strings), values.open (a boolean)
+  end,
+}
+```
+
+`submit` returns like an action's `run`: nothing closes the window, `"stay"`
+keeps it, `"refresh"` clears the form for another one. An error shows on the
+row and keeps what was typed.
 
 ## Icons
 

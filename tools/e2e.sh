@@ -86,6 +86,13 @@ return lumen.extension {
         { title = "Papaya", markdown = "# Papaya\n\n**Sweet** and `orange`", metadata = { { "Origin", "Mexico" }, { label = "Weight", value = 900 } } },
     } },
     { name = "echo", title = "Fixture Echo", search = function(q) return { "echo: " .. q } end },
+    { name = "order", title = "Fixture Order", fields = {
+        { name = "fruit", title = "Fruit", required = true },
+        { name = "size", title = "Size", type = "choice", choices = { "small", "big" } },
+        { name = "gift", title = "Gift Wrap", type = "toggle" },
+      }, submit = function(v)
+        lumen.exec { "sh", "-c", 'printf %s "$1" > "$2"', "sh", v.fruit .. "/" .. v.size .. "/" .. tostring(v.gift), out }
+      end },
     { name = "upper", title = "Fixture Upper", root = function(q)
         if not q:match("^up ") then return nil end
         return { { title = q:sub(4):upper(), actions = { { title = "Record", run = function(row)
@@ -408,6 +415,19 @@ L --key ctrl+enter
 if wait_for '^visible: false' 3 && [[ "$(cat "$T/ext-ran" 2>/dev/null)" == Mango ]]; then ok "Lua action ran and closed the window"; else ko "Lua action ran and closed the window" "$(L --dump; cat "$T/ext-ran" 2>&1)"; fi
 L --command fixture.echo --query "hi there"
 expect_soon "search commands get the query" '> echo: hi there'
+L --command fixture.order; sleep 0.3
+expect "form lists its fields" '> Fruit \* \|.*\| Not set'
+expect "form submit row" 'Submit \|'
+for _ in 1 2 3; do L --key down; done; L --key enter; sleep 0.1
+expect "required fields are checked" 'primary: Fill in Fruit first'
+for _ in 1 2 3; do L --key up; done; L --key enter; sleep 0.2
+expect "text fields open the input view" '^view: input'
+L --text "mango"; L --key enter; sleep 0.2
+L --key down; L --key enter; sleep 0.2; L --key down; L --key enter; sleep 0.2
+L --key down; L --key enter; sleep 0.2
+expect "form shows the values" 'Fruit \* \|.*\| mango'
+L --key down; L --key enter
+if wait_for '^visible: false' 3 && [[ "$(cat "$T/ext-ran" 2>/dev/null)" == "mango/big/true" ]]; then ok "form submits its values"; else ko "form submits its values" "$(L --dump; cat "$T/ext-ran" 2>&1)"; fi
 query root "up quiet words"
 expect_soon "root search shows extension rows" '# Fixture Upper'
 expect "extension root row" '> QUIET WORDS'

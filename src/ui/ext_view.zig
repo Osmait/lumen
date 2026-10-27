@@ -12,6 +12,7 @@ const proc = @import("../sys/proc.zig");
 const index = @import("index");
 const themes = @import("themes.zig");
 const Ui = @import("Ui.zig");
+const form_view = @import("form_view.zig");
 
 const log = std.log.scoped(.ext);
 
@@ -174,7 +175,7 @@ fn onAct(res: *Host.ActResult, ctx: ?*anyopaque) void {
     if (res.gen != ui.ext_act_gen) return;
     ui.ext_act_gen = 0;
     if (res.err) |e| {
-        log.warn("{s}: {s}", .{ if (command(ui)) |cmd| cmd.id else "action", e });
+        log.warn("action: {s}", .{e});
         ui.showFailure(firstLine(ui.query_arena.allocator(), e));
         return;
     }
@@ -184,6 +185,10 @@ fn onAct(res: *Host.ActResult, ctx: ?*anyopaque) void {
         .refresh => if (ui.view == .ext) {
             if (ui.selectedItem()) |it| ui.setReselect("{s}", .{it.key});
             ui.setView(.ext);
+        } else if (ui.view == .form) {
+            // A form "refreshes" by starting over, ready for the next one.
+            form_view.reset(ui);
+            ui.rebuild();
         },
     }
 }
@@ -286,14 +291,19 @@ pub fn placeholder(ui: *Ui, buf: []u8) [*:0]const u8 {
 pub fn activate(ui: *Ui, i: u16) void {
     const reg = ui.ext_registry orelse return;
     if (i >= reg.commands.len) return;
-    if (reg.commands[i].mode == .run) {
-        const h = ui.ext_host orelse return;
-        ui.ext_act_gen = h.act(reg.gen, i, false, 0, null, 0);
-        ui.showRunning();
-        return;
+    switch (reg.commands[i].mode) {
+        .run => {
+            const h = ui.ext_host orelse return;
+            ui.ext_act_gen = h.act(reg.gen, i, false, 0, null, 0);
+            ui.showRunning();
+        },
+        .form => form_view.open(ui, i),
+        .provider => {},
+        .list, .search => {
+            ui.ext_cmd = i;
+            ui.navigate(.ext);
+        },
     }
-    ui.ext_cmd = i;
-    ui.navigate(.ext);
 }
 
 /// Action `index` of the selected extension row.
@@ -364,10 +374,18 @@ pub fn keymap(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) bool {
 /// `text` typed. False when there is no such thing.
 pub fn openTarget(ui: *Ui, target: []const u8, text: ?[*:0]const u8) bool {
     if (ui.ext_registry) |reg| if (find(reg, target)) |i| {
-        if (reg.commands[i].mode == .provider) return false;
-        if (reg.commands[i].mode == .run) {
-            activate(ui, i);
-            return true;
+        switch (reg.commands[i].mode) {
+            .provider => return false,
+            .run => {
+                activate(ui, i);
+                return true;
+            },
+            .form => {
+                if (c.gtk_widget_get_visible(ui.window) == 0) ui.show();
+                form_view.open(ui, i);
+                return true;
+            },
+            .list, .search => {},
         }
         ui.ext_cmd = i;
         if (c.gtk_widget_get_visible(ui.window) == 0) {

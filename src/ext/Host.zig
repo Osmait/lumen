@@ -45,6 +45,8 @@ pub const Mode = enum {
     run,
     /// Only `root`: rows in the root search, not a command of its own.
     provider,
+    /// `fields` and `submit`: a form.
+    form,
 };
 
 pub const Command = struct {
@@ -60,6 +62,10 @@ pub const Command = struct {
     detail: bool,
     /// It answers root searches too (`root = function(query)`).
     root: bool,
+    /// A form's fields, in order (preferences' types).
+    fields: []const Pref = &.{},
+    /// The form's last row ("Submit").
+    submit_title: [:0]const u8 = "Submit",
 };
 
 pub const Keymap = struct {
@@ -91,6 +97,8 @@ pub const Pref = struct {
     /// As JSON would spell it for a toggle ("true"), else the text.
     default: [:0]const u8,
     choices: []const PrefChoice = &.{},
+    /// Form fields: submitting needs a value.
+    required: bool = false,
 };
 
 pub const PrefChoice = struct { value: [:0]const u8, label: [:0]const u8 };
@@ -236,6 +244,18 @@ const ListReq = struct { registry: u32, command: u16, gen: u32, query_len: usize
 const ActReq = struct { registry: u32, command: u16, root: bool, list_gen: u32, item: ?u32, action: u8, gen: u32 };
 const RootReq = struct { registry: u32, gen: u32, query_len: usize };
 
+/// A form's values, as the UI hands them over.
+pub const FormValue = struct { name: []const u8, value: []const u8, toggle: bool };
+
+/// A form submitted; owns copies of its values.
+const SubmitReq = struct {
+    registry: u32,
+    command: u16,
+    gen: u32,
+    values: []FormValue,
+    arena: std.heap.ArenaAllocator,
+};
+
 gpa: std.mem.Allocator,
 io: std.Io,
 config_dir: [:0]const u8,
@@ -256,6 +276,7 @@ list_req: ?ListReq = null,
 list_query: [max_query]u8 = undefined,
 act_req: ?ActReq = null,
 root_req: ?RootReq = null,
+submit_req: ?*SubmitReq = null,
 root_query: [max_query]u8 = undefined,
 
 // Worker thread only.
@@ -289,6 +310,10 @@ pub fn shutdown(h: *Host) void {
     h.stop.store(true, .release);
     h.wake();
     h.thread.join();
+    if (h.submit_req) |r| {
+        r.arena.deinit();
+        h.gpa.destroy(r);
+    }
     h.closeAll();
     h.exts.deinit(h.gpa);
     h.warena.deinit();
@@ -321,6 +346,39 @@ pub fn list(h: *Host, registry: u32, command: u16, query: []const u8) u32 {
     }
     h.wake();
     return h.next_gen;
+}
+
+/// Calls form `command`'s submit with `values` (copied). Its answer comes
+/// like an action's.
+pub fn submit(h: *Host, registry: u32, command: u16, values: []const FormValue) u32 {
+    h.next_gen +%= 1;
+    const req = h.gpa.create(SubmitReq) catch return h.next_gen;
+    req.* = .{ .registry = registry, .command = command, .gen = h.next_gen, .values = &.{}, .arena = .init(h.gpa) };
+    const a = req.arena.allocator();
+    const copy = a.alloc(FormValue, values.len) catch {
+        req.arena.deinit();
+        h.gpa.destroy(req);
+        return h.next_gen;
+    };
+    for (copy, values) |*d, v| d.* = .{
+        .name = a.dupe(u8, v.name) catch "",
+        .value = a.dupe(u8, v.value) catch "",
+        .toggle = v.toggle,
+    };
+    req.values = copy;
+    const old = blk: {
+        h.lock.lockUncancelable(h.io);
+        defer h.lock.unlock(h.io);
+        const o = h.submit_req;
+        h.submit_req = req;
+        break :blk o;
+    };
+    if (old) |o| {
+        o.arena.deinit();
+        h.gpa.destroy(o);
+    }
+    h.wake();
+    return req.gen;
 }
 
 /// Asks every command with `root` for rows for `query`; a newer root
@@ -372,6 +430,7 @@ fn run(h: *Host) void {
         var lreq: ?ListReq = null;
         var areq: ?ActReq = null;
         var rreq: ?RootReq = null;
+        var sreq: ?*SubmitReq = null;
         {
             h.lock.lockUncancelable(h.io);
             defer h.lock.unlock(h.io);
@@ -384,10 +443,13 @@ fn run(h: *Host) void {
             if (lreq) |r| @memcpy(query[0..r.query_len], h.list_query[0..r.query_len]);
             rreq = h.root_req;
             h.root_req = null;
+            sreq = h.submit_req;
+            h.submit_req = null;
             if (rreq) |r| @memcpy(rquery[0..r.query_len], h.root_query[0..r.query_len]);
         }
         if (reload_now) h.doReload();
         if (areq) |r| h.doAct(r);
+        if (sreq) |r| h.doSubmit(r);
         if (lreq) |r| h.doList(r, query[0..r.query_len]);
         if (rreq) |r| h.doRoot(r, rquery[0..r.query_len]);
     }
@@ -550,7 +612,9 @@ fn parseExtension(L: *lua.State, ctx: *LoadCtx, t: c_int) void {
             const where = std.fmt.bufPrint(&where_buf, "preferences[{d}]", .{i}) catch "preferences";
             if (lua.c.lua_rawgeti(L, prefs, @intCast(i)) != lua.c.LUA_TTABLE)
                 lua.raise(L, "{s}: table expected, got {s}", .{ where, lua.typeName(L, -1) });
-            parsePref(L, ctx, lua.absIndex(L, -1), where, title);
+            const pref = parseField(L, ctx, lua.absIndex(L, -1), where, title);
+            for (ctx.load.prefs.items) |p| if (std.mem.eql(u8, p.ext, ctx.e.id) and std.mem.eql(u8, p.name, pref.name)) lua.raise(L, "two preferences named \"{s}\"", .{pref.name});
+            ctx.load.prefs.append(ctx.load.a, pref) catch lua.raise(L, "not enough memory", .{});
             lua.c.lua_settop(L, -2);
         }
     } else if (lua.c.lua_type(L, -1) != lua.c.LUA_TNIL) lua.raise(L, "extension.preferences: a list expected, got {s}", .{lua.typeName(L, -1)});
@@ -571,11 +635,11 @@ fn parseExtension(L: *lua.State, ctx: *LoadCtx, t: c_int) void {
     lua.c.lua_settop(L, -2);
 }
 
-fn parsePref(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_title: [:0]const u8) void {
+/// A preference, or a form field: the same fields.
+fn parseField(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_title: [:0]const u8) Pref {
     const a = ctx.load.a;
     const name = lua.fieldString(L, a, t, "name", where) orelse lua.raise(L, "{s}.name is missing", .{where});
     if (!validId(name)) lua.raise(L, "{s}.name: use only a-z, 0-9, - and _ (got \"{s}\")", .{ where, name });
-    for (ctx.load.prefs.items) |p| if (std.mem.eql(u8, p.ext, ctx.e.id) and std.mem.eql(u8, p.name, name)) lua.raise(L, "two preferences named \"{s}\"", .{name});
     const kind_name = lua.fieldString(L, a, t, "type", where) orelse "text";
     const kind = std.meta.stringToEnum(PrefKind, kind_name) orelse
         lua.raise(L, "{s}.type: toggle, choice, text or password (got \"{s}\")", .{ where, kind_name });
@@ -588,6 +652,7 @@ fn parsePref(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_titl
         .description = lua.fieldString(L, a, t, "description", where) orelse "",
         .kind = kind,
         .default = "",
+        .required = lua.fieldBool(L, t, "required", false, where),
     };
     if (kind == .choice) {
         if (lua.getField(L, t, "choices") != lua.c.LUA_TTABLE) lua.raise(L, "{s}.choices: a list expected for a choice", .{where});
@@ -614,7 +679,7 @@ fn parsePref(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_titl
         .choice => lua.fieldString(L, a, t, "default", where) orelse pref.choices[0].value,
         .text, .password => lua.fieldString(L, a, t, "default", where) orelse "",
     };
-    ctx.load.prefs.append(a, pref) catch lua.raise(L, "not enough memory", .{});
+    return pref;
 }
 
 fn parseCommand(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_title: [:0]const u8, default_icon: item_mod.Icon) void {
@@ -632,7 +697,7 @@ fn parseCommand(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_t
         break :blk ty == lua.c.LUA_TFUNCTION;
     };
     var mode: ?Mode = null;
-    const kinds = [_]struct { [:0]const u8, Mode, bool }{ .{ "items", .list, true }, .{ "search", .search, false }, .{ "run", .run, false } };
+    const kinds = [_]struct { [:0]const u8, Mode, bool }{ .{ "items", .list, true }, .{ "search", .search, false }, .{ "run", .run, false }, .{ "submit", .form, false } };
     for (kinds) |k| {
         const ty = lua.getField(L, t, k[0]);
         defer lua.c.lua_settop(L, -2);
@@ -648,6 +713,29 @@ fn parseCommand(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_t
     if (parseIcon(L, a, -1, where)) |x| icon = x;
     lua.c.lua_settop(L, -2);
 
+    var fields: []const Pref = &.{};
+    if (mode == .form) {
+        if (lua.getField(L, t, "fields") != lua.c.LUA_TTABLE) lua.raise(L, "{s}.fields: a list of fields expected for a form", .{where});
+        const list_idx = lua.absIndex(L, -1);
+        const n = lua.c.lua_rawlen(L, list_idx);
+        if (n == 0 or n > 20) lua.raise(L, "{s}.fields: 1 to 20 fields", .{where});
+        const out = a.alloc(Pref, n) catch lua.raise(L, "not enough memory", .{});
+        for (out, 1..) |*f, i| {
+            var wbuf: [48]u8 = undefined;
+            const fwhere = std.fmt.bufPrint(&wbuf, "{s}.fields[{d}]", .{ where, i }) catch where;
+            if (lua.c.lua_rawgeti(L, list_idx, @intCast(i)) != lua.c.LUA_TTABLE) lua.raise(L, "{s}: table expected", .{fwhere});
+            f.* = parseField(L, ctx, lua.absIndex(L, -1), fwhere, ext_title);
+            lua.c.lua_settop(L, -2);
+            for (out[0 .. i - 1]) |prev| if (std.mem.eql(u8, prev.name, f.name)) lua.raise(L, "{s}: two fields named \"{s}\"", .{ where, f.name });
+        }
+        lua.c.lua_settop(L, -2);
+        fields = out;
+    } else {
+        const ty = lua.getField(L, t, "fields");
+        lua.c.lua_settop(L, -2);
+        if (ty != lua.c.LUA_TNIL) lua.raise(L, "{s}.fields: a form needs submit too", .{where});
+    }
+
     const cmd: Command = .{
         .id = id,
         .title = title,
@@ -658,6 +746,8 @@ fn parseCommand(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_t
         .mode = mode orelse if (has_root) .provider else lua.raise(L, "{s}: give it items, search or run", .{where}),
         .detail = lua.fieldBool(L, t, "detail", false, where),
         .root = has_root,
+        .fields = fields,
+        .submit_title = lua.fieldString(L, a, t, "submit_title", where) orelse "Submit",
     };
     if (ctx.load.commands.items.len >= std.math.maxInt(u16)) lua.raise(L, "too many commands", .{});
     lua.c.lua_pushvalue(L, t);
@@ -748,7 +838,7 @@ const ListCtx = struct {
                 lua.pushString(L, ctx.query);
                 lua.c.lua_callk(L, 1, 1, 0, null);
             },
-            .run, .provider => lua.raise(L, "this command has no list", .{}),
+            .run, .provider, .form => lua.raise(L, "this command has no list", .{}),
         }
         const list_idx = lua.absIndex(L, -1);
         switch (lua.c.lua_type(L, list_idx)) {
@@ -1004,6 +1094,58 @@ const RootCtx = struct {
     }
 };
 
+// --------------------------------------------------------------- submit
+
+fn doSubmit(h: *Host, req: *SubmitReq) void {
+    defer {
+        req.arena.deinit();
+        h.gpa.destroy(req);
+    }
+    const res = h.gpa.create(ActResult) catch return;
+    res.* = .{ .gen = req.gen, .arena = .init(h.gpa) };
+    defer h.deliver(.{ .act = res });
+    if (req.registry != h.registry_gen or req.command >= h.wcmds.len) {
+        res.err = "Extensions were reloaded";
+        return;
+    }
+    const wc = &h.wcmds[req.command];
+    const e = h.exts.items[wc.ext];
+    e.budget.deadline_ns = index.sys.monotonicNs() + act_budget_ns;
+    defer e.budget.deadline_ns = std.math.maxInt(u64);
+    var ctx: SubmitCtx = .{ .wc = wc, .req = req, .res = res };
+    res.err = lua.protect(e.L, res.arena.allocator(), SubmitCtx, &ctx, SubmitCtx.run);
+}
+
+const SubmitCtx = struct {
+    wc: *WorkerCommand,
+    req: *SubmitReq,
+    res: *ActResult,
+
+    fn run(L: *lua.State, ctx: *SubmitCtx) void {
+        _ = lua.pushRef(L, ctx.wc.ref);
+        if (lua.getField(L, -1, "submit") != lua.c.LUA_TFUNCTION) lua.raise(L, "this command has no submit function", .{});
+        lua.c.lua_createtable(L, 0, @intCast(ctx.req.values.len));
+        for (ctx.req.values) |v| {
+            if (v.toggle) lua.c.lua_pushboolean(L, @intFromBool(std.mem.eql(u8, v.value, "true"))) else lua.pushString(L, v.value);
+            lua.pushString(L, v.name);
+            lua.c.lua_rotate(L, -2, 1);
+            lua.c.lua_rawset(L, -3);
+        }
+        lua.c.lua_callk(L, 1, 1, 0, null);
+        ctx.res.outcome = outcomeOf(L);
+    }
+};
+
+/// What a run, an action or a submit returned.
+fn outcomeOf(L: *lua.State) Outcome {
+    return switch (lua.c.lua_type(L, -1)) {
+        lua.c.LUA_TNIL => .close,
+        lua.c.LUA_TSTRING => std.meta.stringToEnum(Outcome, lua.toSlice(L, -1).?) orelse
+            lua.raise(L, "run must return nothing, \"close\", \"stay\" or \"refresh\" (got \"{s}\")", .{lua.toSlice(L, -1).?}),
+        else => lua.raise(L, "run must return nothing, \"close\", \"stay\" or \"refresh\", not a {s}", .{lua.typeName(L, -1)}),
+    };
+}
+
 // ------------------------------------------------------------------ act
 
 fn doAct(h: *Host, req: ActReq) void {
@@ -1048,12 +1190,7 @@ const ActCtx = struct {
             if (lua.getField(L, -1, "run") != lua.c.LUA_TFUNCTION) lua.raise(L, "this command has no run function", .{});
             lua.c.lua_callk(L, 0, 1, 0, null);
         }
-        ctx.res.outcome = switch (lua.c.lua_type(L, -1)) {
-            lua.c.LUA_TNIL => .close,
-            lua.c.LUA_TSTRING => std.meta.stringToEnum(Outcome, lua.toSlice(L, -1).?) orelse
-                lua.raise(L, "run must return nothing, \"close\", \"stay\" or \"refresh\" (got \"{s}\")", .{lua.toSlice(L, -1).?}),
-            else => lua.raise(L, "run must return nothing, \"close\", \"stay\" or \"refresh\", not a {s}", .{lua.typeName(L, -1)}),
-        };
+        ctx.res.outcome = outcomeOf(L);
     }
 };
 

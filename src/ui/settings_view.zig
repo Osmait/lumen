@@ -16,6 +16,7 @@ const themes = @import("themes.zig");
 const Kind = core.file_kind.Kind;
 const Ui = @import("Ui.zig");
 const prefs_view = @import("prefs_view.zig");
+const form_view = @import("form_view.zig");
 
 const log = std.log.scoped(.ui);
 const labels = @import("labels.zig");
@@ -159,6 +160,7 @@ pub fn setChoosing(ui: *Ui, next: Ui.Choosing) void {
         .kind => |k| w.print("Open {s} With", .{k.title()}) catch {},
         .file => |f| w.print("Open {s} With", .{std.Io.Dir.path.basename(f.path)}) catch {},
         .pref => |i| if (ui.ext_registry) |reg| if (i < reg.prefs.len) w.writeAll(reg.prefs[i].title) catch {},
+        .field => |i| if (form_view.field(ui, i)) |f| w.writeAll(f.title) catch {},
     }
     const n = labels.validUtf8Prefix(w.buffered()).len;
     ui.choose_title[n] = 0;
@@ -184,6 +186,7 @@ pub fn chooseCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
         .kind => |k| appOptions(ui, a, &out, k.sampleMime(), ui.settings.open_with.get(@tagName(k)), false),
         .file => |f| appOptions(ui, a, &out, f.mime, null, true),
         .pref => |i| prefs_view.choiceCandidates(ui, a, &out, i),
+        .field => |i| form_view.choiceCandidates(ui, a, &out, i),
     }
     return out.items;
 }
@@ -356,6 +359,7 @@ pub fn performSetting(ui: *Ui, s: item_mod.Setting, op: item_mod.Op) void {
                 ui.goBack();
             },
             .pref => |i| prefs_view.pick(ui, i, v),
+            .field => |i| form_view.pick(ui, i, v),
             else => {},
         },
         .go => |v| {
@@ -390,6 +394,8 @@ pub fn performSetting(ui: *Ui, s: item_mod.Setting, op: item_mod.Op) void {
         .ext_prefs => |id| prefs_view.open(ui, id),
         .pref => |i| prefs_view.edit(ui, i),
         .save_input => prefs_view.saveInput(ui),
+        .field => |i| form_view.edit(ui, i),
+        .submit_form => form_view.submit(ui),
         .reset => {
             ui.settings.deinit();
             ui.settings = Settings.init(ui.gpa);

@@ -30,6 +30,8 @@ All notable changes are listed here. The format follows
   asked for on every query and never waited for.
 - Rows can carry `markdown` (a safe subset, rendered in the detail pane) and
   up to 4 `metadata` pairs.
+- Forms: a command with `fields` and `submit`; text fields use the new input
+  view, required fields are checked before submitting.
 - Example extensions: GitHub (through `gh`), processes, hello.
 
 ## [0.1.0] - 2026-10-26

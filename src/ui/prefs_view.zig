@@ -11,6 +11,7 @@ const Host = @import("../ext/Host.zig");
 const index = @import("index");
 const Ui = @import("Ui.zig");
 const settings_view = @import("settings_view.zig");
+const form_view = @import("form_view.zig");
 
 const log = std.log.scoped(.prefs);
 
@@ -71,7 +72,7 @@ pub fn candidates(ui: *Ui, a: std.mem.Allocator) []Item {
     return out.items;
 }
 
-fn iconOf(kind: Host.PrefKind) item_mod.Icon {
+pub fn iconOf(kind: Host.PrefKind) item_mod.Icon {
     return switch (kind) {
         .toggle => .{ .tile = .{ .name = "emblem-ok-symbolic", .color = .green } },
         .choice => .{ .tile = .{ .name = "view-list-symbolic", .color = .blue } },
@@ -81,7 +82,7 @@ fn iconOf(kind: Host.PrefKind) item_mod.Icon {
 }
 
 /// How a value shows on the right of its row.
-fn display(a: std.mem.Allocator, p: *const Host.Pref, value: []const u8) [:0]const u8 {
+pub fn display(a: std.mem.Allocator, p: *const Host.Pref, value: []const u8) [:0]const u8 {
     return switch (p.kind) {
         .toggle => if (std.mem.eql(u8, value, "true")) "On" else "Off",
         .choice => for (p.choices) |ch| {
@@ -128,7 +129,7 @@ pub fn edit(ui: *Ui, i: u16) void {
             ui.navigate(.choose);
         },
         .text, .password => {
-            ui.input_pref = i;
+            ui.input = .{ .pref = i };
             ui.navigate(.input);
             // After the view change, which clears the search bar.
             const z = arena.allocator().dupeSentinel(u8, value, 0) catch return;
@@ -168,10 +169,15 @@ pub fn inputTitle(ui: *Ui) [*:0]const u8 {
     return p.title.ptr;
 }
 
+/// What the input view edits: a preference, or a field of the open form.
 fn inputPref(ui: *Ui) ?*const Host.Pref {
-    const reg = ui.ext_registry orelse return null;
-    if (ui.input_pref >= reg.prefs.len) return null;
-    return &reg.prefs[ui.input_pref];
+    switch (ui.input) {
+        .pref => |i| {
+            const reg = ui.ext_registry orelse return null;
+            return if (i < reg.prefs.len) &reg.prefs[i] else null;
+        },
+        .field => |i| return form_view.field(ui, i),
+    }
 }
 
 pub fn isPassword(ui: *Ui) bool {
@@ -185,7 +191,7 @@ pub fn inputCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
     const row = a.alloc(Item, 1) catch return &.{};
     row[0] = .{
         .key = "input:save",
-        .title = std.fmt.allocPrintSentinel(a, "Save {s}", .{p.title}, 0) catch "Save",
+        .title = if (ui.input == .field) std.fmt.allocPrintSentinel(a, "Set {s}", .{p.title}, 0) catch "Set" else std.fmt.allocPrintSentinel(a, "Save {s}", .{p.title}, 0) catch "Save",
         .subtitle = if (p.description.len > 0) p.description else "Type the value above",
         .icon = iconOf(p.kind),
         .action = .{ .setting = .save_input },
@@ -195,7 +201,10 @@ pub fn inputCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
 
 pub fn saveInput(ui: *Ui) void {
     const p = inputPref(ui) orelse return;
-    save(ui, p, .{ .string = ui.query() });
+    switch (ui.input) {
+        .pref => save(ui, p, .{ .string = ui.query() }),
+        .field => |i| form_view.setValue(ui, i, ui.query()),
+    }
     ui.goBack();
 }
 

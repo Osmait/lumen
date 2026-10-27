@@ -33,6 +33,7 @@ const keyboard = @import("keyboard.zig");
 pub const ext_view = @import("ext_view.zig");
 pub const dmenu = @import("dmenu.zig");
 const prefs_view = @import("prefs_view.zig");
+const form_view = @import("form_view.zig");
 const ExtHost = @import("../ext/Host.zig");
 const Kind = core.file_kind.Kind;
 
@@ -185,8 +186,12 @@ ext_act_gen: u32 = 0,
 /// The extension whose preferences the prefs view lists.
 prefs_ext: [64]u8 = undefined,
 prefs_ext_len: usize = 0,
-/// The preference the input view edits (index in the registry).
-input_pref: u16 = 0,
+/// What the input view edits: a preference (index in the registry) or a
+/// field of the open form.
+input: union(enum) { pref: u16, field: u16 } = .{ .pref = 0 },
+/// The open form (index in the registry) and its fields' values (gpa).
+form_cmd: u16 = 0,
+form_values: std.ArrayList([:0]u8) = .empty,
 /// `lumen --dmenu` waiting for an answer.
 picker: ?*dmenu.Session = null,
 /// Search highlight colours of the theme, for Pango markup.
@@ -213,6 +218,8 @@ pub const Choosing = union(enum) {
     file: struct { path: [:0]u8, mime: [:0]u8 },
     /// A choice preference of an extension (index in the registry).
     pref: u16,
+    /// A choice field of the open form.
+    field: u16,
 };
 
 /// `hint` shows the primary action while the row is selected, in place of
@@ -655,6 +662,7 @@ fn loadBase(self: *Ui, a: std.mem.Allocator) []Item {
         .dmenu => &.{},
         .prefs => prefs_view.candidates(self, a),
         .input => prefs_view.inputCandidates(self, a),
+        .form => form_view.candidates(self, a),
     };
 }
 
@@ -714,6 +722,7 @@ pub fn setView(self: *Ui, view: View) void {
         .dmenu => "Filter...",
         .prefs => "Search preferences...",
         .input => prefs_view.inputTitle(self),
+        .form => "Search fields...",
     });
     c.gtk_label_set_text(@ptrCast(self.scope), self.viewTitle());
     c.gtk_widget_set_visible(self.scope, @intFromBool(view != .root));
@@ -833,6 +842,7 @@ pub fn refresh(self: *Ui) void {
         .prefs => self.fillSectioned(a, q),
         // What is typed is the value, not a filter.
         .input => self.fillSectioned(a, ""),
+        .form => self.fillSectioned(a, q),
     }
     const searching = self.view == .files or self.view == .contents;
     if (self.rows.items.len == 0 or (searching and self.items.items.len == 0)) {
@@ -1117,6 +1127,7 @@ fn viewTitle(self: *Ui) [*:0]const u8 {
         .dmenu => dmenu.title(self),
         .prefs => prefs_view.title(self),
         .input => prefs_view.inputTitle(self),
+        .form => form_view.title(self),
     };
 }
 

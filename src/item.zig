@@ -32,8 +32,9 @@ pub const Icon = union(enum) {
 
 /// `ext`: the list of an extension command (which one is in the UI).
 /// `dmenu`: lines from `lumen --dmenu`. `prefs`: an extension's preferences;
-/// `input`: typing a preference's value.
-pub const View = enum { root, clipboard, windows, files, contents, settings, themes, default_apps, choose, ext, dmenu, prefs, input };
+/// `input`: typing a preference's or a form field's value; `form`: an
+/// extension's form.
+pub const View = enum { root, clipboard, windows, files, contents, settings, themes, default_apps, choose, ext, dmenu, prefs, input, form };
 
 pub const System = enum {
     lock,
@@ -138,6 +139,10 @@ pub const Setting = union(enum) {
     pref: u16,
     /// Saves what was typed in the input view.
     save_input,
+    /// Changes field `i` of the open form.
+    field: u16,
+    /// Submits the open form.
+    submit_form,
 };
 
 pub const Item = struct {
@@ -257,7 +262,8 @@ pub fn actionsFor(item: *const Item) []const Entry {
             },
             .open_file => &.{.{ .label = "Open Settings File", .keys = "↵", .op = .run }},
             .reset => &.{.{ .label = "Reset All Settings", .keys = "↵", .op = .run }},
-            .ext_prefs, .pref => &.{.{ .label = "Change", .keys = "↵", .op = .run }},
+            .ext_prefs, .pref, .field => &.{.{ .label = "Change", .keys = "↵", .op = .run }},
+            .submit_form => &.{.{ .label = "Submit", .keys = "↵", .op = .run }},
             .save_input => &.{.{ .label = "Save", .keys = "↵", .op = .run }},
         },
         .calc => &.{
