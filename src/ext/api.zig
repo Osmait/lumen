@@ -382,7 +382,27 @@ fn layout(L: *lua.State) lua.Error!c_int {
     c.lua_pushnil(L);
     while (c.lua_next(L, 1) != 0) {
         const key = lua.toSlice(L, -2) orelse return lua.fail(L, "lumen.layout: keys are names ({s})", .{layout_mod.keys});
-        if (std.mem.eql(u8, key, "show")) {
+        if (std.mem.eql(u8, key, "searchbar") or std.mem.eql(u8, key, "row")) {
+            if (c.lua_type(L, -1) != c.LUA_TTABLE) return lua.fail(L, "lumen.layout: {s} is a list of part names", .{key});
+            var names: [8][]const u8 = undefined;
+            const n = c.lua_rawlen(L, -1);
+            if (n == 0 or n > names.len) return lua.fail(L, "lumen.layout: {s} lists 1 to 6 parts", .{key});
+            for (names[0..n], 1..) |*name, i| {
+                _ = c.lua_rawgeti(L, -1, @intCast(i));
+                name.* = lua.toSlice(L, -1) orelse return lua.fail(L, "lumen.layout: {s}[{d}] is a part name", .{ key, i });
+                c.lua_settop(L, -2);
+            }
+            const is_bar = key[0] == 's';
+            const ok = if (is_bar) layout_mod.setParts(layout_mod.BarPart, &l.searchbar, names[0..n], .entry) else layout_mod.setParts(layout_mod.RowPart, &l.row, names[0..n], .text);
+            ok catch return lua.fail(L, "lumen.layout: {s} takes each of {s} at most once, {s} included", .{
+                key,
+                if (is_bar) "back, icon, prompt, scope, entry, keys" else "icon, text, accessory, hint",
+                if (is_bar) "entry" else "text",
+            });
+        } else if (std.mem.eql(u8, key, "prompt")) {
+            const p = lua.toSlice(L, -1) orelse return lua.fail(L, "lumen.layout: prompt is a string", .{});
+            l.prompt = load.a.dupeSentinel(u8, p[0..@min(p.len, 64)], 0) catch return lua.fail(L, "not enough memory", .{});
+        } else if (std.mem.eql(u8, key, "show")) {
             if (c.lua_type(L, -1) != c.LUA_TTABLE) return lua.fail(L, "lumen.layout: show is a table of true/false", .{});
             const show = lua.absIndex(L, -1);
             c.lua_pushnil(L);

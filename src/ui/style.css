@@ -523,3 +523,10 @@ window.lumen-backdrop {
 .actions.from-footer.from-bottom {
   margin: 0 58px 152px 0;
 }
+
+/* lumen.layout's prompt: fixed text before the search field */
+.prompt {
+  color: var(--accent);
+  font-weight: 600;
+  margin-right: 10px;
+}

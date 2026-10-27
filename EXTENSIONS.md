@@ -341,6 +341,9 @@ lumen.layout {
   detail = "right",               -- the detail pane: right, left, bottom
   footer = true,                  -- a bar: the view, what Enter does, Actions
   rows = "inline",                -- subtitles beside titles ("stacked": under)
+  prompt = "run",                 -- fixed text in the search bar, like rofi's
+  searchbar = { "back", "icon", "prompt", "scope", "entry", "keys" },
+  row = { "icon", "text", "accessory", "hint" },
   show = {                        -- all true by default, except search_icon
     hints = false,                -- "Open ↵" in the selected row
     subtitles = true, accessories = true, icons = true, section_titles = true,
@@ -359,6 +362,9 @@ lumen.layout {
 | `search` | `bottom` puts the search field under the results, as many rofi themes do. |
 | `detail` | Where the detail pane goes beside (or under) the list. |
 | `footer` | With a footer, the action panel opens above it, by its Actions key. |
+| `searchbar` | The search bar's parts, in order: `back` (the arrow inside a view), `icon` (the magnifier, with `show.search_icon`), `prompt`, `scope` (the view's name), `entry` (the text, required), `keys` (the Ctrl K chip). Parts left out are not shown. |
+| `row` | A row's parts, in order: `icon`, `text` (title and subtitle, required), `accessory`, `hint` (what Enter does). `{ "text", "accessory", "icon" }` puts icons on the right. |
+| `prompt` | Text before the search field (`.prompt` in style.css). |
 
 A key or value Lumen does not know is an error shown in the root search.
 
@@ -416,6 +422,7 @@ can change anything Lumen draws. The theme's colours are variables: `--bg`,
 | `.grid`, `.grid > flowboxchild`, `.cell-title` | Grids and their cells. |
 | `.footer`, `.footer-title`, `.footer-action`, `.footer-sep` | The footer (`lumen.layout`). |
 | `.search-icon` | The magnifier (`show.search_icon`). |
+| `.prompt` | The prompt (`lumen.layout`'s `prompt`). |
 | `.shell.single`, `.search-bottom`, `.with-footer`, `.alone` | Classes on the window's pieces for each layout: one panel, search at the bottom, a footer, only the search bar showing. |
 | `.results-island.detail-left`, `.detail-bottom` | The detail pane's place. |
 | `.kbd` | Key caps. |

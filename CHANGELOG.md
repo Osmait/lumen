@@ -43,6 +43,8 @@ All notable changes are listed here. The format follows
   of a row show.
 - Four complete styles in `examples/styles`: Raycast, Spotlight, Alfred and a
   minimal rofi-like one.
+- `lumen.layout`'s `searchbar` and `row` order (and leave out) the search
+  bar's and the rows' parts; `prompt` adds fixed text before the search field.
 - Icons: image files (PNG, SVG) wherever an icon is given; `lumen.icons`
   replaces any app's, command's or file kind's icon by its key;
   `~/.config/lumen/icons/<name>.svg` replaces an icon by name everywhere; an

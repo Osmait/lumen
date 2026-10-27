@@ -101,6 +101,8 @@ footer_sep: *c.GtkWidget = undefined,
 /// The "Ctrl K" chip in the search bar, and the magnifier before the text.
 key_chip: *c.GtkWidget = undefined,
 search_icon: *c.GtkWidget = undefined,
+/// lumen.layout's prompt (rofi's "drun"), before the text.
+prompt_label: *c.GtkWidget = undefined,
 /// The widgets exist (settings read before `build` made them wait).
 built: bool = false,
 entry: *c.GtkWidget = undefined,
@@ -336,6 +338,10 @@ pub fn build(self: *Ui) void {
     c.gtk_widget_set_valign(self.search_icon, c.GTK_ALIGN_CENTER);
     c.gtk_widget_set_visible(self.search_icon, 0);
     c.gtk_box_append(@ptrCast(search), self.search_icon);
+    self.prompt_label = widgets.label("", "prompt");
+    c.gtk_widget_set_valign(self.prompt_label, c.GTK_ALIGN_CENTER);
+    c.gtk_widget_set_visible(self.prompt_label, 0);
+    c.gtk_box_append(@ptrCast(search), self.prompt_label);
     self.scope = widgets.label("", "scope");
     c.gtk_widget_set_valign(self.scope, c.GTK_ALIGN_CENTER);
     c.gtk_widget_set_visible(self.scope, 0);
@@ -477,6 +483,17 @@ fn cssClass(w: *c.GtkWidget, name: [*:0]const u8, on: bool) void {
     if (on) c.gtk_widget_add_css_class(w, name) else c.gtk_widget_remove_css_class(w, name);
 }
 
+fn barWidget(self: *Ui, part: layout_mod.BarPart) *c.GtkWidget {
+    return switch (part) {
+        .back => self.back,
+        .icon => self.search_icon,
+        .prompt => self.prompt_label,
+        .scope => self.scope,
+        .entry => self.entry,
+        .keys => self.key_chip,
+    };
+}
+
 /// lumen.layout: the pieces' order, one panel or two, the footer, the
 /// detail pane's side, what rows show; then the size. The caller rebuilds
 /// the rows.
@@ -484,7 +501,18 @@ pub fn applyStructure(self: *Ui) void {
     const l = self.layout;
     widgets.show = l.show;
     widgets.rows_inline = l.rows == .inline_;
-    c.gtk_widget_set_visible(self.search_icon, @intFromBool(l.show.search_icon));
+    widgets.row_parts = l.row;
+    // The search bar's parts in order; setView decides which of them show.
+    const bar: *c.GtkBox = @ptrCast(self.search_bar);
+    var prev: ?*c.GtkWidget = null;
+    for (l.searchbar.slice()) |part| {
+        const w = self.barWidget(part);
+        c.gtk_box_reorder_child_after(bar, w, prev);
+        prev = w;
+    }
+    c.gtk_label_set_text(@ptrCast(self.prompt_label), l.prompt.ptr);
+    c.gtk_widget_set_visible(self.prompt_label, @intFromBool(l.prompt.len > 0 and l.searchbar.has(.prompt)));
+    c.gtk_widget_set_visible(self.search_icon, @intFromBool(l.show.search_icon and l.searchbar.has(.icon)));
     const col: *c.GtkBox = @ptrCast(self.column);
     c.gtk_box_set_spacing(col, if (l.panels == .single) 0 else 10);
     cssClass(self.column, "single", l.panels == .single);
@@ -498,7 +526,7 @@ pub fn applyStructure(self: *Ui) void {
     c.gtk_box_reorder_child_after(col, self.footer, second);
     c.gtk_widget_set_visible(self.spacer, @intFromBool(l.search == .bottom));
     c.gtk_widget_set_visible(self.footer, @intFromBool(l.footer));
-    c.gtk_widget_set_visible(self.key_chip, @intFromBool(l.show.key_hints));
+    c.gtk_widget_set_visible(self.key_chip, @intFromBool(l.show.key_hints and l.searchbar.has(.keys)));
     // With a footer, or the search bar at the bottom, the action panel opens
     // down there, above them.
     c.gtk_widget_set_valign(self.panel, if (l.footer or l.search == .bottom) c.GTK_ALIGN_END else c.GTK_ALIGN_START);
@@ -867,9 +895,11 @@ pub fn setView(self: *Ui, view: View) void {
     }
     c.gtk_widget_set_visible(self.detail_meta, @intFromBool(view != .ext));
     for (self.meta_lines) |l| c.gtk_widget_set_visible(l, 1);
-    c.gtk_widget_set_visible(self.back, @intFromBool(view != .root and self.layout.show.back));
+    const bar = self.layout.searchbar;
+    const back_shows = view != .root and self.layout.show.back and bar.has(.back);
+    c.gtk_widget_set_visible(self.back, @intFromBool(back_shows));
     // The magnifier gives way to the back arrow inside a view.
-    c.gtk_widget_set_visible(self.search_icon, @intFromBool(self.layout.show.search_icon and (view == .root or !self.layout.show.back)));
+    c.gtk_widget_set_visible(self.search_icon, @intFromBool(self.layout.show.search_icon and bar.has(.icon) and !back_shows));
     c.gtk_widget_set_visible(self.detail, @intFromBool(has_detail));
     // A preview needs room: the results take the full height then.
     c.gtk_widget_set_vexpand(self.results, @intFromBool(has_detail));
@@ -910,7 +940,7 @@ pub fn setView(self: *Ui, view: View) void {
         .form => "Search fields...",
     });
     c.gtk_label_set_text(@ptrCast(self.scope), self.viewTitle());
-    c.gtk_widget_set_visible(self.scope, @intFromBool(view != .root and self.layout.show.scope));
+    c.gtk_widget_set_visible(self.scope, @intFromBool(view != .root and self.layout.show.scope and bar.has(.scope)));
     c.gtk_label_set_text(@ptrCast(self.footer_title), self.viewTitle());
 
     // Setting the text triggers `changed`, which refreshes.
@@ -1530,7 +1560,12 @@ pub fn dump(self: *Ui, gpa: std.mem.Allocator) (std.Io.Writer.Error || std.mem.A
     try w.print("view: {t}\nvisible: {}\nquery: {s}\n", .{ self.view, c.gtk_widget_get_visible(self.window) != 0, self.query() });
     try w.print("title: {s}\nprimary: {s}\n", .{ self.viewTitle(), self.primary });
     const lay = self.layout;
-    try w.print("layout: {d}x{d} panels={t} search={t} detail={t} rows={s} footer={}\n", .{ self.panelW(), self.panelH(), lay.panels, lay.search, lay.detail, if (lay.rows == .inline_) "inline" else "stacked", lay.footer });
+    try w.print("layout: {d}x{d} panels={t} search={t} detail={t} rows={s} footer={}", .{ self.panelW(), self.panelH(), lay.panels, lay.search, lay.detail, if (lay.rows == .inline_) "inline" else "stacked", lay.footer });
+    try w.writeAll(" bar=");
+    for (lay.searchbar.slice(), 0..) |p, i| try w.print("{s}{t}", .{ if (i > 0) "," else "", p });
+    try w.writeAll(" row=");
+    for (lay.row.slice(), 0..) |p, i| try w.print("{s}{t}", .{ if (i > 0) "," else "", p });
+    try w.print(" prompt={s}\n", .{lay.prompt});
     if (lay.footer) try w.print("footer: {s} | {s}\n", .{ c.gtk_label_get_text(@ptrCast(self.footer_title)), c.gtk_label_get_text(@ptrCast(self.footer_action)) });
     try w.print("rows:\n", .{});
     if (self.rows.items.len == 0) try w.print("  (empty) {s}\n", .{self.emptyText(a)});

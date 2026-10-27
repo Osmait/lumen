@@ -11,6 +11,27 @@ pub const Search = enum { top, bottom };
 pub const Detail = enum { right, left, bottom };
 /// A row's subtitle under its title, or after it on the same line.
 pub const Rows = enum { stacked, inline_ };
+/// The search bar's pieces: the back arrow, the magnifier, the prompt, the
+/// open view's name, the text field and the "Ctrl K" chip.
+pub const BarPart = enum { back, icon, prompt, scope, entry, keys };
+/// A row's pieces: its icon, title and subtitle, accessory, and the hint
+/// of what Enter does.
+pub const RowPart = enum { icon, text, accessory, hint };
+
+/// An order of parts, some of them maybe left out.
+pub fn Parts(comptime T: type) type {
+    return struct {
+        items: [@typeInfo(T).@"enum".field_names.len]T = std.enums.values(T)[0..@typeInfo(T).@"enum".field_names.len].*,
+        len: u8 = @typeInfo(T).@"enum".field_names.len,
+
+        pub fn slice(p: *const @This()) []const T {
+            return p.items[0..p.len];
+        }
+        pub fn has(p: *const @This(), part: T) bool {
+            return std.mem.findScalar(T, p.slice(), part) != null;
+        }
+    };
+}
 
 pub const Show = struct {
     /// The primary action inside the selected row ("Open ↵").
@@ -44,6 +65,13 @@ pub const Layout = struct {
     footer: bool = false,
     rows: Rows = .stacked,
     show: Show = .{},
+    /// The search bar's and rows' parts, in order; those left out are not
+    /// shown.
+    searchbar: Parts(BarPart) = .{},
+    row: Parts(RowPart) = .{},
+    /// Fixed text in the search bar (rofi's "drun"); its memory belongs to
+    /// the extension registry.
+    prompt: [:0]const u8 = "",
 
     pub const min_width = 360;
     pub const max_width = 2400;
@@ -52,7 +80,7 @@ pub const Layout = struct {
 };
 
 /// The layout keys, for error messages.
-pub const keys = "width, height, position, offset, panels, search, detail, footer, rows, show";
+pub const keys = "width, height, position, offset, panels, search, detail, footer, rows, show, searchbar, row, prompt";
 pub const show_keys = "hints, subtitles, accessories, icons, section_titles, key_hints, scope, back, search_icon";
 
 pub const SetError = error{ UnknownKey, BadValue };
@@ -98,11 +126,36 @@ pub fn setShow(s: *Show, key: []const u8, on: bool) SetError!void {
     return error.UnknownKey;
 }
 
+/// Sets an order of parts from their names; it must keep `required`.
+pub fn setParts(comptime T: type, p: *Parts(T), names: []const []const u8, required: T) SetError!void {
+    if (names.len == 0 or names.len > p.items.len) return error.BadValue;
+    var out: Parts(T) = .{ .len = 0 };
+    for (names) |n| {
+        const part = std.meta.stringToEnum(T, n) orelse return error.UnknownKey;
+        if (out.has(part)) return error.BadValue;
+        out.items[out.len] = part;
+        out.len += 1;
+    }
+    if (!out.has(required)) return error.BadValue;
+    p.* = out;
+}
+
 pub const Value = struct {
     number: ?f64 = null,
     string: ?[]const u8 = null,
     boolean: ?bool = null,
 };
+
+test "orders of parts" {
+    var l: Layout = .{};
+    try std.testing.expect(l.searchbar.has(.keys) and l.row.has(.hint));
+    try setParts(RowPart, &l.row, &.{ "text", "icon" }, .text);
+    try std.testing.expectEqualSlices(RowPart, &.{ .text, .icon }, l.row.slice());
+    try std.testing.expect(!l.row.has(.accessory));
+    try std.testing.expectError(error.BadValue, setParts(RowPart, &l.row, &.{"icon"}, .text));
+    try std.testing.expectError(error.BadValue, setParts(BarPart, &l.searchbar, &.{ "entry", "entry" }, .entry));
+    try std.testing.expectError(error.UnknownKey, setParts(BarPart, &l.searchbar, &.{ "entry", "logo" }, .entry));
+}
 
 test "layout keys and values" {
     var l: Layout = .{};

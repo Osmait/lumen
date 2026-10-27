@@ -17,6 +17,9 @@ lumen.layout {
   panels = "single",
   search = "bottom",
   detail = "bottom",
+  -- rofi's prompt before the text, and nothing else in the bar.
+  prompt = "run",
+  searchbar = { "back", "prompt", "entry" },
   show = {
     icons = false,
     subtitles = false,

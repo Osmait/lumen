@@ -472,10 +472,11 @@ expect "lumen.set shows in Settings" 'Density \| Set in init.lua \| Compact'
 L --key enter; sleep 0.1
 expect "settings init.lua fixes cannot change" 'primary: Set in init.lua'
 cp "$H/.config/lumen/init.lua" "$T/init.lua.bak"
-printf '\nlumen.layout { width = 700, panels = "single", search = "bottom", footer = true, rows = "inline" }\n' >>"$H/.config/lumen/init.lua"
+printf '\nlumen.layout { width = 700, panels = "single", search = "bottom", footer = true, rows = "inline", prompt = "go", searchbar = { "prompt", "entry" }, row = { "text", "icon" } }\n' >>"$H/.config/lumen/init.lua"
 L --reload; sleep 0.5; query root "fixture fruits"
 expect "lumen.layout changes the window" '^layout: 700x[0-9]+ panels=single search=bottom detail=right rows=inline footer=true'
 expect "the footer says what Enter does" '^footer: Lumen \| Open Command'
+expect "search bar and row parts in order" 'bar=prompt,entry row=text,icon prompt=go'
 query settings "window width"
 expect "a layout width shows as set in init.lua" 'Window Width \| Set in init.lua'
 cp "$T/init.lua.bak" "$H/.config/lumen/init.lua"; L --reload; sleep 0.5

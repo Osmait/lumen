@@ -33,3 +33,4 @@
 .actions, .actions row { border-radius: 0; font-family: "JetBrains Mono", monospace; }
 .actions { border: 2px solid var(--accent); box-shadow: none; }
 .actions row:selected { background-image: none; box-shadow: none; }
+.prompt { color: var(--accent); font-weight: 700; margin-right: 12px; }
