@@ -223,6 +223,13 @@ form_cmd: u16 = 0,
 form_values: std.ArrayList([:0]u8) = .empty,
 /// ~/.config/lumen/icons as last read (widgets.renamed points into it).
 icon_arena: ?std.heap.ArenaAllocator = null,
+/// A message for the selected row once the extensions have reloaded (the
+/// reload rebuilds the rows, and would wipe it).
+after_reload: [160:0]u8 = @splat(0),
+after_reload_len: usize = 0,
+/// `after_reload` waits for the next reload (the row may still point at
+/// the text after that: it is never cleared, only replaced).
+after_reload_pending: bool = false,
 /// `lumen --dmenu` waiting for an answer.
 picker: ?*dmenu.Session = null,
 /// Search highlight colours of the theme, for Pango markup.

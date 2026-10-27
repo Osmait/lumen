@@ -502,7 +502,18 @@ if command -v git >/dev/null; then
     L --update greeter >/dev/null && ok "update pulls" || ko "update pulls"
     L --hide; query root "greeter hello"
     expect_soon "updated extension reloads" '> Greeter Hello'
-    L --uninstall greeter >/dev/null && [[ ! -d "$H/.config/lumen/extensions/greeter" ]] && ok "uninstall removes it" || ko "uninstall removes it"
+    query settings "greeter"
+    expect "extensions listed in Settings" '> greeter \| greeter \| 1 command'
+    L --key enter; sleep 0.3
+    expect "an extension's page offers updating it" 'Update \| git pull'
+    L --key down; L --key enter
+    expect_soon "update from Settings says how it went" 'primary: (Already up to date|Updated)'
+    L --key down; L --key enter; sleep 0.1
+    expect "uninstall asks for a second enter" 'primary: Press ↵ again to Uninstall'
+    L --key enter
+    if wait_for '^view: settings' 5 && [[ ! -d "$H/.config/lumen/extensions/greeter" ]]; then ok "uninstall from Settings removes it"; else ko "uninstall from Settings removes it" "$(L --dump)"; fi
+    out=$(L --uninstall greeter 2>&1); st=$?
+    [[ $st == 1 && "$out" == *"no extension named"* ]] && ok "uninstall of a missing extension fails" || ko "uninstall of a missing extension fails" "$st $out"
 else
     echo "  (git not installed: skipped)"
 fi

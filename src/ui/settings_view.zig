@@ -439,6 +439,15 @@ pub fn performSetting(ui: *Ui, s: item_mod.Setting, op: item_mod.Op) void {
         .save_input => prefs_view.saveInput(ui),
         .field => |i| form_view.edit(ui, i),
         .submit_form => form_view.submit(ui),
+        .ext_open => |dir| {
+            run.openFile(ui.actionCtx(), dir, true);
+            ui.hide();
+        },
+        .ext_update => |id| {
+            ui.showFailure("Updating...");
+            Ui.installer.update(ui, null, id);
+        },
+        .ext_uninstall => |id| Ui.installer.uninstall(ui, null, id),
         .reset => {
             ui.settings.deinit();
             ui.settings = Settings.init(ui.gpa);

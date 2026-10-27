@@ -448,6 +448,10 @@ lumen --update                                              # every git extensio
 lumen --uninstall weather
 ```
 
+Settings > Extensions lists every installed extension, those that failed
+to load included: its preferences, its folder, Update (for git checkouts)
+and Uninstall.
+
 The name comes from the repository (`lumen-`, `lumen-ext-` and `-lumen` are
 dropped) unless `--as` gives one. A repository without an `init.lua` is
 refused. Lumen loads the extension at once, and it runs as you: read its

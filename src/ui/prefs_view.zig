@@ -15,21 +15,36 @@ const form_view = @import("form_view.zig");
 
 const log = std.log.scoped(.prefs);
 
-/// Settings > Extensions: one row per extension with preferences.
+/// Settings > Extensions: every installed extension, those that failed to
+/// load too (to update or remove them).
 pub fn extensionRows(ui: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item)) void {
     const reg = ui.ext_registry orelse return;
-    for (reg.prefs, 0..) |p, i| {
-        // First preference of its extension only.
-        if (i > 0 and std.mem.eql(u8, reg.prefs[i - 1].ext, p.ext)) continue;
+    for (reg.extensions) |e| {
         var n: usize = 0;
-        for (reg.prefs) |q| n += @intFromBool(std.mem.eql(u8, q.ext, p.ext));
+        for (reg.prefs) |q| n += @intFromBool(std.mem.eql(u8, q.ext, e.id));
+        out.append(a, .{
+            .key = std.fmt.allocPrint(a, "set:ext:{s}", .{e.id}) catch continue,
+            .section = "Extensions",
+            .title = e.title,
+            .subtitle = e.id,
+            .accessory = (if (n > 0)
+                std.fmt.allocPrintSentinel(a, "{d} {s}", .{ n, if (n == 1) "setting" else "settings" }, 0)
+            else
+                std.fmt.allocPrintSentinel(a, "{d} {s}", .{ e.commands, if (e.commands == 1) "command" else "commands" }, 0)) catch "",
+            .icon = .{ .tile = .{ .name = "application-x-addon-symbolic", .color = .purple } },
+            .keywords = "extension preferences update uninstall",
+            .action = .{ .setting = .{ .ext_prefs = e.id } },
+        }) catch return;
+    }
+    for (reg.problems) |p| {
+        if (std.mem.eql(u8, p.ext, "config")) continue;
         out.append(a, .{
             .key = std.fmt.allocPrint(a, "set:ext:{s}", .{p.ext}) catch continue,
             .section = "Extensions",
-            .title = p.ext_title,
-            .accessory = std.fmt.allocPrintSentinel(a, "{d} {s}", .{ n, if (n == 1) "setting" else "settings" }, 0) catch "",
-            .icon = .{ .tile = .{ .name = "application-x-addon-symbolic", .color = .purple } },
-            .keywords = "extension preferences",
+            .title = p.ext,
+            .subtitle = "Failed to load",
+            .icon = .{ .tile = .{ .name = "dialog-warning-symbolic", .color = .red } },
+            .keywords = "extension error update uninstall",
             .action = .{ .setting = .{ .ext_prefs = p.ext } },
         }) catch return;
     }
@@ -50,7 +65,8 @@ fn extId(ui: *Ui) []const u8 {
 
 pub fn title(ui: *Ui) [*:0]const u8 {
     const reg = ui.ext_registry orelse return "Extension";
-    for (reg.prefs) |p| if (std.mem.eql(u8, p.ext, extId(ui))) return p.ext_title.ptr;
+    for (reg.extensions) |e| if (std.mem.eql(u8, e.id, extId(ui))) return e.title.ptr;
+    for (reg.problems) |p| if (std.mem.eql(u8, p.ext, extId(ui))) return p.ext.ptr;
     return "Extension";
 }
 
@@ -62,6 +78,7 @@ pub fn candidates(ui: *Ui, a: std.mem.Allocator) []Item {
         if (!std.mem.eql(u8, p.ext, extId(ui))) continue;
         out.append(a, .{
             .key = std.fmt.allocPrint(a, "pref:{s}", .{p.name}) catch continue,
+            .section = "Preferences",
             .title = p.title,
             .subtitle = p.description,
             .accessory = display(a, &p, current(a, &p)),
@@ -69,7 +86,40 @@ pub fn candidates(ui: *Ui, a: std.mem.Allocator) []Item {
             .action = .{ .setting = .{ .pref = @intCast(i) } },
         }) catch break;
     }
+    manageRows(ui, a, &out);
     return out.items;
+}
+
+/// The extension's folder, git pull when it is a checkout, removal.
+fn manageRows(ui: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item)) void {
+    const id = a.dupeSentinel(u8, extId(ui), 0) catch return;
+    const dir = std.fmt.allocPrintSentinel(a, "{s}/extensions/{s}", .{ ui.config_dir, id }, 0) catch return;
+    const git = std.fmt.allocPrintSentinel(a, "{s}/.git", .{dir}, 0) catch return;
+    out.append(a, .{
+        .key = "manage:open",
+        .section = "Manage",
+        .title = "Open Folder",
+        .subtitle = dir,
+        .icon = .{ .tile = .{ .name = "folder-open-symbolic", .color = .blue } },
+        .action = .{ .setting = .{ .ext_open = dir } },
+    }) catch return;
+    if (index.sys.info(git) != null) out.append(a, .{
+        .key = "manage:update",
+        .section = "Manage",
+        .title = "Update",
+        .subtitle = "git pull",
+        .icon = .{ .tile = .{ .name = "view-refresh-symbolic", .color = .green } },
+        .action = .{ .setting = .{ .ext_update = id } },
+    }) catch return;
+    out.append(a, .{
+        .key = "manage:uninstall",
+        .section = "Manage",
+        .title = "Uninstall",
+        .subtitle = "Removes its folder",
+        .icon = .{ .tile = .{ .name = "user-trash-symbolic", .color = .red } },
+        .confirm = true,
+        .action = .{ .setting = .{ .ext_uninstall = id } },
+    }) catch return;
 }
 
 pub fn iconOf(kind: Host.PrefKind) item_mod.Icon {

@@ -45,6 +45,8 @@ All notable changes are listed here. The format follows
   minimal rofi-like one.
 - `lumen.layout`'s `searchbar` and `row` order (and leave out) the search
   bar's and the rows' parts; `prompt` adds fixed text before the search field.
+- Settings > Extensions lists every installed extension (failed ones too),
+  with its preferences, Open Folder, Update (git) and Uninstall.
 - Icons: image files (PNG, SVG) wherever an icon is given; `lumen.icons`
   replaces any app's, command's or file kind's icon by its key;
   `~/.config/lumen/icons/<name>.svg` replaces an icon by name everywhere; an

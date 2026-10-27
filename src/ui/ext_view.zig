@@ -91,6 +91,8 @@ fn onRegistry(reg: *Host.Registry, ctx: ?*anyopaque) void {
     // may have changed (or stopped changing) settings.
     ui.reloadSettings();
     if (ui.view != .ext) {
+        // Same row as before the reload (an update from Settings, say).
+        if (ui.selectedItem()) |it| ui.setReselect("{s}", .{it.key});
         ui.rebuild();
     } else if (if (open_id) |id| find(reg, id) else null) |i| {
         ui.ext_cmd = i;
@@ -99,6 +101,11 @@ fn onRegistry(reg: *Host.Registry, ctx: ?*anyopaque) void {
     if (old_result) |r| r.destroy(ui.gpa);
     if (old_root) |r| r.destroy(ui.gpa);
     if (old) |r| r.destroy(ui.gpa);
+    // What an update or removal from Settings said, over the rebuilt rows.
+    if (ui.after_reload_pending) {
+        ui.after_reload_pending = false;
+        ui.showFailure(ui.after_reload[0..ui.after_reload_len :0]);
+    }
 }
 
 fn onRoot(res: *Host.RootResult, ctx: ?*anyopaque) void {

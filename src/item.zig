@@ -146,6 +146,10 @@ pub const Setting = union(enum) {
     field: u16,
     /// Submits the open form.
     submit_form,
+    /// An extension's folder, git pull, removal (its id).
+    ext_open: [:0]const u8,
+    ext_update: [:0]const u8,
+    ext_uninstall: [:0]const u8,
 };
 
 pub const Item = struct {
@@ -269,6 +273,9 @@ pub fn actionsFor(item: *const Item) []const Entry {
             .reset => &.{.{ .label = "Reset All Settings", .keys = "↵", .op = .run }},
             .ext_prefs, .pref, .field => &.{.{ .label = "Change", .keys = "↵", .op = .run }},
             .submit_form => &.{.{ .label = "Submit", .keys = "↵", .op = .run }},
+            .ext_open => &.{.{ .label = "Open Folder", .keys = "↵", .op = .run }},
+            .ext_update => &.{.{ .label = "Update", .keys = "↵", .op = .run }},
+            .ext_uninstall => &.{.{ .label = "Uninstall", .keys = "↵", .op = .run }},
             .save_input => &.{.{ .label = "Save", .keys = "↵", .op = .run }},
         },
         .calc => &.{

@@ -116,6 +116,9 @@ pub const SettingOverride = struct {
     value: [:0]const u8,
 };
 
+/// An extension that loaded, for Settings > Extensions.
+pub const ExtInfo = struct { id: [:0]const u8, title: [:0]const u8, commands: u16 };
+
 pub const Problem = struct {
     ext: [:0]const u8,
     message: [:0]const u8,
@@ -130,6 +133,8 @@ pub const Registry = struct {
     settings: []const SettingOverride = &.{},
     prefs: []const Pref = &.{},
     icons: []const IconOverride = &.{},
+    /// The extensions that loaded (init.lua not included).
+    extensions: []const ExtInfo = &.{},
     /// `lumen.layout { ... }`: the window's structure.
     layout: layout_mod.Layout = .{},
     /// Whether any file called lumen.layout (its size and place then win
@@ -237,6 +242,7 @@ pub const Load = struct {
     settings: std.ArrayList(SettingOverride) = .empty,
     prefs: std.ArrayList(Pref) = .empty,
     icons: std.ArrayList(IconOverride) = .empty,
+    extensions: std.ArrayList(ExtInfo) = .empty,
     layout: layout_mod.Layout = .{},
     has_layout: bool = false,
     problems: std.ArrayList(Problem) = .empty,
@@ -520,6 +526,7 @@ fn doReload(h: *Host) void {
     reg.settings = load.settings.items;
     reg.prefs = load.prefs.items;
     reg.icons = load.icons.items;
+    reg.extensions = load.extensions.items;
     reg.layout = load.layout;
     reg.has_layout = load.has_layout;
     reg.problems = load.problems.items;
@@ -586,7 +593,14 @@ fn loadFile(h: *Host, load: *Load, id: []const u8, dir: []const u8, path: [:0]co
     const err = lua.protect(e.L, load.a, LoadCtx, &ctx, LoadCtx.run);
     e.load = null;
     e.budget.deadline_ns = std.math.maxInt(u64);
-    if (err == null) if (h.exts.append(h.gpa, e)) return else |_| {};
+    if (err == null) if (h.exts.append(h.gpa, e)) {
+        if (!std.mem.eql(u8, id, "config")) load.extensions.append(load.a, .{
+            .id = load.a.dupeSentinel(u8, id, 0) catch "",
+            .title = if (ctx.title.len > 0) ctx.title else load.a.dupeSentinel(u8, id, 0) catch "",
+            .commands = @intCast(load.commands.items.len - marks[0]),
+        }) catch {};
+        return;
+    } else |_| {};
     load.commands.shrinkRetainingCapacity(marks[0]);
     load.wcmds.shrinkRetainingCapacity(marks[1]);
     load.themes.shrinkRetainingCapacity(marks[2]);
@@ -606,6 +620,8 @@ const LoadCtx = struct {
     load: *Load,
     path: [:0]const u8,
     ext_index: u16,
+    /// lumen.extension's title, once parsed.
+    title: [:0]const u8 = "",
 
     fn run(L: *lua.State, ctx: *LoadCtx) void {
         lua.openLibs(L);
@@ -623,6 +639,7 @@ const LoadCtx = struct {
 fn parseExtension(L: *lua.State, ctx: *LoadCtx, t: c_int) void {
     const a = ctx.load.a;
     const title = lua.fieldString(L, a, t, "title", "extension") orelse ctx.e.id;
+    ctx.title = title;
     var default_icon: item_mod.Icon = .{ .tile = .{ .name = "application-x-addon-symbolic", .color = .purple } };
     _ = lua.getField(L, t, "icon");
     if (parseIcon(L, a, -1, "extension.icon")) |icon| default_icon = icon;
