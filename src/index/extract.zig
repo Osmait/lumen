@@ -513,20 +513,22 @@ test "extract docx, xlsx, pptx (OOXML)" {
 
 /// Zips the contents of `dir` (relative member names) into `name` at the
 /// test dir's top level.
+/// Zips `dir` into `name`, members in name order. `unzip -p` prints members in
+/// archive order, and `zip -r` would follow readdir's order, which differs
+/// between file systems (Office writes the body first; sorted names do too).
 fn zipInto(td: *TestDir, dir: []const u8, name: []const u8) !void {
     var buf: [256]u8 = undefined;
     const rel = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ td.rel, dir });
-    var out_buf: [256]u8 = undefined;
-    const out = try std.fmt.bufPrint(&out_buf, "../{s}", .{name});
-    const r = std.process.run(testing.allocator, testing.io, .{
-        .argv = &.{ "zip", "-q", "-X", "-r", out, "." },
+    var cmd_buf: [256]u8 = undefined;
+    const cmd = try std.fmt.bufPrint(&cmd_buf, "find . -type f | LC_ALL=C sort | zip -q -X -@ '../{s}'", .{name});
+    const r = try std.process.run(testing.allocator, testing.io, .{
+        .argv = &.{ "sh", "-c", cmd },
         .cwd = .{ .path = rel },
-    }) catch |err| switch (err) {
-        error.FileNotFound => return error.SkipZigTest,
-        else => return err,
-    };
+    });
     defer testing.allocator.free(r.stdout);
     defer testing.allocator.free(r.stderr);
+    // 127: zip is not installed.
+    if (std.meta.eql(r.term, std.process.Child.Term{ .exited = 127 })) return error.SkipZigTest;
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, r.term);
 }
 
