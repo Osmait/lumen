@@ -51,6 +51,9 @@ All notable changes are listed here. The format follows
   of ~58 ms, and each copy
   into the clipboard history no longer starts a GTK process. Install both
   files (see the README).
+- Searching file contents reads far fewer files for the same results:
+  "SELECT * FROM" 42 → 5 ms, "fn main" 13 → 3.5 ms, "useState" 10 → 6.6
+  ms on a home folder with 49 k text files.
 - Pasting (clipboard history, calculator) sends the keys as soon as
   Hyprland gives the focus back (~2 ms) instead of after a fixed 120 ms.
 - Window actions go through Hyprland's socket instead of starting

@@ -988,12 +988,18 @@ pub const Verified = struct { count: u32, line: u32, snippet: []const u8, phrase
 /// several words, the whole `phrase` (the query as typed) is looked for
 /// first: when present, that is the hit shown. Matching is folded
 /// (`findFold`); line and snippet come from the original text.
-pub fn verify(text: []const u8, words: []const []const u8, phrase: []const u8, arena: std.mem.Allocator) ?Verified {
+pub fn verify(text: []const u8, words: []const []const u8, phrase: []const u8, maybe_phrase: bool, arena: std.mem.Allocator) ?Verified {
     if (words.len == 0) return null;
-    for (words) |w| if (findFold(text, w, 0) == null) return null;
-    const phrase_hit = if (words.len > 1) findFold(text, phrase, 0) else null;
+    // The phrase holds every word: found, they need no looking for. Not
+    // looked for where its trigrams are not all present (`maybe_phrase`).
+    const phrase_hit = if (words.len > 1 and maybe_phrase) findFold(text, phrase, 0) else null;
+    var first = phrase_hit;
+    if (phrase_hit == null) for (words, 0..) |w, i| {
+        const h = findFold(text, w, 0) orelse return null;
+        if (i == 0) first = h;
+    };
     const w0 = if (phrase_hit != null) phrase else words[0];
-    const hit = phrase_hit orelse findFold(text, w0, 0).?;
+    const hit = first.?;
     const at = hit.start;
     // The ranking stops caring after `count_cap` hits; so does counting
     // (in a 4 MB book, "the" would otherwise scan the whole text).
@@ -1184,13 +1190,13 @@ test "verify finds the line and counts hits" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const text = "first line\n  const a = ArenaAllocator.init(gpa);\nArenaAllocator again\n";
-    const v = verify(text, &.{"arenaallocator"}, "arenaallocator", arena.allocator()).?;
+    const v = verify(text, &.{"arenaallocator"}, "arenaallocator", true, arena.allocator()).?;
     try testing.expectEqual(@as(u32, 2), v.line);
     try testing.expectEqual(@as(u32, 2), v.count);
     try testing.expectEqualStrings("const a = ArenaAllocator.init(gpa);", v.snippet);
-    try testing.expect(verify(text, &.{ "arena", "missing" }, "arena missing", arena.allocator()) == null);
+    try testing.expect(verify(text, &.{ "arena", "missing" }, "arena missing", true, arena.allocator()) == null);
     // The phrase wins over the first word's first occurrence.
-    const p = verify("again here\nsee ArenaAllocator again\n", &.{ "arenaallocator", "again" }, "arenaallocator again", arena.allocator()).?;
+    const p = verify("again here\nsee ArenaAllocator again\n", &.{ "arenaallocator", "again" }, "arenaallocator again", true, arena.allocator()).?;
     try testing.expectEqual(@as(u32, 2), p.line);
     try testing.expect(p.phrase);
 }
@@ -1224,31 +1230,83 @@ pub fn plainPath(_: *anyopaque, doc: DocIn, buf: []u8) ?[:0]const u8 {
     return std.fmt.bufPrintSentinel(buf, "{s}", .{doc.path}, 0) catch null;
 }
 
+/// A candidate in verification order: by `bound`, the most its score can
+/// be once its text is read.
+const Cand = struct { doc: u32, bound: i32, maybe_phrase: bool };
+
+/// Verification shared by the pool's threads: each takes the next candidate
+/// (no batches, so nobody waits for the slowest file of a batch) until the
+/// next one's bound cannot beat the `limit`-th match so far.
 const VerifyCtx = struct {
     gpa: std.mem.Allocator,
+    io: std.Io,
     ix: *const Index,
     words: []const []const u8,
     phrase: []const u8,
-    cands: []const u32,
+    cands: []const Cand,
     text_path: PathFn,
     text_ctx: *anyopaque,
-    results: []?Match,
     arenas: []std.heap.ArenaAllocator,
-    chunk: usize,
     now: i64,
+    next: std.atomic.Value(usize) = .init(0),
+    /// The worst score among the best `top.len`, once there are that many.
+    floor: std.atomic.Value(i32) = .init(std.math.minInt(i32)),
+    /// Under `lock`: the best matches so far, snippets in `arena`.
+    lock: std.Io.Mutex = .init,
+    top: []Match,
+    n_top: usize = 0,
+    arena: std.mem.Allocator,
+    oom: std.atomic.Value(bool) = .init(false),
+
+    fn offer(ctx: *VerifyCtx, m: Match) void {
+        ctx.lock.lockUncancelable(ctx.io);
+        defer ctx.lock.unlock(ctx.io);
+        var slot = ctx.n_top;
+        if (ctx.n_top == ctx.top.len) {
+            slot = worst(ctx.top);
+            if (!better(m, ctx.top[slot])) return;
+        }
+        var copy = m;
+        copy.snippet = ctx.arena.dupe(u8, m.snippet) catch {
+            ctx.oom.store(true, .release);
+            return;
+        };
+        ctx.top[slot] = copy;
+        if (ctx.n_top < ctx.top.len) ctx.n_top += 1;
+        if (ctx.n_top == ctx.top.len) ctx.floor.store(ctx.top[worst(ctx.top)].score, .release);
+    }
 };
 
+/// Ranking order: score, then doc id.
+fn better(x: Match, y: Match) bool {
+    return x.score > y.score or (x.score == y.score and x.doc < y.doc);
+}
+
+fn worst(ms: []const Match) usize {
+    var w: usize = 0;
+    for (ms[1..], 1..) |m, i| if (better(ms[w], m)) {
+        w = i;
+    };
+    return w;
+}
+
 fn verifyTask(ctx: *VerifyCtx, t: usize) void {
-    const a = ctx.arenas[t].allocator();
     var pbuf: [4096]u8 = undefined;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.gpa);
-    const from = t * ctx.chunk;
-    const to = @min(from + ctx.chunk, ctx.cands.len);
-    var i = from;
-    while (i < to) : (i += 1) {
-        const doc = ctx.cands[i];
-        const d: DocIn = .{ .path = ctx.ix.path(doc), .mtime = ctx.ix.mtimes[doc], .size = ctx.ix.sizes[doc], .source = @fromBackingInt(@intCast(ctx.ix.sources[doc])) };
+    const a = ctx.arenas[t].allocator();
+    while (true) {
+        const i = ctx.next.fetchAdd(1, .monotonic);
+        if (i >= ctx.cands.len) return;
+        const cand = ctx.cands[i];
+        // Candidates come by bound: none after this one can enter either.
+        if (cand.bound < ctx.floor.load(.acquire)) {
+            ctx.next.store(ctx.cands.len, .monotonic);
+            return;
+        }
+        defer _ = ctx.arenas[t].reset(.retain_capacity);
+        const doc = cand.doc;
+        const d = ctx.ix.docIn(doc);
         const p = ctx.text_path(ctx.text_ctx, d, &pbuf) orelse continue;
         // Plain files (1 MB at most) are read into a reused buffer: cheaper
         // than map + unmap, whose TLB shootdown hits every core of a
@@ -1266,9 +1324,9 @@ fn verifyTask(ctx: *VerifyCtx, t: usize) void {
             mapped = sys.mapPrivate(p) catch continue;
             break :blk mapped.?;
         };
-        const v = verify(text, ctx.words, ctx.phrase, a) orelse continue;
+        const v = verify(text, ctx.words, ctx.phrase, cand.maybe_phrase, a) orelse continue;
         const phrase_bonus: i32 = if (v.phrase) phrase_max else 0;
-        ctx.results[i] = .{ .doc = doc, .count = v.count, .line = v.line, .snippet = v.snippet, .score = rank(d, v.count, ctx.words, ctx.now) + phrase_bonus };
+        ctx.offer(.{ .doc = doc, .count = v.count, .line = v.line, .snippet = v.snippet, .score = rank(d, v.count, ctx.words, ctx.now) + phrase_bonus });
     }
 }
 
@@ -1320,30 +1378,35 @@ pub fn search(ix: *const Index, gpa: std.mem.Allocator, arena: std.mem.Allocator
     if (cands.items.len == 0) return;
     const now = sys.nowSeconds();
 
+    // Only documents holding every trigram of the whole phrase (spaces
+    // included) can get its bonus: the others' bound leaves it out, so they
+    // need not be read once enough better matches are in. Too short to
+    // have trigrams, the phrase could be anywhere.
+    const several = words.len > 1;
+    var phrase_docs: std.ArrayList(u32) = .empty;
+    defer phrase_docs.deinit(gpa);
+    const phrase_known = several and phrase.len >= 3;
+    if (phrase_known) try ix.candidates(gpa, &.{phrase}, &phrase_docs);
+
     // Order candidates by what is known without reading them (recency,
-    // depth, name), so verification can stop early: once `limit` matches
-    // are in, a candidate whose static score plus the best possible hit
-    // count cannot beat the limit-th is never opened.
-    const Cand = struct { doc: u32, static: i32 };
+    // depth, name) plus the most reading can add, so verification stops
+    // as soon as the next one cannot beat the `limit`-th match.
     const ordered = try gpa.alloc(Cand, cands.items.len);
     defer gpa.free(ordered);
+    var pi: usize = 0;
     for (cands.items, ordered) |doc, *o| {
+        // Both lists ascend.
+        while (pi < phrase_docs.items.len and phrase_docs.items[pi] < doc) pi += 1;
+        const maybe_phrase = several and (!phrase_known or (pi < phrase_docs.items.len and phrase_docs.items[pi] == doc));
         const d: DocIn = .{ .path = ix.path(doc), .mtime = ix.mtimes[doc], .size = ix.sizes[doc] };
-        o.* = .{ .doc = doc, .static = staticScore(d, words, now) };
+        o.* = .{ .doc = doc, .maybe_phrase = maybe_phrase, .bound = staticScore(d, words, now) + count_max + if (maybe_phrase) phrase_max else 0 };
     }
     std.mem.sort(Cand, ordered, {}, struct {
         fn gt(_: void, x: Cand, y: Cand) bool {
-            return x.static > y.static or (x.static == y.static and x.doc < y.doc);
+            return x.bound > y.bound or (x.bound == y.bound and x.doc < y.doc);
         }
     }.gt);
-    const n_cands = @min(ordered.len, max_candidates);
-    const docs = try gpa.alloc(u32, n_cands);
-    defer gpa.free(docs);
-    for (ordered[0..n_cands], docs) |o, *d| d.* = o.doc;
 
-    // The most a candidate can still gain once read: hits, and the phrase
-    // bonus only when there are several words to form a phrase.
-    const best_extra: i32 = count_max + if (words.len > 1) phrase_max else 0;
     const tasks = pool.threads.len + 1;
     const arenas = try gpa.alloc(std.heap.ArenaAllocator, tasks);
     defer {
@@ -1351,32 +1414,26 @@ pub fn search(ix: *const Index, gpa: std.mem.Allocator, arena: std.mem.Allocator
         gpa.free(arenas);
     }
     for (arenas) |*x| x.* = .init(gpa);
-    const batch = @max(tasks * 16, limit * 2);
-    const results = try gpa.alloc(?Match, batch);
-    defer gpa.free(results);
-
-    var lo: usize = 0;
-    while (lo < n_cands) {
-        if (out.items.len >= limit) {
-            sortMatches(out.items);
-            const floor = out.items[limit - 1].score;
-            if (ordered[lo].static + best_extra < floor) break;
-        }
-        const hi = @min(lo + batch, n_cands);
-        const slice = docs[lo..hi];
-        @memset(results[0..slice.len], null);
-        var ctx: VerifyCtx = .{ .gpa = gpa, .ix = ix, .words = words, .phrase = phrase, .cands = slice, .text_path = text_path, .text_ctx = text_ctx, .results = results[0..slice.len], .arenas = arenas, .chunk = std.math.divCeil(usize, slice.len, tasks) catch slice.len, .now = now };
-        pool.run(@min(tasks, slice.len), &ctx, verifyTask);
-        for (results[0..slice.len]) |r| if (r) |m| {
-            var copy = m;
-            copy.snippet = try arena.dupe(u8, m.snippet);
-            try out.append(arena, copy);
-        };
-        for (arenas) |*x| _ = x.reset(.retain_capacity);
-        lo = hi;
-    }
+    const top = try gpa.alloc(Match, limit);
+    defer gpa.free(top);
+    var ctx: VerifyCtx = .{
+        .gpa = gpa,
+        .io = pool.io,
+        .ix = ix,
+        .words = words,
+        .phrase = phrase,
+        .cands = ordered[0..@min(ordered.len, max_candidates)],
+        .text_path = text_path,
+        .text_ctx = text_ctx,
+        .arenas = arenas,
+        .now = now,
+        .top = top,
+        .arena = arena,
+    };
+    pool.run(@min(tasks, ctx.cands.len), &ctx, verifyTask);
+    if (ctx.oom.load(.acquire)) return error.OutOfMemory;
+    try out.appendSlice(arena, top[0..ctx.n_top]);
     sortMatches(out.items);
-    out.shrinkRetainingCapacity(@min(out.items.len, limit));
 }
 
 fn sortMatches(items: []Match) void {
@@ -1459,15 +1516,15 @@ test "folded search: accents and case, both ways, positions in the original" {
     const a = arena.allocator();
     for ([_][]const u8{ "accion", "ACCIÓN", "acción" }) |q| {
         const words = try splitWords(a, q);
-        const v = verify(text, words, words[0], a).?;
+        const v = verify(text, words, words[0], true, a).?;
         try testing.expectEqual(@as(u32, 2), v.line);
         try testing.expectEqualStrings("Una ACCIÓN rápida", v.snippet);
     }
-    const v = verify(text, try splitWords(a, "nandu corre"), try fold.foldAlloc(a, "nandu corre"), a).?;
+    const v = verify(text, try splitWords(a, "nandu corre"), try fold.foldAlloc(a, "nandu corre"), true, a).?;
     try testing.expectEqual(@as(u32, 3), v.line);
     try testing.expect(v.phrase);
     // Two hits of different lengths, counted without overlap.
-    try testing.expectEqual(@as(u32, 3), verify("acción accion ACCIÓN", &.{"accion"}, "accion", a).?.count);
+    try testing.expectEqual(@as(u32, 3), verify("acción accion ACCIÓN", &.{"accion"}, "accion", true, a).?.count);
 }
 
 const FileDocs = struct {
@@ -1475,6 +1532,76 @@ const FileDocs = struct {
         return readPlain(gpa, d.path, buf);
     }
 };
+
+test "search: the top matches equal reading every document and ranking them all" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dbuf: [4096]u8 = undefined;
+    const dir = try sys.tmpDirPath(&tmp, &dbuf);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    // Few words, so documents share them, phrases occur by chance, and
+    // scores tie (recency and depth vary too).
+    const vocab = [_][]const u8{ "select", "from", "where", "fn", "main", "the", "lumen", "index", "*", "use", "state", "café" };
+    var prng: std.Random.DefaultPrng = .init(42);
+    const r = prng.random();
+    const n = 400;
+    var docs: [n]DocIn = undefined;
+    const now = sys.nowSeconds();
+    for (&docs, 0..) |*d, i| {
+        var t: std.ArrayList(u8) = .empty;
+        for (0..r.intRangeAtMost(usize, 3, 40)) |_| {
+            try t.appendSlice(a, vocab[r.uintLessThan(usize, vocab.len)]);
+            try t.append(a, if (r.uintLessThan(u8, 6) == 0) '\n' else ' ');
+        }
+        const sub = if (i % 3 == 0) "/deep/er" else "";
+        if (sub.len > 0) {
+            var mb: [4096]u8 = undefined;
+            _ = linux.mkdir(try std.fmt.bufPrintSentinel(&mb, "{s}/deep", .{dir}, 0), 0o700);
+            _ = linux.mkdir(try std.fmt.bufPrintSentinel(&mb, "{s}/deep/er", .{dir}, 0), 0o700);
+        }
+        const path = try std.fmt.allocPrint(a, "{s}{s}/{s}{d}.txt", .{ dir, sub, if (i % 7 == 0) "main" else "doc", i });
+        var zb: [4096]u8 = undefined;
+        try sys.writeFile(try std.fmt.bufPrintSentinel(&zb, "{s}", .{path}, 0), t.items);
+        const ages = [_]i64{ 0, 3, 20, 100, 300, 900 };
+        d.* = .{ .path = path, .mtime = now - ages[i % ages.len] * 86_400, .size = t.items.len };
+    }
+    const pool = try Pool.create(gpa, testing.io, 3);
+    defer pool.destroy();
+    var dummy: u8 = 0;
+    var ix = try build(gpa, pool, &docs, .{ .read = FileDocs.text, .ctx = &dummy }, null);
+    defer ix.deinit(gpa);
+
+    var out: std.ArrayList(Match) = .empty;
+    var want: std.ArrayList(Match) = .empty;
+    var tbuf: std.ArrayList(u8) = .empty;
+    defer tbuf.deinit(gpa);
+    const queries = [_][]const u8{ "select * from", "fn main", "use state", "the lumen", "lumen", "where", "café index", "main", "from where select" };
+    for (queries) |q| for ([_]usize{ 5, 20 }) |limit| {
+        try search(&ix, gpa, a, pool, q, .{ .limit = limit, .text_path = plainPath, .text_ctx = &dummy }, &out);
+        // Every document read and ranked.
+        want.clearRetainingCapacity();
+        const words = try splitWords(a, q);
+        const phrase = try fold.foldAlloc(a, std.mem.trim(u8, q, " \t"));
+        for (docs, 0..) |d, i| {
+            if (!try readPlain(gpa, d.path, &tbuf)) continue;
+            const v = verify(tbuf.items, words, phrase, true, a) orelse continue;
+            const bonus: i32 = if (v.phrase) phrase_max else 0;
+            try want.append(a, .{ .doc = @intCast(i), .count = v.count, .line = v.line, .snippet = v.snippet, .score = rank(d, v.count, words, now) + bonus });
+        }
+        sortMatches(want.items);
+        want.shrinkRetainingCapacity(@min(want.items.len, limit));
+        try testing.expectEqual(want.items.len, out.items.len);
+        for (want.items, out.items) |w, o| {
+            try testing.expectEqual(w.doc, o.doc);
+            try testing.expectEqual(w.score, o.score);
+            try testing.expectEqual(w.line, o.line);
+            try testing.expectEqualStrings(w.snippet, o.snippet);
+        }
+    };
+}
 
 test "search: unaccented and capital queries find accented text" {
     const gpa = testing.allocator;
@@ -1812,7 +1939,7 @@ fn fuzzVerify(_: void, smith: *testing.Smith) anyerror!void {
     const q = query[0..smith.sliceWeightedBytes(&query, w)];
     const words = try splitWords(a, q);
     const phrase = try fold.foldAlloc(a, std.mem.trim(u8, q, " \t"));
-    if (verify(t, words, phrase, a)) |v| {
+    if (verify(t, words, phrase, true, a)) |v| {
         try testing.expect(std.unicode.utf8ValidateSlice(v.snippet));
         try testing.expect(v.count >= 1 and v.count <= count_cap and v.line >= 1);
     }

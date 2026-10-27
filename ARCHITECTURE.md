@@ -176,8 +176,13 @@ directory (2.8 s cold) and every core.
   is retried on the next check.
 - **Query**: intersect the lists of every trigram of every word (shortest
   first), then verify candidates by reading them, in parallel and in order of
-  what is known without I/O (recency, depth, file name), stopping once no
-  unread candidate can still enter the top 50. With several words, the exact
+  their bound: what is known without I/O (recency, depth, file name) plus the
+  most reading can add. Only documents holding every trigram of the whole
+  phrase (spaces included) can get the phrase bonus, so the others' bound
+  leaves it out and the phrase is not looked for in them. Each thread takes
+  the next candidate and offers its match to a shared top 50, whose worst
+  score stops everyone once no unread candidate can beat it. "SELECT * FROM"
+  read 4000 files (all it was allowed) and now reads 379: 42 → 5 ms. With several words, the exact
   phrase ranks first. Queries run on a worker thread; the newest one wins.
 - **Freshness**: on start, every 5 minutes and when the window opens, the
   files are compared with the index by (path, mtime, size). Listing them
