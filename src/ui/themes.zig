@@ -82,6 +82,13 @@ pub fn css(w: *std.Io.Writer, t: *const Theme, s: *const settings.Settings) std.
     try rgba(w, "shadow", 0, if (t.dark) 0.45 else 0.18);
     const sizes = [_]struct { []const u8, f32 }{ .{ "font", 14 }, .{ "font-query", 18 }, .{ "font-small", 13 }, .{ "font-tiny", 12 }, .{ "font-mono", 12.5 }, .{ "font-calc", 26 }, .{ "font-emoji", 17 } };
     for (sizes) |sz| try w.print("  --{s}: {d:.1}px;\n", .{ sz[0], sz[1] * scale });
+    // Density: row height and icon size (the Density setting).
+    const row_h: u8, const icon: u8 = switch (s.density) {
+        .compact => .{ 40, 26 },
+        .default => .{ 48, 32 },
+        .comfortable => .{ 58, 38 },
+    };
+    try w.print("  --row-h: {d}px;\n  --icon: {d}px;\n", .{ row_h, icon });
     try w.writeAll("}\n");
 }
 

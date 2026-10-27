@@ -182,8 +182,9 @@ and repositories through `gh`), a process list, and a sample `init.lua` and
 ## Configuration
 
 Search for **Settings** in Lumen to change the theme, text size, opacity,
-window position, what the main search shows, clipboard history, your terminal
-and the editor used to open search results at the matching line. **Change
+window position, width and height, how dense the rows are, what the main
+search shows, clipboard history, your terminal and the editor used to open
+search results at the matching line. **Change
 Theme** previews every theme as you move through the list, and **Default
 Apps** picks the app for each kind of file.
 
@@ -194,6 +195,8 @@ things can only be set there, like an app for a single file extension:
 ```ini
 theme = catppuccin-mocha
 text_size = large
+width = wide
+density = compact
 clipboard_keep = 500
 terminal = kitty
 

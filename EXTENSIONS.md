@@ -139,6 +139,7 @@ way.
 | `lumen.id` | The extension's id (`"config"` for `init.lua`). |
 | `lumen.theme(spec)` | Adds a theme (see [init.lua](#initlua)). |
 | `lumen.keymap(keys, target)` | Adds a shortcut (see [init.lua](#initlua)). |
+| `lumen.set(settings)` | Fixes settings (see [init.lua](#initlua)). |
 
 `require("name")` loads `name.lua` or `name/init.lua` from the extension's
 folder. The standard library is there except `os.exit`, `os.execute`,
@@ -169,7 +170,25 @@ lumen.theme {
 -- (clipboard, windows, files, contents, settings, themes, default_apps).
 lumen.keymap("ctrl+1", "clipboard")
 lumen.keymap("ctrl+g", "github.prs")
+
+-- Settings, as in settings.conf.
+lumen.set {
+  theme = "midnight",
+  width = "wide",          -- narrow, default, wide
+  height = "tall",         -- short, default, tall
+  density = "compact",     -- compact, default, comfortable
+  position = "center",     -- upper_third, center
+  text_size = "default",   -- small, default, large
+  opacity = 97,
+  suggestions = true,
+  files_in_root = true,
+}
 ```
+
+A setting `lumen.set` fixes shows as *Set in init.lua* in Settings and cannot
+be changed there; `settings.conf` keeps its own value for it, which is used
+again if you take it out of `init.lua`. A key or value Lumen does not know is
+an error, so typos do not go unnoticed.
 
 Keys are written as modifiers then a key, `+` between them: `ctrl+g`,
 `alt+shift+F5`, `super+space`. Each needs ctrl, alt or super, since plain keys

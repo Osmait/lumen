@@ -56,6 +56,9 @@ pub fn settingsCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
     out.append(a, S.row(a, .{ .section = "Appearance", .name = "text_size", .title = "Text Size", .value = choiceLabel(ui, a, .text_size), .icon = "preferences-desktop-font-symbolic", .color = .purple, .action = choose(.text_size), .keywords = "font scale zoom bigger smaller" })) catch {};
     out.append(a, S.row(a, .{ .section = "Appearance", .name = "opacity", .title = "Window Opacity", .value = choiceLabel(ui, a, .opacity), .icon = "display-brightness-symbolic", .color = .purple, .action = choose(.opacity), .keywords = "transparency translucent background" })) catch {};
     out.append(a, S.row(a, .{ .section = "Appearance", .name = "position", .title = "Window Position", .value = choiceLabel(ui, a, .position), .icon = "preferences-desktop-display-symbolic", .color = .purple, .action = choose(.position), .keywords = "center top place" })) catch {};
+    out.append(a, S.row(a, .{ .section = "Layout", .name = "width", .title = "Window Width", .value = choiceLabel(ui, a, .width), .icon = "view-dual-symbolic", .color = .green, .action = choose(.width), .keywords = "size wide narrow layout" })) catch {};
+    out.append(a, S.row(a, .{ .section = "Layout", .name = "height", .title = "Window Height", .value = choiceLabel(ui, a, .height), .icon = "view-list-symbolic", .color = .green, .action = choose(.height), .keywords = "size tall short rows results layout" })) catch {};
+    out.append(a, S.row(a, .{ .section = "Layout", .name = "density", .title = "Density", .value = choiceLabel(ui, a, .density), .icon = "view-grid-symbolic", .color = .green, .action = choose(.density), .keywords = "compact comfortable spacing icons rows layout" })) catch {};
     out.append(a, S.row(a, .{ .section = "Search", .name = "files_in_root", .title = "Show Files in Main Search", .value = S.onOff(st.files_in_root), .icon = "folder-saved-search-symbolic", .color = .orange, .action = .{ .toggle = .files_in_root }, .keywords = "results" })) catch {};
     out.append(a, S.row(a, .{ .section = "Search", .name = "suggestions", .title = "Show Suggestions", .value = S.onOff(st.suggestions), .icon = "starred-symbolic", .color = .orange, .action = .{ .toggle = .suggestions }, .keywords = "frecency recent most used" })) catch {};
     out.append(a, S.row(a, .{ .section = "Clipboard", .name = "clipboard", .title = "Clipboard History", .value = S.onOff(st.clipboard), .icon = "edit-paste-symbolic", .color = .red, .action = .{ .toggle = .clipboard }, .keywords = "copy paste record" })) catch {};
@@ -69,7 +72,22 @@ pub fn settingsCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
     var reset = S.row(a, .{ .section = "Lumen", .name = "reset", .title = "Reset All Settings", .value = "", .icon = "edit-undo-symbolic", .color = .gray, .action = .reset, .keywords = "defaults restore" });
     reset.confirm = true;
     out.append(a, reset) catch {};
+    // What init.lua fixes cannot be changed here.
+    for (out.items) |*it| {
+        const key = settingName(it.action.setting) orelse continue;
+        if (ui.overridden(key)) it.subtitle = "Set in init.lua";
+    }
     return out.items;
+}
+
+/// The settings.conf key a Settings row changes, if any.
+fn settingName(s: item_mod.Setting) ?[]const u8 {
+    return switch (s) {
+        .toggle => |t| @tagName(t),
+        .choose => |ch| @tagName(ch),
+        .go => |v| if (v == .themes) "theme" else null,
+        else => null,
+    };
 }
 
 const Option = struct { value: [:0]const u8, label: [:0]const u8 };
@@ -80,6 +98,9 @@ pub fn choiceOptions(ui: *Ui, a: std.mem.Allocator, ch: settings_mod.Choice) []c
     return switch (ch) {
         .text_size => &.{ .{ .value = "small", .label = "Small" }, .{ .value = "default", .label = "Default" }, .{ .value = "large", .label = "Large" } },
         .position => &.{ .{ .value = "upper_third", .label = "Upper Third" }, .{ .value = "center", .label = "Center" } },
+        .width => &.{ .{ .value = "narrow", .label = "Narrow" }, .{ .value = "default", .label = "Default" }, .{ .value = "wide", .label = "Wide" } },
+        .height => &.{ .{ .value = "short", .label = "Short" }, .{ .value = "default", .label = "Default" }, .{ .value = "tall", .label = "Tall" } },
+        .density => &.{ .{ .value = "compact", .label = "Compact" }, .{ .value = "default", .label = "Default" }, .{ .value = "comfortable", .label = "Comfortable" } },
         .opacity => &.{ .{ .value = "100", .label = "100% (Opaque)" }, .{ .value = "97", .label = "97%" }, .{ .value = "90", .label = "90%" }, .{ .value = "80", .label = "80%" } },
         .clipboard_keep => &.{ .{ .value = "100", .label = "100 entries" }, .{ .value = "500", .label = "500 entries" }, .{ .value = "1000", .label = "1,000 entries" }, .{ .value = "5000", .label = "5,000 entries" } },
         .terminal, .editor => blk: {
@@ -112,6 +133,9 @@ pub fn chooseTitle(ch: settings_mod.Choice) []const u8 {
         .text_size => "Text Size",
         .opacity => "Window Opacity",
         .position => "Window Position",
+        .width => "Window Width",
+        .height => "Window Height",
+        .density => "Density",
         .clipboard_keep => "Clipboard Entries to Keep",
         .terminal => "Terminal",
         .editor => "Editor for Open at Line",
@@ -294,6 +318,11 @@ pub fn swatchOf(t: *const themes.Theme) item_mod.Icon {
 
 /// Applies what a settings row does.
 pub fn performSetting(ui: *Ui, s: item_mod.Setting, op: item_mod.Op) void {
+    const locked: ?[]const u8 = switch (s) {
+        .theme => "theme",
+        else => settingName(s),
+    };
+    if (locked) |key| if (ui.overridden(key)) return ui.showFailure("Set in init.lua");
     switch (s) {
         .toggle => |t| {
             ui.settings.setToggle(t, !ui.settings.get(t));
@@ -356,6 +385,7 @@ pub fn performSetting(ui: *Ui, s: item_mod.Setting, op: item_mod.Op) void {
         .reset => {
             ui.settings.deinit();
             ui.settings = Settings.init(ui.gpa);
+            ui.applyOverrides();
             ui.saveSettings();
             ui.setReselect("set:reset", .{});
             ui.rebuild();

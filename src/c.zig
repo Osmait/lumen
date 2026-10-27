@@ -287,6 +287,7 @@ pub extern fn gtk_widget_set_hexpand(w: *GtkWidget, v: gboolean) void;
 pub extern fn gtk_widget_set_vexpand(w: *GtkWidget, v: gboolean) void;
 pub extern fn gtk_widget_set_halign(w: *GtkWidget, a: c_int) void;
 pub extern fn gtk_widget_set_valign(w: *GtkWidget, a: c_int) void;
+pub extern fn gtk_widget_get_size_request(w: *GtkWidget, width: ?*c_int, height: ?*c_int) void;
 pub extern fn gtk_widget_set_size_request(w: *GtkWidget, width: c_int, height: c_int) void;
 pub extern fn gtk_widget_set_margin_top(w: *GtkWidget, m: c_int) void;
 pub extern fn gtk_widget_set_margin_bottom(w: *GtkWidget, m: c_int) void;

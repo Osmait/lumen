@@ -11,6 +11,7 @@ const proc = @import("../sys/proc.zig");
 const themes = @import("../ui/themes.zig");
 const index = @import("index");
 const gtk = @import("c");
+const Settings = @import("../settings.zig").Settings;
 
 const log = std.log.scoped(.ext);
 
@@ -37,6 +38,7 @@ pub fn install(L: *lua.State, e: *Host.Ext) void {
         .{ "log", lua.wrap(logFn) },
         .{ "theme", lua.wrap(theme) },
         .{ "keymap", lua.wrap(keymap) },
+        .{ "set", lua.wrap(set) },
     };
     for (funcs) |f| {
         c.lua_pushcclosure(L, f[1], 0);
@@ -266,6 +268,38 @@ pub fn parseKeys(s: []const u8) ?Keys {
     const kv = gtk.gdk_keyval_from_name(&buf);
     if (kv == 0 or kv == gtk.GDK_KEY_VoidSymbol) return null;
     return .{ .keyval = gtk.gdk_keyval_to_lower(kv), .mods = mods };
+}
+
+/// `lumen.set { width = "wide", density = "compact", suggestions = false }`:
+/// settings init.lua fixes (Settings shows them as set here). Keys and
+/// values are those of settings.conf.
+fn set(L: *lua.State) lua.Error!c_int {
+    try lua.argTable(L, 1, "lumen.set");
+    const e = extOf(L);
+    const load = e.load orelse return lua.fail(L, "lumen.set works only while a file loads", .{});
+    const a = load.a;
+    c.lua_pushnil(L);
+    while (c.lua_next(L, 1) != 0) {
+        const key = lua.toSlice(L, -2) orelse return lua.fail(L, "lumen.set: keys are setting names, not {s}", .{lua.typeName(L, -2)});
+        var buf: [64]u8 = undefined;
+        const value: []const u8 = switch (c.lua_type(L, -1)) {
+            c.LUA_TBOOLEAN => if (c.lua_toboolean(L, -1) != 0) "true" else "false",
+            c.LUA_TSTRING => lua.toSlice(L, -1).?,
+            c.LUA_TNUMBER => std.fmt.bufPrint(&buf, "{d}", .{c.lua_tointegerx(L, -1, null)}) catch "",
+            else => return lua.fail(L, "lumen.set: {s} cannot be a {s}", .{ key, lua.typeName(L, -1) }),
+        };
+        switch (Settings.check(key, value)) {
+            .ok => {},
+            .unknown_key => return lua.fail(L, "lumen.set: no setting named \"{s}\"", .{key}),
+            .bad_value => return lua.fail(L, "lumen.set: \"{s}\" is not a value for {s}", .{ value, key }),
+        }
+        load.settings.append(a, .{
+            .key = a.dupeSentinel(u8, key, 0) catch return lua.fail(L, "not enough memory", .{}),
+            .value = a.dupeSentinel(u8, value, 0) catch return lua.fail(L, "not enough memory", .{}),
+        }) catch return lua.fail(L, "not enough memory", .{});
+        c.lua_settop(L, -2);
+    }
+    return 0;
 }
 
 // lumen.action.*: tables a row's `actions` list takes.

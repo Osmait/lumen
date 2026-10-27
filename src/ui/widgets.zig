@@ -61,6 +61,9 @@ pub fn swatchTexture(bg: u24, fg: u24, accent: u24) ?*c.GdkTexture {
     return tex;
 }
 
+/// Icon size in result rows, from the Density setting (main thread).
+pub var icon_px: c_int = 32;
+
 /// Icon, title over subtitle, accessory, and the hidden hint that shows
 /// the primary action while the row is selected.
 pub const RowParts = struct { hint: ?*c.GtkWidget = null, accessory: ?*c.GtkWidget = null };
@@ -68,7 +71,7 @@ pub const RowParts = struct { hint: ?*c.GtkWidget = null, accessory: ?*c.GtkWidg
 pub fn itemRow(it: Item, parts: *RowParts) *c.GtkWidget {
     const row = c.gtk_list_box_row_new();
     const box = hbox(12);
-    c.gtk_box_append(@ptrCast(box), iconWidget(it.icon, 32));
+    c.gtk_box_append(@ptrCast(box), iconWidget(it.icon, icon_px));
     const text = vbox(1);
     c.gtk_widget_set_valign(text, c.GTK_ALIGN_CENTER);
     c.gtk_widget_set_hexpand(text, 1);

@@ -42,11 +42,26 @@ pub const onContentResult = file_results.onContentResult;
 
 const log = std.log.scoped(.ui);
 
-const panel_w = 750;
-const panel_h = 474;
+/// The window's pieces, by the Width and Height settings.
+fn panelW(self: *const Ui) c_int {
+    return switch (self.settings.width) {
+        .narrow => 620,
+        .default => 750,
+        .wide => 920,
+    };
+}
+fn panelH(self: *const Ui) c_int {
+    return switch (self.settings.height) {
+        .short => 380,
+        .default => 474,
+        .tall => 640,
+    };
+}
 /// The list's height limit: what is left under the search bar (56), the gap
 /// (10) and the results' padding and border (14).
-const list_max_h = panel_h - 56 - 10 - 14;
+fn listMaxH(self: *const Ui) c_int {
+    return self.panelH() - 56 - 10 - 14;
+}
 /// Clear space around the pieces for their shadows (`.shell` in style.css).
 const shell_margin = 48;
 const max_results = 60;
@@ -58,6 +73,10 @@ db: Db,
 apps: Apps,
 
 window: *c.GtkWidget = undefined,
+/// The search bar and the results, sized by the layout settings.
+column: *c.GtkWidget = undefined,
+/// The widgets exist (settings read before `build` made them wait).
+built: bool = false,
 entry: *c.GtkWidget = undefined,
 back: *c.GtkWidget = undefined,
 list: *c.GtkWidget = undefined,
@@ -224,7 +243,7 @@ pub fn build(self: *Ui) void {
     c.gtk_window_set_decorated(@ptrCast(win), 0);
     // A fixed size: the layer surface would otherwise grow to its content's
     // natural size (a large image preview, a long path).
-    c.gtk_window_set_default_size(@ptrCast(win), panel_w + 2 * shell_margin, panel_h + 2 * shell_margin);
+    c.gtk_window_set_default_size(@ptrCast(win), self.panelW() + 2 * shell_margin, self.panelH() + 2 * shell_margin);
 
     const w: *c.GtkWindow = @ptrCast(win);
     c.gtk_layer_init_for_window(w);
@@ -239,8 +258,9 @@ pub fn build(self: *Ui) void {
     // Two pieces on a transparent surface: the search bar and, below it, the
     // results, as tall as their rows (the rest of the surface stays clear).
     const column = widgets.vbox(10);
+    self.column = column;
     c.gtk_widget_add_css_class(column, "shell");
-    c.gtk_widget_set_size_request(column, panel_w, panel_h);
+    c.gtk_widget_set_size_request(column, self.panelW(), self.panelH());
     c.gtk_overlay_set_child(@ptrCast(overlay), column);
 
     // search bar
@@ -280,7 +300,7 @@ pub fn build(self: *Ui) void {
     c.gtk_scrolled_window_set_policy(@ptrCast(self.scroller), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
     // As tall as the rows, up to the space left under the search bar.
     c.gtk_scrolled_window_set_propagate_natural_height(@ptrCast(self.scroller), 1);
-    c.gtk_scrolled_window_set_max_content_height(@ptrCast(self.scroller), list_max_h);
+    c.gtk_scrolled_window_set_max_content_height(@ptrCast(self.scroller), self.listMaxH());
     c.gtk_widget_set_hexpand(self.scroller, 1);
     self.list = c.gtk_list_box_new();
     c.gtk_widget_add_css_class(self.list, "results");
@@ -317,6 +337,35 @@ pub fn build(self: *Ui) void {
     c.gtk_event_controller_set_propagation_phase(click, c.GTK_PHASE_CAPTURE);
     widgets.connect(click, "pressed", &backdrop.onWindowPressed, self);
     c.gtk_widget_add_controller(win, click);
+    self.built = true;
+    self.applyLayout();
+}
+
+/// Width, height and density from the settings. A layer surface takes its
+/// size when it is mapped: a change while it shows maps it again.
+fn applyLayout(self: *Ui) void {
+    widgets.icon_px = switch (self.settings.density) {
+        .compact => 26,
+        .default => 32,
+        .comfortable => 38,
+    };
+    if (!self.built) return;
+    const w = self.panelW();
+    const h = self.panelH();
+    var cw: c_int = 0;
+    var ch: c_int = 0;
+    c.gtk_widget_get_size_request(self.column, &cw, &ch);
+    if (cw == w and ch == h) return;
+    c.gtk_widget_set_size_request(self.column, w, h);
+    c.gtk_scrolled_window_set_max_content_height(@ptrCast(self.scroller), self.listMaxH());
+    c.gtk_window_set_default_size(@ptrCast(self.window), w + 2 * shell_margin, h + 2 * shell_margin);
+    if (c.gtk_widget_get_visible(self.window) != 0) {
+        c.gtk_widget_set_visible(self.window, 0);
+        c.gtk_widget_set_visible(self.window, 1);
+        _ = c.gtk_widget_grab_focus(self.entry);
+    }
+    // The list beside a detail pane keeps ~40% of the width.
+    if (c.gtk_widget_get_visible(self.detail) != 0) c.gtk_widget_set_size_request(self.scroller, @divTrunc(w * 2, 5), -1);
 }
 
 fn loadCss(self: *Ui) void {
@@ -327,21 +376,44 @@ fn loadCss(self: *Ui) void {
 
 // ------------------------------------------------------------ settings
 
-/// Reads the settings file again and applies it.
-fn reloadSettings(self: *Ui) void {
+/// Reads the settings file again and applies it, init.lua's settings over it.
+pub fn reloadSettings(self: *Ui) void {
     const fresh = Settings.load(self.gpa, self.settings_path.ptr);
     self.settings.deinit();
     self.settings = fresh;
     self.settings_stamp = settings_mod.Stamp.of(self.settings_path.ptr);
+    self.applyOverrides();
     self.applyAppearance(null);
+    self.applyLayout();
     if (self.on_settings_changed) |f| f();
 }
 
+/// Writes the settings; what init.lua fixes keeps its value in the file.
 pub fn saveSettings(self: *Ui) void {
-    self.settings.save(self.gpa, self.settings_path) catch |err| log.warn("saving settings: {t}", .{err});
+    var kept: [32][]const u8 = undefined;
+    var n: usize = 0;
+    if (self.ext_registry) |reg| for (reg.settings) |o| if (n < kept.len) {
+        kept[n] = o.key;
+        n += 1;
+    };
+    self.settings.save(self.gpa, self.settings_path, kept[0..n]) catch |err| log.warn("saving settings: {t}", .{err});
     self.settings_stamp = settings_mod.Stamp.of(self.settings_path.ptr);
     self.applyAppearance(null);
+    self.applyLayout();
     if (self.on_settings_changed) |f| f();
+}
+
+/// `lumen.set` in init.lua, over the file's values.
+pub fn applyOverrides(self: *Ui) void {
+    const reg = self.ext_registry orelse return;
+    for (reg.settings) |o| _ = self.settings.set(o.key, o.value);
+}
+
+/// Set by init.lua: Settings shows it but cannot change it.
+pub fn overridden(self: *const Ui, key: []const u8) bool {
+    const reg = self.ext_registry orelse return false;
+    for (reg.settings) |o| if (std.mem.eql(u8, o.key, key)) return true;
+    return false;
 }
 
 fn currentTheme(self: *Ui) *const themes.Theme {
@@ -509,7 +581,7 @@ fn placeOnFocusedMonitor(self: *Ui) void {
         var geo: c.GdkRectangle = undefined;
         c.gdk_monitor_get_geometry(mon, &geo);
         const tenths: c_int = if (self.settings.position == .center) 5 else 3;
-        const margin = @max(@divTrunc((geo.height - panel_h) * tenths, 10) - shell_margin, 0);
+        const margin = @max(@divTrunc((geo.height - self.panelH()) * tenths, 10) - shell_margin, 0);
         c.gtk_layer_set_margin(@ptrCast(self.window), c.GTK_LAYER_SHELL_EDGE_TOP, margin);
         return;
     }
@@ -583,7 +655,7 @@ pub fn setView(self: *Ui, view: View) void {
     // A preview needs room: the results take the full height then.
     c.gtk_widget_set_vexpand(self.results, @intFromBool(has_detail));
     // With the detail pane, the list takes ~40%.
-    c.gtk_widget_set_size_request(self.scroller, if (has_detail) 300 else -1, -1);
+    c.gtk_widget_set_size_request(self.scroller, if (has_detail) @divTrunc(self.panelW() * 2, 5) else -1, -1);
     c.gtk_widget_set_hexpand(self.scroller, @intFromBool(!has_detail));
     const keys: [4][:0]const u8 = switch (view) {
         .files => .{ "Kind", "Size", "Modified", "Where" },

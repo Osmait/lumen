@@ -66,6 +66,7 @@ mkdir -p "$H/.config/lumen/extensions/fixture" "$H/.config/lumen/extensions/brok
 cat >"$H/.config/lumen/init.lua" <<'EOF'
 lumen.theme { id = "e2e-night", name = "E2E Night", bg = "#101820", fg = "#e0e0e0", accent = "#33aaff" }
 lumen.keymap("ctrl+g", "fixture.fruits")
+lumen.set { density = "compact" }
 EOF
 echo "local out = '$T/ext-ran'" >"$H/.config/lumen/extensions/fixture/init.lua"
 cat >>"$H/.config/lumen/extensions/fixture/init.lua" <<'EOF'
@@ -400,6 +401,10 @@ L --key ctrl+g; sleep 0.3
 expect "keymap from init.lua opens a command" '^title: Fixture Fruits'
 query themes "e2e night"
 expect "theme from init.lua in Change Theme" 'E2E Night .*swatch:e2e-night'
+query settings "density"
+expect "lumen.set shows in Settings" 'Density \| Set in init.lua \| Compact'
+L --key enter; sleep 0.1
+expect "settings init.lua fixes cannot change" 'primary: Set in init.lua'
 sed -i 's/Fixture Fruits/Fixture Fruit Bowl/' "$H/.config/lumen/extensions/fixture/init.lua"
 L --hide; L --query "fruit bowl"
 expect_soon "edited extensions reload when the window opens" '> Fixture Fruit Bowl'

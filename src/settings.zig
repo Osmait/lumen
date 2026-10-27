@@ -16,11 +16,15 @@ pub const default_theme = "lumen-dark";
 
 pub const TextSize = enum { small, default, large };
 pub const Position = enum { upper_third, center };
+pub const Width = enum { narrow, default, wide };
+pub const Height = enum { short, default, tall };
+/// Row height and icon size.
+pub const Density = enum { compact, default, comfortable };
 
 /// On/off settings.
 pub const Toggle = enum { files_in_root, suggestions, clipboard };
 /// Settings with a list of values to pick from.
-pub const Choice = enum { text_size, opacity, position, clipboard_keep, terminal, editor };
+pub const Choice = enum { text_size, opacity, position, width, height, density, clipboard_keep, terminal, editor };
 
 pub const opacity_choices = [_]u8{ 100, 97, 90, 80 };
 pub const keep_choices = [_]u32{ 100, 500, 1000, 5000 };
@@ -45,6 +49,9 @@ pub const Settings = struct {
     /// Window background opacity, percent.
     opacity: u8 = 97,
     position: Position = .upper_third,
+    width: Width = .default,
+    height: Height = .default,
+    density: Density = .default,
     files_in_root: bool = true,
     suggestions: bool = true,
     clipboard: bool = true,
@@ -153,6 +160,9 @@ pub const Settings = struct {
         switch (ch) {
             .text_size => s.text_size = std.meta.stringToEnum(TextSize, value) orelse return false,
             .position => s.position = std.meta.stringToEnum(Position, value) orelse return false,
+            .width => s.width = std.meta.stringToEnum(Width, value) orelse return false,
+            .height => s.height = std.meta.stringToEnum(Height, value) orelse return false,
+            .density => s.density = std.meta.stringToEnum(Density, value) orelse return false,
             .opacity => {
                 const v = std.fmt.parseInt(u8, std.mem.trimEnd(u8, value, "%"), 10) catch return false;
                 if (v < 50 or v > 100) return false;
@@ -180,6 +190,9 @@ pub const Settings = struct {
         return switch (ch) {
             .text_size => @tagName(s.text_size),
             .position => @tagName(s.position),
+            .width => @tagName(s.width),
+            .height => @tagName(s.height),
+            .density => @tagName(s.density),
             .opacity => std.fmt.bufPrint(buf, "{d}", .{s.opacity}) catch "",
             .clipboard_keep => std.fmt.bufPrint(buf, "{d}", .{s.clipboard_keep}) catch "",
             .terminal => s.terminal,
@@ -218,6 +231,22 @@ pub const Settings = struct {
     }
 
     pub fn write(s: *const Settings, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        return s.writeKeeping(w, s, &.{});
+    }
+
+    /// Writes `s`, except the keys in `kept`, which keep their values from
+    /// `file` (keys init.lua sets stay out of the file).
+    pub fn writeKeeping(s: *const Settings, w: *std.Io.Writer, file: *const Settings, kept: []const []const u8) std.Io.Writer.Error!void {
+        const P = struct {
+            s: *const Settings,
+            file: *const Settings,
+            kept: []const []const u8,
+            fn of(p: @This(), key: []const u8) *const Settings {
+                for (p.kept) |k| if (std.mem.eql(u8, k, key)) return p.file;
+                return p.s;
+            }
+        };
+        const p: P = .{ .s = s, .file = file, .kept = kept };
         try w.print(
             \\# Lumen settings. Change them from Lumen (search "Settings") or here:
             \\# Lumen reads this file again when its window opens.
@@ -230,6 +259,11 @@ pub const Settings = struct {
             \\opacity = {d}
             \\# upper_third, center
             \\position = {t}
+            \\# Window size: narrow, default, wide; short, default, tall
+            \\width = {t}
+            \\height = {t}
+            \\# Rows and icons: compact, default, comfortable
+            \\density = {t}
             \\
             \\# Search
             \\files_in_root = {}
@@ -243,7 +277,13 @@ pub const Settings = struct {
             \\terminal = {s}
             \\editor = {s}
             \\
-        , .{ s.theme, s.text_size, s.opacity, s.position, s.files_in_root, s.suggestions, s.clipboard, s.clipboard_keep, s.terminal, s.editor });
+        , .{
+            p.of("theme").theme,         p.of("text_size").text_size,           p.of("opacity").opacity,
+            p.of("position").position,   p.of("width").width,                   p.of("height").height,
+            p.of("density").density,     p.of("files_in_root").files_in_root,   p.of("suggestions").suggestions,
+            p.of("clipboard").clipboard, p.of("clipboard_keep").clipboard_keep, p.of("terminal").terminal,
+            p.of("editor").editor,
+        });
         if (s.unknown.items.len > 0) {
             try w.writeAll("\n# Not known to this version of Lumen\n");
             for (s.unknown.items) |l| try w.print("{s}\n", .{l});
@@ -269,14 +309,32 @@ pub const Settings = struct {
 
     /// Writes `path` atomically (temporary file, fsync, rename): a crash or a
     /// full disk never leaves half a file. Owner-only, like Lumen's other
-    /// files.
-    pub fn save(s: *const Settings, gpa: std.mem.Allocator, path: []const u8) SaveError!void {
+    /// files. The keys in `kept` keep the values the file has now.
+    pub fn save(s: *const Settings, gpa: std.mem.Allocator, path: [:0]const u8, kept: []const []const u8) SaveError!void {
         if (s.incomplete) return error.Incomplete;
         if (std.mem.findScalarLast(u8, path, '/')) |slash| sys.mkdirP(path[0..slash]);
+        var file = if (kept.len > 0) load(gpa, path.ptr) else Settings.init(gpa);
+        defer file.deinit();
         var out: std.Io.Writer.Allocating = .init(gpa);
         defer out.deinit();
-        try s.write(&out.writer);
+        try s.writeKeeping(&out.writer, &file, kept);
         try sys.writeFileAtomic(path, out.written());
+    }
+
+    pub const Check = enum { ok, unknown_key, bad_value };
+
+    /// Whether `key = value` would be taken (`lumen.set` reports both
+    /// mistakes instead of ignoring them like a hand-edited file).
+    pub fn check(key: []const u8, value: []const u8) Check {
+        if (std.meta.stringToEnum(Toggle, key) != null) return if (parseBool(value) != null) .ok else .bad_value;
+        if (std.meta.stringToEnum(Choice, key)) |ch| {
+            var buf: [1024]u8 = undefined;
+            var fba: std.heap.FixedBufferAllocator = .init(&buf);
+            var probe: Settings = .{ .arena = .init(fba.allocator()) };
+            return if (probe.setChoice(ch, value)) .ok else .bad_value;
+        }
+        if (std.mem.eql(u8, key, "theme")) return if (isToken(value)) .ok else .bad_value;
+        return .unknown_key;
     }
 };
 
@@ -441,7 +499,7 @@ test "save is atomic and owner-only; load survives a missing file" {
     var s = Settings.init(testing.allocator);
     defer s.deinit();
     try testing.expect(s.setChoice(.text_size, "small"));
-    try s.save(testing.allocator, path);
+    try s.save(testing.allocator, path, &.{});
     const before = Stamp.of(path);
     var back = Settings.load(testing.allocator, path);
     defer back.deinit();
@@ -451,6 +509,27 @@ test "save is atomic and owner-only; load survives a missing file" {
     try testing.expectEqual(@as(u32, 0o600), st.mode & 0o777);
 
     try testing.expect(s.setChoice(.text_size, "large"));
-    try s.save(testing.allocator, path);
+    try s.save(testing.allocator, path, &.{});
     try testing.expect(!Stamp.of(path).eql(before));
+
+    // Keys init.lua sets keep the file's values when saving.
+    try testing.expect(s.setChoice(.width, "wide"));
+    try testing.expect(s.setChoice(.text_size, "small"));
+    try s.save(testing.allocator, path, &.{"width"});
+    var kept = Settings.load(testing.allocator, path);
+    defer kept.deinit();
+    try testing.expectEqual(Width.default, kept.width);
+    try testing.expectEqual(TextSize.small, kept.text_size);
+}
+
+test "check tells unknown keys from bad values" {
+    try testing.expectEqual(Settings.Check.ok, Settings.check("width", "wide"));
+    try testing.expectEqual(Settings.Check.ok, Settings.check("density", "compact"));
+    try testing.expectEqual(Settings.Check.ok, Settings.check("suggestions", "off"));
+    try testing.expectEqual(Settings.Check.ok, Settings.check("opacity", "90"));
+    try testing.expectEqual(Settings.Check.ok, Settings.check("theme", "midnight"));
+    try testing.expectEqual(Settings.Check.bad_value, Settings.check("width", "huge"));
+    try testing.expectEqual(Settings.Check.bad_value, Settings.check("opacity", "10"));
+    try testing.expectEqual(Settings.Check.bad_value, Settings.check("clipboard", "maybe"));
+    try testing.expectEqual(Settings.Check.unknown_key, Settings.check("colour", "red"));
 }

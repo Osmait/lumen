@@ -17,6 +17,9 @@ All notable changes are listed here. The format follows
   own.
 - `~/.config/lumen/style.css`, loaded after Lumen's own styles.
 - `lumen --command <extension>.<command>` and `lumen --reload`.
+- Layout settings: window width and height, and density (row height and icon
+  size), in Settings and settings.conf.
+- `lumen.set` in init.lua fixes settings; Settings shows them as set there.
 - Example extensions: GitHub (through `gh`), processes, hello.
 
 ## [0.1.0] - 2026-10-26

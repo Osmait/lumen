@@ -69,6 +69,12 @@ pub const Keymap = struct {
     ext: [:0]const u8,
 };
 
+/// `lumen.set { width = "wide" }`: a setting init.lua fixes.
+pub const SettingOverride = struct {
+    key: [:0]const u8,
+    value: [:0]const u8,
+};
+
 pub const Problem = struct {
     ext: [:0]const u8,
     message: [:0]const u8,
@@ -80,6 +86,7 @@ pub const Registry = struct {
     commands: []const Command = &.{},
     themes: []const themes.Theme = &.{},
     keymaps: []const Keymap = &.{},
+    settings: []const SettingOverride = &.{},
     problems: []const Problem = &.{},
     arena: std.heap.ArenaAllocator,
 
@@ -160,6 +167,7 @@ pub const Load = struct {
     wcmds: std.ArrayList(WorkerCommand) = .empty,
     themes: std.ArrayList(themes.Theme) = .empty,
     keymaps: std.ArrayList(Keymap) = .empty,
+    settings: std.ArrayList(SettingOverride) = .empty,
     problems: std.ArrayList(Problem) = .empty,
 };
 
@@ -342,6 +350,7 @@ fn doReload(h: *Host) void {
     reg.commands = load.commands.items;
     reg.themes = load.themes.items;
     reg.keymaps = load.keymaps.items;
+    reg.settings = load.settings.items;
     reg.problems = load.problems.items;
     for (reg.problems) |p| log.warn("{s}: {s}", .{ p.ext, p.message });
     h.deliver(.{ .registry = reg });
@@ -395,7 +404,7 @@ fn loadFile(h: *Host, load: *Load, id: []const u8, dir: []const u8, path: [:0]co
         return problem(load, id, "out of memory");
     };
     // What this file adds is dropped again if it fails half-way.
-    const marks = .{ load.commands.items.len, load.wcmds.items.len, load.themes.items.len, load.keymaps.items.len };
+    const marks = .{ load.commands.items.len, load.wcmds.items.len, load.themes.items.len, load.keymaps.items.len, load.settings.items.len };
     e.load = load;
     e.budget.deadline_ns = index.sys.monotonicNs() + load_budget_ns;
     var ctx: LoadCtx = .{ .e = e, .load = load, .path = path, .ext_index = @intCast(h.exts.items.len) };
@@ -407,6 +416,7 @@ fn loadFile(h: *Host, load: *Load, id: []const u8, dir: []const u8, path: [:0]co
     load.wcmds.shrinkRetainingCapacity(marks[1]);
     load.themes.shrinkRetainingCapacity(marks[2]);
     load.keymaps.shrinkRetainingCapacity(marks[3]);
+    load.settings.shrinkRetainingCapacity(marks[4]);
     problem(load, id, err orelse "out of memory");
     lua.c.lua_close(e.L);
     h.gpa.destroy(e);
@@ -910,6 +920,7 @@ test "extensions load, list, search and run actions" {
     try writeTestFile(dir, "init.lua",
         \\lumen.theme { id = "mine", name = "Mine", bg = "#101010", fg = "#f0f0f0", accent = "#ff8800" }
         \\lumen.keymap("ctrl+g", "demo.fruits")
+        \\lumen.set { width = "wide", suggestions = false, opacity = 90 }
         \\return lumen.extension { commands = { { name = "hello", title = "Say Hello", run = function() return "stay" end } } }
     );
     try writeTestFile(dir, "extensions/demo/init.lua",
@@ -955,6 +966,11 @@ test "extensions load, list, search and run actions" {
     try testing.expectEqual(@as(u24, 0x101010), reg.themes[0].surface);
     try testing.expectEqual(@as(usize, 1), reg.keymaps.len);
     try testing.expectEqualStrings("demo.fruits", reg.keymaps[0].target);
+    try testing.expectEqual(@as(usize, 3), reg.settings.len);
+    for (reg.settings) |o| {
+        const want: []const u8 = if (std.mem.eql(u8, o.key, "width")) "wide" else if (std.mem.eql(u8, o.key, "suggestions")) "false" else "90";
+        try testing.expectEqualStrings(want, o.value);
+    }
     // The broken one is reported, the others load.
     try testing.expectEqual(@as(usize, 1), reg.problems.len);
     try testing.expectEqualStrings("broken", reg.problems[0].ext);
@@ -1034,6 +1050,7 @@ test "errors in extensions come back as messages" {
     try writeTestFile(dir, "extensions/syntax/init.lua", "return lumen.extension {");
     try writeTestFile(dir, "extensions/Bad Name/init.lua", "return nil");
     try writeTestFile(dir, "extensions/keys/init.lua", "lumen.keymap('g', 'x.y')");
+    try writeTestFile(dir, "extensions/sets/init.lua", "lumen.set { widht = 'wide' }");
 
     var probe: Probe = .{};
     defer probe.deinit();
@@ -1043,9 +1060,9 @@ test "errors in extensions come back as messages" {
     try probe.wait("reg");
     const reg = probe.reg.?;
     try testing.expectEqual(@as(usize, 4), reg.commands.len);
-    try testing.expectEqual(@as(usize, 3), reg.problems.len);
+    try testing.expectEqual(@as(usize, 4), reg.problems.len);
     for (reg.problems) |p| {
-        const want: []const u8 = if (std.mem.eql(u8, p.ext, "Bad Name")) "folder names" else if (std.mem.eql(u8, p.ext, "keys")) "needs ctrl" else "unexpected symbol near <eof>";
+        const want: []const u8 = if (std.mem.eql(u8, p.ext, "Bad Name")) "folder names" else if (std.mem.eql(u8, p.ext, "keys")) "needs ctrl" else if (std.mem.eql(u8, p.ext, "sets")) "no setting named \"widht\"" else "unexpected symbol near <eof>";
         if (std.mem.find(u8, p.message, want) == null) {
             std.debug.print("{s}: {s}\n", .{ p.ext, p.message });
             return error.TestUnexpectedResult;
