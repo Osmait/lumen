@@ -51,6 +51,13 @@ All notable changes are listed here. The format follows
   of ~58 ms, and each copy
   into the clipboard history no longer starts a GTK process. Install both
   files (see the README).
+- Typing in Search Files is about twice as fast (23 → 12 ms per key) and
+  in Search File Contents a third faster: only the rows you can see are
+  built with each keystroke, the rest right after.
+- Image previews are decoded off the UI thread, and once per file: a large
+  photo as the top result blocked every keystroke for ~100 ms.
+- The first show after starting is faster again (45 → 27 ms): the
+  full-screen backdrops are made beforehand too.
 - Searching file contents reads far fewer files for the same results:
   "SELECT * FROM" 42 → 5 ms, "fn main" 13 → 3.5 ms, "useState" 10 → 6.6
   ms on a home folder with 49 k text files.

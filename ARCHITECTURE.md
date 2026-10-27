@@ -241,7 +241,10 @@ documents indexed):
 | anonymous memory | 44 MB | 37 MB | glibc's malloc in release builds (Zig 0.17's ReleaseSafe default is a checking allocator mapping every allocation of 6 KB or more, so the tuning above did not apply), no 256 KB signal stack in each of 31 threads' TLS |
 | disk writes, idle | ~1 GB/h | — | the name index rescanned every 10 minutes whenever caches changed (always); now only on start |
 | key press to window (p50) | 58.5 ms | 7.8 ms | `lumen` without GTK: 42.8 ms of client became 0.9 ms (Hyprland's `openlayer` event, 15 runs); the focused monitor read from Hyprland's socket instead of starting `hyprctl` (daemon's show 16.3 → 6.8 ms) |
-| first show after start | ~175 ms | ~30 ms | the window's surface and Vulkan renderer created, and the root view built, while hidden right after start |
+| files view, key to frame (p50) | 23.5 ms | 12 ms | only the first 14 rows are built with the keystroke's frame (the list shows ~8); the rest after it, a few per idle callback, dropped by the next keystroke. GTK laid out all 61 rows (~430 widgets) per key |
+| contents view, key to frame (p50) | 15 ms | 11 ms | the same, and a keystroke that only asks the worker no longer rebuilds the rows of the previous result |
+| image preview | ~100 ms on the UI thread per keystroke (24 MP photo) | off the UI thread | decoded on a GTask thread, not again for the same file |
+| first show after start | ~175 ms | ~27 ms | the window's surface and Vulkan renderer created, the root view built and the full-screen backdrops made, while hidden right after start |
 | GPU | | ~10 MiB VRAM while shown, none hidden | |
 
 ## Edge cases
