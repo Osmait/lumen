@@ -36,3 +36,6 @@
 .actions row { border-radius: 8px; }
 .actions row:selected { background-color: alpha(#ffffff, 0.09); background-image: none; box-shadow: none; }
 .actions row:selected label { color: var(--fg); }
+
+/* SF Pro when it is installed (Apple does not allow sharing it), else Inter. */
+.shell, .actions { font-family: "SF Pro Text", "SF Pro", "Inter", sans-serif; }

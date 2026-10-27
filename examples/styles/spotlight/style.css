@@ -6,7 +6,7 @@
 .shell.single.alone .search { border-radius: 16px; }
 
 .search-icon { -gtk-icon-size: 24px; color: alpha(var(--fg), 0.6); margin-right: 12px; }
-.query { font-size: 26px; font-weight: 300; }
+.query { font-size: 26px; font-weight: 300; font-family: "SF Pro Display", "SF Pro", "Inter", sans-serif; }
 .query > placeholder { color: alpha(var(--fg), 0.35); }
 
 .results > row { border-radius: 7px; min-height: 30px; padding: 0 8px; }
@@ -28,3 +28,6 @@
 .scope { background-color: alpha(#ffffff, 0.10); color: var(--fg); }
 .actions { border-radius: 12px; }
 .actions row:selected { background-image: none; box-shadow: none; }
+
+/* SF Pro when it is installed (Apple does not allow sharing it), else Inter. */
+.shell, .actions { font-family: "SF Pro Text", "SF Pro", "Inter", sans-serif; }

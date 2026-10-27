@@ -25,5 +25,11 @@ If you already have an `init.lua`, paste the style's `lumen.theme`,
 `lumen.set` and `lumen.layout` calls into it instead. Every option is in
 [EXTENSIONS.md](../../EXTENSIONS.md#layout).
 
-They imitate the look, not the trade marks: no logos, and the fonts are the
-ones on your system (the originals use Apple's SF Pro).
+They imitate the look, not the trade marks: no logos, and no fonts shipped.
+The Raycast, Spotlight and Alfred styles use Apple's SF Pro when it is
+installed on your system and Inter otherwise. Any font can be used the same
+way, in style.css:
+
+```css
+.shell, .actions { font-family: "Your Font", "Inter", sans-serif; }
+```

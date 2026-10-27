@@ -30,3 +30,6 @@
 .scope { background-color: alpha(#ffffff, 0.10); color: var(--fg); }
 .actions { border-radius: 10px; }
 .actions row:selected { background-image: none; box-shadow: none; }
+
+/* SF Pro when it is installed (Apple does not allow sharing it), else Inter. */
+.shell, .actions { font-family: "SF Pro Text", "SF Pro", "Inter", sans-serif; }
