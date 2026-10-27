@@ -6,7 +6,9 @@
 //!   sqlite SQLite through translate-c
 //!   lua    Lua 5.4 through translate-c (extensions and init.lua)
 //!   main   the daemon: providers, actions, extensions and the window
-//!          -> core, index, c, sqlite, lua
+//!          -> core, index, c, sqlite, lua (the lumen-gtk executable)
+//!   client `lumen`, what the shortcut runs: passes its arguments to the
+//!          daemon over a socket, or runs lumen-gtk (no GTK, no libc)
 
 const std = @import("std");
 
@@ -70,8 +72,19 @@ pub fn build(b: *std.Build) void {
     // The styles in examples/styles, built in (Change Theme > Styles).
     mod.addImport("styles", b.createModule(.{ .root_source_file = b.path("examples/styles/styles.zig"), .target = target, .optimize = optimize }));
 
-    const exe = b.addExecutable(.{ .name = "lumen", .root_module = mod });
+    const exe = b.addExecutable(.{ .name = "lumen-gtk", .root_module = mod });
     b.installArtifact(exe);
+
+    // Loading GTK costs a process ~40 ms; the shortcut runs this instead.
+    const client = b.createModule(.{
+        .root_source_file = b.path("src/client.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = false,
+        .single_threaded = true,
+        .strip = optimize != .debug,
+    });
+    b.installArtifact(b.addExecutable(.{ .name = "lumen", .root_module = client, .linkage = .static }));
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
@@ -113,13 +126,15 @@ pub fn build(b: *std.Build) void {
 
     // End-to-end: an isolated instance driven through --dump/--key. Needs a
     // Wayland session; the window shows for a few seconds.
+    // `lumen` as installed, with lumen-gtk beside it.
     const e2e_run = b.addSystemCommand(&.{ "bash", "tools/e2e.sh" });
-    e2e_run.addArtifactArg(exe);
+    e2e_run.addArg("zig-out/bin/lumen");
+    e2e_run.step.dependOn(b.getInstallStep());
     e2e_run.has_side_effects = true;
     b.step("e2e", "End-to-end tests against an isolated instance").dependOn(&e2e_run.step);
 
     const test_step = b.step("test", "Run unit tests");
-    for ([_]*std.Build.Module{ core, index, mod }) |m| {
+    for ([_]*std.Build.Module{ core, index, mod, client }) |m| {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     }
 }

@@ -1,20 +1,36 @@
 # How Lumen works
 
-Lumen is one process: a GTK4 application that starts hidden (`lumen
---daemon`), keeps its indexes warm, and shows a gtk4-layer-shell window when
-`lumen` is called again (GApplication forwards the command line to the
-running instance).
+Lumen is one process: a GTK4 application (`lumen-gtk`) that starts hidden
+(`lumen --daemon`), keeps its indexes warm, and shows a gtk4-layer-shell
+window when `lumen` is called again.
+
+`lumen` itself is a separate, static executable without GTK or libc
+(`src/client.zig`). Loading GTK4 costs a process about 40 ms (measured on
+the reference machine: an empty program linked against libgtk-4 takes 41
+ms, 13 of them for libGLX, which GStreamer GL pulls in), and the keyboard
+shortcut used to pay that before every window. The client connects to
+`$XDG_RUNTIME_DIR/lumen/<app id>.sock` (owner-only; the daemon also checks
+the peer's uid), sends its arguments, prints the answer: under 1 ms. What
+it cannot pass on (no daemon yet, `--daemon`, `--dmenu`, installs, unknown
+flags) it hands to `lumen-gtk` with `execve`, where GApplication forwards
+the command line to the running instance as before. Both paths run the
+same handler in `main.zig`. The clipboard watcher runs `lumen
+--clip-store` for every copy, so copies go through the socket too, into the
+daemon's open database.
 
 ## Layout
 
 ```
 src/main.zig      entry point: GApplication, command line, clipboard watcher
+src/client.zig    `lumen`: arguments to the daemon over a socket, else lumen-gtk
+src/ipc.zig       the socket's path and messages (shared by both)
 src/core/         pure logic, unit tested: fuzzy matching, accent folding,
                   calculator and units, frecency, window geometry, script headers
 src/index/        file index (std + Linux syscalls only): store, scan, search,
                   live updates, service; content index: content, content_list,
                   extract, ContentService
-src/sys/          SQLite store (Db.zig), process spawning (GLib), hyprctl
+src/sys/          SQLite store (Db.zig), process spawning (GLib), hyprctl,
+                  the daemon's end of the socket (ipc_server.zig)
 src/providers/    apps (GIO), built-in commands, script commands
 src/ext/          Lua extensions: lua.zig (the C API and its rules), Host.zig
                   (the worker thread and the registry), api.zig (the `lumen`
@@ -196,6 +212,7 @@ documents indexed):
 | contents, key to frame p50 | 131 ms | 18 ms | previews clip long lines instead of wrapping |
 | files, key to frame p50 | 73 ms | 23 ms | preview capped at 40 lines, no wrapping |
 | CPU idle | 0 % | 0 % | nothing polls: inotify and futex waits |
+| key press to window (p50) | 58.5 ms | 17.2 ms | `lumen` without GTK: 42.8 ms of client became 0.9 ms (Hyprland's `openlayer` event, 15 runs) |
 | GPU | | ~10 MiB VRAM while shown, none hidden | |
 
 ## Edge cases

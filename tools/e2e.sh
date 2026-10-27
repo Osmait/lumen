@@ -279,9 +279,9 @@ query files "espanol"
 expect "accent-insensitive file names" 'español.txt'
 
 echo "clipboard"
-printf 'e2e clipboard entry 42' | env CLIPBOARD_STATE=data XDG_DATA_HOME="$T/data" XDG_CONFIG_HOME="$H/.config" HOME="$H" "$BIN" --clip-store
-printf 'e2e second entry' | env CLIPBOARD_STATE=data XDG_DATA_HOME="$T/data" XDG_CONFIG_HOME="$H/.config" HOME="$H" "$BIN" --clip-store
-printf 'secret' | env CLIPBOARD_STATE=sensitive XDG_DATA_HOME="$T/data" XDG_CONFIG_HOME="$H/.config" HOME="$H" "$BIN" --clip-store
+printf 'e2e clipboard entry 42' | CLIPBOARD_STATE=data L --clip-store
+printf 'e2e second entry' | CLIPBOARD_STATE=data L --clip-store
+printf 'secret' | CLIPBOARD_STATE=sensitive L --clip-store
 L --view clipboard; sleep 0.2
 expect "clipboard lists entries, newest first" '> e2e second entry'
 expect "older entry listed" 'e2e clipboard entry 42'
@@ -383,7 +383,7 @@ grep -q '^markdown = text-opener-e2e.desktop' "$C" && ok "open and always use re
 query settings "clipboard history"
 L --key enter; sleep 0.2
 expect "clipboard history off" 'Clipboard History \|  \| Off'
-printf 'copied while history is off' | env CLIPBOARD_STATE=data XDG_DATA_HOME="$T/data" XDG_CONFIG_HOME="$H/.config" HOME="$H" "$BIN" --clip-store
+printf 'copied while history is off' | CLIPBOARD_STATE=data L --clip-store
 L --view clipboard; sleep 0.2
 expect_not "nothing is recorded while off" 'copied while history is off'
 query settings "clipboard history"
@@ -544,7 +544,14 @@ fi
 echo "dmenu"
 # dm INPUT ARGS...: runs `lumen --dmenu` in the background; its stdout and
 # exit status end up in $T/dm.
-dm() { local input=$1; shift; ( printf "$input" | L --dmenu "$@" >"$T/dm"; echo "exit $?" >>"$T/dm" ) & DM=$!; wait_for '^view: dmenu' 3; }
+# The view is left elsewhere first: a dmenu closed before keeps its view
+# while hidden, and waiting for it would not wait for this one.
+dm() {
+    local input=$1; shift
+    L --view root; L --hide
+    ( printf "$input" | L --dmenu "$@" >"$T/dm"; echo "exit $?" >>"$T/dm" ) & DM=$!
+    wait_for '^view: dmenu' 3
+}
 # The caller's output once it has exited (wait in this shell, not in $(...)).
 dm_result() { wait "$DM"; r=$(tr '\n' ' ' <"$T/dm"); }
 dm 'red\ngreen\nblue\n' --prompt Colour

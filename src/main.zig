@@ -18,17 +18,19 @@ const Ui = @import("ui/Ui.zig");
 const index = @import("index");
 const stats = @import("stats.zig");
 const Settings = @import("settings.zig").Settings;
+const ipc = @import("ipc.zig");
+const ipc_server = @import("sys/ipc_server.zig");
 
 pub const std_options: std.Options = .{ .log_level = .info };
 
 const log = std.log.scoped(.main);
 
-/// LUMEN_APP_ID lets end-to-end tests run a second, isolated instance
-/// (GApplication is single-instance per id).
-const default_app_id = "dev.osmait.Lumen";
-
 // The daemon's state, reached from GLib callbacks; main thread only.
 var ui: Ui = undefined;
+var the_app: *c.GApplication = undefined;
+/// LUMEN_APP_ID lets end-to-end tests run a second, isolated instance
+/// (GApplication is single-instance per id; the socket is per id too).
+var app_id: [:0]const u8 = ipc.default_app_id;
 var ui_ready = false;
 var watcher_pid: c.GPid = 0;
 
@@ -58,7 +60,7 @@ pub fn main(init: std.process.Init) !void {
         return clipStore(init);
     }
 
-    const app_id: [*:0]const u8 = c.g_getenv("LUMEN_APP_ID") orelse default_app_id;
+    if (c.g_getenv("LUMEN_APP_ID")) |id| app_id = std.mem.span(id);
     // Commands that only talk to a running daemon must not become one: with
     // none running GApplication makes the caller the primary instance, so
     // `lumen --stats` would start a whole new daemon and never return. As a
@@ -66,7 +68,8 @@ pub fn main(init: std.process.Init) !void {
     // made a daemon starting at the same moment fail to register).
     const client_only = argv.items.len > 1 and clientOnly(std.mem.span(argv.items[1].?));
     const flags = c.G_APPLICATION_HANDLES_COMMAND_LINE | if (client_only) c.G_APPLICATION_IS_LAUNCHER else 0;
-    const app = c.gtk_application_new(app_id, flags);
+    const app = c.gtk_application_new(app_id.ptr, flags);
+    the_app = @ptrCast(app);
     defer c.g_object_unref(app);
     var start: Start = .{ .gpa = init.gpa, .io = init.io };
     Ui.connect(app, "startup", &onStartup, &start);
@@ -110,15 +113,53 @@ fn onStartup(app: *c.GtkApplication, data: ?*anyopaque) callconv(.c) void {
         _ = c.g_timeout_add_seconds(300, &testWatchdog, app);
     }
     startFileIndex();
+    // `lumen` (src/client.zig) reaches us here without loading GTK.
+    ipc_server.start(start.gpa, app_id, &onSocket);
     stats.startup_ns = stats.now() - stats.started_ns;
 }
 
-/// Every invocation (the first one and the ones that follow) lands here.
+/// Where a command's answer goes: the GApplication client that ran it, or
+/// the socket `lumen` asked through.
+const Out = struct {
+    cmdline: ?*c.GApplicationCommandLine = null,
+    out: ?*std.Io.Writer = null,
+    err: ?*std.Io.Writer = null,
+    /// What followed the arguments on the socket (a copy, --clip-store).
+    payload: ?[]const u8 = null,
+
+    fn print(o: *const Out, text: [:0]const u8) void {
+        if (o.cmdline) |cl| c.g_application_command_line_print(cl, "%s", text.ptr) else if (o.out) |w| w.writeAll(text) catch {};
+    }
+
+    fn printErr(o: *const Out, text: [:0]const u8) void {
+        if (o.cmdline) |cl| c.g_application_command_line_printerr(cl, "%s", text.ptr) else if (o.err) |w| w.writeAll(text) catch {};
+    }
+};
+
+/// Every invocation through GApplication (the first one, and those `lumen`
+/// hands to lumen-gtk) lands here.
 fn onCommandLine(app: *c.GApplication, cmdline: *c.GApplicationCommandLine, _: ?*anyopaque) callconv(.c) c_int {
     var argc: c_int = 0;
-    const args = c.g_application_command_line_get_arguments(cmdline, &argc);
-    defer c.g_strfreev(args);
+    const argv = c.g_application_command_line_get_arguments(cmdline, &argc);
+    defer c.g_strfreev(argv);
+    var args: [ipc.max_args][:0]const u8 = undefined;
+    var n: usize = 0;
+    var i: usize = 1;
+    while (i < argc and n < args.len) : (i += 1) {
+        args[n] = std.mem.span(argv[i] orelse continue);
+        n += 1;
+    }
+    return run(app, args[0..n], &.{ .cmdline = cmdline });
+}
 
+/// Every invocation through the socket.
+fn onSocket(args: []const [:0]const u8, payload: []const u8, out: *std.Io.Writer, err: *std.Io.Writer) u8 {
+    const status = run(the_app, args, &.{ .out = out, .err = err, .payload = payload });
+    return std.math.cast(u8, status) orelse 1;
+}
+
+/// `args` without the program's name.
+fn run(app: *c.GApplication, args: []const [:0]const u8, out: *const Out) c_int {
     var mode: enum { toggle, show, hide, daemon } = .toggle;
     var view: ?Ui.View = null;
     var command: ?[]const u8 = null;
@@ -128,30 +169,30 @@ fn onCommandLine(app: *c.GApplication, cmdline: *c.GApplicationCommandLine, _: ?
     var job_arg: ?[]const u8 = null;
     var as: ?[]const u8 = null;
     var query: ?[*:0]const u8 = null;
-    var i: usize = 1;
-    while (i < argc) : (i += 1) {
-        const a = std.mem.span(args[i] orelse continue);
-        const next: ?[*:0]const u8 = if (i + 1 < argc) args[i + 1] else null;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        const next: ?[:0]const u8 = if (i + 1 < args.len) args[i + 1] else null;
         if (std.mem.eql(u8, a, "--dump")) {
             if (!ui_ready) return 1;
             const text = ui.dump(ui.gpa) catch return 1;
             defer ui.gpa.free(text);
-            c.g_application_command_line_print(cmdline, "%s", text.ptr);
+            out.print(text);
             return 0;
         } else if (std.mem.eql(u8, a, "--key") and next != null) {
             if (!ui_ready) return 1;
-            if (!ui.injectKey(std.mem.span(next.?))) return usage(cmdline);
+            if (!ui.injectKey(next.?)) return usage(out);
             return 0;
         } else if (std.mem.eql(u8, a, "--stats")) {
             if (!ui_ready) return 1;
             const text = stats.report(ui.gpa, ui.files, ui.contents) catch return 1;
             defer ui.gpa.free(text);
-            c.g_application_command_line_print(cmdline, "%s", text.ptr);
+            out.print(text);
             return 0;
         } else if (std.mem.eql(u8, a, "--text") and next != null) {
             // Types into the search bar of the view shown (tests).
             if (!ui_ready) return 1;
-            c.gtk_editable_set_text(@ptrCast(ui.entry), next.?);
+            c.gtk_editable_set_text(@ptrCast(ui.entry), next.?.ptr);
             return 0;
         } else if (std.mem.eql(u8, a, "--reload")) {
             if (!ui_ready) return 1;
@@ -159,29 +200,29 @@ fn onCommandLine(app: *c.GApplication, cmdline: *c.GApplicationCommandLine, _: ?
             return 0;
         } else if (std.mem.eql(u8, a, "--install") and next != null) {
             job = .install;
-            job_arg = std.mem.span(next.?);
+            job_arg = next.?;
             i += 1;
         } else if (std.mem.eql(u8, a, "--uninstall") and next != null) {
             job = .uninstall;
-            job_arg = std.mem.span(next.?);
+            job_arg = next.?;
             i += 1;
         } else if (std.mem.eql(u8, a, "--update")) {
             job = .update;
             // The name is optional: without it, every git extension.
-            if (next) |n| if (!std.mem.startsWith(u8, std.mem.span(n), "-")) {
-                job_arg = std.mem.span(n);
+            if (next) |n| if (!std.mem.startsWith(u8, n, "-")) {
+                job_arg = n;
                 i += 1;
             };
         } else if (std.mem.eql(u8, a, "--as") and next != null) {
-            as = std.mem.span(next.?);
+            as = next.?;
             i += 1;
         } else if (std.mem.eql(u8, a, "--dmenu")) {
             pick = true;
         } else if (std.mem.eql(u8, a, "--prompt") and next != null) {
-            prompt = std.mem.span(next.?);
+            prompt = next.?;
             i += 1;
         } else if (std.mem.eql(u8, a, "--command") and next != null) {
-            command = std.mem.span(next.?);
+            command = next.?;
             i += 1;
         } else if (std.mem.eql(u8, a, "--quit")) {
             c.g_application_quit(app);
@@ -195,15 +236,23 @@ fn onCommandLine(app: *c.GApplication, cmdline: *c.GApplicationCommandLine, _: ?
         } else if (std.mem.eql(u8, a, "--toggle")) {
             mode = .toggle;
         } else if (std.mem.eql(u8, a, "--query") and next != null) {
-            query = next;
+            query = next.?.ptr;
             i += 1;
         } else if (std.mem.eql(u8, a, "--view") and next != null) {
-            view = std.meta.stringToEnum(Ui.View, std.mem.span(next.?)) orelse return usage(cmdline);
-            if (view == .ext) return usage(cmdline);
+            view = std.meta.stringToEnum(Ui.View, next.?) orelse return usage(out);
+            if (view == .ext) return usage(out);
             i += 1;
-        } else return usage(cmdline);
+        } else if (std.mem.eql(u8, a, "--clip-store") and out.payload != null) {
+            storeClip(out.payload.?);
+            return 0;
+        } else return usage(out);
     }
     if (!ui_ready) return 1;
+    // Answered later, through the GApplication client (lumen-gtk).
+    const cmdline = out.cmdline orelse if (job != null or pick) {
+        out.printErr("lumen: --dmenu and installs go through lumen-gtk\n");
+        return 1;
+    } else null;
     if (job) |j| {
         // The answer comes when git is done; the job holds `cmdline`.
         switch (j) {
@@ -215,12 +264,13 @@ fn onCommandLine(app: *c.GApplication, cmdline: *c.GApplicationCommandLine, _: ?
     }
     if (pick) {
         // The answer comes later: the session keeps `cmdline` until then.
-        Ui.dmenu.start(&ui, cmdline, prompt, query);
+        Ui.dmenu.start(&ui, cmdline.?, prompt, query);
         return 1;
     }
     if (command) |id| {
         if (Ui.ext_view.openTarget(&ui, id, query)) return 0;
-        c.g_application_command_line_printerr(cmdline, "lumen: no command \"%.*s\"\n", @as(c_int, @intCast(@min(id.len, 200))), id.ptr);
+        var buf: [256]u8 = undefined;
+        out.printErr(std.fmt.bufPrintSentinel(&buf, "lumen: no command \"{s}\"\n", .{id[0..@min(id.len, 200)]}, 0) catch "lumen: no such command\n");
         return 1;
     }
     // A view or a query always means "show me this".
@@ -240,8 +290,8 @@ fn clientOnly(flag: []const u8) bool {
     return false;
 }
 
-fn usage(cmdline: *c.GApplicationCommandLine) c_int {
-    c.g_application_command_line_printerr(cmdline,
+fn usage(out: *const Out) c_int {
+    out.printErr(
         \\usage: lumen [--toggle | --show | --hide | --daemon | --quit | --reload | --stats | --dump]
         \\             [--key down|up|enter|ctrl+enter|ctrl+k|escape|backspace|pagedown|pageup|ctrl+x|ctrl+o|ctrl+KEY]
         \\             [--view root|clipboard|windows|files|contents|settings|themes|default_apps]
@@ -255,6 +305,7 @@ fn usage(cmdline: *c.GApplicationCommandLine) c_int {
 
 fn onShutdown(_: *c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
     shutting_down = true;
+    ipc_server.stop();
     if (watcher_pid != 0) _ = c.kill(watcher_pid, c.SIGTERM);
     if (ui_ready) Ui.ext_view.shutdown(&ui);
     // Saves what the index learned this session, so it is there tomorrow.
@@ -310,7 +361,13 @@ fn dbPath() ?[*:0]u8 {
 fn startClipboardWatcher() void {
     const self_exe = c.g_file_read_link("/proc/self/exe", null) orelse return;
     defer c.g_free(self_exe);
-    var argv = [_:null]?[*:0]const u8{ "wl-paste", "--type", "text", "--watch", self_exe, "--clip-store" };
+    // `lumen` beside us hands each copy over without loading GTK.
+    var buf: [4096]u8 = undefined;
+    const client = if (std.fmt.bufPrintSentinel(&buf, "{s}/lumen", .{std.fs.path.dirname(std.mem.span(self_exe)) orelse "/"}, 0)) |p|
+        (if (std.os.linux.access(p.ptr, std.os.linux.X_OK) == 0) p.ptr else self_exe)
+    else |_|
+        self_exe;
+    var argv = [_:null]?[*:0]const u8{ "wl-paste", "--type", "text", "--watch", client, "--clip-store" };
     var err: ?*c.GError = null;
     if (c.g_spawn_async(null, @ptrCast(&argv), null, c.G_SPAWN_SEARCH_PATH | c.G_SPAWN_DO_NOT_REAP_CHILD, &dieWithParent, null, &watcher_pid, &err) == 0) {
         if (err) |e| {
@@ -369,6 +426,16 @@ fn dieWithParent(_: ?*anyopaque) callconv(.c) void {
 }
 
 /// Reads one clipboard copy from stdin and stores it.
+/// A copy handed over the socket by `lumen --clip-store`.
+fn storeClip(content: []const u8) void {
+    if (!ui_ready or !ui.settings.clipboard) return;
+    if (!std.unicode.utf8ValidateSlice(content)) return;
+    ui.db.addClip(content, @divTrunc(c.g_get_real_time(), std.time.us_per_s), ui.settings.clipboard_keep) catch |err|
+        log.warn("clipboard: {t}", .{err});
+}
+
+/// `lumen-gtk --clip-store`, when no daemon took the copy: straight into the
+/// database.
 fn clipStore(init: std.process.Init) !void {
     // wl-clipboard tells us about password managers and cleared selections.
     if (init.environ_map.get("CLIPBOARD_STATE")) |state| {
@@ -400,6 +467,7 @@ fn clipStore(init: std.process.Init) !void {
 }
 
 test {
+    _ = @import("ipc.zig");
     _ = @import("sys/Db.zig");
     _ = @import("sys/proc.zig");
     _ = @import("sys/hypr.zig");

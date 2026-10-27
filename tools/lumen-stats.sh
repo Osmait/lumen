@@ -14,7 +14,7 @@ set -euo pipefail
 
 LUMEN=${LUMEN:-lumen}
 IDLE_SECS=${IDLE_SECS:-10}
-PID=$(pgrep -x lumen | head -1 || true)
+PID=$(pgrep -x lumen-gtk | head -1 || true)
 [[ -n "$PID" ]] || { echo "lumen is not running" >&2; exit 1; }
 TCK=$(getconf CLK_TCK)
 

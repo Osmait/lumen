@@ -431,3 +431,9 @@ pub extern fn gtk_orientable_set_orientation(o: *anyopaque, orientation: c_int) 
 pub extern fn gtk_layer_set_margin(w: *GtkWindow, edge: c_int, margin: c_int) void;
 pub extern fn gtk_layer_set_monitor(w: *GtkWindow, monitor: ?*GdkMonitor) void;
 pub extern fn gtk_layer_set_exclusive_zone(w: *GtkWindow, zone: c_int) void;
+
+// ---------------------------------------------------------------- glib-unix
+
+pub const G_IO_IN: c_uint = 1;
+pub const GUnixFDSourceFunc = *const fn (fd: c_int, condition: c_uint, data: ?*anyopaque) callconv(.c) gboolean;
+pub extern fn g_unix_fd_add(fd: c_int, condition: c_uint, function: GUnixFDSourceFunc, data: ?*anyopaque) c_uint;

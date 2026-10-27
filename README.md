@@ -73,10 +73,13 @@ pkg-config: build there with `zig build -Dlua-pkg=lua ...`.
 git clone https://github.com/Osmait/lumen.git
 cd lumen
 zig build -Doptimize=ReleaseSafe
-install -Dm755 zig-out/bin/lumen ~/.local/bin/lumen
+install -Dm755 zig-out/bin/lumen zig-out/bin/lumen-gtk -t ~/.local/bin
 ```
 
-Make sure `~/.local/bin` is on your `PATH`.
+Make sure `~/.local/bin` is on your `PATH`. `lumen` is what you run: a tiny
+program that hands its arguments to the daemon (`lumen-gtk`, installed
+beside it) without loading GTK, so the window is up about 17 ms after the
+key press.
 
 ## Set up
 
