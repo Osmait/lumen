@@ -58,13 +58,23 @@ return lumen.extension {
     {
       name = "repos",
       title = "My Repositories",
+      detail = true,
       items = function()
         local rows = {}
-        for _, repo in ipairs(gh { "repo", "list", "--limit=200", "--json", "name,description,url,isPrivate" }) do
+        for _, repo in ipairs(gh { "repo", "list", "--limit=200",
+          "--json", "name,description,url,isPrivate,stargazerCount,primaryLanguage,updatedAt" }) do
           rows[#rows + 1] = {
             title = repo.name,
             subtitle = repo.description,
             accessory = repo.isPrivate and "Private" or "",
+            markdown = "## " .. repo.name .. "\n\n" .. (repo.description or "*No description*")
+              .. "\n\n[" .. repo.url .. "](" .. repo.url .. ")",
+            metadata = {
+              { "Visibility", repo.isPrivate and "Private" or "Public" },
+              { "Stars", repo.stargazerCount },
+              { "Language", repo.primaryLanguage and repo.primaryLanguage.name or "—" },
+              { "Updated", (repo.updatedAt or ""):sub(1, 10) },
+            },
             actions = {
               lumen.action.open(repo.url, "Open in Browser"),
               lumen.action.copy("git clone " .. repo.url .. ".git", "Copy Clone Command"),

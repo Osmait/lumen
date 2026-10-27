@@ -8,6 +8,7 @@ pub const script_meta = @import("script_meta.zig");
 pub const geometry = @import("geometry.zig");
 pub const file_badge = @import("file_badge.zig");
 pub const file_kind = @import("file_kind.zig");
+pub const markdown = @import("markdown.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

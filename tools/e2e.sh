@@ -83,6 +83,7 @@ return lumen.extension {
               end },
           } },
         "Kiwi",
+        { title = "Papaya", markdown = "# Papaya\n\n**Sweet** and `orange`", metadata = { { "Origin", "Mexico" }, { label = "Weight", value = 900 } } },
     } },
     { name = "echo", title = "Fixture Echo", search = function(q) return { "echo: " .. q } end },
     { name = "upper", title = "Fixture Upper", root = function(q)
@@ -392,6 +393,10 @@ expect "command lists its items" '^title: Fixture Fruits'
 expect "item with subtitle" '> Mango \| sweet'
 expect "items without icon wear the command's" 'Kiwi .*emoji:🧪'
 expect "detail pane shows the item's detail" 'text = a mango detail'
+L --command fixture.fruits --query papaya; sleep 0.3
+expect "markdown detail" 'text = Papaya'
+expect "metadata in the detail pane" 'Origin = Mexico'
+expect "metadata numbers read as text" 'Weight = 900'
 L --command fixture.fruits --query kiw; sleep 0.3
 expect "list commands filter as you type" '> Kiwi'
 expect_not "filtered out" 'Mango'

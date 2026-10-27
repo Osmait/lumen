@@ -16,6 +16,7 @@ const c = @import("c");
 const lua = @import("lua.zig");
 const api = @import("api.zig");
 const index = @import("index");
+const core = @import("core");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
 const themes = @import("../ui/themes.zig");
@@ -809,6 +810,13 @@ fn parseItem(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8, o
     _ = lua.getField(L, t, "icon");
     if (parseIcon(L, a, -1, where)) |icon| it.icon = icon;
     lua.c.lua_settop(L, -2);
+    if (lua.fieldString(L, a, t, "markdown", where)) |md| {
+        var out: std.Io.Writer.Allocating = .init(a);
+        core.markdown.toMarkup(&out.writer, md) catch lua.raise(L, "not enough memory", .{});
+        it.detail = out.written();
+        it.markup = true;
+    }
+    it.meta = metadata(L, a, t, where);
 
     if (lua.getField(L, t, "actions") == lua.c.LUA_TNIL) {
         lua.c.lua_settop(L, -2);
@@ -835,6 +843,47 @@ fn parseItem(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8, o
     lua.c.lua_settop(L, -2);
     it.action = .{ .ext_item = .{ .command = origin.command, .root = origin.root, .gen = origin.gen, .index = pos, .actions = actions, .entries = entries } };
     return it;
+}
+
+/// `metadata = { { "Label", "value" }, { label = "Size", value = 42 } }`:
+/// up to 4 pairs for the detail pane.
+fn metadata(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8) []const item_mod.Meta {
+    defer lua.c.lua_settop(L, -2);
+    switch (lua.getField(L, t, "metadata")) {
+        lua.c.LUA_TNIL => return &.{},
+        lua.c.LUA_TTABLE => {},
+        else => lua.raise(L, "{s}.metadata: a list expected, got {s}", .{ where, lua.typeName(L, -1) }),
+    }
+    const pairs = lua.absIndex(L, -1);
+    const n = @min(lua.c.lua_rawlen(L, pairs), max_meta);
+    const out = a.alloc(item_mod.Meta, n) catch lua.raise(L, "not enough memory", .{});
+    for (out, 1..) |*m, i| {
+        var wbuf: [48]u8 = undefined;
+        const mwhere = std.fmt.bufPrint(&wbuf, "{s}.metadata[{d}]", .{ where, i }) catch where;
+        if (lua.c.lua_rawgeti(L, pairs, @intCast(i)) != lua.c.LUA_TTABLE) lua.raise(L, "{s}: table expected", .{mwhere});
+        defer lua.c.lua_settop(L, -2);
+        const pair = lua.absIndex(L, -1);
+        m.* = .{
+            .label = lua.fieldString(L, a, pair, "label", mwhere) orelse pairPart(L, a, pair, 1, mwhere),
+            .value = lua.fieldString(L, a, pair, "value", mwhere) orelse pairPart(L, a, pair, 2, mwhere),
+        };
+    }
+    return out;
+}
+
+const max_meta = 4;
+
+/// `pair[i]` as text (numbers too).
+fn pairPart(L: *lua.State, a: std.mem.Allocator, pair: c_int, i: c_int, where: []const u8) [:0]const u8 {
+    defer lua.c.lua_settop(L, -2);
+    return switch (lua.c.lua_rawgeti(L, pair, i)) {
+        lua.c.LUA_TSTRING, lua.c.LUA_TNUMBER => blk: {
+            var len: usize = 0;
+            const p = lua.c.lua_tolstring(L, -1, &len);
+            break :blk a.dupeSentinel(u8, p[0..len], 0) catch lua.raise(L, "not enough memory", .{});
+        },
+        else => lua.raise(L, "{s}: {{ label, value }} expected", .{where}),
+    };
 }
 
 fn key(a: std.mem.Allocator, ext_id: []const u8, id: []const u8) []const u8 {

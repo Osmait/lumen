@@ -288,6 +288,11 @@ window.lumen {
   color: var(--fg);
   padding: 10px 14px;
 }
+/* An extension's markdown reads as prose; code spans keep the mono font. */
+.detail-text.markdown {
+  font-family: "Inter", sans-serif;
+  font-size: var(--font);
+}
 .preview {
   margin: 10px 14px 0 14px;
 }

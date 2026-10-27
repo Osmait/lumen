@@ -95,10 +95,27 @@ A row is a table, or just a string (a row with that title).
 | `icon` | See [Icons](#icons). Defaults to the command's icon. |
 | `keywords` | Also matched when Lumen filters (`items` commands). |
 | `detail` | Text for the detail pane (`detail = true` on the command). |
+| `markdown` | Instead of `detail`: formatted text (see below). |
+| `metadata` | Up to 4 `{ "Label", "value" }` pairs under the detail, in an *Information* block. |
 | `section` | Rows with the same section are grouped under it. |
 | `id` | Keeps the selection on this row when the list reloads (default: the title). |
 | `confirm` | `true`: the first action needs a second Enter. |
 | `actions` | Up to 9. Without any, Enter copies the title. |
+
+### Markdown in the detail pane
+
+`markdown` understands a small, safe subset: `#`, `##` and `###` headings,
+**bold**, *italic*, `` `code` ``, fenced code blocks, `-` and `1.` lists,
+`>` quotes, `---` rules and `[links](https://...)`. Anything else shows as
+typed.
+
+```lua
+{
+  title = "lumen",
+  markdown = "## lumen\n\nA fast launcher. **MIT** licensed.\n\n```\nzig build\n```",
+  metadata = { { "Stars", 120 }, { "Language", "Zig" } },
+}
+```
 
 ## Actions
 

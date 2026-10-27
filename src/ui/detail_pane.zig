@@ -44,6 +44,7 @@ pub fn buildDetail(ui: *Ui) void {
     const keys = [_][:0]const u8{ "Content type", "Characters", "Words", "Copied" };
     for (keys, 0..) |key, i| {
         const line = widgets.hbox(12);
+        ui.meta_lines[i] = line;
         ui.meta_keys[i] = widgets.label(key, "meta-key");
         c.gtk_box_append(@ptrCast(line), ui.meta_keys[i]);
         const spacer = widgets.hbox(0);
@@ -127,6 +128,32 @@ pub fn showFileDetail(ui: *Ui, it: *const Item) void {
 /// ~50 ms per frame (measured with `lumen --stats`).
 const preview_lines = 40;
 
+/// An extension row: its text or markdown, and up to 4 metadata pairs.
+fn showExtDetail(ui: *Ui, it: ?*const Item) void {
+    var arena: std.heap.ArenaAllocator = .init(ui.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const label: *c.GtkLabel = @ptrCast(ui.detail_text);
+    const markup = if (it) |i| i.markup else false;
+    if (markup) {
+        // Whole: cutting markup could leave a tag open.
+        c.gtk_label_set_markup(label, (a.dupeSentinel(u8, it.?.detail, 0) catch return).ptr);
+        c.gtk_widget_add_css_class(ui.detail_text, "markdown");
+    } else {
+        const text = if (it) |i| i.detail[0..@min(i.detail.len, 20_000)] else "";
+        c.gtk_label_set_text(label, (a.dupeSentinel(u8, labels.validUtf8Prefix(text), 0) catch return).ptr);
+        c.gtk_widget_remove_css_class(ui.detail_text, "markdown");
+    }
+    const meta = if (it) |i| i.meta else &.{};
+    c.gtk_widget_set_visible(ui.detail_meta, @intFromBool(meta.len > 0));
+    for (ui.meta_lines, ui.meta_keys, ui.meta_values, 0..) |line, k, v, i| {
+        c.gtk_widget_set_visible(line, @intFromBool(i < meta.len));
+        if (i >= meta.len) continue;
+        c.gtk_label_set_text(@ptrCast(k), meta[i].label.ptr);
+        c.gtk_label_set_text(@ptrCast(v), meta[i].value.ptr);
+    }
+}
+
 pub fn showDetail(ui: *Ui, it: ?*const Item) void {
     if (ui.view == .files or ui.view == .contents) {
         if (it) |i| if (i.action == .file) {
@@ -137,13 +164,7 @@ pub fn showDetail(ui: *Ui, it: ?*const Item) void {
         for (ui.meta_values) |v| c.gtk_label_set_text(@ptrCast(v), "");
         return;
     }
-    if (ui.view == .ext) {
-        var arena: std.heap.ArenaAllocator = .init(ui.gpa);
-        defer arena.deinit();
-        const text = if (it) |i| i.detail[0..@min(i.detail.len, 20_000)] else "";
-        c.gtk_label_set_text(@ptrCast(ui.detail_text), (arena.allocator().dupeSentinel(u8, labels.validUtf8Prefix(text), 0) catch return).ptr);
-        return;
-    }
+    if (ui.view == .ext) return showExtDetail(ui, it);
     if (ui.view != .clipboard) return;
     const i = it orelse {
         c.gtk_label_set_text(@ptrCast(ui.detail_text), "");

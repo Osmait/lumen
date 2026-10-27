@@ -28,6 +28,8 @@ All notable changes are listed here. The format follows
 - Icons named without `-symbolic` show in full colour.
 - `root = function(query)` on a command: its rows show in the main search,
   asked for on every query and never waited for.
+- Rows can carry `markdown` (a safe subset, rendered in the detail pane) and
+  up to 4 `metadata` pairs.
 - Example extensions: GitHub (through `gh`), processes, hello.
 
 ## [0.1.0] - 2026-10-26

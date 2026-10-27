@@ -88,6 +88,8 @@ pub const Action = union(enum) {
     pick: struct { index: u32, selectable: bool },
 };
 
+pub const Meta = struct { label: [:0]const u8, value: [:0]const u8 };
+
 pub const ExtItem = struct {
     /// The extension command that listed it (index in the registry), and
     /// whether in its list or in the root search.
@@ -152,6 +154,10 @@ pub const Item = struct {
     confirm: bool = false,
     /// Full text for the detail pane / the value to copy.
     detail: []const u8 = "",
+    /// `detail` is Pango markup (an extension's markdown).
+    markup: bool = false,
+    /// Label and value pairs for the detail pane's Information block.
+    meta: []const Meta = &.{},
     /// Shown only in the detail pane: the folder, and a short fact (e.g.
     /// "line 58 · 10 matches"), when the list row has no room for them.
     where: [:0]const u8 = "",

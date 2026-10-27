@@ -89,6 +89,8 @@ detail_picture: *c.GtkWidget = undefined,
 /// The "Information" block under the preview (hidden for extensions).
 detail_meta: *c.GtkWidget = undefined,
 meta_keys: [4]*c.GtkWidget = undefined,
+/// The rows of the Information block (extensions show as many as they give).
+meta_lines: [4]*c.GtkWidget = undefined,
 meta_values: [4]*c.GtkWidget = undefined,
 /// File index, started by main once the window exists.
 files: ?*index.Service = null,
@@ -676,6 +678,7 @@ pub fn setView(self: *Ui, view: View) void {
     const has_detail = view == .clipboard or view == .files or view == .contents or
         (view == .ext and if (ext_view.command(self)) |cmd| cmd.detail else false);
     c.gtk_widget_set_visible(self.detail_meta, @intFromBool(view != .ext));
+    for (self.meta_lines) |l| c.gtk_widget_set_visible(l, 1);
     c.gtk_widget_set_visible(self.back, @intFromBool(view != .root));
     c.gtk_widget_set_visible(self.detail, @intFromBool(has_detail));
     // A preview needs room: the results take the full height then.
@@ -1304,11 +1307,15 @@ pub fn dump(self: *Ui, gpa: std.mem.Allocator) (std.Io.Writer.Error || std.mem.A
     }
     if (c.gtk_widget_get_visible(self.detail) != 0) {
         try w.print("detail:\n", .{});
-        if (c.gtk_widget_get_visible(self.detail_meta) != 0) {
-            for (self.meta_keys, self.meta_values) |k, v| try w.print("  {s} = {s}\n", .{ c.gtk_label_get_text(@ptrCast(k)), c.gtk_label_get_text(@ptrCast(v)) });
-        } else {
+        if (self.view == .ext) {
             const text = std.mem.span(c.gtk_label_get_text(@ptrCast(self.detail_text)));
             try w.print("  text = {s}\n", .{text[0 .. std.mem.findScalar(u8, text, '\n') orelse text.len]});
+        }
+        if (c.gtk_widget_get_visible(self.detail_meta) != 0) {
+            for (self.meta_lines, self.meta_keys, self.meta_values) |l, k, v| {
+                if (c.gtk_widget_get_visible(l) == 0) continue;
+                try w.print("  {s} = {s}\n", .{ c.gtk_label_get_text(@ptrCast(k)), c.gtk_label_get_text(@ptrCast(v)) });
+            }
         }
     }
     if (self.panel_open) {

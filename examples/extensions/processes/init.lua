@@ -13,7 +13,12 @@ local function processes()
         subtitle = "PID " .. pid .. " · " .. cpu .. "% CPU",
         accessory = string.format("%.0f MB", rss / 1024),
         keywords = args,
-        detail = args,
+        markdown = "**" .. name .. "**\n\n```\n" .. args .. "\n```",
+        metadata = {
+          { "PID", pid },
+          { "Memory", string.format("%.1f MB", rss / 1024) },
+          { "CPU", cpu .. "%" },
+        },
         -- Quitting needs a second Enter.
         confirm = true,
         actions = {
