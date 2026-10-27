@@ -439,3 +439,5 @@ pub const GUnixFDSourceFunc = *const fn (fd: c_int, condition: c_uint, data: ?*a
 pub extern fn g_unix_fd_add(fd: c_int, condition: c_uint, function: GUnixFDSourceFunc, data: ?*anyopaque) c_uint;
 pub extern fn gtk_widget_realize(w: *GtkWidget) void;
 pub extern fn gtk_widget_measure(w: *GtkWidget, orientation: c_int, for_size: c_int, minimum: ?*c_int, natural: ?*c_int, minimum_baseline: ?*c_int, natural_baseline: ?*c_int) void;
+pub extern fn g_source_remove(id: c_uint) gboolean;
+pub extern fn gdk_display_flush(display: *GdkDisplay) void;

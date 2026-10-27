@@ -84,6 +84,8 @@ io: std.Io,
 app: *c.GtkApplication,
 db: Db,
 apps: Apps,
+/// Coalesces the app monitor's bursts (onAppsChanged).
+apps_reload_timer: c_uint = 0,
 
 window: *c.GtkWidget = undefined,
 /// The search bar and the results, sized by the layout settings.
@@ -829,6 +831,8 @@ pub fn prewarm(self: *Ui) void {
 }
 
 pub fn hide(self: *Ui) void {
+    // Window actions wait for Hyprland to give the focus back.
+    hypr.sendAfterHide();
     dmenu.finish(self, null);
     // A theme previewed but not chosen.
     if (self.view == .themes) self.applyAppearance(null);
@@ -905,6 +909,8 @@ pub fn rebuild(self: *Ui) void {
     _ = self.data_arena.reset(.retain_capacity);
     self.base = self.loadBase(self.data_arena.allocator());
     self.refresh();
+    // Nothing points into the app lists a reload replaced any more.
+    self.apps.dropStale();
 }
 
 fn loadBase(self: *Ui, a: std.mem.Allocator) []Item {
@@ -1008,6 +1014,8 @@ pub fn setView(self: *Ui, view: View) void {
 
     // Setting the text triggers `changed`, which refreshes.
     if (c.gtk_editable_get_text(@ptrCast(self.entry))[0] == 0) self.refresh() else c.gtk_editable_set_text(@ptrCast(self.entry), "");
+    // The rows are this base's now: nothing points into replaced app lists.
+    self.apps.dropStale();
 }
 
 fn rootCandidates(self: *Ui, a: std.mem.Allocator) []Item {
@@ -1607,10 +1615,22 @@ fn onBackClicked(_: *c.GtkEventController, _: c_int, _: f64, _: f64, data: ?*any
     _ = c.gtk_widget_grab_focus(self.entry);
 }
 
+/// An install or update changes many .desktop files: one reload (~5 ms of
+/// parsing) for the burst. Hidden, the next show builds its view anew.
 fn onAppsChanged(_: *c.GAppInfoMonitor, data: ?*anyopaque) callconv(.c) void {
     const self: *Ui = @ptrCast(@alignCast(data));
+    if (self.apps_reload_timer == 0) self.apps_reload_timer = c.g_timeout_add(500, &reloadApps, self);
+}
+
+fn reloadApps(data: ?*anyopaque) callconv(.c) c.gboolean {
+    const self: *Ui = @ptrCast(@alignCast(data));
+    self.apps_reload_timer = 0;
     self.apps.reload();
-    if (self.view == .root) self.setView(.root);
+    if (c.gtk_widget_get_visible(self.window) != 0) {
+        if (self.selectedItem()) |it| self.setReselect("{s}", .{it.key});
+        self.rebuild();
+    }
+    return 0;
 }
 
 fn onKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, state: c.GdkModifierType, data: ?*anyopaque) callconv(.c) c.gboolean {

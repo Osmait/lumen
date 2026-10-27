@@ -51,6 +51,19 @@ All notable changes are listed here. The format follows
   of ~58 ms, and each copy
   into the clipboard history no longer starts a GTK process. Install both
   files (see the README).
+- Pasting (clipboard history, calculator) sends the keys as soon as
+  Hyprland gives the focus back (~2 ms) instead of after a fixed 120 ms.
+- Window actions go through Hyprland's socket instead of starting
+  `hyprctl`, once the focus is back from Lumen's window.
+- The name index no longer rescans every 10 minutes when something changed
+  (it always did: caches change all the time), which wrote 49 MB and took
+  ~1 s of CPU each time; it still rescans on start.
+- The daemon uses glibc's allocator in release builds (Zig's default there
+  is a checking allocator that maps every allocation of 6 KB or more), and
+  no 256 KB signal stack in every thread: 7 MB less memory.
+- Fixed: an app installed or updated while the windows or Open With view
+  was open could leave it pointing at freed icons. App reloads are also
+  coalesced (one per burst of changes).
 - Checking the content index for changes no longer lists every file with
   ripgrep when the name index saw no new, deleted or moved files outside
   hidden folders: it looks at the indexed files only (75 ms on one core

@@ -9,25 +9,50 @@ const Apps = @This();
 
 const log = std.log.scoped(.apps);
 
+gpa: std.mem.Allocator,
 arena: std.heap.ArenaAllocator,
 list: ?*c.GList = null,
 items: []Item = &.{},
+/// Lists replaced by `reload` that views may still point into (their items'
+/// strings, GAppInfo and GIcon pointers): freed by `dropStale` once every
+/// view's items were built again.
+stale: std.ArrayList(Generation) = .empty,
+
+const Generation = struct { arena: std.heap.ArenaAllocator, list: ?*c.GList };
 
 pub fn init(gpa: std.mem.Allocator) Apps {
-    return .{ .arena = .init(gpa) };
+    return .{ .gpa = gpa, .arena = .init(gpa) };
 }
 
 pub fn deinit(self: *Apps) void {
+    self.dropStale();
+    self.stale.deinit(self.gpa);
     if (self.list) |l| c.g_list_free_full(l, &c.g_object_unref);
     self.arena.deinit();
     self.* = undefined;
 }
 
-/// Reads the installed apps again. Invalidates earlier `items` and the
-/// GAppInfo pointers in them.
+/// Frees the lists `reload` replaced; call once nothing points into them.
+pub fn dropStale(self: *Apps) void {
+    for (self.stale.items) |*g| {
+        if (g.list) |l| c.g_list_free_full(l, &c.g_object_unref);
+        g.arena.deinit();
+    }
+    self.stale.clearRetainingCapacity();
+}
+
+/// Reads the installed apps again. Earlier `items` and the GAppInfo
+/// pointers in them stay valid until `dropStale`.
 pub fn reload(self: *Apps) void {
-    if (self.list) |l| c.g_list_free_full(l, &c.g_object_unref);
-    _ = self.arena.reset(.retain_capacity);
+    if (self.list != null or self.items.len > 0) {
+        if (self.stale.append(self.gpa, .{ .arena = self.arena, .list = self.list })) {
+            self.arena = .init(self.gpa);
+        } else |_| {
+            // No room to keep them: free now, as before (rare and racy).
+            if (self.list) |l| c.g_list_free_full(l, &c.g_object_unref);
+            _ = self.arena.reset(.retain_capacity);
+        }
+    }
     self.list = c.g_app_info_get_all();
     const a = self.arena.allocator();
 

@@ -66,20 +66,35 @@ fn query(arena: std.mem.Allocator, comptime T: type, what: [:0]const u8) ?T {
 /// show asks for the focused monitor, and starting hyprctl for it took ~4 ms
 /// against 0.04. Null when the socket cannot be reached.
 fn request(arena: std.mem.Allocator, what: []const u8) ?[]const u8 {
+    var msg_buf: [64]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, "j/{s}", .{what}) catch return null;
+    return talk(arena, msg);
+}
+
+/// Connects to one of Hyprland's sockets (".socket.sock" for requests,
+/// ".socket2.sock" for events); null without Hyprland.
+fn connect(which: []const u8, flags: u32) ?linux.fd_t {
     const sig = std.mem.span(c.g_getenv("HYPRLAND_INSTANCE_SIGNATURE") orelse return null);
     const rt = std.mem.span(c.g_getenv("XDG_RUNTIME_DIR") orelse return null);
     var addr: linux.sockaddr.un = .{ .path = @splat(0) };
-    _ = std.fmt.bufPrint(addr.path[0 .. addr.path.len - 1], "{s}/hypr/{s}/.socket.sock", .{ rt, sig }) catch return null;
-    const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    _ = std.fmt.bufPrint(addr.path[0 .. addr.path.len - 1], "{s}/hypr/{s}/{s}", .{ rt, sig, which }) catch return null;
+    const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC | flags, 0);
     if (linux.errno(rc) != .SUCCESS) return null;
     const fd: linux.fd_t = @intCast(rc);
+    if (linux.errno(linux.connect(fd, &addr, @sizeOf(linux.sockaddr.un))) != .SUCCESS) {
+        _ = linux.close(fd);
+        return null;
+    }
+    return fd;
+}
+
+/// Sends `msg` to the request socket and reads the whole answer.
+fn talk(arena: std.mem.Allocator, msg: []const u8) ?[]const u8 {
+    const fd = connect(".socket.sock", 0) orelse return null;
     defer _ = linux.close(fd);
     // A compositor that does not answer must not freeze the window.
     const timeout: linux.timeval = .{ .sec = 1, .usec = 0 };
     _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO, @ptrCast(&timeout), @sizeOf(linux.timeval));
-    if (linux.errno(linux.connect(fd, &addr, @sizeOf(linux.sockaddr.un))) != .SUCCESS) return null;
-    var msg_buf: [64]u8 = undefined;
-    const msg = std.fmt.bufPrint(&msg_buf, "j/{s}", .{what}) catch return null;
     if (linux.errno(linux.write(fd, msg.ptr, msg.len)) != .SUCCESS) return null;
     var out: std.ArrayList(u8) = .empty;
     while (true) {
@@ -160,10 +175,140 @@ pub fn batchString(gpa: std.mem.Allocator, commands: []const []const u8) std.mem
     return cmd.toOwnedSliceSentinel(gpa, 0);
 }
 
+/// Dispatches waiting for the window to hide: sent before Hyprland gave the
+/// focus back from Lumen's layer, a `focuswindow` is undone by that (seen:
+/// the focus stayed put). Sent once the focus is back (`sendAfterHide`).
+/// Starting hyprctl for them took ~4 ms; the socket, ~0.05.
+var queued_buf: [8192]u8 = undefined;
+var queued_len: usize = 0;
+var queued_idle: c_uint = 0;
+
 pub fn batch(gpa: std.mem.Allocator, commands: []const []const u8) void {
-    const z = batchString(gpa, commands) catch return;
-    defer gpa.free(z);
+    var w: std.Io.Writer = .fixed(queued_buf[queued_len..]);
+    const ok = blk: {
+        for (commands) |command| {
+            w.writeAll(if (queued_len + w.end == 0) "[[BATCH]]dispatch " else ";dispatch ") catch break :blk false;
+            w.writeAll(command) catch break :blk false;
+        }
+        break :blk true;
+    };
+    if (!ok) {
+        // Too long to queue: the old way.
+        const z = batchString(gpa, commands) catch return;
+        defer gpa.free(z);
+        proc.spawn(&.{ "hyprctl", "--batch", z });
+        return;
+    }
+    queued_len += w.end;
+    // Not every action hides the window.
+    if (queued_idle == 0) queued_idle = c.g_idle_add(&sendQueuedIdle, null);
+}
+
+fn sendQueuedIdle(_: ?*anyopaque) callconv(.c) c.gboolean {
+    queued_idle = 0;
+    sendQueued();
+    return 0;
+}
+
+/// Before the window hides: queued dispatches go once Hyprland has given
+/// the focus back (or after 60 ms). Listening starts now, so the event that
+/// the hide causes is not missed.
+pub fn sendAfterHide() void {
+    if (queued_len == 0) return;
+    if (queued_idle != 0) _ = c.g_source_remove(queued_idle);
+    queued_idle = 0;
+    afterFocusChange(&sendQueued, 60);
+}
+
+/// Sends what `batch` queued; hyprctl if the socket cannot be reached.
+pub fn sendQueued() void {
+    if (queued_len == 0) return;
+    const msg = queued_buf[0..queued_len];
+    queued_len = 0;
+    var buf: [4096]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    if (talk(fba.allocator(), msg) != null) return;
+    // "[[BATCH]]dispatch a;dispatch b" is what `hyprctl --batch` sends.
+    var zbuf: [8192]u8 = undefined;
+    const z = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{msg["[[BATCH]]".len..]}, 0) catch return;
     proc.spawn(&.{ "hyprctl", "--batch", z });
+}
+
+/// Calls `cb` once Hyprland gives a window the focus (`activewindow` on its
+/// event socket), else after `fallback_ms`: a paste right after Lumen hides
+/// waited a fixed 120 ms, and the focus is back in ~2.
+pub fn afterFocusChange(cb: *const fn () void, fallback_ms: c_uint) void {
+    for (focus_cbs[0..n_focus_cbs]) |x| if (x == cb) return;
+    if (n_focus_cbs == focus_cbs.len) return cb();
+    focus_cbs[n_focus_cbs] = cb;
+    n_focus_cbs += 1;
+    if (events_timer != 0) return; // already waiting: one event serves all
+    events_len = 0;
+    if (connect(".socket2.sock", linux.SOCK.NONBLOCK)) |fd| {
+        events_fd = fd;
+        events_watch = c.g_unix_fd_add(fd, c.G_IO_IN, &onEvents, null);
+    }
+    events_timer = c.g_timeout_add(fallback_ms, &onFallback, null);
+}
+
+var focus_cbs: [4]*const fn () void = undefined;
+var n_focus_cbs: usize = 0;
+var events_fd: linux.fd_t = -1;
+var events_watch: c_uint = 0;
+var events_timer: c_uint = 0;
+var events_buf: [4096]u8 = undefined;
+var events_len: usize = 0;
+
+fn stopWaiting() void {
+    if (events_watch != 0) _ = c.g_source_remove(events_watch);
+    if (events_timer != 0) _ = c.g_source_remove(events_timer);
+    if (events_fd >= 0) _ = linux.close(events_fd);
+    events_watch = 0;
+    events_timer = 0;
+    events_fd = -1;
+}
+
+fn fire() void {
+    stopWaiting();
+    const cbs = focus_cbs;
+    const n = n_focus_cbs;
+    n_focus_cbs = 0;
+    for (cbs[0..n]) |cb| cb();
+}
+
+fn onFallback(_: ?*anyopaque) callconv(.c) c.gboolean {
+    events_timer = 0;
+    fire();
+    return 0;
+}
+
+fn onEvents(fd: c_int, _: c_uint, _: ?*anyopaque) callconv(.c) c.gboolean {
+    while (true) {
+        if (events_len == events_buf.len) events_len = 0;
+        const n = linux.read(fd, events_buf[events_len..].ptr, events_buf.len - events_len);
+        if (linux.errno(n) != .SUCCESS or n == 0) break;
+        events_len += n;
+    }
+    if (focusEvent(events_buf[0..events_len])) {
+        // fire() removes this source: say so instead of removing it twice.
+        events_watch = 0;
+        fire();
+        return 0;
+    }
+    return 1;
+}
+
+/// Whether Hyprland's event text holds a focus change.
+fn focusEvent(text: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| if (std.mem.startsWith(u8, line, "activewindow>>")) return true;
+    return false;
+}
+
+test "a focus change among Hyprland's events" {
+    try std.testing.expect(focusEvent("closelayer>>lumen\nactivewindow>>kitty,~\n"));
+    try std.testing.expect(!focusEvent("closelayer>>lumen\nactivewindowv2>>5619ce\n"));
+    try std.testing.expect(!focusEvent("openlayer>>lumen\n"));
 }
 
 pub fn dispatch(gpa: std.mem.Allocator, command: []const u8) void {

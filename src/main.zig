@@ -12,6 +12,7 @@
 //!   lumen --clip-store  internal: `wl-paste --watch` hands a copy on stdin
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("c");
 const Db = @import("sys/Db.zig");
 const Ui = @import("ui/Ui.zig");
@@ -21,7 +22,12 @@ const Settings = @import("settings.zig").Settings;
 const ipc = @import("ipc.zig");
 const ipc_server = @import("sys/ipc_server.zig");
 
-pub const std_options: std.Options = .{ .log_level = .info };
+pub const std_options: std.Options = .{
+    .log_level = .info,
+    // A 256 KB alternate signal stack in every thread's TLS (GTK's, the
+    // driver's too: ~8 MB), only for stack traces on stack overflow.
+    .signal_stack_size = null,
+};
 
 const log = std.log.scoped(.main);
 
@@ -71,7 +77,11 @@ pub fn main(init: std.process.Init) !void {
     const app = c.gtk_application_new(app_id.ptr, flags);
     the_app = @ptrCast(app);
     defer c.g_object_unref(app);
-    var start: Start = .{ .gpa = init.gpa, .io = init.io };
+    // Zig's default in ReleaseSafe is a checking allocator over mmap (every
+    // allocation of 6 KB or more a fresh mapping); glibc's, tuned above, is
+    // what the measurements were made with. Debug builds keep the checks.
+    const gpa = if (builtin.mode == .debug) init.gpa else std.heap.c_allocator;
+    var start: Start = .{ .gpa = gpa, .io = init.io };
     Ui.connect(app, "startup", &onStartup, &start);
     Ui.connect(app, "command-line", &onCommandLine, null);
     Ui.connect(app, "shutdown", &onShutdown, null);

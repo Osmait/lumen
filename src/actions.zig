@@ -341,10 +341,15 @@ pub fn copy(text: []const u8) void {
     proc.pipeTo(&.{"wl-copy"}, text);
 }
 
-/// Copies, then sends Ctrl+V to whatever gets focus once the window hides.
+/// Copies, then sends Ctrl+V to whatever gets focus once the window hides:
+/// as soon as Hyprland says the focus moved (~2 ms), else after 120 ms.
 pub fn pasteText(text: []const u8) void {
     copy(text);
-    _ = c.g_timeout_add(120, &sendPaste, null);
+    hypr.afterFocusChange(&pasteNow, 120);
+}
+
+fn pasteNow() void {
+    _ = sendPaste(null);
 }
 
 /// Runs once Lumen has hidden and the previous window has focus again: that

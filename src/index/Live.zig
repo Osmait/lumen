@@ -27,9 +27,11 @@ const log = std.log.scoped(.files);
 
 const Live = @This();
 
-/// Flush to disk at least this often if something changed (covers crashes;
-/// a clean exit flushes anyway).
-pub const compact_interval_ns: u64 = 600 * std.time.ns_per_s;
+/// Flush to disk at least this often if something changed. Off: a home's
+/// caches change all the time, so it rescanned every 10 minutes (49 MB
+/// written, ~1 s of CPU, +54 MB while it ran) to cover a crash, which the
+/// rescan on every start covers anyway; a clean exit flushes.
+pub const compact_interval_ns: u64 = std.math.maxInt(u64);
 
 /// Distinguishes delta ids from base ids. inotify events arrive as (watch,
 /// name) and every watch must map to *some* entry; directories created after
@@ -517,7 +519,7 @@ pub fn needsCompaction(l: *const Live) bool {
     const graves = l.base.len() - l.base.liveLen();
     const lim = l.limits;
     if (l.delta.len() > lim.delta_max or (graves > lim.graves_min and graves > l.base.len() / lim.graves_div)) return true;
-    return l.dirty and sys.monotonicNs() - l.last_compact_ns >= lim.interval_ns;
+    return l.dirty and sys.monotonicNs() -| l.last_compact_ns >= lim.interval_ns;
 }
 
 /// Builds the replacement index without touching the current one: the
