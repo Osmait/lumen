@@ -69,6 +69,27 @@ pub const Keymap = struct {
     ext: [:0]const u8,
 };
 
+pub const PrefKind = enum { toggle, choice, text, password };
+
+/// A preference an extension declares; Settings edits it, Lua reads it as
+/// `lumen.preferences.<name>`.
+pub const Pref = struct {
+    /// The extension's id and title.
+    ext: [:0]const u8,
+    ext_title: [:0]const u8,
+    /// Where Settings writes the values: <data>/preferences.json.
+    file: [:0]const u8,
+    name: [:0]const u8,
+    title: [:0]const u8,
+    description: [:0]const u8,
+    kind: PrefKind,
+    /// As JSON would spell it for a toggle ("true"), else the text.
+    default: [:0]const u8,
+    choices: []const PrefChoice = &.{},
+};
+
+pub const PrefChoice = struct { value: [:0]const u8, label: [:0]const u8 };
+
 /// `lumen.set { width = "wide" }`: a setting init.lua fixes.
 pub const SettingOverride = struct {
     key: [:0]const u8,
@@ -87,6 +108,7 @@ pub const Registry = struct {
     themes: []const themes.Theme = &.{},
     keymaps: []const Keymap = &.{},
     settings: []const SettingOverride = &.{},
+    prefs: []const Pref = &.{},
     problems: []const Problem = &.{},
     arena: std.heap.ArenaAllocator,
 
@@ -143,6 +165,8 @@ pub const Ext = struct {
     host: *Host,
     id: [:0]const u8,
     dir: [:0]const u8,
+    /// Its storage and preferences: $XDG_DATA_HOME/lumen/extensions/<id>.
+    data: [:0]const u8,
     /// While its file runs: where `lumen.theme` and `lumen.keymap` go.
     load: ?*Load = null,
     /// The table its last list returned, for the rows' actions.
@@ -168,6 +192,7 @@ pub const Load = struct {
     themes: std.ArrayList(themes.Theme) = .empty,
     keymaps: std.ArrayList(Keymap) = .empty,
     settings: std.ArrayList(SettingOverride) = .empty,
+    prefs: std.ArrayList(Pref) = .empty,
     problems: std.ArrayList(Problem) = .empty,
 };
 
@@ -180,6 +205,8 @@ const ActReq = struct { registry: u32, command: u16, list_gen: u32, item: ?u32, 
 gpa: std.mem.Allocator,
 io: std.Io,
 config_dir: [:0]const u8,
+/// Where extensions keep data: <data_dir>/extensions/<id>.
+data_dir: [:0]const u8,
 cb: Callbacks,
 thread: std.Thread = undefined,
 lock: std.Io.Mutex = .init,
@@ -204,14 +231,17 @@ warena: std.heap.ArenaAllocator,
 
 pub const StartError = std.mem.Allocator.Error || std.Thread.SpawnError;
 
-/// Starts the worker; call `reload` to load the files. `config_dir` is
+/// Starts the worker; call `reload` to load the files. `config_dir`
+/// ($XDG_CONFIG_HOME/lumen) and `data_dir` ($XDG_DATA_HOME/lumen) are
 /// copied.
-pub fn start(gpa: std.mem.Allocator, io: std.Io, config_dir: []const u8, cb: Callbacks) StartError!*Host {
+pub fn start(gpa: std.mem.Allocator, io: std.Io, config_dir: []const u8, data_dir: []const u8, cb: Callbacks) StartError!*Host {
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
     const dir = try gpa.dupeSentinel(u8, config_dir, 0);
     errdefer gpa.free(dir);
-    h.* = .{ .gpa = gpa, .io = io, .config_dir = dir, .cb = cb, .warena = .init(gpa) };
+    const data = try gpa.dupeSentinel(u8, data_dir, 0);
+    errdefer gpa.free(data);
+    h.* = .{ .gpa = gpa, .io = io, .config_dir = dir, .data_dir = data, .cb = cb, .warena = .init(gpa) };
     h.thread = try std.Thread.spawn(.{}, run, .{h});
     h.thread.setName(io, "lm-ext") catch {};
     return h;
@@ -227,6 +257,7 @@ pub fn shutdown(h: *Host) void {
     h.exts.deinit(h.gpa);
     h.warena.deinit();
     h.gpa.free(h.config_dir);
+    h.gpa.free(h.data_dir);
     h.gpa.destroy(h);
 }
 
@@ -351,6 +382,7 @@ fn doReload(h: *Host) void {
     reg.themes = load.themes.items;
     reg.keymaps = load.keymaps.items;
     reg.settings = load.settings.items;
+    reg.prefs = load.prefs.items;
     reg.problems = load.problems.items;
     for (reg.problems) |p| log.warn("{s}: {s}", .{ p.ext, p.message });
     h.deliver(.{ .registry = reg });
@@ -398,13 +430,15 @@ fn loadFile(h: *Host, load: *Load, id: []const u8, dir: []const u8, path: [:0]co
         .host = h,
         .id = wa.dupeSentinel(u8, id, 0) catch "",
         .dir = wa.dupeSentinel(u8, dir, 0) catch "",
+        .data = std.fmt.allocPrintSentinel(wa, "{s}/extensions/{s}", .{ h.data_dir, id }, 0) catch "",
     };
+    index.sys.mkdirP(e.data);
     e.L = lua.newState(&e.budget) orelse {
         h.gpa.destroy(e);
         return problem(load, id, "out of memory");
     };
     // What this file adds is dropped again if it fails half-way.
-    const marks = .{ load.commands.items.len, load.wcmds.items.len, load.themes.items.len, load.keymaps.items.len, load.settings.items.len };
+    const marks = .{ load.commands.items.len, load.wcmds.items.len, load.themes.items.len, load.keymaps.items.len, load.settings.items.len, load.prefs.items.len };
     e.load = load;
     e.budget.deadline_ns = index.sys.monotonicNs() + load_budget_ns;
     var ctx: LoadCtx = .{ .e = e, .load = load, .path = path, .ext_index = @intCast(h.exts.items.len) };
@@ -417,6 +451,7 @@ fn loadFile(h: *Host, load: *Load, id: []const u8, dir: []const u8, path: [:0]co
     load.themes.shrinkRetainingCapacity(marks[2]);
     load.keymaps.shrinkRetainingCapacity(marks[3]);
     load.settings.shrinkRetainingCapacity(marks[4]);
+    load.prefs.shrinkRetainingCapacity(marks[5]);
     problem(load, id, err orelse "out of memory");
     lua.c.lua_close(e.L);
     h.gpa.destroy(e);
@@ -449,6 +484,20 @@ fn parseExtension(L: *lua.State, ctx: *LoadCtx, t: c_int) void {
     if (parseIcon(L, a, -1, "extension.icon")) |icon| default_icon = icon;
     lua.c.lua_settop(L, -2);
 
+    if (lua.getField(L, t, "preferences") == lua.c.LUA_TTABLE) {
+        const prefs = lua.absIndex(L, -1);
+        const n = lua.c.lua_rawlen(L, prefs);
+        for (1..n + 1) |i| {
+            var where_buf: [32]u8 = undefined;
+            const where = std.fmt.bufPrint(&where_buf, "preferences[{d}]", .{i}) catch "preferences";
+            if (lua.c.lua_rawgeti(L, prefs, @intCast(i)) != lua.c.LUA_TTABLE)
+                lua.raise(L, "{s}: table expected, got {s}", .{ where, lua.typeName(L, -1) });
+            parsePref(L, ctx, lua.absIndex(L, -1), where, title);
+            lua.c.lua_settop(L, -2);
+        }
+    } else if (lua.c.lua_type(L, -1) != lua.c.LUA_TNIL) lua.raise(L, "extension.preferences: a list expected, got {s}", .{lua.typeName(L, -1)});
+    lua.c.lua_settop(L, -2);
+
     if (lua.getField(L, t, "commands") != lua.c.LUA_TTABLE)
         lua.raise(L, "extension.commands: a list of commands expected, got {s}", .{lua.typeName(L, -1)});
     const cmds = lua.absIndex(L, -1);
@@ -462,6 +511,52 @@ fn parseExtension(L: *lua.State, ctx: *LoadCtx, t: c_int) void {
         lua.c.lua_settop(L, -2);
     }
     lua.c.lua_settop(L, -2);
+}
+
+fn parsePref(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_title: [:0]const u8) void {
+    const a = ctx.load.a;
+    const name = lua.fieldString(L, a, t, "name", where) orelse lua.raise(L, "{s}.name is missing", .{where});
+    if (!validId(name)) lua.raise(L, "{s}.name: use only a-z, 0-9, - and _ (got \"{s}\")", .{ where, name });
+    for (ctx.load.prefs.items) |p| if (std.mem.eql(u8, p.ext, ctx.e.id) and std.mem.eql(u8, p.name, name)) lua.raise(L, "two preferences named \"{s}\"", .{name});
+    const kind_name = lua.fieldString(L, a, t, "type", where) orelse "text";
+    const kind = std.meta.stringToEnum(PrefKind, kind_name) orelse
+        lua.raise(L, "{s}.type: toggle, choice, text or password (got \"{s}\")", .{ where, kind_name });
+    var pref: Pref = .{
+        .ext = ctx.e.id,
+        .ext_title = ext_title,
+        .file = std.fmt.allocPrintSentinel(a, "{s}/preferences.json", .{ctx.e.data}, 0) catch lua.raise(L, "not enough memory", .{}),
+        .name = name,
+        .title = lua.fieldString(L, a, t, "title", where) orelse name,
+        .description = lua.fieldString(L, a, t, "description", where) orelse "",
+        .kind = kind,
+        .default = "",
+    };
+    if (kind == .choice) {
+        if (lua.getField(L, t, "choices") != lua.c.LUA_TTABLE) lua.raise(L, "{s}.choices: a list expected for a choice", .{where});
+        const choice_list = lua.absIndex(L, -1);
+        const n = lua.c.lua_rawlen(L, choice_list);
+        if (n == 0) lua.raise(L, "{s}.choices is empty", .{where});
+        const choices = a.alloc(PrefChoice, n) catch lua.raise(L, "not enough memory", .{});
+        for (choices, 1..) |*ch, i| {
+            _ = lua.c.lua_rawgeti(L, choice_list, @intCast(i));
+            defer lua.c.lua_settop(L, -2);
+            if (lua.toSlice(L, -1)) |s| {
+                const v = a.dupeSentinel(u8, s, 0) catch lua.raise(L, "not enough memory", .{});
+                ch.* = .{ .value = v, .label = v };
+            } else if (lua.c.lua_type(L, -1) == lua.c.LUA_TTABLE) {
+                const v = lua.fieldString(L, a, -1, "value", where) orelse lua.raise(L, "{s}.choices[{d}].value is missing", .{ where, i });
+                ch.* = .{ .value = v, .label = lua.fieldString(L, a, -1, "title", where) orelse v };
+            } else lua.raise(L, "{s}.choices[{d}]: string or table expected", .{ where, i });
+        }
+        lua.c.lua_settop(L, -2);
+        pref.choices = choices;
+    }
+    pref.default = switch (kind) {
+        .toggle => if (lua.fieldBool(L, t, "default", false, where)) "true" else "false",
+        .choice => lua.fieldString(L, a, t, "default", where) orelse pref.choices[0].value,
+        .text, .password => lua.fieldString(L, a, t, "default", where) orelse "",
+    };
+    ctx.load.prefs.append(a, pref) catch lua.raise(L, "not enough memory", .{});
 }
 
 fn parseCommand(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_title: [:0]const u8, default_icon: item_mod.Icon) void {
@@ -909,7 +1004,9 @@ fn writeTestFile(dir: []const u8, name: []const u8, data: []const u8) !void {
 }
 
 fn testHost(probe: *Probe, dir: []const u8) !*Host {
-    return start(testing.allocator, testing.io, dir, .{ .ctx = probe, .registry = &Probe.onRegistry, .list = &Probe.onList, .act = &Probe.onAct });
+    var buf: [4096]u8 = undefined;
+    const data = try std.fmt.bufPrint(&buf, "{s}/data", .{dir});
+    return start(testing.allocator, testing.io, dir, data, .{ .ctx = probe, .registry = &Probe.onRegistry, .list = &Probe.onList, .act = &Probe.onAct });
 }
 
 test "extensions load, list, search and run actions" {
@@ -1083,4 +1180,68 @@ test "errors in extensions come back as messages" {
     const badret = try probe.take("act");
     defer badret.destroy(testing.allocator);
     try testing.expect(std.mem.find(u8, badret.err.?, "must return") != null);
+}
+
+test "preferences read Settings' file over their defaults; storage persists" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dbuf: [4096]u8 = undefined;
+    const dir = try index.sys.tmpDirPath(&tmp, &dbuf);
+    try writeTestFile(dir, "extensions/kv/init.lua",
+        \\return lumen.extension {
+        \\  preferences = {
+        \\    { name = "who", title = "Who", type = "text", default = "nobody" },
+        \\    { name = "loud", title = "Loud", type = "toggle" },
+        \\    { name = "size", title = "Size", type = "choice", choices = { "s", { value = "m", title = "Medium" } } },
+        \\  },
+        \\  commands = {
+        \\    { name = "show", title = "Show", items = function()
+        \\        local ok = pcall(function() lumen.preferences.who = "x" end)
+        \\        return { lumen.preferences.who, tostring(lumen.preferences.loud), lumen.preferences.size,
+        \\                 tostring(lumen.storage.get("count")), tostring(ok) }
+        \\    end },
+        \\    { name = "bump", title = "Bump", run = function()
+        \\        lumen.storage.set("count", (lumen.storage.get("count") or 0) + 1)
+        \\    end },
+        \\  },
+        \\}
+    );
+    // What Settings writes.
+    try writeTestFile(dir, "data/extensions/kv/preferences.json", "{\"loud\": true}");
+
+    var probe: Probe = .{};
+    defer probe.deinit();
+    const h = try testHost(&probe, dir);
+    defer h.shutdown();
+    h.reload();
+    try probe.wait("reg");
+    const reg = probe.reg.?;
+    try testing.expectEqual(@as(usize, 3), reg.prefs.len);
+    try testing.expectEqual(PrefKind.toggle, reg.prefs[1].kind);
+    try testing.expectEqualStrings("false", reg.prefs[1].default);
+    try testing.expectEqualStrings("s", reg.prefs[2].default);
+    try testing.expectEqualStrings("Medium", reg.prefs[2].choices[1].label);
+    try testing.expect(std.mem.endsWith(u8, reg.prefs[0].file, "data/extensions/kv/preferences.json"));
+
+    _ = h.list(reg.gen, 0, "");
+    const before = try probe.take("res");
+    defer before.destroy(testing.allocator);
+    const want = [_][]const u8{ "nobody", "true", "s", "nil", "false" };
+    try testing.expect(before.err == null);
+    for (want, before.items) |w, it| try testing.expectEqualStrings(w, it.title);
+
+    _ = h.act(reg.gen, 1, 0, null, 0);
+    (try probe.take("act")).destroy(testing.allocator);
+    _ = h.act(reg.gen, 1, 0, null, 0);
+    (try probe.take("act")).destroy(testing.allocator);
+    // Storage outlives a reload (a new Lua state reads the file).
+    probe.reg = null;
+    defer reg.destroy(testing.allocator);
+    h.reload();
+    try probe.wait("reg");
+    const reg2 = probe.reg.?;
+    _ = h.list(reg2.gen, 0, "");
+    const after = try probe.take("res");
+    defer after.destroy(testing.allocator);
+    try testing.expectEqualStrings("2", after.items[3].title);
 }

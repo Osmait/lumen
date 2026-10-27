@@ -15,6 +15,7 @@ const Settings = settings_mod.Settings;
 const themes = @import("themes.zig");
 const Kind = core.file_kind.Kind;
 const Ui = @import("Ui.zig");
+const prefs_view = @import("prefs_view.zig");
 
 const log = std.log.scoped(.ui);
 const labels = @import("labels.zig");
@@ -66,6 +67,7 @@ pub fn settingsCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
     out.append(a, S.row(a, .{ .section = "Apps", .name = "default_apps", .title = "Default Apps", .value = defaultAppsSummary(ui, a), .icon = "applications-system-symbolic", .color = .blue, .action = .{ .go = .default_apps }, .keywords = "open with file types associations mime" })) catch {};
     out.append(a, S.row(a, .{ .section = "Apps", .name = "terminal", .title = "Terminal", .value = choiceLabel(ui, a, .terminal), .icon = "utilities-terminal-symbolic", .color = .blue, .action = choose(.terminal), .keywords = "console shell emulator" })) catch {};
     out.append(a, S.row(a, .{ .section = "Apps", .name = "editor", .title = "Editor for Open at Line", .value = choiceLabel(ui, a, .editor), .icon = "accessories-text-editor-symbolic", .color = .blue, .action = choose(.editor), .keywords = "code vim nvim" })) catch {};
+    prefs_view.extensionRows(ui, a, &out);
     var file_item = S.row(a, .{ .section = "Lumen", .name = "open_file", .title = "Open Settings File", .value = "", .icon = "document-edit-symbolic", .color = .gray, .action = .open_file, .keywords = "config edit text" });
     file_item.subtitle = labels.homeRelative(a, ui.settings_path);
     out.append(a, file_item) catch {};
@@ -156,6 +158,7 @@ pub fn setChoosing(ui: *Ui, next: Ui.Choosing) void {
         .setting => |ch| w.writeAll(chooseTitle(ch)) catch {},
         .kind => |k| w.print("Open {s} With", .{k.title()}) catch {},
         .file => |f| w.print("Open {s} With", .{std.Io.Dir.path.basename(f.path)}) catch {},
+        .pref => |i| if (ui.ext_registry) |reg| if (i < reg.prefs.len) w.writeAll(reg.prefs[i].title) catch {},
     }
     const n = labels.validUtf8Prefix(w.buffered()).len;
     ui.choose_title[n] = 0;
@@ -180,6 +183,7 @@ pub fn chooseCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
         },
         .kind => |k| appOptions(ui, a, &out, k.sampleMime(), ui.settings.open_with.get(@tagName(k)), false),
         .file => |f| appOptions(ui, a, &out, f.mime, null, true),
+        .pref => |i| prefs_view.choiceCandidates(ui, a, &out, i),
     }
     return out.items;
 }
@@ -351,6 +355,7 @@ pub fn performSetting(ui: *Ui, s: item_mod.Setting, op: item_mod.Op) void {
                 if (ui.settings.setOpenWith(@tagName(k), v)) ui.saveSettings() else |err| log.warn("default app for {t}: {t}", .{ k, err });
                 ui.goBack();
             },
+            .pref => |i| prefs_view.pick(ui, i, v),
             else => {},
         },
         .go => |v| {
@@ -382,6 +387,9 @@ pub fn performSetting(ui: *Ui, s: item_mod.Setting, op: item_mod.Op) void {
             run.openFile(ui.actionCtx(), ui.settings_path, false);
             ui.hide();
         },
+        .ext_prefs => |id| prefs_view.open(ui, id),
+        .pref => |i| prefs_view.edit(ui, i),
+        .save_input => prefs_view.saveInput(ui),
         .reset => {
             ui.settings.deinit();
             ui.settings = Settings.init(ui.gpa);

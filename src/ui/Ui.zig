@@ -32,6 +32,7 @@ const backdrop = @import("backdrop.zig");
 const keyboard = @import("keyboard.zig");
 pub const ext_view = @import("ext_view.zig");
 pub const dmenu = @import("dmenu.zig");
+const prefs_view = @import("prefs_view.zig");
 const ExtHost = @import("../ext/Host.zig");
 const Kind = core.file_kind.Kind;
 
@@ -173,6 +174,11 @@ ext_asked: [256]u8 = undefined,
 ext_asked_len: usize = 0,
 /// The Lua action running (0: none); its answer decides what happens.
 ext_act_gen: u32 = 0,
+/// The extension whose preferences the prefs view lists.
+prefs_ext: [64]u8 = undefined,
+prefs_ext_len: usize = 0,
+/// The preference the input view edits (index in the registry).
+input_pref: u16 = 0,
 /// `lumen --dmenu` waiting for an answer.
 picker: ?*dmenu.Session = null,
 /// Search highlight colours of the theme, for Pango markup.
@@ -197,6 +203,8 @@ pub const Choosing = union(enum) {
     kind: Kind,
     /// Open With for one file; both strings are owned by `gpa`.
     file: struct { path: [:0]u8, mime: [:0]u8 },
+    /// A choice preference of an extension (index in the registry).
+    pref: u16,
 };
 
 /// `hint` shows the primary action while the row is selected, in place of
@@ -637,6 +645,8 @@ fn loadBase(self: *Ui, a: std.mem.Allocator) []Item {
         .ext => ext_view.base(self),
         // Filtered straight from the session's lines.
         .dmenu => &.{},
+        .prefs => prefs_view.candidates(self, a),
+        .input => prefs_view.inputCandidates(self, a),
     };
 }
 
@@ -653,6 +663,8 @@ pub fn setView(self: *Ui, view: View) void {
     self.confirm_key = "";
     _ = self.data_arena.reset(.retain_capacity);
     if (view == .ext) ext_view.enter(self);
+    // Passwords are typed unseen.
+    c.gtk_text_set_visibility(@ptrCast(self.entry), @intFromBool(!(view == .input and prefs_view.isPassword(self))));
     self.base = self.loadBase(self.data_arena.allocator());
 
     const has_detail = view == .clipboard or view == .files or view == .contents or
@@ -691,6 +703,8 @@ pub fn setView(self: *Ui, view: View) void {
         .choose => if (self.choosing == .setting) "Filter values..." else "Search apps...",
         .ext => ext_view.placeholder(self, &placeholder_buf),
         .dmenu => "Filter...",
+        .prefs => "Search preferences...",
+        .input => prefs_view.inputTitle(self),
     });
     c.gtk_label_set_text(@ptrCast(self.scope), self.viewTitle());
     c.gtk_widget_set_visible(self.scope, @intFromBool(view != .root));
@@ -807,6 +821,9 @@ pub fn refresh(self: *Ui) void {
         // Search commands are asked for `q`; list commands filter here.
         .ext => self.fillSectioned(a, if (ext_view.prepare(self, q)) q else ""),
         .dmenu => dmenu.fill(self, a, q),
+        .prefs => self.fillSectioned(a, q),
+        // What is typed is the value, not a filter.
+        .input => self.fillSectioned(a, ""),
     }
     const searching = self.view == .files or self.view == .contents;
     if (self.rows.items.len == 0 or (searching and self.items.items.len == 0)) {
@@ -1087,6 +1104,8 @@ fn viewTitle(self: *Ui) [*:0]const u8 {
         .choose => &self.choose_title,
         .ext => if (ext_view.command(self)) |cmd| cmd.title else "Extension",
         .dmenu => dmenu.title(self),
+        .prefs => prefs_view.title(self),
+        .input => prefs_view.inputTitle(self),
     };
 }
 

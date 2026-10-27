@@ -42,7 +42,8 @@ return lumen.extension {
 
 Open Lumen and type "greetings". [`examples/`](examples) has more: a GitHub
 extension (pull requests, issues and repositories through `gh`), a process
-list that can quit processes, and a sample `init.lua` and `style.css`.
+list that can quit processes, quick notes (storage and preferences), and a
+sample `init.lua` and `style.css`.
 
 ## Commands
 
@@ -116,6 +117,60 @@ Any action can instead be a Lua function:
 If it fails, the error shows on the row. A command's own `run` works the same
 way.
 
+## Preferences
+
+An extension can ask for settings: an API token, a folder, an option. They
+show in Lumen's Settings under *Extensions*, and the extension reads them from
+`lumen.preferences`:
+
+```lua
+return lumen.extension {
+  title = "Weather",
+  preferences = {
+    { name = "city", title = "City", type = "text", default = "Madrid" },
+    { name = "units", title = "Units", type = "choice",
+      choices = { { value = "metric", title = "Celsius" }, { value = "imperial", title = "Fahrenheit" } } },
+    { name = "token", title = "API Key", type = "password" },
+    { name = "details", title = "Show Details", type = "toggle", default = true },
+  },
+  commands = { ... uses lumen.preferences.city ... },
+}
+```
+
+| Field | |
+|---|---|
+| `name` | Required; the key in `lumen.preferences`. |
+| `title`, `description` | What Settings shows. |
+| `type` | `text` (the default), `password` (typed unseen), `choice` or `toggle`. |
+| `choices` | For `choice`: strings, or `{ value, title }` tables. |
+| `default` | Until it is set: `""`, `false`, or the first choice. |
+
+Toggles read as `true`/`false`, the rest as strings. `lumen.preferences` is
+read-only; changing a preference in Settings reloads the extension. Values are
+kept in `~/.local/share/lumen/extensions/<id>/preferences.json`.
+
+## Storage
+
+`lumen.storage` keeps values between runs and reloads, per extension:
+
+```lua
+local seen = lumen.storage.get("seen") or {}
+seen[#seen + 1] = id
+lumen.storage.set("seen", seen)
+```
+
+| | |
+|---|---|
+| `lumen.storage.get(key)` | The value, or nil. |
+| `lumen.storage.set(key, value)` | Saves it at once (anything `lumen.json.encode` takes). |
+| `lumen.storage.remove(key)` | |
+| `lumen.storage.all()` | A copy of everything. |
+
+Keys are strings. It is a JSON file written atomically, in
+`~/.local/share/lumen/extensions/<id>/storage.json`, so keep it to settings,
+lists and small caches, not megabytes. `lumen.data_dir` is that folder, for
+files of your own.
+
 ## Icons
 
 - An emoji: `icon = "🐙"`.
@@ -138,6 +193,9 @@ way.
 | `lumen.notify(title [, body])` | A desktop notification. |
 | `lumen.log(...)`, `print(...)` | To Lumen's log, tagged with the extension. |
 | `lumen.dir` | The extension's folder. |
+| `lumen.data_dir` | Its data folder (storage, preferences, your own files). |
+| `lumen.preferences` | Its [preferences](#preferences). |
+| `lumen.storage` | Its [storage](#storage). |
 | `lumen.id` | The extension's id (`"config"` for `init.lua`). |
 | `lumen.theme(spec)` | Adds a theme (see [init.lua](#initlua)). |
 | `lumen.keymap(keys, target)` | Adds a shortcut (see [init.lua](#initlua)). |

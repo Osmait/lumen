@@ -31,8 +31,9 @@ pub const Icon = union(enum) {
 };
 
 /// `ext`: the list of an extension command (which one is in the UI).
-/// `dmenu`: lines from `lumen --dmenu`.
-pub const View = enum { root, clipboard, windows, files, contents, settings, themes, default_apps, choose, ext, dmenu };
+/// `dmenu`: lines from `lumen --dmenu`. `prefs`: an extension's preferences;
+/// `input`: typing a preference's value.
+pub const View = enum { root, clipboard, windows, files, contents, settings, themes, default_apps, choose, ext, dmenu, prefs, input };
 
 pub const System = enum {
     lock,
@@ -125,6 +126,12 @@ pub const Setting = union(enum) {
     open_with: [:0]const u8,
     open_file,
     reset,
+    /// Opens an extension's preferences (its id).
+    ext_prefs: [:0]const u8,
+    /// Changes one preference (its index in the extension registry).
+    pref: u16,
+    /// Saves what was typed in the input view.
+    save_input,
 };
 
 pub const Item = struct {
@@ -240,6 +247,8 @@ pub fn actionsFor(item: *const Item) []const Entry {
             },
             .open_file => &.{.{ .label = "Open Settings File", .keys = "↵", .op = .run }},
             .reset => &.{.{ .label = "Reset All Settings", .keys = "↵", .op = .run }},
+            .ext_prefs, .pref => &.{.{ .label = "Change", .keys = "↵", .op = .run }},
+            .save_input => &.{.{ .label = "Save", .keys = "↵", .op = .run }},
         },
         .calc => &.{
             .{ .label = "Copy Answer", .keys = "↵", .op = .calc_copy },

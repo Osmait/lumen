@@ -29,6 +29,9 @@ pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
         // A dmenu caller is waiting: Esc answers "nothing" and hides.
         if (ui.view == .dmenu and ui.query().len == 0) {
             ui.hide();
+        } else if (ui.view == .input) {
+            // The text is the value being edited: Esc leaves it unsaved.
+            ui.goBack();
         } else if (ui.query().len > 0) {
             c.gtk_editable_set_text(@ptrCast(ui.entry), "");
         } else if (ui.view != .root) ui.goBack() else ui.hide();

@@ -22,6 +22,10 @@ All notable changes are listed here. The format follows
 - `lumen.set` in init.lua fixes settings; Settings shows them as set there.
 - `lumen --dmenu [--prompt TEXT]`: pick a line of stdin, like dmenu and
   `rofi -dmenu` (row icons and `meta` words included).
+- Extension preferences (text, password, choice, toggle), edited in Settings >
+  Extensions and read as `lumen.preferences`; `lumen.storage` keeps an
+  extension's data between runs.
+- Icons named without `-symbolic` show in full colour.
 - Example extensions: GitHub (through `gh`), processes, hello.
 
 ## [0.1.0] - 2026-10-26

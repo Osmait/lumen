@@ -32,7 +32,6 @@ pub fn install(L: *lua.State, e: *Host.Ext) void {
 
     c.lua_createtable(L, 0, 16);
     const funcs = [_]struct { [:0]const u8, c.lua_CFunction }{
-        .{ "extension", lua.wrap(extension) },
         .{ "exec", lua.wrap(execFn) },
         .{ "notify", lua.wrap(notify) },
         .{ "log", lua.wrap(logFn) },
@@ -44,6 +43,8 @@ pub fn install(L: *lua.State, e: *Host.Ext) void {
         c.lua_pushcclosure(L, f[1], 0);
         c.lua_setfield(L, -2, f[0].ptr);
     }
+    _ = c.lua_pushstring(L, e.data.ptr);
+    c.lua_setfield(L, -2, "data_dir");
     _ = c.lua_pushstring(L, e.dir.ptr);
     c.lua_setfield(L, -2, "dir");
     _ = c.lua_pushstring(L, e.id.ptr);
@@ -78,15 +79,81 @@ pub fn install(L: *lua.State, e: *Host.Ext) void {
 
     c.lua_pushcclosure(L, lua.wrap(logFn), 0);
     c.lua_setglobal(L, "print");
+
+    // The parts written in Lua: lumen.extension, preferences, storage.
+    if (c.luaL_loadbufferx(L, prelude.ptr, prelude.len, "=lumen", "t") != c.LUA_OK) _ = c.lua_error(L);
+    _ = c.lua_getglobal(L, "lumen");
+    c.lua_callk(L, 1, 0, 0, null);
 }
 
-/// `lumen.extension{ title, icon, commands = {...} }`: what init.lua
-/// returns. Checked when the file has run.
-fn extension(L: *lua.State) lua.Error!c_int {
-    try lua.argTable(L, 1, "lumen.extension");
-    c.lua_settop(L, 1);
-    return 1;
-}
+/// lumen.extension (it notes the preferences' defaults), lumen.preferences
+/// and lumen.storage. Both files live in the extension's data folder
+/// (lumen.data_dir): storage.json is the extension's, preferences.json is
+/// written by Settings.
+const prelude =
+    \\local lumen = ...
+    \\local function read_json(path)
+    \\  local f = io.open(path, "r")
+    \\  if not f then return {} end
+    \\  local text = f:read("a")
+    \\  f:close()
+    \\  local ok, value = pcall(lumen.json.decode, text)
+    \\  if ok and type(value) == "table" then return value end
+    \\  lumen.log("ignoring unreadable " .. path)
+    \\  return {}
+    \\end
+    \\
+    \\local defaults = {}
+    \\function lumen.extension(spec)
+    \\  if type(spec) ~= "table" then error("lumen.extension: a table expected", 2) end
+    \\  for _, p in ipairs(type(spec.preferences) == "table" and spec.preferences or {}) do
+    \\    if type(p) == "table" and type(p.name) == "string" then
+    \\      local d = p.default
+    \\      if d == nil and p.type == "toggle" then d = false end
+    \\      if d == nil and p.type == "choice" and type(p.choices) == "table" then
+    \\        local first = p.choices[1]
+    \\        d = type(first) == "table" and first.value or first
+    \\      end
+    \\      if d == nil then d = "" end
+    \\      defaults[p.name] = d
+    \\    end
+    \\  end
+    \\  return spec
+    \\end
+    \\
+    \\local saved
+    \\lumen.preferences = setmetatable({}, {
+    \\  __index = function(_, name)
+    \\    saved = saved or read_json(lumen.data_dir .. "/preferences.json")
+    \\    local v = saved[name]
+    \\    if v == nil then v = defaults[name] end
+    \\    return v
+    \\  end,
+    \\  __newindex = function() error("lumen.preferences is read-only: change them in Settings", 2) end,
+    \\})
+    \\
+    \\local storage, data = {}, nil
+    \\local function load() data = data or read_json(lumen.data_dir .. "/storage.json") return data end
+    \\local function save()
+    \\  local path = lumen.data_dir .. "/storage.json"
+    \\  local f = assert(io.open(path .. ".tmp", "w"))
+    \\  f:write(lumen.json.encode(data))
+    \\  f:close()
+    \\  assert(os.rename(path .. ".tmp", path))
+    \\end
+    \\local function check(key)
+    \\  if type(key) ~= "string" then error("lumen.storage: keys are strings, not " .. type(key), 3) end
+    \\end
+    \\function storage.get(key) check(key) return load()[key] end
+    \\function storage.set(key, value) check(key) load()[key] = value save() end
+    \\function storage.remove(key) check(key) load()[key] = nil save() end
+    \\function storage.all()
+    \\  local copy = {}
+    \\  for k, v in pairs(load()) do copy[k] = v end
+    \\  return copy
+    \\end
+    \\lumen.storage = storage
+;
 
 /// `lumen.exec(argv [, { stdin = "", timeout = seconds }])` returns
 /// stdout, exit code (nil when killed) and stderr; or nil and a message

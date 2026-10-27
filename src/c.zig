@@ -341,6 +341,7 @@ pub extern fn gtk_picture_set_content_fit(p: *GtkPicture, fit: c_int) void;
 
 pub extern fn gtk_text_new() *GtkWidget;
 pub extern fn gtk_text_set_placeholder_text(t: *GtkText, text: ?[*:0]const u8) void;
+pub extern fn gtk_text_set_visibility(t: *GtkText, visible: gboolean) void;
 pub extern fn gtk_editable_get_text(e: *GtkEditable) [*:0]const u8;
 pub extern fn gtk_editable_set_position(e: *GtkEditable, position: c_int) void;
 pub extern fn gtk_editable_set_text(e: *GtkEditable, text: [*:0]const u8) void;

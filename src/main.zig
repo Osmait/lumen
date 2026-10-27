@@ -144,6 +144,11 @@ fn onCommandLine(app: *c.GApplication, cmdline: *c.GApplicationCommandLine, _: ?
             defer ui.gpa.free(text);
             c.g_application_command_line_print(cmdline, "%s", text.ptr);
             return 0;
+        } else if (std.mem.eql(u8, a, "--text") and next != null) {
+            // Types into the search bar of the view shown (tests).
+            if (!ui_ready) return 1;
+            c.gtk_editable_set_text(@ptrCast(ui.entry), next.?);
+            return 0;
         } else if (std.mem.eql(u8, a, "--reload")) {
             if (!ui_ready) return 1;
             Ui.ext_view.reload(&ui);
@@ -199,7 +204,7 @@ fn onCommandLine(app: *c.GApplication, cmdline: *c.GApplicationCommandLine, _: ?
 }
 
 fn clientOnly(flag: []const u8) bool {
-    const flags = [_][]const u8{ "--dump", "--key", "--stats", "--hide", "--quit", "--reload", "--dmenu" };
+    const flags = [_][]const u8{ "--dump", "--key", "--text", "--stats", "--hide", "--quit", "--reload", "--dmenu" };
     for (flags) |f| if (std.mem.eql(u8, flag, f)) return true;
     return false;
 }

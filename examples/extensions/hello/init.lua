@@ -5,6 +5,10 @@ local lumen = require("lumen")
 return lumen.extension {
   title = "Hello",
   icon = "👋",
+  -- Settings > Extensions > Hello; read as lumen.preferences.name.
+  preferences = {
+    { name = "name", title = "Your Name", type = "text", description = "Used by What Time Is It" },
+  },
   commands = {
     -- A list: Lumen filters it as you type.
     {
@@ -49,7 +53,8 @@ return lumen.extension {
       title = "What Time Is It",
       icon = "🕒",
       run = function()
-        lumen.notify("It is " .. os.date("%H:%M"))
+        local name = lumen.preferences.name
+        lumen.notify("It is " .. os.date("%H:%M") .. (name ~= "" and ", " .. name or ""))
       end,
     },
   },

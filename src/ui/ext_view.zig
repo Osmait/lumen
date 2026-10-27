@@ -18,7 +18,9 @@ const log = std.log.scoped(.ext);
 /// Starts the extension thread and loads the files. Main thread, once the
 /// window exists.
 pub fn start(ui: *Ui) void {
-    ui.ext_host = Host.start(ui.gpa, ui.io, ui.config_dir, .{
+    var buf: [4096]u8 = undefined;
+    const data_dir = std.fmt.bufPrint(&buf, "{s}/lumen", .{std.mem.span(c.g_get_user_data_dir())}) catch return;
+    ui.ext_host = Host.start(ui.gpa, ui.io, ui.config_dir, data_dir, .{
         .ctx = ui,
         .registry = &onRegistry,
         .list = &onList,

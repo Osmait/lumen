@@ -73,6 +73,7 @@ cat >>"$H/.config/lumen/extensions/fixture/init.lua" <<'EOF'
 local lumen = require("lumen")
 return lumen.extension {
   title = "Fixture", icon = "🧪",
+  preferences = { { name = "loud", title = "Loud Fruit", type = "toggle" } },
   commands = {
     { name = "fruits", title = "Fixture Fruits", detail = true, items = {
         { title = "Mango", subtitle = "sweet", detail = "a mango detail", actions = {
@@ -401,6 +402,13 @@ L --key ctrl+g; sleep 0.3
 expect "keymap from init.lua opens a command" '^title: Fixture Fruits'
 query themes "e2e night"
 expect "theme from init.lua in Change Theme" 'E2E Night .*swatch:e2e-night'
+query settings "fixture"
+expect "extension preferences in Settings" '> Fixture \| .*1 setting'
+L --key enter; sleep 0.2
+expect "preferences view" '> Loud Fruit .*\| Off'
+L --key enter; sleep 0.5
+expect "toggling a preference" '> Loud Fruit .*\| On'
+grep -q '"loud": true' "$T/data/lumen/extensions/fixture/preferences.json" && ok "preference saved" || ko "preference saved" "$(cat "$T/data/lumen/extensions/fixture/preferences.json" 2>&1)"
 query settings "density"
 expect "lumen.set shows in Settings" 'Density \| Set in init.lua \| Compact'
 L --key enter; sleep 0.1
