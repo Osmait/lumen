@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Arch packages gtk4-layer-shell and every tool the tests call.
+    container: archlinux:latest
+    steps:
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm --needed git gtk4 gtk4-layer-shell sqlite \
+            ripgrep poppler unzip zip pkgconf gcc
+
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Format
+        run: zig fmt --check src build.zig
+
+      - name: Unit and integration tests
+        run: zig build test --summary all
+
+      - name: Release build
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Performance checks
+        # Shared runners are slower and noisier than a desktop.
+        env:
+          PERF_SCALE: "4"
+        run: zig build perf

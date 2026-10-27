@@ -1,0 +1,197 @@
+# How Lumen works
+
+Lumen is one process: a GTK4 application that starts hidden (`lumen
+--daemon`), keeps its indexes warm, and shows a gtk4-layer-shell window when
+`lumen` is called again (GApplication forwards the command line to the
+running instance).
+
+## Layout
+
+```
+src/main.zig      entry point: GApplication, command line, clipboard watcher
+src/core/         pure logic, unit tested: fuzzy matching, accent folding,
+                  calculator and units, frecency, window geometry, script headers
+src/index/        file index (std + Linux syscalls only): store, scan, search,
+                  live updates, service; content index: content, content_list,
+                  extract, ContentService
+src/sys/          SQLite store (Db.zig), process spawning (GLib), hyprctl
+src/providers/    apps (GIO), built-in commands, script commands
+src/ui/           the window: Ui.zig (state and flow), widgets, labels,
+                  settings_view, file_results, detail_pane, backdrop, keyboard,
+                  themes, the stylesheet
+src/actions.zig   what each action does to the system
+src/settings.zig  the settings file
+src/c.zig         hand-written GTK/GLib/gtk4-layer-shell bindings
+```
+
+`src/c.zig` declares only the C functions Lumen calls: Zig 0.16's
+translate-c could not parse GLib's headers. Zig 0.17's can, so the bindings
+could be generated now; they were kept by hand, with enum values checked
+against the installed headers. SQLite goes through translate-c
+(`src/sqlite.h`).
+
+## The window
+
+Two floating pieces on a clear layer-shell surface: the search bar and, under
+it, the results, as tall as their rows. While the window shows, a clear
+full-screen layer per monitor sits under it, so a click anywhere outside
+hides Lumen. The selected row is filled with the theme's accent and names
+what Enter does.
+
+Themes are a handful of colours (`src/ui/themes.zig`) turned into CSS
+variables in front of `style.css`. A test checks every theme's text contrast
+(WCAG) and that the stylesheet uses no variable a theme does not define.
+
+Settings live in `~/.config/lumen/settings.conf`, written atomically
+(temporary file, fsync, rename) and owner-only. Lumen reads it again when its
+window opens if the file's mtime (to the nanosecond), size or inode changed.
+A bad value falls back to its default and an unknown key is kept as it was.
+
+## File index
+
+`src/index/` keeps the names of everything under `$HOME`:
+
+- **One buffer, same format in RAM and on disk** (struct of arrays, paths as
+  name + parent id): start-up maps `~/.cache/lumen/files.idx`, then a rescan
+  always runs in the background (a saved index is a photo).
+- **Scan level by level** with raw `getdents64` (d_type, zero `stat`), each
+  level in parallel; parents end up sorted, so children are a binary search.
+- **Cascaded search**: incremental refinement → 64-bit character mask →
+  greedy cheap score with a per-chunk top-K → optimal alignment (fzf-style,
+  in `fine.zig`) on the finalists → recency (`statx`) on the head of the list
+  only.
+- **Live**: inotify watches armed in batches, deletes are a zeroed mask,
+  additions go to a small delta, rescans build unlocked on half the cores and
+  swap in microseconds. Events lost to an error or a queue overflow trigger a
+  rescan instead.
+- **Words and names**: spaces separate words (`cargo toml`), a name without
+  its extension counts as exact (`readme` → `README.md`), directories named
+  `*cache*` rank as noise, and after each rescan the heap copy is replaced by
+  a mapping of the saved file (reclaimable page cache).
+
+Measured on a 12-thread desktop, `$HOME` with 1.6 M entries:
+
+| | |
+|---|---|
+| full scan | 353 ms (4.6 M entries/s) |
+| map the saved index | 0.02 ms |
+| `c` / `ca` | 3.7 / 4.1 ms |
+| `cargo` / `cargo.toml` | 2.3 / 1.4 ms |
+| recall vs exhaustive | 100% |
+
+`zig build -Doptimize=ReleaseFast && zig-out/bin/lumen-find bench` measures
+your machine.
+
+## Content index
+
+`src/index/content.zig` answers "which files contain this text" without
+reading them all: ripgrep needs ~200 ms per query over a developer's home
+directory (2.8 s cold) and every core.
+
+- **What is indexed**: what `rg --files` lists under `$HOME` (honours
+  `.gitignore`, skips hidden files), minus package caches and build output,
+  text files up to 1 MB, plus PDFs (`pdftotext`) and docx/xlsx/pptx/odt/ods/odp
+  (`unzip` + XML to text, `extract.zig`). Extracted text is cached per
+  document version in `~/.cache/lumen/text/`; a document that cannot be
+  extracted is remembered, a passing failure (timeout, missing tool, memory)
+  is retried.
+- **Format**: one mapped file (`~/.cache/lumen/content.idx`): document table
+  (path, mtime, size) and segments of sorted trigram keys with varint-delta
+  posting lists. Building dedups each file's trigrams with a 16M-bit map and
+  radix-sorts (trigram, doc) pairs, closing a segment every 16 M pairs so
+  memory stays bounded.
+- **Query**: intersect the lists of every trigram of every word (shortest
+  first), then verify candidates by reading them, in parallel and in order of
+  what is known without I/O (recency, depth, file name), stopping once no
+  unread candidate can still enter the top 50. With several words, the exact
+  phrase ranks first. Queries run on a worker thread; the newest one wins.
+- **Freshness**: re-listing takes ~150 ms; on start, every 5 minutes and when
+  the window opens, changed (path, mtime, size) trigger a rebuild in the
+  background, swapped in under a lock.
+
+Measured on the same desktop: 43k files / 438 MB of text → 66 MB index, built
+in 0.9 s (first run with extraction of 274 documents: ~38 s, once); queries
+0.8–12 ms including verification. `zig-out/bin/lumen-find content`
+reproduces it.
+
+Every index file read from disk is validated before use (layout arithmetic is
+overflow-checked, parent chains are proven to end), and fuzz tests feed them
+garbage.
+
+## Measuring
+
+```sh
+lumen --stats                      # inside the daemon: latency to painted frame
+                                   # per view (p50/p95/max, search vs rows),
+                                   # heap, index sizes and build times
+tools/lumen-stats.sh               # + memory by kind of mapping, disk, CPU per
+                                   # named thread while idle, GPU (nvidia-smi)
+tools/lumen-stats.sh --scenario    # + drives the window (every view, x3) and
+                                   # measures CPU and GPU during it
+```
+
+Threads are named (`lm-search-N`, `lm-scan-N`, `lm-files`, `lm-content`) so
+CPU can be attributed. Latency is measured to GdkFrameClock's `after-paint`,
+so it includes GTK's layout and drawing, not only the search.
+
+What the measurements changed (12 threads, 1.06 M files and 43 k text
+documents indexed):
+
+| | before | after | what fixed it |
+|---|---|---|---|
+| RSS / private | 396 / 128 MB | 113 / 49 MB | fixed `M_MMAP_THRESHOLD` (glibc's dynamic threshold kept 133 MB of freed buffers), 4 malloc arenas, `malloc_trim` after rebuilds |
+| peak RSS | 704 MB | 245 MB | same |
+| CPU, 13 s of typing | 6.9 s | 2.35 s | content verification below |
+| contents, search p50 | 106 ms | 5 ms | SIMD case-insensitive scan, stop counting at 10 hits, tight early-stop bound, map extracted texts instead of reading them |
+| contents, key to frame p50 | 131 ms | 18 ms | previews clip long lines instead of wrapping |
+| files, key to frame p50 | 73 ms | 23 ms | preview capped at 40 lines, no wrapping |
+| CPU idle | 0 % | 0 % | nothing polls: inotify and futex waits |
+| GPU | | ~10 MiB VRAM while shown, none hidden | |
+
+## Edge cases
+
+Search ignores accents and case in all three searches (apps, file names,
+file contents): "accion" finds "acción", "español" finds `espanol.txt`,
+"ÑANDÚ" finds "ñandú" (`core/fold.zig` folds Latin-1 and Latin Extended-A
+letters to their base; symbols like `×` stay distinct). Also handled, each
+with a test:
+
+- an indexed file replaced by a FIFO or device: opened non-blocking and
+  checked to be regular (a blocking open of a FIFO froze the launcher)
+- file names that are invalid UTF-8 or contain newlines: shown with U+FFFD /
+  a space, searchable by content (`rg --null`), actions use the raw path
+- caches and indexes are owner-only (0700 / 0600) and written atomically
+- the clipboard watcher is restarted with backoff if it dies
+- pasting into a terminal sends Ctrl+Shift+V
+- file-name queries up to 255 bytes; a hung mount cannot block the content
+  listing for more than a minute
+- corrupt index files are rejected and rebuilt, never trusted
+- a failed database write (clearing the history, deleting an entry) is shown
+  on the row, not silently ignored
+- client commands (`--stats`, `--dump`, `--quit`...) never start a daemon;
+  test instances quit by themselves after five minutes
+
+## Tests
+
+```sh
+zig build test      # unit and integration tests (index on real temp trees,
+                    # inotify, extraction with real zip/pdftotext, SQLite)
+zig build perf      # performance regressions on synthetic data (1M names,
+                    # 3k documents): latency limits, exact recall, peak RSS;
+                    # PERF_SCALE=2 relaxes the limits on slower machines
+zig build e2e       # end-to-end: an isolated instance (own app id, fake $HOME,
+                    # own caches) driven with --dump and --key; needs Wayland
+```
+
+The end-to-end runner (`tools/e2e.sh`) checks every view, the keyboard, the
+action panel, live file changes, the clipboard store and latency, then quits
+the instance and checks the indexes were saved. `lumen --dump` prints what
+the window shows (rows, selection, detail, panel) and `lumen --key NAME`
+presses a key, so the UI is tested without screenshots.
+
+Fuzz tests (index files, calculator, Office XML, case-insensitive search) run
+on their seed corpus as part of `zig build test`. Exploring with `--fuzz`
+builds with Zig 0.17.0 but does not run yet: the test runner's input poller
+panics (`start index 1 is larger than end index 0`) in every worker as soon
+as fuzzing starts, in std, not in Lumen's targets. Under 0.16, with a patched
+lib dir and `use_llvm = true`, 3.5M + 4.9M iterations found nothing.

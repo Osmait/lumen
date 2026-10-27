@@ -888,7 +888,10 @@ fn setHint(self: *Ui, text: []const u8, warn: bool) void {
     const row = self.rows.items[ri];
     const h = row.hint orelse return;
     if (row.accessory) |acc| c.gtk_widget_set_visible(acc, 0);
-    const shown = if (warn) text else std.fmt.allocPrint(self.query_arena.allocator(), "{s}  ↵", .{text}) catch return;
+    // Beside the detail pane the list is narrow: the action's name would
+    // squeeze the title to a few letters, so only the key shows there.
+    const narrow = c.gtk_widget_get_visible(self.detail) != 0;
+    const shown = if (warn) text else if (narrow) "↵" else std.fmt.allocPrint(self.query_arena.allocator(), "{s}  ↵", .{text}) catch return;
     const z = self.query_arena.allocator().dupeSentinel(u8, shown, 0) catch return;
     c.gtk_label_set_text(@ptrCast(h), z.ptr);
     if (warn) c.gtk_widget_add_css_class(h, "warn") else c.gtk_widget_remove_css_class(h, "warn");

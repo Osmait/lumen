@@ -1,0 +1,31 @@
+name: Bug report
+description: Something does not work as it should.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected and what happened instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Lumen version or commit
+      placeholder: "0.1.0, or the output of git rev-parse --short HEAD"
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Distribution and compositor
+      placeholder: "Arch, Hyprland 0.56"
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log or `lumen --stats`
+      description: Run `lumen --quit`, then `lumen --daemon` from a terminal and reproduce. Check it shows nothing private.
+      render: text

@@ -1,0 +1,15 @@
+name: Idea
+description: Something Lumen could do.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What you would like to do
+      description: The task, not the feature. "Find the PDF I downloaded yesterday" says more than "sort by date".
+    validations:
+      required: true
+  - type: textarea
+    id: how
+    attributes:
+      label: How you do it today
