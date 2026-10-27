@@ -465,6 +465,26 @@ L --hide; L --query "fruit bowl"
 expect_soon "edited extensions reload when the window opens" '> Fixture Fruit Bowl'
 L --hide
 
+echo "install from git"
+if command -v git >/dev/null; then
+    G="git -c user.name=e2e -c user.email=e2e@example.com -c init.defaultBranch=main"
+    mkdir -p "$T/repos/lumen-greeter"
+    ( cd "$T/repos/lumen-greeter" && $G init -q && echo 'return lumen.extension { commands = { { name = "hi", title = "Greeter Hi", items = { "hi" } } } }' >init.lua && $G add . && $G commit -qm one )
+    out=$(L --install "$T/repos/lumen-greeter"); st=$?
+    [[ $st == 0 && "$out" == Installed\ greeter* ]] && ok "install clones and names it" || ko "install clones and names it" "$st $out"
+    L --hide; query root "greeter hi"
+    expect_soon "installed extension loads" '> Greeter Hi'
+    out=$(L --install "$T/repos/lumen-greeter" 2>&1); st=$?
+    [[ $st == 1 && "$out" == *"already exists"* ]] && ok "install refuses an existing name" || ko "install refuses an existing name" "$st $out"
+    ( cd "$T/repos/lumen-greeter" && sed -i 's/Greeter Hi/Greeter Hello/' init.lua && $G commit -qam two )
+    L --update greeter >/dev/null && ok "update pulls" || ko "update pulls"
+    L --hide; query root "greeter hello"
+    expect_soon "updated extension reloads" '> Greeter Hello'
+    L --uninstall greeter >/dev/null && [[ ! -d "$H/.config/lumen/extensions/greeter" ]] && ok "uninstall removes it" || ko "uninstall removes it"
+else
+    echo "  (git not installed: skipped)"
+fi
+
 echo "dmenu"
 # dm INPUT ARGS...: runs `lumen --dmenu` in the background; its stdout and
 # exit status end up in $T/dm.

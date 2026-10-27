@@ -87,6 +87,8 @@ pub const G_SPAWN_DO_NOT_REAP_CHILD: c_int = 1 << 1;
 pub const G_SPAWN_SEARCH_PATH: c_int = 1 << 2;
 pub const G_SPAWN_STDERR_TO_DEV_NULL: c_int = 1 << 4;
 pub const G_SUBPROCESS_FLAGS_STDIN_PIPE: c_int = 1 << 0;
+pub const G_SUBPROCESS_FLAGS_STDOUT_PIPE: c_int = 1 << 2;
+pub const G_SUBPROCESS_FLAGS_STDERR_MERGE: c_int = 1 << 6;
 
 pub const GDK_SHIFT_MASK: GdkModifierType = 1 << 0;
 pub const GDK_CONTROL_MASK: GdkModifierType = 1 << 2;
@@ -262,6 +264,9 @@ pub extern fn g_list_model_get_item(list: *GListModel, position: c_uint) ?*anyop
 
 pub extern fn g_subprocess_newv(argv: [*]const ?[*:0]const u8, flags: c_int, err: ?*?*GError) ?*GSubprocess;
 pub extern fn g_subprocess_get_stdin_pipe(sp: *GSubprocess) *GOutputStream;
+pub extern fn g_subprocess_communicate_utf8_async(sp: *GSubprocess, stdin: ?[*:0]const u8, cancellable: ?*GCancellable, callback: GAsyncReadyCallback, data: ?*anyopaque) void;
+pub extern fn g_subprocess_communicate_utf8_finish(sp: *GSubprocess, res: *GAsyncResult, stdout: ?*?[*:0]u8, stderr: ?*?[*:0]u8, err: ?*?*GError) gboolean;
+pub extern fn g_subprocess_get_successful(sp: *GSubprocess) gboolean;
 pub extern fn g_output_stream_write_all(stream: *GOutputStream, buffer: *const anyopaque, count: usize, written: ?*usize, cancellable: ?*anyopaque, err: ?*?*GError) gboolean;
 pub extern fn g_output_stream_close(stream: *GOutputStream, cancellable: ?*anyopaque, err: ?*?*GError) gboolean;
 

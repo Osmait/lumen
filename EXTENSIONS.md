@@ -348,6 +348,27 @@ can change anything Lumen draws. The theme's colours are variables: `--bg`,
 These class names are part of Lumen's interface: a change to them is noted in
 the changelog.
 
+## Sharing and installing extensions
+
+An extension is a folder with an `init.lua`, so a git repository whose root
+holds one can be installed with a command:
+
+```sh
+lumen --install https://github.com/someone/lumen-weather    # → extensions/weather
+lumen --install git@host:me/tools.git --as tools           # pick the name
+lumen --update weather                                      # git pull it
+lumen --update                                              # every git extension
+lumen --uninstall weather
+```
+
+The name comes from the repository (`lumen-`, `lumen-ext-` and `-lumen` are
+dropped) unless `--as` gives one. A repository without an `init.lua` is
+refused. Lumen loads the extension at once, and it runs as you: read its
+`init.lua` first, as you would a script.
+
+To publish one, push the folder (with its `init.lua` at the root) to any git
+host. Naming the repository `lumen-<name>` makes it easy to find.
+
 ## From the command line
 
 ```sh

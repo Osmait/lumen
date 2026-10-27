@@ -32,6 +32,7 @@ const backdrop = @import("backdrop.zig");
 const keyboard = @import("keyboard.zig");
 pub const ext_view = @import("ext_view.zig");
 pub const dmenu = @import("dmenu.zig");
+pub const installer = @import("installer.zig");
 const prefs_view = @import("prefs_view.zig");
 const form_view = @import("form_view.zig");
 const ExtHost = @import("../ext/Host.zig");

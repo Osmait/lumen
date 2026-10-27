@@ -34,6 +34,8 @@ All notable changes are listed here. The format follows
   view, required fields are checked before submitting.
 - Grids: `grid = true` shows a command's rows as cells (large icons or
   image thumbnails), with 2D arrow keys.
+- `lumen --install URL [--as NAME]`, `--update [NAME]` and `--uninstall NAME`:
+  extensions from git repositories.
 - Example extensions: GitHub (through `gh`), processes, hello.
 
 ## [0.1.0] - 2026-10-26

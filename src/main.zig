@@ -8,6 +8,7 @@
 //!   lumen --command github.prs           open an extension's command
 //!   lumen --reload     load init.lua and the extensions again
 //!   lumen --dmenu [--prompt TEXT]   pick a line of stdin, print it
+//!   lumen --install URL [--as NAME] | --update [NAME] | --uninstall NAME
 //!   lumen --clip-store  internal: `wl-paste --watch` hands a copy on stdin
 
 const std = @import("std");
@@ -123,6 +124,9 @@ fn onCommandLine(app: *c.GApplication, cmdline: *c.GApplicationCommandLine, _: ?
     var command: ?[]const u8 = null;
     var pick = false;
     var prompt: ?[]const u8 = null;
+    var job: ?enum { install, update, uninstall } = null;
+    var job_arg: ?[]const u8 = null;
+    var as: ?[]const u8 = null;
     var query: ?[*:0]const u8 = null;
     var i: usize = 1;
     while (i < argc) : (i += 1) {
@@ -153,6 +157,24 @@ fn onCommandLine(app: *c.GApplication, cmdline: *c.GApplicationCommandLine, _: ?
             if (!ui_ready) return 1;
             Ui.ext_view.reload(&ui);
             return 0;
+        } else if (std.mem.eql(u8, a, "--install") and next != null) {
+            job = .install;
+            job_arg = std.mem.span(next.?);
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--uninstall") and next != null) {
+            job = .uninstall;
+            job_arg = std.mem.span(next.?);
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--update")) {
+            job = .update;
+            // The name is optional: without it, every git extension.
+            if (next) |n| if (!std.mem.startsWith(u8, std.mem.span(n), "-")) {
+                job_arg = std.mem.span(n);
+                i += 1;
+            };
+        } else if (std.mem.eql(u8, a, "--as") and next != null) {
+            as = std.mem.span(next.?);
+            i += 1;
         } else if (std.mem.eql(u8, a, "--dmenu")) {
             pick = true;
         } else if (std.mem.eql(u8, a, "--prompt") and next != null) {
@@ -182,6 +204,15 @@ fn onCommandLine(app: *c.GApplication, cmdline: *c.GApplicationCommandLine, _: ?
         } else return usage(cmdline);
     }
     if (!ui_ready) return 1;
+    if (job) |j| {
+        // The answer comes when git is done; the job holds `cmdline`.
+        switch (j) {
+            .install => Ui.installer.install(&ui, cmdline, job_arg.?, as),
+            .update => Ui.installer.update(&ui, cmdline, job_arg),
+            .uninstall => Ui.installer.uninstall(&ui, cmdline, job_arg.?),
+        }
+        return 1;
+    }
     if (pick) {
         // The answer comes later: the session keeps `cmdline` until then.
         Ui.dmenu.start(&ui, cmdline, prompt, query);
@@ -204,7 +235,7 @@ fn onCommandLine(app: *c.GApplication, cmdline: *c.GApplicationCommandLine, _: ?
 }
 
 fn clientOnly(flag: []const u8) bool {
-    const flags = [_][]const u8{ "--dump", "--key", "--text", "--stats", "--hide", "--quit", "--reload", "--dmenu" };
+    const flags = [_][]const u8{ "--dump", "--key", "--text", "--stats", "--hide", "--quit", "--reload", "--dmenu", "--install", "--update", "--uninstall" };
     for (flags) |f| if (std.mem.eql(u8, flag, f)) return true;
     return false;
 }
@@ -216,6 +247,7 @@ fn usage(cmdline: *c.GApplicationCommandLine) c_int {
         \\             [--view root|clipboard|windows|files|contents|settings|themes|default_apps]
         \\             [--command EXTENSION.COMMAND] [--query TEXT]
         \\       lumen --dmenu [--prompt TEXT] [--query TEXT]   < lines
+        \\       lumen --install URL [--as NAME] | --update [NAME] | --uninstall NAME
         \\
     );
     return 2;
@@ -392,4 +424,5 @@ test {
     _ = @import("ext/api.zig");
     _ = @import("ext/Host.zig");
     _ = @import("ui/ext_view.zig");
+    _ = @import("ui/installer.zig");
 }

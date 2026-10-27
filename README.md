@@ -119,6 +119,7 @@ lumen --show | --hide | --quit
 lumen --stats                memory, index and latency numbers
 lumen --command github.prs   open an extension's command
 lumen --reload               load init.lua and the extensions again
+lumen --install URL          install an extension from git (--update, --uninstall)
 ```
 
 So you can bind a key straight to clipboard history:
@@ -194,6 +195,13 @@ and `~/.config/lumen/style.css` can restyle anything.
 Extensions can answer in the main search too (type "time tokyo" with the
 world clock example), declare preferences, which show in Settings, and keep
 data between runs with `lumen.storage`.
+
+Extensions shared as git repositories install with one command:
+
+```sh
+lumen --install https://github.com/someone/lumen-weather
+lumen --update            # git pull every installed extension
+```
 
 [EXTENSIONS.md](EXTENSIONS.md) is the full guide.
 [`examples/`](examples) has a GitHub extension (your pull requests, issues
