@@ -115,6 +115,8 @@ fn onStartup(app: *c.GtkApplication, data: ?*anyopaque) callconv(.c) void {
     startFileIndex();
     // `lumen` (src/client.zig) reaches us here without loading GTK.
     ipc_server.start(start.gpa, app_id, &onSocket);
+    // Once the main loop runs, so starting is not slower.
+    _ = c.g_idle_add(&prewarm, null);
     stats.startup_ns = stats.now() - stats.started_ns;
 }
 
@@ -397,6 +399,11 @@ fn onWatcherExit(pid: c.GPid, status: c_int, _: ?*anyopaque) callconv(.c) void {
     log.warn("clipboard watcher exited ({d}); restarting in {d} ms", .{ status, watcher_backoff_ms });
     _ = c.g_timeout_add(watcher_backoff_ms, &restartWatcher, null);
     watcher_backoff_ms = @min(watcher_backoff_ms * 2, 60_000);
+}
+
+fn prewarm(_: ?*anyopaque) callconv(.c) c.gboolean {
+    if (ui_ready) ui.prewarm();
+    return 0;
 }
 
 fn testWatchdog(app: ?*anyopaque) callconv(.c) c.gboolean {

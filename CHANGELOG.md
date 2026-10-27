@@ -47,9 +47,15 @@ All notable changes are listed here. The format follows
   bar's and the rows' parts; `prompt` adds fixed text before the search field.
 - `lumen` is now a tiny static program that hands its arguments to the
   daemon over a Unix socket; the GTK program is `lumen-gtk`, installed
-  beside it. The window opens in ~17 ms instead of ~58 ms, and each copy
+  beside it. With the two changes below the window opens in ~8 ms instead
+  of ~58 ms, and each copy
   into the clipboard history no longer starts a GTK process. Install both
   files (see the README).
+- Hyprland is asked for the focused monitor through its socket instead of
+  by starting `hyprctl` on every show.
+- The first show after the daemon starts no longer creates the window's
+  renderer while you wait: that is done hidden, right after start (~175 ms
+  down to ~30 ms).
 - Styles in Change Theme: whole looks (layout, themes, settings and CSS)
   switched at once. The five in `examples/styles` are built in, and each
   folder in `~/.config/lumen/styles` is one more, under Custom. A style's

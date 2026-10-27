@@ -815,6 +815,19 @@ fn onAfterPaint(_: *anyopaque, _: ?*anyopaque) callconv(.c) void {
     stats.onPainted();
 }
 
+/// What the first show used to do while the user waited (~175 ms of it,
+/// against ~7 for later shows): the window's surface and its renderer (a
+/// Vulkan device), and the root view's rows, styles and text measured. Now
+/// ~31 ms. Runs once, hidden, right after the daemon starts.
+pub fn prewarm(self: *Ui) void {
+    if (c.gtk_widget_get_visible(self.window) != 0) return;
+    c.gtk_widget_realize(self.window);
+    self.setView(.root);
+    var size: c_int = 0;
+    c.gtk_widget_measure(self.window, c.GTK_ORIENTATION_HORIZONTAL, -1, &size, null, null, null);
+    c.gtk_widget_measure(self.window, c.GTK_ORIENTATION_VERTICAL, -1, &size, null, null, null);
+}
+
 pub fn hide(self: *Ui) void {
     dmenu.finish(self, null);
     // A theme previewed but not chosen.

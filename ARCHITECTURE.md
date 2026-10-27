@@ -212,7 +212,8 @@ documents indexed):
 | contents, key to frame p50 | 131 ms | 18 ms | previews clip long lines instead of wrapping |
 | files, key to frame p50 | 73 ms | 23 ms | preview capped at 40 lines, no wrapping |
 | CPU idle | 0 % | 0 % | nothing polls: inotify and futex waits |
-| key press to window (p50) | 58.5 ms | 17.2 ms | `lumen` without GTK: 42.8 ms of client became 0.9 ms (Hyprland's `openlayer` event, 15 runs) |
+| key press to window (p50) | 58.5 ms | 7.8 ms | `lumen` without GTK: 42.8 ms of client became 0.9 ms (Hyprland's `openlayer` event, 15 runs); the focused monitor read from Hyprland's socket instead of starting `hyprctl` (daemon's show 16.3 → 6.8 ms) |
+| first show after start | ~175 ms | ~30 ms | the window's surface and Vulkan renderer created, and the root view built, while hidden right after start |
 | GPU | | ~10 MiB VRAM while shown, none hidden | |
 
 ## Edge cases

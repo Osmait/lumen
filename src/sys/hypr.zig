@@ -1,9 +1,12 @@
-//! Hyprland through `hyprctl -j` (read) and `hyprctl dispatch` (act).
+//! Hyprland through its request socket (read; `hyprctl -j` if it cannot be
+//! reached) and `hyprctl dispatch` (act).
 //! Parsing and command building are pure functions over the JSON text, so
 //! they are tested against recorded output (testdata/) instead of a live
 //! compositor.
 
 const std = @import("std");
+const linux = std.os.linux;
+const c = @import("c");
 const proc = @import("proc.zig");
 const geometry = @import("core").geometry;
 
@@ -48,12 +51,46 @@ pub fn parse(comptime T: type, arena: std.mem.Allocator, json: []const u8) ?T {
 }
 
 fn query(arena: std.mem.Allocator, comptime T: type, what: [:0]const u8) ?T {
-    const out = proc.output(&.{ "hyprctl", "-j", what }) orelse return null;
-    defer proc.free(out);
-    return parse(T, arena, out) orelse {
+    const json = request(arena, what) orelse blk: {
+        const out = proc.output(&.{ "hyprctl", "-j", what }) orelse return null;
+        defer proc.free(out);
+        break :blk arena.dupe(u8, out) catch return null;
+    };
+    return parse(T, arena, json) orelse {
         log.warn("hyprctl {s}: unexpected JSON", .{what});
         return null;
     };
+}
+
+/// What `hyprctl -j <what>` prints, straight from Hyprland's socket: every
+/// show asks for the focused monitor, and starting hyprctl for it took ~4 ms
+/// against 0.04. Null when the socket cannot be reached.
+fn request(arena: std.mem.Allocator, what: []const u8) ?[]const u8 {
+    const sig = std.mem.span(c.g_getenv("HYPRLAND_INSTANCE_SIGNATURE") orelse return null);
+    const rt = std.mem.span(c.g_getenv("XDG_RUNTIME_DIR") orelse return null);
+    var addr: linux.sockaddr.un = .{ .path = @splat(0) };
+    _ = std.fmt.bufPrint(addr.path[0 .. addr.path.len - 1], "{s}/hypr/{s}/.socket.sock", .{ rt, sig }) catch return null;
+    const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    if (linux.errno(rc) != .SUCCESS) return null;
+    const fd: linux.fd_t = @intCast(rc);
+    defer _ = linux.close(fd);
+    // A compositor that does not answer must not freeze the window.
+    const timeout: linux.timeval = .{ .sec = 1, .usec = 0 };
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO, @ptrCast(&timeout), @sizeOf(linux.timeval));
+    if (linux.errno(linux.connect(fd, &addr, @sizeOf(linux.sockaddr.un))) != .SUCCESS) return null;
+    var msg_buf: [64]u8 = undefined;
+    const msg = std.fmt.bufPrint(&msg_buf, "j/{s}", .{what}) catch return null;
+    if (linux.errno(linux.write(fd, msg.ptr, msg.len)) != .SUCCESS) return null;
+    var out: std.ArrayList(u8) = .empty;
+    while (true) {
+        out.ensureUnusedCapacity(arena, 16 * 1024) catch return null;
+        const n = linux.read(fd, out.unusedCapacitySlice().ptr, out.unusedCapacitySlice().len);
+        if (linux.errno(n) == .INTR) continue;
+        if (linux.errno(n) != .SUCCESS) return null;
+        if (n == 0) break;
+        out.items.len += n;
+    }
+    return if (out.items.len > 0) out.items else null;
 }
 
 /// Most recently focused first.
