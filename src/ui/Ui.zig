@@ -36,6 +36,7 @@ pub const installer = @import("installer.zig");
 const prefs_view = @import("prefs_view.zig");
 const form_view = @import("form_view.zig");
 const ExtHost = @import("../ext/Host.zig");
+const layout_mod = @import("../layout.zig");
 const Kind = core.file_kind.Kind;
 
 const Ui = @This();
@@ -46,8 +47,10 @@ pub const onContentResult = file_results.onContentResult;
 
 const log = std.log.scoped(.ui);
 
-/// The window's pieces, by the Width and Height settings.
+/// The window's pieces: lumen.layout's pixels, else the Width and Height
+/// settings.
 fn panelW(self: *const Ui) c_int {
+    if (self.layout.width) |w| return w;
     return switch (self.settings.width) {
         .narrow => 620,
         .default => 750,
@@ -55,17 +58,22 @@ fn panelW(self: *const Ui) c_int {
     };
 }
 fn panelH(self: *const Ui) c_int {
+    if (self.layout.height) |h| return h;
     return switch (self.settings.height) {
         .short => 380,
         .default => 474,
         .tall => 640,
     };
 }
-/// The list's height limit: what is left under the search bar (56), the gap
-/// (10) and the results' padding and border (14).
+/// The list's height limit: what is left beside the search bar (56), the
+/// results' padding and border (14), the footer (40) and the gaps between
+/// pieces (10, none in a single panel).
 fn listMaxH(self: *const Ui) c_int {
-    return self.panelH() - 56 - 10 - 14;
+    const gap: c_int = if (self.layout.panels == .split) 10 else 0;
+    const footer: c_int = if (self.layout.footer) footer_h + gap else 0;
+    return self.panelH() - 56 - 14 - gap - footer;
 }
+const footer_h = 40;
 /// Clear space around the pieces for their shadows (`.shell` in style.css).
 const shell_margin = 48;
 const max_results = 60;
@@ -79,6 +87,20 @@ apps: Apps,
 window: *c.GtkWidget = undefined,
 /// The search bar and the results, sized by the layout settings.
 column: *c.GtkWidget = undefined,
+/// lumen.layout from init.lua (defaults until the files load).
+layout: layout_mod.Layout = .{},
+/// Takes the room above the results when the search bar is at the bottom.
+spacer: *c.GtkWidget = undefined,
+/// The bar under the results (lumen.layout's footer): the view's name,
+/// what Enter does, and Actions.
+footer: *c.GtkWidget = undefined,
+footer_title: *c.GtkWidget = undefined,
+footer_action: *c.GtkWidget = undefined,
+footer_enter: *c.GtkWidget = undefined,
+footer_sep: *c.GtkWidget = undefined,
+/// The "Ctrl K" chip in the search bar, and the magnifier before the text.
+key_chip: *c.GtkWidget = undefined,
+search_icon: *c.GtkWidget = undefined,
 /// The widgets exist (settings read before `build` made them wait).
 built: bool = false,
 entry: *c.GtkWidget = undefined,
@@ -307,6 +329,11 @@ pub fn build(self: *Ui) void {
     widgets.connect(back_click, "released", &onBackClicked, self);
     c.gtk_widget_add_controller(self.back, back_click);
     c.gtk_box_append(@ptrCast(search), self.back);
+    self.search_icon = c.gtk_image_new_from_icon_name("system-search-symbolic");
+    c.gtk_widget_add_css_class(self.search_icon, "search-icon");
+    c.gtk_widget_set_valign(self.search_icon, c.GTK_ALIGN_CENTER);
+    c.gtk_widget_set_visible(self.search_icon, 0);
+    c.gtk_box_append(@ptrCast(search), self.search_icon);
     self.scope = widgets.label("", "scope");
     c.gtk_widget_set_valign(self.scope, c.GTK_ALIGN_CENTER);
     c.gtk_widget_set_visible(self.scope, 0);
@@ -318,9 +345,14 @@ pub fn build(self: *Ui) void {
     c.gtk_box_append(@ptrCast(search), self.entry);
     widgets.connect(self.entry, "changed", &onChanged, self);
     const k = widgets.label("Ctrl K", "kbd");
+    self.key_chip = k;
     c.gtk_widget_set_valign(k, c.GTK_ALIGN_CENTER);
     c.gtk_widget_set_tooltip_text(k, "Actions");
     c.gtk_box_append(@ptrCast(search), k);
+    self.spacer = widgets.vbox(0);
+    c.gtk_widget_set_vexpand(self.spacer, 1);
+    c.gtk_widget_set_visible(self.spacer, 0);
+    c.gtk_box_append(@ptrCast(column), self.spacer);
     c.gtk_box_append(@ptrCast(column), search);
 
     // results + detail
@@ -359,6 +391,30 @@ pub fn build(self: *Ui) void {
     c.gtk_box_append(@ptrCast(body), self.detail);
     c.gtk_box_append(@ptrCast(column), body);
 
+    // footer (lumen.layout { footer = true })
+    self.footer = widgets.hbox(8);
+    c.gtk_widget_add_css_class(self.footer, "footer");
+    c.gtk_widget_set_size_request(self.footer, -1, footer_h);
+    self.footer_title = widgets.label("Lumen", "footer-title");
+    c.gtk_widget_set_hexpand(self.footer_title, 1);
+    c.gtk_label_set_xalign(@ptrCast(self.footer_title), 0);
+    c.gtk_label_set_ellipsize(@ptrCast(self.footer_title), c.PANGO_ELLIPSIZE_END);
+    c.gtk_box_append(@ptrCast(self.footer), self.footer_title);
+    self.footer_action = widgets.label("", "footer-action");
+    c.gtk_box_append(@ptrCast(self.footer), self.footer_action);
+    self.footer_enter = widgets.label("↵", "kbd");
+    c.gtk_widget_set_valign(self.footer_enter, c.GTK_ALIGN_CENTER);
+    c.gtk_box_append(@ptrCast(self.footer), self.footer_enter);
+    self.footer_sep = widgets.label("", "footer-sep");
+    c.gtk_widget_set_valign(self.footer_sep, c.GTK_ALIGN_CENTER);
+    c.gtk_box_append(@ptrCast(self.footer), self.footer_sep);
+    c.gtk_box_append(@ptrCast(self.footer), widgets.label("Actions", "footer-action"));
+    const fk = widgets.label("Ctrl K", "kbd");
+    c.gtk_widget_set_valign(fk, c.GTK_ALIGN_CENTER);
+    c.gtk_box_append(@ptrCast(self.footer), fk);
+    c.gtk_widget_set_visible(self.footer, 0);
+    c.gtk_box_append(@ptrCast(column), self.footer);
+
     // action panel, floating over the top right corner of the results
     self.panel = widgets.vbox(0);
     c.gtk_widget_add_css_class(self.panel, "actions");
@@ -384,6 +440,46 @@ pub fn build(self: *Ui) void {
     widgets.connect(click, "pressed", &backdrop.onWindowPressed, self);
     c.gtk_widget_add_controller(win, click);
     self.built = true;
+    self.applyStructure();
+}
+
+fn cssClass(w: *c.GtkWidget, name: [*:0]const u8, on: bool) void {
+    if (on) c.gtk_widget_add_css_class(w, name) else c.gtk_widget_remove_css_class(w, name);
+}
+
+/// lumen.layout: the pieces' order, one panel or two, the footer, the
+/// detail pane's side, what rows show; then the size. The caller rebuilds
+/// the rows.
+pub fn applyStructure(self: *Ui) void {
+    const l = self.layout;
+    widgets.show = l.show;
+    widgets.rows_inline = l.rows == .inline_;
+    c.gtk_widget_set_visible(self.search_icon, @intFromBool(l.show.search_icon));
+    const col: *c.GtkBox = @ptrCast(self.column);
+    c.gtk_box_set_spacing(col, if (l.panels == .single) 0 else 10);
+    cssClass(self.column, "single", l.panels == .single);
+    cssClass(self.column, "search-bottom", l.search == .bottom);
+    cssClass(self.column, "with-footer", l.footer);
+    // spacer, then search and results in the chosen order, footer last.
+    c.gtk_box_reorder_child_after(col, self.spacer, null);
+    const first, const second = if (l.search == .bottom) .{ self.results, self.search_bar } else .{ self.search_bar, self.results };
+    c.gtk_box_reorder_child_after(col, first, self.spacer);
+    c.gtk_box_reorder_child_after(col, second, first);
+    c.gtk_box_reorder_child_after(col, self.footer, second);
+    c.gtk_widget_set_visible(self.spacer, @intFromBool(l.search == .bottom));
+    c.gtk_widget_set_visible(self.footer, @intFromBool(l.footer));
+    c.gtk_widget_set_visible(self.key_chip, @intFromBool(l.show.key_hints));
+    // With a footer, or the search bar at the bottom, the action panel opens
+    // down there, above them.
+    c.gtk_widget_set_valign(self.panel, if (l.footer or l.search == .bottom) c.GTK_ALIGN_END else c.GTK_ALIGN_START);
+    cssClass(self.panel, "from-footer", l.footer);
+    cssClass(self.panel, "from-bottom", l.search == .bottom);
+
+    const island: *c.GtkBox = @ptrCast(self.results);
+    c.gtk_orientable_set_orientation(self.results, if (l.detail == .bottom) c.GTK_ORIENTATION_VERTICAL else c.GTK_ORIENTATION_HORIZONTAL);
+    if (l.detail == .left) c.gtk_box_reorder_child_after(island, self.detail, null) else c.gtk_box_reorder_child_after(island, self.detail, self.scroller);
+    cssClass(self.results, "detail-left", l.detail == .left);
+    cssClass(self.results, "detail-bottom", l.detail == .bottom);
     self.applyLayout();
 }
 
@@ -398,12 +494,12 @@ fn applyLayout(self: *Ui) void {
     if (!self.built) return;
     const w = self.panelW();
     const h = self.panelH();
+    c.gtk_scrolled_window_set_max_content_height(@ptrCast(self.scroller), self.listMaxH());
     var cw: c_int = 0;
     var ch: c_int = 0;
     c.gtk_widget_get_size_request(self.column, &cw, &ch);
     if (cw == w and ch == h) return;
     c.gtk_widget_set_size_request(self.column, w, h);
-    c.gtk_scrolled_window_set_max_content_height(@ptrCast(self.scroller), self.listMaxH());
     c.gtk_window_set_default_size(@ptrCast(self.window), w + 2 * shell_margin, h + 2 * shell_margin);
     if (c.gtk_widget_get_visible(self.window) != 0) {
         c.gtk_widget_set_visible(self.window, 0);
@@ -457,6 +553,10 @@ pub fn applyOverrides(self: *Ui) void {
 
 /// Set by init.lua: Settings shows it but cannot change it.
 pub fn overridden(self: *const Ui, key: []const u8) bool {
+    // lumen.layout's pixels and place win over these.
+    if (std.mem.eql(u8, key, "width") and self.layout.width != null) return true;
+    if (std.mem.eql(u8, key, "height") and self.layout.height != null) return true;
+    if (std.mem.eql(u8, key, "position") and self.layout.position != null) return true;
     const reg = self.ext_registry orelse return false;
     for (reg.settings) |o| if (std.mem.eql(u8, o.key, key)) return true;
     return false;
@@ -627,9 +727,21 @@ fn placeOnFocusedMonitor(self: *Ui) void {
         c.gtk_layer_set_monitor(@ptrCast(self.window), mon);
         var geo: c.GdkRectangle = undefined;
         c.gdk_monitor_get_geometry(mon, &geo);
-        const tenths: c_int = if (self.settings.position == .center) 5 else 3;
-        const margin = @max(@divTrunc((geo.height - self.panelH()) * tenths, 10) - shell_margin, 0);
-        c.gtk_layer_set_margin(@ptrCast(self.window), c.GTK_LAYER_SHELL_EDGE_TOP, margin);
+        const w: *c.GtkWindow = @ptrCast(self.window);
+        const pos: layout_mod.Position = self.layout.position orelse switch (self.settings.position) {
+            .upper_third => .upper_third,
+            .center => .center,
+        };
+        const off: c_int = self.layout.offset;
+        // The pieces sit `shell_margin` inside the surface (room for shadows).
+        const at_bottom = pos == .bottom;
+        c.gtk_layer_set_anchor(w, c.GTK_LAYER_SHELL_EDGE_TOP, @intFromBool(!at_bottom));
+        c.gtk_layer_set_anchor(w, c.GTK_LAYER_SHELL_EDGE_BOTTOM, @intFromBool(at_bottom));
+        const margin: c_int = switch (pos) {
+            .top, .bottom => off - shell_margin,
+            .upper_third, .center => @max(@divTrunc((geo.height - self.panelH()) * @as(c_int, if (pos == .center) 5 else 3), 10) - shell_margin, 0) + off,
+        };
+        c.gtk_layer_set_margin(w, if (at_bottom) c.GTK_LAYER_SHELL_EDGE_BOTTOM else c.GTK_LAYER_SHELL_EDGE_TOP, margin);
         return;
     }
 }
@@ -713,13 +825,18 @@ pub fn setView(self: *Ui, view: View) void {
     }
     c.gtk_widget_set_visible(self.detail_meta, @intFromBool(view != .ext));
     for (self.meta_lines) |l| c.gtk_widget_set_visible(l, 1);
-    c.gtk_widget_set_visible(self.back, @intFromBool(view != .root));
+    c.gtk_widget_set_visible(self.back, @intFromBool(view != .root and self.layout.show.back));
+    // The magnifier gives way to the back arrow inside a view.
+    c.gtk_widget_set_visible(self.search_icon, @intFromBool(self.layout.show.search_icon and (view == .root or !self.layout.show.back)));
     c.gtk_widget_set_visible(self.detail, @intFromBool(has_detail));
     // A preview needs room: the results take the full height then.
     c.gtk_widget_set_vexpand(self.results, @intFromBool(has_detail));
     // With the detail pane, the list takes ~40%.
-    c.gtk_widget_set_size_request(self.scroller, if (has_detail) @divTrunc(self.panelW() * 2, 5) else -1, -1);
-    c.gtk_widget_set_hexpand(self.scroller, @intFromBool(!has_detail));
+    // Beside the detail pane the list takes ~40%; above it, ~half the height.
+    const detail_below = self.layout.detail == .bottom;
+    c.gtk_widget_set_size_request(self.scroller, if (has_detail and !detail_below) @divTrunc(self.panelW() * 2, 5) else -1, -1);
+    c.gtk_widget_set_hexpand(self.scroller, @intFromBool(!has_detail or detail_below));
+    c.gtk_scrolled_window_set_max_content_height(@ptrCast(self.scroller), if (has_detail and detail_below) @divTrunc(self.listMaxH(), 2) else self.listMaxH());
     const keys: [4][:0]const u8 = switch (view) {
         .files => .{ "Kind", "Size", "Modified", "Where" },
         .contents => .{ "Kind", "Matches", "Modified", "Where" },
@@ -751,7 +868,8 @@ pub fn setView(self: *Ui, view: View) void {
         .form => "Search fields...",
     });
     c.gtk_label_set_text(@ptrCast(self.scope), self.viewTitle());
-    c.gtk_widget_set_visible(self.scope, @intFromBool(view != .root));
+    c.gtk_widget_set_visible(self.scope, @intFromBool(view != .root and self.layout.show.scope));
+    c.gtk_label_set_text(@ptrCast(self.footer_title), self.viewTitle());
 
     // Setting the text triggers `changed`, which refreshes.
     if (c.gtk_editable_get_text(@ptrCast(self.entry))[0] == 0) self.refresh() else c.gtk_editable_set_text(@ptrCast(self.entry), "");
@@ -886,7 +1004,10 @@ pub fn refresh(self: *Ui) void {
     c.gtk_widget_set_visible(self.grid, @intFromBool(self.grid_mode and self.items.items.len > 0));
     c.gtk_widget_set_visible(self.list, @intFromBool(!self.grid_mode or self.items.items.len == 0));
     // Nothing typed and nothing to suggest: only the search bar shows.
-    c.gtk_widget_set_visible(self.results, @intFromBool(!(self.view == .root and q.len == 0 and self.items.items.len == 0)));
+    const alone = self.view == .root and q.len == 0 and self.items.items.len == 0;
+    c.gtk_widget_set_visible(self.results, @intFromBool(!alone));
+    // One panel with only the search bar showing rounds all its corners.
+    cssClass(self.column, "alone", alone);
 
     const adj = c.gtk_scrolled_window_get_vadjustment(@ptrCast(self.scroller));
     c.gtk_adjustment_set_value(adj, 0);
@@ -1045,7 +1166,7 @@ fn sortByScore(items: []Item) void {
 
 pub fn addSection(self: *Ui, title: [:0]const u8) void {
     // A grid has no sections: rows and items stay one to one there.
-    if (self.grid_mode) return;
+    if (self.grid_mode or !self.layout.show.section_titles) return;
     // Room first: a widget without its `rows` entry would shift every later
     // row's index.
     self.rows.ensureUnusedCapacity(self.query_arena.allocator(), 1) catch return;
@@ -1102,6 +1223,7 @@ pub fn select(self: *Ui, row_index: ?usize) void {
     self.confirm_key = "";
     self.primary = "";
     const ri = row_index orelse {
+        self.setFooterAction("", false);
         c.gtk_list_box_unselect_all(@ptrCast(self.list));
         c.gtk_flow_box_unselect_all(@ptrCast(self.grid));
         detail_pane.showDetail(self, null);
@@ -1122,8 +1244,22 @@ pub fn select(self: *Ui, row_index: ?usize) void {
         self.applyAppearance(themes.find(it.action.setting.theme, self.preferDark()));
 }
 
-/// The selected row's hint: "Open ↵", or a warning waiting for Enter.
+/// The footer's "what Enter does" (hidden with nothing selected).
+fn setFooterAction(self: *Ui, text: []const u8, warn: bool) void {
+    const z = self.query_arena.allocator().dupeSentinel(u8, text, 0) catch return;
+    c.gtk_label_set_text(@ptrCast(self.footer_action), z.ptr);
+    cssClass(self.footer_action, "warn", warn);
+    const any = text.len > 0;
+    c.gtk_widget_set_visible(self.footer_action, @intFromBool(any));
+    c.gtk_widget_set_visible(self.footer_enter, @intFromBool(any and !warn));
+    c.gtk_widget_set_visible(self.footer_sep, @intFromBool(any));
+}
+
+/// The selected row's hint: "Open ↵", or a warning waiting for Enter (and
+/// the footer's, which says the same).
 fn setHint(self: *Ui, text: []const u8, warn: bool) void {
+    self.setFooterAction(text, warn);
+    if (!self.layout.show.hints and !warn) return;
     const ri = self.selected orelse return;
     const row = self.rows.items[ri];
     const h = row.hint orelse return;
@@ -1349,6 +1485,9 @@ pub fn dump(self: *Ui, gpa: std.mem.Allocator) (std.Io.Writer.Error || std.mem.A
     const w = &out.writer;
     try w.print("view: {t}\nvisible: {}\nquery: {s}\n", .{ self.view, c.gtk_widget_get_visible(self.window) != 0, self.query() });
     try w.print("title: {s}\nprimary: {s}\n", .{ self.viewTitle(), self.primary });
+    const lay = self.layout;
+    try w.print("layout: {d}x{d} panels={t} search={t} detail={t} rows={s} footer={}\n", .{ self.panelW(), self.panelH(), lay.panels, lay.search, lay.detail, if (lay.rows == .inline_) "inline" else "stacked", lay.footer });
+    if (lay.footer) try w.print("footer: {s} | {s}\n", .{ c.gtk_label_get_text(@ptrCast(self.footer_title)), c.gtk_label_get_text(@ptrCast(self.footer_action)) });
     try w.print("rows:\n", .{});
     if (self.rows.items.len == 0) try w.print("  (empty) {s}\n", .{self.emptyText(a)});
     for (self.rows.items, 0..) |row, i| {

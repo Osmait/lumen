@@ -8,6 +8,9 @@ Lumen runs Lua 5.4 for three things:
   keyboard shortcuts, quick commands.
 - **`style.css`**: your own CSS in `~/.config/lumen/style.css`, loaded after
   Lumen's.
+- **`lumen.layout`**: the window's structure (size, place, one panel or
+  two, a footer...), in `init.lua`. With `style.css` it can make Lumen look
+  like Raycast, Spotlight, Alfred or rofi: see [`examples/styles`](examples/styles).
 
 Lumen draws everything itself: an extension returns data (rows, details,
 actions) and it shows up like the rest of Lumen, in every theme. Lua never
@@ -264,6 +267,7 @@ row and keeps what was typed.
 | `lumen.theme(spec)` | Adds a theme (see [init.lua](#initlua)). |
 | `lumen.keymap(keys, target)` | Adds a shortcut (see [init.lua](#initlua)). |
 | `lumen.set(settings)` | Fixes settings (see [init.lua](#initlua)). |
+| `lumen.layout(options)` | The window's structure (see [Layout](#layout)). |
 
 `require("name")` loads `name.lua` or `name/init.lua` from the extension's
 folder. The standard library is there except `os.exit`, `os.execute`,
@@ -319,6 +323,42 @@ Keys are written as modifiers then a key, `+` between them: `ctrl+g`,
 type into the search. Lumen's own keys (arrows, Enter, Esc, Ctrl+K, Ctrl+N/P/J,
 Ctrl+X, Ctrl+O, Ctrl+Shift+C/F) come first.
 
+## Layout
+
+`lumen.layout` in `init.lua` decides what the window is made of; `style.css`
+then styles it. Every key is optional, and several calls add up.
+
+```lua
+lumen.layout {
+  width = 750, height = 475,      -- pixels (else the Width/Height settings)
+  position = "upper_third",       -- top, upper_third, center, bottom
+  offset = 0,                     -- pixels away from there
+  panels = "single",              -- "split": search bar and results apart
+  search = "top",                 -- or "bottom"
+  detail = "right",               -- the detail pane: right, left, bottom
+  footer = true,                  -- a bar: the view, what Enter does, Actions
+  rows = "inline",                -- subtitles beside titles ("stacked": under)
+  show = {                        -- all true by default, except search_icon
+    hints = false,                -- "Open ↵" in the selected row
+    subtitles = true, accessories = true, icons = true, section_titles = true,
+    key_hints = false,            -- the "Ctrl K" chip in the search bar
+    scope = true, back = true,    -- the view's name and the back arrow
+    search_icon = false,          -- a magnifier before the text
+  },
+}
+```
+
+| | |
+|---|---|
+| `width`, `height` | 360–2400 and 240–1600 pixels. Settings shows Window Width and Height as *Set in init.lua*. |
+| `position`, `offset` | `bottom` anchors to the bottom of the screen; `offset` moves it (down from the top, up from the bottom). |
+| `panels` | `split` (Lumen's own look): the search bar and the results float apart. `single`: one panel, the pieces touching. |
+| `search` | `bottom` puts the search field under the results, as many rofi themes do. |
+| `detail` | Where the detail pane goes beside (or under) the list. |
+| `footer` | With a footer, the action panel opens above it, by its Actions key. |
+
+A key or value Lumen does not know is an error shown in the root search.
+
 ## style.css
 
 `~/.config/lumen/style.css` is GTK CSS, loaded after Lumen's own rules, so it
@@ -338,6 +378,10 @@ can change anything Lumen draws. The theme's colours are variables: `--bg`,
 | `.detail`, `.detail-text`, `.meta` | The detail pane. |
 | `.actions` | The action panel (Ctrl+K). |
 | `.grid`, `.grid > flowboxchild`, `.cell-title` | Grids and their cells. |
+| `.footer`, `.footer-title`, `.footer-action`, `.footer-sep` | The footer (`lumen.layout`). |
+| `.search-icon` | The magnifier (`show.search_icon`). |
+| `.shell.single`, `.search-bottom`, `.with-footer`, `.alone` | Classes on the window's pieces for each layout: one panel, search at the bottom, a footer, only the search bar showing. |
+| `.results-island.detail-left`, `.detail-bottom` | The detail pane's place. |
 | `.kbd` | Key caps. |
 
 ```css

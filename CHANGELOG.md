@@ -36,6 +36,13 @@ All notable changes are listed here. The format follows
   image thumbnails), with 2D arrow keys.
 - `lumen --install URL [--as NAME]`, `--update [NAME]` and `--uninstall NAME`:
   extensions from git repositories.
+- `lumen.layout` in init.lua: the window's size in pixels and place (top,
+  upper third, centre, bottom, with an offset), one panel or two, the search
+  field at the top or the bottom, the detail pane right, left or below, a
+  footer with what Enter does and Actions, subtitles inline, and which parts
+  of a row show.
+- Four complete styles in `examples/styles`: Raycast, Spotlight, Alfred and a
+  minimal rofi-like one.
 - Example extensions: GitHub (through `gh`), processes, hello.
 
 ## [0.1.0] - 2026-10-26

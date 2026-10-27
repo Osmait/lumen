@@ -235,6 +235,20 @@ pdf = org.gnome.Papers.desktop
 .log = org.gnome.TextEditor.desktop
 ```
 
+## Make it yours
+
+Lumen's look goes as far as you want to take it: 13 themes, layout settings
+(width, height, density), and for everything else a `style.css` and
+`lumen.layout` in `init.lua`, which decide the window's structure: one panel
+or two, a footer, where the search field and the detail pane go, what rows
+show. [`examples/styles`](examples/styles) has four complete looks:
+
+![Lumen styled as Raycast, Spotlight, Alfred and a minimal rofi-like look](assets/screenshots/styles.png)
+
+```sh
+cp examples/styles/raycast/{init.lua,style.css} ~/.config/lumen/ && lumen --reload
+```
+
 ## Privacy
 
 Lumen makes no network connections and sends nothing anywhere. What it keeps

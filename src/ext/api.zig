@@ -12,6 +12,7 @@ const themes = @import("../ui/themes.zig");
 const index = @import("index");
 const gtk = @import("c");
 const Settings = @import("../settings.zig").Settings;
+const layout_mod = @import("../layout.zig");
 
 const log = std.log.scoped(.ext);
 
@@ -38,6 +39,7 @@ pub fn install(L: *lua.State, e: *Host.Ext) void {
         .{ "theme", lua.wrap(theme) },
         .{ "keymap", lua.wrap(keymap) },
         .{ "set", lua.wrap(set) },
+        .{ "layout", lua.wrap(layout) },
     };
     for (funcs) |f| {
         c.lua_pushcclosure(L, f[1], 0);
@@ -366,6 +368,46 @@ fn set(L: *lua.State) lua.Error!c_int {
         }) catch return lua.fail(L, "not enough memory", .{});
         c.lua_settop(L, -2);
     }
+    return 0;
+}
+
+/// `lumen.layout { width = 820, panels = "single", footer = true, show = {
+/// hints = false } }`: the window's structure. Several calls add up.
+fn layout(L: *lua.State) lua.Error!c_int {
+    try lua.argTable(L, 1, "lumen.layout");
+    const e = extOf(L);
+    const load = e.load orelse return lua.fail(L, "lumen.layout works only while a file loads", .{});
+    var l = load.layout;
+    c.lua_pushnil(L);
+    while (c.lua_next(L, 1) != 0) {
+        const key = lua.toSlice(L, -2) orelse return lua.fail(L, "lumen.layout: keys are names ({s})", .{layout_mod.keys});
+        if (std.mem.eql(u8, key, "show")) {
+            if (c.lua_type(L, -1) != c.LUA_TTABLE) return lua.fail(L, "lumen.layout: show is a table of true/false", .{});
+            const show = lua.absIndex(L, -1);
+            c.lua_pushnil(L);
+            while (c.lua_next(L, show) != 0) {
+                const sk = lua.toSlice(L, -2) orelse return lua.fail(L, "lumen.layout: show's keys are {s}", .{layout_mod.show_keys});
+                if (c.lua_type(L, -1) != c.LUA_TBOOLEAN) return lua.fail(L, "lumen.layout: show.{s} is true or false", .{sk});
+                layout_mod.setShow(&l.show, sk, c.lua_toboolean(L, -1) != 0) catch
+                    return lua.fail(L, "lumen.layout: show has no \"{s}\" (it has {s})", .{ sk, layout_mod.show_keys });
+                c.lua_settop(L, -2);
+            }
+        } else {
+            const value: layout_mod.Value = switch (c.lua_type(L, -1)) {
+                c.LUA_TNUMBER => .{ .number = c.lua_tonumberx(L, -1, null) },
+                c.LUA_TSTRING => .{ .string = lua.toSlice(L, -1).? },
+                c.LUA_TBOOLEAN => .{ .boolean = c.lua_toboolean(L, -1) != 0 },
+                else => .{},
+            };
+            layout_mod.set(&l, key, value) catch |err| return switch (err) {
+                error.UnknownKey => lua.fail(L, "lumen.layout: no \"{s}\" (it has {s})", .{ key, layout_mod.keys }),
+                error.BadValue => lua.fail(L, "lumen.layout: bad value for {s} (see EXTENSIONS.md)", .{key}),
+            };
+        }
+        c.lua_settop(L, -2);
+    }
+    load.layout = l;
+    load.has_layout = true;
     return 0;
 }
 

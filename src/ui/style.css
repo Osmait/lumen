@@ -399,3 +399,127 @@ window.lumen-backdrop {
 .grid picture {
   border-radius: 10px;
 }
+
+/* lumen.layout: the detail pane beside the list on the left, or under it */
+.results-island.detail-left .detail {
+  border-left: none;
+  margin-left: 0;
+  border-right: 1px solid alpha(var(--ink), 0.14);
+  margin-right: 8px;
+}
+.results-island.detail-bottom .detail {
+  border-left: none;
+  margin-left: 0;
+  border-top: 1px solid alpha(var(--ink), 0.14);
+  margin-top: 6px;
+}
+
+/* lumen.layout: the footer (what Enter does, and Actions) */
+.footer {
+  padding: 0 10px 0 18px;
+  background-color: var(--bg);
+  border: 1px solid alpha(var(--ink), 0.16);
+  border-radius: 20px;
+  font-size: var(--font-small);
+  box-shadow: inset 0 1px alpha(var(--ink), 0.08), 0 2px 4px var(--shadow),
+    0 12px 30px var(--shadow);
+}
+.footer-title {
+  color: alpha(var(--fg), 0.72);
+  font-weight: 600;
+}
+.footer-action {
+  color: var(--fg);
+}
+.footer-action.warn {
+  color: var(--accent);
+  font-weight: 600;
+}
+.footer-sep {
+  min-width: 1px;
+  min-height: 14px;
+  margin: 0 4px;
+  background-color: alpha(var(--ink), 0.18);
+}
+
+/* lumen.layout: one panel. The pieces touch; inner corners go square and
+   only the bottom piece casts a shadow, downwards (an upward one would be
+   painted over the piece above). */
+.shell.single .search,
+.shell.single .results-island,
+.shell.single .footer {
+  box-shadow: none;
+}
+.shell.single .search {
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.shell.single .results-island {
+  border-top-width: 0;
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+  box-shadow: 0 18px 30px -12px var(--shadow);
+}
+.shell.single .results-island,
+.shell.single.search-bottom .search {
+  border-top: 1px solid alpha(var(--ink), 0.08);
+}
+.shell.single.with-footer .results-island,
+.shell.single.with-footer.search-bottom .search,
+.shell.single.with-footer.alone .search {
+  border-bottom-width: 0;
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+  box-shadow: none;
+}
+.shell.single .footer {
+  border-top: 1px solid alpha(var(--ink), 0.08);
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+  box-shadow: 0 18px 30px -12px var(--shadow);
+}
+/* search at the bottom: the results are the top piece */
+.shell.single.search-bottom .results-island {
+  border-top-width: 1px;
+  border-top-left-radius: 28px;
+  border-top-right-radius: 28px;
+  border-bottom-width: 0;
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+  box-shadow: none;
+}
+.shell.single.search-bottom .search {
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+  border-bottom-left-radius: 28px;
+  border-bottom-right-radius: 28px;
+  box-shadow: 0 18px 30px -12px var(--shadow);
+}
+/* nothing listed: the search bar is the whole panel */
+.shell.single.alone .search {
+  border-radius: 28px;
+  box-shadow: inset 0 1px alpha(var(--ink), 0.10), 0 2px 4px var(--shadow),
+    0 12px 30px var(--shadow);
+}
+.shell.single.alone.with-footer .search {
+  border-radius: 28px 28px 0 0;
+}
+
+/* lumen.layout: show = { search_icon = true } */
+.search-icon {
+  color: alpha(var(--ink), 0.55);
+  margin-right: 10px;
+  -gtk-icon-size: 20px;
+}
+
+/* lumen.layout's footer, or a search bar at the bottom: the action panel
+   opens above them */
+.actions.from-footer {
+  margin: 0 58px 96px 0;
+}
+.actions.from-bottom {
+  margin: 0 58px 112px 0;
+}
+.actions.from-footer.from-bottom {
+  margin: 0 58px 152px 0;
+}

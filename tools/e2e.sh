@@ -460,6 +460,16 @@ query settings "density"
 expect "lumen.set shows in Settings" 'Density \| Set in init.lua \| Compact'
 L --key enter; sleep 0.1
 expect "settings init.lua fixes cannot change" 'primary: Set in init.lua'
+cp "$H/.config/lumen/init.lua" "$T/init.lua.bak"
+printf '\nlumen.layout { width = 700, panels = "single", search = "bottom", footer = true, rows = "inline" }\n' >>"$H/.config/lumen/init.lua"
+L --reload; sleep 0.5; query root "fixture fruits"
+expect "lumen.layout changes the window" '^layout: 700x[0-9]+ panels=single search=bottom detail=right rows=inline footer=true'
+expect "the footer says what Enter does" '^footer: Lumen \| Open Command'
+query settings "window width"
+expect "a layout width shows as set in init.lua" 'Window Width \| Set in init.lua'
+cp "$T/init.lua.bak" "$H/.config/lumen/init.lua"; L --reload; sleep 0.5
+L --hide; query root ""
+expect "back to the default layout" '^layout: [0-9]+x[0-9]+ panels=split search=top'
 sed -i 's/Fixture Fruits/Fixture Fruit Bowl/' "$H/.config/lumen/extensions/fixture/init.lua"
 L --hide; L --query "fruit bowl"
 expect_soon "edited extensions reload when the window opens" '> Fixture Fruit Bowl'

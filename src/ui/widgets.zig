@@ -64,6 +64,10 @@ pub fn swatchTexture(bg: u24, fg: u24, accent: u24) ?*c.GdkTexture {
 
 /// Icon size in result rows, from the Density setting (main thread).
 pub var icon_px: c_int = 32;
+/// What rows show, from lumen.layout (main thread).
+pub var show: @import("../layout.zig").Show = .{};
+/// Subtitles after titles on the same line (lumen.layout's rows = "inline").
+pub var rows_inline = false;
 
 /// Icon, title over subtitle, accessory, and the hidden hint that shows
 /// the primary action while the row is selected.
@@ -72,22 +76,22 @@ pub const RowParts = struct { hint: ?*c.GtkWidget = null, accessory: ?*c.GtkWidg
 pub fn itemRow(it: Item, parts: *RowParts) *c.GtkWidget {
     const row = c.gtk_list_box_row_new();
     const box = hbox(12);
-    c.gtk_box_append(@ptrCast(box), iconWidget(it.icon, icon_px));
-    const text = vbox(1);
+    if (show.icons) c.gtk_box_append(@ptrCast(box), iconWidget(it.icon, icon_px));
+    const text = if (rows_inline) hbox(10) else vbox(1);
     c.gtk_widget_set_valign(text, c.GTK_ALIGN_CENTER);
     c.gtk_widget_set_hexpand(text, 1);
     const title = label(it.title, "title");
     c.gtk_label_set_ellipsize(@ptrCast(title), c.PANGO_ELLIPSIZE_END);
     c.gtk_label_set_max_width_chars(@ptrCast(title), 60);
     c.gtk_box_append(@ptrCast(text), title);
-    if (it.subtitle.len > 0) {
+    if (it.subtitle.len > 0 and show.subtitles) {
         const sub = label(it.subtitle, "subtitle");
         c.gtk_label_set_ellipsize(@ptrCast(sub), c.PANGO_ELLIPSIZE_END);
         c.gtk_label_set_max_width_chars(@ptrCast(sub), 60);
         c.gtk_box_append(@ptrCast(text), sub);
     }
     c.gtk_box_append(@ptrCast(box), text);
-    if (it.accessory.len > 0) {
+    if (it.accessory.len > 0 and show.accessories) {
         parts.accessory = label(it.accessory, "accessory");
         c.gtk_box_append(@ptrCast(box), parts.accessory.?);
     }

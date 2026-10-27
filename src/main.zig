@@ -425,4 +425,5 @@ test {
     _ = @import("ext/Host.zig");
     _ = @import("ui/ext_view.zig");
     _ = @import("ui/installer.zig");
+    _ = @import("layout.zig");
 }

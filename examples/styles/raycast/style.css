@@ -1,0 +1,38 @@
+/* Raycast: 12px corners, a flat search field, a grey selection. */
+.search { min-height: 54px; padding: 0 16px; border-radius: 12px; }
+.results-island { padding: 6px 8px; border-radius: 12px; }
+.footer { border-radius: 12px; min-height: 40px; padding: 0 8px 0 16px; }
+.shell.single .search { border-radius: 12px 12px 0 0; }
+.shell.single.with-footer .results-island { border-radius: 0; }
+.shell.single .footer { border-radius: 0 0 12px 12px; background-color: mix(var(--bg), #ffffff, 0.03); }
+.shell.single.alone .search { border-radius: 12px 12px 0 0; }
+
+.query { font-size: 16px; }
+.query > placeholder { color: alpha(var(--fg), 0.45); }
+
+.results > row { border-radius: 8px; min-height: 40px; padding: 0 10px; }
+.results > row:selected {
+  background-color: alpha(#ffffff, 0.09);
+  background-image: none;
+  box-shadow: none;
+}
+.results > row:selected .title { color: var(--fg); }
+.results > row:selected .subtitle,
+.results > row:selected .accessory { color: alpha(var(--fg), 0.5); }
+.subtitle { font-size: var(--font); color: alpha(var(--fg), 0.5); }
+.accessory { color: alpha(var(--fg), 0.45); }
+.section-title { font-size: 12px; font-weight: 600; color: alpha(var(--fg), 0.45); }
+
+/* Rounded-square icons instead of circles */
+.tile { border-radius: 7px; box-shadow: none; }
+
+.footer-title { color: alpha(var(--fg), 0.6); font-weight: 500; }
+.footer .kbd { background-color: alpha(#ffffff, 0.08); border-radius: 5px; }
+.scope { background-color: alpha(#ffffff, 0.08); color: var(--fg); }
+
+/* The action panel, above the footer */
+.actions { border-radius: 12px; }
+.actions.from-footer { margin: 0 56px 92px 0; }
+.actions row { border-radius: 8px; }
+.actions row:selected { background-color: alpha(#ffffff, 0.09); background-image: none; box-shadow: none; }
+.actions row:selected label { color: var(--fg); }

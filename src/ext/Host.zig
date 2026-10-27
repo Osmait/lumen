@@ -20,6 +20,7 @@ const core = @import("core");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
 const themes = @import("../ui/themes.zig");
+const layout_mod = @import("../layout.zig");
 
 const Host = @This();
 
@@ -125,6 +126,11 @@ pub const Registry = struct {
     keymaps: []const Keymap = &.{},
     settings: []const SettingOverride = &.{},
     prefs: []const Pref = &.{},
+    /// `lumen.layout { ... }`: the window's structure.
+    layout: layout_mod.Layout = .{},
+    /// Whether any file called lumen.layout (its size and place then win
+    /// over Settings).
+    has_layout: bool = false,
     problems: []const Problem = &.{},
     arena: std.heap.ArenaAllocator,
 
@@ -226,6 +232,8 @@ pub const Load = struct {
     keymaps: std.ArrayList(Keymap) = .empty,
     settings: std.ArrayList(SettingOverride) = .empty,
     prefs: std.ArrayList(Pref) = .empty,
+    layout: layout_mod.Layout = .{},
+    has_layout: bool = false,
     problems: std.ArrayList(Problem) = .empty,
 };
 
@@ -506,6 +514,8 @@ fn doReload(h: *Host) void {
     reg.keymaps = load.keymaps.items;
     reg.settings = load.settings.items;
     reg.prefs = load.prefs.items;
+    reg.layout = load.layout;
+    reg.has_layout = load.has_layout;
     reg.problems = load.problems.items;
     for (reg.problems) |p| log.warn("{s}: {s}", .{ p.ext, p.message });
     h.deliver(.{ .registry = reg });
@@ -561,6 +571,8 @@ fn loadFile(h: *Host, load: *Load, id: []const u8, dir: []const u8, path: [:0]co
         return problem(load, id, "out of memory");
     };
     // What this file adds is dropped again if it fails half-way.
+    const layout_before = load.layout;
+    const had_layout = load.has_layout;
     const marks = .{ load.commands.items.len, load.wcmds.items.len, load.themes.items.len, load.keymaps.items.len, load.settings.items.len, load.prefs.items.len };
     e.load = load;
     e.budget.deadline_ns = index.sys.monotonicNs() + load_budget_ns;
@@ -575,6 +587,8 @@ fn loadFile(h: *Host, load: *Load, id: []const u8, dir: []const u8, path: [:0]co
     load.keymaps.shrinkRetainingCapacity(marks[3]);
     load.settings.shrinkRetainingCapacity(marks[4]);
     load.prefs.shrinkRetainingCapacity(marks[5]);
+    load.layout = layout_before;
+    load.has_layout = had_layout;
     problem(load, id, err orelse "out of memory");
     lua.c.lua_close(e.L);
     h.gpa.destroy(e);
@@ -1350,6 +1364,8 @@ test "extensions load, list, search and run actions" {
         \\lumen.theme { id = "mine", name = "Mine", bg = "#101010", fg = "#f0f0f0", accent = "#ff8800" }
         \\lumen.keymap("ctrl+g", "demo.fruits")
         \\lumen.set { width = "wide", suggestions = false, opacity = 90 }
+        \\lumen.layout { width = 820, panels = "single", footer = true }
+        \\lumen.layout { rows = "inline", show = { icons = false } }
         \\return lumen.extension { commands = { { name = "hello", title = "Say Hello", run = function() return "stay" end } } }
     );
     try writeTestFile(dir, "extensions/demo/init.lua",
@@ -1403,6 +1419,11 @@ test "extensions load, list, search and run actions" {
     try testing.expectEqual(@as(usize, 1), reg.keymaps.len);
     try testing.expectEqualStrings("demo.fruits", reg.keymaps[0].target);
     try testing.expectEqual(@as(usize, 3), reg.settings.len);
+    // Several lumen.layout calls add up.
+    try testing.expect(reg.has_layout);
+    try testing.expectEqual(@as(?u16, 820), reg.layout.width);
+    try testing.expect(reg.layout.footer and reg.layout.panels == .single and reg.layout.rows == .inline_);
+    try testing.expect(!reg.layout.show.icons and reg.layout.show.subtitles);
     for (reg.settings) |o| {
         const want: []const u8 = if (std.mem.eql(u8, o.key, "width")) "wide" else if (std.mem.eql(u8, o.key, "suggestions")) "false" else "90";
         try testing.expectEqualStrings(want, o.value);
@@ -1510,6 +1531,7 @@ test "errors in extensions come back as messages" {
     try writeTestFile(dir, "extensions/Bad Name/init.lua", "return nil");
     try writeTestFile(dir, "extensions/keys/init.lua", "lumen.keymap('g', 'x.y')");
     try writeTestFile(dir, "extensions/sets/init.lua", "lumen.set { widht = 'wide' }");
+    try writeTestFile(dir, "extensions/lay/init.lua", "lumen.layout { panels = 'triple' }");
 
     var probe: Probe = .{};
     defer probe.deinit();
@@ -1519,9 +1541,10 @@ test "errors in extensions come back as messages" {
     try probe.wait("reg");
     const reg = probe.reg.?;
     try testing.expectEqual(@as(usize, 4), reg.commands.len);
-    try testing.expectEqual(@as(usize, 4), reg.problems.len);
+    try testing.expectEqual(@as(usize, 5), reg.problems.len);
+    try testing.expect(!reg.has_layout);
     for (reg.problems) |p| {
-        const want: []const u8 = if (std.mem.eql(u8, p.ext, "Bad Name")) "folder names" else if (std.mem.eql(u8, p.ext, "keys")) "needs ctrl" else if (std.mem.eql(u8, p.ext, "sets")) "no setting named \"widht\"" else "unexpected symbol near <eof>";
+        const want: []const u8 = if (std.mem.eql(u8, p.ext, "Bad Name")) "folder names" else if (std.mem.eql(u8, p.ext, "keys")) "needs ctrl" else if (std.mem.eql(u8, p.ext, "sets")) "no setting named \"widht\"" else if (std.mem.eql(u8, p.ext, "lay")) "bad value for panels" else "unexpected symbol near <eof>";
         if (std.mem.find(u8, p.message, want) == null) {
             std.debug.print("{s}: {s}\n", .{ p.ext, p.message });
             return error.TestUnexpectedResult;

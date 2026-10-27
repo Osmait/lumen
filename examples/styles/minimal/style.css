@@ -1,0 +1,35 @@
+/* Minimal: square, a thin accent frame, monospace, inverted selection. */
+.shell { font-family: "JetBrains Mono", monospace; }
+.search,
+.results-island,
+.shell.single .search,
+.shell.single .results-island,
+.shell.single.search-bottom .search,
+.shell.single.search-bottom .results-island,
+.shell.single.alone .search {
+  border-radius: 0;
+  border-color: var(--accent);
+  border-width: 2px;
+  box-shadow: none;
+}
+.shell.single.search-bottom .results-island { border-bottom-width: 0; }
+.shell.single.search-bottom .search { border-top: 1px solid alpha(var(--accent), 0.4); }
+
+.search { min-height: 44px; padding: 0 14px; }
+.query { font-size: 15px; }
+.query > placeholder { color: alpha(var(--fg), 0.35); }
+.search .back { border-radius: 0; }
+
+.results-island { padding: 4px; }
+.results { padding: 0; }
+.results > row { border-radius: 0; min-height: 28px; padding: 0 10px; }
+.results > row:selected {
+  background-color: var(--accent);
+  background-image: none;
+  box-shadow: none;
+}
+.title { font-size: 14px; }
+.detail-text { font-size: 12px; }
+.actions, .actions row { border-radius: 0; font-family: "JetBrains Mono", monospace; }
+.actions { border: 2px solid var(--accent); box-shadow: none; }
+.actions row:selected { background-image: none; box-shadow: none; }

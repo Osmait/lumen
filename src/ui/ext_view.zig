@@ -84,6 +84,8 @@ fn onRegistry(reg: *Host.Registry, ctx: ?*anyopaque) void {
     ui.ext_gen = 0;
     ui.ext_root_gen = 0;
     themes.custom = reg.themes;
+    ui.layout = reg.layout;
+    ui.applyStructure();
     // Rows and theme names point into the old registry: rebuild before
     // freeing it. A theme from init.lua may be the one in use, and lumen.set
     // may have changed (or stopped changing) settings.

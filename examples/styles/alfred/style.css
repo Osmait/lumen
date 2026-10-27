@@ -1,0 +1,32 @@
+/* Alfred: the search field is a box of its own inside the panel. */
+.search {
+  min-height: 72px;
+  padding: 12px 12px 6px;
+  border-radius: 10px;
+  border-bottom-width: 0;
+}
+.shell.single .search { border-radius: 10px 10px 0 0; border-bottom-width: 0; }
+.shell.single .results-island { border-radius: 0 0 10px 10px; border-top-width: 0; padding: 4px 12px 12px; }
+.shell.single.alone .search { border-radius: 10px; padding-bottom: 12px; border-bottom-width: 1px; }
+
+.query {
+  font-size: 28px;
+  font-weight: 300;
+  background-color: alpha(#000000, 0.28);
+  border: 1px solid alpha(#ffffff, 0.08);
+  border-radius: 8px;
+  padding: 6px 14px;
+}
+
+.results { padding: 0; }
+.results > row { border-radius: 6px; min-height: 56px; padding: 0 10px; }
+.results > row:selected { background-image: none; box-shadow: none; }
+.results > row:selected .title,
+.results > row:selected .subtitle { color: #ffffff; }
+.title { font-size: 18px; }
+.subtitle { font-size: 12px; color: alpha(var(--fg), 0.55); }
+
+.tile { box-shadow: none; }
+.scope { background-color: alpha(#ffffff, 0.10); color: var(--fg); }
+.actions { border-radius: 10px; }
+.actions row:selected { background-image: none; box-shadow: none; }
