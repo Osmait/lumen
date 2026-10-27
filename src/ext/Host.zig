@@ -21,6 +21,7 @@ const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
 const themes = @import("../ui/themes.zig");
 const layout_mod = @import("../layout.zig");
+const styles = @import("styles");
 
 const Host = @This();
 
@@ -135,6 +136,9 @@ pub const Registry = struct {
     icons: []const IconOverride = &.{},
     /// The extensions that loaded (init.lua not included).
     extensions: []const ExtInfo = &.{},
+    /// lumen.set in the style: defaults the UI applies when the style is
+    /// chosen (unlike init.lua's, they fix nothing).
+    style_settings: []const SettingOverride = &.{},
     /// `lumen.layout { ... }`: the window's structure.
     layout: layout_mod.Layout = .{},
     /// Whether any file called lumen.layout (its size and place then win
@@ -243,6 +247,7 @@ pub const Load = struct {
     prefs: std.ArrayList(Pref) = .empty,
     icons: std.ArrayList(IconOverride) = .empty,
     extensions: std.ArrayList(ExtInfo) = .empty,
+    style_settings: std.ArrayList(SettingOverride) = .empty,
     layout: layout_mod.Layout = .{},
     has_layout: bool = false,
     problems: std.ArrayList(Problem) = .empty,
@@ -298,6 +303,9 @@ list_req: ?ListReq = null,
 list_query: [max_query]u8 = undefined,
 act_req: ?ActReq = null,
 root_req: ?RootReq = null,
+/// The style to load before init.lua (under `lock`); empty is none.
+style: [64]u8 = undefined,
+style_len: usize = 0,
 submit_req: ?*SubmitReq = null,
 root_query: [max_query]u8 = undefined,
 
@@ -342,6 +350,19 @@ pub fn shutdown(h: *Host) void {
     h.gpa.free(h.config_dir);
     h.gpa.free(h.data_dir);
     h.gpa.destroy(h);
+}
+
+/// The style loaded before init.lua from the next reload on: a folder in
+/// <config>/styles, else a built-in one; empty for none. False when it was
+/// that one already.
+pub fn setStyle(h: *Host, name: []const u8) bool {
+    h.lock.lockUncancelable(h.io);
+    defer h.lock.unlock(h.io);
+    const n = @min(name.len, h.style.len);
+    if (std.mem.eql(u8, h.style[0..h.style_len], name[0..n])) return false;
+    @memcpy(h.style[0..n], name[0..n]);
+    h.style_len = n;
+    return true;
 }
 
 /// Loads every file again; the new registry arrives through the callback.
@@ -501,6 +522,13 @@ fn doReload(h: *Host) void {
     var load: Load = .{ .a = reg.arena.allocator() };
 
     const wa = h.warena.allocator();
+    // The style first: init.lua may adjust it.
+    const style = blk: {
+        h.lock.lockUncancelable(h.io);
+        defer h.lock.unlock(h.io);
+        break :blk wa.dupe(u8, h.style[0..h.style_len]) catch "";
+    };
+    if (style.len > 0) h.loadStyle(&load, style);
     if (std.fmt.allocPrintSentinel(wa, "{s}/init.lua", .{h.config_dir}, 0)) |path| {
         if (index.sys.info(path) != null) h.loadFile(&load, "config", h.config_dir, path);
     } else |_| {}
@@ -527,6 +555,7 @@ fn doReload(h: *Host) void {
     reg.prefs = load.prefs.items;
     reg.icons = load.icons.items;
     reg.extensions = load.extensions.items;
+    reg.style_settings = load.style_settings.items;
     reg.layout = load.layout;
     reg.has_layout = load.has_layout;
     reg.problems = load.problems.items;
@@ -569,7 +598,25 @@ fn problem(load: *Load, ext: []const u8, message: []const u8) void {
     }) catch {};
 }
 
+/// A style: <config>/styles/<name>/init.lua, else the built-in one. Its
+/// file runs as the extension "style".
+fn loadStyle(h: *Host, load: *Load, name: []const u8) void {
+    const wa = h.warena.allocator();
+    const dir = std.fmt.allocPrintSentinel(wa, "{s}/styles/{s}", .{ h.config_dir, name }, 0) catch return;
+    const path = std.fmt.allocPrintSentinel(wa, "{s}/init.lua", .{dir}, 0) catch return;
+    if (index.sys.info(path) != null) return h.loadSource(load, "style", dir, path, null);
+    // A style folder may hold only a style.css.
+    if (index.sys.info(dir) != null) return;
+    if (styles.find(name)) |s| return h.loadSource(load, "style", h.config_dir, "=style", s.lua);
+    problem(load, "style", "no such style");
+}
+
 fn loadFile(h: *Host, load: *Load, id: []const u8, dir: []const u8, path: [:0]const u8) void {
+    h.loadSource(load, id, dir, path, null);
+}
+
+/// Runs a file (`path`), or `source` (then `path` names it in errors).
+fn loadSource(h: *Host, load: *Load, id: []const u8, dir: []const u8, path: [:0]const u8, source: ?[:0]const u8) void {
     const wa = h.warena.allocator();
     const e = h.gpa.create(Ext) catch return problem(load, id, "out of memory");
     e.* = .{
@@ -586,15 +633,15 @@ fn loadFile(h: *Host, load: *Load, id: []const u8, dir: []const u8, path: [:0]co
     // What this file adds is dropped again if it fails half-way.
     const layout_before = load.layout;
     const had_layout = load.has_layout;
-    const marks = .{ load.commands.items.len, load.wcmds.items.len, load.themes.items.len, load.keymaps.items.len, load.settings.items.len, load.prefs.items.len, load.icons.items.len };
+    const marks = .{ load.commands.items.len, load.wcmds.items.len, load.themes.items.len, load.keymaps.items.len, load.settings.items.len, load.prefs.items.len, load.icons.items.len, load.style_settings.items.len };
     e.load = load;
     e.budget.deadline_ns = index.sys.monotonicNs() + load_budget_ns;
-    var ctx: LoadCtx = .{ .e = e, .load = load, .path = path, .ext_index = @intCast(h.exts.items.len) };
+    var ctx: LoadCtx = .{ .e = e, .load = load, .path = path, .source = source, .ext_index = @intCast(h.exts.items.len) };
     const err = lua.protect(e.L, load.a, LoadCtx, &ctx, LoadCtx.run);
     e.load = null;
     e.budget.deadline_ns = std.math.maxInt(u64);
     if (err == null) if (h.exts.append(h.gpa, e)) {
-        if (!std.mem.eql(u8, id, "config")) load.extensions.append(load.a, .{
+        if (!std.mem.eql(u8, id, "config") and !std.mem.eql(u8, id, "style")) load.extensions.append(load.a, .{
             .id = load.a.dupeSentinel(u8, id, 0) catch "",
             .title = if (ctx.title.len > 0) ctx.title else load.a.dupeSentinel(u8, id, 0) catch "",
             .commands = @intCast(load.commands.items.len - marks[0]),
@@ -608,6 +655,7 @@ fn loadFile(h: *Host, load: *Load, id: []const u8, dir: []const u8, path: [:0]co
     load.settings.shrinkRetainingCapacity(marks[4]);
     load.prefs.shrinkRetainingCapacity(marks[5]);
     load.icons.shrinkRetainingCapacity(marks[6]);
+    load.style_settings.shrinkRetainingCapacity(marks[7]);
     load.layout = layout_before;
     load.has_layout = had_layout;
     problem(load, id, err orelse "out of memory");
@@ -619,6 +667,8 @@ const LoadCtx = struct {
     e: *Ext,
     load: *Load,
     path: [:0]const u8,
+    /// Code to run instead of the file (a built-in style).
+    source: ?[:0]const u8 = null,
     ext_index: u16,
     /// lumen.extension's title, once parsed.
     title: [:0]const u8 = "",
@@ -626,7 +676,11 @@ const LoadCtx = struct {
     fn run(L: *lua.State, ctx: *LoadCtx) void {
         lua.openLibs(L);
         api.install(L, ctx.e);
-        if (lua.c.luaL_loadfilex(L, ctx.path.ptr, "t") != lua.c.LUA_OK) _ = lua.c.lua_error(L);
+        const loaded = if (ctx.source) |src|
+            lua.c.luaL_loadbufferx(L, src.ptr, src.len, ctx.path.ptr, "t")
+        else
+            lua.c.luaL_loadfilex(L, ctx.path.ptr, "t");
+        if (loaded != lua.c.LUA_OK) _ = lua.c.lua_error(L);
         lua.c.lua_callk(L, 0, 1, 0, null);
         switch (lua.c.lua_type(L, -1)) {
             lua.c.LUA_TNIL => {},
@@ -1285,12 +1339,20 @@ pub fn stamp(config_dir: []const u8) u64 {
     var hasher: std.hash.Wyhash = .init(0);
     var buf: [4096]u8 = undefined;
     if (std.fmt.bufPrintSentinel(&buf, "{s}/init.lua", .{config_dir}, 0)) |p| hashFile(&hasher, p) else |_| {}
-    const ext_dir = std.fmt.bufPrintSentinel(&buf, "{s}/extensions", .{config_dir}, 0) catch return hasher.final();
-    const d = c.g_dir_open(ext_dir.ptr, 0, null) orelse return hasher.final();
+    hashFolders(&hasher, config_dir, "extensions");
+    hashFolders(&hasher, config_dir, "styles");
+    return hasher.final();
+}
+
+/// The .lua files in each folder of <config>/<kind>.
+fn hashFolders(hasher: *std.hash.Wyhash, config_dir: []const u8, kind: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    const top = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ config_dir, kind }, 0) catch return;
+    const d = c.g_dir_open(top.ptr, 0, null) orelse return;
     defer c.g_dir_close(d);
     while (c.g_dir_read_name(d)) |n| {
         var sub_buf: [4096]u8 = undefined;
-        const sub = std.fmt.bufPrintSentinel(&sub_buf, "{s}/extensions/{s}", .{ config_dir, std.mem.span(n) }, 0) catch continue;
+        const sub = std.fmt.bufPrintSentinel(&sub_buf, "{s}/{s}", .{ top, std.mem.span(n) }, 0) catch continue;
         hasher.update(sub);
         const sd = c.g_dir_open(sub.ptr, 0, null) orelse continue;
         defer c.g_dir_close(sd);
@@ -1299,10 +1361,9 @@ pub fn stamp(config_dir: []const u8) u64 {
             if (!std.mem.endsWith(u8, f, ".lua")) continue;
             var fbuf: [4096]u8 = undefined;
             const p = std.fmt.bufPrintSentinel(&fbuf, "{s}/{s}", .{ sub, f }, 0) catch continue;
-            hashFile(&hasher, p);
+            hashFile(hasher, p);
         }
     }
-    return hasher.final();
 }
 
 fn hashFile(hasher: *std.hash.Wyhash, path: [:0]const u8) void {

@@ -9,6 +9,7 @@
 pub const gboolean = c_int;
 pub const GPid = c_int;
 pub const GdkModifierType = c_uint;
+pub const GdkFrameClock = opaque {};
 
 pub const GError = extern struct {
     domain: u32,
@@ -314,6 +315,8 @@ pub extern fn gtk_widget_set_focusable(w: *GtkWidget, v: gboolean) void;
 pub extern fn gtk_widget_get_frame_clock(w: *GtkWidget) ?*anyopaque;
 pub extern fn gtk_widget_add_controller(w: *GtkWidget, controller: *GtkEventController) void;
 pub extern fn gtk_widget_compute_bounds(w: *GtkWidget, target: *GtkWidget, out: *graphene_rect_t) gboolean;
+pub const GtkTickCallback = *const fn (?*GtkWidget, ?*GdkFrameClock, ?*anyopaque) callconv(.c) gboolean;
+pub extern fn gtk_widget_add_tick_callback(w: *GtkWidget, cb: GtkTickCallback, data: ?*anyopaque, notify: ?*const anyopaque) c_uint;
 
 pub extern fn gtk_box_new(orientation: c_int, spacing: c_int) *GtkWidget;
 pub extern fn gtk_box_append(box: *GtkBox, child: *GtkWidget) void;

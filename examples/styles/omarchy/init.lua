@@ -5,9 +5,10 @@
 --
 -- On Omarchy it follows the theme you pick there (it reads
 -- ~/.local/state/omarchy/current/theme/colors.toml); elsewhere it starts on
--- Tokyo Night. All 23 Omarchy palettes are in Change Theme ("Your Themes").
+-- Tokyo Night. All 23 Omarchy palettes are in Change Theme ("Omarchy Themes").
 --
--- Copy this file to ~/.config/lumen/init.lua and style.css beside it.
+-- Built into Lumen: pick it in Change Theme > Styles. To change it, copy
+-- this folder to ~/.config/lumen/styles/omarchy and edit it there.
 local lumen = require("lumen")
 
 -- A palette to always use ("omarchy-nord", "omarchy-gruvbox"...), or nil:
@@ -84,7 +85,6 @@ lumen.layout {
   show = {
     hints = false,
     key_hints = false,
-    accessories = false,
     section_titles = false,
     scope = false,
     back = false,

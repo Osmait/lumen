@@ -67,6 +67,8 @@ pub fn build(b: *std.Build) void {
     mod.addImport("c", c_mod);
     mod.addImport("sqlite", sqlite.createModule());
     mod.addImport("lua", lua.createModule());
+    // The styles in examples/styles, built in (Change Theme > Styles).
+    mod.addImport("styles", b.createModule(.{ .root_source_file = b.path("examples/styles/styles.zig"), .target = target, .optimize = optimize }));
 
     const exe = b.addExecutable(.{ .name = "lumen", .root_module = mod });
     b.installArtifact(exe);

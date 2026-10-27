@@ -1,7 +1,7 @@
 -- Lumen dressed as Raycast: one panel, a footer that says what Enter does,
 -- subtitles beside titles, a quiet grey selection.
--- Copy this file to ~/.config/lumen/init.lua and style.css beside it
--- (or paste the lines below into your own init.lua).
+-- Built into Lumen: pick it in Change Theme > Styles. To change it, copy
+-- this folder to ~/.config/lumen/styles/raycast and edit it there.
 local lumen = require("lumen")
 
 lumen.theme {
@@ -9,7 +9,7 @@ lumen.theme {
   bg = "#1c1c1e", surface = "#26262a", fg = "#ececee", ink = "#ffffff", accent = "#ff6363",
 }
 
-lumen.set { theme = "raycast", density = "compact" }
+lumen.set { theme = "raycast", density = "compact", opacity = 97 }
 
 lumen.layout {
   width = 750,

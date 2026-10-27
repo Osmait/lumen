@@ -10,7 +10,9 @@ const proc = @import("../sys/proc.zig");
 const Apps = @import("../providers/Apps.zig");
 const run = @import("../actions.zig");
 const index = @import("index");
+const styles = @import("styles");
 const settings_mod = @import("../settings.zig");
+const ext_view = @import("ext_view.zig");
 const Settings = settings_mod.Settings;
 const themes = @import("themes.zig");
 const Kind = core.file_kind.Kind;
@@ -89,7 +91,6 @@ fn settingName(s: item_mod.Setting) ?[]const u8 {
     return switch (s) {
         .toggle => |t| @tagName(t),
         .choose => |ch| @tagName(ch),
-        .go => |v| if (v == .themes) "theme" else null,
         else => null,
     };
 }
@@ -331,6 +332,7 @@ pub fn defaultAppsCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
 
 pub fn themeCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
     var out: std.ArrayList(Item) = .empty;
+    styleCandidates(ui, a, &out);
     const dark = ui.preferDark();
     const auto_theme = themes.find(themes.auto_id, dark);
     out.append(a, .{
@@ -347,8 +349,82 @@ pub fn themeCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
             out.append(a, themeItem(ui, a, t, if (want_dark) "Dark" else "Light")) catch break;
         }
     }
-    for (themes.custom) |*t| out.append(a, themeItem(ui, a, t, "Your Themes")) catch break;
+    const style_section = std.fmt.allocPrintSentinel(a, "{s} Themes", .{styleTitle(a, ui.settings.style)}, 0) catch "Style Themes";
+    for (themes.custom) |*t| if (t.from_style) out.append(a, themeItem(ui, a, t, style_section)) catch break;
+    for (themes.custom) |*t| if (!t.from_style) out.append(a, themeItem(ui, a, t, "Your Themes")) catch break;
     return out.items;
+}
+
+/// Styles: the built-in ones, then "Custom", the folders in
+/// ~/.config/lumen/styles (one named like a built-in style replaces it).
+fn styleCandidates(ui: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item)) void {
+    const custom = customStyles(ui, a);
+    const current = if (ui.settings.style.len > 0) ui.settings.style else "lumen";
+    for (&styles.all) |*s| {
+        if (has(custom, s.id)) continue;
+        out.append(a, styleItem(a, s.id, s.name, s.description, "Styles", current)) catch return;
+    }
+    for (custom) |name| {
+        const sub = std.fmt.allocPrintSentinel(a, "~/.config/lumen/styles/{s}", .{name}, 0) catch "";
+        out.append(a, styleItem(a, name, titleOf(a, name), sub, "Custom", current)) catch return;
+    }
+}
+
+/// A style's name: the built-in one's, else its folder's ("my-style" is
+/// "My Style").
+fn styleTitle(a: std.mem.Allocator, id: []const u8) [:0]const u8 {
+    if (id.len == 0) return "Lumen";
+    if (styles.find(id)) |s| return s.name;
+    return titleOf(a, id);
+}
+
+fn titleOf(a: std.mem.Allocator, name: []const u8) [:0]const u8 {
+    const out = a.allocSentinel(u8, name.len, 0) catch return "";
+    var start = true;
+    for (name, 0..) |ch, i| {
+        out[i] = if (ch == '-' or ch == '_') ' ' else if (start) std.ascii.toUpper(ch) else ch;
+        start = ch == '-' or ch == '_';
+    }
+    return out;
+}
+
+fn has(names: []const [:0]const u8, name: []const u8) bool {
+    for (names) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+fn styleItem(a: std.mem.Allocator, id: []const u8, name: [:0]const u8, description: [:0]const u8, section: [:0]const u8, current: []const u8) Item {
+    return .{
+        .key = std.fmt.allocPrint(a, "style:{s}", .{id}) catch "",
+        .section = section,
+        .title = name,
+        .subtitle = description,
+        .accessory = if (std.mem.eql(u8, current, id)) "✓" else "",
+        .icon = .{ .tile = .{ .name = "applications-graphics-symbolic", .color = .purple } },
+        .action = .{ .setting = .{ .style = id } },
+    };
+}
+
+/// The folders in ~/.config/lumen/styles, sorted.
+fn customStyles(ui: *Ui, a: std.mem.Allocator) []const [:0]const u8 {
+    const path = std.fmt.allocPrintSentinel(a, "{s}/styles", .{ui.config_dir}, 0) catch return &.{};
+    const d = c.g_dir_open(path.ptr, 0, null) orelse return &.{};
+    defer c.g_dir_close(d);
+    var names: std.ArrayList([:0]const u8) = .empty;
+    while (c.g_dir_read_name(d)) |n| {
+        const name = std.mem.span(n);
+        if (name.len == 0 or name[0] == '.' or !settings_mod.isToken(name)) continue;
+        const full = std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ path, name }, 0) catch continue;
+        const info = index.sys.info(full) orelse continue;
+        if (!info.is_dir) continue;
+        names.append(a, a.dupeSentinel(u8, name, 0) catch continue) catch continue;
+    }
+    std.mem.sort([:0]const u8, names.items, {}, struct {
+        fn lt(_: void, x: [:0]const u8, y: [:0]const u8) bool {
+            return std.mem.order(u8, x, y) == .lt;
+        }
+    }.lt);
+    return names.items;
 }
 
 fn themeItem(ui: *Ui, a: std.mem.Allocator, t: *const themes.Theme, section: [:0]const u8) Item {
@@ -370,6 +446,7 @@ pub fn swatchOf(t: *const themes.Theme) item_mod.Icon {
 pub fn performSetting(ui: *Ui, s: item_mod.Setting, op: item_mod.Op) void {
     const locked: ?[]const u8 = switch (s) {
         .theme => "theme",
+        .style => "style",
         else => settingName(s),
     };
     if (locked) |key| if (ui.overridden(key)) return ui.showFailure("Set in init.lua");
@@ -413,6 +490,15 @@ pub fn performSetting(ui: *Ui, s: item_mod.Setting, op: item_mod.Op) void {
             _ = ui.settings.set("theme", id);
             ui.saveSettings();
             ui.goBack();
+        },
+        .style => |id| {
+            // Its CSS now, its Lua (layout, themes, lumen.set) on the reload.
+            _ = ui.settings.set("style", id);
+            ui.saveSettings();
+            ui.style_defaults_pending = true;
+            ext_view.syncStyle(ui);
+            ui.setReselect("style:{s}", .{id});
+            ui.rebuild();
         },
         .open_with => |id| {
             if (ui.choosing != .file) return;

@@ -18,6 +18,7 @@ const commands = @import("../providers/commands.zig");
 const scripts = @import("../providers/scripts.zig");
 const run = @import("../actions.zig");
 const index = @import("index");
+const styles = @import("styles");
 const stats = @import("../stats.zig");
 pub const ContentSearch = @import("ContentSearch.zig");
 const settings_mod = @import("../settings.zig");
@@ -187,6 +188,13 @@ css: *c.GtkCssProvider = undefined,
 css_hash: u64 = 0,
 /// The user's style.css as last read (it is applied after Lumen's).
 user_css_stamp: settings_mod.Stamp = .none,
+/// The style folder's style.css, likewise (built-in styles have none).
+style_css_stamp: settings_mod.Stamp = .none,
+/// A style was chosen: its lumen.set applies when its registry arrives.
+style_defaults_pending: bool = false,
+/// Scrolls to the selection once the rebuilt list has its layout.
+scroll_tick: c_uint = 0,
+scroll_tries: u8 = 0,
 
 /// Lua extensions and init.lua (null when they could not start).
 ext_host: ?*ExtHost = null,
@@ -593,6 +601,8 @@ pub fn reloadSettings(self: *Ui) void {
     self.applyAppearance(null);
     self.applyLayout();
     self.applyIconTheme();
+    // The style may have changed in the file, or from init.lua.
+    ext_view.syncStyle(self);
     if (self.on_settings_changed) |f| f();
 }
 
@@ -651,6 +661,7 @@ pub fn applyAppearance(self: *Ui, preview: ?*const themes.Theme) void {
     defer out.deinit();
     themes.css(&out.writer, t, &self.settings) catch return;
     out.writer.writeAll(@embedFile("style.css")) catch return;
+    self.appendStyleCss(&out.writer) catch return;
     self.appendUserCss(&out.writer) catch return;
     out.writer.writeByte(0) catch return;
     const text = out.written();
@@ -660,6 +671,31 @@ pub fn applyAppearance(self: *Ui, preview: ?*const themes.Theme) void {
     if (h == self.css_hash) return;
     self.css_hash = h;
     c.gtk_css_provider_load_from_string(self.css, @ptrCast(text.ptr));
+}
+
+/// The style's CSS, between Lumen's and the user's: styles/<name>/style.css,
+/// else the built-in style's.
+fn appendStyleCss(self: *Ui, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    self.style_css_stamp = .none;
+    const name = self.settings.style;
+    if (name.len == 0) return;
+    var buf: [4096]u8 = undefined;
+    const dir = std.fmt.bufPrintSentinel(&buf, "{s}/styles/{s}", .{ self.config_dir, name }, 0) catch return;
+    if (index.sys.info(dir) == null) {
+        const s = styles.find(name) orelse return;
+        try w.print("\n/* style {s} */\n", .{name});
+        return w.writeAll(s.css);
+    }
+    var pbuf: [4096]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&pbuf, "{s}/style.css", .{dir}, 0) catch return;
+    self.style_css_stamp = settings_mod.Stamp.of(path.ptr);
+    var contents: ?[*:0]u8 = null;
+    var len: usize = 0;
+    if (c.g_file_get_contents(path.ptr, &contents, &len, null) == 0) return;
+    defer c.g_free(contents);
+    try w.print("\n/* {s} */\n", .{path});
+    try w.writeAll(contents.?[0..len]);
+    try w.writeByte('\n');
 }
 
 /// $XDG_CONFIG_HOME/lumen/style.css, after Lumen's rules so it wins. The
@@ -680,7 +716,10 @@ fn appendUserCss(self: *Ui, w: *std.Io.Writer) std.Io.Writer.Error!void {
 fn userCssChanged(self: *Ui) bool {
     var buf: [4096]u8 = undefined;
     const path = std.fmt.bufPrintSentinel(&buf, "{s}/style.css", .{self.config_dir}, 0) catch return false;
-    return !settings_mod.Stamp.of(path.ptr).eql(self.user_css_stamp);
+    if (!settings_mod.Stamp.of(path.ptr).eql(self.user_css_stamp)) return true;
+    if (self.settings.style.len == 0) return false;
+    const style = std.fmt.bufPrintSentinel(&buf, "{s}/styles/{s}/style.css", .{ self.config_dir, self.settings.style }, 0) catch return false;
+    return !settings_mod.Stamp.of(style.ptr).eql(self.style_css_stamp);
 }
 
 /// The desktop's light/dark preference (dark when it cannot be read).
@@ -1361,7 +1400,14 @@ fn setHint(self: *Ui, text: []const u8, warn: bool) void {
 
 fn scrollTo(self: *Ui, row: *c.GtkWidget) void {
     var b: c.graphene_rect_t = undefined;
-    if (c.gtk_widget_compute_bounds(row, if (self.grid_mode) self.grid else self.list, &b) == 0) return;
+    // A row just added has no place yet: once the list's layout is done.
+    if (c.gtk_widget_compute_bounds(row, if (self.grid_mode) self.grid else self.list, &b) == 0 or b.size.height == 0) {
+        if (self.scroll_tick == 0) {
+            self.scroll_tries = 0;
+            self.scroll_tick = c.gtk_widget_add_tick_callback(self.scroller, &onScrollTick, self, null);
+        }
+        return;
+    }
     const adj = c.gtk_scrolled_window_get_vadjustment(@ptrCast(self.scroller));
     const value = c.gtk_adjustment_get_value(adj);
     const page = c.gtk_adjustment_get_page_size(adj);
@@ -1370,6 +1416,26 @@ fn scrollTo(self: *Ui, row: *c.GtkWidget) void {
     // Keep a section header above the first item visible, and the selection
     // clear of the fade at the bottom edge (style.css, undershoot).
     if (top < value + 4) c.gtk_adjustment_set_value(adj, @max(top - 30, 0)) else if (bottom > value + page - 20) c.gtk_adjustment_set_value(adj, bottom - page + 20);
+}
+
+fn onScrollTick(_: ?*c.GtkWidget, _: ?*c.GdkFrameClock, data: ?*anyopaque) callconv(.c) c.gboolean {
+    const self: *Ui = @ptrCast(@alignCast(data.?));
+    self.scroll_tries += 1;
+    const ri = self.selected orelse {
+        self.scroll_tick = 0;
+        return 0;
+    };
+    if (ri >= self.rows.items.len) {
+        self.scroll_tick = 0;
+        return 0;
+    }
+    const row = self.rows.items[ri].widget;
+    var b: c.graphene_rect_t = undefined;
+    const placed = c.gtk_widget_compute_bounds(row, if (self.grid_mode) self.grid else self.list, &b) != 0 and b.size.height > 0;
+    if (!placed and self.scroll_tries < 10) return 1;
+    self.scroll_tick = 0;
+    if (placed) self.scrollTo(row);
+    return 0;
 }
 
 pub fn selectedItem(self: *Ui) ?*Item {
@@ -1571,6 +1637,7 @@ pub fn dump(self: *Ui, gpa: std.mem.Allocator) (std.Io.Writer.Error || std.mem.A
     try w.print("view: {t}\nvisible: {}\nquery: {s}\n", .{ self.view, c.gtk_widget_get_visible(self.window) != 0, self.query() });
     try w.print("title: {s}\nprimary: {s}\n", .{ self.viewTitle(), self.primary });
     const lay = self.layout;
+    try w.print("style: {s}\n", .{if (self.settings.style.len > 0) self.settings.style else "-"});
     try w.print("layout: {d}x{d} panels={t} search={t} detail={t} rows={s} footer={}", .{ self.panelW(), self.panelH(), lay.panels, lay.search, lay.detail, if (lay.rows == .inline_) "inline" else "stacked", lay.footer });
     try w.writeAll(" bar=");
     for (lay.searchbar.slice(), 0..) |p, i| try w.print("{s}{t}", .{ if (i > 0) "," else "", p });

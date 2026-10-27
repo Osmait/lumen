@@ -482,6 +482,29 @@ expect "a layout width shows as set in init.lua" 'Window Width \| Set in init.lu
 cp "$T/init.lua.bak" "$H/.config/lumen/init.lua"; L --reload; sleep 0.5
 L --hide; query root ""
 expect "back to the default layout" '^layout: [0-9]+x[0-9]+ panels=split search=top'
+# Styles, chosen in Change Theme: built in, or a folder in styles/.
+query themes "minimal"
+expect "built-in styles are listed" 'Minimal \| rofi-like.*style:minimal'
+L --key enter; sleep 0.6
+expect "a chosen style is applied at once" '^style: minimal'
+expect "with its layout" '^layout: 560x420 panels=single search=bottom detail=bottom.* prompt=run'
+grep -q '^theme = minimal' "$C" && ok "the style's lumen.set becomes the settings" || ko "the style's lumen.set becomes the settings" "$(cat "$C")"
+query settings "density"
+expect "init.lua still fixes what it sets" 'Density \| Set in init.lua'
+mkdir -p "$H/.config/lumen/styles/e2e-look"
+printf 'lumen.layout { width = 640, panels = "single" }\nlumen.theme { id = "e2e-ink", name = "E2E Ink", bg = "#101010", fg = "#eeeeee", accent = "#ff8800" }\nlumen.set { theme = "e2e-ink" }\n' >"$H/.config/lumen/styles/e2e-look/init.lua"
+query themes "e2e look"
+expect "a style folder is listed under Custom" 'E2e Look \| ~/.config/lumen/styles/e2e-look'
+L --key enter; sleep 0.6
+expect "a custom style is applied" '^layout: 640x'
+query themes "e2e ink"
+expect "its themes are listed under its name" 'E2E Ink \| .*✓'
+query themes "lumen"
+L --key enter; sleep 0.6
+L --hide; query root ""
+expect "back to Lumen's own style" '^layout: [0-9]+x[0-9]+ panels=split search=top'
+grep -q '^theme = auto' "$C" && ok "Lumen's style brings its theme back" || ko "Lumen's style brings its theme back" "$(cat "$C")"
+rm -rf "$H/.config/lumen/styles"
 sed -i 's/Fixture Fruits/Fixture Fruit Bowl/' "$H/.config/lumen/extensions/fixture/init.lua"
 L --hide; L --query "fruit bowl"
 expect_soon "edited extensions reload when the window opens" '> Fixture Fruit Bowl'

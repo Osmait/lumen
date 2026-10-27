@@ -11,14 +11,17 @@ Lumen runs Lua 5.4 for three things:
 - **`lumen.layout`**: the window's structure (size, place, one panel or
   two, a footer...), in `init.lua`. With `style.css` it can make Lumen look
   like Raycast, Spotlight, Alfred or rofi: see [`examples/styles`](examples/styles).
+- **Styles**: a whole look (an `init.lua` with the above and a `style.css`)
+  in `~/.config/lumen/styles/<name>/`, chosen in Change Theme.
 
 Lumen draws everything itself: an extension returns data (rows, details,
 actions) and it shows up like the rest of Lumen, in every theme. Lua never
 runs on the window's thread, so a slow extension cannot freeze the window.
 
 Edits take effect the next time the window opens. Lumen watches `init.lua`
-and the `.lua` files directly inside each extension's folder; after editing a
-file in a subfolder, or to reload at once, run `lumen --reload`.
+and the `.lua` files directly inside each extension's and style's folder;
+after editing a file in a subfolder, or to reload at once, run
+`lumen --reload`.
 
 ## A first extension
 
@@ -402,6 +405,34 @@ sleep, restart, shutdown, logout, dark, trash, volup, voldown, mute, mic,
 play, next, prev), `win:` (window management: left, right, maximize...),
 `script:<file name>`, `ext:<extension>.<command>`, and `file:<extension>` or
 `file:folder`. `lumen --dump` prints each row's icon and, last, its key.
+
+## Styles
+
+A style is a look you switch to in Change Theme, under **Styles** (the ones
+in [`examples/styles`](examples/styles), built in) and **Custom** (each
+folder in `~/.config/lumen/styles`, which may hold an `init.lua`, a
+`style.css` or both; one named like a built-in style replaces it). The
+choice is the `style` setting in `settings.conf`.
+
+The style's `init.lua` runs before yours, so yours can adjust it, and its
+`style.css` comes between Lumen's rules and yours. Inside it:
+
+- `lumen.layout` and `lumen.theme` work as in `init.lua`; its themes are
+  listed under the style's name.
+- `lumen.set` gives the values the settings take when the style is
+  chosen, without fixing them: they can be changed afterwards in Settings
+  and Change Theme. (In `init.lua`, `lumen.set` fixes them.) Set the same
+  keys in every style you switch between (`theme`, `density`, `opacity`), or
+  one style's value stays in the next.
+
+```lua
+-- ~/.config/lumen/styles/paper/init.lua
+local lumen = require("lumen")
+lumen.theme { id = "paper", name = "Paper", dark = false,
+  bg = "#f7f3ea", fg = "#2b2b2b", accent = "#c2410c" }
+lumen.set { theme = "paper", density = "comfortable", opacity = 100 }
+lumen.layout { width = 640, panels = "single", show = { key_hints = false } }
+```
 
 ## style.css
 

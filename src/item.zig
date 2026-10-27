@@ -130,6 +130,8 @@ pub const Setting = union(enum) {
     /// A value in that list ("large", a desktop file id; "" is automatic).
     pick: [:0]const u8,
     theme: []const u8,
+    /// A style (Change Theme > Styles): its name.
+    style: []const u8,
     /// Opens another settings list (themes, default apps).
     go: View,
     /// Open With: open the file being chosen for with this app (desktop id).
@@ -265,6 +267,7 @@ pub fn actionsFor(item: *const Item) []const Entry {
             .choose, .kind, .go => &.{.{ .label = "Change", .keys = "↵", .op = .run }},
             .pick => &.{.{ .label = "Select", .keys = "↵", .op = .run }},
             .theme => &.{.{ .label = "Use Theme", .keys = "↵", .op = .run }},
+            .style => &.{.{ .label = "Use Style", .keys = "↵", .op = .run }},
             .open_with => &.{
                 .{ .label = "Open", .keys = "↵", .op = .run },
                 .{ .label = "Open and Always Use", .keys = "Ctrl ↵", .op = .always_use },

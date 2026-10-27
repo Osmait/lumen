@@ -1,8 +1,10 @@
 # Styles
 
-Four complete looks for Lumen, each an `init.lua` (the window's structure
-with `lumen.layout`, a theme, a few settings) and a `style.css` (the finer
-details).
+Complete looks for Lumen, each an `init.lua` (the window's structure with
+`lumen.layout`, themes, a few settings) and a `style.css` (the finer
+details). They are built into Lumen: search **Change Theme**, and the
+**Styles** at the top switch the whole look at once; the themes below them
+then recolour it.
 
 ![Raycast, Spotlight, Alfred and Minimal](../../assets/screenshots/styles.png)
 
@@ -25,17 +27,19 @@ install -Dm755 examples/styles/omarchy/theme-set-hook ~/.config/omarchy/hooks/th
 
 (without it, Lumen picks the new theme up the next time its window opens).
 
-To use one:
+## Your own
+
+A folder in `~/.config/lumen/styles` is a style too, listed under
+**Custom**: an `init.lua`, a `style.css`, or both. Start from one of these:
 
 ```sh
-cp examples/styles/raycast/init.lua ~/.config/lumen/init.lua
-cp examples/styles/raycast/style.css ~/.config/lumen/style.css
-lumen --reload
+mkdir -p ~/.config/lumen/styles
+cp -r examples/styles/omarchy ~/.config/lumen/styles/my-look
 ```
 
-If you already have an `init.lua`, paste the style's `lumen.theme`,
-`lumen.set` and `lumen.layout` calls into it instead. Every option is in
-[EXTENSIONS.md](../../EXTENSIONS.md#layout).
+A folder named like a built-in style (`styles/raycast`) replaces it. How a
+style is loaded, and the options, are in
+[EXTENSIONS.md](../../EXTENSIONS.md#styles).
 
 They imitate the look, not the trade marks: no logos, and no fonts shipped.
 The Raycast, Spotlight and Alfred styles use Apple's SF Pro when it is

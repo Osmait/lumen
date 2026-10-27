@@ -1,6 +1,7 @@
 -- Lumen dressed as Alfred: a framed search field inside one panel, tall
 -- rows with large icons and their subtitles under them, no footer.
--- Copy this file to ~/.config/lumen/init.lua and style.css beside it.
+-- Built into Lumen: pick it in Change Theme > Styles. To change it, copy
+-- this folder to ~/.config/lumen/styles/alfred and edit it there.
 local lumen = require("lumen")
 
 lumen.theme {

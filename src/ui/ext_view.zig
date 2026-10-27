@@ -32,7 +32,14 @@ pub fn start(ui: *Ui) void {
         return;
     };
     ui.ext_stamp = Host.stamp(ui.config_dir);
+    _ = ui.ext_host.?.setStyle(ui.settings.style);
     ui.ext_host.?.reload();
+}
+
+/// Loads the Style setting's style, if it is not the one loaded.
+pub fn syncStyle(ui: *Ui) void {
+    const h = ui.ext_host orelse return;
+    if (h.setStyle(ui.settings.style)) h.reload();
 }
 
 /// After the GTK main loop has stopped.
@@ -90,6 +97,16 @@ fn onRegistry(reg: *Host.Registry, ctx: ?*anyopaque) void {
     // freeing it. A theme from init.lua may be the one in use, and lumen.set
     // may have changed (or stopped changing) settings.
     ui.reloadSettings();
+    // A style just chosen: its lumen.set as the new values.
+    if (ui.style_defaults_pending) {
+        ui.style_defaults_pending = false;
+        var changed = false;
+        for (reg.style_settings) |o| {
+            if (ui.overridden(o.key)) continue;
+            changed = ui.settings.set(o.key, o.value) or changed;
+        }
+        if (changed) ui.saveSettings();
+    }
     if (ui.view != .ext) {
         // Same row as before the reload (an update from Settings, say).
         if (ui.selectedItem()) |it| ui.setReselect("{s}", .{it.key});

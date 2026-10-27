@@ -22,6 +22,8 @@ pub const Theme = struct {
     ink: u24,
     /// Caret, selection, search highlights, warnings.
     accent: u24,
+    /// Registered by the style (Change Theme lists them under its name).
+    from_style: bool = false,
 };
 
 /// Follows the desktop's light/dark preference with Lumen Dark / Light.

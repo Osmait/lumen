@@ -1,6 +1,7 @@
 -- A minimal, rofi-like Lumen: text only, square, monospace, the search
 -- field at the bottom, in the middle of the screen.
--- Copy this file to ~/.config/lumen/init.lua and style.css beside it.
+-- Built into Lumen: pick it in Change Theme > Styles. To change it, copy
+-- this folder to ~/.config/lumen/styles/minimal and edit it there.
 local lumen = require("lumen")
 
 lumen.theme {

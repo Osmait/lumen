@@ -242,15 +242,14 @@ Lumen's look goes as far as you want to take it: 13 themes, layout settings
 app, command or file kind, and for everything else a `style.css` and
 `lumen.layout` in `init.lua`, which decide the window's structure: one panel
 or two, a footer, where the search field and the detail pane go, what rows
-show. [`examples/styles`](examples/styles) has complete looks: Raycast,
-Spotlight, Alfred, a minimal rofi-like one, and Omarchy's menu (with all its
-palettes, following the Omarchy theme when you run it there):
+show. Styles put all of that together, and you switch between them in
+**Change Theme** as you would between themes: Raycast, Spotlight, Alfred, a
+minimal rofi-like one and Omarchy's menu come built in (Omarchy's with all
+its palettes, following the Omarchy theme when you run it there), and each
+folder in `~/.config/lumen/styles` is one of your own, under **Custom**. See
+[`examples/styles`](examples/styles).
 
 ![Lumen styled as Raycast, Spotlight, Alfred and a minimal rofi-like look](assets/screenshots/styles.png)
-
-```sh
-cp examples/styles/raycast/{init.lua,style.css} ~/.config/lumen/ && lumen --reload
-```
 
 ## Privacy
 

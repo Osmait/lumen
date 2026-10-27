@@ -1,6 +1,7 @@
 -- Lumen dressed as macOS Spotlight: a large search field with a magnifier,
 -- one translucent panel, compact rows with only their titles, macOS blue.
--- Copy this file to ~/.config/lumen/init.lua and style.css beside it.
+-- Built into Lumen: pick it in Change Theme > Styles. To change it, copy
+-- this folder to ~/.config/lumen/styles/spotlight and edit it there.
 local lumen = require("lumen")
 
 lumen.theme {

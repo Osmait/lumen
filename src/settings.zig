@@ -62,6 +62,9 @@ pub const Settings = struct {
     editor: []const u8 = "",
     /// An icon theme for Lumen only; empty follows the desktop.
     icon_theme: []const u8 = "",
+    /// The style in use (Change Theme > Styles): a built-in one or a folder
+    /// in ~/.config/lumen/styles; empty is Lumen's own look.
+    style: []const u8 = "",
     /// A kind's name ("pdf") or an extension (".log") → desktop file id.
     open_with: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
     /// `key = value` lines this version does not know, kept as they were.
@@ -134,6 +137,13 @@ pub const Settings = struct {
             if (isToken(value)) s.theme = s.alloc().dupe(u8, value) catch blk: {
                 s.incomplete = true;
                 break :blk s.theme;
+            };
+            return true;
+        }
+        if (std.mem.eql(u8, key, "style")) {
+            if (value.len == 0 or isToken(value)) s.style = s.alloc().dupe(u8, value) catch blk: {
+                s.incomplete = true;
+                break :blk s.style;
             };
             return true;
         }
@@ -258,7 +268,8 @@ pub const Settings = struct {
             \\# Lumen settings. Change them from Lumen (search "Settings") or here:
             \\# Lumen reads this file again when its window opens.
             \\
-            \\# Appearance. Themes: search "Change Theme" in Lumen.
+            \\# Appearance. Themes and styles: search "Change Theme" in Lumen.
+            \\style = {s}
             \\theme = {s}
             \\# small, default, large
             \\text_size = {t}
@@ -288,11 +299,10 @@ pub const Settings = struct {
             \\editor = {s}
             \\
         , .{
-            p.of("theme").theme,             p.of("text_size").text_size,   p.of("opacity").opacity,
-            p.of("position").position,       p.of("width").width,           p.of("height").height,
-            p.of("density").density,         p.of("icon_theme").icon_theme, p.of("files_in_root").files_in_root,
-            p.of("suggestions").suggestions, p.of("clipboard").clipboard,   p.of("clipboard_keep").clipboard_keep,
-            p.of("terminal").terminal,       p.of("editor").editor,
+            p.of("style").style,                   p.of("theme").theme,                 p.of("text_size").text_size,     p.of("opacity").opacity,
+            p.of("position").position,             p.of("width").width,                 p.of("height").height,           p.of("density").density,
+            p.of("icon_theme").icon_theme,         p.of("files_in_root").files_in_root, p.of("suggestions").suggestions, p.of("clipboard").clipboard,
+            p.of("clipboard_keep").clipboard_keep, p.of("terminal").terminal,           p.of("editor").editor,
         });
         if (s.unknown.items.len > 0) {
             try w.writeAll("\n# Not known to this version of Lumen\n");
@@ -344,6 +354,7 @@ pub const Settings = struct {
             return if (probe.setChoice(ch, value)) .ok else .bad_value;
         }
         if (std.mem.eql(u8, key, "theme")) return if (isToken(value)) .ok else .bad_value;
+        if (std.mem.eql(u8, key, "style")) return if (value.len == 0 or isToken(value)) .ok else .bad_value;
         return .unknown_key;
     }
 };
@@ -382,7 +393,7 @@ fn parseBool(v: []const u8) ?bool {
 
 /// One word of safe characters: values are written back into the file and
 /// passed to programs, so no spaces, quotes or newlines.
-fn isToken(v: []const u8) bool {
+pub fn isToken(v: []const u8) bool {
     if (v.len == 0 or v.len > 200) return false;
     for (v) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '.' or ch == '-' or ch == '_' or ch == '+')) return false;
     return true;

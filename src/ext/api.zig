@@ -267,6 +267,7 @@ fn theme(L: *lua.State) lua.Error!c_int {
         .fg = fg,
         .ink = try color(L, a, "ink", fg),
         .accent = try color(L, a, "accent", null),
+        .from_style = std.mem.eql(u8, e.id, "style"),
     };
     load.themes.append(a, t) catch return lua.fail(L, "not enough memory", .{});
     return 0;
@@ -363,7 +364,9 @@ fn set(L: *lua.State) lua.Error!c_int {
             .unknown_key => return lua.fail(L, "lumen.set: no setting named \"{s}\"", .{key}),
             .bad_value => return lua.fail(L, "lumen.set: \"{s}\" is not a value for {s}", .{ value, key }),
         }
-        load.settings.append(a, .{
+        // A style's settings are defaults for when it is chosen; init.lua's fix them.
+        const list = if (std.mem.eql(u8, e.id, "style")) &load.style_settings else &load.settings;
+        list.append(a, .{
             .key = a.dupeSentinel(u8, key, 0) catch return lua.fail(L, "not enough memory", .{}),
             .value = a.dupeSentinel(u8, value, 0) catch return lua.fail(L, "not enough memory", .{}),
         }) catch return lua.fail(L, "not enough memory", .{});
