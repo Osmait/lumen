@@ -242,7 +242,9 @@ Lumen's look goes as far as you want to take it: 13 themes, layout settings
 app, command or file kind, and for everything else a `style.css` and
 `lumen.layout` in `init.lua`, which decide the window's structure: one panel
 or two, a footer, where the search field and the detail pane go, what rows
-show. [`examples/styles`](examples/styles) has four complete looks:
+show. [`examples/styles`](examples/styles) has complete looks: Raycast,
+Spotlight, Alfred, a minimal rofi-like one, and Omarchy's menu (with all its
+palettes, following the Omarchy theme when you run it there):
 
 ![Lumen styled as Raycast, Spotlight, Alfred and a minimal rofi-like look](assets/screenshots/styles.png)
 

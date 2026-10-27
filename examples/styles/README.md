@@ -12,6 +12,18 @@ details).
 | [`spotlight`](spotlight) | A large search field with a magnifier, compact rows with titles only, macOS blue. |
 | [`alfred`](alfred) | A framed search field inside the panel, tall rows with large icons. |
 | [`minimal`](minimal) | rofi-like: text only, monospace, square, the search field at the bottom. |
+| [`omarchy`](omarchy) | Omarchy's menu: a square card with a 2px border, monospace, "Go…", the screen dimmed behind. All 23 Omarchy palettes, and on Omarchy it follows the theme you pick there. |
+
+![Lumen styled as Omarchy's menu, Tokyo Night](../../assets/screenshots/style-omarchy.png)
+
+On Omarchy, make Lumen switch with the system theme at once: install the
+hook that comes with the style,
+
+```sh
+install -Dm755 examples/styles/omarchy/theme-set-hook ~/.config/omarchy/hooks/theme-set.d/lumen
+```
+
+(without it, Lumen picks the new theme up the next time its window opens).
 
 To use one:
 

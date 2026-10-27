@@ -1,0 +1,95 @@
+/* Omarchy's menu: square, a 2px border in the text colour, no shadow,
+   monospace (Omarchy's `monospace` alias, JetBrainsMono Nerd Font there),
+   a plain search line, rows lifted 8% with accent text when selected. */
+
+.shell,
+.actions { font-family: monospace; }
+
+/* the card: search line and results as one bordered box */
+.search,
+.results-island,
+.shell.single .search,
+.shell.single .results-island,
+.shell.single.alone .search {
+  border-radius: 0;
+  box-shadow: none;
+  background-color: var(--bg);
+  background-image: none;
+}
+.shell.single .search {
+  min-height: 62px;
+  padding: 0 30px;
+  border: 2px solid var(--fg);
+  border-bottom-width: 0;
+}
+.shell.single .results-island {
+  padding: 4px 18px 18px;
+  border: 2px solid var(--fg);
+  border-top-width: 0;
+}
+.shell.single.alone .search { border-bottom-width: 2px; }
+
+.query { font-size: 16px; }
+.query > placeholder { color: alpha(var(--fg), 0.58); }
+.query > selection { background-color: alpha(var(--accent), 0.35); }
+
+/* rows */
+.results { padding: 0; }
+.results > row {
+  border-radius: 0;
+  min-height: 50px;
+  padding: 0 12px;
+}
+.results > row:hover:not(:selected) { background-color: alpha(var(--fg), 0.04); }
+.results > row:selected {
+  background-color: alpha(var(--fg), 0.08);
+  background-image: none;
+  box-shadow: none;
+}
+.results > row .title { font-size: 16px; font-weight: 500; color: var(--fg); }
+.results > row:selected .title,
+.results > row:selected .subtitle { color: var(--accent); }
+.results > row .subtitle { font-size: 11px; color: alpha(var(--fg), 0.52); }
+
+/* icons as plain glyphs in the text colour, not coloured tiles */
+.tile,
+.tile-red, .tile-orange, .tile-yellow, .tile-green,
+.tile-blue, .tile-purple, .tile-pink, .tile-gray {
+  background: none;
+  box-shadow: none;
+  -gtk-icon-shadow: none;
+  color: var(--fg);
+  min-width: 36px;
+}
+.results > row:selected .tile { color: var(--accent); }
+.app-icon { -gtk-icon-shadow: none; }
+
+/* the detail pane, behind a thin rule, in monospace */
+.detail { border-left: 1px solid alpha(var(--fg), 0.35); margin-left: 12px; }
+.detail-text, .detail-text.markdown { font-family: monospace; font-size: 14px; padding: 6px 18px; }
+.meta { border-top: 1px solid alpha(var(--fg), 0.2); }
+.meta-header { color: alpha(var(--fg), 0.52); }
+
+/* the action panel (Ctrl+K): the same card */
+.actions {
+  border-radius: 0;
+  border: 2px solid var(--fg);
+  box-shadow: none;
+  background-color: var(--bg);
+}
+.actions row { border-radius: 0; }
+.actions row:selected {
+  background-color: alpha(var(--fg), 0.08);
+  background-image: none;
+  box-shadow: none;
+}
+.actions row:selected label { color: var(--accent); }
+.kbd { border-radius: 0; }
+
+/* grids, the scrollbar */
+.grid > flowboxchild { border-radius: 0; }
+.grid > flowboxchild:selected { background-color: alpha(var(--fg), 0.08); background-image: none; color: var(--accent); }
+.results-island scrollbar slider { border-radius: 0; }
+
+/* the whole screen dims behind the menu, as Omarchy's does */
+window.lumen-backdrop { background-color: alpha(var(--bg), 0.5); }

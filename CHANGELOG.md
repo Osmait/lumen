@@ -45,6 +45,9 @@ All notable changes are listed here. The format follows
   minimal rofi-like one.
 - `lumen.layout`'s `searchbar` and `row` order (and leave out) the search
   bar's and the rows' parts; `prompt` adds fixed text before the search field.
+- An Omarchy style (`examples/styles/omarchy`): its menu's look, its 23
+  palettes, following Omarchy's current theme, with a theme-set hook.
+- `lumen.layout`'s `placeholder`: the empty search field's text.
 - Settings > Extensions lists every installed extension (failed ones too),
   with its preferences, Open Folder, Update (git) and Uninstall.
 - Icons: image files (PNG, SVG) wherever an icon is given; `lumen.icons`

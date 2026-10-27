@@ -342,6 +342,7 @@ lumen.layout {
   footer = true,                  -- a bar: the view, what Enter does, Actions
   rows = "inline",                -- subtitles beside titles ("stacked": under)
   prompt = "run",                 -- fixed text in the search bar, like rofi's
+  placeholder = "Go…",            -- the empty search field's text ("<view>…" elsewhere)
   searchbar = { "back", "icon", "prompt", "scope", "entry", "keys" },
   row = { "icon", "text", "accessory", "hint" },
   show = {                        -- all true by default, except search_icon
@@ -365,6 +366,7 @@ lumen.layout {
 | `searchbar` | The search bar's parts, in order: `back` (the arrow inside a view), `icon` (the magnifier, with `show.search_icon`), `prompt`, `scope` (the view's name), `entry` (the text, required), `keys` (the Ctrl K chip). Parts left out are not shown. |
 | `row` | A row's parts, in order: `icon`, `text` (title and subtitle, required), `accessory`, `hint` (what Enter does). `{ "text", "accessory", "icon" }` puts icons on the right. |
 | `prompt` | Text before the search field (`.prompt` in style.css). |
+| `placeholder` | What the empty search field says at the root; inside a view it then says the view's name and "…" (Omarchy's menu does this). |
 
 A key or value Lumen does not know is an error shown in the root search.
 

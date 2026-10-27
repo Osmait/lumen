@@ -1,0 +1,5 @@
+#!/bin/sh
+# Omarchy runs ~/.config/omarchy/hooks/theme-set.d/* after `omarchy theme set`.
+# Install as ~/.config/omarchy/hooks/theme-set.d/lumen (executable) so Lumen
+# picks up the new theme at once.
+exec lumen --reload

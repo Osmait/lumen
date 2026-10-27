@@ -399,9 +399,10 @@ fn layout(L: *lua.State) lua.Error!c_int {
                 if (is_bar) "back, icon, prompt, scope, entry, keys" else "icon, text, accessory, hint",
                 if (is_bar) "entry" else "text",
             });
-        } else if (std.mem.eql(u8, key, "prompt")) {
-            const p = lua.toSlice(L, -1) orelse return lua.fail(L, "lumen.layout: prompt is a string", .{});
-            l.prompt = load.a.dupeSentinel(u8, p[0..@min(p.len, 64)], 0) catch return lua.fail(L, "not enough memory", .{});
+        } else if (std.mem.eql(u8, key, "prompt") or std.mem.eql(u8, key, "placeholder")) {
+            const p = lua.toSlice(L, -1) orelse return lua.fail(L, "lumen.layout: {s} is a string", .{key});
+            const text = load.a.dupeSentinel(u8, p[0..@min(p.len, 64)], 0) catch return lua.fail(L, "not enough memory", .{});
+            if (key[1] == 'r') l.prompt = text else l.placeholder = text;
         } else if (std.mem.eql(u8, key, "show")) {
             if (c.lua_type(L, -1) != c.LUA_TTABLE) return lua.fail(L, "lumen.layout: show is a table of true/false", .{});
             const show = lua.absIndex(L, -1);

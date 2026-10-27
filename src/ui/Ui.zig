@@ -930,7 +930,11 @@ pub fn setView(self: *Ui, view: View) void {
     c.gtk_label_set_ellipsize(@ptrCast(self.detail_text), if (wrap) c.PANGO_ELLIPSIZE_NONE else c.PANGO_ELLIPSIZE_END);
     c.gtk_widget_set_visible(self.detail_picture, 0);
     var placeholder_buf: [128]u8 = undefined;
-    c.gtk_text_set_placeholder_text(@ptrCast(self.entry), switch (view) {
+    // lumen.layout's placeholder: "Go…" at the root, "<view>…" elsewhere.
+    const custom: ?[*:0]const u8 = if (self.layout.placeholder.len == 0) null else if (view == .root)
+        self.layout.placeholder.ptr
+    else if (std.fmt.bufPrintSentinel(&placeholder_buf, "{s}…", .{std.mem.span(self.viewTitle())}, 0)) |t| t.ptr else |_| "…";
+    c.gtk_text_set_placeholder_text(@ptrCast(self.entry), custom orelse switch (view) {
         .root => "Search for apps and commands...",
         .clipboard => "Type to filter entries...",
         .windows => "Search windows...",
@@ -1572,7 +1576,7 @@ pub fn dump(self: *Ui, gpa: std.mem.Allocator) (std.Io.Writer.Error || std.mem.A
     for (lay.searchbar.slice(), 0..) |p, i| try w.print("{s}{t}", .{ if (i > 0) "," else "", p });
     try w.writeAll(" row=");
     for (lay.row.slice(), 0..) |p, i| try w.print("{s}{t}", .{ if (i > 0) "," else "", p });
-    try w.print(" prompt={s}\n", .{lay.prompt});
+    try w.print(" prompt={s} placeholder={s}\n", .{ lay.prompt, lay.placeholder });
     if (lay.footer) try w.print("footer: {s} | {s}\n", .{ c.gtk_label_get_text(@ptrCast(self.footer_title)), c.gtk_label_get_text(@ptrCast(self.footer_action)) });
     try w.print("rows:\n", .{});
     if (self.rows.items.len == 0) try w.print("  (empty) {s}\n", .{self.emptyText(a)});

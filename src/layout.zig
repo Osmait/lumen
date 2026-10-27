@@ -72,6 +72,9 @@ pub const Layout = struct {
     /// Fixed text in the search bar (rofi's "drun"); its memory belongs to
     /// the extension registry.
     prompt: [:0]const u8 = "",
+    /// The empty search field's text in the root view ("Go…"); with it,
+    /// other views show their name and "…". Registry memory, like prompt.
+    placeholder: [:0]const u8 = "",
 
     pub const min_width = 360;
     pub const max_width = 2400;
@@ -80,7 +83,7 @@ pub const Layout = struct {
 };
 
 /// The layout keys, for error messages.
-pub const keys = "width, height, position, offset, panels, search, detail, footer, rows, show, searchbar, row, prompt";
+pub const keys = "width, height, position, offset, panels, search, detail, footer, rows, show, searchbar, row, prompt, placeholder";
 pub const show_keys = "hints, subtitles, accessories, icons, section_titles, key_hints, scope, back, search_icon";
 
 pub const SetError = error{ UnknownKey, BadValue };
