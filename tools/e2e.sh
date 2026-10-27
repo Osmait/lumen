@@ -60,6 +60,33 @@ cat >"$H/.config/lumen/scripts/hello.sh" <<'EOF'
 true
 EOF
 chmod +x "$H/.config/lumen/scripts/hello.sh"
+# Lua: init.lua (a theme, a keymap) and an extension with each kind of
+# command; a Lua action leaves a file behind to prove it ran.
+mkdir -p "$H/.config/lumen/extensions/fixture" "$H/.config/lumen/extensions/broken"
+cat >"$H/.config/lumen/init.lua" <<'EOF'
+lumen.theme { id = "e2e-night", name = "E2E Night", bg = "#101820", fg = "#e0e0e0", accent = "#33aaff" }
+lumen.keymap("ctrl+g", "fixture.fruits")
+EOF
+echo "local out = '$T/ext-ran'" >"$H/.config/lumen/extensions/fixture/init.lua"
+cat >>"$H/.config/lumen/extensions/fixture/init.lua" <<'EOF'
+local lumen = require("lumen")
+return lumen.extension {
+  title = "Fixture", icon = "🧪",
+  commands = {
+    { name = "fruits", title = "Fixture Fruits", detail = true, items = {
+        { title = "Mango", subtitle = "sweet", detail = "a mango detail", actions = {
+            lumen.action.copy("mango"),
+            { title = "Record Mango", run = function(row)
+                lumen.exec { "sh", "-c", 'printf %s "$1" > "$2"', "sh", row.title, out }
+              end },
+          } },
+        "Kiwi",
+    } },
+    { name = "echo", title = "Fixture Echo", search = function(q) return { "echo: " .. q } end },
+  },
+}
+EOF
+echo 'return lumen.extension { commands = { { name = "x", title = "X" } } }' >"$H/.config/lumen/extensions/broken/init.lua"
 # Apps that record what they were asked to open, for Default Apps / Open With.
 mkdir -p "$T/bin"
 printf '#!/bin/sh\nprintf "%%s %%s\\n" "$(basename "$0")" "$@" >>"%s/opened"\n' "$T" >"$T/bin/pdf-viewer-e2e"
@@ -346,6 +373,37 @@ L --key enter; sleep 0.2
 grep -q '^theme = lumen-dark' "$C" && ! grep -q '^pdf' "$C" && ok "reset restores the defaults" || ko "reset restores the defaults" "$(cat "$C")"
 L --key escape; L --key backspace; sleep 0.1
 expect "backspace leaves settings" '^view: root'
+
+echo "extensions (Lua)"
+query root "fixture fruits"
+expect "extension command in root" '> Fixture Fruits \| Fixture \| Command \| emoji:🧪'
+query root "failed to load"
+expect "broken extension reported" 'Extension "broken" failed to load .*give it items, search or run'
+L --command fixture.fruits; sleep 0.4
+expect "command lists its items" '^title: Fixture Fruits'
+expect "item with subtitle" '> Mango \| sweet'
+expect "items without icon wear the command's" 'Kiwi .*emoji:🧪'
+expect "detail pane shows the item's detail" 'text = a mango detail'
+L --command fixture.fruits --query kiw; sleep 0.3
+expect "list commands filter as you type" '> Kiwi'
+expect_not "filtered out" 'Mango'
+L --command fixture.fruits; sleep 0.3
+L --key ctrl+k
+expect "action panel lists the item's actions" 'Record Mango \[Ctrl ↵\]'
+L --key escape
+L --key ctrl+enter
+if wait_for '^visible: false' 3 && [[ "$(cat "$T/ext-ran" 2>/dev/null)" == Mango ]]; then ok "Lua action ran and closed the window"; else ko "Lua action ran and closed the window" "$(L --dump; cat "$T/ext-ran" 2>&1)"; fi
+L --command fixture.echo --query "hi there"
+expect_soon "search commands get the query" '> echo: hi there'
+query root ""
+L --key ctrl+g; sleep 0.3
+expect "keymap from init.lua opens a command" '^title: Fixture Fruits'
+query themes "e2e night"
+expect "theme from init.lua in Change Theme" 'E2E Night .*swatch:e2e-night'
+sed -i 's/Fixture Fruits/Fixture Fruit Bowl/' "$H/.config/lumen/extensions/fixture/init.lua"
+L --hide; L --query "fruit bowl"
+expect_soon "edited extensions reload when the window opens" '> Fixture Fruit Bowl'
+L --hide
 
 echo "latency (lumen --stats)"
 stats=$(L --stats)

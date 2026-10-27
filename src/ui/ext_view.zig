@@ -1,0 +1,331 @@
+//! Extensions in the window: their commands in the root search, the list a
+//! command shows, its actions, keymaps, and reloading edited files.
+
+const std = @import("std");
+const c = @import("c");
+const item_mod = @import("../item.zig");
+const Item = item_mod.Item;
+const Host = @import("../ext/Host.zig");
+const api = @import("../ext/api.zig");
+const run = @import("../actions.zig");
+const proc = @import("../sys/proc.zig");
+const index = @import("index");
+const themes = @import("themes.zig");
+const Ui = @import("Ui.zig");
+
+const log = std.log.scoped(.ext);
+
+/// Starts the extension thread and loads the files. Main thread, once the
+/// window exists.
+pub fn start(ui: *Ui) void {
+    ui.ext_host = Host.start(ui.gpa, ui.io, ui.config_dir, .{
+        .ctx = ui,
+        .registry = &onRegistry,
+        .list = &onList,
+        .act = &onAct,
+    }) catch |err| {
+        log.warn("extensions: {t}", .{err});
+        return;
+    };
+    ui.ext_stamp = Host.stamp(ui.config_dir);
+    ui.ext_host.?.reload();
+}
+
+/// After the GTK main loop has stopped.
+pub fn shutdown(ui: *Ui) void {
+    const h = ui.ext_host orelse return;
+    ui.ext_host = null;
+    h.shutdown();
+}
+
+/// Reloads when init.lua or an extension's files changed since the last
+/// look (the window is about to open).
+pub fn checkReload(ui: *Ui) void {
+    const h = ui.ext_host orelse return;
+    const s = Host.stamp(ui.config_dir);
+    if (s == ui.ext_stamp) return;
+    ui.ext_stamp = s;
+    h.reload();
+}
+
+/// `lumen --reload`.
+pub fn reload(ui: *Ui) void {
+    const h = ui.ext_host orelse return;
+    ui.ext_stamp = Host.stamp(ui.config_dir);
+    h.reload();
+}
+
+pub fn command(ui: *Ui) ?*const Host.Command {
+    const reg = ui.ext_registry orelse return null;
+    if (ui.ext_cmd >= reg.commands.len) return null;
+    return &reg.commands[ui.ext_cmd];
+}
+
+// ------------------------------------------------------------- results
+
+fn onRegistry(reg: *Host.Registry, ctx: ?*anyopaque) void {
+    const ui: *Ui = @ptrCast(@alignCast(ctx.?));
+    const old = ui.ext_registry;
+    const old_result = ui.ext_result;
+    // The open command, found again by its id in the new registry.
+    const open_id: ?[]const u8 = if (ui.view == .ext) if (command(ui)) |cmd| cmd.id else null else null;
+
+    ui.ext_registry = reg;
+    ui.ext_result = null;
+    ui.ext_pending = false;
+    // A list still on its way was asked of the old files: drop it.
+    ui.ext_gen = 0;
+    themes.custom = reg.themes;
+    // Rows and theme names point into the old registry: rebuild before
+    // freeing it. A theme from init.lua may be the one in use.
+    ui.applyAppearance(null);
+    if (ui.view != .ext) {
+        ui.rebuild();
+    } else if (if (open_id) |id| find(reg, id) else null) |i| {
+        ui.ext_cmd = i;
+        ui.setView(.ext);
+    } else ui.setView(.root);
+    if (old_result) |r| r.destroy(ui.gpa);
+    if (old) |r| r.destroy(ui.gpa);
+}
+
+fn onList(res: *Host.ListResult, ctx: ?*anyopaque) void {
+    const ui: *Ui = @ptrCast(@alignCast(ctx.?));
+    if (res.gen != ui.ext_gen) {
+        res.destroy(ui.gpa);
+        return;
+    }
+    if (res.err) |e| log.warn("{s}: {s}", .{ if (command(ui)) |cmd| cmd.id else "?", e });
+    // Rows without an icon wear their command's (the registry outlives the
+    // result: a reload drops results first).
+    if (command(ui)) |cmd| for (res.items) |*it| {
+        if (it.icon == .none) it.icon = cmd.icon;
+    };
+    const old = ui.ext_result;
+    ui.ext_result = res;
+    ui.ext_pending = false;
+    if (ui.view == .ext) {
+        if (ui.selectedItem()) |it| ui.setReselect("{s}", .{it.key});
+        ui.rebuild();
+    }
+    if (old) |o| o.destroy(ui.gpa);
+}
+
+fn onAct(res: *Host.ActResult, ctx: ?*anyopaque) void {
+    const ui: *Ui = @ptrCast(@alignCast(ctx.?));
+    defer res.destroy(ui.gpa);
+    if (res.gen != ui.ext_act_gen) return;
+    ui.ext_act_gen = 0;
+    if (res.err) |e| {
+        log.warn("{s}: {s}", .{ if (command(ui)) |cmd| cmd.id else "action", e });
+        ui.showFailure(firstLine(ui.query_arena.allocator(), e));
+        return;
+    }
+    switch (res.outcome) {
+        .close => ui.hide(),
+        .stay => ui.select(ui.selected),
+        .refresh => if (ui.view == .ext) {
+            if (ui.selectedItem()) |it| ui.setReselect("{s}", .{it.key});
+            ui.setView(.ext);
+        },
+    }
+}
+
+fn find(reg: *const Host.Registry, id: []const u8) ?u16 {
+    for (reg.commands, 0..) |cmd, i| if (std.mem.eql(u8, cmd.id, id)) return @intCast(i);
+    return null;
+}
+
+/// The first line of an error (the rest is the traceback), in `a`.
+fn firstLine(a: std.mem.Allocator, msg: []const u8) [:0]const u8 {
+    const end = std.mem.findScalar(u8, msg, '\n') orelse msg.len;
+    return a.dupeSentinel(u8, msg[0..@min(end, 200)], 0) catch "Failed";
+}
+
+// ----------------------------------------------------------------- rows
+
+/// Commands, and the files that failed to load, for the root search.
+pub fn rootItems(ui: *Ui, a: std.mem.Allocator) []const Item {
+    const reg = ui.ext_registry orelse return &.{};
+    var out: std.ArrayList(Item) = .empty;
+    for (reg.commands, 0..) |cmd, i| {
+        out.append(a, .{
+            .key = std.fmt.allocPrint(a, "ext:{s}", .{cmd.id}) catch continue,
+            .title = cmd.title,
+            .subtitle = cmd.subtitle,
+            .accessory = "Command",
+            .icon = cmd.icon,
+            .keywords = cmd.keywords,
+            .action = .{ .ext_command = .{ .index = @intCast(i), .run = cmd.mode == .run } },
+        }) catch break;
+    }
+    for (reg.problems) |p| {
+        out.append(a, .{
+            .title = std.fmt.allocPrintSentinel(a, "Extension \"{s}\" failed to load", .{p.ext}, 0) catch continue,
+            .subtitle = firstLine(a, p.message),
+            .accessory = "Error",
+            .icon = .{ .tile = .{ .name = "dialog-warning-symbolic", .color = .red } },
+            .action = .ext_problem,
+            .detail = p.message,
+        }) catch break;
+    }
+    return out.items;
+}
+
+/// The open command's rows before filtering.
+pub fn base(ui: *Ui) []Item {
+    const r = ui.ext_result orelse return &.{};
+    return if (r.command == ui.ext_cmd and r.err == null) r.items else &.{};
+}
+
+/// Before the ext view shows: list commands are asked once here.
+pub fn enter(ui: *Ui) void {
+    const cmd = command(ui) orelse return;
+    if (cmd.mode == .list) ask(ui, "");
+}
+
+/// On each refresh: search commands ask for the query typed, unless it is
+/// already answered or on its way. True when the rows are local (filtered
+/// by Lumen).
+pub fn prepare(ui: *Ui, q: []const u8) bool {
+    const cmd = command(ui) orelse return true;
+    if (cmd.mode != .search) return true;
+    const answered = if (ui.ext_result) |r| r.command == ui.ext_cmd and std.mem.eql(u8, r.query, q) else false;
+    const asked = ui.ext_pending and std.mem.eql(u8, ui.ext_asked[0..ui.ext_asked_len], q);
+    if (!answered and !asked) ask(ui, q);
+    return false;
+}
+
+fn ask(ui: *Ui, q: []const u8) void {
+    const h = ui.ext_host orelse return;
+    const reg = ui.ext_registry orelse return;
+    const n = @min(q.len, ui.ext_asked.len);
+    @memcpy(ui.ext_asked[0..n], q[0..n]);
+    ui.ext_asked_len = n;
+    ui.ext_gen = h.list(reg.gen, ui.ext_cmd, q);
+    ui.ext_pending = true;
+}
+
+pub fn emptyText(ui: *Ui, a: std.mem.Allocator, q: []const u8) [:0]const u8 {
+    const cmd = command(ui) orelse return "No Results";
+    if (ui.ext_result) |r| if (r.command == ui.ext_cmd) if (r.err) |e|
+        return std.fmt.allocPrintSentinel(a, "Error: {s}", .{firstLine(a, e)}, 0) catch "Error";
+    if (ui.ext_pending) return "Loading...";
+    if (cmd.mode == .search and q.len == 0) return "Type to search";
+    return "No Results";
+}
+
+pub fn placeholder(ui: *Ui, buf: []u8) [*:0]const u8 {
+    const cmd = command(ui) orelse return "Search...";
+    if (cmd.placeholder.len > 0) return cmd.placeholder;
+    const text = std.fmt.bufPrintSentinel(buf, "Search {s}...", .{cmd.title}, 0) catch return "Search...";
+    return text.ptr;
+}
+
+// -------------------------------------------------------------- actions
+
+/// Enter on a command in the root search: opens its list, or runs it.
+pub fn activate(ui: *Ui, i: u16) void {
+    const reg = ui.ext_registry orelse return;
+    if (i >= reg.commands.len) return;
+    if (reg.commands[i].mode == .run) {
+        const h = ui.ext_host orelse return;
+        ui.ext_act_gen = h.act(reg.gen, i, 0, null, 0);
+        ui.showRunning();
+        return;
+    }
+    ui.ext_cmd = i;
+    ui.navigate(.ext);
+}
+
+/// Action `index` of the selected extension row.
+pub fn perform(ui: *Ui, index_: u8) void {
+    const it = ui.selectedItem() orelse return;
+    if (it.action != .ext_item) return;
+    const x = it.action.ext_item;
+    if (index_ >= x.actions.len) return;
+    if (it.confirm and index_ == 0 and ui.needsConfirm(it)) return;
+    ui.closePanel();
+    switch (x.actions[index_]) {
+        .lua => {
+            const h = ui.ext_host orelse return;
+            const reg = ui.ext_registry orelse return;
+            ui.ext_act_gen = h.act(reg.gen, ui.ext_cmd, x.gen, x.index, index_);
+            ui.showRunning();
+            return;
+        },
+        .open => |target| open(ui, target),
+        .copy => |text| run.copy(text),
+        .paste => |text| run.pasteText(text),
+        .exec => |argv| proc.spawn(argv),
+    }
+    ui.hide();
+}
+
+/// A URL in the default app; a path ("~/" allowed) the way Lumen opens
+/// files, Default Apps included.
+fn open(ui: *Ui, target: [:0]const u8) void {
+    if (std.mem.find(u8, target, "://") != null or std.mem.startsWith(u8, target, "mailto:")) {
+        const lctx = c.gdk_display_get_app_launch_context(c.gdk_display_get_default() orelse return);
+        defer c.g_object_unref(lctx);
+        var err: ?*c.GError = null;
+        if (c.g_app_info_launch_default_for_uri(target.ptr, @ptrCast(lctx), &err) == 0) if (err) |e| {
+            log.warn("open {s}: {s}", .{ target, e.message });
+            c.g_error_free(e);
+        };
+        return;
+    }
+    var buf: [4096]u8 = undefined;
+    const path = if (std.mem.startsWith(u8, target, "~/"))
+        std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ std.mem.span(c.g_get_home_dir()), target[2..] }, 0) catch return
+    else
+        target;
+    const info = index.sys.info(path) orelse {
+        log.warn("open {s}: no such file", .{path});
+        return;
+    };
+    run.openFile(ui.actionCtx(), path, info.is_dir);
+}
+
+// --------------------------------------------------------------- keymaps
+
+/// A keymap from init.lua or an extension: opens its command or view.
+pub fn keymap(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) bool {
+    const reg = ui.ext_registry orelse return false;
+    const mask = c.GDK_CONTROL_MASK | c.GDK_ALT_MASK | c.GDK_SHIFT_MASK | c.GDK_SUPER_MASK;
+    const key = c.gdk_keyval_to_lower(keyval);
+    for (reg.keymaps) |k| {
+        if (k.keyval != key or k.mods != state & mask) continue;
+        if (!openTarget(ui, k.target, null)) log.warn("keymap {s} ({s}): no command or view \"{s}\"", .{ k.keys, k.ext, k.target });
+        return true;
+    }
+    return false;
+}
+
+/// Opens a command by id ("github.prs") or a built-in view by name, with
+/// `text` typed. False when there is no such thing.
+pub fn openTarget(ui: *Ui, target: []const u8, text: ?[*:0]const u8) bool {
+    if (ui.ext_registry) |reg| if (find(reg, target)) |i| {
+        if (reg.commands[i].mode == .run) {
+            activate(ui, i);
+            return true;
+        }
+        ui.ext_cmd = i;
+        if (c.gtk_widget_get_visible(ui.window) == 0) {
+            ui.showWith(.ext, text);
+        } else {
+            ui.navigate(.ext);
+            if (text) |t| c.gtk_editable_set_text(@ptrCast(ui.entry), t);
+        }
+        return true;
+    };
+    const view = std.meta.stringToEnum(item_mod.View, target) orelse return false;
+    if (view == .ext or view == .choose) return false;
+    if (c.gtk_widget_get_visible(ui.window) == 0) ui.showWith(view, text) else ui.navigate(view);
+    return true;
+}
+
+/// `lumen --key ctrl+g` for keys that are not built in.
+pub fn parseKey(name: []const u8) ?api.Keys {
+    return api.parseKeys(name);
+}

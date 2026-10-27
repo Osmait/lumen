@@ -5,6 +5,8 @@
 //!   lumen --show | --hide | --quit
 //!   lumen --stats      memory, index and latency numbers of the running daemon
 //!   lumen --view clipboard --query foo   open a view, prefilled
+//!   lumen --command github.prs           open an extension's command
+//!   lumen --reload     load init.lua and the extensions again
 //!   lumen --clip-store  internal: `wl-paste --watch` hands a copy on stdin
 
 const std = @import("std");
@@ -94,6 +96,7 @@ fn onStartup(app: *c.GtkApplication, data: ?*anyopaque) callconv(.c) void {
     ui.build();
     ui.on_settings_changed = &onSettingsChanged;
     ui_ready = true;
+    Ui.ext_view.start(&ui);
     c.g_application_hold(@ptrCast(app));
     // Tests feed the clipboard store directly (`--clip-store`).
     if (c.g_getenv("LUMEN_TEST") == null) {
@@ -116,6 +119,7 @@ fn onCommandLine(app: *c.GApplication, cmdline: *c.GApplicationCommandLine, _: ?
 
     var mode: enum { toggle, show, hide, daemon } = .toggle;
     var view: ?Ui.View = null;
+    var command: ?[]const u8 = null;
     var query: ?[*:0]const u8 = null;
     var i: usize = 1;
     while (i < argc) : (i += 1) {
@@ -137,6 +141,13 @@ fn onCommandLine(app: *c.GApplication, cmdline: *c.GApplicationCommandLine, _: ?
             defer ui.gpa.free(text);
             c.g_application_command_line_print(cmdline, "%s", text.ptr);
             return 0;
+        } else if (std.mem.eql(u8, a, "--reload")) {
+            if (!ui_ready) return 1;
+            Ui.ext_view.reload(&ui);
+            return 0;
+        } else if (std.mem.eql(u8, a, "--command") and next != null) {
+            command = std.mem.span(next.?);
+            i += 1;
         } else if (std.mem.eql(u8, a, "--quit")) {
             c.g_application_quit(app);
             return 0;
@@ -153,10 +164,16 @@ fn onCommandLine(app: *c.GApplication, cmdline: *c.GApplicationCommandLine, _: ?
             i += 1;
         } else if (std.mem.eql(u8, a, "--view") and next != null) {
             view = std.meta.stringToEnum(Ui.View, std.mem.span(next.?)) orelse return usage(cmdline);
+            if (view == .ext) return usage(cmdline);
             i += 1;
         } else return usage(cmdline);
     }
     if (!ui_ready) return 1;
+    if (command) |id| {
+        if (Ui.ext_view.openTarget(&ui, id, query)) return 0;
+        c.g_application_command_line_printerr(cmdline, "lumen: no command \"%.*s\"\n", @as(c_int, @intCast(@min(id.len, 200))), id.ptr);
+        return 1;
+    }
     // A view or a query always means "show me this".
     if (view != null or query != null) mode = .show;
     switch (mode) {
@@ -169,17 +186,17 @@ fn onCommandLine(app: *c.GApplication, cmdline: *c.GApplicationCommandLine, _: ?
 }
 
 fn clientOnly(flag: []const u8) bool {
-    const flags = [_][]const u8{ "--dump", "--key", "--stats", "--hide", "--quit" };
+    const flags = [_][]const u8{ "--dump", "--key", "--stats", "--hide", "--quit", "--reload" };
     for (flags) |f| if (std.mem.eql(u8, flag, f)) return true;
     return false;
 }
 
 fn usage(cmdline: *c.GApplicationCommandLine) c_int {
     c.g_application_command_line_printerr(cmdline,
-        \\usage: lumen [--toggle | --show | --hide | --daemon | --quit | --stats | --dump]
-        \\             [--key down|up|enter|ctrl+enter|ctrl+k|escape|backspace|pagedown|pageup|ctrl+x|ctrl+o]
+        \\usage: lumen [--toggle | --show | --hide | --daemon | --quit | --reload | --stats | --dump]
+        \\             [--key down|up|enter|ctrl+enter|ctrl+k|escape|backspace|pagedown|pageup|ctrl+x|ctrl+o|ctrl+KEY]
         \\             [--view root|clipboard|windows|files|contents|settings|themes|default_apps]
-        \\             [--query TEXT]
+        \\             [--command EXTENSION.COMMAND] [--query TEXT]
         \\
     );
     return 2;
@@ -188,6 +205,7 @@ fn usage(cmdline: *c.GApplicationCommandLine) c_int {
 fn onShutdown(_: *c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
     shutting_down = true;
     if (watcher_pid != 0) _ = c.kill(watcher_pid, c.SIGTERM);
+    if (ui_ready) Ui.ext_view.shutdown(&ui);
     // Saves what the index learned this session, so it is there tomorrow.
     if (ui_ready) if (ui.content_search) |w| {
         ui.content_search = null;
@@ -349,4 +367,10 @@ test {
 
 test {
     _ = @import("ui/logos.zig");
+    _ = @import("ext/lua.zig");
+    _ = @import("ext/exec.zig");
+    _ = @import("ext/json.zig");
+    _ = @import("ext/api.zig");
+    _ = @import("ext/Host.zig");
+    _ = @import("ui/ext_view.zig");
 }

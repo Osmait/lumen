@@ -1,0 +1,332 @@
+//! The `lumen` module extensions see (`local lumen = require("lumen")`).
+//! EXTENSIONS.md documents it; keep the two in step.
+
+const std = @import("std");
+const lua = @import("lua.zig");
+const c = lua.c;
+const Host = @import("Host.zig");
+const json = @import("json.zig");
+const exec = @import("exec.zig");
+const proc = @import("../sys/proc.zig");
+const themes = @import("../ui/themes.zig");
+const index = @import("index");
+const gtk = @import("c");
+
+const log = std.log.scoped(.ext);
+
+fn extOf(L: *lua.State) *Host.Ext {
+    return @fieldParentPtr("budget", lua.budgetOf(L));
+}
+
+/// Sets up `lumen` (also a global), `require` for the extension's own
+/// modules, and `print` (to Lumen's log). Inside `protect`.
+pub fn install(L: *lua.State, e: *Host.Ext) void {
+    // require("x") finds x.lua and x/init.lua in the extension's folder.
+    _ = c.lua_getglobal(L, "package");
+    var buf: [4200]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&buf, "{s}/?.lua;{s}/?/init.lua", .{ e.dir, e.dir }, 0) catch lua.raise(L, "extension path too long", .{});
+    _ = c.lua_pushstring(L, path.ptr);
+    c.lua_setfield(L, -2, "path");
+    c.lua_settop(L, -2);
+
+    c.lua_createtable(L, 0, 16);
+    const funcs = [_]struct { [:0]const u8, c.lua_CFunction }{
+        .{ "extension", lua.wrap(extension) },
+        .{ "exec", lua.wrap(execFn) },
+        .{ "notify", lua.wrap(notify) },
+        .{ "log", lua.wrap(logFn) },
+        .{ "theme", lua.wrap(theme) },
+        .{ "keymap", lua.wrap(keymap) },
+    };
+    for (funcs) |f| {
+        c.lua_pushcclosure(L, f[1], 0);
+        c.lua_setfield(L, -2, f[0].ptr);
+    }
+    _ = c.lua_pushstring(L, e.dir.ptr);
+    c.lua_setfield(L, -2, "dir");
+    _ = c.lua_pushstring(L, e.id.ptr);
+    c.lua_setfield(L, -2, "id");
+
+    c.lua_createtable(L, 0, 4);
+    const kinds = [_]struct { [:0]const u8, c.lua_CFunction }{
+        .{ "open", lua.wrap(actionOpen) },
+        .{ "copy", lua.wrap(actionCopy) },
+        .{ "paste", lua.wrap(actionPaste) },
+        .{ "exec", lua.wrap(actionExec) },
+    };
+    for (kinds) |k| {
+        c.lua_pushcclosure(L, k[1], 0);
+        c.lua_setfield(L, -2, k[0].ptr);
+    }
+    c.lua_setfield(L, -2, "action");
+
+    c.lua_createtable(L, 0, 2);
+    c.lua_pushcclosure(L, lua.wrap(jsonDecode), 0);
+    c.lua_setfield(L, -2, "decode");
+    c.lua_pushcclosure(L, lua.wrap(jsonEncode), 0);
+    c.lua_setfield(L, -2, "encode");
+    c.lua_setfield(L, -2, "json");
+
+    _ = c.lua_getglobal(L, "package");
+    _ = c.lua_getfield(L, -1, "loaded");
+    c.lua_pushvalue(L, -3);
+    c.lua_setfield(L, -2, "lumen");
+    c.lua_settop(L, -3);
+    c.lua_setglobal(L, "lumen");
+
+    c.lua_pushcclosure(L, lua.wrap(logFn), 0);
+    c.lua_setglobal(L, "print");
+}
+
+/// `lumen.extension{ title, icon, commands = {...} }`: what init.lua
+/// returns. Checked when the file has run.
+fn extension(L: *lua.State) lua.Error!c_int {
+    try lua.argTable(L, 1, "lumen.extension");
+    c.lua_settop(L, 1);
+    return 1;
+}
+
+/// `lumen.exec(argv [, { stdin = "", timeout = seconds }])` returns
+/// stdout, exit code (nil when killed) and stderr; or nil and a message
+/// when it cannot run or times out.
+fn execFn(L: *lua.State) lua.Error!c_int {
+    try lua.argTable(L, 1, "lumen.exec");
+    var argv: [64][]const u8 = undefined;
+    const n = c.lua_rawlen(L, 1);
+    if (n == 0 or n > argv.len) return lua.fail(L, "lumen.exec: argv needs 1 to {d} strings", .{argv.len});
+    for (argv[0..n], 1..) |*arg, i| {
+        _ = c.lua_rawgeti(L, 1, @intCast(i));
+        // The table keeps the string alive after the pop.
+        arg.* = lua.toSlice(L, -1) orelse return lua.fail(L, "lumen.exec: argv[{d}] is a {s}, not a string", .{ i, lua.typeName(L, -1) });
+        c.lua_settop(L, -2);
+    }
+    var stdin: []const u8 = "";
+    var timeout_ns: u64 = std.math.maxInt(u64);
+    switch (c.lua_type(L, 2)) {
+        c.LUA_TNONE, c.LUA_TNIL => {},
+        c.LUA_TTABLE => {
+            if (c.lua_getfield(L, 2, "stdin") != c.LUA_TNIL)
+                stdin = lua.toSlice(L, -1) orelse return lua.fail(L, "lumen.exec: stdin must be a string", .{});
+            c.lua_settop(L, -2);
+            if (c.lua_getfield(L, 2, "timeout") != c.LUA_TNIL) {
+                const s = c.lua_tonumberx(L, -1, null);
+                if (!(s > 0)) return lua.fail(L, "lumen.exec: timeout must be a positive number of seconds", .{});
+                timeout_ns = @intFromFloat(@min(s, 3600) * std.time.ns_per_s);
+            }
+            c.lua_settop(L, -2);
+        },
+        else => return lua.fail(L, "bad argument #2 to 'lumen.exec' (table expected, got {s})", .{lua.typeName(L, 2)}),
+    }
+
+    const e = extOf(L);
+    // Never past the deadline of the call that runs it.
+    const deadline = @min(e.budget.deadline_ns, index.sys.monotonicNs() +| timeout_ns);
+    var r = exec.run(e.gpa(), e.io(), argv[0..n], .{ .stdin = stdin, .deadline_ns = deadline }) catch |err| {
+        c.lua_pushnil(L);
+        lua.pushFmt(L, "lumen.exec: {s}: {s}", .{ argv[0], switch (err) {
+            error.FileNotFound => "not found",
+            error.AccessDenied => "permission denied",
+            else => @errorName(err),
+        } });
+        return 2;
+    };
+    defer r.deinit(e.gpa());
+    if (r.timed_out) {
+        c.lua_pushnil(L);
+        lua.pushFmt(L, "lumen.exec: {s} timed out", .{argv[0]});
+        return 2;
+    }
+    if (!lua.tryCall(L, exec.Result, &r, pushExec, 0, 3)) return error.Raise;
+    return 3;
+}
+
+fn pushExec(L: *lua.State, r: *exec.Result) void {
+    lua.pushString(L, r.stdout);
+    if (r.code) |code| c.lua_pushinteger(L, code) else c.lua_pushnil(L);
+    lua.pushString(L, r.stderr);
+}
+
+/// `lumen.notify(title [, body])`: a desktop notification.
+fn notify(L: *lua.State) lua.Error!c_int {
+    const title = try lua.argString(L, 1, "lumen.notify");
+    const body: [:0]const u8 = if (c.lua_type(L, 2) <= 0) "" else try lua.argString(L, 2, "lumen.notify");
+    proc.spawn(&.{ "notify-send", "-a", "Lumen", title, body });
+    return 0;
+}
+
+/// `lumen.log(...)` and `print(...)`: to Lumen's log, tagged with the
+/// extension.
+fn logFn(L: *lua.State) lua.Error!c_int {
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    const n = c.lua_gettop(L);
+    var i: c_int = 1;
+    while (i <= n) : (i += 1) {
+        var len: usize = 0;
+        const s = c.luaL_tolstring(L, i, &len);
+        if (i > 1) w.writeByte('\t') catch {};
+        w.writeAll(s[0..len]) catch {};
+        c.lua_settop(L, -2);
+    }
+    log.info("[{s}] {s}", .{ extOf(L).id, w.buffered() });
+    return 0;
+}
+
+/// `lumen.theme{ id, name, dark, bg, fg, accent [, surface, ink] }`: a
+/// theme for Change Theme. Colours are "#rrggbb". init.lua only.
+fn theme(L: *lua.State) lua.Error!c_int {
+    try lua.argTable(L, 1, "lumen.theme");
+    const e = extOf(L);
+    const load = e.load orelse return lua.fail(L, "lumen.theme works only while a file loads", .{});
+    const a = load.a;
+    const id = lua.fieldString(L, a, 1, "id", "theme") orelse return lua.fail(L, "theme.id is missing", .{});
+    if (!Host.validId(id) or std.mem.eql(u8, id, themes.auto_id)) return lua.fail(L, "theme.id: use a-z, 0-9, - and _ (got \"{s}\")", .{id});
+    for (themes.all) |t| if (std.mem.eql(u8, t.id, id)) return lua.fail(L, "theme.id \"{s}\" is a built-in theme", .{id});
+    for (load.themes.items) |t| if (std.mem.eql(u8, t.id, id)) return lua.fail(L, "two themes named \"{s}\"", .{id});
+    const name = lua.fieldString(L, a, 1, "name", "theme") orelse return lua.fail(L, "theme.name is missing", .{});
+    const bg = try color(L, a, "bg", null);
+    const fg = try color(L, a, "fg", null);
+    const t: themes.Theme = .{
+        .id = id,
+        .name = name,
+        .dark = lua.fieldBool(L, 1, "dark", true, "theme"),
+        .bg = bg,
+        .surface = try color(L, a, "surface", bg),
+        .fg = fg,
+        .ink = try color(L, a, "ink", fg),
+        .accent = try color(L, a, "accent", null),
+    };
+    load.themes.append(a, t) catch return lua.fail(L, "not enough memory", .{});
+    return 0;
+}
+
+fn color(L: *lua.State, a: std.mem.Allocator, field: [:0]const u8, default: ?u24) lua.Error!u24 {
+    const s = lua.fieldString(L, a, 1, field, "theme") orelse {
+        if (default) |d| return d;
+        return lua.fail(L, "theme.{s} is missing", .{field});
+    };
+    return parseHex(s) orelse lua.fail(L, "theme.{s}: \"#rrggbb\" expected (got \"{s}\")", .{ field, s });
+}
+
+pub fn parseHex(s: []const u8) ?u24 {
+    if (s.len != 7 or s[0] != '#') return null;
+    return std.fmt.parseInt(u24, s[1..], 16) catch null;
+}
+
+/// `lumen.keymap("ctrl+g", "github.prs")`: a key that opens a command (or
+/// a built-in view: "clipboard", "files"...) while the window shows.
+fn keymap(L: *lua.State) lua.Error!c_int {
+    const keys = try lua.argString(L, 1, "lumen.keymap");
+    const target = try lua.argString(L, 2, "lumen.keymap");
+    const e = extOf(L);
+    const load = e.load orelse return lua.fail(L, "lumen.keymap works only while a file loads", .{});
+    const parsed = parseKeys(keys) orelse return lua.fail(L, "lumen.keymap: \"{s}\" is not a key (write it like \"ctrl+g\" or \"alt+shift+F5\")", .{keys});
+    if (parsed.mods & (gtk.GDK_CONTROL_MASK | gtk.GDK_ALT_MASK | gtk.GDK_SUPER_MASK) == 0)
+        return lua.fail(L, "lumen.keymap: \"{s}\" needs ctrl, alt or super (plain keys type into the search)", .{keys});
+    const a = load.a;
+    load.keymaps.append(a, .{
+        .keyval = parsed.keyval,
+        .mods = parsed.mods,
+        .keys = a.dupeSentinel(u8, keys, 0) catch return lua.fail(L, "not enough memory", .{}),
+        .target = a.dupeSentinel(u8, target, 0) catch return lua.fail(L, "not enough memory", .{}),
+        .ext = a.dupeSentinel(u8, e.id, 0) catch return lua.fail(L, "not enough memory", .{}),
+    }) catch return lua.fail(L, "not enough memory", .{});
+    return 0;
+}
+
+pub const Keys = struct { keyval: c_uint, mods: gtk.GdkModifierType };
+
+/// "ctrl+shift+g", "alt+F5", "super+space": modifiers, then a key named as
+/// GDK names it (letters in either case). Null when it is not a key.
+pub fn parseKeys(s: []const u8) ?Keys {
+    var mods: gtk.GdkModifierType = 0;
+    var it = std.mem.splitScalar(u8, s, '+');
+    var key: []const u8 = "";
+    while (it.next()) |part| {
+        if (it.peek() == null) {
+            key = part;
+            break;
+        }
+        const names = [_]struct { []const u8, gtk.GdkModifierType }{
+            .{ "ctrl", gtk.GDK_CONTROL_MASK }, .{ "control", gtk.GDK_CONTROL_MASK },
+            .{ "alt", gtk.GDK_ALT_MASK },      .{ "shift", gtk.GDK_SHIFT_MASK },
+            .{ "super", gtk.GDK_SUPER_MASK },
+        };
+        for (names) |n| {
+            if (std.ascii.eqlIgnoreCase(part, n[0])) {
+                mods |= n[1];
+                break;
+            }
+        } else return null;
+    }
+    if (key.len == 0 or key.len > 31) return null;
+    var buf: [32:0]u8 = @splat(0);
+    @memcpy(buf[0..key.len], key);
+    if (key.len == 1) buf[0] = std.ascii.toLower(key[0]);
+    const kv = gtk.gdk_keyval_from_name(&buf);
+    if (kv == 0 or kv == gtk.GDK_KEY_VoidSymbol) return null;
+    return .{ .keyval = gtk.gdk_keyval_to_lower(kv), .mods = mods };
+}
+
+// lumen.action.*: tables a row's `actions` list takes.
+
+fn actionOf(L: *lua.State, kind: [:0]const u8, field: [:0]const u8, func: []const u8) lua.Error!c_int {
+    if (std.mem.eql(u8, field, "argv")) try lua.argTable(L, 1, func) else _ = try lua.argString(L, 1, func);
+    const has_title = c.lua_type(L, 2) > 0;
+    if (has_title) _ = try lua.argString(L, 2, func);
+    c.lua_createtable(L, 0, 3);
+    _ = c.lua_pushstring(L, kind.ptr);
+    c.lua_setfield(L, -2, "kind");
+    c.lua_pushvalue(L, 1);
+    c.lua_setfield(L, -2, field.ptr);
+    if (has_title) {
+        c.lua_pushvalue(L, 2);
+        c.lua_setfield(L, -2, "title");
+    }
+    return 1;
+}
+
+fn actionOpen(L: *lua.State) lua.Error!c_int {
+    return actionOf(L, "open", "target", "lumen.action.open");
+}
+fn actionCopy(L: *lua.State) lua.Error!c_int {
+    return actionOf(L, "copy", "text", "lumen.action.copy");
+}
+fn actionPaste(L: *lua.State) lua.Error!c_int {
+    return actionOf(L, "paste", "text", "lumen.action.paste");
+}
+fn actionExec(L: *lua.State) lua.Error!c_int {
+    return actionOf(L, "exec", "argv", "lumen.action.exec");
+}
+
+fn jsonDecode(L: *lua.State) lua.Error!c_int {
+    const text = try lua.argString(L, 1, "lumen.json.decode");
+    try json.decode(L, extOf(L).gpa(), text);
+    return 1;
+}
+
+fn jsonEncode(L: *lua.State) lua.Error!c_int {
+    if (c.lua_type(L, 1) == c.LUA_TNONE) return lua.fail(L, "bad argument #1 to 'lumen.json.encode' (value expected)", .{});
+    try json.encode(L, extOf(L).gpa(), 1);
+    return 1;
+}
+
+test "keys parse like ctrl+g" {
+    const g = parseKeys("ctrl+g").?;
+    try std.testing.expectEqual(gtk.GDK_CONTROL_MASK, g.mods);
+    try std.testing.expectEqual(@as(c_uint, 'g'), g.keyval);
+    try std.testing.expectEqual(parseKeys("Ctrl+Shift+G").?.keyval, g.keyval);
+    try std.testing.expectEqual(gtk.GDK_CONTROL_MASK | gtk.GDK_SHIFT_MASK, parseKeys("ctrl+shift+g").?.mods);
+    try std.testing.expectEqual(gtk.GDK_KEY_Return, parseKeys("alt+Return").?.keyval);
+    try std.testing.expect(parseKeys("hyper+g") == null);
+    try std.testing.expect(parseKeys("ctrl+nosuchkey") == null);
+    try std.testing.expect(parseKeys("ctrl+") == null);
+}
+
+test "theme colours parse as #rrggbb" {
+    try std.testing.expectEqual(@as(?u24, 0x1e1e2e), parseHex("#1e1e2e"));
+    try std.testing.expectEqual(@as(?u24, 0xFFAA00), parseHex("#FFAA00"));
+    try std.testing.expectEqual(@as(?u24, null), parseHex("1e1e2e"));
+    try std.testing.expectEqual(@as(?u24, null), parseHex("#12345"));
+    try std.testing.expectEqual(@as(?u24, null), parseHex("#zzzzzz"));
+}

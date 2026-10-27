@@ -25,6 +25,7 @@ your machine.
 | **Windows** | switch to or close any open window |
 | **Window management** | halves, thirds, maximize, center, floating, fullscreen, move to the next display or workspace |
 | **System** | lock, sleep, restart, shut down, log out, volume, microphone, media keys, dark mode, empty trash |
+| **Extensions** | commands of your own in Lua, with lists, search and actions; themes, shortcuts and CSS of your own too |
 | **Script commands** | your own scripts in `~/.config/lumen/scripts`, run from the launcher |
 | **Themes** | 13 built in (Lumen, Catppuccin, Dracula, Nord, Gruvbox, Tokyo Night, Rosé Pine, One Dark, Solarized) plus Automatic, previewed live |
 | **Default apps** | choose which app opens each kind of file, or a single file with Open With |
@@ -46,19 +47,20 @@ Search ignores case and accents everywhere: `accion` finds *acción*.
   focused monitor talk to Hyprland; on other compositors they do nothing.
   Reports from other compositors are welcome.
 - [Zig 0.17](https://ziglang.org/download/) to build.
-- GTK 4, gtk4-layer-shell and SQLite.
+- GTK 4, gtk4-layer-shell, SQLite and Lua 5.4.
 - At run time, for the features that use them: `wl-clipboard` and `wtype`
   (clipboard, paste), `ripgrep` (file contents), `poppler` and `unzip` (PDF and
   Office documents), `wpctl` (volume), `playerctl` (media keys).
 
 | Distribution | Packages |
 |---|---|
-| Arch | `sudo pacman -S gtk4 gtk4-layer-shell sqlite wl-clipboard wtype ripgrep poppler unzip wireplumber playerctl` |
-| Fedora | `sudo dnf install gtk4-devel gtk4-layer-shell-devel sqlite-devel wl-clipboard wtype ripgrep poppler-utils unzip wireplumber playerctl` |
-| Debian / Ubuntu | `sudo apt install libgtk-4-dev libgtk4-layer-shell-dev libsqlite3-dev wl-clipboard wtype ripgrep poppler-utils unzip wireplumber playerctl` |
+| Arch | `sudo pacman -S gtk4 gtk4-layer-shell sqlite lua54 wl-clipboard wtype ripgrep poppler unzip wireplumber playerctl` |
+| Fedora | `sudo dnf install gtk4-devel gtk4-layer-shell-devel sqlite-devel lua-devel wl-clipboard wtype ripgrep poppler-utils unzip wireplumber playerctl` |
+| Debian / Ubuntu | `sudo apt install libgtk-4-dev libgtk4-layer-shell-dev libsqlite3-dev liblua5.4-dev wl-clipboard wtype ripgrep poppler-utils unzip wireplumber playerctl` |
 
 Names can differ between releases; gtk4-layer-shell is packaged in recent
-ones (for example Debian 13 and Ubuntu 24.04).
+ones (for example Debian 13 and Ubuntu 24.04). Fedora names Lua 5.4 `lua` for
+pkg-config: build there with `zig build -Dlua-pkg=lua ...`.
 
 ## Install
 
@@ -143,6 +145,40 @@ pkill waybar; waybar &
 launchers with `@raycast.*` keys work unchanged. See
 [`examples/scripts`](examples/scripts).
 
+## Extensions
+
+For more than a script, write an extension in Lua: commands with a list to
+search, rows with a detail pane, and actions for Enter, Ctrl+Enter and the
+action panel. `~/.config/lumen/extensions/hello/init.lua`:
+
+```lua
+local lumen = require("lumen")
+
+return lumen.extension {
+  title = "Hello",
+  commands = {
+    {
+      name = "shout",
+      title = "Shout",
+      search = function(query)
+        local loud = query:upper() .. "!"
+        return { { title = loud, actions = { lumen.action.paste(loud), lumen.action.copy(loud) } } }
+      end,
+    },
+  },
+}
+```
+
+`lumen.exec` runs programs and `lumen.json` reads their output, so the
+command-line tools you already use can become commands. In
+`~/.config/lumen/init.lua` you can add your own themes and keyboard shortcuts,
+and `~/.config/lumen/style.css` can restyle anything.
+
+[EXTENSIONS.md](EXTENSIONS.md) is the full guide.
+[`examples/`](examples) has a GitHub extension (your pull requests, issues
+and repositories through `gh`), a process list, and a sample `init.lua` and
+`style.css`.
+
 ## Configuration
 
 Search for **Settings** in Lumen to change the theme, text size, opacity,
@@ -173,9 +209,12 @@ stays on your disk, readable only by you:
 
 | | |
 |---|---|
-| `~/.config/lumen/` | settings and script commands |
+| `~/.config/lumen/` | settings, `init.lua`, extensions and script commands |
 | `~/.local/share/lumen/lumen.db` | clipboard history and how often you open things |
 | `~/.cache/lumen/` | the file and content indexes, and text extracted from documents |
+
+Extensions and script commands you add run as you and do what their code
+does, network included; read them before installing them.
 
 Copies made by password managers are not stored (they mark them as secret),
 and clipboard history can be turned off in Settings. Deleting those folders

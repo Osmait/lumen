@@ -16,9 +16,12 @@ src/index/        file index (std + Linux syscalls only): store, scan, search,
                   extract, ContentService
 src/sys/          SQLite store (Db.zig), process spawning (GLib), hyprctl
 src/providers/    apps (GIO), built-in commands, script commands
+src/ext/          Lua extensions: lua.zig (the C API and its rules), Host.zig
+                  (the worker thread and the registry), api.zig (the `lumen`
+                  module), exec.zig, json.zig
 src/ui/           the window: Ui.zig (state and flow), widgets, labels,
                   settings_view, file_results, detail_pane, backdrop, keyboard,
-                  themes, the stylesheet
+                  ext_view (extensions in the window), themes, the stylesheet
 src/actions.zig   what each action does to the system
 src/settings.zig  the settings file
 src/c.zig         hand-written GTK/GLib/gtk4-layer-shell bindings
@@ -27,8 +30,8 @@ src/c.zig         hand-written GTK/GLib/gtk4-layer-shell bindings
 `src/c.zig` declares only the C functions Lumen calls: Zig 0.16's
 translate-c could not parse GLib's headers. Zig 0.17's can, so the bindings
 could be generated now; they were kept by hand, with enum values checked
-against the installed headers. SQLite goes through translate-c
-(`src/sqlite.h`).
+against the installed headers. SQLite and Lua go through translate-c
+(`src/sqlite.h`, `src/lua.h`).
 
 ## The window
 
@@ -46,6 +49,33 @@ Settings live in `~/.config/lumen/settings.conf`, written atomically
 (temporary file, fsync, rename) and owner-only. Lumen reads it again when its
 window opens if the file's mtime (to the nanosecond), size or inode changed.
 A bad value falls back to its default and an unknown key is kept as it was.
+
+## Extensions
+
+`src/ext/` runs `init.lua` and every `extensions/<id>/init.lua`, each in its
+own Lua 5.4 state, on one worker thread (`lm-ext`). The window never waits on
+Lua: it posts a request (reload, list a command's rows, run an action) and
+gets the answer on the GTK main loop through `g_idle_add`, like the content
+search. Answers carry a generation and the registry they were asked of; stale
+ones are dropped.
+
+What a file defines (commands, themes, keymaps) and what failed to load is a
+*registry*, handed to the UI and replaced whole on reload. Rows come back as
+ordinary `Item`s built on the worker, so the window draws them like any other
+row. Actions that need no Lua (open, copy, paste, start a program) run in the
+UI at once; the rest go back to the worker, against the list they came from.
+
+Lua raises errors with longjmp, which skips Zig's `defer`. Lumen enters a
+state only through a protected call whose frames own nothing (their memory
+is an arena owned by the caller). Zig functions Lua calls return an error
+union and raise only once their own frames are gone; work that must clean up
+(a child process, a buffer) finishes first or runs under its own protected
+call. Every state has a 64 MB allocator cap and an instruction-count hook
+that stops code past its deadline. `lumen.exec` polls stdin, stdout and stderr
+together until the same deadline, and waits for the exit on a pidfd.
+
+Reloads are cheap to detect: the stat of `init.lua` and of each extension's
+`.lua` files, hashed and compared when the window opens.
 
 ## File index
 

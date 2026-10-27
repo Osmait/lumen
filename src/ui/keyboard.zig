@@ -20,7 +20,7 @@ pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
         } else if (up) {
             ui.selectPanel(ui.panel_selected -| 1);
         } else if (enter) {
-            ui.perform(ui.panel_entries[ui.panel_selected].op);
+            ui.performEntry(ui.panel_entries[ui.panel_selected]);
         }
         return 1;
     }
@@ -53,7 +53,7 @@ pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
     if (enter) {
         const it = ui.selectedItem() orelse return 1;
         const actions = item_mod.actionsFor(it);
-        if (ctrl and actions.len > 1) ui.perform(actions[1].op) else ui.perform(actions[0].op);
+        if (ctrl and actions.len > 1) ui.performEntry(actions[1]) else ui.performEntry(actions[0]);
         return 1;
     }
     if (ctrl and (keyval == c.GDK_KEY_x or keyval == c.GDK_KEY_X)) {
@@ -81,5 +81,7 @@ pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
         if (it.action == .file) ui.perform(.open_with);
         return 1;
     }
+    // Keymaps from init.lua and extensions.
+    if (Ui.ext_view.keymap(ui, keyval, state)) return 1;
     return 0;
 }

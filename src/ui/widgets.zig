@@ -10,17 +10,18 @@ const themes = @import("themes.zig");
 const labels = @import("labels.zig");
 
 /// A small picture of a theme: its background, two lines of text and an
-/// accent dot. Made once per theme and kept.
-pub fn swatchTexture(id: []const u8, bg: u24, fg: u24, accent: u24) ?*c.GdkTexture {
+/// accent dot. Made once per set of colours and kept (themes from init.lua
+/// included, up to the cache's size).
+pub fn swatchTexture(bg: u24, fg: u24, accent: u24) ?*c.GdkTexture {
     const Cache = struct {
-        var textures: [themes.all.len + 1]?*c.GdkTexture = @splat(null);
+        var keys: [64]u72 = @splat(0);
+        var textures: [64]?*c.GdkTexture = @splat(null);
+        var len: usize = 0;
+        /// Next slot to reuse once full; images keep their own reference.
+        var next: usize = 0;
     };
-    var slot: usize = themes.all.len;
-    for (themes.all, 0..) |t, i| if (std.mem.eql(u8, t.id, id)) {
-        slot = i;
-        break;
-    };
-    if (slot < themes.all.len) if (Cache.textures[slot]) |t| return t;
+    const colors = (@as(u72, bg) << 48) | (@as(u72, fg) << 24) | accent;
+    for (Cache.keys[0..Cache.len], Cache.textures[0..Cache.len]) |ck, t| if (ck == colors) return t;
     const n = 44;
     var px: [n * n * 4]u8 = undefined;
     const r: f32 = 10;
@@ -52,7 +53,11 @@ pub fn swatchTexture(id: []const u8, bg: u24, fg: u24, accent: u24) ?*c.GdkTextu
     const bytes = c.g_bytes_new(&px, px.len);
     defer c.g_bytes_unref(bytes);
     const tex = c.gdk_memory_texture_new(n, n, c.GDK_MEMORY_R8G8B8A8, bytes, n * 4);
-    if (slot < themes.all.len) Cache.textures[slot] = tex;
+    const slot = if (Cache.len < Cache.keys.len) Cache.len else Cache.next;
+    if (Cache.len < Cache.keys.len) Cache.len += 1 else Cache.next = (Cache.next + 1) % Cache.keys.len;
+    if (Cache.textures[slot]) |old| c.g_object_unref(old);
+    Cache.keys[slot] = colors;
+    Cache.textures[slot] = tex;
     return tex;
 }
 
@@ -152,7 +157,7 @@ pub fn iconWidget(icon: item_mod.Icon, size: c_int) *c.GtkWidget {
         },
         .emoji => |e| return label(e, "emoji"),
         .swatch => |sw| {
-            const t = swatchTexture(sw.id, sw.bg, sw.fg, sw.accent) orelse return iconWidget(.none, size);
+            const t = swatchTexture(sw.bg, sw.fg, sw.accent) orelse return iconWidget(.none, size);
             const img = c.gtk_image_new_from_paintable(@ptrCast(t));
             c.gtk_image_set_pixel_size(@ptrCast(img), size);
             c.gtk_widget_set_valign(img, c.GTK_ALIGN_CENTER);

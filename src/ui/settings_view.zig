@@ -270,17 +270,22 @@ pub fn themeCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
     for ([_]bool{ true, false }) |want_dark| {
         for (&themes.all) |*t| {
             if (t.dark != want_dark) continue;
-            out.append(a, .{
-                .key = std.fmt.allocPrint(a, "theme:{s}", .{t.id}) catch "",
-                .section = if (want_dark) "Dark" else "Light",
-                .title = t.name,
-                .accessory = if (std.mem.eql(u8, ui.settings.theme, t.id)) "✓" else "",
-                .icon = swatchOf(t),
-                .action = .{ .setting = .{ .theme = t.id } },
-            }) catch break;
+            out.append(a, themeItem(ui, a, t, if (want_dark) "Dark" else "Light")) catch break;
         }
     }
+    for (themes.custom) |*t| out.append(a, themeItem(ui, a, t, "Your Themes")) catch break;
     return out.items;
+}
+
+fn themeItem(ui: *Ui, a: std.mem.Allocator, t: *const themes.Theme, section: [:0]const u8) Item {
+    return .{
+        .key = std.fmt.allocPrint(a, "theme:{s}", .{t.id}) catch "",
+        .section = section,
+        .title = t.name,
+        .accessory = if (std.mem.eql(u8, ui.settings.theme, t.id)) "✓" else "",
+        .icon = swatchOf(t),
+        .action = .{ .setting = .{ .theme = t.id } },
+    };
 }
 
 pub fn swatchOf(t: *const themes.Theme) item_mod.Icon {

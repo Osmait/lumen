@@ -43,11 +43,16 @@ pub const all = [_]Theme{
     .{ .id = "solarized-light", .name = "Solarized Light", .dark = false, .bg = 0xfdf6e3, .surface = 0xeee8d5, .fg = 0x586e75, .ink = 0x002b36, .accent = 0x268bd2 },
 };
 
+/// Themes from init.lua (`lumen.theme`); set by the UI when the files
+/// load. Main thread only.
+pub var custom: []const Theme = &.{};
+
 /// The theme with `id`; unknown ids (a typo in the file, a theme removed)
 /// get the default. `auto` resolves with `prefer_dark`.
 pub fn find(id: []const u8, prefer_dark: bool) *const Theme {
     if (std.mem.eql(u8, id, auto_id)) return if (prefer_dark) &all[0] else &all[1];
     for (&all) |*t| if (std.mem.eql(u8, t.id, id)) return t;
+    for (custom) |*t| if (std.mem.eql(u8, t.id, id)) return t;
     return &all[0];
 }
 

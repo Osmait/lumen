@@ -4,7 +4,9 @@
 //!   index  file index: scan, mmap store, cascaded search, inotify (std + core)
 //!   c      hand-written GLib/GIO/GTK4/gtk4-layer-shell bindings
 //!   sqlite SQLite through translate-c
-//!   main   the daemon: providers, actions and the window -> core, c, sqlite
+//!   lua    Lua 5.4 through translate-c (extensions and init.lua)
+//!   main   the daemon: providers, actions, extensions and the window
+//!          -> core, index, c, sqlite, lua
 
 const std = @import("std");
 
@@ -44,6 +46,16 @@ pub fn build(b: *std.Build) void {
     });
     sqlite.linkSystemLibrary("sqlite3", .{});
 
+    // Lua 5.4's pkg-config name differs between distributions: lua5.4 on
+    // Arch and Debian, lua on Fedora.
+    const lua_pkg = b.option([]const u8, "lua-pkg", "pkg-config name of Lua 5.4 (default lua5.4)") orelse "lua5.4";
+    const lua = b.addTranslateC(.{
+        .root_source_file = b.path("src/lua.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lua.linkSystemLibrary(lua_pkg, .{});
+
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -54,6 +66,7 @@ pub fn build(b: *std.Build) void {
     mod.addImport("index", index);
     mod.addImport("c", c_mod);
     mod.addImport("sqlite", sqlite.createModule());
+    mod.addImport("lua", lua.createModule());
 
     const exe = b.addExecutable(.{ .name = "lumen", .root_module = mod });
     b.installArtifact(exe);

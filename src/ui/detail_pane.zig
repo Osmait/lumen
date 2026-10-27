@@ -38,6 +38,7 @@ pub fn buildDetail(ui: *Ui) void {
     c.gtk_box_append(@ptrCast(ui.detail), sc);
 
     const meta = widgets.vbox(4);
+    ui.detail_meta = meta;
     c.gtk_widget_add_css_class(meta, "meta");
     c.gtk_box_append(@ptrCast(meta), widgets.label("Information", "meta-header"));
     const keys = [_][:0]const u8{ "Content type", "Characters", "Words", "Copied" };
@@ -134,6 +135,13 @@ pub fn showDetail(ui: *Ui, it: ?*const Item) void {
         c.gtk_widget_set_visible(ui.detail_picture, 0);
         c.gtk_label_set_text(@ptrCast(ui.detail_text), "");
         for (ui.meta_values) |v| c.gtk_label_set_text(@ptrCast(v), "");
+        return;
+    }
+    if (ui.view == .ext) {
+        var arena: std.heap.ArenaAllocator = .init(ui.gpa);
+        defer arena.deinit();
+        const text = if (it) |i| i.detail[0..@min(i.detail.len, 20_000)] else "";
+        c.gtk_label_set_text(@ptrCast(ui.detail_text), (arena.allocator().dupeSentinel(u8, labels.validUtf8Prefix(text), 0) catch return).ptr);
         return;
     }
     if (ui.view != .clipboard) return;

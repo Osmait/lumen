@@ -25,6 +25,9 @@ For example:
   starts.
 
 Lumen makes no network connections; anything that makes it do so is a bug
-too.
+too. Extensions are code you install and run as you (see
+[EXTENSIONS.md](EXTENSIONS.md#safety)): what an extension does is not a
+vulnerability in Lumen, but a way for a file name, a document or a list row to
+make Lumen or an extension run something unintended is.
 
 Only the latest release and the `main` branch get fixes.

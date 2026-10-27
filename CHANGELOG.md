@@ -6,6 +6,19 @@ All notable changes are listed here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Extensions in Lua 5.4 (`~/.config/lumen/extensions/<name>/init.lua`):
+  commands with lists Lumen filters, searches asked again for every query, or
+  a single run; rows with subtitles, sections, a detail pane and up to nine
+  actions (open, copy, paste, start a program, or a Lua function). Lua runs on
+  its own thread, with time and memory limits. See EXTENSIONS.md.
+- `~/.config/lumen/init.lua`: themes, keyboard shortcuts and commands of your
+  own.
+- `~/.config/lumen/style.css`, loaded after Lumen's own styles.
+- `lumen --command <extension>.<command>` and `lumen --reload`.
+- Example extensions: GitHub (through `gh`), processes, hello.
+
 ## [0.1.0] - 2026-10-26
 
 First public release.

@@ -22,7 +22,8 @@ pub const Icon = union(enum) {
     swatch: struct { id: []const u8, bg: u24, fg: u24, accent: u24 },
 };
 
-pub const View = enum { root, clipboard, windows, files, contents, settings, themes, default_apps, choose };
+/// `ext`: the list of an extension command (which one is in the UI).
+pub const View = enum { root, clipboard, windows, files, contents, settings, themes, default_apps, choose, ext };
 
 pub const System = enum {
     lock,
@@ -66,6 +67,35 @@ pub const Action = union(enum) {
         /// The match is in text extracted from a PDF/Office document.
         extracted: bool = false,
     },
+    /// An extension command (its index in the extension registry): opens
+    /// its list, or runs it when it has no list.
+    ext_command: struct { index: u16, run: bool },
+    /// A row listed by an extension command.
+    ext_item: ExtItem,
+    /// An extension that failed to load; `Item.detail` holds the error.
+    ext_problem,
+};
+
+pub const ExtItem = struct {
+    /// The list result it came from: its Lua actions run against that one.
+    gen: u32,
+    /// Position in the list the extension returned.
+    index: u32,
+    actions: []const ExtAction,
+    /// Labels and keys of `actions`, in the same order.
+    entries: []const Entry,
+};
+
+/// What an extension row's action does. All but `lua` run in the UI
+/// without a trip to the extension thread.
+pub const ExtAction = union(enum) {
+    /// A Lua function, run on the extension thread.
+    lua,
+    /// A URL, or a path (with the Default Apps from Settings).
+    open: [:0]const u8,
+    copy: []const u8,
+    paste: []const u8,
+    exec: []const [:0]const u8,
 };
 
 /// Rows of the Settings views.
@@ -129,6 +159,9 @@ pub const Op = enum {
     open_at_line,
     open_with,
     always_use,
+    copy_detail,
+    /// An extension action: `Entry.index` says which.
+    ext,
 };
 
 pub const Entry = struct {
@@ -136,6 +169,8 @@ pub const Entry = struct {
     /// Shown as key caps, e.g. "↵", "Ctrl ↵", "Ctrl X".
     keys: [:0]const u8,
     op: Op,
+    /// For `Op.ext`: which of the row's actions.
+    index: u8 = 0,
 };
 
 /// Actions for the action panel (Ctrl+K). The first is Enter, the second
@@ -197,5 +232,14 @@ pub fn actionsFor(item: *const Item) []const Entry {
             .{ .label = "Copy Answer", .keys = "↵", .op = .calc_copy },
             .{ .label = "Paste Answer", .keys = "Ctrl ↵", .op = .calc_paste },
         },
+        .ext_command => |x| if (x.run) &.{
+            .{ .label = "Run Command", .keys = "↵", .op = .run },
+            .{ .label = "Reset Ranking", .keys = "", .op = .reset_ranking },
+        } else &.{
+            .{ .label = "Open Command", .keys = "↵", .op = .open },
+            .{ .label = "Reset Ranking", .keys = "", .op = .reset_ranking },
+        },
+        .ext_item => |x| x.entries,
+        .ext_problem => &.{.{ .label = "Copy Error", .keys = "↵", .op = .copy_detail }},
     };
 }

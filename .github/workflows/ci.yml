@@ -16,7 +16,7 @@ jobs:
     steps:
       - name: Install dependencies
         run: |
-          pacman -Syu --noconfirm --needed git gtk4 gtk4-layer-shell sqlite \
+          pacman -Syu --noconfirm --needed git gtk4 gtk4-layer-shell sqlite lua54 \
             ripgrep poppler unzip zip pkgconf gcc
 
       - uses: actions/checkout@v4

@@ -30,6 +30,8 @@ const file_results = @import("file_results.zig");
 const detail_pane = @import("detail_pane.zig");
 const backdrop = @import("backdrop.zig");
 const keyboard = @import("keyboard.zig");
+pub const ext_view = @import("ext_view.zig");
+const ExtHost = @import("../ext/Host.zig");
 const Kind = core.file_kind.Kind;
 
 const Ui = @This();
@@ -63,6 +65,8 @@ scroller: *c.GtkWidget = undefined,
 detail: *c.GtkWidget = undefined,
 detail_text: *c.GtkWidget = undefined,
 detail_picture: *c.GtkWidget = undefined,
+/// The "Information" block under the preview (hidden for extensions).
+detail_meta: *c.GtkWidget = undefined,
 meta_keys: [4]*c.GtkWidget = undefined,
 meta_values: [4]*c.GtkWidget = undefined,
 /// File index, started by main once the window exists.
@@ -117,6 +121,8 @@ panel_selected: usize = 0,
 confirm_key: []const u8 = "",
 
 settings: Settings,
+/// $XDG_CONFIG_HOME/lumen: settings, init.lua, extensions, style.css.
+config_dir: [:0]const u8 = "",
 settings_path: [:0]const u8 = "",
 /// The settings file as last read or written: a different one on disk was
 /// edited by hand.
@@ -126,6 +132,27 @@ settings_stamp: settings_mod.Stamp = .none,
 on_settings_changed: ?*const fn () void = null,
 css: *c.GtkCssProvider = undefined,
 css_hash: u64 = 0,
+/// The user's style.css as last read (it is applied after Lumen's).
+user_css_stamp: settings_mod.Stamp = .none,
+
+/// Lua extensions and init.lua (null when they could not start).
+ext_host: ?*ExtHost = null,
+/// What the files define; rows and themes point into it.
+ext_registry: ?*ExtHost.Registry = null,
+/// The files as last loaded (ExtHost.stamp).
+ext_stamp: u64 = 0,
+/// The command the ext view shows (its index in the registry).
+ext_cmd: u16 = 0,
+/// Its latest rows; they point into it.
+ext_result: ?*ExtHost.ListResult = null,
+/// Generation of the last list asked for; older answers are dropped.
+ext_gen: u32 = 0,
+ext_pending: bool = false,
+/// The query of the last list asked for.
+ext_asked: [256]u8 = undefined,
+ext_asked_len: usize = 0,
+/// The Lua action running (0: none); its answer decides what happens.
+ext_act_gen: u32 = 0,
 /// Search highlight colours of the theme, for Pango markup.
 hl_fg: [8]u8 = "#ffffff\x00".*,
 hl_bg: [8]u8 = "#ff6363\x00".*,
@@ -184,7 +211,8 @@ pub fn build(self: *Ui) void {
     widgets.connect(monitor, "changed", &onAppsChanged, self);
 
     self.loadCss();
-    self.settings_path = std.fmt.allocPrintSentinel(self.gpa, "{s}/lumen/settings.conf", .{std.mem.span(c.g_get_user_config_dir())}, 0) catch "";
+    self.config_dir = std.fmt.allocPrintSentinel(self.gpa, "{s}/lumen", .{std.mem.span(c.g_get_user_config_dir())}, 0) catch "";
+    self.settings_path = std.fmt.allocPrintSentinel(self.gpa, "{s}/settings.conf", .{self.config_dir}, 0) catch "";
     self.watchColorScheme();
     self.reloadSettings();
 
@@ -320,14 +348,16 @@ fn currentTheme(self: *Ui) *const themes.Theme {
     return themes.find(self.settings.theme, self.preferDark());
 }
 
-/// Theme variables + style.css, reloaded only when they changed. `preview`
-/// paints a theme without choosing it (moving through Change Theme).
-fn applyAppearance(self: *Ui, preview: ?*const themes.Theme) void {
+/// Theme variables + style.css + the user's style.css, reloaded only when
+/// they changed. `preview` paints a theme without choosing it (moving
+/// through Change Theme).
+pub fn applyAppearance(self: *Ui, preview: ?*const themes.Theme) void {
     const t = preview orelse self.currentTheme();
     var out: std.Io.Writer.Allocating = .init(self.gpa);
     defer out.deinit();
     themes.css(&out.writer, t, &self.settings) catch return;
     out.writer.writeAll(@embedFile("style.css")) catch return;
+    self.appendUserCss(&out.writer) catch return;
     out.writer.writeByte(0) catch return;
     const text = out.written();
     _ = themes.hex(&self.hl_fg, t.fg);
@@ -336,6 +366,27 @@ fn applyAppearance(self: *Ui, preview: ?*const themes.Theme) void {
     if (h == self.css_hash) return;
     self.css_hash = h;
     c.gtk_css_provider_load_from_string(self.css, @ptrCast(text.ptr));
+}
+
+/// $XDG_CONFIG_HOME/lumen/style.css, after Lumen's rules so it wins. The
+/// classes it can use are listed in EXTENSIONS.md.
+fn appendUserCss(self: *Ui, w: *std.Io.Writer) std.Io.Writer.Error!void {
+    var buf: [4096]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&buf, "{s}/style.css", .{self.config_dir}, 0) catch return;
+    self.user_css_stamp = settings_mod.Stamp.of(path.ptr);
+    var contents: ?[*:0]u8 = null;
+    var len: usize = 0;
+    if (c.g_file_get_contents(path.ptr, &contents, &len, null) == 0) return;
+    defer c.g_free(contents);
+    try w.writeAll("\n/* ~/.config/lumen/style.css */\n");
+    try w.writeAll(contents.?[0..len]);
+    try w.writeByte('\n');
+}
+
+fn userCssChanged(self: *Ui) bool {
+    var buf: [4096]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&buf, "{s}/style.css", .{self.config_dir}, 0) catch return false;
+    return !settings_mod.Stamp.of(path.ptr).eql(self.user_css_stamp);
 }
 
 /// The desktop's light/dark preference (dark when it cannot be read).
@@ -392,13 +443,16 @@ pub fn showWith(self: *Ui, view: View, text: ?[*:0]const u8) void {
     if (c.gtk_widget_get_visible(self.window) == 0) {
         // Edited by hand since the last look?
         if (!settings_mod.Stamp.of(self.settings_path.ptr).eql(self.settings_stamp)) self.reloadSettings();
+        if (self.userCssChanged()) self.applyAppearance(null);
+        ext_view.checkReload(self);
         self.placeOnFocusedMonitor();
         // Opening is a good moment to look for edited files.
         if (self.contents) |cs| cs.poke();
     }
     self.nav_len = 0;
-    // The choose view only means something reached from a setting.
-    self.setView(if (view == .choose and self.choosing == .none) .settings else view);
+    // The choose view only means something reached from a setting, the
+    // ext view from a command.
+    self.setView(if (view == .choose and self.choosing == .none) .settings else if (view == .ext and ext_view.command(self) == null) .root else view);
     if (text) |t| c.gtk_editable_set_text(@ptrCast(self.entry), t);
     if (was_hidden) backdrop.showBackdrops(self);
     c.gtk_widget_set_visible(self.window, 1);
@@ -504,10 +558,11 @@ fn loadBase(self: *Ui, a: std.mem.Allocator) []Item {
         .themes => settings_view.themeCandidates(self, a),
         .default_apps => settings_view.defaultAppsCandidates(self, a),
         .choose => settings_view.chooseCandidates(self, a),
+        .ext => ext_view.base(self),
     };
 }
 
-fn setView(self: *Ui, view: View) void {
+pub fn setView(self: *Ui, view: View) void {
     const leaving_themes = self.view == .themes and view != .themes;
     // Change Theme starts on the theme in use.
     if (view == .themes and self.reselect_len == 0) self.setReselect("theme:{s}", .{self.settings.theme});
@@ -517,9 +572,12 @@ fn setView(self: *Ui, view: View) void {
     self.closePanel();
     self.confirm_key = "";
     _ = self.data_arena.reset(.retain_capacity);
+    if (view == .ext) ext_view.enter(self);
     self.base = self.loadBase(self.data_arena.allocator());
 
-    const has_detail = view == .clipboard or view == .files or view == .contents;
+    const has_detail = view == .clipboard or view == .files or view == .contents or
+        (view == .ext and if (ext_view.command(self)) |cmd| cmd.detail else false);
+    c.gtk_widget_set_visible(self.detail_meta, @intFromBool(view != .ext));
     c.gtk_widget_set_visible(self.back, @intFromBool(view != .root));
     c.gtk_widget_set_visible(self.detail, @intFromBool(has_detail));
     // A preview needs room: the results take the full height then.
@@ -536,10 +594,11 @@ fn setView(self: *Ui, view: View) void {
     // Code previews do not wrap, they clip long lines like an editor: a
     // wrapping widgets.label makes GTK lay its text out at several widths per frame
     // (~30 ms measured with `lumen --stats`). Clipboard text is prose: wrap.
-    const wrap = view == .clipboard;
+    const wrap = view == .clipboard or view == .ext;
     c.gtk_label_set_wrap(@ptrCast(self.detail_text), @intFromBool(wrap));
     c.gtk_label_set_ellipsize(@ptrCast(self.detail_text), if (wrap) c.PANGO_ELLIPSIZE_NONE else c.PANGO_ELLIPSIZE_END);
     c.gtk_widget_set_visible(self.detail_picture, 0);
+    var placeholder_buf: [128]u8 = undefined;
     c.gtk_text_set_placeholder_text(@ptrCast(self.entry), switch (view) {
         .root => "Search for apps and commands...",
         .clipboard => "Type to filter entries...",
@@ -550,6 +609,7 @@ fn setView(self: *Ui, view: View) void {
         .themes => "Search themes...",
         .default_apps => "Search file kinds...",
         .choose => if (self.choosing == .setting) "Filter values..." else "Search apps...",
+        .ext => ext_view.placeholder(self, &placeholder_buf),
     });
     c.gtk_label_set_text(@ptrCast(self.scope), self.viewTitle());
     c.gtk_widget_set_visible(self.scope, @intFromBool(view != .root));
@@ -563,6 +623,7 @@ fn rootCandidates(self: *Ui, a: std.mem.Allocator) []Item {
     all.appendSlice(a, self.apps.items) catch {};
     all.appendSlice(a, &commands.all) catch {};
     all.appendSlice(a, scripts.load(a)) catch {};
+    all.appendSlice(a, ext_view.rootItems(self, a)) catch {};
     return all.items;
 }
 
@@ -652,6 +713,8 @@ pub fn refresh(self: *Ui) void {
             }
         },
         .settings, .themes, .default_apps, .choose => self.fillSectioned(a, q),
+        // Search commands are asked for `q`; list commands filter here.
+        .ext => self.fillSectioned(a, if (ext_view.prepare(self, q)) q else ""),
     }
     const searching = self.view == .files or self.view == .contents;
     if (self.rows.items.len == 0 or (searching and self.items.items.len == 0)) {
@@ -727,7 +790,10 @@ fn fillRoot(self: *Ui, a: std.mem.Allocator, q: []const u8) void {
         }
         self.addSection("Commands");
         for (self.base) |it| {
-            if (it.action == .view or it.action == .script) self.addItem(it);
+            switch (it.action) {
+                .view, .script, .ext_command, .ext_problem => self.addItem(it),
+                else => {},
+            }
         }
         return;
     }
@@ -927,6 +993,7 @@ fn viewTitle(self: *Ui) [*:0]const u8 {
         .themes => "Change Theme",
         .default_apps => "Default Apps",
         .choose => &self.choose_title,
+        .ext => if (ext_view.command(self)) |cmd| cmd.title else "Extension",
     };
 }
 
@@ -969,18 +1036,42 @@ pub fn selectPanel(self: *Ui, i: usize) void {
 
 // ------------------------------------------------------------- actions
 
+/// Runs one of the selected row's actions (a row of the action panel, or
+/// what Enter and Ctrl+Enter do).
+pub fn performEntry(self: *Ui, e: item_mod.Entry) void {
+    if (e.op == .ext) return ext_view.perform(self, e.index);
+    self.perform(e.op);
+}
+
+/// Destructive commands need a second Enter: true while waiting for it
+/// (the row says so).
+pub fn needsConfirm(self: *Ui, it: *const Item) bool {
+    if (std.mem.eql(u8, self.confirm_key, it.key)) return false;
+    self.confirm_key = it.key;
+    self.primary = std.fmt.allocPrintSentinel(self.query_arena.allocator(), "Press ↵ again to {s}", .{it.title}, 0) catch return true;
+    self.setHint(self.primary, true);
+    return true;
+}
+
+/// It did not work: say so on the selected row. `msg` must outlive the rows.
+pub fn showFailure(self: *Ui, msg: [:0]const u8) void {
+    self.primary = msg;
+    self.setHint(msg, true);
+}
+
+/// A Lua action is running.
+pub fn showRunning(self: *Ui) void {
+    self.primary = "Running...";
+    self.setHint(self.primary, false);
+}
+
 pub fn perform(self: *Ui, op: item_mod.Op) void {
     const it = self.selectedItem() orelse return;
-    // Destructive commands need a second Enter.
-    if (it.confirm and (op == .run or op == .open) and !std.mem.eql(u8, self.confirm_key, it.key)) {
-        self.confirm_key = it.key;
-        self.primary = std.fmt.allocPrintSentinel(self.query_arena.allocator(), "Press ↵ again to {s}", .{it.title}, 0) catch return;
-        self.setHint(self.primary, true);
-        return;
-    }
+    if (it.confirm and (op == .run or op == .open) and self.needsConfirm(it)) return;
     self.closePanel();
     // Ranking only (Db logs failures): the action goes ahead regardless.
     if (it.key.len > 0 and it.action != .setting and (op == .run or op == .open)) self.db.recordUse(it.key, labels.now()) catch {};
+    if (it.action == .ext_command and (op == .run or op == .open)) return ext_view.activate(self, it.action.ext_command.index);
 
     const outcome = run.perform(self.actionCtx(), it, op);
     switch (outcome) {
@@ -1010,13 +1101,13 @@ fn onRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, data: ?*anyopaque) ca
     if (tag == 0) return;
     self.select(tag - 1);
     const it = self.selectedItem() orelse return;
-    self.perform(item_mod.actionsFor(it)[0].op);
+    self.performEntry(item_mod.actionsFor(it)[0]);
 }
 
 fn onPanelRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, data: ?*anyopaque) callconv(.c) void {
     const self: *Ui = @ptrCast(@alignCast(data));
     const i: usize = @intCast(c.gtk_list_box_row_get_index(row));
-    if (i < self.panel_entries.len) self.perform(self.panel_entries[i].op);
+    if (i < self.panel_entries.len) self.performEntry(self.panel_entries[i]);
 }
 
 fn onBackClicked(_: *c.GtkEventController, _: c_int, _: f64, _: f64, data: ?*anyopaque) callconv(.c) void {
@@ -1052,7 +1143,10 @@ pub fn injectKey(self: *Ui, name: []const u8) bool {
         _ = keyboard.handleKey(self, k[1], k[2]);
         return true;
     };
-    return false;
+    // Anything else written like a keymap ("ctrl+g").
+    const parsed = ext_view.parseKey(name) orelse return false;
+    _ = keyboard.handleKey(self, parsed.keyval, parsed.mods);
+    return true;
 }
 
 /// `lumen --dump`: what the window shows, as text (for end-to-end tests).
@@ -1088,7 +1182,12 @@ pub fn dump(self: *Ui, gpa: std.mem.Allocator) (std.Io.Writer.Error || std.mem.A
     }
     if (c.gtk_widget_get_visible(self.detail) != 0) {
         try w.print("detail:\n", .{});
-        for (self.meta_keys, self.meta_values) |k, v| try w.print("  {s} = {s}\n", .{ c.gtk_label_get_text(@ptrCast(k)), c.gtk_label_get_text(@ptrCast(v)) });
+        if (c.gtk_widget_get_visible(self.detail_meta) != 0) {
+            for (self.meta_keys, self.meta_values) |k, v| try w.print("  {s} = {s}\n", .{ c.gtk_label_get_text(@ptrCast(k)), c.gtk_label_get_text(@ptrCast(v)) });
+        } else {
+            const text = std.mem.span(c.gtk_label_get_text(@ptrCast(self.detail_text)));
+            try w.print("  text = {s}\n", .{text[0 .. std.mem.findScalar(u8, text, '\n') orelse text.len]});
+        }
     }
     if (self.panel_open) {
         try w.print("panel:\n", .{});
@@ -1106,5 +1205,6 @@ fn emptyText(self: *Ui, a: std.mem.Allocator) [:0]const u8 {
     if (self.view == .contents) if (self.content_result) |r| if (r.err) |err|
         return std.fmt.allocPrintSentinel(a, "Content search failed ({t})", .{err}, 0) catch "Content search failed";
     if (self.view == .clipboard and q.len == 0 and !self.settings.clipboard) return "Clipboard history is off: turn it on in Settings";
+    if (self.view == .ext) return ext_view.emptyText(self, a, q);
     return "No Results";
 }

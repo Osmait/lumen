@@ -93,8 +93,10 @@ pub fn perform(ctx: Ctx, it: *const Item, op: item_mod.Op) Outcome {
             ctx.db.clearClips() catch return .{ .failed = "Could not clear the history" };
             return .refresh_view;
         },
-        .calc_copy => copy(it.detail),
+        .calc_copy, .copy_detail => copy(it.detail),
         .calc_paste => pasteText(it.detail),
+        // The UI runs extension actions (ext_view.zig).
+        .ext => return .stay,
     }
     return .hide;
 }
@@ -115,6 +117,9 @@ fn primary(ctx: Ctx, it: *const Item) Outcome {
         .calc => copy(it.detail),
         .file => |f| openFile(ctx, f.path, f.is_dir),
         .setting => |s| return .{ .setting = .{ .setting = s, .op = .run } },
+        // The UI runs extension commands (ext_view.zig).
+        .ext_command, .ext_item => return .stay,
+        .ext_problem => copy(it.detail),
     }
     return .hide;
 }
@@ -337,7 +342,7 @@ pub fn copy(text: []const u8) void {
 }
 
 /// Copies, then sends Ctrl+V to whatever gets focus once the window hides.
-fn pasteText(text: []const u8) void {
+pub fn pasteText(text: []const u8) void {
     copy(text);
     _ = c.g_timeout_add(120, &sendPaste, null);
 }

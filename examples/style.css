@@ -1,0 +1,14 @@
+/* ~/.config/lumen/style.css: loaded after Lumen's own styles, so these
+   rules win. The variables (--bg, --fg, --accent, --ink...) come from the
+   theme in use. EXTENSIONS.md lists the classes. */
+
+/* Squarer pieces */
+.search,
+.results-island {
+  border-radius: 14px;
+}
+
+/* Bolder row titles */
+.results > row .title {
+  font-weight: 600;
+}

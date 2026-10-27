@@ -86,6 +86,11 @@ pub const G_SUBPROCESS_FLAGS_STDIN_PIPE: c_int = 1 << 0;
 
 pub const GDK_SHIFT_MASK: GdkModifierType = 1 << 0;
 pub const GDK_CONTROL_MASK: GdkModifierType = 1 << 2;
+pub const GDK_ALT_MASK: GdkModifierType = 1 << 3;
+pub const GDK_SUPER_MASK: GdkModifierType = 1 << 26;
+pub const GDK_KEY_VoidSymbol: c_uint = 0xffffff;
+pub extern fn gdk_keyval_from_name(name: [*:0]const u8) c_uint;
+pub extern fn gdk_keyval_to_lower(keyval: c_uint) c_uint;
 
 pub const GDK_KEY_BackSpace: c_uint = 0xff08;
 pub const GDK_KEY_Return: c_uint = 0xff0d;
@@ -173,6 +178,7 @@ pub extern fn g_bytes_new(data: ?*const anyopaque, size: usize) *GBytes;
 pub const GChildWatchFunc = *const fn (GPid, c_int, ?*anyopaque) callconv(.c) void;
 pub extern fn g_child_watch_add(pid: GPid, func: GChildWatchFunc, data: ?*anyopaque) c_uint;
 pub extern fn g_spawn_close_pid(pid: GPid) void;
+pub extern fn g_main_context_iteration(context: ?*anyopaque, may_block: gboolean) gboolean;
 pub extern fn g_idle_add(func: GSourceFunc, data: ?*anyopaque) c_uint;
 pub extern fn g_timeout_add_seconds(interval: c_uint, func: GSourceFunc, data: ?*anyopaque) c_uint;
 pub extern fn g_timeout_add(interval: c_uint, func: GSourceFunc, data: ?*anyopaque) c_uint;
