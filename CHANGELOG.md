@@ -32,6 +32,8 @@ All notable changes are listed here. The format follows
   up to 4 `metadata` pairs.
 - Forms: a command with `fields` and `submit`; text fields use the new input
   view, required fields are checked before submitting.
+- Grids: `grid = true` shows a command's rows as cells (large icons or
+  image thumbnails), with 2D arrow keys.
 - Example extensions: GitHub (through `gh`), processes, hello.
 
 ## [0.1.0] - 2026-10-26

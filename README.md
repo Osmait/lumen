@@ -198,7 +198,8 @@ data between runs with `lumen.storage`.
 [EXTENSIONS.md](EXTENSIONS.md) is the full guide.
 [`examples/`](examples) has a GitHub extension (your pull requests, issues
 and repositories through `gh`), a process list, quick notes, a world clock,
-and a sample `init.lua` and `style.css`.
+a "New File" form, an emoji picker, a wallpaper browser, and a sample
+`init.lua` and `style.css`.
 
 ## Configuration
 

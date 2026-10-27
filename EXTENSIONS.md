@@ -43,8 +43,9 @@ return lumen.extension {
 Open Lumen and type "greetings". [`examples/`](examples) has more: a GitHub
 extension (pull requests, issues and repositories through `gh`), a process
 list that can quit processes, quick notes (storage and preferences), a world
-clock that answers "time tokyo" in the main search, a "New File" form, and a
-sample `init.lua` and `style.css`.
+clock that answers "time tokyo" in the main search, a "New File" form, an
+emoji picker and a wallpaper browser (grids), and a sample `init.lua` and
+`style.css`.
 
 ## Commands
 
@@ -84,6 +85,8 @@ is not listed as a command itself.
 | `keywords` | A string or a list of strings, also matched by the search. |
 | `placeholder` | Text in the empty search bar. |
 | `detail` | `true` shows a detail pane with the selected row's `detail`. |
+| `grid` | `true` shows the rows as a grid of cells: a large icon or an `image`, and the title. Arrows move in two directions. |
+| `columns` | Cells to a line in a grid, 2 to 10 (default 5). |
 
 ## Rows
 
@@ -98,6 +101,7 @@ A row is a table, or just a string (a row with that title).
 | `detail` | Text for the detail pane (`detail = true` on the command). |
 | `markdown` | Instead of `detail`: formatted text (see below). |
 | `metadata` | Up to 4 `{ "Label", "value" }` pairs under the detail, in an *Information* block. |
+| `image` | A picture file for the row's grid cell (scaled down as it loads). |
 | `section` | Rows with the same section are grouped under it. |
 | `id` | Keeps the selection on this row when the list reloads (default: the title). |
 | `confirm` | `true`: the first action needs a second Enter. |
@@ -333,6 +337,7 @@ can change anything Lumen draws. The theme's colours are variables: `--bg`,
 | `.tile`, `.emoji` | Icons. |
 | `.detail`, `.detail-text`, `.meta` | The detail pane. |
 | `.actions` | The action panel (Ctrl+K). |
+| `.grid`, `.grid > flowboxchild`, `.cell-title` | Grids and their cells. |
 | `.kbd` | Key caps. |
 
 ```css

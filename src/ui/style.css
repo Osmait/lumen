@@ -371,3 +371,31 @@ tooltip.background {
 window.lumen-backdrop {
   background: none;
 }
+
+/* grid: extension commands with grid = true */
+.grid {
+  padding: 2px 4px;
+}
+.grid > flowboxchild {
+  border-radius: 16px;
+  padding: 8px 6px;
+  outline: none;
+  background: none;
+}
+.grid > flowboxchild:hover:not(:selected) {
+  background-color: alpha(var(--ink), 0.06);
+}
+.grid > flowboxchild:selected {
+  background-color: var(--accent);
+  background-image: linear-gradient(alpha(#ffffff, 0.14), alpha(#ffffff, 0));
+  color: var(--on-accent);
+}
+.grid .cell-title {
+  font-size: var(--font-small);
+}
+.grid .emoji {
+  font-size: 34px;
+}
+.grid picture {
+  border-radius: 10px;
+}

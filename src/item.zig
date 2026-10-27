@@ -163,6 +163,8 @@ pub const Item = struct {
     markup: bool = false,
     /// Label and value pairs for the detail pane's Information block.
     meta: []const Meta = &.{},
+    /// A picture for a grid cell (an image file's path).
+    image: [:0]const u8 = "",
     /// Shown only in the detail pane: the folder, and a short fact (e.g.
     /// "line 58 · 10 matches"), when the list row has no room for them.
     where: [:0]const u8 = "",

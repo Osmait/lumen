@@ -93,6 +93,10 @@ return lumen.extension {
       }, submit = function(v)
         lumen.exec { "sh", "-c", 'printf %s "$1" > "$2"', "sh", v.fruit .. "/" .. v.size .. "/" .. tostring(v.gift), out }
       end },
+    { name = "tiles", title = "Fixture Tiles", grid = true, columns = 3, items = {
+        { title = "One", icon = "1️⃣" }, { title = "Two", icon = "2️⃣" }, { title = "Three", icon = "3️⃣" },
+        { title = "Four", icon = "4️⃣" }, { title = "Five", icon = "5️⃣" },
+    } },
     { name = "upper", title = "Fixture Upper", root = function(q)
         if not q:match("^up ") then return nil end
         return { { title = q:sub(4):upper(), actions = { { title = "Record", run = function(row)
@@ -415,6 +419,12 @@ L --key ctrl+enter
 if wait_for '^visible: false' 3 && [[ "$(cat "$T/ext-ran" 2>/dev/null)" == Mango ]]; then ok "Lua action ran and closed the window"; else ko "Lua action ran and closed the window" "$(L --dump; cat "$T/ext-ran" 2>&1)"; fi
 L --command fixture.echo --query "hi there"
 expect_soon "search commands get the query" '> echo: hi there'
+L --command fixture.tiles; sleep 0.3
+expect "grid lists its cells" '> One \|'
+L --key right; expect "grid: right moves one cell" '> Two \|'
+L --key down; expect "grid: down moves a line" '> Five \|'
+L --key down; expect "grid: down stops at the end" '> Five \|'
+L --key left; L --key up; expect "grid: up moves a line back" '> One \|'
 L --command fixture.order; sleep 0.3
 expect "form lists its fields" '> Fruit \* \|.*\| Not set'
 expect "form submit row" 'Submit \|'

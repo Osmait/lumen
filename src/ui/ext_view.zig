@@ -281,7 +281,9 @@ pub fn emptyText(ui: *Ui, a: std.mem.Allocator, q: []const u8) [:0]const u8 {
 pub fn placeholder(ui: *Ui, buf: []u8) [*:0]const u8 {
     const cmd = command(ui) orelse return "Search...";
     if (cmd.placeholder.len > 0) return cmd.placeholder;
-    const text = std.fmt.bufPrintSentinel(buf, "Search {s}...", .{cmd.title}, 0) catch return "Search...";
+    // "Search Emoji" reads "Search Emoji...", not "Search Search Emoji...".
+    const verb = if (std.mem.startsWith(u8, cmd.title, "Search ")) "" else "Search ";
+    const text = std.fmt.bufPrintSentinel(buf, "{s}{s}...", .{ verb, cmd.title }, 0) catch return "Search...";
     return text.ptr;
 }
 

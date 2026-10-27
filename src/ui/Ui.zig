@@ -83,6 +83,10 @@ built: bool = false,
 entry: *c.GtkWidget = undefined,
 back: *c.GtkWidget = undefined,
 list: *c.GtkWidget = undefined,
+/// Extension commands with `grid = true` show their rows here instead.
+grid: *c.GtkWidget = undefined,
+grid_mode: bool = false,
+grid_columns: c_int = 5,
 scroller: *c.GtkWidget = undefined,
 detail: *c.GtkWidget = undefined,
 detail_text: *c.GtkWidget = undefined,
@@ -333,7 +337,22 @@ pub fn build(self: *Ui) void {
     c.gtk_list_box_set_selection_mode(@ptrCast(self.list), c.GTK_SELECTION_SINGLE);
     c.gtk_widget_set_focusable(self.list, 0);
     widgets.connect(self.list, "row-activated", &onRowActivated, self);
-    c.gtk_scrolled_window_set_child(@ptrCast(self.scroller), self.list);
+    self.grid = c.gtk_flow_box_new();
+    c.gtk_widget_add_css_class(self.grid, "grid");
+    c.gtk_flow_box_set_selection_mode(@ptrCast(self.grid), c.GTK_SELECTION_SINGLE);
+    c.gtk_flow_box_set_homogeneous(@ptrCast(self.grid), 1);
+    c.gtk_flow_box_set_activate_on_single_click(@ptrCast(self.grid), 1);
+    c.gtk_flow_box_set_row_spacing(@ptrCast(self.grid), 6);
+    c.gtk_flow_box_set_column_spacing(@ptrCast(self.grid), 6);
+    c.gtk_widget_set_focusable(self.grid, 0);
+    c.gtk_widget_set_valign(self.grid, c.GTK_ALIGN_START);
+    c.gtk_widget_set_visible(self.grid, 0);
+    widgets.connect(self.grid, "child-activated", &onGridActivated, self);
+    // Both in the scroller; one shows at a time.
+    const lists = widgets.vbox(0);
+    c.gtk_box_append(@ptrCast(lists), self.list);
+    c.gtk_box_append(@ptrCast(lists), self.grid);
+    c.gtk_scrolled_window_set_child(@ptrCast(self.scroller), lists);
     c.gtk_box_append(@ptrCast(body), self.scroller);
     detail_pane.buildDetail(self);
     c.gtk_box_append(@ptrCast(body), self.detail);
@@ -685,6 +704,12 @@ pub fn setView(self: *Ui, view: View) void {
 
     const has_detail = view == .clipboard or view == .files or view == .contents or
         (view == .ext and if (ext_view.command(self)) |cmd| cmd.detail else false);
+    self.grid_mode = view == .ext and if (ext_view.command(self)) |cmd| cmd.grid else false;
+    if (self.grid_mode) {
+        self.grid_columns = ext_view.command(self).?.columns;
+        c.gtk_flow_box_set_min_children_per_line(@ptrCast(self.grid), @intCast(self.grid_columns));
+        c.gtk_flow_box_set_max_children_per_line(@ptrCast(self.grid), @intCast(self.grid_columns));
+    }
     c.gtk_widget_set_visible(self.detail_meta, @intFromBool(view != .ext));
     for (self.meta_lines) |l| c.gtk_widget_set_visible(l, 1);
     c.gtk_widget_set_visible(self.back, @intFromBool(view != .root));
@@ -804,6 +829,7 @@ pub fn refresh(self: *Ui) void {
     self.selected = null;
     self.confirm_key = "";
     c.gtk_list_box_remove_all(@ptrCast(self.list));
+    c.gtk_flow_box_remove_all(@ptrCast(self.grid));
     // The rows holding the previous icons are gone; GtkImage kept its refs.
     for (self.icons.items) |icon| c.g_object_unref(icon);
     self.icons.clearRetainingCapacity();
@@ -855,6 +881,9 @@ pub fn refresh(self: *Ui) void {
         c.gtk_list_box_row_set_child(@ptrCast(row), widgets.label(empty, "empty"));
         c.gtk_list_box_append(@ptrCast(self.list), row);
     }
+    // A grid shows its cells; the list is there for the "No Results" row.
+    c.gtk_widget_set_visible(self.grid, @intFromBool(self.grid_mode and self.items.items.len > 0));
+    c.gtk_widget_set_visible(self.list, @intFromBool(!self.grid_mode or self.items.items.len == 0));
     // Nothing typed and nothing to suggest: only the search bar shows.
     c.gtk_widget_set_visible(self.results, @intFromBool(!(self.view == .root and q.len == 0 and self.items.items.len == 0)));
 
@@ -1014,6 +1043,8 @@ fn sortByScore(items: []Item) void {
 }
 
 pub fn addSection(self: *Ui, title: [:0]const u8) void {
+    // A grid has no sections: rows and items stay one to one there.
+    if (self.grid_mode) return;
     // Room first: a widget without its `rows` entry would shift every later
     // row's index.
     self.rows.ensureUnusedCapacity(self.query_arena.allocator(), 1) catch return;
@@ -1033,6 +1064,14 @@ pub fn addItem(self: *Ui, it: Item) void {
     // row's index (and `onRowActivated` would select the wrong item).
     self.rows.ensureUnusedCapacity(a, 1) catch return;
     self.items.append(a, it) catch return;
+    if (self.grid_mode) {
+        const gap = 6 * (self.grid_columns - 1) + 24;
+        const cell = widgets.gridCell(it, @divTrunc(self.panelW() - gap, self.grid_columns) - 12);
+        c.gtk_flow_box_append(@ptrCast(self.grid), cell);
+        const child = c.gtk_flow_box_get_child_at_index(@ptrCast(self.grid), @intCast(item_index)) orelse return;
+        self.rows.appendAssumeCapacity(.{ .widget = @ptrCast(child), .item = item_index });
+        return;
+    }
     var parts: widgets.RowParts = .{};
     const row = if (it.action == .calc) widgets.calcRow(it) else widgets.itemRow(it, &parts);
     c.g_object_set_data(@ptrCast(row), "lumen-row", @ptrFromInt(self.rows.items.len + 1));
@@ -1063,11 +1102,15 @@ pub fn select(self: *Ui, row_index: ?usize) void {
     self.primary = "";
     const ri = row_index orelse {
         c.gtk_list_box_unselect_all(@ptrCast(self.list));
+        c.gtk_flow_box_unselect_all(@ptrCast(self.grid));
         detail_pane.showDetail(self, null);
         return;
     };
     const row = self.rows.items[ri];
-    c.gtk_list_box_select_row(@ptrCast(self.list), @ptrCast(row.widget));
+    if (self.grid_mode)
+        c.gtk_flow_box_select_child(@ptrCast(self.grid), @ptrCast(row.widget))
+    else
+        c.gtk_list_box_select_row(@ptrCast(self.list), @ptrCast(row.widget));
     self.scrollTo(row.widget);
     const it = &self.items.items[row.item.?];
     self.primary = item_mod.actionsFor(it)[0].label;
@@ -1096,7 +1139,7 @@ fn setHint(self: *Ui, text: []const u8, warn: bool) void {
 
 fn scrollTo(self: *Ui, row: *c.GtkWidget) void {
     var b: c.graphene_rect_t = undefined;
-    if (c.gtk_widget_compute_bounds(row, self.list, &b) == 0) return;
+    if (c.gtk_widget_compute_bounds(row, if (self.grid_mode) self.grid else self.list, &b) == 0) return;
     const adj = c.gtk_scrolled_window_get_vadjustment(@ptrCast(self.scroller));
     const value = c.gtk_adjustment_get_value(adj);
     const page = c.gtk_adjustment_get_page_size(adj);
@@ -1239,6 +1282,15 @@ fn onRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, data: ?*anyopaque) ca
     self.performEntry(item_mod.actionsFor(it)[0]);
 }
 
+fn onGridActivated(_: *c.GtkFlowBox, child: *c.GtkFlowBoxChild, data: ?*anyopaque) callconv(.c) void {
+    const self: *Ui = @ptrCast(@alignCast(data));
+    const i = c.gtk_flow_box_child_get_index(child);
+    if (i < 0 or i >= self.rows.items.len) return;
+    self.select(@intCast(i));
+    const it = self.selectedItem() orelse return;
+    self.performEntry(item_mod.actionsFor(it)[0]);
+}
+
 fn onPanelRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, data: ?*anyopaque) callconv(.c) void {
     const self: *Ui = @ptrCast(@alignCast(data));
     const i: usize = @intCast(c.gtk_list_box_row_get_index(row));
@@ -1272,7 +1324,8 @@ pub fn injectKey(self: *Ui, name: []const u8) bool {
         .{ "ctrl+k", c.GDK_KEY_k, c.GDK_CONTROL_MASK }, .{ "escape", c.GDK_KEY_Escape, 0 },
         .{ "backspace", c.GDK_KEY_BackSpace, 0 },       .{ "pagedown", c.GDK_KEY_Page_Down, 0 },
         .{ "pageup", c.GDK_KEY_Page_Up, 0 },            .{ "ctrl+x", c.GDK_KEY_x, c.GDK_CONTROL_MASK },
-        .{ "ctrl+o", c.GDK_KEY_o, c.GDK_CONTROL_MASK },
+        .{ "ctrl+o", c.GDK_KEY_o, c.GDK_CONTROL_MASK }, .{ "left", c.GDK_KEY_Left, 0 },
+        .{ "right", c.GDK_KEY_Right, 0 },
     };
     for (keys) |k| if (std.mem.eql(u8, k[0], name)) {
         _ = keyboard.handleKey(self, k[1], k[2]);

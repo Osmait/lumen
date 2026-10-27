@@ -8,6 +8,7 @@ const Item = item_mod.Item;
 const logos = @import("logos.zig");
 const themes = @import("themes.zig");
 const labels = @import("labels.zig");
+const index = @import("index");
 
 /// A small picture of a theme: its background, two lines of text and an
 /// accent dot. Made once per set of colours and kept (themes from init.lua
@@ -95,6 +96,43 @@ pub fn itemRow(it: Item, parts: *RowParts) *c.GtkWidget {
     c.gtk_box_append(@ptrCast(box), parts.hint.?);
     c.gtk_list_box_row_set_child(@ptrCast(row), box);
     return row;
+}
+
+/// A grid cell: a picture (an image file, scaled down as it is decoded) or
+/// a large icon, and the title under it. `w` is the cell's width.
+pub fn gridCell(it: Item, w: c_int) *c.GtkWidget {
+    const box = vbox(6);
+    c.gtk_widget_add_css_class(box, "cell");
+    const pic_h = @divTrunc(w * 5, 8);
+    var picture: ?*c.GtkWidget = null;
+    // Only regular files: decoding blocks, and a FIFO would never answer.
+    if (it.image.len > 0 and index.sys.isRegular(it.image.ptr)) {
+        if (c.gdk_pixbuf_new_from_file_at_scale(it.image.ptr, w, pic_h, 1, null)) |pb| {
+            defer c.g_object_unref(pb);
+            const tex = c.gdk_texture_new_for_pixbuf(pb);
+            defer c.g_object_unref(tex);
+            const pic = c.gtk_picture_new_for_paintable(tex);
+            c.gtk_picture_set_content_fit(@ptrCast(pic), c.GTK_CONTENT_FIT_COVER);
+            c.gtk_widget_set_size_request(pic, -1, pic_h);
+            c.gtk_widget_set_overflow(pic, c.GTK_OVERFLOW_HIDDEN);
+            picture = pic;
+        }
+    }
+    const top = picture orelse blk: {
+        const icon = iconWidget(it.icon, @min(@divTrunc(w, 2), 56));
+        c.gtk_widget_set_halign(icon, c.GTK_ALIGN_CENTER);
+        c.gtk_widget_set_size_request(icon, -1, @min(pic_h, 64));
+        break :blk icon;
+    };
+    c.gtk_box_append(@ptrCast(box), top);
+    const title = label(it.title, "cell-title");
+    c.gtk_label_set_ellipsize(@ptrCast(title), c.PANGO_ELLIPSIZE_END);
+    c.gtk_label_set_xalign(@ptrCast(title), 0.5);
+    c.gtk_label_set_max_width_chars(@ptrCast(title), 1);
+    c.gtk_widget_set_hexpand(title, 1);
+    c.gtk_box_append(@ptrCast(box), title);
+    c.gtk_widget_set_size_request(box, w, -1);
+    return box;
 }
 
 pub fn calcRow(it: Item) *c.GtkWidget {

@@ -66,6 +66,9 @@ pub const Command = struct {
     fields: []const Pref = &.{},
     /// The form's last row ("Submit").
     submit_title: [:0]const u8 = "Submit",
+    /// Rows as a grid of cells (`grid = true`), this many to a line.
+    grid: bool = false,
+    columns: u8 = 5,
 };
 
 pub const Keymap = struct {
@@ -748,6 +751,12 @@ fn parseCommand(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_t
         .root = has_root,
         .fields = fields,
         .submit_title = lua.fieldString(L, a, t, "submit_title", where) orelse "Submit",
+        .grid = lua.fieldBool(L, t, "grid", false, where),
+        .columns = blk: {
+            const n = lua.fieldNumber(L, t, "columns", where) orelse break :blk 5;
+            if (!(n >= 2 and n <= 10)) lua.raise(L, "{s}.columns: 2 to 10", .{where});
+            break :blk @intFromFloat(n);
+        },
     };
     if (ctx.load.commands.items.len >= std.math.maxInt(u16)) lua.raise(L, "too many commands", .{});
     lua.c.lua_pushvalue(L, t);
@@ -907,6 +916,7 @@ fn parseItem(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8, o
         it.markup = true;
     }
     it.meta = metadata(L, a, t, where);
+    it.image = lua.fieldString(L, a, t, "image", where) orelse "";
 
     if (lua.getField(L, t, "actions") == lua.c.LUA_TNIL) {
         lua.c.lua_settop(L, -2);

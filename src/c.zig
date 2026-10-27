@@ -336,8 +336,34 @@ pub extern fn gtk_image_set_from_icon_name(img: *GtkImage, name: ?[*:0]const u8)
 pub extern fn gtk_image_set_pixel_size(img: *GtkImage, size: c_int) void;
 
 pub extern fn gtk_picture_new() *GtkWidget;
+pub extern fn gtk_picture_new_for_paintable(paintable: ?*anyopaque) *GtkWidget;
+
+pub const GtkFlowBox = opaque {};
+pub const GtkFlowBoxChild = opaque {};
+pub const GdkPixbuf = opaque {};
+pub extern fn gtk_flow_box_new() *GtkWidget;
+pub extern fn gtk_flow_box_append(box: *GtkFlowBox, child: *GtkWidget) void;
+pub extern fn gtk_flow_box_remove_all(box: *GtkFlowBox) void;
+pub extern fn gtk_flow_box_get_child_at_index(box: *GtkFlowBox, idx: c_int) ?*GtkFlowBoxChild;
+pub extern fn gtk_flow_box_select_child(box: *GtkFlowBox, child: *GtkFlowBoxChild) void;
+pub extern fn gtk_flow_box_unselect_all(box: *GtkFlowBox) void;
+pub extern fn gtk_flow_box_set_selection_mode(box: *GtkFlowBox, mode: c_int) void;
+pub extern fn gtk_flow_box_set_min_children_per_line(box: *GtkFlowBox, n: c_uint) void;
+pub extern fn gtk_flow_box_set_max_children_per_line(box: *GtkFlowBox, n: c_uint) void;
+pub extern fn gtk_flow_box_set_homogeneous(box: *GtkFlowBox, homogeneous: gboolean) void;
+pub extern fn gtk_flow_box_set_activate_on_single_click(box: *GtkFlowBox, single: gboolean) void;
+pub extern fn gtk_flow_box_set_row_spacing(box: *GtkFlowBox, spacing: c_uint) void;
+pub extern fn gtk_flow_box_set_column_spacing(box: *GtkFlowBox, spacing: c_uint) void;
+pub extern fn gtk_flow_box_child_get_index(child: *GtkFlowBoxChild) c_int;
+pub extern fn gdk_pixbuf_new_from_file_at_scale(path: [*:0]const u8, width: c_int, height: c_int, keep_aspect: gboolean, err: ?*?*GError) ?*GdkPixbuf;
+pub extern fn gdk_texture_new_for_pixbuf(pixbuf: *GdkPixbuf) *GdkTexture;
+pub const GDK_KEY_Left: c_uint = 0xff51;
+pub const GDK_KEY_Right: c_uint = 0xff53;
 pub extern fn gtk_picture_set_filename(p: *GtkPicture, filename: ?[*:0]const u8) void;
 pub extern fn gtk_picture_set_content_fit(p: *GtkPicture, fit: c_int) void;
+pub const GTK_CONTENT_FIT_COVER: c_int = 2;
+pub const GTK_OVERFLOW_HIDDEN: c_int = 1;
+pub extern fn gtk_widget_set_overflow(w: *GtkWidget, overflow: c_int) void;
 
 pub extern fn gtk_text_new() *GtkWidget;
 pub extern fn gtk_text_set_placeholder_text(t: *GtkText, text: ?[*:0]const u8) void;

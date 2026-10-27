@@ -37,6 +37,15 @@ pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
         } else if (ui.view != .root) ui.goBack() else ui.hide();
         return 1;
     }
+    // A grid moves in two directions: a line is `grid_columns` cells.
+    if (ui.grid_mode and ui.rows.items.len > 0 and (down or up or keyval == c.GDK_KEY_Left or keyval == c.GDK_KEY_Right)) {
+        const n: i64 = @intCast(ui.rows.items.len);
+        const cur: i64 = if (ui.selected) |s| @intCast(s) else 0;
+        const step: i64 = if (down) ui.grid_columns else if (up) -ui.grid_columns else if (keyval == c.GDK_KEY_Right) 1 else -1;
+        const next = cur + step;
+        if (next >= 0 and next < n) ui.select(@intCast(next));
+        return 1;
+    }
     if (down) {
         ui.select(ui.nextSelectable(ui.selected, 1));
         return 1;
