@@ -43,6 +43,11 @@ scan_pool: *Pool,
 cfg: scan.Config,
 roots: [1][]const u8,
 cache_path: [:0]u8,
+/// Names created, removed or moved outside hidden files and directories,
+/// and anything uncertain (a queue overflow, a rescan): the content service
+/// lists files again only when this moved. Idle, a home sees name changes
+/// all the time, but in .cache and .config (120 in 90 s, none elsewhere).
+name_changes: std.atomic.Value(u64) = .init(0),
 /// For `lumen --stats`, read from other threads.
 rescans: std.atomic.Value(u32) = .init(0),
 last_rescan_ns: std.atomic.Value(u64) = .init(0),
@@ -145,8 +150,37 @@ fn freeReplaced(gpa: std.mem.Allocator, old: Live.Replaced) void {
     old.watcher.destroy(gpa);
 }
 
+/// `name_changes`, or null while it cannot be trusted: watches not all
+/// armed yet, or directories left unwatched (the inotify limit).
+pub fn nameChanges(s: *Service) ?u64 {
+    s.lock.lockSharedUncancelable(s.io);
+    defer s.lock.unlockShared(s.io);
+    if (!s.live.fullyArmed() or s.live.watcher.unwatched > 0) return null;
+    return s.name_changes.load(.acquire);
+}
+
+/// Whether a change may concern the content index (see `name_changes`).
+/// Under the lock, before the change is applied (its parent id resolves).
+fn concernsContent(s: *Service, ch: Watcher.Change) bool {
+    const parent: u32, const name: []const u8 = switch (ch) {
+        .created => |x| .{ x.parent, x.name },
+        .removed => |x| .{ x.parent, x.name },
+        else => return true,
+    };
+    if (name.len > 0 and name[0] == '.') return false;
+    var buf: [4096]u8 = undefined;
+    const dir = s.live.pathOf(parent, &buf) orelse return true;
+    const root = s.roots[0];
+    const rel = if (std.mem.startsWith(u8, dir, root)) dir[root.len..] else dir;
+    var it = std.mem.tokenizeScalar(u8, rel, '/');
+    while (it.next()) |part| if (part[0] == '.') return false;
+    return true;
+}
+
 fn rescan(s: *Service) void {
     const t0 = sys.monotonicNs();
+    // Nobody can tell what changed while the index is rebuilt.
+    defer _ = s.name_changes.fetchAdd(1, .release);
     defer {
         s.last_rescan_ns.store(sys.monotonicNs() - t0, .monotonic);
         _ = s.rescans.fetchAdd(1, .monotonic);
@@ -213,6 +247,10 @@ fn run(s: *Service) void {
             s.live.watcher.drain(arena, &changes) catch |err| {
                 log.warn("reading file events: {t}", .{err});
                 s.live.pending_resync = true;
+            };
+            for (changes.items) |ch| if (s.concernsContent(ch)) {
+                _ = s.name_changes.fetchAdd(1, .release);
+                break;
             };
             _ = s.live.apply(changes.items) catch |err| {
                 log.warn("applying file events: {t}", .{err});
@@ -473,6 +511,42 @@ test "service: shutdown saves what was learned and the next start maps it" {
     const s2 = try Service.start(gpa, testing.io, root, idx);
     defer s2.shutdown();
     try testing.expect(try has(s2, arena, "de_la_sesion", "/de_la_sesion.rs"));
+}
+
+/// Waits until `nameChanges` differs from `from` (or, `from` null, is known).
+pub fn waitNames(s: *Service, from: ?u64) !u64 {
+    for (0..600) |_| {
+        if (s.nameChanges()) |n| if (from == null or n != from.?) return n;
+        sys.sleepUs(5_000);
+    }
+    return error.NoNameChange;
+}
+
+test "service: name changes are counted outside hidden files and folders" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dbuf: [4096]u8 = undefined;
+    const dir = try tmpAbs(&tmp, &dbuf);
+    try mkdirAbs(dir, "root");
+    var rbuf: [4096]u8 = undefined;
+    const root = try std.fmt.bufPrint(&rbuf, "{s}/root", .{dir});
+    try mkdirAbs(root, ".hidden");
+    var hbuf: [4096]u8 = undefined;
+    const hidden = try std.fmt.bufPrint(&hbuf, "{s}/.hidden", .{root});
+    var ibuf: [4096]u8 = undefined;
+    const idx = try std.fmt.bufPrintSentinel(&ibuf, "{s}/files.idx", .{dir}, 0);
+
+    const s = try Service.start(gpa, testing.io, root, idx);
+    defer s.shutdown();
+    try settle(s);
+    const before = try waitNames(s, null);
+    try touch(root, ".dotfile");
+    try touch(hidden, "inside.txt");
+    sys.sleepUs(300_000);
+    try testing.expectEqual(before, s.nameChanges().?);
+    try touch(root, "visible.txt");
+    _ = try waitNames(s, before);
 }
 
 test "service: the delta threshold triggers a compaction" {

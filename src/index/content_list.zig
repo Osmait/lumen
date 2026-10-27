@@ -55,13 +55,9 @@ pub fn list(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, root: 
         const p: []const u8 = z;
         const doc_kind = documentKind(p);
         if (doc_kind and !with_documents) continue;
-        var stx: linux.Statx = undefined;
-        const rc = linux.statx(linux.AT.FDCWD, z, 0, .{ .TYPE = true, .SIZE = true, .MTIME = true }, &stx);
-        if (linux.errno(rc) != .SUCCESS or stx.mode & linux.S.IFMT != linux.S.IFREG) continue;
-        if (!doc_kind and (stx.size > content.max_text or stx.size < 3)) continue;
-        if (doc_kind and stx.size > 64 << 20) continue;
         if (!doc_kind and binaryByName(p)) continue;
-        try docs.append(arena, .{ .path = try arena.dupe(u8, p), .mtime = stx.mtime.sec, .size = stx.size, .source = if (doc_kind) .extracted else .plain });
+        const st = stat(z, doc_kind) orelse continue;
+        try docs.append(arena, .{ .path = try arena.dupe(u8, p), .mtime = st.mtime, .size = st.size, .source = if (doc_kind) .extracted else .plain });
     }
     std.mem.sort(content.DocIn, docs.items, {}, struct {
         fn lt(_: void, a: content.DocIn, b: content.DocIn) bool {
@@ -69,6 +65,19 @@ pub fn list(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, root: 
         }
     }.lt);
     return docs.items;
+}
+
+pub const Stat = struct { mtime: i64, size: u64 };
+
+/// A listed file's mtime and size, or null if it is not one to index (any
+/// more): not a regular file, or a size out of bounds.
+pub fn stat(path: [*:0]const u8, doc_kind: bool) ?Stat {
+    var stx: linux.Statx = undefined;
+    const rc = linux.statx(linux.AT.FDCWD, path, 0, .{ .TYPE = true, .SIZE = true, .MTIME = true }, &stx);
+    if (linux.errno(rc) != .SUCCESS or stx.mode & linux.S.IFMT != linux.S.IFREG) return null;
+    if (!doc_kind and (stx.size > content.max_text or stx.size < 3)) return null;
+    if (doc_kind and stx.size > 64 << 20) return null;
+    return .{ .mtime = stx.mtime.sec, .size = stx.size };
 }
 
 pub fn documentKind(path: []const u8) bool {

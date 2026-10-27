@@ -51,6 +51,10 @@ All notable changes are listed here. The format follows
   of ~58 ms, and each copy
   into the clipboard history no longer starts a GTK process. Install both
   files (see the README).
+- Checking the content index for changes no longer lists every file with
+  ripgrep when the name index saw no new, deleted or moved files outside
+  hidden folders: it looks at the indexed files only (75 ms on one core
+  instead of ~0.45 s of CPU for 49 k files).
 - The content index follows edits incrementally: changed files are read
   again and added, the rest is left alone (two edits: 23 ms instead of a
   1.6 s rebuild, and ~100 MB less memory at the peak). It is rebuilt whole

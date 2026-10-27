@@ -407,7 +407,7 @@ fn deltaRoot(l: *Live, dir_path: []const u8, depth: u16) !u32 {
     return id;
 }
 
-fn pathOf(l: *const Live, id: u32, buf: []u8) ?[]const u8 {
+pub fn pathOf(l: *const Live, id: u32, buf: []u8) ?[]const u8 {
     if (isDelta(id)) {
         const i = deltaIdx(id);
         return if (i < l.delta.len()) l.delta.path(i, buf) else null;

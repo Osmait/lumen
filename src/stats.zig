@@ -142,8 +142,8 @@ pub fn report(gpa: std.mem.Allocator, files: ?*index.Service, contents: ?*index.
     if (contents) |cs| {
         const st = cs.status();
         try w.print("Content index\n  {d} documents ({d} extracted), {d} segments, index {d:.1} MB{s}\n", .{ st.docs, st.extracted, st.segments, mb(st.index_bytes), if (st.building) ", rebuilding" else "" });
-        try w.print("  {d} checks (last listing {d:.0} ms), {d} builds, {d} of them updates (last {d:.0} ms, extraction {d:.0} ms)\n\n", .{
-            st.checks, @as(f64, @floatFromInt(st.last_list_ns)) / 1e6, st.builds, st.updates, @as(f64, @floatFromInt(st.last_build_ns)) / 1e6, @as(f64, @floatFromInt(st.last_extract_ns)) / 1e6,
+        try w.print("  {d} checks, {d} of them listings (last {d:.0} ms; indexed files only: {d:.0} ms), {d} builds, {d} of them updates (last {d:.0} ms, extraction {d:.0} ms)\n\n", .{
+            st.checks, st.listings, @as(f64, @floatFromInt(st.last_list_ns)) / 1e6, @as(f64, @floatFromInt(st.last_stat_ns)) / 1e6, st.builds, st.updates, @as(f64, @floatFromInt(st.last_build_ns)) / 1e6, @as(f64, @floatFromInt(st.last_extract_ns)) / 1e6,
         });
     }
 

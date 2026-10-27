@@ -19,6 +19,7 @@ const content = @import("content.zig");
 const content_list = @import("content_list.zig");
 const extract = @import("extract.zig");
 const Pool = @import("Pool.zig");
+const Service = @import("Service.zig");
 const sys = @import("sys.zig");
 
 const log = std.log.scoped(.content);
@@ -33,6 +34,14 @@ pub const Options = struct {
     /// documents (in percent), or this many segments.
     max_removed_percent: u8 = 20,
     max_segments: usize = 32,
+    /// The name index over the same root: while it saw no name change that
+    /// could matter, a check only looks at the files already indexed
+    /// (edits in place) instead of listing them all with ripgrep (~0.45 s
+    /// of CPU for 49 k). Null: always list.
+    names: ?*Service = null,
+    /// Listed at least this often anyway (a .gitignore edited in place
+    /// changes what is listed without a name change).
+    list_every_ns: u64 = 30 * 60 * std.time.ns_per_s,
 };
 /// Extracted text kept per document.
 const max_extracted = 4 << 20;
@@ -57,9 +66,16 @@ building: std.atomic.Value(bool) = .init(false),
 builds: std.atomic.Value(u32) = .init(0),
 /// Of those, the ones that only added what changed.
 updates: std.atomic.Value(u32) = .init(0),
+/// Checks that listed every file (the others only looked at indexed ones).
+listings: std.atomic.Value(u32) = .init(0),
+/// `names.nameChanges()` when files were last listed. Service thread only.
+listed_names: ?u64 = null,
+last_listing_at: u64 = 0,
 checks: std.atomic.Value(u32) = .init(0),
 extractions: std.atomic.Value(u32) = .init(0),
 last_list_ns: std.atomic.Value(u64) = .init(0),
+/// The last check that looked at indexed files only.
+last_stat_ns: std.atomic.Value(u64) = .init(0),
 last_build_ns: std.atomic.Value(u64) = .init(0),
 last_extract_ns: std.atomic.Value(u64) = .init(0),
 /// The index in use could not be saved: retried on the next check even if
@@ -135,10 +151,12 @@ pub const Status = struct {
     index_bytes: usize = 0,
     builds: u32 = 0,
     updates: u32 = 0,
+    listings: u32 = 0,
     checks: u32 = 0,
     /// Documents whose text was extracted (a child process each).
     extractions: u32 = 0,
     last_list_ns: u64 = 0,
+    last_stat_ns: u64 = 0,
     last_build_ns: u64 = 0,
     last_extract_ns: u64 = 0,
 };
@@ -159,9 +177,11 @@ pub fn status(s: *ContentService) Status {
         .index_bytes = if (s.index) |ix| ix.buf.len else 0,
         .builds = s.builds.load(.acquire),
         .updates = s.updates.load(.acquire),
+        .listings = s.listings.load(.acquire),
         .checks = s.checks.load(.acquire),
         .extractions = s.extractions.load(.acquire),
         .last_list_ns = s.last_list_ns.load(.monotonic),
+        .last_stat_ns = s.last_stat_ns.load(.monotonic),
         .last_build_ns = s.last_build_ns.load(.monotonic),
         .last_extract_ns = s.last_extract_ns.load(.monotonic),
     };
@@ -323,6 +343,43 @@ fn diff(s: *ContentService, arena: std.mem.Allocator, docs: []content.DocIn) std
     return .{ .gone = gone.items, .added = added.items };
 }
 
+/// Every file to index, listed by ripgrep; `names` is what the name index
+/// said before listing, so a change during the listing lists again next time.
+fn listAll(s: *ContentService, arena: std.mem.Allocator, names: ?u64) ?[]content.DocIn {
+    const t = sys.monotonicNs();
+    const docs = content_list.list(arena, s.gpa, s.io, s.root, true) catch |err| {
+        log.warn("listing files: {t}", .{err});
+        return null;
+    };
+    s.last_list_ns.store(sys.monotonicNs() - t, .monotonic);
+    _ = s.listings.fetchAdd(1, .release);
+    s.listed_names = names;
+    s.last_listing_at = t;
+    return docs;
+}
+
+/// Changes to the files already indexed, without listing: edits in place
+/// (mtime, size), and files gone or out of bounds. New files need a name
+/// change, which makes the next check list. Paths point into the index,
+/// which outlives the refresh.
+fn indexedChanges(s: *ContentService, arena: std.mem.Allocator) std.mem.Allocator.Error!Diff {
+    const ix = &s.index.?;
+    var gone: std.ArrayList(u32) = .empty;
+    var added: std.ArrayList(content.DocIn) = .empty;
+    var zbuf: [4096]u8 = undefined;
+    for (0..ix.n_docs) |i| {
+        const id: u32 = @intCast(i);
+        if (ix.removed(id)) continue;
+        const d = ix.docIn(id);
+        const z = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{d.path}, 0) catch continue;
+        const now = content_list.stat(z, d.source == .extracted);
+        if (now) |st| if (st.mtime == d.mtime and st.size == d.size) continue;
+        try gone.append(arena, id);
+        if (now) |st| try added.append(arena, .{ .path = d.path, .mtime = st.mtime, .size = st.size, .source = d.source });
+    }
+    return .{ .gone = gone.items, .added = added.items };
+}
+
 fn refresh(s: *ContentService) void {
     s.last_check_ns.store(sys.monotonicNs(), .release);
     // Counted when done, so `checks` going up means its result is visible.
@@ -331,12 +388,18 @@ fn refresh(s: *ContentService) void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var t = sys.monotonicNs();
-    const docs = content_list.list(arena, s.gpa, s.io, s.root, true) catch |err| {
-        log.warn("listing files: {t}", .{err});
-        return;
+    const names = if (s.opts.names) |n| n.nameChanges() else null;
+    const must_list = s.index == null or names == null or s.listed_names == null or
+        names.? != s.listed_names.? or t - s.last_listing_at >= s.opts.list_every_ns;
+    var docs: ?[]content.DocIn = null;
+    var d = if (must_list) blk: {
+        docs = s.listAll(arena, names) orelse return;
+        break :blk s.diff(arena, docs.?) catch return;
+    } else blk: {
+        const r = s.indexedChanges(arena) catch return;
+        s.last_stat_ns.store(sys.monotonicNs() - t, .monotonic);
+        break :blk r;
     };
-    s.last_list_ns.store(sys.monotonicNs() - t, .monotonic);
-    const d = s.diff(arena, docs) catch return;
     if (s.index != null and d.gone.len == 0 and d.added.len == 0) {
         if (s.unsaved) s.retrySave();
         return;
@@ -352,8 +415,13 @@ fn refresh(s: *ContentService) void {
         const total = ix.n_docs + d.added.len;
         break :blk removed * 100 > total * s.opts.max_removed_percent or ix.n_segs >= s.opts.max_segments;
     } else true;
+    // A whole build indexes every file: they must be listed.
+    if (whole and docs == null) {
+        docs = s.listAll(arena, names) orelse return;
+        d = s.diff(arena, docs.?) catch return;
+    }
     t = sys.monotonicNs();
-    s.extractMissing(if (whole) docs else d.added);
+    s.extractMissing(if (whole) docs.? else d.added);
     s.last_extract_ns.store(sys.monotonicNs() - t, .monotonic);
     if (s.stop.load(.acquire)) return;
     t = sys.monotonicNs();
@@ -362,7 +430,7 @@ fn refresh(s: *ContentService) void {
     // Written to the cache file as it grows and served mapped: clean page
     // cache, never the whole index in heap.
     const written = if (whole)
-        content.buildFile(s.gpa, s.build_pool, docs, reader, s.cache_path, null)
+        content.buildFile(s.gpa, s.build_pool, docs.?, reader, s.cache_path, null)
     else
         content.updateFile(s.gpa, s.build_pool, &s.index.?, d.gone, d.added, reader, s.cache_path, null);
     const fresh = written catch |file_err| blk: {
@@ -375,7 +443,7 @@ fn refresh(s: *ContentService) void {
         log.warn("writing the content index: {t}", .{file_err});
         s.unsaved = true;
         break :blk (if (whole)
-            content.build(s.gpa, s.build_pool, docs, reader, null)
+            content.build(s.gpa, s.build_pool, docs.?, reader, null)
         else
             content.update(s.gpa, s.build_pool, &s.index.?, d.gone, d.added, reader, null)) catch |err| {
             log.warn("building the content index: {t}", .{err});
@@ -621,6 +689,43 @@ test "content service: a cache it cannot write still serves from memory, and sav
     try pokeAndWait(s);
     try testing.expect(sys.exists(saved));
     try testing.expectEqual(@as(u32, 1), s.status().builds);
+}
+
+test "content service: with the name index, checks without name changes only look at indexed files" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.root.write("a.txt", "first apricot\n");
+    var ibuf: [4096]u8 = undefined;
+    const idx = try std.fmt.bufPrintSentinel(&ibuf, "{s}/files.idx", .{f.cache.abs}, 0);
+    const names = try Service.start(testing.allocator, testing.io, f.root.abs, idx);
+    defer names.shutdown();
+    _ = try Service.waitNames(names, null);
+    const s = try f.startWith(.{ .refresh_every_ns = std.math.maxInt(u64), .poke_min_ns = 0, .max_removed_percent = 100, .names = names });
+    defer s.shutdown();
+    try waitChecks(s, 1);
+    try testing.expectEqual(@as(u32, 1), s.status().listings);
+
+    // Edited in place (no name change): seen without listing.
+    var pbuf: [4096]u8 = undefined;
+    try f.root.write("a.txt", "second banana\n");
+    try setMtime(try f.root.path(&pbuf, "a.txt"), sys.nowSeconds() - 100);
+    try pokeAndWait(s);
+    var st = s.status();
+    try testing.expectEqual(@as(u32, 1), st.listings);
+    try testing.expectEqual(@as(u32, 1), st.updates);
+    try testing.expectEqual(@as(usize, 1), (try f.find(s, "banana")).len);
+    try testing.expectEqual(@as(usize, 0), (try f.find(s, "apricot")).len);
+
+    // A new file is a name change: the next check lists.
+    const before = names.nameChanges().?;
+    try f.root.write("b.txt", "third cherry\n");
+    _ = try Service.waitNames(names, before);
+    try pokeAndWait(s);
+    st = s.status();
+    try testing.expectEqual(@as(u32, 2), st.listings);
+    try testing.expectEqual(@as(usize, 2), st.docs);
+    try testing.expectEqual(@as(usize, 1), (try f.find(s, "cherry")).len);
 }
 
 test "content service: rebuilt whole once removed versions pile up" {
