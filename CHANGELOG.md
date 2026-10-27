@@ -26,6 +26,8 @@ All notable changes are listed here. The format follows
   Extensions and read as `lumen.preferences`; `lumen.storage` keeps an
   extension's data between runs.
 - Icons named without `-symbolic` show in full colour.
+- `root = function(query)` on a command: its rows show in the main search,
+  asked for on every query and never waited for.
 - Example extensions: GitHub (through `gh`), processes, hello.
 
 ## [0.1.0] - 2026-10-26

@@ -42,8 +42,9 @@ return lumen.extension {
 
 Open Lumen and type "greetings". [`examples/`](examples) has more: a GitHub
 extension (pull requests, issues and repositories through `gh`), a process
-list that can quit processes, quick notes (storage and preferences), and a
-sample `init.lua` and `style.css`.
+list that can quit processes, quick notes (storage and preferences), a world
+clock that answers "time tokyo" in the main search, and a sample `init.lua`
+and `style.css`.
 
 ## Commands
 
@@ -57,6 +58,21 @@ Each command has one of `items`, `search` or `run`:
 | `items` | A list of rows, or a function returning one. It runs when the command opens; Lumen filters the rows as you type. |
 | `search` | `function(query)` returning rows. It runs again for every query; Lumen shows what it returns as it is. |
 | `run` | `function()` with no list: Enter runs it. |
+
+A command can also have `root = function(query)`: its rows then show in the
+main search, in a section of their own right after the calculator, while you
+type. Return nil when the query is not for you; at most 8 rows show. Lumen asks
+for each query (2 characters or more) and never waits: rows appear when they
+are ready, and a newer query replaces an older one. A command with only `root`
+is not listed as a command itself.
+
+```lua
+{ name = "time", title = "World Clock", root = function(query)
+    local city = query:match("^time%s+(.+)$")
+    if not city then return nil end
+    return { { title = clock(city), subtitle = city } }
+  end }
+```
 
 | Field | |
 |---|---|
@@ -303,6 +319,7 @@ bind = ALT SHIFT, G, exec, lumen --command github.prs
 |---|---|
 | Loading a file | 5 s |
 | Listing rows (`items`, `search`) | 10 s |
+| Root search rows (`root`) | 3 s |
 | A `run` | 30 s |
 | `lumen.exec` | its `timeout`, never past the limit of the call it is in |
 | Memory | 64 MB per extension |

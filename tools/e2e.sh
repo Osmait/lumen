@@ -85,6 +85,12 @@ return lumen.extension {
         "Kiwi",
     } },
     { name = "echo", title = "Fixture Echo", search = function(q) return { "echo: " .. q } end },
+    { name = "upper", title = "Fixture Upper", root = function(q)
+        if not q:match("^up ") then return nil end
+        return { { title = q:sub(4):upper(), actions = { { title = "Record", run = function(row)
+            lumen.exec { "sh", "-c", 'printf %s "$1" > "$2"', "sh", row.title, out }
+          end } } } }
+    end },
   },
 }
 EOF
@@ -397,6 +403,12 @@ L --key ctrl+enter
 if wait_for '^visible: false' 3 && [[ "$(cat "$T/ext-ran" 2>/dev/null)" == Mango ]]; then ok "Lua action ran and closed the window"; else ko "Lua action ran and closed the window" "$(L --dump; cat "$T/ext-ran" 2>&1)"; fi
 L --command fixture.echo --query "hi there"
 expect_soon "search commands get the query" '> echo: hi there'
+query root "up quiet words"
+expect_soon "root search shows extension rows" '# Fixture Upper'
+expect "extension root row" '> QUIET WORDS'
+expect_not "a root provider is not a command" 'Fixture Upper \| Fixture \| Command'
+L --key enter
+if wait_for '^visible: false' 3 && [[ "$(cat "$T/ext-ran" 2>/dev/null)" == "QUIET WORDS" ]]; then ok "root row's Lua action ran"; else ko "root row's Lua action ran" "$(L --dump; cat "$T/ext-ran" 2>&1)"; fi
 query root ""
 L --key ctrl+g; sleep 0.3
 expect "keymap from init.lua opens a command" '^title: Fixture Fruits'

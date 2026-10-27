@@ -42,6 +42,8 @@ pub const Mode = enum {
     search,
     /// `run`: no list; Enter runs it.
     run,
+    /// Only `root`: rows in the root search, not a command of its own.
+    provider,
 };
 
 pub const Command = struct {
@@ -55,6 +57,8 @@ pub const Command = struct {
     mode: Mode,
     /// Show the detail pane (the selected row's `detail`).
     detail: bool,
+    /// It answers root searches too (`root = function(query)`).
+    root: bool,
 };
 
 pub const Keymap = struct {
@@ -148,12 +152,33 @@ pub const ActResult = struct {
     }
 };
 
+/// Rows extensions give for a root search, a section per command.
+/// Owned by the receiver: `destroy`.
+pub const RootResult = struct {
+    gen: u32,
+    query: []const u8,
+    sections: []const RootSection = &.{},
+    arena: std.heap.ArenaAllocator,
+
+    pub fn destroy(r: *RootResult, gpa: std.mem.Allocator) void {
+        r.arena.deinit();
+        gpa.destroy(r);
+    }
+};
+
+pub const RootSection = struct { command: u16, items: []Item };
+
+/// Root rows per command at most.
+pub const max_root_items = 8;
+const root_budget_ns = 3 * std.time.ns_per_s;
+
 /// Called on the GTK main loop; each takes ownership of its result.
 pub const Callbacks = struct {
     ctx: ?*anyopaque,
     registry: *const fn (*Registry, ?*anyopaque) void,
     list: *const fn (*ListResult, ?*anyopaque) void,
     act: *const fn (*ActResult, ?*anyopaque) void,
+    root: *const fn (*RootResult, ?*anyopaque) void,
 };
 
 // ---------------------------------------------------------- the worker
@@ -169,10 +194,6 @@ pub const Ext = struct {
     data: [:0]const u8,
     /// While its file runs: where `lumen.theme` and `lumen.keymap` go.
     load: ?*Load = null,
-    /// The table its last list returned, for the rows' actions.
-    last_ref: c_int = c_noref,
-    last_gen: u32 = 0,
-    last_cmd: u16 = 0,
 
     pub fn gpa(e: *Ext) std.mem.Allocator {
         return e.host.gpa;
@@ -196,11 +217,23 @@ pub const Load = struct {
     problems: std.ArrayList(Problem) = .empty,
 };
 
-/// Where the worker finds a command: its state and its spec table.
-const WorkerCommand = struct { ext: u16, ref: c_int, mode: Mode };
+/// Where the worker finds a command: its state and its spec table, and the
+/// tables its last list and root rows came from (their actions run there).
+const WorkerCommand = struct {
+    ext: u16,
+    ref: c_int,
+    mode: Mode,
+    root: bool,
+    list: Kept = .{},
+    root_rows: Kept = .{},
+};
+
+/// A list a command returned, kept for its rows' actions.
+const Kept = struct { ref: c_int = c_noref, gen: u32 = 0 };
 
 const ListReq = struct { registry: u32, command: u16, gen: u32, query_len: usize };
-const ActReq = struct { registry: u32, command: u16, list_gen: u32, item: ?u32, action: u8, gen: u32 };
+const ActReq = struct { registry: u32, command: u16, root: bool, list_gen: u32, item: ?u32, action: u8, gen: u32 };
+const RootReq = struct { registry: u32, gen: u32, query_len: usize };
 
 gpa: std.mem.Allocator,
 io: std.Io,
@@ -221,6 +254,8 @@ want_reload: bool = false,
 list_req: ?ListReq = null,
 list_query: [max_query]u8 = undefined,
 act_req: ?ActReq = null,
+root_req: ?RootReq = null,
+root_query: [max_query]u8 = undefined,
 
 // Worker thread only.
 exts: std.ArrayList(*Ext) = .empty,
@@ -287,14 +322,30 @@ pub fn list(h: *Host, registry: u32, command: u16, query: []const u8) u32 {
     return h.next_gen;
 }
 
+/// Asks every command with `root` for rows for `query`; a newer root
+/// request replaces one not started yet.
+pub fn root(h: *Host, registry: u32, query: []const u8) u32 {
+    h.next_gen +%= 1;
+    const q = query[0..@min(query.len, max_query)];
+    {
+        h.lock.lockUncancelable(h.io);
+        defer h.lock.unlock(h.io);
+        @memcpy(h.root_query[0..q.len], q);
+        h.root_req = .{ .registry = registry, .gen = h.next_gen, .query_len = q.len };
+    }
+    h.wake();
+    return h.next_gen;
+}
+
 /// Runs a Lua action: action `action` of row `item` of the list with
-/// generation `list_gen`, or the command's own `run` when `item` is null.
-pub fn act(h: *Host, registry: u32, command: u16, list_gen: u32, item: ?u32, action: u8) u32 {
+/// generation `list_gen` (the command's root rows when `root`), or the
+/// command's own `run` when `item` is null.
+pub fn act(h: *Host, registry: u32, command: u16, root_rows: bool, list_gen: u32, item: ?u32, action: u8) u32 {
     h.next_gen +%= 1;
     {
         h.lock.lockUncancelable(h.io);
         defer h.lock.unlock(h.io);
-        h.act_req = .{ .registry = registry, .command = command, .list_gen = list_gen, .item = item, .action = action, .gen = h.next_gen };
+        h.act_req = .{ .registry = registry, .command = command, .root = root_rows, .list_gen = list_gen, .item = item, .action = action, .gen = h.next_gen };
     }
     h.wake();
     return h.next_gen;
@@ -308,6 +359,7 @@ fn wake(h: *Host) void {
 fn run(h: *Host) void {
     var seen: u32 = 0;
     var query: [max_query]u8 = undefined;
+    var rquery: [max_query]u8 = undefined;
     while (true) {
         while (h.seq.load(.acquire) == seen and !h.stop.load(.acquire)) {
             h.io.futexWaitUncancelable(u32, &h.seq.raw, seen);
@@ -318,6 +370,7 @@ fn run(h: *Host) void {
         var reload_now = false;
         var lreq: ?ListReq = null;
         var areq: ?ActReq = null;
+        var rreq: ?RootReq = null;
         {
             h.lock.lockUncancelable(h.io);
             defer h.lock.unlock(h.io);
@@ -328,10 +381,14 @@ fn run(h: *Host) void {
             areq = h.act_req;
             h.act_req = null;
             if (lreq) |r| @memcpy(query[0..r.query_len], h.list_query[0..r.query_len]);
+            rreq = h.root_req;
+            h.root_req = null;
+            if (rreq) |r| @memcpy(rquery[0..r.query_len], h.root_query[0..r.query_len]);
         }
         if (reload_now) h.doReload();
         if (areq) |r| h.doAct(r);
         if (lreq) |r| h.doList(r, query[0..r.query_len]);
+        if (rreq) |r| h.doRoot(r, rquery[0..r.query_len]);
     }
 }
 
@@ -567,6 +624,12 @@ fn parseCommand(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_t
     const id = std.fmt.allocPrintSentinel(a, "{s}.{s}", .{ ctx.e.id, name }, 0) catch lua.raise(L, "not enough memory", .{});
     for (ctx.load.commands.items) |cmd| if (std.mem.eql(u8, cmd.id, id)) lua.raise(L, "two commands named \"{s}\"", .{name});
 
+    const has_root = blk: {
+        const ty = lua.getField(L, t, "root");
+        defer lua.c.lua_settop(L, -2);
+        if (ty != lua.c.LUA_TNIL and ty != lua.c.LUA_TFUNCTION) lua.raise(L, "{s}.root: function expected, got {s}", .{ where, lua.typeName(L, -1) });
+        break :blk ty == lua.c.LUA_TFUNCTION;
+    };
     var mode: ?Mode = null;
     const kinds = [_]struct { [:0]const u8, Mode, bool }{ .{ "items", .list, true }, .{ "search", .search, false }, .{ "run", .run, false } };
     for (kinds) |k| {
@@ -591,13 +654,14 @@ fn parseCommand(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_t
         .icon = icon,
         .keywords = keywords(L, a, t, where),
         .placeholder = lua.fieldString(L, a, t, "placeholder", where) orelse "",
-        .mode = mode orelse lua.raise(L, "{s}: give it items, search or run", .{where}),
+        .mode = mode orelse if (has_root) .provider else lua.raise(L, "{s}: give it items, search or run", .{where}),
         .detail = lua.fieldBool(L, t, "detail", false, where),
+        .root = has_root,
     };
     if (ctx.load.commands.items.len >= std.math.maxInt(u16)) lua.raise(L, "too many commands", .{});
     lua.c.lua_pushvalue(L, t);
     const r = lua.ref(L);
-    ctx.load.wcmds.append(a, .{ .ext = ctx.ext_index, .ref = r, .mode = cmd.mode }) catch lua.raise(L, "not enough memory", .{});
+    ctx.load.wcmds.append(a, .{ .ext = ctx.ext_index, .ref = r, .mode = cmd.mode, .root = has_root }) catch lua.raise(L, "not enough memory", .{});
     ctx.load.commands.append(a, cmd) catch lua.raise(L, "not enough memory", .{});
 }
 
@@ -658,7 +722,7 @@ fn doList(h: *Host, req: ListReq, query: []const u8) void {
         res.err = "Extensions were reloaded";
         return;
     }
-    const wc = h.wcmds[req.command];
+    const wc = &h.wcmds[req.command];
     const e = h.exts.items[wc.ext];
     e.budget.deadline_ns = index.sys.monotonicNs() + list_budget_ns;
     defer e.budget.deadline_ns = std.math.maxInt(u64);
@@ -668,7 +732,7 @@ fn doList(h: *Host, req: ListReq, query: []const u8) void {
 
 const ListCtx = struct {
     e: *Ext,
-    wc: WorkerCommand,
+    wc: *WorkerCommand,
     req: ListReq,
     res: *ListResult,
     query: []const u8,
@@ -683,7 +747,7 @@ const ListCtx = struct {
                 lua.pushString(L, ctx.query);
                 lua.c.lua_callk(L, 1, 1, 0, null);
             },
-            .run => lua.raise(L, "this command has no list", .{}),
+            .run, .provider => lua.raise(L, "this command has no list", .{}),
         }
         const list_idx = lua.absIndex(L, -1);
         switch (lua.c.lua_type(L, list_idx)) {
@@ -691,38 +755,43 @@ const ListCtx = struct {
             lua.c.LUA_TTABLE => {},
             else => lua.raise(L, "items: a list expected, got {s}", .{lua.typeName(L, list_idx)}),
         }
-        // Kept for the rows' actions until the next list.
-        const e = ctx.e;
-        if (e.last_ref != c_noref) {
-            lua.unref(L, e.last_ref);
-            e.last_ref = c_noref;
-        }
-        lua.c.lua_pushvalue(L, list_idx);
-        e.last_ref = lua.ref(L);
-        e.last_gen = ctx.req.gen;
-        e.last_cmd = ctx.req.command;
-        ctx.res.items = parseItems(L, ctx.res.arena.allocator(), list_idx, ctx.req.gen, ctx.e.id);
+        keep(L, &ctx.wc.list, list_idx, ctx.req.gen);
+        ctx.res.items = parseItems(L, ctx.res.arena.allocator(), list_idx, .{ .gen = ctx.req.gen, .command = ctx.req.command }, ctx.e.id, max_items);
     }
 };
 
-fn parseItems(L: *lua.State, a: std.mem.Allocator, list_idx: c_int, gen: u32, ext_id: []const u8) []Item {
-    const n = @min(lua.c.lua_rawlen(L, list_idx), max_items);
+/// Keeps the table at `idx` for its rows' actions, until the next one.
+fn keep(L: *lua.State, k: *Kept, idx: c_int, gen: u32) void {
+    if (k.ref != c_noref) {
+        lua.unref(L, k.ref);
+        k.ref = c_noref;
+    }
+    lua.c.lua_pushvalue(L, idx);
+    k.ref = lua.ref(L);
+    k.gen = gen;
+}
+
+/// Where rows came from, for their actions.
+const Origin = struct { gen: u32, command: u16, root: bool = false };
+
+fn parseItems(L: *lua.State, a: std.mem.Allocator, list_idx: c_int, origin: Origin, ext_id: []const u8, limit: usize) []Item {
+    const n = @min(lua.c.lua_rawlen(L, list_idx), limit);
     const items = a.alloc(Item, n) catch lua.raise(L, "not enough memory", .{});
     for (items, 1..) |*it, i| {
         var where_buf: [24]u8 = undefined;
         const where = std.fmt.bufPrint(&where_buf, "items[{d}]", .{i}) catch "items";
         _ = lua.c.lua_rawgeti(L, list_idx, @intCast(i));
         defer lua.c.lua_settop(L, -2);
-        it.* = parseItem(L, a, lua.absIndex(L, -1), where, gen, @intCast(i - 1), ext_id);
+        it.* = parseItem(L, a, lua.absIndex(L, -1), where, origin, @intCast(i - 1), ext_id);
     }
     return items;
 }
 
-fn parseItem(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8, gen: u32, pos: u32, ext_id: []const u8) Item {
+fn parseItem(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8, origin: Origin, pos: u32, ext_id: []const u8) Item {
     // A plain string is a row with that title.
     if (lua.toSlice(L, t)) |s| {
         const title = a.dupeSentinel(u8, s, 0) catch lua.raise(L, "not enough memory", .{});
-        return .{ .key = key(a, ext_id, title), .title = title, .action = .{ .ext_item = defaultActions(a, L, gen, pos, title) } };
+        return .{ .key = key(a, ext_id, title), .title = title, .action = .{ .ext_item = defaultActions(a, L, origin, pos, title) } };
     }
     if (lua.c.lua_type(L, t) != lua.c.LUA_TTABLE) lua.raise(L, "{s}: table or string expected, got {s}", .{ where, lua.typeName(L, t) });
     const title = lua.fieldString(L, a, t, "title", where) orelse lua.raise(L, "{s}.title is missing", .{where});
@@ -743,7 +812,7 @@ fn parseItem(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8, g
 
     if (lua.getField(L, t, "actions") == lua.c.LUA_TNIL) {
         lua.c.lua_settop(L, -2);
-        it.action = .{ .ext_item = defaultActions(a, L, gen, pos, title) };
+        it.action = .{ .ext_item = defaultActions(a, L, origin, pos, title) };
         return it;
     }
     const acts_idx = lua.absIndex(L, -1);
@@ -764,7 +833,7 @@ fn parseItem(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8, g
         entry.* = .{ .label = parsed.label, .keys = keysFor(j), .op = .ext, .index = @intCast(j) };
     }
     lua.c.lua_settop(L, -2);
-    it.action = .{ .ext_item = .{ .gen = gen, .index = pos, .actions = actions, .entries = entries } };
+    it.action = .{ .ext_item = .{ .command = origin.command, .root = origin.root, .gen = origin.gen, .index = pos, .actions = actions, .entries = entries } };
     return it;
 }
 
@@ -781,10 +850,10 @@ fn keysFor(j: usize) [:0]const u8 {
 }
 
 /// A row without actions copies its title.
-fn defaultActions(a: std.mem.Allocator, L: *lua.State, gen: u32, pos: u32, title: [:0]const u8) item_mod.ExtItem {
+fn defaultActions(a: std.mem.Allocator, L: *lua.State, origin: Origin, pos: u32, title: [:0]const u8) item_mod.ExtItem {
     const actions = a.dupe(item_mod.ExtAction, &.{.{ .copy = title }}) catch lua.raise(L, "not enough memory", .{});
     const entries = a.dupe(item_mod.Entry, &.{.{ .label = "Copy to Clipboard", .keys = "↵", .op = .ext }}) catch lua.raise(L, "not enough memory", .{});
-    return .{ .gen = gen, .index = pos, .actions = actions, .entries = entries };
+    return .{ .command = origin.command, .root = origin.root, .gen = origin.gen, .index = pos, .actions = actions, .entries = entries };
 }
 
 const ParsedAction = struct { action: item_mod.ExtAction, label: [:0]const u8 };
@@ -827,6 +896,65 @@ fn parseAction(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8)
     lua.raise(L, "{s}.kind: unknown \"{s}\"", .{ where, kind });
 }
 
+// ----------------------------------------------------------------- root
+
+fn doRoot(h: *Host, req: RootReq, query: []const u8) void {
+    const res = h.gpa.create(RootResult) catch return;
+    res.* = .{ .gen = req.gen, .query = "", .arena = .init(h.gpa) };
+    const a = res.arena.allocator();
+    res.query = a.dupe(u8, query) catch "";
+    defer h.deliver(.{ .root = res });
+    if (req.registry != h.registry_gen) return;
+    var sections: std.ArrayList(RootSection) = .empty;
+    for (h.wcmds, 0..) |*wc, i| {
+        if (!wc.root) continue;
+        // A newer query came in: this one is already stale.
+        if (h.rootSuperseded()) break;
+        const e = h.exts.items[wc.ext];
+        e.budget.deadline_ns = index.sys.monotonicNs() + root_budget_ns;
+        defer e.budget.deadline_ns = std.math.maxInt(u64);
+        var ctx: RootCtx = .{ .e = e, .wc = wc, .command = @intCast(i), .gen = req.gen, .query = query, .a = a };
+        if (lua.protect(e.L, a, RootCtx, &ctx, RootCtx.run)) |err| {
+            // One provider failing must not hide the others' rows.
+            log.warn("{s}: root search: {s}", .{ e.id, err });
+            continue;
+        }
+        if (ctx.items.len > 0) sections.append(a, .{ .command = @intCast(i), .items = ctx.items }) catch break;
+    }
+    res.sections = sections.items;
+}
+
+fn rootSuperseded(h: *Host) bool {
+    h.lock.lockUncancelable(h.io);
+    defer h.lock.unlock(h.io);
+    return h.root_req != null;
+}
+
+const RootCtx = struct {
+    e: *Ext,
+    wc: *WorkerCommand,
+    command: u16,
+    gen: u32,
+    query: []const u8,
+    a: std.mem.Allocator,
+    items: []Item = &.{},
+
+    fn run(L: *lua.State, ctx: *RootCtx) void {
+        _ = lua.pushRef(L, ctx.wc.ref);
+        _ = lua.getField(L, -1, "root");
+        lua.pushString(L, ctx.query);
+        lua.c.lua_callk(L, 1, 1, 0, null);
+        const list_idx = lua.absIndex(L, -1);
+        switch (lua.c.lua_type(L, list_idx)) {
+            lua.c.LUA_TNIL => return,
+            lua.c.LUA_TTABLE => {},
+            else => lua.raise(L, "root: a list expected, got {s}", .{lua.typeName(L, list_idx)}),
+        }
+        keep(L, &ctx.wc.root_rows, list_idx, ctx.gen);
+        ctx.items = parseItems(L, ctx.a, list_idx, .{ .gen = ctx.gen, .command = ctx.command, .root = true }, ctx.e.id, max_root_items);
+    }
+};
+
 // ------------------------------------------------------------------ act
 
 fn doAct(h: *Host, req: ActReq) void {
@@ -837,7 +965,7 @@ fn doAct(h: *Host, req: ActReq) void {
         res.err = "Extensions were reloaded";
         return;
     }
-    const wc = h.wcmds[req.command];
+    const wc = &h.wcmds[req.command];
     const e = h.exts.items[wc.ext];
     e.budget.deadline_ns = index.sys.monotonicNs() + act_budget_ns;
     defer e.budget.deadline_ns = std.math.maxInt(u64);
@@ -847,17 +975,17 @@ fn doAct(h: *Host, req: ActReq) void {
 
 const ActCtx = struct {
     e: *Ext,
-    wc: WorkerCommand,
+    wc: *WorkerCommand,
     req: ActReq,
     res: *ActResult,
 
     fn run(L: *lua.State, ctx: *ActCtx) void {
         const req = ctx.req;
         if (req.item) |item| {
-            const e = ctx.e;
-            if (e.last_ref == c_noref or e.last_gen != req.list_gen or e.last_cmd != req.command)
+            const k = if (req.root) &ctx.wc.root_rows else &ctx.wc.list;
+            if (k.ref == c_noref or k.gen != req.list_gen)
                 lua.raise(L, "the list changed meanwhile; try again", .{});
-            _ = lua.pushRef(L, e.last_ref);
+            _ = lua.pushRef(L, k.ref);
             if (lua.c.lua_rawgeti(L, -1, @intCast(item + 1)) != lua.c.LUA_TTABLE) lua.raise(L, "that row has no actions", .{});
             const row = lua.absIndex(L, -1);
             _ = lua.getField(L, row, "actions");
@@ -884,7 +1012,7 @@ const ActCtx = struct {
 
 const Hop = struct {
     h: *Host,
-    what: union(enum) { registry: *Registry, list: *ListResult, act: *ActResult },
+    what: union(enum) { registry: *Registry, list: *ListResult, act: *ActResult, root: *RootResult },
 };
 
 fn deliver(h: *Host, what: @FieldType(Hop, "what")) void {
@@ -906,6 +1034,7 @@ fn onIdle(data: ?*anyopaque) callconv(.c) c.gboolean {
         .registry => |r| h.cb.registry(r, h.cb.ctx),
         .list => |r| h.cb.list(r, h.cb.ctx),
         .act => |r| h.cb.act(r, h.cb.ctx),
+        .root => |r| h.cb.root(r, h.cb.ctx),
     }
     return 0;
 }
@@ -958,6 +1087,7 @@ const Probe = struct {
     reg: ?*Registry = null,
     res: ?*ListResult = null,
     act: ?*ActResult = null,
+    root: ?*RootResult = null,
 
     fn onRegistry(r: *Registry, ctx: ?*anyopaque) void {
         const p: *Probe = @ptrCast(@alignCast(ctx.?));
@@ -974,7 +1104,13 @@ const Probe = struct {
         if (p.act) |o| o.destroy(testing.allocator);
         p.act = r;
     }
+    fn onRoot(r: *RootResult, ctx: ?*anyopaque) void {
+        const p: *Probe = @ptrCast(@alignCast(ctx.?));
+        if (p.root) |o| o.destroy(testing.allocator);
+        p.root = r;
+    }
     fn deinit(p: *Probe) void {
+        if (p.root) |r| r.destroy(testing.allocator);
         if (p.reg) |r| r.destroy(testing.allocator);
         if (p.res) |r| r.destroy(testing.allocator);
         if (p.act) |r| r.destroy(testing.allocator);
@@ -1006,7 +1142,7 @@ fn writeTestFile(dir: []const u8, name: []const u8, data: []const u8) !void {
 fn testHost(probe: *Probe, dir: []const u8) !*Host {
     var buf: [4096]u8 = undefined;
     const data = try std.fmt.bufPrint(&buf, "{s}/data", .{dir});
-    return start(testing.allocator, testing.io, dir, data, .{ .ctx = probe, .registry = &Probe.onRegistry, .list = &Probe.onList, .act = &Probe.onAct });
+    return start(testing.allocator, testing.io, dir, data, .{ .ctx = probe, .registry = &Probe.onRegistry, .list = &Probe.onList, .act = &Probe.onAct, .root = &Probe.onRoot });
 }
 
 test "extensions load, list, search and run actions" {
@@ -1036,6 +1172,11 @@ test "extensions load, list, search and run actions" {
         \\        return { { title = "you typed " .. out } }
         \\    end },
         \\    { name = "eaten", title = "Eaten", items = function() return { util.eaten or "nothing" } end },
+        \\    { name = "double", title = "Doubler", root = function(q)
+        \\        local n = tonumber(q)
+        \\        if not n then return nil end
+        \\        return { { title = tostring(n * 2), actions = { { title = "Note", run = function(row) util.eaten = row.title end } } } }
+        \\    end },
         \\  },
         \\}
     );
@@ -1050,7 +1191,9 @@ test "extensions load, list, search and run actions" {
     try probe.wait("reg");
     const reg = probe.reg.?;
 
-    try testing.expectEqual(@as(usize, 4), reg.commands.len);
+    try testing.expectEqual(@as(usize, 5), reg.commands.len);
+    try testing.expectEqual(Mode.provider, reg.commands[4].mode);
+    try testing.expect(reg.commands[4].root and !reg.commands[1].root);
     try testing.expectEqualStrings("config.hello", reg.commands[0].id);
     try testing.expectEqual(Mode.run, reg.commands[0].mode);
     try testing.expectEqualStrings("demo.fruits", reg.commands[1].id);
@@ -1092,7 +1235,7 @@ test "extensions load, list, search and run actions" {
 
     // Its Lua action runs against that list, and changes state other
     // commands of the extension see.
-    const ga = h.act(reg.gen, 1, fruits.gen, 1, 1);
+    const ga = h.act(reg.gen, 1, false, fruits.gen, 1, 1);
     const done = try probe.take("act");
     defer done.destroy(testing.allocator);
     try testing.expectEqual(ga, done.gen);
@@ -1111,13 +1254,36 @@ test "extensions load, list, search and run actions" {
     try testing.expectEqualStrings("you typed it's \"quoted\"", echo.items[0].title);
 
     // A run command's return value.
-    _ = h.act(reg.gen, 0, 0, null, 0);
+    _ = h.act(reg.gen, 0, false, 0, null, 0);
     const hello = try probe.take("act");
     defer hello.destroy(testing.allocator);
     try testing.expectEqual(Outcome.stay, hello.outcome);
 
+    // Root search: rows from providers, their Lua actions run there.
+    const gr = h.root(reg.gen, "21");
+    const r21 = try probe.take("root");
+    defer r21.destroy(testing.allocator);
+    try testing.expectEqual(gr, r21.gen);
+    try testing.expectEqual(@as(usize, 1), r21.sections.len);
+    try testing.expectEqual(@as(u16, 4), r21.sections[0].command);
+    const doubled = r21.sections[0].items[0];
+    try testing.expectEqualStrings("42", doubled.title);
+    try testing.expect(doubled.action.ext_item.root);
+    _ = h.act(reg.gen, 4, true, doubled.action.ext_item.gen, 0, 0);
+    (try probe.take("act")).destroy(testing.allocator);
+    _ = h.list(reg.gen, 3, "");
+    const noted = try probe.take("res");
+    defer noted.destroy(testing.allocator);
+    try testing.expectEqualStrings("42", noted.items[0].title);
+    _ = h.root(reg.gen, "not a number");
+    const none = try probe.take("root");
+    defer none.destroy(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), none.sections.len);
+
     // An action against a list that has been replaced is refused.
-    _ = h.act(reg.gen, 1, fruits.gen, 1, 1);
+    _ = h.list(reg.gen, 1, "");
+    (try probe.take("res")).destroy(testing.allocator);
+    _ = h.act(reg.gen, 1, false, fruits.gen, 1, 1);
     const stale = try probe.take("act");
     defer stale.destroy(testing.allocator);
     try testing.expect(std.mem.find(u8, stale.err.?, "changed") != null);
@@ -1176,7 +1342,7 @@ test "errors in extensions come back as messages" {
     defer badrow.destroy(testing.allocator);
     try testing.expect(std.mem.find(u8, badrow.err.?, "items[1].title is missing") != null);
 
-    _ = h.act(reg.gen, 3, 0, null, 0);
+    _ = h.act(reg.gen, 3, false, 0, null, 0);
     const badret = try probe.take("act");
     defer badret.destroy(testing.allocator);
     try testing.expect(std.mem.find(u8, badret.err.?, "must return") != null);
@@ -1230,9 +1396,9 @@ test "preferences read Settings' file over their defaults; storage persists" {
     try testing.expect(before.err == null);
     for (want, before.items) |w, it| try testing.expectEqualStrings(w, it.title);
 
-    _ = h.act(reg.gen, 1, 0, null, 0);
+    _ = h.act(reg.gen, 1, false, 0, null, 0);
     (try probe.take("act")).destroy(testing.allocator);
-    _ = h.act(reg.gen, 1, 0, null, 0);
+    _ = h.act(reg.gen, 1, false, 0, null, 0);
     (try probe.take("act")).destroy(testing.allocator);
     // Storage outlives a reload (a new Lua state reads the file).
     probe.reg = null;

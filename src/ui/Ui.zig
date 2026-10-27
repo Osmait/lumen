@@ -172,6 +172,12 @@ ext_pending: bool = false,
 /// The query of the last list asked for.
 ext_asked: [256]u8 = undefined,
 ext_asked_len: usize = 0,
+/// Extension rows for the root search, and the query last asked for.
+ext_root: ?*ExtHost.RootResult = null,
+ext_root_gen: u32 = 0,
+ext_root_pending: bool = false,
+ext_root_asked: [256]u8 = undefined,
+ext_root_asked_len: usize = 0,
 /// The Lua action running (0: none); its answer decides what happens.
 ext_act_gen: u32 = 0,
 /// The extension whose preferences the prefs view lists.
@@ -919,6 +925,8 @@ fn fillRoot(self: *Ui, a: std.mem.Allocator, q: []const u8) void {
             .detail = plain,
         });
     }
+    // Extensions' answers (rows from `root = function(query)`).
+    ext_view.addRootSections(self, q);
 
     const t_search = stats.now();
     defer self.search_ns += stats.now() - t_search;
@@ -992,7 +1000,7 @@ fn sortByScore(items: []Item) void {
     }.gt);
 }
 
-fn addSection(self: *Ui, title: [:0]const u8) void {
+pub fn addSection(self: *Ui, title: [:0]const u8) void {
     // Room first: a widget without its `rows` entry would shift every later
     // row's index.
     self.rows.ensureUnusedCapacity(self.query_arena.allocator(), 1) catch return;

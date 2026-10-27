@@ -191,13 +191,14 @@ command-line tools you already use can become commands. In
 `~/.config/lumen/init.lua` you can add your own themes and keyboard shortcuts,
 and `~/.config/lumen/style.css` can restyle anything.
 
-Extensions can declare preferences, which show in Settings, and keep data
-between runs with `lumen.storage`.
+Extensions can answer in the main search too (type "time tokyo" with the
+world clock example), declare preferences, which show in Settings, and keep
+data between runs with `lumen.storage`.
 
 [EXTENSIONS.md](EXTENSIONS.md) is the full guide.
 [`examples/`](examples) has a GitHub extension (your pull requests, issues
-and repositories through `gh`), a process list, quick notes, and a sample
-`init.lua` and `style.css`.
+and repositories through `gh`), a process list, quick notes, a world clock,
+and a sample `init.lua` and `style.css`.
 
 ## Configuration
 

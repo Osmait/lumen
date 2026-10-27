@@ -25,6 +25,7 @@ pub fn start(ui: *Ui) void {
         .registry = &onRegistry,
         .list = &onList,
         .act = &onAct,
+        .root = &onRoot,
     }) catch |err| {
         log.warn("extensions: {t}", .{err});
         return;
@@ -72,11 +73,15 @@ fn onRegistry(reg: *Host.Registry, ctx: ?*anyopaque) void {
     // The open command, found again by its id in the new registry.
     const open_id: ?[]const u8 = if (ui.view == .ext) if (command(ui)) |cmd| cmd.id else null else null;
 
+    const old_root = ui.ext_root;
     ui.ext_registry = reg;
     ui.ext_result = null;
+    ui.ext_root = null;
     ui.ext_pending = false;
-    // A list still on its way was asked of the old files: drop it.
+    ui.ext_root_pending = false;
+    // Answers still on their way were asked of the old files: drop them.
     ui.ext_gen = 0;
+    ui.ext_root_gen = 0;
     themes.custom = reg.themes;
     // Rows and theme names point into the old registry: rebuild before
     // freeing it. A theme from init.lua may be the one in use, and lumen.set
@@ -89,7 +94,56 @@ fn onRegistry(reg: *Host.Registry, ctx: ?*anyopaque) void {
         ui.setView(.ext);
     } else ui.setView(.root);
     if (old_result) |r| r.destroy(ui.gpa);
+    if (old_root) |r| r.destroy(ui.gpa);
     if (old) |r| r.destroy(ui.gpa);
+}
+
+fn onRoot(res: *Host.RootResult, ctx: ?*anyopaque) void {
+    const ui: *Ui = @ptrCast(@alignCast(ctx.?));
+    if (res.gen != ui.ext_root_gen) {
+        res.destroy(ui.gpa);
+        return;
+    }
+    const reg = ui.ext_registry orelse {
+        res.destroy(ui.gpa);
+        return;
+    };
+    for (res.sections) |sec| for (sec.items) |*it| {
+        if (it.icon == .none and sec.command < reg.commands.len) it.icon = reg.commands[sec.command].icon;
+    };
+    const old = ui.ext_root;
+    ui.ext_root = res;
+    ui.ext_root_pending = false;
+    if (ui.view == .root and res.sections.len > 0) {
+        if (ui.selectedItem()) |it| ui.setReselect("{s}", .{it.key});
+        ui.refresh();
+    }
+    if (old) |o| o.destroy(ui.gpa);
+}
+
+/// Extension rows for the root search `q`: shown when they answer `q`,
+/// asked for otherwise (they arrive with onRoot).
+pub fn addRootSections(ui: *Ui, q: []const u8) void {
+    const reg = ui.ext_registry orelse return;
+    const h = ui.ext_host orelse return;
+    var any = false;
+    for (reg.commands) |cmd| any = any or cmd.root;
+    if (!any or q.len < 2) return;
+    if (ui.ext_root) |r| if (std.mem.eql(u8, r.query, q)) {
+        for (r.sections) |sec| {
+            if (sec.command >= reg.commands.len) continue;
+            ui.addSection(reg.commands[sec.command].title);
+            for (sec.items) |it| ui.addItem(it);
+        }
+        return;
+    };
+    const asked = ui.ext_root_pending and std.mem.eql(u8, ui.ext_root_asked[0..ui.ext_root_asked_len], q);
+    if (asked) return;
+    const n = @min(q.len, ui.ext_root_asked.len);
+    @memcpy(ui.ext_root_asked[0..n], q[0..n]);
+    ui.ext_root_asked_len = n;
+    ui.ext_root_gen = h.root(reg.gen, q);
+    ui.ext_root_pending = true;
 }
 
 fn onList(res: *Host.ListResult, ctx: ?*anyopaque) void {
@@ -152,6 +206,7 @@ pub fn rootItems(ui: *Ui, a: std.mem.Allocator) []const Item {
     const reg = ui.ext_registry orelse return &.{};
     var out: std.ArrayList(Item) = .empty;
     for (reg.commands, 0..) |cmd, i| {
+        if (cmd.mode == .provider) continue;
         out.append(a, .{
             .key = std.fmt.allocPrint(a, "ext:{s}", .{cmd.id}) catch continue,
             .title = cmd.title,
@@ -233,7 +288,7 @@ pub fn activate(ui: *Ui, i: u16) void {
     if (i >= reg.commands.len) return;
     if (reg.commands[i].mode == .run) {
         const h = ui.ext_host orelse return;
-        ui.ext_act_gen = h.act(reg.gen, i, 0, null, 0);
+        ui.ext_act_gen = h.act(reg.gen, i, false, 0, null, 0);
         ui.showRunning();
         return;
     }
@@ -253,7 +308,7 @@ pub fn perform(ui: *Ui, index_: u8) void {
         .lua => {
             const h = ui.ext_host orelse return;
             const reg = ui.ext_registry orelse return;
-            ui.ext_act_gen = h.act(reg.gen, ui.ext_cmd, x.gen, x.index, index_);
+            ui.ext_act_gen = h.act(reg.gen, x.command, x.root, x.gen, x.index, index_);
             ui.showRunning();
             return;
         },
@@ -309,6 +364,7 @@ pub fn keymap(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) bool {
 /// `text` typed. False when there is no such thing.
 pub fn openTarget(ui: *Ui, target: []const u8, text: ?[*:0]const u8) bool {
     if (ui.ext_registry) |reg| if (find(reg, target)) |i| {
+        if (reg.commands[i].mode == .provider) return false;
         if (reg.commands[i].mode == .run) {
             activate(ui, i);
             return true;

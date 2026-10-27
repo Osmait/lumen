@@ -89,6 +89,10 @@ pub const Action = union(enum) {
 };
 
 pub const ExtItem = struct {
+    /// The extension command that listed it (index in the registry), and
+    /// whether in its list or in the root search.
+    command: u16,
+    root: bool = false,
     /// The list result it came from: its Lua actions run against that one.
     gen: u32,
     /// Position in the list the extension returned.
