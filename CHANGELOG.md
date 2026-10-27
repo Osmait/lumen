@@ -51,7 +51,8 @@ All notable changes are listed here. The format follows
   `lumen.set` gives defaults instead of fixing settings.
 - An Omarchy style (`examples/styles/omarchy`): its menu's look, its 23
   palettes, following Omarchy's current theme, with a theme-set hook.
-- Change Theme opens scrolled to the theme in use.
+- Change Theme opens scrolled to the theme in use, and a style row shows
+  the theme in use instead of the last one previewed.
 - `lumen.layout`'s `placeholder`: the empty search field's text.
 - Settings > Extensions lists every installed extension (failed ones too),
   with its preferences, Open Folder, Update (git) and Uninstall.

@@ -7,11 +7,15 @@ A fast, native launcher for Linux on Wayland, built for Hyprland. Apps,
 calculator, clipboard history, file and file-content search, windows, window
 management, system commands and your own scripts, behind one keystroke.
 
+![Lumen switching between its styles and themes: its own look, Raycast, Spotlight, Alfred, a minimal rofi-like one and Omarchy's menu in several palettes](assets/screenshots/customize.gif)
+
+It looks the way you want: every look above is one Enter away in **Change
+Theme**, switched live, and you can make your own ([Make it
+yours](#make-it-yours)).
+
 Written in Zig with GTK4 and gtk4-layer-shell. No Electron, no web view, no
 network: it starts in about 100 ms, idles at 0 % CPU and keeps everything on
 your machine.
-
-![Lumen searching apps and commands](assets/screenshots/launcher.png)
 
 ## Features
 
@@ -28,6 +32,7 @@ your machine.
 | **Extensions** | commands of your own in Lua, with lists, search and actions; themes, shortcuts and CSS of your own too |
 | **Script commands** | your own scripts in `~/.config/lumen/scripts`, run from the launcher |
 | **Themes** | 13 built in (Lumen, Catppuccin, Dracula, Nord, Gruvbox, Tokyo Night, Rosé Pine, One Dark, Solarized) plus Automatic, previewed live |
+| **Styles** | whole looks switched live: Raycast, Spotlight, Alfred, rofi-like, Omarchy (with its 23 palettes), and your own in `~/.config/lumen/styles` |
 | **Default apps** | choose which app opens each kind of file, or a single file with Open With |
 
 Search ignores case and accents everywhere: `accion` finds *acción*.

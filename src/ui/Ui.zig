@@ -1363,9 +1363,12 @@ pub fn select(self: *Ui, row_index: ?usize) void {
     self.primary = item_mod.actionsFor(it)[0].label;
     self.setHint(self.primary, false);
     detail_pane.showDetail(self, it);
-    // Change Theme shows each theme as the selection moves over it.
-    if (self.view == .themes and it.action == .setting and it.action.setting == .theme)
-        self.applyAppearance(themes.find(it.action.setting.theme, self.preferDark()));
+    // Change Theme shows each theme as the selection moves over it, and the
+    // theme in use on a style.
+    if (self.view == .themes) self.applyAppearance(if (it.action == .setting and it.action.setting == .theme)
+        themes.find(it.action.setting.theme, self.preferDark())
+    else
+        null);
 }
 
 /// The footer's "what Enter does" (hidden with nothing selected).
