@@ -20,6 +20,8 @@ All notable changes are listed here. The format follows
 - Layout settings: window width and height, and density (row height and icon
   size), in Settings and settings.conf.
 - `lumen.set` in init.lua fixes settings; Settings shows them as set there.
+- `lumen --dmenu [--prompt TEXT]`: pick a line of stdin, like dmenu and
+  `rofi -dmenu` (row icons and `meta` words included).
 - Example extensions: GitHub (through `gh`), processes, hello.
 
 ## [0.1.0] - 2026-10-26

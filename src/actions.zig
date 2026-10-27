@@ -95,8 +95,8 @@ pub fn perform(ctx: Ctx, it: *const Item, op: item_mod.Op) Outcome {
         },
         .calc_copy, .copy_detail => copy(it.detail),
         .calc_paste => pasteText(it.detail),
-        // The UI runs extension actions (ext_view.zig).
-        .ext => return .stay,
+        // The UI runs extension actions (ext_view.zig) and dmenu answers.
+        .ext, .pick_typed => return .stay,
     }
     return .hide;
 }
@@ -118,7 +118,7 @@ fn primary(ctx: Ctx, it: *const Item) Outcome {
         .file => |f| openFile(ctx, f.path, f.is_dir),
         .setting => |s| return .{ .setting = .{ .setting = s, .op = .run } },
         // The UI runs extension commands (ext_view.zig).
-        .ext_command, .ext_item => return .stay,
+        .ext_command, .ext_item, .pick => return .stay,
         .ext_problem => copy(it.detail),
     }
     return .hide;

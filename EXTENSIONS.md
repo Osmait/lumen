@@ -119,7 +119,9 @@ way.
 ## Icons
 
 - An emoji: `icon = "🐙"`.
-- An icon name from your icon theme, on a grey tile: `icon = "folder-symbolic"`.
+- An icon from your icon theme, in full colour: `icon = "firefox"`.
+- A symbolic icon (its name ends in `-symbolic`), on a grey tile:
+  `icon = "folder-symbolic"`.
 - An icon name on a coloured tile: `icon = { name = "folder-symbolic", color = "blue" }`.
   The colours are red, orange, yellow, green, blue, purple, pink and gray.
 

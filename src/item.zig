@@ -8,11 +8,19 @@ const settings = @import("settings.zig");
 pub const Color = enum { red, orange, yellow, green, blue, purple, pink, gray };
 
 pub const Icon = union(enum) {
+    /// An icon given by name: "*-symbolic" on a grey tile, anything else in
+    /// full colour. `name` must outlive the icon.
+    pub fn byName(name: [:0]const u8) Icon {
+        return if (std.mem.endsWith(u8, name, "-symbolic")) .{ .tile = .{ .name = name, .color = .gray } } else .{ .named = name };
+    }
+
     none,
     /// App icon from its .desktop file.
     gicon: *c.GIcon,
     /// Symbolic icon on a coloured tile (built-in commands).
     tile: struct { name: [:0]const u8, color: Color },
+    /// A full-colour icon from the icon theme ("firefox"), at full size.
+    named: [:0]const u8,
     emoji: [:0]const u8,
     /// File extension on a coloured tile ("GO", "ZIG").
     badge: struct { text: [:0]const u8, color: core.file_badge.Color },
@@ -23,7 +31,8 @@ pub const Icon = union(enum) {
 };
 
 /// `ext`: the list of an extension command (which one is in the UI).
-pub const View = enum { root, clipboard, windows, files, contents, settings, themes, default_apps, choose, ext };
+/// `dmenu`: lines from `lumen --dmenu`.
+pub const View = enum { root, clipboard, windows, files, contents, settings, themes, default_apps, choose, ext, dmenu };
 
 pub const System = enum {
     lock,
@@ -74,6 +83,8 @@ pub const Action = union(enum) {
     ext_item: ExtItem,
     /// An extension that failed to load; `Item.detail` holds the error.
     ext_problem,
+    /// A line given to `lumen --dmenu` (its index).
+    pick: struct { index: u32, selectable: bool },
 };
 
 pub const ExtItem = struct {
@@ -162,6 +173,8 @@ pub const Op = enum {
     copy_detail,
     /// An extension action: `Entry.index` says which.
     ext,
+    /// `lumen --dmenu`: answer with the text typed instead of a line.
+    pick_typed,
 };
 
 pub const Entry = struct {
@@ -241,5 +254,11 @@ pub fn actionsFor(item: *const Item) []const Entry {
         },
         .ext_item => |x| x.entries,
         .ext_problem => &.{.{ .label = "Copy Error", .keys = "↵", .op = .copy_detail }},
+        .pick => |p| if (p.selectable) &.{
+            .{ .label = "Select", .keys = "↵", .op = .run },
+            .{ .label = "Use Typed Text", .keys = "Ctrl ↵", .op = .pick_typed },
+        } else &.{
+            .{ .label = "Use Typed Text", .keys = "Ctrl ↵", .op = .pick_typed },
+        },
     };
 }

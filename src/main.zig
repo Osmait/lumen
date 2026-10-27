@@ -7,6 +7,7 @@
 //!   lumen --view clipboard --query foo   open a view, prefilled
 //!   lumen --command github.prs           open an extension's command
 //!   lumen --reload     load init.lua and the extensions again
+//!   lumen --dmenu [--prompt TEXT]   pick a line of stdin, print it
 //!   lumen --clip-store  internal: `wl-paste --watch` hands a copy on stdin
 
 const std = @import("std");
@@ -120,6 +121,8 @@ fn onCommandLine(app: *c.GApplication, cmdline: *c.GApplicationCommandLine, _: ?
     var mode: enum { toggle, show, hide, daemon } = .toggle;
     var view: ?Ui.View = null;
     var command: ?[]const u8 = null;
+    var pick = false;
+    var prompt: ?[]const u8 = null;
     var query: ?[*:0]const u8 = null;
     var i: usize = 1;
     while (i < argc) : (i += 1) {
@@ -145,6 +148,11 @@ fn onCommandLine(app: *c.GApplication, cmdline: *c.GApplicationCommandLine, _: ?
             if (!ui_ready) return 1;
             Ui.ext_view.reload(&ui);
             return 0;
+        } else if (std.mem.eql(u8, a, "--dmenu")) {
+            pick = true;
+        } else if (std.mem.eql(u8, a, "--prompt") and next != null) {
+            prompt = std.mem.span(next.?);
+            i += 1;
         } else if (std.mem.eql(u8, a, "--command") and next != null) {
             command = std.mem.span(next.?);
             i += 1;
@@ -169,6 +177,11 @@ fn onCommandLine(app: *c.GApplication, cmdline: *c.GApplicationCommandLine, _: ?
         } else return usage(cmdline);
     }
     if (!ui_ready) return 1;
+    if (pick) {
+        // The answer comes later: the session keeps `cmdline` until then.
+        Ui.dmenu.start(&ui, cmdline, prompt, query);
+        return 1;
+    }
     if (command) |id| {
         if (Ui.ext_view.openTarget(&ui, id, query)) return 0;
         c.g_application_command_line_printerr(cmdline, "lumen: no command \"%.*s\"\n", @as(c_int, @intCast(@min(id.len, 200))), id.ptr);
@@ -186,7 +199,7 @@ fn onCommandLine(app: *c.GApplication, cmdline: *c.GApplicationCommandLine, _: ?
 }
 
 fn clientOnly(flag: []const u8) bool {
-    const flags = [_][]const u8{ "--dump", "--key", "--stats", "--hide", "--quit", "--reload" };
+    const flags = [_][]const u8{ "--dump", "--key", "--stats", "--hide", "--quit", "--reload", "--dmenu" };
     for (flags) |f| if (std.mem.eql(u8, flag, f)) return true;
     return false;
 }
@@ -197,6 +210,7 @@ fn usage(cmdline: *c.GApplicationCommandLine) c_int {
         \\             [--key down|up|enter|ctrl+enter|ctrl+k|escape|backspace|pagedown|pageup|ctrl+x|ctrl+o|ctrl+KEY]
         \\             [--view root|clipboard|windows|files|contents|settings|themes|default_apps]
         \\             [--command EXTENSION.COMMAND] [--query TEXT]
+        \\       lumen --dmenu [--prompt TEXT] [--query TEXT]   < lines
         \\
     );
     return 2;

@@ -26,7 +26,10 @@ pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
     }
 
     if (keyval == c.GDK_KEY_Escape) {
-        if (ui.query().len > 0) {
+        // A dmenu caller is waiting: Esc answers "nothing" and hides.
+        if (ui.view == .dmenu and ui.query().len == 0) {
+            ui.hide();
+        } else if (ui.query().len > 0) {
             c.gtk_editable_set_text(@ptrCast(ui.entry), "");
         } else if (ui.view != .root) ui.goBack() else ui.hide();
         return 1;
@@ -48,6 +51,12 @@ pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
     }
     if (ctrl and keyval == c.GDK_KEY_k) {
         ui.openPanel();
+        return 1;
+    }
+    // dmenu: Ctrl+Enter, or Enter with nothing matching, answers with the
+    // text typed.
+    if (enter and ui.view == .dmenu and (ctrl or ui.selectedItem() == null)) {
+        Ui.dmenu.chooseTyped(ui);
         return 1;
     }
     if (enter) {

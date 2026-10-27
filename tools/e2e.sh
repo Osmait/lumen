@@ -410,6 +410,28 @@ L --hide; L --query "fruit bowl"
 expect_soon "edited extensions reload when the window opens" '> Fixture Fruit Bowl'
 L --hide
 
+echo "dmenu"
+# dm INPUT ARGS...: runs `lumen --dmenu` in the background; its stdout and
+# exit status end up in $T/dm.
+dm() { local input=$1; shift; ( printf "$input" | L --dmenu "$@" >"$T/dm"; echo "exit $?" >>"$T/dm" ) & DM=$!; wait_for '^view: dmenu' 3; }
+# The caller's output once it has exited (wait in this shell, not in $(...)).
+dm_result() { wait "$DM"; r=$(tr '\n' ' ' <"$T/dm"); }
+dm 'red\ngreen\nblue\n' --prompt Colour
+expect "dmenu lists stdin" '> red .*'
+expect "dmenu prompt" '^title: Colour'
+L --key down; L --key enter
+dm_result; [[ "$r" == "green exit 0 " ]] && ok "dmenu prints the choice" || ko "dmenu prints the choice" "$r"
+dm 'red\ngreen\n'
+L --key escape
+dm_result; [[ "$r" == "exit 1 " ]] && ok "dmenu: Esc exits 1" || ko "dmenu: Esc exits 1" "$r"
+dm 'red\ngreen\n' --query purple
+L --key enter
+dm_result; [[ "$r" == "purple exit 0 " ]] && ok "dmenu: no match gives the typed text" || ko "dmenu: no match gives the typed text" "$r"
+dm 'plain\nfancy\0icon\x1f⭐\x1fmeta\x1fsparkly\n' --query sparkly
+expect "dmenu: rofi row options" '> fancy \| .*emoji:⭐'
+L --hide
+dm_result; [[ "$r" == "exit 1 " ]] && ok "dmenu: hiding exits 1" || ko "dmenu: hiding exits 1" "$r"
+
 echo "latency (lumen --stats)"
 stats=$(L --stats)
 # p95 includes the cold instance's first frame (GL context, icon theme);

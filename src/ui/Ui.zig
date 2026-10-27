@@ -31,6 +31,7 @@ const detail_pane = @import("detail_pane.zig");
 const backdrop = @import("backdrop.zig");
 const keyboard = @import("keyboard.zig");
 pub const ext_view = @import("ext_view.zig");
+pub const dmenu = @import("dmenu.zig");
 const ExtHost = @import("../ext/Host.zig");
 const Kind = core.file_kind.Kind;
 
@@ -172,6 +173,8 @@ ext_asked: [256]u8 = undefined,
 ext_asked_len: usize = 0,
 /// The Lua action running (0: none); its answer decides what happens.
 ext_act_gen: u32 = 0,
+/// `lumen --dmenu` waiting for an answer.
+picker: ?*dmenu.Session = null,
 /// Search highlight colours of the theme, for Pango markup.
 hl_fg: [8]u8 = "#ffffff\x00".*,
 hl_bg: [8]u8 = "#ff6363\x00".*,
@@ -554,6 +557,7 @@ fn onAfterPaint(_: *anyopaque, _: ?*anyopaque) callconv(.c) void {
 }
 
 pub fn hide(self: *Ui) void {
+    dmenu.finish(self, null);
     // A theme previewed but not chosen.
     if (self.view == .themes) self.applyAppearance(null);
     self.closePanel();
@@ -631,11 +635,15 @@ fn loadBase(self: *Ui, a: std.mem.Allocator) []Item {
         .default_apps => settings_view.defaultAppsCandidates(self, a),
         .choose => settings_view.chooseCandidates(self, a),
         .ext => ext_view.base(self),
+        // Filtered straight from the session's lines.
+        .dmenu => &.{},
     };
 }
 
 pub fn setView(self: *Ui, view: View) void {
     const leaving_themes = self.view == .themes and view != .themes;
+    // Somewhere else now: the dmenu caller gets no answer.
+    if (self.view == .dmenu and view != .dmenu) dmenu.finish(self, null);
     // Change Theme starts on the theme in use.
     if (view == .themes and self.reselect_len == 0) self.setReselect("theme:{s}", .{self.settings.theme});
     self.view = view;
@@ -682,6 +690,7 @@ pub fn setView(self: *Ui, view: View) void {
         .default_apps => "Search file kinds...",
         .choose => if (self.choosing == .setting) "Filter values..." else "Search apps...",
         .ext => ext_view.placeholder(self, &placeholder_buf),
+        .dmenu => "Filter...",
     });
     c.gtk_label_set_text(@ptrCast(self.scope), self.viewTitle());
     c.gtk_widget_set_visible(self.scope, @intFromBool(view != .root));
@@ -739,6 +748,16 @@ pub fn query(self: *Ui) []const u8 {
     return std.mem.span(c.gtk_editable_get_text(@ptrCast(self.entry)));
 }
 
+/// No rows (what they pointed to is going away).
+pub fn clearRows(self: *Ui) void {
+    _ = self.query_arena.reset(.retain_capacity);
+    self.items = .empty;
+    self.rows = .empty;
+    self.selected = null;
+    self.primary = "";
+    c.gtk_list_box_remove_all(@ptrCast(self.list));
+}
+
 pub fn refresh(self: *Ui) void {
     const t0 = stats.now();
     self.search_ns = 0;
@@ -787,6 +806,7 @@ pub fn refresh(self: *Ui) void {
         .settings, .themes, .default_apps, .choose => self.fillSectioned(a, q),
         // Search commands are asked for `q`; list commands filter here.
         .ext => self.fillSectioned(a, if (ext_view.prepare(self, q)) q else ""),
+        .dmenu => dmenu.fill(self, a, q),
     }
     const searching = self.view == .files or self.view == .contents;
     if (self.rows.items.len == 0 or (searching and self.items.items.len == 0)) {
@@ -968,7 +988,7 @@ fn addSection(self: *Ui, title: [:0]const u8) void {
     self.rows.appendAssumeCapacity(.{ .widget = row, .item = null, .section = title });
 }
 
-fn addItem(self: *Ui, it: Item) void {
+pub fn addItem(self: *Ui, it: Item) void {
     const a = self.query_arena.allocator();
     const item_index = self.items.items.len;
     // Room first: a widget without its `rows` entry would shift every later
@@ -1066,6 +1086,7 @@ fn viewTitle(self: *Ui) [*:0]const u8 {
         .default_apps => "Default Apps",
         .choose => &self.choose_title,
         .ext => if (ext_view.command(self)) |cmd| cmd.title else "Extension",
+        .dmenu => dmenu.title(self),
     };
 }
 
@@ -1144,6 +1165,7 @@ pub fn perform(self: *Ui, op: item_mod.Op) void {
     // Ranking only (Db logs failures): the action goes ahead regardless.
     if (it.key.len > 0 and it.action != .setting and (op == .run or op == .open)) self.db.recordUse(it.key, labels.now()) catch {};
     if (it.action == .ext_command and (op == .run or op == .open)) return ext_view.activate(self, it.action.ext_command.index);
+    if (it.action == .pick) return if (op == .pick_typed) dmenu.chooseTyped(self) else dmenu.choose(self, it.action.pick.index);
 
     const outcome = run.perform(self.actionCtx(), it, op);
     switch (outcome) {
@@ -1249,6 +1271,7 @@ pub fn dump(self: *Ui, gpa: std.mem.Allocator) (std.Io.Writer.Error || std.mem.A
             .gicon => try w.print("gicon\n", .{}),
             .emoji => |e| try w.print("emoji:{s}\n", .{e}),
             .swatch => |sw| try w.print("swatch:{s}\n", .{sw.id}),
+            .named => |n| try w.print("icon:{s}\n", .{n}),
             .none => try w.print("none\n", .{}),
         }
     }
@@ -1278,5 +1301,6 @@ fn emptyText(self: *Ui, a: std.mem.Allocator) [:0]const u8 {
         return std.fmt.allocPrintSentinel(a, "Content search failed ({t})", .{err}, 0) catch "Content search failed";
     if (self.view == .clipboard and q.len == 0 and !self.settings.clipboard) return "Clipboard history is off: turn it on in Settings";
     if (self.view == .ext) return ext_view.emptyText(self, a, q);
+    if (self.view == .dmenu) return dmenu.emptyText(self);
     return "No Results";
 }

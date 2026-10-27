@@ -159,6 +159,12 @@ pub fn iconWidget(icon: item_mod.Icon, size: c_int) *c.GtkWidget {
             return img;
         },
         .emoji => |e| return label(e, "emoji"),
+        .named => |n| {
+            const img = c.gtk_image_new_from_icon_name(n);
+            c.gtk_image_set_pixel_size(@ptrCast(img), size);
+            c.gtk_widget_add_css_class(img, "app-icon");
+            return img;
+        },
         .swatch => |sw| {
             const t = swatchTexture(sw.bg, sw.fg, sw.accent) orelse return iconWidget(.none, size);
             const img = c.gtk_image_new_from_paintable(@ptrCast(t));

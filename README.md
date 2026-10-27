@@ -117,6 +117,8 @@ lumen --view clipboard       open a view: root, clipboard, windows, files, conte
 lumen --query "10 km to mi"  open with a search typed
 lumen --show | --hide | --quit
 lumen --stats                memory, index and latency numbers
+lumen --command github.prs   open an extension's command
+lumen --reload               load init.lua and the extensions again
 ```
 
 So you can bind a key straight to clipboard history:
@@ -124,6 +126,21 @@ So you can bind a key straight to clipboard history:
 ```ini
 bind = ALT SHIFT, V, exec, lumen --view clipboard
 ```
+
+### Pick from a list in your scripts
+
+`lumen --dmenu` works like dmenu or `rofi -dmenu`: it shows the lines it
+reads on stdin, prints the one you pick, and exits 0; Esc exits 1 with nothing
+printed. Ctrl+Enter, or Enter when nothing matches, prints what you typed.
+
+```sh
+choice=$(printf 'Lock\nSuspend\nReboot\n' | lumen --dmenu --prompt Power) || exit
+git branch --format='%(refname:short)' | lumen --dmenu --prompt Branch | xargs git switch
+```
+
+Lines show as they arrive, so a slow command does not hold the window up.
+rofi's row options work too: `printf 'Firefox\0icon\x1ffirefox\n'` shows an
+icon, and `meta` adds words to search by. It needs Lumen running (the daemon).
 
 ## Script commands
 

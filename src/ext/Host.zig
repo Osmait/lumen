@@ -538,7 +538,7 @@ pub fn parseIcon(L: *lua.State, a: std.mem.Allocator, idx: c_int, where: []const
             const s = lua.toSlice(L, t).?;
             const copy = a.dupeSentinel(u8, s, 0) catch lua.raise(L, "not enough memory", .{});
             if (s.len > 0 and s.len <= 32 and s[0] >= 0x80) return .{ .emoji = copy };
-            return .{ .tile = .{ .name = copy, .color = .gray } };
+            return .byName(copy);
         },
         lua.c.LUA_TTABLE => {
             const name = lua.fieldString(L, a, t, "name", where) orelse lua.raise(L, "{s}.icon.name is missing", .{where});
