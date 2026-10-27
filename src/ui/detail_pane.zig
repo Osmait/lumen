@@ -86,6 +86,65 @@ pub fn showContentDetail(ui: *Ui, it: *const Item) void {
     c.gtk_label_set_text(@ptrCast(ui.meta_values[3]), it.where.ptr);
 }
 
+/// The image the preview shows or is loading. Decoding happened on the UI
+/// thread for every keystroke that kept an image as the top hit (a 24 MP
+/// photo: ~100 ms each); now on a GTask thread (GdkTexture loading is
+/// thread-safe), and not again for the same file.
+var image_path: [4096]u8 = undefined;
+var image_len: usize = 0;
+var image_mtime: i64 = 0;
+var image_gen: u32 = 0;
+
+const ImageJob = struct { gen: u32, path: [:0]u8, ui: *Ui };
+
+fn showImage(ui: *Ui, path: [:0]const u8, mtime: i64) void {
+    if (image_len == path.len and image_mtime == mtime and std.mem.eql(u8, image_path[0..image_len], path)) return;
+    forgetImage(ui);
+    if (path.len > image_path.len) return;
+    @memcpy(image_path[0..path.len], path);
+    image_len = path.len;
+    image_mtime = mtime;
+    const job = ui.gpa.create(ImageJob) catch return;
+    job.* = .{ .gen = image_gen, .path = ui.gpa.dupeSentinel(u8, path, 0) catch {
+        ui.gpa.destroy(job);
+        return;
+    }, .ui = ui };
+    const task = c.g_task_new(null, null, &onImageLoaded, job);
+    c.g_task_set_task_data(task, job, null);
+    c.g_task_run_in_thread(task, &loadImage);
+    c.g_object_unref(task);
+}
+
+/// No image: what is on its way is dropped when it arrives.
+fn forgetImage(ui: *Ui) void {
+    image_gen +%= 1;
+    image_len = 0;
+    c.gtk_picture_set_paintable(ui.detail_picture, null);
+}
+
+fn loadImage(task: *c.GTask, _: ?*c.GObject, data: ?*anyopaque, _: ?*c.GCancellable) callconv(.c) void {
+    const job: *ImageJob = @ptrCast(@alignCast(data.?));
+    const tex = c.gdk_texture_new_from_filename(job.path.ptr, null);
+    c.g_task_return_pointer(task, tex, &unrefObject);
+}
+
+fn unrefObject(p: ?*anyopaque) callconv(.c) void {
+    if (p) |o| c.g_object_unref(o);
+}
+
+fn onImageLoaded(_: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) void {
+    const job: *ImageJob = @ptrCast(@alignCast(data.?));
+    const ui = job.ui;
+    defer {
+        ui.gpa.free(job.path);
+        ui.gpa.destroy(job);
+    }
+    const tex = c.g_task_propagate_pointer(@ptrCast(res), null);
+    defer unrefObject(tex);
+    if (job.gen != image_gen) return;
+    c.gtk_picture_set_paintable(ui.detail_picture, tex);
+}
+
 pub fn showFileDetail(ui: *Ui, it: *const Item) void {
     const f = it.action.file;
     var arena: std.heap.ArenaAllocator = .init(ui.gpa);
@@ -101,7 +160,7 @@ pub fn showFileDetail(ui: *Ui, it: *const Item) void {
     const image = (c.g_content_type_is_a(ct, "image/*") != 0 or std.mem.startsWith(u8, std.mem.span(ct), "image/")) and index.sys.isRegular(f.path);
     const info = index.sys.info(f.path);
     c.gtk_widget_set_visible(ui.detail_picture, @intFromBool(image));
-    c.gtk_picture_set_filename(@ptrCast(ui.detail_picture), if (image) f.path.ptr else null);
+    if (image) showImage(ui, f.path, if (info) |i| i.mtime else 0) else forgetImage(ui);
 
     // Text preview: the head of anything that is valid UTF-8.
     var text: []const u8 = "";

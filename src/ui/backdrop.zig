@@ -26,6 +26,23 @@ pub fn makeBackdrop(ui: *Ui) *c.GtkWidget {
 }
 
 /// One backdrop per monitor, mapped before the window so they stack under it.
+/// Makes and realizes one per monitor, hidden: the first show used to create
+/// each full-screen layer (its surface and renderer) while the user waited.
+pub fn prewarmBackdrops(ui: *Ui) void {
+    if (Ui.testMode()) return;
+    const monitors = c.gdk_display_get_monitors(c.gdk_display_get_default() orelse return);
+    const n = @min(c.g_list_model_get_n_items(monitors), ui.backdrops.len);
+    for (ui.backdrops[0..n], 0..) |*slot, i| {
+        if (slot.* != null) continue;
+        const obj = c.g_list_model_get_item(monitors, @intCast(i)) orelse continue;
+        defer c.g_object_unref(obj);
+        const b = makeBackdrop(ui);
+        slot.* = b;
+        c.gtk_layer_set_monitor(@ptrCast(b), @ptrCast(obj));
+        c.gtk_widget_realize(b);
+    }
+}
+
 pub fn showBackdrops(ui: *Ui) void {
     if (Ui.testMode()) return;
     const monitors = c.gdk_display_get_monitors(c.gdk_display_get_default() orelse return);

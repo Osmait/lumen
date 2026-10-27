@@ -133,6 +133,9 @@ contents: ?*index.ContentService = null,
 content_search: ?*ContentSearch = null,
 /// The latest content result applied; its arena backs the rows shown.
 content_result: ?*ContentSearch.Result = null,
+/// The result the rows on screen were built from: a keystroke that only
+/// asks the worker leaves them as they are.
+shown_content: ?*ContentSearch.Result = null,
 /// Generation of the last query submitted; older results are dropped.
 content_gen: u32 = 0,
 content_pending: bool = false,
@@ -168,6 +171,10 @@ base: []Item = &.{},
 /// Visible items, in row order.
 items: std.ArrayList(Item) = .empty,
 rows: std.ArrayList(Row) = .empty,
+/// Rows past the first `eager_rows`, built after the frame (`ensureRows`
+/// when something needs them sooner). In `query_arena`.
+pending: std.ArrayList(Pending) = .empty,
+pending_idle: c_uint = 0,
 selected: ?usize = null,
 
 panel_open: bool = false,
@@ -273,6 +280,14 @@ pub const Choosing = union(enum) {
 /// `hint` shows the primary action while the row is selected, in place of
 /// `accessory`.
 const Row = struct { widget: *c.GtkWidget, item: ?usize, section: [:0]const u8 = "", hint: ?*c.GtkWidget = null, accessory: ?*c.GtkWidget = null };
+
+/// A row not built yet: an item (its index) or a section title.
+const Pending = union(enum) { item: usize, section: [:0]const u8 };
+
+/// Rows built with the keystroke's frame: the ~8 the list shows, and some
+/// to scroll into. Files listed 61 rows (~430 widgets) per key, and GTK
+/// laid them all out: ~14 of the view's 23 ms.
+const eager_rows = 14;
 
 /// End-to-end tests run a second, isolated Lumen (LUMEN_TEST=1): it must not
 /// take the keyboard from the session, nor ask Hyprland where to go.
@@ -824,6 +839,7 @@ fn onAfterPaint(_: *anyopaque, _: ?*anyopaque) callconv(.c) void {
 pub fn prewarm(self: *Ui) void {
     if (c.gtk_widget_get_visible(self.window) != 0) return;
     c.gtk_widget_realize(self.window);
+    backdrop.prewarmBackdrops(self);
     self.setView(.root);
     var size: c_int = 0;
     c.gtk_widget_measure(self.window, c.GTK_ORIENTATION_HORIZONTAL, -1, &size, null, null, null);
@@ -1072,6 +1088,10 @@ pub fn clearRows(self: *Ui) void {
     _ = self.query_arena.reset(.retain_capacity);
     self.items = .empty;
     self.rows = .empty;
+    self.pending = .empty;
+    if (self.pending_idle != 0) _ = c.g_source_remove(self.pending_idle);
+    self.pending_idle = 0;
+    self.shown_content = null;
     self.selected = null;
     self.primary = "";
     c.gtk_list_box_remove_all(@ptrCast(self.list));
@@ -1079,6 +1099,17 @@ pub fn clearRows(self: *Ui) void {
 
 pub fn refresh(self: *Ui) void {
     const t0 = stats.now();
+    // Contents: the rows on screen are the last result's; asking the worker
+    // for the new query changes nothing on screen until it answers (which
+    // refreshes again). Building them again cost a frame per keystroke.
+    if (self.view == .contents) if (self.content_search) |cs| if (self.content_result) |r| {
+        const q = std.mem.trim(u8, self.query(), " ");
+        if (q.len >= 3 and r == self.shown_content and !std.mem.eql(u8, r.query, ContentSearch.clip(q))) {
+            self.content_gen = cs.submit(q, t0);
+            self.content_pending = true;
+            return;
+        }
+    };
     self.search_ns = 0;
     defer {
         const total = stats.now() - t0;
@@ -1088,6 +1119,10 @@ pub fn refresh(self: *Ui) void {
     const a = self.query_arena.allocator();
     self.items = .empty;
     self.rows = .empty;
+    self.pending = .empty;
+    if (self.pending_idle != 0) _ = c.g_source_remove(self.pending_idle);
+    self.pending_idle = 0;
+    self.shown_content = null;
     self.selected = null;
     self.confirm_key = "";
     c.gtk_list_box_remove_all(@ptrCast(self.list));
@@ -1117,6 +1152,7 @@ pub fn refresh(self: *Ui) void {
                 if (self.content_result) |r| {
                     self.addSection("Matches");
                     for (file_results.itemsFromHits(self, a, r.hits)) |it| self.addItem(it);
+                    self.shown_content = r;
                 }
             } else {
                 self.addSection("Matches");
@@ -1156,6 +1192,8 @@ pub fn refresh(self: *Ui) void {
     c.gtk_adjustment_set_value(adj, 0);
     var first = self.nextSelectable(null, 1);
     if (self.reselect_len > 0) {
+        // The row to select back may be any of them.
+        self.ensureRows();
         const want = self.reselect[0..self.reselect_len];
         self.reselect_len = 0;
         for (self.rows.items, 0..) |row, i| {
@@ -1310,6 +1348,47 @@ fn sortByScore(items: []Item) void {
 pub fn addSection(self: *Ui, title: [:0]const u8) void {
     // A grid has no sections: rows and items stay one to one there.
     if (self.grid_mode or !self.layout.show.section_titles) return;
+    if (self.deferRow(.{ .section = title })) return;
+    self.buildSection(title);
+}
+
+/// Queues a row past the first `eager_rows`; false: build it now.
+fn deferRow(self: *Ui, p: Pending) bool {
+    if (self.grid_mode or (self.rows.items.len < eager_rows and self.pending.items.len == 0)) return false;
+    self.pending.append(self.query_arena.allocator(), p) catch return false;
+    if (self.pending_idle == 0) self.pending_idle = c.g_idle_add_full(c.G_PRIORITY_LOW, &onPendingRows, self, null);
+    return true;
+}
+
+/// Builds every queued row now.
+pub fn ensureRows(self: *Ui) void {
+    if (self.pending_idle != 0) _ = c.g_source_remove(self.pending_idle);
+    self.pending_idle = 0;
+    self.buildPending(self.pending.items.len);
+}
+
+fn buildPending(self: *Ui, n: usize) void {
+    const k = @min(n, self.pending.items.len);
+    for (self.pending.items[0..k]) |p| switch (p) {
+        .item => |i| self.buildItemRow(i),
+        .section => |t| self.buildSection(t),
+    };
+    // What is left moves to the front.
+    std.mem.copyForwards(Pending, self.pending.items, self.pending.items[k..]);
+    self.pending.items.len -= k;
+}
+
+/// After the frame: the queued rows a few at a time, so a keystroke that
+/// comes meanwhile is not kept waiting (it drops them).
+fn onPendingRows(data: ?*anyopaque) callconv(.c) c.gboolean {
+    const self: *Ui = @ptrCast(@alignCast(data));
+    self.buildPending(16);
+    if (self.pending.items.len > 0) return 1;
+    self.pending_idle = 0;
+    return 0;
+}
+
+fn buildSection(self: *Ui, title: [:0]const u8) void {
     // Room first: a widget without its `rows` entry would shift every later
     // row's index.
     self.rows.ensureUnusedCapacity(self.query_arena.allocator(), 1) catch return;
@@ -1327,10 +1406,17 @@ pub fn addItem(self: *Ui, it_in: Item) void {
     if (self.keyIcon(it.key)) |icon| it.icon = icon;
     const a = self.query_arena.allocator();
     const item_index = self.items.items.len;
+    self.items.append(a, it) catch return;
+    if (self.deferRow(.{ .item = item_index })) return;
+    self.buildItemRow(item_index);
+}
+
+fn buildItemRow(self: *Ui, item_index: usize) void {
+    const a = self.query_arena.allocator();
+    const it = self.items.items[item_index];
     // Room first: a widget without its `rows` entry would shift every later
     // row's index (and `onRowActivated` would select the wrong item).
     self.rows.ensureUnusedCapacity(a, 1) catch return;
-    self.items.append(a, it) catch return;
     if (self.grid_mode) {
         const gap = 6 * (self.grid_columns - 1) + 24;
         const cell = widgets.gridCell(it, @divTrunc(self.panelW() - gap, self.grid_columns) - 12);
@@ -1349,6 +1435,8 @@ pub fn addItem(self: *Ui, it_in: Item) void {
 // ----------------------------------------------------------- selection
 
 pub fn nextSelectable(self: *Ui, from: ?usize, dir: i32) ?usize {
+    // Past the rows built so far, or from the end: build the rest first.
+    if (self.pending.items.len > 0 and ((from == null and dir < 0) or (from != null and dir > 0 and from.? + 1 >= self.rows.items.len))) self.ensureRows();
     const n = self.rows.items.len;
     if (n == 0) return null;
     var i: i64 = if (from) |f| @as(i64, @intCast(f)) + dir else if (dir > 0) 0 else @as(i64, @intCast(n)) - 1;
@@ -1682,6 +1770,7 @@ pub fn dump(self: *Ui, gpa: std.mem.Allocator) (std.Io.Writer.Error || std.mem.A
     try w.print(" prompt={s} placeholder={s}\n", .{ lay.prompt, lay.placeholder });
     if (lay.footer) try w.print("footer: {s} | {s}\n", .{ c.gtk_label_get_text(@ptrCast(self.footer_title)), c.gtk_label_get_text(@ptrCast(self.footer_action)) });
     try w.print("rows:\n", .{});
+    self.ensureRows();
     if (self.rows.items.len == 0) try w.print("  (empty) {s}\n", .{self.emptyText(a)});
     for (self.rows.items, 0..) |row, i| {
         const it_index = row.item orelse {
