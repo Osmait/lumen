@@ -508,21 +508,27 @@ fn extractTaskOrFail(ctx: *ExtractCtx, t: usize) std.mem.Allocator.Error!void {
 
 pub const BuildStats = struct { docs_indexed: usize = 0, pairs: usize = 0, segments: usize = 0, ns: u64 = 0 };
 
+pub const BuildError = std.mem.Allocator.Error || error{BadIndex};
+pub const FileError = BuildError || sys.Error;
+
 /// Builds the index of `docs` (their order defines doc ids). `text` gives
 /// each document's text; documents it rejects are kept (their path still
 /// resolves) but have no postings.
-pub fn build(gpa: std.mem.Allocator, pool: *Pool, docs: []const DocIn, text: TextReader, stats: ?*BuildStats) (std.mem.Allocator.Error || error{BadIndex})!Index {
-    const t0 = sys.monotonicNs();
-    var st: BuildStats = .{};
-    // Aligned as the index needs, so it becomes the index without a copy.
-    var out: Out = .empty;
-    defer out.deinit(gpa);
-    var dir: std.ArrayList(SegEntry) = .empty;
-    defer dir.deinit(gpa);
-    const docs_off = try writeDocs(gpa, &out, docs, null);
-    try indexDocs(gpa, pool, &out, &dir, docs, 0, text, &st);
-    st.docs_indexed = docs.len;
-    return finish(gpa, &out, dir.items, docs, docs_off, t0, &st, stats);
+pub fn build(gpa: std.mem.Allocator, pool: *Pool, docs: []const DocIn, text: TextReader, stats: ?*BuildStats) BuildError!Index {
+    var sink: Sink = .{ .gpa = gpa };
+    defer sink.deinit();
+    return toMemory(&sink, buildInto(&sink, pool, docs, text, stats) catch |err| return memoryOnly(err));
+}
+
+/// `build`, written to `path` as it grows (atomically, see
+/// `sys.AtomicFile`) and returned mapped: the finished index (~80 MB for
+/// 49 k files) is never whole in memory.
+pub fn buildFile(gpa: std.mem.Allocator, pool: *Pool, docs: []const DocIn, text: TextReader, path_z: [:0]const u8, stats: ?*BuildStats) FileError!Index {
+    var file = try sys.AtomicFile.create(path_z);
+    errdefer file.abort();
+    var sink: Sink = .{ .gpa = gpa, .file = &file };
+    defer sink.deinit();
+    return toFile(&sink, try buildInto(&sink, pool, docs, text, stats), path_z);
 }
 
 /// `old` with the documents `gone` (ids) marked removed and `added`
@@ -530,7 +536,121 @@ pub fn build(gpa: std.mem.Allocator, pool: *Pool, docs: []const DocIn, text: Tex
 /// as they are. A few edited files cost reading those files, not the
 /// thousands of others (a full build: ~1.1 s and ~270 MB for 49 k). Doc ids
 /// of `old` keep their meaning, so lists stay ascending across segments.
-pub fn update(gpa: std.mem.Allocator, pool: *Pool, old: *const Index, gone: []const u32, added: []const DocIn, text: TextReader, stats: ?*BuildStats) (std.mem.Allocator.Error || error{BadIndex})!Index {
+pub fn update(gpa: std.mem.Allocator, pool: *Pool, old: *const Index, gone: []const u32, added: []const DocIn, text: TextReader, stats: ?*BuildStats) BuildError!Index {
+    var sink: Sink = .{ .gpa = gpa };
+    defer sink.deinit();
+    return toMemory(&sink, updateInto(&sink, pool, old, gone, added, text, stats) catch |err| return memoryOnly(err));
+}
+
+/// `update`, written to `path` (it may be the file `old` is mapped from:
+/// that mapping keeps the old file) and returned mapped. `old`'s segments go
+/// from its mapping to the file without passing through the heap.
+pub fn updateFile(gpa: std.mem.Allocator, pool: *Pool, old: *const Index, gone: []const u32, added: []const DocIn, text: TextReader, path_z: [:0]const u8, stats: ?*BuildStats) FileError!Index {
+    var file = try sys.AtomicFile.create(path_z);
+    errdefer file.abort();
+    var sink: Sink = .{ .gpa = gpa, .file = &file };
+    defer sink.deinit();
+    return toFile(&sink, try updateInto(&sink, pool, old, gone, added, text, stats), path_z);
+}
+
+/// Where an index is written: memory, where it becomes the index, or a file,
+/// keeping only what is not written yet. Offsets are positions in the whole.
+const Sink = struct {
+    gpa: std.mem.Allocator,
+    file: ?*sys.AtomicFile = null,
+    buf: Out = .empty,
+    /// Bytes already in the file.
+    written: usize = 0,
+
+    /// Larger pieces go to the file directly instead of through `buf`.
+    const direct = 64 * 1024;
+
+    fn deinit(k: *Sink) void {
+        k.buf.deinit(k.gpa);
+    }
+
+    fn pos(k: *const Sink) usize {
+        return k.written + k.buf.items.len;
+    }
+
+    fn append(k: *Sink, bytes: []const u8) FileError!void {
+        if (k.file != null and bytes.len >= direct) {
+            try k.flush();
+            try k.file.?.write(bytes);
+            k.written += bytes.len;
+            return;
+        }
+        try k.buf.appendSlice(k.gpa, bytes);
+    }
+
+    fn zeros(k: *Sink, n: usize) FileError!void {
+        try k.buf.appendNTimes(k.gpa, 0, n);
+    }
+
+    fn pad8(k: *Sink) FileError!void {
+        while (k.pos() % 8 != 0) try k.buf.append(k.gpa, 0);
+    }
+
+    /// Writes what is buffered (file mode only).
+    fn flush(k: *Sink) FileError!void {
+        const f = k.file orelse return;
+        try f.write(k.buf.items);
+        k.written += k.buf.items.len;
+        k.buf.clearRetainingCapacity();
+    }
+};
+
+/// The header, once everything after it is written.
+const Header = struct { n: usize, n_segs: usize, paths_len: usize, docs_off: usize, dir_off: usize, total: usize };
+
+fn headerBytes(h: Header) [header_len]u8 {
+    var b: [header_len]u8 = @splat(0);
+    @memcpy(b[0..8], magic);
+    std.mem.writeInt(u64, b[8..16], h.n, .little);
+    std.mem.writeInt(u64, b[16..24], h.n_segs, .little);
+    std.mem.writeInt(u64, b[24..32], h.paths_len, .little);
+    std.mem.writeInt(u64, b[32..40], h.docs_off, .little);
+    std.mem.writeInt(u64, b[40..48], h.dir_off, .little);
+    std.mem.writeInt(u64, b[48..56], h.total, .little);
+    return b;
+}
+
+/// A sink without a file never fails to write one.
+fn memoryOnly(err: FileError) BuildError {
+    return switch (err) {
+        error.OutOfMemory, error.BadIndex => |e| e,
+        else => unreachable,
+    };
+}
+
+fn toMemory(sink: *Sink, h: Header) BuildError!Index {
+    @memcpy(sink.buf.items[0..header_len], &headerBytes(h));
+    const buf = try sink.buf.toOwnedSlice(sink.gpa);
+    errdefer sink.gpa.free(buf);
+    return Index.parse(buf, false);
+}
+
+fn toFile(sink: *Sink, h: Header, path_z: [:0]const u8) FileError!Index {
+    try sink.flush();
+    const f = sink.file.?;
+    try f.writeAt(&headerBytes(h), 0);
+    try f.commit();
+    return Index.open(path_z);
+}
+
+fn buildInto(sink: *Sink, pool: *Pool, docs: []const DocIn, text: TextReader, stats: ?*BuildStats) FileError!Header {
+    const t0 = sys.monotonicNs();
+    var st: BuildStats = .{};
+    var dir: std.ArrayList(SegEntry) = .empty;
+    defer dir.deinit(sink.gpa);
+    const docs_off = try writeDocs(sink, docs, null);
+    try indexDocs(sink, pool, &dir, docs, 0, text, &st);
+    st.docs_indexed = docs.len;
+    return finish(sink, dir.items, docs, docs_off, t0, &st, stats);
+}
+
+fn updateInto(sink: *Sink, pool: *Pool, old: *const Index, gone: []const u32, added: []const DocIn, text: TextReader, stats: ?*BuildStats) FileError!Header {
+    const gpa = sink.gpa;
     const t0 = sys.monotonicNs();
     var st: BuildStats = .{};
     const n = old.n_docs + added.len;
@@ -545,52 +665,53 @@ pub fn update(gpa: std.mem.Allocator, pool: *Pool, old: *const Index, gone: []co
     @memset(flags[old.n_docs..], 0);
     for (gone) |id| flags[id] |= flag_removed;
 
-    var out: Out = .empty;
-    defer out.deinit(gpa);
     var dir: std.ArrayList(SegEntry) = .empty;
     defer dir.deinit(gpa);
-    const docs_off = try writeDocs(gpa, &out, docs, flags);
-    for (old.segs) |seg| try copySegment(gpa, &out, &dir, old.buf, seg);
-    try indexDocs(gpa, pool, &out, &dir, docs, old.n_docs, text, &st);
+    const docs_off = try writeDocs(sink, docs, flags);
+    for (old.segs) |seg| try copySegment(sink, &dir, old.buf, seg);
+    try indexDocs(sink, pool, &dir, docs, old.n_docs, text, &st);
     st.docs_indexed = added.len;
-    return finish(gpa, &out, dir.items, docs, docs_off, t0, &st, stats);
+    return finish(sink, dir.items, docs, docs_off, t0, &st, stats);
 }
 
 /// Header room, then the doc table and paths; returns where the table
 /// starts. `flags` null: none set.
-fn writeDocs(gpa: std.mem.Allocator, out: *Out, docs: []const DocIn, flags: ?[]const u8) std.mem.Allocator.Error!usize {
-    try out.appendNTimes(gpa, 0, header_len);
+fn writeDocs(sink: *Sink, docs: []const DocIn, flags: ?[]const u8) FileError!usize {
+    try sink.zeros(header_len);
     var paths_len: usize = 0;
     for (docs) |d| paths_len += d.path.len;
-    const docs_off = out.items.len;
-    try out.appendNTimes(gpa, 0, align8(docs.len * doc_bytes + paths_len));
-    var o = docs_off;
+    const docs_off = sink.pos();
+    // Built in the buffer: nothing is written before the doc table is done.
+    const at = sink.buf.items.len;
+    try sink.zeros(align8(docs.len * doc_bytes + paths_len));
+    const b = sink.buf.items;
+    var o = at;
     for (docs) |d| {
-        std.mem.writeInt(i64, out.items[o..][0..8], d.mtime, .little);
+        std.mem.writeInt(i64, b[o..][0..8], d.mtime, .little);
         o += 8;
     }
     for (docs) |d| {
-        std.mem.writeInt(u64, out.items[o..][0..8], d.size, .little);
+        std.mem.writeInt(u64, b[o..][0..8], d.size, .little);
         o += 8;
     }
     var po: u32 = 0;
     for (docs) |d| {
-        std.mem.writeInt(u32, out.items[o..][0..4], po, .little);
+        std.mem.writeInt(u32, b[o..][0..4], po, .little);
         po += @intCast(d.path.len);
         o += 4;
     }
     for (docs) |d| {
-        std.mem.writeInt(u16, out.items[o..][0..2], @intCast(@min(d.path.len, std.math.maxInt(u16))), .little);
+        std.mem.writeInt(u16, b[o..][0..2], @intCast(@min(d.path.len, std.math.maxInt(u16))), .little);
         o += 2;
     }
     for (docs) |d| {
-        out.items[o] = @backingInt(d.source);
+        b[o] = @backingInt(d.source);
         o += 1;
     }
-    if (flags) |f| @memcpy(out.items[o..][0..docs.len], f);
+    if (flags) |f| @memcpy(b[o..][0..docs.len], f);
     o += docs.len;
     for (docs) |d| {
-        @memcpy(out.items[o..][0..d.path.len], d.path);
+        @memcpy(b[o..][0..d.path.len], d.path);
         o += d.path.len;
     }
     return docs_off;
@@ -598,7 +719,8 @@ fn writeDocs(gpa: std.mem.Allocator, out: *Out, docs: []const DocIn, flags: ?[]c
 
 /// Indexes `docs[from..]` (ids are positions in `docs`), closing segments as
 /// they fill.
-fn indexDocs(gpa: std.mem.Allocator, pool: *Pool, out: *Out, dir: *std.ArrayList(SegEntry), docs: []const DocIn, from: usize, text: TextReader, st: *BuildStats) std.mem.Allocator.Error!void {
+fn indexDocs(sink: *Sink, pool: *Pool, dir: *std.ArrayList(SegEntry), docs: []const DocIn, from: usize, text: TextReader, st: *BuildStats) FileError!void {
+    const gpa = sink.gpa;
     var pairs: std.ArrayList(u64) = .empty;
     defer pairs.deinit(gpa);
     var scratch: std.ArrayList(u64) = .empty;
@@ -628,56 +750,47 @@ fn indexDocs(gpa: std.mem.Allocator, pool: *Pool, out: *Out, dir: *std.ArrayList
         if (pairs.items.len >= segment_pairs or lo == n) {
             if (pairs.items.len > 0) {
                 st.pairs += pairs.items.len;
-                try closeSegment(gpa, out, dir, pairs.items, &scratch);
+                try closeSegment(sink, dir, pairs.items, &scratch);
                 st.segments += 1;
                 pairs.clearRetainingCapacity();
+                try sink.flush();
             }
         }
     }
 }
 
-/// A segment of another index, as it is, at the end of `out`.
-fn copySegment(gpa: std.mem.Allocator, out: *Out, dir: *std.ArrayList(SegEntry), from: []align(8) const u8, seg: SegEntry) std.mem.Allocator.Error!void {
+/// A segment of another index, as it is.
+fn copySegment(sink: *Sink, dir: *std.ArrayList(SegEntry), from: []align(8) const u8, seg: SegEntry) FileError!void {
     const n_keys: usize = @intCast(seg.n_keys);
-    while (out.items.len % 8 != 0) try out.append(gpa, 0);
-    const keys_off = out.items.len;
-    try out.appendSlice(gpa, from[@intCast(seg.keys_off)..][0 .. n_keys * 4]);
-    while (out.items.len % 8 != 0) try out.append(gpa, 0);
-    const offs_off = out.items.len;
-    try out.appendSlice(gpa, from[@intCast(seg.offs_off)..][0 .. (n_keys + 1) * 4]);
-    const post_off = out.items.len;
-    try out.appendSlice(gpa, from[@intCast(seg.post_off)..][0..@intCast(seg.post_len)]);
-    try dir.append(gpa, .{ .n_keys = seg.n_keys, .keys_off = keys_off, .offs_off = offs_off, .post_off = post_off, .post_len = seg.post_len });
+    try sink.pad8();
+    const keys_off = sink.pos();
+    try sink.append(from[@intCast(seg.keys_off)..][0 .. n_keys * 4]);
+    try sink.pad8();
+    const offs_off = sink.pos();
+    try sink.append(from[@intCast(seg.offs_off)..][0 .. (n_keys + 1) * 4]);
+    const post_off = sink.pos();
+    try sink.append(from[@intCast(seg.post_off)..][0..@intCast(seg.post_len)]);
+    try dir.append(sink.gpa, .{ .n_keys = seg.n_keys, .keys_off = keys_off, .offs_off = offs_off, .post_off = post_off, .post_len = seg.post_len });
 }
 
-/// The segment directory and the header; `out`'s buffer becomes the index.
-fn finish(gpa: std.mem.Allocator, out: *Out, dir: []const SegEntry, docs: []const DocIn, docs_off: usize, t0: u64, st: *BuildStats, stats: ?*BuildStats) (std.mem.Allocator.Error || error{BadIndex})!Index {
+/// The segment directory; returns the header to put first.
+fn finish(sink: *Sink, dir: []const SegEntry, docs: []const DocIn, docs_off: usize, t0: u64, st: *BuildStats, stats: ?*BuildStats) FileError!Header {
     var paths_len: usize = 0;
     for (docs) |d| paths_len += d.path.len;
-    while (out.items.len % 8 != 0) try out.append(gpa, 0);
-    const dir_off = out.items.len;
-    try out.appendSlice(gpa, std.mem.sliceAsBytes(dir));
-    const total = out.items.len;
-    @memcpy(out.items[0..8], magic);
-    std.mem.writeInt(u64, out.items[8..16], docs.len, .little);
-    std.mem.writeInt(u64, out.items[16..24], dir.len, .little);
-    std.mem.writeInt(u64, out.items[24..32], paths_len, .little);
-    std.mem.writeInt(u64, out.items[32..40], docs_off, .little);
-    std.mem.writeInt(u64, out.items[40..48], dir_off, .little);
-    std.mem.writeInt(u64, out.items[48..56], total, .little);
-
-    const buf = try out.toOwnedSlice(gpa);
-    errdefer gpa.free(buf);
+    try sink.pad8();
+    const dir_off = sink.pos();
+    try sink.append(std.mem.sliceAsBytes(dir));
     st.ns = sys.monotonicNs() - t0;
     if (stats) |s| s.* = st.*;
-    return Index.parse(buf, false);
+    return .{ .n = docs.len, .n_segs = dir.len, .paths_len = paths_len, .docs_off = docs_off, .dir_off = dir_off, .total = sink.pos() };
 }
 
-/// Sorts a segment's pairs by trigram (stable, so docs stay ascending) and
-/// appends keys, offsets and varint-delta lists to `out`.
 const Out = std.array_list.Aligned(u8, .@"8");
 
-fn closeSegment(gpa: std.mem.Allocator, out: *Out, dir: *std.ArrayList(SegEntry), pairs: []u64, scratch: *std.ArrayList(u64)) !void {
+/// Sorts a segment's pairs by trigram (stable, so docs stay ascending) and
+/// appends keys, offsets and varint-delta lists.
+fn closeSegment(sink: *Sink, dir: *std.ArrayList(SegEntry), pairs: []u64, scratch: *std.ArrayList(u64)) FileError!void {
+    const gpa = sink.gpa;
     try scratch.resize(gpa, pairs.len);
     radixByKey(pairs, scratch.items);
 
@@ -701,14 +814,14 @@ fn closeSegment(gpa: std.mem.Allocator, out: *Out, dir: *std.ArrayList(SegEntry)
     }
     try offs.append(gpa, @intCast(post.items.len));
 
-    while (out.items.len % 8 != 0) try out.append(gpa, 0);
-    const keys_off = out.items.len;
-    try out.appendSlice(gpa, std.mem.sliceAsBytes(keys.items));
-    while (out.items.len % 8 != 0) try out.append(gpa, 0);
-    const offs_off = out.items.len;
-    try out.appendSlice(gpa, std.mem.sliceAsBytes(offs.items));
-    const post_off = out.items.len;
-    try out.appendSlice(gpa, post.items);
+    try sink.pad8();
+    const keys_off = sink.pos();
+    try sink.append(std.mem.sliceAsBytes(keys.items));
+    try sink.pad8();
+    const offs_off = sink.pos();
+    try sink.append(std.mem.sliceAsBytes(offs.items));
+    const post_off = sink.pos();
+    try sink.append(post.items);
     try dir.append(gpa, .{ .n_keys = keys.items.len, .keys_off = keys_off, .offs_off = offs_off, .post_off = post_off, .post_len = post.items.len });
 }
 
@@ -1043,6 +1156,18 @@ test "update: edited and deleted documents leave, new ones join, old ids keep th
         try x.candidates(gpa, &.{"okavango"}, &got);
         try testing.expectEqualSlices(u32, &.{ 3, 4 }, got.items);
     }
+
+    // Written to a file as they grow: the same bytes. The update overwrites
+    // the file its old index is mapped from, as the service does.
+    const fp = try std.fmt.bufPrintSentinel(&pbuf, "{s}/streamed.idx", .{dir}, 0);
+    var built = try buildFile(gpa, pool, &docs, .{ .read = TestDocs.text, .ctx = &before }, fp, null);
+    defer built.deinit(gpa);
+    try testing.expect(built.mapped);
+    try testing.expectEqualSlices(u8, ix.buf, built.buf);
+    var streamed = try updateFile(gpa, pool, &built, &.{ 1, 2 }, &added, .{ .read = TestDocs.text, .ctx = &after }, fp, null);
+    defer streamed.deinit(gpa);
+    try testing.expectEqualSlices(u8, up.buf, streamed.buf);
+    try testing.expectEqualStrings("0", built.path(0));
 
     // Updated again, with only a removal: no new segment.
     var again = try update(gpa, pool, &mapped, &.{0}, &.{}, .{ .read = TestDocs.text, .ctx = &after }, null);

@@ -358,31 +358,34 @@ fn refresh(s: *ContentService) void {
     if (s.stop.load(.acquire)) return;
     t = sys.monotonicNs();
     const reader: content.TextReader = .{ .read = textOf, .ctx = s };
-    var fresh = (if (whole)
-        content.build(s.gpa, s.build_pool, docs, reader, null)
+    if (std.mem.findScalarLast(u8, s.cache_path, '/')) |slash| sys.mkdirP(s.cache_path[0..slash]);
+    // Written to the cache file as it grows and served mapped: clean page
+    // cache, never the whole index in heap.
+    const written = if (whole)
+        content.buildFile(s.gpa, s.build_pool, docs, reader, s.cache_path, null)
     else
-        content.update(s.gpa, s.build_pool, &s.index.?, d.gone, d.added, reader, null)) catch |err| {
-        log.warn("building the content index: {t}", .{err});
-        return;
+        content.updateFile(s.gpa, s.build_pool, &s.index.?, d.gone, d.added, reader, s.cache_path, null);
+    const fresh = written catch |file_err| blk: {
+        if (file_err == error.OutOfMemory) {
+            log.warn("building the content index: out of memory", .{});
+            return;
+        }
+        // Not written (a full disk, a read-only cache): built in memory and
+        // served from there; saving is retried on the next check.
+        log.warn("writing the content index: {t}", .{file_err});
+        s.unsaved = true;
+        break :blk (if (whole)
+            content.build(s.gpa, s.build_pool, docs, reader, null)
+        else
+            content.update(s.gpa, s.build_pool, &s.index.?, d.gone, d.added, reader, null)) catch |err| {
+            log.warn("building the content index: {t}", .{err});
+            return;
+        };
     };
+    if (fresh.mapped) s.unsaved = false;
     s.last_build_ns.store(sys.monotonicNs() - t, .monotonic);
     _ = s.builds.fetchAdd(1, .release);
     if (!whole) _ = s.updates.fetchAdd(1, .release);
-    // Save, then serve the mapping of what was saved: clean page cache
-    // instead of tens of MB of heap.
-    if (std.mem.findScalarLast(u8, s.cache_path, '/')) |slash| sys.mkdirP(s.cache_path[0..slash]);
-    // Not saved: still served from memory, and saving is retried on the
-    // next check (a full disk, a read-only cache).
-    if (fresh.save(s.cache_path)) |_| {
-        s.unsaved = false;
-        if (content.Index.open(s.cache_path)) |mapped| {
-            fresh.deinit(s.gpa);
-            fresh = mapped;
-        } else |_| {}
-    } else |err| {
-        s.unsaved = true;
-        log.warn("saving the content index: {t}", .{err});
-    }
 
     var old = blk: {
         s.lock.lockUncancelable(s.io);
@@ -595,6 +598,29 @@ test "content service: finds, follows edits and deletions, rebuilds only on chan
     try testing.expectEqual(@as(usize, 1), (try f.find(s, "unrelated")).len);
     try waitChecks(s, 1);
     try testing.expectEqual(@as(u32, 0), s.status().builds);
+}
+
+test "content service: a cache it cannot write still serves from memory, and saves later" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    try f.root.write("a.txt", "an unwritable cache lemur\n");
+    // A directory where the index's temporary file goes: writing it fails.
+    var bbuf: [4096]u8 = undefined;
+    const blocker = try std.fmt.bufPrintSentinel(&bbuf, "{s}/content.idx.tmp", .{f.cache.abs}, 0);
+    try testing.expect(linux.errno(linux.mkdir(blocker, 0o700)) == .SUCCESS);
+    const s = try f.start();
+    defer s.shutdown();
+    try waitChecks(s, 1);
+    try testing.expectEqual(@as(usize, 1), (try f.find(s, "lemur")).len);
+    var ibuf: [4096]u8 = undefined;
+    const saved = try std.fmt.bufPrintSentinel(&ibuf, "{s}/content.idx", .{f.cache.abs}, 0);
+    try testing.expect(!sys.exists(saved));
+    // Writable again: the next check saves it, though nothing changed.
+    _ = linux.rmdir(blocker);
+    try pokeAndWait(s);
+    try testing.expect(sys.exists(saved));
+    try testing.expectEqual(@as(u32, 1), s.status().builds);
 }
 
 test "content service: rebuilt whole once removed versions pile up" {

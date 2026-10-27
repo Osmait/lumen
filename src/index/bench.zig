@@ -127,11 +127,11 @@ fn contentBench(gpa: std.mem.Allocator, io: std.Io, pool: *index.Pool, root: []c
 
     var st: index.content.BuildStats = .{};
     var dummy: u8 = 0;
-    var ix = try index.content.build(gpa, pool, docs, .{ .read = plainText, .ctx = &dummy }, &st);
+    // Written to the file as it grows, as the daemon builds it.
+    const path = "/tmp/lumen-content-bench.idx";
+    var ix = try index.content.buildFile(gpa, pool, docs, .{ .read = plainText, .ctx = &dummy }, path, &st);
     defer ix.deinit(gpa);
     std.debug.print("build     {d:>8.1} ms  {d} pairs, {d} segments, index {d:.1} MB (postings {d:.1} MB)\n", .{ ms(st.ns), st.pairs, st.segments, @as(f64, @floatFromInt(ix.buf.len)) / 1e6, @as(f64, @floatFromInt(ix.postingBytes())) / 1e6 });
-    const path = "/tmp/lumen-content-bench.idx";
-    try ix.save(path);
     t = sys.monotonicNs();
     var mapped = try index.content.Index.open(path);
     defer mapped.deinit(gpa);

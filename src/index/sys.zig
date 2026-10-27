@@ -184,6 +184,51 @@ pub fn writeFileAtomic(path: []const u8, data: []const u8) Error!void {
     try rename(tmp, final);
 }
 
+/// `writeFileAtomic` a piece at a time: `<path>.tmp`, written in order, a
+/// header patched in at the end, fsync and rename on `commit`; `abort` (or
+/// a failed commit) leaves `path` as it was.
+pub const AtomicFile = struct {
+    fd: i32,
+    tmp: [4096]u8 = undefined,
+    final: [4096]u8 = undefined,
+    tmp_len: usize = 0,
+    final_len: usize = 0,
+
+    pub fn create(path: []const u8) Error!AtomicFile {
+        var f: AtomicFile = .{ .fd = -1 };
+        const final = std.fmt.bufPrintSentinel(&f.final, "{s}", .{path}, 0) catch return error.NameTooLong;
+        const tmp = std.fmt.bufPrintSentinel(&f.tmp, "{s}.tmp", .{path}, 0) catch return error.NameTooLong;
+        f.final_len = final.len;
+        f.tmp_len = tmp.len;
+        f.fd = @intCast(try check(linux.open(tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600)));
+        return f;
+    }
+
+    pub fn write(f: *AtomicFile, data: []const u8) Error!void {
+        var off: usize = 0;
+        while (off < data.len) off += try check(linux.write(f.fd, data[off..].ptr, data.len - off));
+    }
+
+    pub fn writeAt(f: *AtomicFile, data: []const u8, at: usize) Error!void {
+        var off: usize = 0;
+        while (off < data.len) off += try check(linux.pwrite(f.fd, data[off..].ptr, data.len - off, @intCast(at + off)));
+    }
+
+    pub fn commit(f: *AtomicFile) Error!void {
+        errdefer f.abort();
+        _ = try check(linux.fsync(f.fd));
+        close(f.fd);
+        f.fd = -1;
+        try rename(f.tmp[0..f.tmp_len :0], f.final[0..f.final_len :0]);
+    }
+
+    pub fn abort(f: *AtomicFile) void {
+        if (f.fd >= 0) close(f.fd);
+        f.fd = -1;
+        _ = linux.unlink(f.tmp[0..f.tmp_len :0]);
+    }
+};
+
 /// Creates missing directories, owner-only (existing ones are untouched).
 pub fn mkdirP(path: []const u8) void {
     var buf: [4096]u8 = undefined;

@@ -56,9 +56,10 @@ All notable changes are listed here. The format follows
   1.6 s rebuild, and ~100 MB less memory at the peak). It is rebuilt whole
   once 20 % of it is outdated. The index format changes (LUMCTX03): the
   first start rebuilds it once.
-- Rebuilding the content index peaks at less than half the memory (585 →
-  268 MB on 49 k documents; the daemon's peak at start 702 → 445 MB), with
-  the same search times.
+- Rebuilding the content index peaks at a third of the memory (585 → 195
+  MB on 49 k documents): smaller segments, and the index written to its
+  file as it grows instead of built whole in memory. An update's peak:
+  +26 MB. The same search times.
 - Hyprland is asked for the focused monitor through its socket instead of
   by starting `hyprctl` on every show.
 - The first show after the daemon starts no longer creates the window's

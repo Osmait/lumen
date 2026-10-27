@@ -165,10 +165,15 @@ directory (2.8 s cold) and every core.
   (path, mtime, size) and segments of sorted trigram keys with varint-delta
   posting lists. Building dedups each file's trigrams with a 16M-bit map and
   radix-sorts (trigram, doc) pairs, closing a segment every 4 M pairs so
-  memory stays bounded, and grows the file in an 8-aligned buffer that
-  becomes the index without a copy. On 49 k documents the build peaked at
-  585 MB with 16 M-pair segments and a final copy; it peaks at 268 MB now,
-  with the same query times (12 segments instead of 4, an index 8 % larger).
+  memory stays bounded, and writes the file as segments close
+  (`sys.AtomicFile`: a temporary file, the header patched in last, fsync,
+  rename), so the finished index is never whole in the heap; an update
+  copies the old segments from their mapping straight to the file. On 49 k
+  documents the build peaked at 585 MB with 16 M-pair segments, built in
+  memory and copied; it peaks at 195 MB now, with the same query times (12
+  segments instead of 4, an index 8 % larger). If the cache cannot be
+  written, the index is built in memory and served from there, and saving
+  is retried on the next check.
 - **Query**: intersect the lists of every trigram of every word (shortest
   first), then verify candidates by reading them, in parallel and in order of
   what is known without I/O (recency, depth, file name), stopping once no
