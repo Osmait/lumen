@@ -28,8 +28,11 @@ const header_len = 64;
 
 /// Plain text files above this are not indexed (logs, dumps, data).
 pub const max_text = 1 << 20;
-/// A segment is closed past this many (trigram, doc) pairs: 128 MB of pairs.
-const segment_pairs = 16 << 20;
+/// A segment is closed past this many (trigram, doc) pairs: 32 MB of pairs
+/// and as much again to sort them. 16 M pairs made the build peak at 585 MB
+/// (49 k documents) for no faster queries; 4 M peaks at ~346 MB, for 12
+/// segments instead of 4 and an index 8 % larger.
+const segment_pairs = 4 << 20;
 /// Documents read in parallel per round.
 const batch_docs = 1024;
 
@@ -478,7 +481,8 @@ pub fn build(gpa: std.mem.Allocator, pool: *Pool, docs: []const DocIn, text: Tex
     var st: BuildStats = .{};
 
     // Header, documents and paths first; segments are appended as they close.
-    var out: std.ArrayList(u8) = .empty;
+    // Aligned as the index needs, so it becomes the index without a copy.
+    var out: Out = .empty;
     defer out.deinit(gpa);
     try out.appendNTimes(gpa, 0, header_len);
     var paths_len: usize = 0;
@@ -567,9 +571,8 @@ pub fn build(gpa: std.mem.Allocator, pool: *Pool, docs: []const DocIn, text: Tex
     std.mem.writeInt(u64, out.items[40..48], dir_off, .little);
     std.mem.writeInt(u64, out.items[48..56], total, .little);
 
-    const buf = try gpa.alignedAlloc(u8, .@"8", total);
+    const buf = try out.toOwnedSlice(gpa);
     errdefer gpa.free(buf);
-    @memcpy(buf, out.items);
     st.docs_indexed = n;
     st.ns = sys.monotonicNs() - t0;
     if (stats) |s| s.* = st;
@@ -578,7 +581,9 @@ pub fn build(gpa: std.mem.Allocator, pool: *Pool, docs: []const DocIn, text: Tex
 
 /// Sorts a segment's pairs by trigram (stable, so docs stay ascending) and
 /// appends keys, offsets and varint-delta lists to `out`.
-fn closeSegment(gpa: std.mem.Allocator, out: *std.ArrayList(u8), dir: *std.ArrayList(SegEntry), pairs: []u64, scratch: *std.ArrayList(u64)) !void {
+const Out = std.array_list.Aligned(u8, .@"8");
+
+fn closeSegment(gpa: std.mem.Allocator, out: *Out, dir: *std.ArrayList(SegEntry), pairs: []u64, scratch: *std.ArrayList(u64)) !void {
     try scratch.resize(gpa, pairs.len);
     radixByKey(pairs, scratch.items);
 

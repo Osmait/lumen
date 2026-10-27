@@ -51,6 +51,9 @@ All notable changes are listed here. The format follows
   of ~58 ms, and each copy
   into the clipboard history no longer starts a GTK process. Install both
   files (see the README).
+- Rebuilding the content index peaks at less than half the memory (585 →
+  268 MB on 49 k documents; the daemon's peak at start 702 → 445 MB), with
+  the same search times.
 - Hyprland is asked for the focused monitor through its socket instead of
   by starting `hyprctl` on every show.
 - The first show after the daemon starts no longer creates the window's
