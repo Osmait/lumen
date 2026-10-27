@@ -21,7 +21,10 @@ src/ext/          Lua extensions: lua.zig (the C API and its rules), Host.zig
                   module), exec.zig, json.zig
 src/ui/           the window: Ui.zig (state and flow), widgets, labels,
                   settings_view, file_results, detail_pane, backdrop, keyboard,
-                  ext_view (extensions in the window), themes, the stylesheet
+                  ext_view (extensions in the window), prefs_view (their
+                  preferences, the input view), form_view, dmenu (lumen
+                  --dmenu), installer (extensions from git), themes, the
+                  stylesheet
 src/actions.zig   what each action does to the system
 src/settings.zig  the settings file
 src/c.zig         hand-written GTK/GLib/gtk4-layer-shell bindings
@@ -76,6 +79,23 @@ together until the same deadline, and waits for the exit on a pidfd.
 
 Reloads are cheap to detect: the stat of `init.lua` and of each extension's
 `.lua` files, hashed and compared when the window opens.
+
+The tables rows come from are kept per command, one for its list and one for
+its root-search rows, so their actions always run against the table they
+were listed from. Root searches ask every provider in turn for the newest
+query only (3 s each), and stop early once a newer query is waiting.
+
+`lumen.preferences`, `lumen.storage` and `lumen.extension` are Lua, in a
+prelude over `lumen.json` and `io`; preferences.json is written by the UI
+(atomically) and the extension reloads. Forms reuse the preference fields:
+the window keeps the values while the input and choose views edit them, and
+`submit` gets them as a table.
+
+Commands that need an answer later (`lumen --dmenu`, `--install`) keep a
+reference to the caller's `GApplicationCommandLine`: the caller's
+invocation ends, with the exit status set, when it is released. dmenu reads
+stdin with GIO's async reads, so lines show as they arrive; git runs as a
+`GSubprocess`, so the daemon never waits on the network.
 
 ## File index
 
