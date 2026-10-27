@@ -219,6 +219,8 @@ input: union(enum) { pref: u16, field: u16 } = .{ .pref = 0 },
 /// The open form (index in the registry) and its fields' values (gpa).
 form_cmd: u16 = 0,
 form_values: std.ArrayList([:0]u8) = .empty,
+/// ~/.config/lumen/icons as last read (widgets.renamed points into it).
+icon_arena: ?std.heap.ArenaAllocator = null,
 /// `lumen --dmenu` waiting for an answer.
 picker: ?*dmenu.Session = null,
 /// Search highlight colours of the theme, for Pango markup.
@@ -440,7 +442,35 @@ pub fn build(self: *Ui) void {
     widgets.connect(click, "pressed", &backdrop.onWindowPressed, self);
     c.gtk_widget_add_controller(win, click);
     self.built = true;
+    self.scanIconDir();
     self.applyStructure();
+}
+
+/// ~/.config/lumen/icons/<name>.svg|png replaces the icon <name> everywhere
+/// (widgets.renamed). Read when the window opens: a handful of files.
+fn scanIconDir(self: *Ui) void {
+    widgets.renamed = .empty;
+    if (self.icon_arena) |*ar| _ = ar.reset(.retain_capacity) else self.icon_arena = .init(self.gpa);
+    const a = self.icon_arena.?.allocator();
+    const dir = std.fmt.allocPrintSentinel(a, "{s}/icons", .{self.config_dir}, 0) catch return;
+    const d = c.g_dir_open(dir.ptr, 0, null) orelse return;
+    defer c.g_dir_close(d);
+    while (c.g_dir_read_name(d)) |n| {
+        const name = std.mem.span(n);
+        const dot = std.mem.findScalarLast(u8, name, '.') orelse continue;
+        const ext = name[dot + 1 ..];
+        if (!(std.ascii.eqlIgnoreCase(ext, "svg") or std.ascii.eqlIgnoreCase(ext, "png"))) continue;
+        const path = std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir, name }, 0) catch continue;
+        widgets.renamed.put(a, a.dupe(u8, name[0..dot]) catch continue, path) catch continue;
+    }
+}
+
+/// The icon init.lua gave the item with `key` (lumen.icons), if any.
+pub fn keyIcon(self: *const Ui, key: []const u8) ?item_mod.Icon {
+    const reg = self.ext_registry orelse return null;
+    if (key.len == 0) return null;
+    for (reg.icons) |o| if (std.mem.eql(u8, o.key, key)) return o.icon;
+    return null;
 }
 
 fn cssClass(w: *c.GtkWidget, name: [*:0]const u8, on: bool) void {
@@ -527,7 +557,17 @@ pub fn reloadSettings(self: *Ui) void {
     self.applyOverrides();
     self.applyAppearance(null);
     self.applyLayout();
+    self.applyIconTheme();
     if (self.on_settings_changed) |f| f();
+}
+
+/// The Icon Theme setting, for Lumen's process only.
+fn applyIconTheme(self: *Ui) void {
+    const gs = c.gtk_settings_get_default() orelse return;
+    if (self.settings.icon_theme.len == 0) return c.gtk_settings_reset_property(gs, "gtk-icon-theme-name");
+    var buf: [128]u8 = undefined;
+    const name = std.fmt.bufPrintSentinel(&buf, "{s}", .{self.settings.icon_theme}, 0) catch return;
+    c.g_object_set(gs, "gtk-icon-theme-name", name.ptr, @as(?*anyopaque, null));
 }
 
 /// Writes the settings; what init.lua fixes keeps its value in the file.
@@ -542,6 +582,7 @@ pub fn saveSettings(self: *Ui) void {
     self.settings_stamp = settings_mod.Stamp.of(self.settings_path.ptr);
     self.applyAppearance(null);
     self.applyLayout();
+    self.applyIconTheme();
     if (self.on_settings_changed) |f| f();
 }
 
@@ -662,6 +703,7 @@ pub fn showWith(self: *Ui, view: View, text: ?[*:0]const u8) void {
         // Edited by hand since the last look?
         if (!settings_mod.Stamp.of(self.settings_path.ptr).eql(self.settings_stamp)) self.reloadSettings();
         if (self.userCssChanged()) self.applyAppearance(null);
+        self.scanIconDir();
         ext_view.checkReload(self);
         self.placeOnFocusedMonitor();
         // Opening is a good moment to look for edited files.
@@ -1179,7 +1221,9 @@ pub fn addSection(self: *Ui, title: [:0]const u8) void {
     self.rows.appendAssumeCapacity(.{ .widget = row, .item = null, .section = title });
 }
 
-pub fn addItem(self: *Ui, it: Item) void {
+pub fn addItem(self: *Ui, it_in: Item) void {
+    var it = it_in;
+    if (self.keyIcon(it.key)) |icon| it.icon = icon;
     const a = self.query_arena.allocator();
     const item_index = self.items.items.len;
     // Room first: a widget without its `rows` entry would shift every later
@@ -1499,15 +1543,19 @@ pub fn dump(self: *Ui, gpa: std.mem.Allocator) (std.Io.Writer.Error || std.mem.A
         const mark: []const u8 = if (self.selected == i) ">" else " ";
         try w.print("  {s} {s} | {s} | {s} | ", .{ mark, it.title, it.subtitle, it.accessory });
         switch (it.icon) {
-            .logo => |l| try w.print("logo:{s}\n", .{l.name}),
-            .badge => |b| try w.print("badge:{s}\n", .{b.text}),
-            .tile => |t| try w.print("tile:{s}\n", .{t.name}),
-            .gicon => try w.print("gicon\n", .{}),
-            .emoji => |e| try w.print("emoji:{s}\n", .{e}),
-            .swatch => |sw| try w.print("swatch:{s}\n", .{sw.id}),
-            .named => |n| try w.print("icon:{s}\n", .{n}),
-            .none => try w.print("none\n", .{}),
+            .logo => |l| try w.print("logo:{s}", .{l.name}),
+            .badge => |b| try w.print("badge:{s}", .{b.text}),
+            .tile => |t| try w.print("tile:{s}", .{t.name}),
+            .gicon => try w.print("gicon", .{}),
+            .emoji => |e| try w.print("emoji:{s}", .{e}),
+            .file => |f| try w.print("file:{s}", .{std.Io.Dir.path.basename(f)}),
+            .swatch => |sw| try w.print("swatch:{s}", .{sw.id}),
+            .named => |n| try w.print("icon:{s}", .{n}),
+            .none => try w.print("none", .{}),
         }
+        // The key, for lumen.icons (empty for rows without one). A file's is
+        // its path, which need not be UTF-8: the dump must stay text.
+        try w.print(" | {s}\n", .{if (std.unicode.utf8ValidateSlice(it.key)) it.key else "?"});
     }
     if (c.gtk_widget_get_visible(self.detail) != 0) {
         try w.print("detail:\n", .{});

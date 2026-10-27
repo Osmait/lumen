@@ -67,7 +67,10 @@ cat >"$H/.config/lumen/init.lua" <<'EOF'
 lumen.theme { id = "e2e-night", name = "E2E Night", bg = "#101820", fg = "#e0e0e0", accent = "#33aaff" }
 lumen.keymap("ctrl+g", "fixture.fruits")
 lumen.set { density = "compact" }
+lumen.icons { ["cmd:files"] = "🗂️", ["file:md"] = "📝", ["app:kitty-e2e"] = { name = "utilities-terminal-symbolic", color = "green" } }
 EOF
+mkdir -p "$H/.config/lumen/icons"
+printf '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8"><rect width="8" height="8" fill="#f80"/></svg>' >"$H/.config/lumen/icons/edit-paste-symbolic.svg"
 echo "local out = '$T/ext-ran'" >"$H/.config/lumen/extensions/fixture/init.lua"
 cat >>"$H/.config/lumen/extensions/fixture/init.lua" <<'EOF'
 local lumen = require("lumen")
@@ -456,6 +459,14 @@ expect "preferences view" '> Loud Fruit .*\| Off'
 L --key enter; sleep 0.5
 expect "toggling a preference" '> Loud Fruit .*\| On'
 grep -q '"loud": true' "$T/data/lumen/extensions/fixture/preferences.json" && ok "preference saved" || ko "preference saved" "$(cat "$T/data/lumen/extensions/fixture/preferences.json" 2>&1)"
+query root "search files"
+expect "lumen.icons replaces a command's icon" 'Search Files \| Lumen \| Command \| emoji:🗂️'
+query root "kitty e2e"
+expect "lumen.icons replaces an app's icon (app:name)" 'Kitty E2E .*tile:utilities-terminal-symbolic'
+query files "zebrafish"
+expect_soon "lumen.icons replaces a file kind's icon" 'zebrafish.md .*emoji:📝'
+query settings "icon theme"
+expect "icon theme setting" 'Icon Theme \|.*Automatic'
 query settings "density"
 expect "lumen.set shows in Settings" 'Density \| Set in init.lua \| Compact'
 L --key enter; sleep 0.1

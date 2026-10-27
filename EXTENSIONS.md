@@ -240,7 +240,10 @@ row and keeps what was typed.
 
 ## Icons
 
+Anywhere an icon is given (commands, rows, `lumen.icons`):
+
 - An emoji: `icon = "🐙"`.
+- An image file, PNG or SVG: `icon = "~/icons/fox.svg"` (or an absolute path).
 - An icon from your icon theme, in full colour: `icon = "firefox"`.
 - A symbolic icon (its name ends in `-symbolic`), on a grey tile:
   `icon = "folder-symbolic"`.
@@ -359,6 +362,39 @@ lumen.layout {
 
 A key or value Lumen does not know is an error shown in the root search.
 
+## Replacing Lumen's icons
+
+Three ways, from the broadest:
+
+- **Icon Theme** in Settings (or `icon_theme = Papirus` in settings.conf, or
+  `lumen.set { icon_theme = "Papirus" }`): a different icon theme for Lumen
+  only; the rest of the desktop keeps its own.
+- **`~/.config/lumen/icons/<name>.svg`** (or `.png`) replaces the icon called
+  `<name>` everywhere in Lumen. The built-in commands use symbolic icons such
+  as `edit-paste-symbolic` (Clipboard History), `folder-saved-search-symbolic`
+  (Search Files) or `system-lock-screen-symbolic` (Lock Screen); `lumen --dump`
+  prints each row's icon name.
+- **`lumen.icons`** in init.lua replaces the icon of one item, by its key:
+
+```lua
+lumen.icons {
+  ["app:firefox"] = "~/icons/firefox.svg",   -- an app, by its .desktop file
+  ["cmd:clipboard"] = "📋",                   -- a built-in command
+  ["sys:lock"] = { name = "changes-prevent-symbolic", color = "red" },
+  ["ext:github.prs"] = "🐙",                  -- an extension's command
+  ["script:backup.sh"] = "💾",                -- a script command
+  ["file:pdf"] = "~/icons/pdf.png",           -- files of a kind, by extension
+  ["file:folder"] = "📁",                     -- folders
+}
+```
+
+Keys: `app:<desktop id>` (with or without `.desktop`), `cmd:` (clipboard,
+files, contents, settings, themes, default_apps, windows), `sys:` (lock,
+sleep, restart, shutdown, logout, dark, trash, volup, voldown, mute, mic,
+play, next, prev), `win:` (window management: left, right, maximize...),
+`script:<file name>`, `ext:<extension>.<command>`, and `file:<extension>` or
+`file:folder`. `lumen --dump` prints each row's icon and, last, its key.
+
 ## style.css
 
 `~/.config/lumen/style.css` is GTK CSS, loaded after Lumen's own rules, so it
@@ -374,7 +410,7 @@ can change anything Lumen draws. The theme's colours are variables: `--bg`,
 | `.results > row` | A row; `:selected` is the highlighted one. |
 | `.title`, `.subtitle`, `.accessory`, `.hint` | The parts of a row. |
 | `.section-title` | A section header. |
-| `.tile`, `.emoji` | Icons. |
+| `.tile`, `.emoji`, `.app-icon`, `.file-icon` | Icons: symbolic ones on tiles, emoji, theme icons, image files. |
 | `.detail`, `.detail-text`, `.meta` | The detail pane. |
 | `.actions` | The action panel (Ctrl+K). |
 | `.grid`, `.grid > flowboxchild`, `.cell-title` | Grids and their cells. |

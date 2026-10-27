@@ -109,9 +109,17 @@ pub fn fileItems(self: *Ui, a: std.mem.Allocator, q: []const u8, limit: usize) [
 /// Icon for a file's type, guessed from its name (no I/O): the extension
 /// badge for code and text, the theme's icon for the rest.
 pub fn fileIcon(ui: *Ui, path: [:0]const u8, is_dir: bool) item_mod.Icon {
-    if (!is_dir) {
+    if (is_dir) {
+        if (ui.keyIcon("file:folder")) |icon| return icon;
+    } else {
         const slash = std.mem.findScalarLast(u8, path, '/');
         const name = if (slash) |s| path[s + 1 ..] else path;
+        // lumen.icons { ["file:pdf"] = ... }, by extension.
+        if (std.mem.findScalarLast(u8, name, '.')) |dot| if (name.len - dot <= 16) {
+            var buf: [24]u8 = undefined;
+            const k = std.fmt.bufPrint(&buf, "file:{s}", .{name[dot + 1 ..]}) catch "";
+            if (ui.keyIcon(std.ascii.lowerString(buf[0..k.len], k))) |icon| return icon;
+        };
         if (core.file_badge.logoOf(name)) |l| return .{ .logo = l };
         var upper: [4]u8 = undefined;
         if (core.file_badge.of(name, &upper)) |b| {

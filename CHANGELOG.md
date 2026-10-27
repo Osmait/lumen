@@ -43,6 +43,10 @@ All notable changes are listed here. The format follows
   of a row show.
 - Four complete styles in `examples/styles`: Raycast, Spotlight, Alfred and a
   minimal rofi-like one.
+- Icons: image files (PNG, SVG) wherever an icon is given; `lumen.icons`
+  replaces any app's, command's or file kind's icon by its key;
+  `~/.config/lumen/icons/<name>.svg` replaces an icon by name everywhere; an
+  Icon Theme setting for Lumen only.
 - Example extensions: GitHub (through `gh`), processes, hello.
 
 ## [0.1.0] - 2026-10-26

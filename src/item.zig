@@ -11,6 +11,7 @@ pub const Icon = union(enum) {
     /// An icon given by name: "*-symbolic" on a grey tile, anything else in
     /// full colour. `name` must outlive the icon.
     pub fn byName(name: [:0]const u8) Icon {
+        if (name.len > 0 and name[0] == '/') return .{ .file = name };
         return if (std.mem.endsWith(u8, name, "-symbolic")) .{ .tile = .{ .name = name, .color = .gray } } else .{ .named = name };
     }
 
@@ -21,6 +22,8 @@ pub const Icon = union(enum) {
     tile: struct { name: [:0]const u8, color: Color },
     /// A full-colour icon from the icon theme ("firefox"), at full size.
     named: [:0]const u8,
+    /// An image file (PNG, SVG...), scaled to the icon's size.
+    file: [:0]const u8,
     emoji: [:0]const u8,
     /// File extension on a coloured tile ("GO", "ZIG").
     badge: struct { text: [:0]const u8, color: core.file_badge.Color },

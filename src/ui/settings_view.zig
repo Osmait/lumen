@@ -58,6 +58,7 @@ pub fn settingsCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
     out.append(a, S.row(a, .{ .section = "Appearance", .name = "text_size", .title = "Text Size", .value = choiceLabel(ui, a, .text_size), .icon = "preferences-desktop-font-symbolic", .color = .purple, .action = choose(.text_size), .keywords = "font scale zoom bigger smaller" })) catch {};
     out.append(a, S.row(a, .{ .section = "Appearance", .name = "opacity", .title = "Window Opacity", .value = choiceLabel(ui, a, .opacity), .icon = "display-brightness-symbolic", .color = .purple, .action = choose(.opacity), .keywords = "transparency translucent background" })) catch {};
     out.append(a, S.row(a, .{ .section = "Appearance", .name = "position", .title = "Window Position", .value = choiceLabel(ui, a, .position), .icon = "preferences-desktop-display-symbolic", .color = .purple, .action = choose(.position), .keywords = "center top place" })) catch {};
+    out.append(a, S.row(a, .{ .section = "Appearance", .name = "icon_theme", .title = "Icon Theme", .value = choiceLabel(ui, a, .icon_theme), .icon = "preferences-desktop-icons-symbolic", .color = .purple, .action = choose(.icon_theme), .keywords = "icons pack papirus adwaita" })) catch {};
     out.append(a, S.row(a, .{ .section = "Layout", .name = "width", .title = "Window Width", .value = choiceLabel(ui, a, .width), .icon = "view-dual-symbolic", .color = .green, .action = choose(.width), .keywords = "size wide narrow layout" })) catch {};
     out.append(a, S.row(a, .{ .section = "Layout", .name = "height", .title = "Window Height", .value = choiceLabel(ui, a, .height), .icon = "view-list-symbolic", .color = .green, .action = choose(.height), .keywords = "size tall short rows results layout" })) catch {};
     out.append(a, S.row(a, .{ .section = "Layout", .name = "density", .title = "Density", .value = choiceLabel(ui, a, .density), .icon = "view-grid-symbolic", .color = .green, .action = choose(.density), .keywords = "compact comfortable spacing icons rows layout" })) catch {};
@@ -106,6 +107,7 @@ pub fn choiceOptions(ui: *Ui, a: std.mem.Allocator, ch: settings_mod.Choice) []c
         .density => &.{ .{ .value = "compact", .label = "Compact" }, .{ .value = "default", .label = "Default" }, .{ .value = "comfortable", .label = "Comfortable" } },
         .opacity => &.{ .{ .value = "100", .label = "100% (Opaque)" }, .{ .value = "97", .label = "97%" }, .{ .value = "90", .label = "90%" }, .{ .value = "80", .label = "80%" } },
         .clipboard_keep => &.{ .{ .value = "100", .label = "100 entries" }, .{ .value = "500", .label = "500 entries" }, .{ .value = "1000", .label = "1,000 entries" }, .{ .value = "5000", .label = "5,000 entries" } },
+        .icon_theme => iconThemes(a),
         .terminal, .editor => blk: {
             var out: std.ArrayList(Option) = .empty;
             const list: []const [2][:0]const u8 = if (ch == .terminal) &settings_mod.terminals else &settings_mod.editors;
@@ -120,6 +122,46 @@ pub fn choiceOptions(ui: *Ui, a: std.mem.Allocator, ch: settings_mod.Choice) []c
             break :blk out.items;
         },
     };
+}
+
+/// "Automatic", then the icon themes installed (folders under the icon
+/// directories with an index.theme that lists icon directories: cursor
+/// themes have none), by their names.
+fn iconThemes(a: std.mem.Allocator) []const Option {
+    var out: std.ArrayList(Option) = .empty;
+    out.append(a, .{ .value = "", .label = "Automatic (the desktop's)" }) catch return out.items;
+    var roots: std.ArrayList([]const u8) = .empty;
+    const home = std.mem.span(c.g_get_home_dir());
+    roots.append(a, std.fmt.allocPrint(a, "{s}/.icons", .{home}) catch "") catch {};
+    roots.append(a, std.fmt.allocPrint(a, "{s}/icons", .{std.mem.span(c.g_get_user_data_dir())}) catch "") catch {};
+    var dirs = c.g_get_system_data_dirs();
+    while (dirs[0]) |d| : (dirs += 1) roots.append(a, std.fmt.allocPrint(a, "{s}/icons", .{std.mem.span(d)}) catch "") catch {};
+    for (roots.items) |root| {
+        const rz = a.dupeSentinel(u8, root, 0) catch continue;
+        const dir = c.g_dir_open(rz.ptr, 0, null) orelse continue;
+        defer c.g_dir_close(dir);
+        while (c.g_dir_read_name(dir)) |n| {
+            const name = std.mem.span(n);
+            if (std.mem.eql(u8, name, "hicolor") or std.mem.eql(u8, name, "default")) continue;
+            var dup = false;
+            for (out.items) |o| dup = dup or std.mem.eql(u8, o.value, name);
+            if (dup) continue;
+            const index_path = std.fmt.allocPrintSentinel(a, "{s}/{s}/index.theme", .{ root, name }, 0) catch continue;
+            var buf: [8192]u8 = undefined;
+            const text = index.sys.readHead(index_path.ptr, &buf);
+            if (std.mem.find(u8, text, "\nDirectories=") == null) continue;
+            var label: []const u8 = name;
+            if (std.mem.find(u8, text, "\nName=")) |at| {
+                const rest = text[at + 6 ..];
+                label = rest[0 .. std.mem.findScalar(u8, rest, '\n') orelse rest.len];
+            }
+            out.append(a, .{
+                .value = a.dupeSentinel(u8, name, 0) catch continue,
+                .label = a.dupeSentinel(u8, label, 0) catch continue,
+            }) catch break;
+        }
+    }
+    return out.items;
 }
 
 /// The current value of a choice, as shown.
@@ -139,6 +181,7 @@ pub fn chooseTitle(ch: settings_mod.Choice) []const u8 {
         .width => "Window Width",
         .height => "Window Height",
         .density => "Density",
+        .icon_theme => "Icon Theme",
         .clipboard_keep => "Clipboard Entries to Keep",
         .terminal => "Terminal",
         .editor => "Editor for Open at Line",

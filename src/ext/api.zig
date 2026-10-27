@@ -40,6 +40,7 @@ pub fn install(L: *lua.State, e: *Host.Ext) void {
         .{ "keymap", lua.wrap(keymap) },
         .{ "set", lua.wrap(set) },
         .{ "layout", lua.wrap(layout) },
+        .{ "icons", lua.wrap(icons) },
     };
     for (funcs) |f| {
         c.lua_pushcclosure(L, f[1], 0);
@@ -408,6 +409,32 @@ fn layout(L: *lua.State) lua.Error!c_int {
     }
     load.layout = l;
     load.has_layout = true;
+    return 0;
+}
+
+/// `lumen.icons { ["app:firefox"] = "~/icons/fox.svg", ["cmd:clipboard"] =
+/// "📋", ["file:pdf"] = { name = "x-office-document-symbolic", color = "red" } }`:
+/// icons of apps, commands and file kinds replaced. Several calls add up.
+fn icons(L: *lua.State) lua.Error!c_int {
+    try lua.argTable(L, 1, "lumen.icons");
+    const e = extOf(L);
+    const load = e.load orelse return lua.fail(L, "lumen.icons works only while a file loads", .{});
+    const a = load.a;
+    c.lua_pushnil(L);
+    while (c.lua_next(L, 1) != 0) {
+        const key = lua.toSlice(L, -2) orelse return lua.fail(L, "lumen.icons: keys are item keys like \"app:firefox\" or \"cmd:clipboard\"", .{});
+        if (std.mem.findScalar(u8, key, ':') == null)
+            return lua.fail(L, "lumen.icons: \"{s}\" is not a key (app:, cmd:, sys:, win:, script:, ext:, file:)", .{key});
+        const icon = Host.parseIcon(L, a, -1, "lumen.icons") orelse return lua.fail(L, "lumen.icons: no icon for {s}", .{key});
+        // "app:firefox" means firefox.desktop.
+        const full = if (std.mem.startsWith(u8, key, "app:") and !std.mem.endsWith(u8, key, ".desktop"))
+            std.fmt.allocPrintSentinel(a, "{s}.desktop", .{key}, 0)
+        else
+            a.dupeSentinel(u8, key, 0);
+        load.icons.append(a, .{ .key = full catch return lua.fail(L, "not enough memory", .{}), .icon = icon }) catch
+            return lua.fail(L, "not enough memory", .{});
+        c.lua_settop(L, -2);
+    }
     return 0;
 }
 

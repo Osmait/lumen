@@ -238,7 +238,8 @@ pdf = org.gnome.Papers.desktop
 ## Make it yours
 
 Lumen's look goes as far as you want to take it: 13 themes, layout settings
-(width, height, density), and for everything else a `style.css` and
+(width, height, density), an icon theme of its own, your own icons for any
+app, command or file kind, and for everything else a `style.css` and
 `lumen.layout` in `init.lua`, which decide the window's structure: one panel
 or two, a footer, where the search field and the detail pane go, what rows
 show. [`examples/styles`](examples/styles) has four complete looks:

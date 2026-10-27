@@ -24,7 +24,7 @@ pub const Density = enum { compact, default, comfortable };
 /// On/off settings.
 pub const Toggle = enum { files_in_root, suggestions, clipboard };
 /// Settings with a list of values to pick from.
-pub const Choice = enum { text_size, opacity, position, width, height, density, clipboard_keep, terminal, editor };
+pub const Choice = enum { text_size, opacity, position, width, height, density, icon_theme, clipboard_keep, terminal, editor };
 
 pub const opacity_choices = [_]u8{ 100, 97, 90, 80 };
 pub const keep_choices = [_]u32{ 100, 500, 1000, 5000 };
@@ -60,6 +60,8 @@ pub const Settings = struct {
     /// first one installed).
     terminal: []const u8 = "",
     editor: []const u8 = "",
+    /// An icon theme for Lumen only; empty follows the desktop.
+    icon_theme: []const u8 = "",
     /// A kind's name ("pdf") or an extension (".log") → desktop file id.
     open_with: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
     /// `key = value` lines this version does not know, kept as they were.
@@ -173,13 +175,17 @@ pub const Settings = struct {
                 if (v < 10 or v > 100_000) return false;
                 s.clipboard_keep = v;
             },
-            .terminal, .editor => {
+            .terminal, .editor, .icon_theme => {
                 if (value.len > 0 and !isToken(value)) return false;
                 const owned = s.alloc().dupe(u8, value) catch {
                     s.incomplete = true;
                     return false;
                 };
-                if (ch == .terminal) s.terminal = owned else s.editor = owned;
+                switch (ch) {
+                    .terminal => s.terminal = owned,
+                    .editor => s.editor = owned,
+                    else => s.icon_theme = owned,
+                }
             },
         }
         return true;
@@ -197,6 +203,7 @@ pub const Settings = struct {
             .clipboard_keep => std.fmt.bufPrint(buf, "{d}", .{s.clipboard_keep}) catch "",
             .terminal => s.terminal,
             .editor => s.editor,
+            .icon_theme => s.icon_theme,
         };
     }
 
@@ -264,6 +271,9 @@ pub const Settings = struct {
             \\height = {t}
             \\# Rows and icons: compact, default, comfortable
             \\density = {t}
+            \\# An icon theme for Lumen only (a folder in /usr/share/icons); empty
+            \\# follows the desktop
+            \\icon_theme = {s}
             \\
             \\# Search
             \\files_in_root = {}
@@ -278,11 +288,11 @@ pub const Settings = struct {
             \\editor = {s}
             \\
         , .{
-            p.of("theme").theme,         p.of("text_size").text_size,           p.of("opacity").opacity,
-            p.of("position").position,   p.of("width").width,                   p.of("height").height,
-            p.of("density").density,     p.of("files_in_root").files_in_root,   p.of("suggestions").suggestions,
-            p.of("clipboard").clipboard, p.of("clipboard_keep").clipboard_keep, p.of("terminal").terminal,
-            p.of("editor").editor,
+            p.of("theme").theme,             p.of("text_size").text_size,   p.of("opacity").opacity,
+            p.of("position").position,       p.of("width").width,           p.of("height").height,
+            p.of("density").density,         p.of("icon_theme").icon_theme, p.of("files_in_root").files_in_root,
+            p.of("suggestions").suggestions, p.of("clipboard").clipboard,   p.of("clipboard_keep").clipboard_keep,
+            p.of("terminal").terminal,       p.of("editor").editor,
         });
         if (s.unknown.items.len > 0) {
             try w.writeAll("\n# Not known to this version of Lumen\n");

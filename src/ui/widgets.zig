@@ -64,10 +64,39 @@ pub fn swatchTexture(bg: u24, fg: u24, accent: u24) ?*c.GdkTexture {
 
 /// Icon size in result rows, from the Density setting (main thread).
 pub var icon_px: c_int = 32;
+/// Icons replaced by name: ~/.config/lumen/icons/<name>.svg (or .png) is
+/// used wherever the icon <name> would be. Name to path; the UI fills it.
+pub var renamed: std.StringHashMapUnmanaged([:0]const u8) = .empty;
 /// What rows show, from lumen.layout (main thread).
 pub var show: @import("../layout.zig").Show = .{};
 /// Subtitles after titles on the same line (lumen.layout's rows = "inline").
 pub var rows_inline = false;
+
+/// An image file as an icon, decoded at twice `size` (sharp on HiDPI) and
+/// kept: the same few icons show again and again. Regular files only:
+/// decoding blocks, and a FIFO would never answer.
+fn fileTexture(path: [:0]const u8, size: c_int) ?*c.GdkTexture {
+    const Cache = struct {
+        var keys: [128]u64 = @splat(0);
+        var textures: [128]?*c.GdkTexture = @splat(null);
+        var len: usize = 0;
+        var next: usize = 0;
+    };
+    var h: std.hash.Wyhash = .init(@intCast(size));
+    h.update(path);
+    const k = h.final();
+    for (Cache.keys[0..Cache.len], Cache.textures[0..Cache.len]) |ck, t| if (ck == k) return t;
+    if (!index.sys.isRegular(path.ptr)) return null;
+    const pb = c.gdk_pixbuf_new_from_file_at_scale(path.ptr, size * 2, size * 2, 1, null) orelse return null;
+    defer c.g_object_unref(pb);
+    const tex = c.gdk_texture_new_for_pixbuf(pb);
+    const slot = if (Cache.len < Cache.keys.len) Cache.len else Cache.next;
+    if (Cache.len < Cache.keys.len) Cache.len += 1 else Cache.next = (Cache.next + 1) % Cache.keys.len;
+    if (Cache.textures[slot]) |old| c.g_object_unref(old);
+    Cache.keys[slot] = k;
+    Cache.textures[slot] = tex;
+    return tex;
+}
 
 /// Icon, title over subtitle, accessory, and the hidden hint that shows
 /// the primary action while the row is selected.
@@ -191,6 +220,7 @@ pub fn iconWidget(icon: item_mod.Icon, size: c_int) *c.GtkWidget {
             return img;
         },
         .tile => |t| {
+            if (renamed.get(t.name)) |path| return iconWidget(.{ .file = path }, size);
             const img = c.gtk_image_new_from_icon_name(t.name);
             c.gtk_image_set_pixel_size(@ptrCast(img), @divTrunc(size, 2) + 2);
             c.gtk_widget_add_css_class(img, "tile");
@@ -202,6 +232,7 @@ pub fn iconWidget(icon: item_mod.Icon, size: c_int) *c.GtkWidget {
         },
         .emoji => |e| return label(e, "emoji"),
         .named => |n| {
+            if (renamed.get(n)) |path| return iconWidget(.{ .file = path }, size);
             const img = c.gtk_image_new_from_icon_name(n);
             c.gtk_image_set_pixel_size(@ptrCast(img), size);
             c.gtk_widget_add_css_class(img, "app-icon");
@@ -224,6 +255,14 @@ pub fn iconWidget(icon: item_mod.Icon, size: c_int) *c.GtkWidget {
             if (b.text.len >= 4) c.gtk_widget_add_css_class(l, "badge-long");
             c.gtk_widget_set_valign(l, c.GTK_ALIGN_CENTER);
             return l;
+        },
+        .file => |path| {
+            const tex = fileTexture(path, size) orelse return iconWidget(.none, size);
+            const img = c.gtk_image_new_from_paintable(@ptrCast(tex));
+            c.gtk_image_set_pixel_size(@ptrCast(img), size);
+            c.gtk_widget_add_css_class(img, "file-icon");
+            c.gtk_widget_set_valign(img, c.GTK_ALIGN_CENTER);
+            return img;
         },
         .none => {
             const img = c.gtk_image_new_from_icon_name("application-x-executable");

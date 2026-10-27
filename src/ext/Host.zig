@@ -107,6 +107,9 @@ pub const Pref = struct {
 
 pub const PrefChoice = struct { value: [:0]const u8, label: [:0]const u8 };
 
+/// `lumen.icons { ["cmd:clipboard"] = "📋" }`: an item's icon replaced.
+pub const IconOverride = struct { key: [:0]const u8, icon: item_mod.Icon };
+
 /// `lumen.set { width = "wide" }`: a setting init.lua fixes.
 pub const SettingOverride = struct {
     key: [:0]const u8,
@@ -126,6 +129,7 @@ pub const Registry = struct {
     keymaps: []const Keymap = &.{},
     settings: []const SettingOverride = &.{},
     prefs: []const Pref = &.{},
+    icons: []const IconOverride = &.{},
     /// `lumen.layout { ... }`: the window's structure.
     layout: layout_mod.Layout = .{},
     /// Whether any file called lumen.layout (its size and place then win
@@ -232,6 +236,7 @@ pub const Load = struct {
     keymaps: std.ArrayList(Keymap) = .empty,
     settings: std.ArrayList(SettingOverride) = .empty,
     prefs: std.ArrayList(Pref) = .empty,
+    icons: std.ArrayList(IconOverride) = .empty,
     layout: layout_mod.Layout = .{},
     has_layout: bool = false,
     problems: std.ArrayList(Problem) = .empty,
@@ -514,6 +519,7 @@ fn doReload(h: *Host) void {
     reg.keymaps = load.keymaps.items;
     reg.settings = load.settings.items;
     reg.prefs = load.prefs.items;
+    reg.icons = load.icons.items;
     reg.layout = load.layout;
     reg.has_layout = load.has_layout;
     reg.problems = load.problems.items;
@@ -573,7 +579,7 @@ fn loadFile(h: *Host, load: *Load, id: []const u8, dir: []const u8, path: [:0]co
     // What this file adds is dropped again if it fails half-way.
     const layout_before = load.layout;
     const had_layout = load.has_layout;
-    const marks = .{ load.commands.items.len, load.wcmds.items.len, load.themes.items.len, load.keymaps.items.len, load.settings.items.len, load.prefs.items.len };
+    const marks = .{ load.commands.items.len, load.wcmds.items.len, load.themes.items.len, load.keymaps.items.len, load.settings.items.len, load.prefs.items.len, load.icons.items.len };
     e.load = load;
     e.budget.deadline_ns = index.sys.monotonicNs() + load_budget_ns;
     var ctx: LoadCtx = .{ .e = e, .load = load, .path = path, .ext_index = @intCast(h.exts.items.len) };
@@ -587,6 +593,7 @@ fn loadFile(h: *Host, load: *Load, id: []const u8, dir: []const u8, path: [:0]co
     load.keymaps.shrinkRetainingCapacity(marks[3]);
     load.settings.shrinkRetainingCapacity(marks[4]);
     load.prefs.shrinkRetainingCapacity(marks[5]);
+    load.icons.shrinkRetainingCapacity(marks[6]);
     load.layout = layout_before;
     load.has_layout = had_layout;
     problem(load, id, err orelse "out of memory");
@@ -809,7 +816,11 @@ pub fn parseIcon(L: *lua.State, a: std.mem.Allocator, idx: c_int, where: []const
         lua.c.LUA_TNIL => return null,
         lua.c.LUA_TSTRING => {
             const s = lua.toSlice(L, t).?;
-            const copy = a.dupeSentinel(u8, s, 0) catch lua.raise(L, "not enough memory", .{});
+            // "~/icons/x.svg": a file in the home folder.
+            const copy = (if (std.mem.startsWith(u8, s, "~/"))
+                std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ std.mem.span(c.g_get_home_dir()), s[2..] }, 0)
+            else
+                a.dupeSentinel(u8, s, 0)) catch lua.raise(L, "not enough memory", .{});
             if (s.len > 0 and s.len <= 32 and s[0] >= 0x80) return .{ .emoji = copy };
             return .byName(copy);
         },
