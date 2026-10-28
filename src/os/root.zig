@@ -65,7 +65,11 @@ pub const DirIter = struct {
 /// Names of the folders directly in `path` (links to folders count), that
 /// `keep` accepts, sorted, in `a`. Hidden ones are skipped. Empty when the
 /// folder cannot be read; out of memory, the ones found so far.
-pub fn subdirs(a: std.mem.Allocator, path: [:0]const u8, keep: *const fn ([]const u8) bool) []const [:0]const u8 {
+pub fn subdirs(
+    a: std.mem.Allocator,
+    path: [:0]const u8,
+    keep: *const fn ([]const u8) bool,
+) []const [:0]const u8 {
     const fd = openDir(path) catch return &.{};
     defer close(fd);
     var it: DirIter = .{ .fd = fd };
@@ -75,7 +79,12 @@ pub fn subdirs(a: std.mem.Allocator, path: [:0]const u8, keep: *const fn ([]cons
         if (e.kind != Kind.dir) {
             if (e.kind != Kind.symlink and e.kind != Kind.unknown) continue;
             var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-            const full = std.mem.printSentinel(&buf, "{s}/{s}", .{ path, e.name }, 0) catch continue;
+            const full = std.mem.printSentinel(
+                &buf,
+                "{s}/{s}",
+                .{ path, e.name },
+                0,
+            ) catch continue;
             const i = info(full) orelse continue;
             if (!i.is_dir) continue;
         }
@@ -267,7 +276,12 @@ pub fn writeAllAt(fd: i32, data: []const u8, at: ?usize) Error!void {
 
 /// Reads `fd` into `buf` until its end or `buf` holds `max_bytes` (it can
 /// hold a little more: a read is not cut short). A read error ends it.
-pub fn readUpTo(gpa: std.mem.Allocator, fd: i32, buf: *std.ArrayList(u8), max_bytes: usize) std.mem.Allocator.Error!void {
+pub fn readUpTo(
+    gpa: std.mem.Allocator,
+    fd: i32,
+    buf: *std.ArrayList(u8),
+    max_bytes: usize,
+) std.mem.Allocator.Error!void {
     while (buf.items.len < max_bytes) {
         try buf.ensureUnusedCapacity(gpa, 64 * 1024);
         const spare = buf.unusedCapacitySlice();
@@ -530,7 +544,11 @@ test "subdirs: folders and links to them, sorted, filtered" {
     var buf: [256]u8 = undefined;
     const root = try tmpDirPath(&tmp, &buf);
     var pbuf: [512]u8 = undefined;
-    for ([_][]const u8{ "b", "a", ".hidden", "skip" }) |d| mkdirP(try std.mem.print(&pbuf, "{s}/{s}", .{ root, d }));
+    for ([_][]const u8{ "b", "a", ".hidden", "skip" }) |d| mkdirP(try std.mem.print(
+        &pbuf,
+        "{s}/{s}",
+        .{ root, d },
+    ));
     try writeFile(try std.mem.printSentinel(&pbuf, "{s}/file", .{root}, 0), "x");
     var lbuf: [512]u8 = undefined;
     _ = linux.symlink("a", try std.mem.printSentinel(&lbuf, "{s}/c", .{root}, 0));
@@ -543,7 +561,11 @@ test "subdirs: folders and links to them, sorted, filtered" {
         }
     }.keep);
     try std.testing.expectEqual(@as(usize, 3), names.len);
-    for ([_][]const u8{ "a", "b", "c" }, names) |want, got| try std.testing.expectEqualStrings(want, got);
+    for ([_][]const u8{
+        "a",
+        "b",
+        "c",
+    }, names) |want, got| try std.testing.expectEqualStrings(want, got);
 }
 
 test "special files are refused without blocking" {

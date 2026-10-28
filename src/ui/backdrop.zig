@@ -75,7 +75,8 @@ pub fn isOn(ui: *Ui, w: *c.GtkWidget, x: f64, y: f64) bool {
     if (c.gtk_widget_get_visible(w) == 0) return false;
     var b: c.graphene_rect_t = undefined;
     if (c.gtk_widget_compute_bounds(w, ui.window, &b) == 0) return false;
-    return x >= b.origin.x and x < b.origin.x + b.size.width and y >= b.origin.y and y < b.origin.y + b.size.height;
+    return x >= b.origin.x and x < b.origin.x + b.size.width and y >= b.origin.y and
+        y < b.origin.y + b.size.height;
 }
 
 pub fn onWindowPressed(

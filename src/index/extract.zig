@@ -142,7 +142,8 @@ const Gap = enum(u2) { none, space, newline };
 
 fn gapOf(local: []const u8) Gap {
     const newline = [_][]const u8{
-        "p",         "h",          "br",   "cr",        "tr", "si", // w:/a:/text: paragraphs, rows, xlsx strings
+        // w:/a:/text: paragraphs, rows, xlsx strings
+        "p",         "h",          "br",   "cr",        "tr", "si",
         "table-row", "line-break", "page", "list-item",
     };
     const space = [_][]const u8{ "tab", "tc", "table-cell", "s", "c" };

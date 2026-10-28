@@ -78,7 +78,9 @@ pub fn readAll(fd: linux.fd_t, buf: []u8, deadline_ns: u64) ReadError!usize {
 
 test "whole reads and writes over a socket pair" {
     var fds: [2]i32 = undefined;
-    try std.testing.expect(failed(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) == null);
+    try std.testing.expect(
+        failed(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) == null,
+    );
     defer _ = linux.close(fds[0]);
     try std.testing.expect(writeAll(fds[1], "hello"));
     _ = linux.shutdown(fds[1], linux.SHUT.WR);
@@ -88,7 +90,9 @@ test "whole reads and writes over a socket pair" {
     _ = linux.close(fds[1]);
 
     // A peer that sends nothing and never closes: the deadline ends it.
-    try std.testing.expect(failed(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) == null);
+    try std.testing.expect(
+        failed(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) == null,
+    );
     defer _ = linux.close(fds[0]);
     defer _ = linux.close(fds[1]);
     const t0 = os.monotonicNs();

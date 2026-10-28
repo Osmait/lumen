@@ -20,9 +20,10 @@ pub const RowPart = enum { icon, text, accessory, hint };
 
 /// An order of parts, some of them maybe left out.
 pub fn Parts(comptime T: type) type {
+    const n = @typeInfo(T).@"enum".field_names.len;
     return struct {
-        items: [@typeInfo(T).@"enum".field_names.len]T = std.enums.values(T)[0..@typeInfo(T).@"enum".field_names.len].*,
-        len: u8 = @typeInfo(T).@"enum".field_names.len,
+        items: [n]T = std.enums.values(T)[0..n].*,
+        len: u8 = n,
 
         pub fn slice(p: *const @This()) []const T {
             return p.items[0..p.len];

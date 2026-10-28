@@ -356,7 +356,9 @@ const Parser = struct {
     // power := postfix ('^' unary)?   (right associative)
     fn parsePower(p: *Parser) Error!f64 {
         const base = try p.parsePostfix();
-        if (p.peek() == '^' or (p.peek() == '*' and p.pos + 1 < p.src.len and p.src[p.pos + 1] == '*')) {
+        if (p.peek() == '^' or
+            (p.peek() == '*' and p.pos + 1 < p.src.len and p.src[p.pos + 1] == '*'))
+        {
             p.pos += if (p.src[p.pos] == '^') 1 else 2;
             p.saw_operator = true;
             const exp = try p.parseUnary();
@@ -397,7 +399,9 @@ const Parser = struct {
 
     fn parseNumber(p: *Parser) Error!f64 {
         const start = p.pos;
-        if (p.pos + 1 < p.src.len and p.src[p.pos] == '0' and (p.src[p.pos + 1] == 'x' or p.src[p.pos + 1] == 'b')) {
+        if (p.pos + 1 < p.src.len and p.src[p.pos] == '0' and
+            (p.src[p.pos + 1] == 'x' or p.src[p.pos + 1] == 'b'))
+        {
             const radix: u8 = if (p.src[p.pos + 1] == 'x') 16 else 2;
             p.pos += 2;
             const ds = p.pos;

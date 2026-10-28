@@ -148,7 +148,16 @@ pub fn search(
     try s.live.search(arena, s.search_pool, query, .{ .limit = limit }, out);
 }
 
-pub const Status = struct { entries: usize, watches: usize, unwatched: u32 = 0, armed: bool, rescanning: bool, index_bytes: usize = 0, rescans: u32 = 0, last_rescan_ns: u64 = 0 };
+pub const Status = struct {
+    entries: usize,
+    watches: usize,
+    unwatched: u32 = 0,
+    armed: bool,
+    rescanning: bool,
+    index_bytes: usize = 0,
+    rescans: u32 = 0,
+    last_rescan_ns: u64 = 0,
+};
 
 pub fn status(s: *Service) Status {
     s.lock.lockSharedUncancelable(s.io);

@@ -9,8 +9,10 @@ const Ui = @import("Ui.zig");
 pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
     const ctrl = state & c.GDK_CONTROL_MASK != 0;
     const shift = state & c.GDK_SHIFT_MASK != 0;
-    const down = keyval == c.GDK_KEY_Down or (ctrl and (keyval == c.GDK_KEY_n or keyval == c.GDK_KEY_j));
-    const up = keyval == c.GDK_KEY_Up or (ctrl and (keyval == c.GDK_KEY_p or keyval == c.GDK_KEY_k and ui.panel_open));
+    const down = keyval == c.GDK_KEY_Down or
+        (ctrl and (keyval == c.GDK_KEY_n or keyval == c.GDK_KEY_j));
+    const up = keyval == c.GDK_KEY_Up or
+        (ctrl and (keyval == c.GDK_KEY_p or keyval == c.GDK_KEY_k and ui.panel_open));
     const enter = keyval == c.GDK_KEY_Return or keyval == c.GDK_KEY_KP_Enter;
 
     if (ui.panel_open) {
@@ -78,10 +80,19 @@ fn escape(ui: *Ui) void {
 /// the key was one of those.
 fn move(ui: *Ui, keyval: c_uint, down: bool, up: bool) bool {
     // A grid moves in two directions: a line is `grid_columns` cells.
-    if (ui.grid_mode and ui.rows.items.len > 0 and (down or up or keyval == c.GDK_KEY_Left or keyval == c.GDK_KEY_Right)) {
+    if (ui.grid_mode and ui.rows.items.len > 0 and
+        (down or up or keyval == c.GDK_KEY_Left or keyval == c.GDK_KEY_Right))
+    {
         const n: i64 = @intCast(ui.rows.items.len);
         const cur: i64 = if (ui.selected) |s| @intCast(s) else 0;
-        const step: i64 = if (down) ui.grid_columns else if (up) -ui.grid_columns else if (keyval == c.GDK_KEY_Right) 1 else -1;
+        const step: i64 = if (down)
+            ui.grid_columns
+        else if (up)
+            -ui.grid_columns
+        else if (keyval == c.GDK_KEY_Right)
+            1
+        else
+            -1;
         const next = cur + step;
         if (next >= 0 and next < n) ui.select(@intCast(next));
         return true;
@@ -107,7 +118,10 @@ fn itemShortcut(ui: *Ui, keyval: c_uint, ctrl: bool, shift: bool) bool {
     if (!ctrl or keyval > 0x7f or !std.ascii.isAlphabetic(@intCast(keyval))) return false;
     const letter = std.ascii.toUpper(@intCast(keyval));
     var buf: [16]u8 = undefined;
-    const chord = std.mem.print(&buf, "Ctrl {s}{c}", .{ if (shift) "Shift " else "", letter }) catch return false;
+    const chord = std.mem.print(&buf, "Ctrl {s}{c}", .{
+        if (shift) "Shift " else "",
+        letter,
+    }) catch return false;
     const it = ui.selectedItem() orelse return false;
     for (item_mod.actionsFor(it)) |e| if (std.mem.eql(u8, e.keys, chord)) {
         ui.performEntry(e);

@@ -81,7 +81,12 @@ fn onRegistry(reg: *Host.Registry, ctx: ?*anyopaque) void {
     const old = ui.ext_registry;
     const old_result = ui.ext_result;
     // The open command, found again by its id in the new registry.
-    const open_id: ?[]const u8 = if (ui.view == .ext) if (command(ui)) |cmd| cmd.id else null else null;
+    const open_id: ?[]const u8 = if (ui.view != .ext)
+        null
+    else if (command(ui)) |cmd|
+        cmd.id
+    else
+        null;
 
     const old_root = ui.ext_root;
     ui.ext_registry = reg;
@@ -138,7 +143,8 @@ fn onRoot(res: *Host.RootResult, ctx: ?*anyopaque) void {
         return;
     };
     for (res.sections) |sec| for (sec.items) |*it| {
-        if (it.icon == .none and sec.command < reg.commands.len) it.icon = reg.commands[sec.command].icon;
+        if (it.icon == .none and
+            sec.command < reg.commands.len) it.icon = reg.commands[sec.command].icon;
     };
     const old = ui.ext_root;
     ui.ext_root = res;

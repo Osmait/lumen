@@ -283,7 +283,15 @@ const WorkerCommand = struct {
 const Kept = struct { ref: c_int = c_noref, gen: u32 = 0 };
 
 const ListReq = struct { registry: u32, command: u16, gen: u32, query_len: usize };
-const ActReq = struct { registry: u32, command: u16, root: bool, list_gen: u32, item: ?u32, action: u8, gen: u32 };
+const ActReq = struct {
+    registry: u32,
+    command: u16,
+    root: bool,
+    list_gen: u32,
+    item: ?u32,
+    action: u8,
+    gen: u32,
+};
 const RootReq = struct { registry: u32, gen: u32, query_len: usize };
 
 /// A form's values, as the UI hands them over.
@@ -650,7 +658,8 @@ fn anyName(_: []const u8) bool {
 
 pub fn validId(id: []const u8) bool {
     if (id.len == 0 or id.len > 40) return false;
-    for (id) |ch| if (!(std.ascii.isLower(ch) or std.ascii.isDigit(ch) or ch == '-' or ch == '_')) return false;
+    for (id) |ch| if (!(std.ascii.isLower(ch) or std.ascii.isDigit(ch) or ch == '-' or
+        ch == '_')) return false;
     return true;
 }
 
@@ -1722,7 +1731,12 @@ const ActCtx = struct {
 
 const Hop = struct {
     h: *Host,
-    what: union(enum) { registry: *Registry, list: *ListResult, act: *ActResult, root: *RootResult },
+    what: union(enum) {
+        registry: *Registry,
+        list: *ListResult,
+        act: *ActResult,
+        root: *RootResult,
+    },
 };
 
 fn deliver(h: *Host, what: @FieldType(Hop, "what")) void {

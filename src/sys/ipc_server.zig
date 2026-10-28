@@ -13,7 +13,12 @@ const log = std.log.scoped(.ipc);
 
 /// Runs a request: `args` without the program name, `payload` what came
 /// after them. Writes what goes to stdout and stderr; returns the status.
-pub const Handler = *const fn (args: []const [:0]const u8, payload: []const u8, out: *std.Io.Writer, err: *std.Io.Writer) u8;
+pub const Handler = *const fn (
+    args: []const [:0]const u8,
+    payload: []const u8,
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+) u8;
 
 /// struct ucred (SO_PEERCRED).
 const Ucred = extern struct { pid: i32, uid: u32, gid: u32 };

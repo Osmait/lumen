@@ -463,7 +463,12 @@ fn intersect(
 /// read from the text cache by the caller-provided resolver. Running out of
 /// memory is an error, never "no text": the index would keep the document
 /// empty until it changed.
-pub const TextFn = *const fn (ctx: *anyopaque, doc: DocIn, buf: *std.ArrayList(u8), gpa: std.mem.Allocator) std.mem.Allocator.Error!bool;
+pub const TextFn = *const fn (
+    ctx: *anyopaque,
+    doc: DocIn,
+    buf: *std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+) std.mem.Allocator.Error!bool;
 
 /// A `TextFn` and the context it is called with.
 pub const TextReader = struct { read: TextFn, ctx: *anyopaque };
@@ -539,7 +544,12 @@ fn extractTaskOrFail(ctx: *ExtractCtx, t: usize) std.mem.Allocator.Error!void {
     }
 }
 
-pub const BuildStats = struct { docs_indexed: usize = 0, pairs: usize = 0, segments: usize = 0, ns: u64 = 0 };
+pub const BuildStats = struct {
+    docs_indexed: usize = 0,
+    pairs: usize = 0,
+    segments: usize = 0,
+    ns: u64 = 0,
+};
 
 pub const BuildError = std.mem.Allocator.Error || error{BadIndex};
 pub const FileError = BuildError || sys.Error;
@@ -801,7 +811,14 @@ const Sink = struct {
 };
 
 /// The header, once everything after it is written.
-const Header = struct { n: usize, n_segs: usize, paths_len: usize, docs_off: usize, dir_off: usize, total: usize };
+const Header = struct {
+    n: usize,
+    n_segs: usize,
+    paths_len: usize,
+    docs_off: usize,
+    dir_off: usize,
+    total: usize,
+};
 
 fn headerBytes(h: Header) [header_len]u8 {
     var b: [header_len]u8 = @splat(0);
@@ -1841,7 +1858,14 @@ fn staticScore(d: DocIn, words: []const []const u8, now: i64) i32 {
     };
     // Saturating: mtimes come from the index file, which may be damaged.
     const age_days = @divTrunc(now -| d.mtime, 86_400);
-    s += if (age_days < 1) 300 else if (age_days < 7) 220 else if (age_days < 30) 140 else if (age_days < 180) 60 else if (age_days < 365) 20 else 0;
+    s += switch (age_days) {
+        std.math.minInt(i64)...0 => 300,
+        1...6 => 220,
+        7...29 => 140,
+        30...179 => 60,
+        180...364 => 20,
+        else => 0,
+    };
     s -= @intCast(std.mem.count(u8, d.path, "/") * 5);
     return s;
 }
@@ -1894,7 +1918,8 @@ pub fn search(
     for (cands.items, ordered) |doc, *o| {
         // Both lists ascend.
         while (pi < phrase_docs.items.len and phrase_docs.items[pi] < doc) pi += 1;
-        const maybe_phrase = several and (!phrase_known or (pi < phrase_docs.items.len and phrase_docs.items[pi] == doc));
+        const maybe_phrase = several and
+            (!phrase_known or (pi < phrase_docs.items.len and phrase_docs.items[pi] == doc));
         const d: DocIn = .{ .path = ix.path(doc), .mtime = ix.mtimes[doc], .size = ix.sizes[doc] };
         o.* = .{
             .doc = doc,

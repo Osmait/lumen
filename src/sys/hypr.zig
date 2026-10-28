@@ -78,7 +78,11 @@ fn connect(which: []const u8, opts: os.unix.ConnectOptions) ?linux.fd_t {
     const sig = std.mem.span(c.g_getenv("HYPRLAND_INSTANCE_SIGNATURE") orelse return null);
     const rt = std.mem.span(c.g_getenv("XDG_RUNTIME_DIR") orelse return null);
     var path_buf: [108]u8 = undefined;
-    const path = std.mem.print(&path_buf, "{s}/hypr/{s}/{s}", .{ rt, sig, which }) catch return null;
+    const path = std.mem.print(
+        &path_buf,
+        "{s}/hypr/{s}/{s}",
+        .{ rt, sig, which },
+    ) catch return null;
     return os.unix.connect(path, opts);
 }
 

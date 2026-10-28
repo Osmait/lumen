@@ -75,7 +75,11 @@ pub const GBytes = opaque {};
 pub const GdkTexture = opaque {};
 
 pub const GCallback = *const fn () callconv(.c) void;
-pub const GAsyncReadyCallback = *const fn (source: ?*GObject, res: *GAsyncResult, data: ?*anyopaque) callconv(.c) void;
+pub const GAsyncReadyCallback = *const fn (
+    source: ?*GObject,
+    res: *GAsyncResult,
+    data: ?*anyopaque,
+) callconv(.c) void;
 pub const GDestroyNotify = *const fn (?*anyopaque) callconv(.c) void;
 pub const GSpawnChildSetupFunc = *const fn (?*anyopaque) callconv(.c) void;
 pub const GSourceFunc = *const fn (?*anyopaque) callconv(.c) gboolean;
@@ -452,7 +456,11 @@ pub extern fn gtk_widget_compute_bounds(
     target: *GtkWidget,
     out: *graphene_rect_t,
 ) gboolean;
-pub const GtkTickCallback = *const fn (?*GtkWidget, ?*GdkFrameClock, ?*anyopaque) callconv(.c) gboolean;
+pub const GtkTickCallback = *const fn (
+    ?*GtkWidget,
+    ?*GdkFrameClock,
+    ?*anyopaque,
+) callconv(.c) gboolean;
 pub extern fn gtk_widget_add_tick_callback(
     w: *GtkWidget,
     cb: GtkTickCallback,
@@ -597,7 +605,11 @@ pub extern fn gtk_layer_set_exclusive_zone(w: *GtkWindow, zone: c_int) void;
 // ---------------------------------------------------------------- glib-unix
 
 pub const G_IO_IN: c_uint = 1;
-pub const GUnixFDSourceFunc = *const fn (fd: c_int, condition: c_uint, data: ?*anyopaque) callconv(.c) gboolean;
+pub const GUnixFDSourceFunc = *const fn (
+    fd: c_int,
+    condition: c_uint,
+    data: ?*anyopaque,
+) callconv(.c) gboolean;
 pub extern fn g_unix_fd_add(
     fd: c_int,
     condition: c_uint,
@@ -624,7 +636,12 @@ pub extern fn g_idle_add_full(
     notify: ?*const anyopaque,
 ) c_uint;
 pub const GTask = opaque {};
-pub const GTaskThreadFunc = *const fn (task: *GTask, source: ?*GObject, data: ?*anyopaque, cancellable: ?*GCancellable) callconv(.c) void;
+pub const GTaskThreadFunc = *const fn (
+    task: *GTask,
+    source: ?*GObject,
+    data: ?*anyopaque,
+    cancellable: ?*GCancellable,
+) callconv(.c) void;
 pub extern fn g_task_new(
     source: ?*GObject,
     cancellable: ?*GCancellable,

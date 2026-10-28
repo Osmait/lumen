@@ -313,7 +313,12 @@ fn launch(info: *c.GAppInfo) void {
     const ctx = proc.launchContext() orelse return;
     defer c.g_object_unref(ctx);
     var err: ?*c.GError = null;
-    if (c.g_app_info_launch(info, null, ctx, &err) == 0) proc.warnError(.actions, err, "launch", .{});
+    if (c.g_app_info_launch(info, null, ctx, &err) == 0) proc.warnError(
+        .actions,
+        err,
+        "launch",
+        .{},
+    );
 }
 
 fn focusWindow(ctx: Ctx, it: *const Item) void {

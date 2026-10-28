@@ -55,7 +55,9 @@ pub fn swatchTexture(bg: u24, fg: u24, accent: u24) ?*c.GdkTexture {
     defer c.g_bytes_unref(bytes);
     const tex = c.gdk_memory_texture_new(n, n, c.GDK_MEMORY_R8G8B8A8, bytes, n * 4);
     const slot = if (Cache.len < Cache.keys.len) Cache.len else Cache.next;
-    if (Cache.len < Cache.keys.len) Cache.len += 1 else Cache.next = (Cache.next + 1) % Cache.keys.len;
+    if (Cache.len < Cache.keys.len) {
+        Cache.len += 1;
+    } else Cache.next = (Cache.next + 1) % Cache.keys.len;
     if (Cache.textures[slot]) |old| c.g_object_unref(old);
     Cache.keys[slot] = colors;
     Cache.textures[slot] = tex;
@@ -99,7 +101,9 @@ fn fileTexture(path: [:0]const u8, size: c_int) ?*c.GdkTexture {
     defer c.g_object_unref(pb);
     const tex = c.gdk_texture_new_for_pixbuf(pb);
     const slot = if (Cache.len < Cache.keys.len) Cache.len else Cache.next;
-    if (Cache.len < Cache.keys.len) Cache.len += 1 else Cache.next = (Cache.next + 1) % Cache.keys.len;
+    if (Cache.len < Cache.keys.len) {
+        Cache.len += 1;
+    } else Cache.next = (Cache.next + 1) % Cache.keys.len;
     if (Cache.textures[slot]) |old| c.g_object_unref(old);
     Cache.keys[slot] = k;
     Cache.textures[slot] = tex;

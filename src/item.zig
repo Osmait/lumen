@@ -40,7 +40,22 @@ pub const Icon = union(enum) {
 /// `dmenu`: lines from `lumen --dmenu`. `prefs`: an extension's preferences;
 /// `input`: typing a preference's or a form field's value; `form`: an
 /// extension's form.
-pub const View = enum { root, clipboard, windows, files, contents, settings, themes, default_apps, choose, ext, dmenu, prefs, input, form };
+pub const View = enum {
+    root,
+    clipboard,
+    windows,
+    files,
+    contents,
+    settings,
+    themes,
+    default_apps,
+    choose,
+    ext,
+    dmenu,
+    prefs,
+    input,
+    form,
+};
 
 pub const System = enum {
     lock,
@@ -59,7 +74,16 @@ pub const System = enum {
     empty_trash,
 };
 
-pub const WindowOp = enum { toggle_floating, toggle_fullscreen, toggle_maximize, pin, close, next_workspace, prev_workspace, move_next_monitor };
+pub const WindowOp = enum {
+    toggle_floating,
+    toggle_fullscreen,
+    toggle_maximize,
+    pin,
+    close,
+    next_workspace,
+    prev_workspace,
+    move_next_monitor,
+};
 
 pub const Action = union(enum) {
     app: *c.GAppInfo,

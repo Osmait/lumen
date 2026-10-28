@@ -241,7 +241,10 @@ pub fn choiceCandidates(ui: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item)
     if (i >= reg.prefs.len) return;
     const p = &reg.prefs[i];
     const value = current(a, p);
-    for (p.choices) |ch| out.append(a, settings_view.pickRow(a, ch, value) catch return) catch return;
+    for (p.choices) |ch| out.append(
+        a,
+        settings_view.pickRow(a, ch, value) catch return,
+    ) catch return;
 }
 
 /// A value picked in the choose view.

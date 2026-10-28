@@ -48,7 +48,12 @@ fn deltaIdx(id: u32) u32 {
 
 pub const Hit = struct { path: []const u8, score: i32, is_dir: bool };
 
-pub const Stats = struct { added: usize = 0, removed: usize = 0, resyncs: usize = 0, watches: usize = 0 };
+pub const Stats = struct {
+    added: usize = 0,
+    removed: usize = 0,
+    resyncs: usize = 0,
+    watches: usize = 0,
+};
 
 /// When the layers on top are worth a rescan. A field, not constants, so
 /// tests can reach the thresholds without creating 20k files.
@@ -267,7 +272,10 @@ fn pathExists(l: *const Live, id: u32) bool {
 /// Without it, new files under a dot-dir ranked as the user's own until the
 /// next rescan.
 fn hiddenFlag(l: *const Live, parent: u32, name: []const u8) u8 {
-    const parent_fl = if (isDelta(parent)) l.delta_b.flags.items[deltaIdx(parent)] else l.base.flags()[parent];
+    const parent_fl = if (isDelta(parent))
+        l.delta_b.flags.items[deltaIdx(parent)]
+    else
+        l.base.flags()[parent];
     const hidden = parent_fl & store_mod.flag_hidden != 0 or name[0] == '.' or
         std.ascii.findIgnoreCase(name, "cache") != null;
     return if (hidden) store_mod.flag_hidden else 0;
@@ -581,7 +589,8 @@ pub fn adopt(l: *Live, base: Store, watcher: *Watcher) std.mem.Allocator.Error!R
 pub fn needsCompaction(l: *const Live) bool {
     const graves = l.graves;
     const lim = l.limits;
-    if (l.delta.len() > lim.delta_max or (graves > lim.graves_min and graves > l.base.len() / lim.graves_div)) return true;
+    if (l.delta.len() > lim.delta_max or
+        (graves > lim.graves_min and graves > l.base.len() / lim.graves_div)) return true;
     return l.dirty and sys.monotonicNs() -| l.last_compact_ns >= lim.interval_ns;
 }
 

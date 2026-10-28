@@ -71,14 +71,33 @@ const setting_rows = [_]struct { [:0]const u8, item_mod.Color, []const RowSpec }
 
 /// A row of `setting_rows`, its value as it is now. Rows are found again by
 /// their setting's name (`settingKey`).
-fn settingRow(ui: *Ui, a: std.mem.Allocator, section: [:0]const u8, color: item_mod.Color, r: RowSpec) Item {
+fn settingRow(
+    ui: *Ui,
+    a: std.mem.Allocator,
+    section: [:0]const u8,
+    color: item_mod.Color,
+    r: RowSpec,
+) Item {
     const title, const icon, const source, const keywords = r;
-    const name: []const u8, const value: [:0]const u8, const action: item_mod.Setting = switch (source) {
-        .theme => .{ "theme", themes.displayName(a, ui.settings.theme, ui.preferDark()), .{ .go = .themes } },
-        .default_apps => .{ "default_apps", defaultAppsSummary(ui, a), .{ .go = .default_apps } },
-        .choice => |ch| .{ @tagName(ch), choiceLabel(ui, a, ch), .{ .choose = ch } },
-        .toggle => |t| .{ @tagName(t), if (ui.settings.get(t)) "On" else "Off", .{ .toggle = t } },
-    };
+    const name: []const u8, const value: [:0]const u8, const action: item_mod.Setting =
+        switch (source) {
+            .theme => .{
+                "theme",
+                themes.displayName(a, ui.settings.theme, ui.preferDark()),
+                .{ .go = .themes },
+            },
+            .default_apps => .{
+                "default_apps",
+                defaultAppsSummary(ui, a),
+                .{ .go = .default_apps },
+            },
+            .choice => |ch| .{ @tagName(ch), choiceLabel(ui, a, ch), .{ .choose = ch } },
+            .toggle => |t| .{
+                @tagName(t),
+                if (ui.settings.get(t)) "On" else "Off",
+                .{ .toggle = t },
+            },
+        };
     return .{
         .key = settingKey(a, name),
         .section = section,
@@ -187,8 +206,12 @@ pub fn choiceOptions(ui: *Ui, a: std.mem.Allocator, ch: settings_mod.Choice) []c
         .icon_theme => iconThemes(a),
         .terminal, .editor => blk: {
             var out: std.ArrayList(Option) = .empty;
-            const list: []const [2][:0]const u8 = if (ch == .terminal) &settings_mod.terminals else &settings_mod.editors;
-            const auto_cmd: []const u8 = if (ch == .terminal) run.autoTerminal() else run.autoEditor();
+            const terminal = ch == .terminal;
+            const list: []const [2][:0]const u8 = if (terminal)
+                &settings_mod.terminals
+            else
+                &settings_mod.editors;
+            const auto_cmd: []const u8 = if (terminal) run.autoTerminal() else run.autoEditor();
             const auto_base = std.Io.Dir.path.basename(auto_cmd);
             var auto_name: []const u8 = auto_base;
             for (list) |e| if (std.mem.eql(u8, e[0], auto_base)) {
@@ -311,7 +334,10 @@ pub fn chooseCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
         .setting => |ch| {
             var buf: [32]u8 = undefined;
             const current = ui.settings.choiceValue(ch, &buf);
-            for (choiceOptions(ui, a, ch)) |o| out.append(a, pickRow(a, o, current) catch break) catch break;
+            for (choiceOptions(ui, a, ch)) |o| out.append(
+                a,
+                pickRow(a, o, current) catch break,
+            ) catch break;
         },
         .kind => |k| appOptions(
             ui,

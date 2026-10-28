@@ -129,7 +129,11 @@ const Pump = struct {
     fn loop(p: *Pump) Error!End {
         if (p.child.stdin) |f| {
             const nonblock: u32 = @bitCast(linux.O{ .NONBLOCK = true });
-            _ = linux.fcntl(f.handle, linux.F.SETFL, linux.fcntl(f.handle, linux.F.GETFL, 0) | nonblock);
+            _ = linux.fcntl(
+                f.handle,
+                linux.F.SETFL,
+                linux.fcntl(f.handle, linux.F.GETFL, 0) | nonblock,
+            );
         }
         while (p.out_open or p.err_open) {
             const now_ns = os.monotonicNs();
@@ -159,7 +163,9 @@ const Pump = struct {
             }
             for (fds[0..n]) |pfd| {
                 if (pfd.revents == 0) continue;
-                if (pfd.events == linux.POLL.OUT) p.feed() else if (try p.drain(pfd.fd)) return .capped;
+                if (pfd.events == linux.POLL.OUT) {
+                    p.feed();
+                } else if (try p.drain(pfd.fd)) return .capped;
             }
         }
         return .closed;

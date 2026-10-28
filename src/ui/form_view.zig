@@ -100,7 +100,10 @@ pub fn edit(ui: *Ui, i: u16) void {
 /// The values of choice field `i`, for the choose view.
 pub fn choiceCandidates(ui: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item), i: u16) void {
     const f = field(ui, i) orelse return;
-    for (f.choices) |ch| out.append(a, settings_view.pickRow(a, ch, value(ui, i)) catch return) catch return;
+    for (f.choices) |ch| out.append(
+        a,
+        settings_view.pickRow(a, ch, value(ui, i)) catch return,
+    ) catch return;
 }
 
 pub fn pick(ui: *Ui, i: u16, v: []const u8) void {

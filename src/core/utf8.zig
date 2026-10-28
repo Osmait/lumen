@@ -57,7 +57,17 @@ test "validPrefix stops at the first invalid sequence" {
 test "validPrefix agrees with the longest valid prefix on random bytes" {
     var prng: std.Random.DefaultPrng = .init(0x7e57);
     const r = prng.random();
-    const pieces = [_][]const u8{ "a", "é", "€", "😀", "\x80", "\xc3", "\xe2\x82", "\xff", "\xed\xa0\x80" };
+    const pieces = [_][]const u8{
+        "a",
+        "é",
+        "€",
+        "😀",
+        "\x80",
+        "\xc3",
+        "\xe2\x82",
+        "\xff",
+        "\xed\xa0\x80",
+    };
     var buf: [64]u8 = undefined;
     for (0..5000) |_| {
         var len: usize = 0;

@@ -283,7 +283,13 @@ pub const Choosing = union(enum) {
 
 /// `hint` shows the primary action while the row is selected, in place of
 /// `accessory`.
-const Row = struct { widget: *c.GtkWidget, item: ?usize, section: [:0]const u8 = "", hint: ?*c.GtkWidget = null, accessory: ?*c.GtkWidget = null };
+const Row = struct {
+    widget: *c.GtkWidget,
+    item: ?usize,
+    section: [:0]const u8 = "",
+    hint: ?*c.GtkWidget = null,
+    accessory: ?*c.GtkWidget = null,
+};
 
 /// A row not built yet: an item (its index) or a section title.
 const Pending = union(enum) { item: usize, section: [:0]const u8 };
@@ -387,7 +393,10 @@ fn buildWindow(self: *Ui) *c.GtkWidget {
     c.gtk_layer_set_layer(w, c.GTK_LAYER_SHELL_LAYER_OVERLAY);
     c.gtk_layer_set_keyboard_mode(
         w,
-        if (testMode()) c.GTK_LAYER_SHELL_KEYBOARD_MODE_NONE else c.GTK_LAYER_SHELL_KEYBOARD_MODE_EXCLUSIVE,
+        if (testMode())
+            c.GTK_LAYER_SHELL_KEYBOARD_MODE_NONE
+        else
+            c.GTK_LAYER_SHELL_KEYBOARD_MODE_EXCLUSIVE,
     );
     c.gtk_layer_set_namespace(w, "lumen");
     c.gtk_layer_set_anchor(w, c.GTK_LAYER_SHELL_EDGE_TOP, 1);
@@ -919,7 +928,8 @@ pub fn showWith(self: *Ui, view: View, text: ?[*:0]const u8) void {
     // The choose view only means something reached from a setting, the
     // ext view from a command.
     self.setView(
-        if (view == .choose and self.choosing == .none) .settings else if (view == .ext and ext_view.command(self) == null) .root else view,
+        if (view == .choose and self.choosing == .none) .settings else if (view == .ext and
+            ext_view.command(self) == null) .root else view,
     );
     if (text) |t| c.gtk_editable_set_text(@ptrCast(self.entry), t);
     if (was_hidden) backdrop.showBackdrops(self);
@@ -994,10 +1004,11 @@ fn placeOnFocusedMonitor(self: *Ui) void {
         var geo: c.GdkRectangle = undefined;
         c.gdk_monitor_get_geometry(mon, &geo);
         const w: *c.GtkWindow = @ptrCast(self.window);
-        const pos: layout_mod.Position = self.layout.position orelse switch (self.settings.position) {
+        const chosen: layout_mod.Position = switch (self.settings.position) {
             .upper_third => .upper_third,
             .center => .center,
         };
+        const pos = self.layout.position orelse chosen;
         const off: c_int = self.layout.offset;
         // The pieces sit `shell_margin` inside the surface (room for shadows).
         const at_bottom = pos == .bottom;
@@ -1099,7 +1110,10 @@ pub fn setView(self: *Ui, view: View) void {
 
     self.layoutFor(view);
     var placeholder_buf: [128]u8 = undefined;
-    c.gtk_text_set_placeholder_text(@ptrCast(self.entry), self.placeholderFor(view, &placeholder_buf));
+    c.gtk_text_set_placeholder_text(
+        @ptrCast(self.entry),
+        self.placeholderFor(view, &placeholder_buf),
+    );
     c.gtk_label_set_text(@ptrCast(self.scope), self.viewTitle());
     c.gtk_widget_set_visible(self.scope, @intFromBool(
         view != .root and self.layout.show.scope and self.layout.searchbar.has(.scope),
@@ -1173,7 +1187,9 @@ fn layoutFor(self: *Ui, view: View) void {
 /// The search bar's text while empty, for `view` (`buf` may hold it).
 fn placeholderFor(self: *Ui, view: View, buf: *[128]u8) [*:0]const u8 {
     // lumen.layout's placeholder: "Go…" at the root, "<view>…" elsewhere.
-    const custom: ?[*:0]const u8 = if (self.layout.placeholder.len == 0) null else if (view == .root)
+    const custom: ?[*:0]const u8 = if (self.layout.placeholder.len == 0)
+        null
+    else if (view == .root)
         self.layout.placeholder.ptr
     else if (std.mem.printSentinel(
         buf,
@@ -1308,7 +1324,11 @@ fn answerPending(self: *Ui, t0: u64) bool {
     if (self.view != .contents) return false;
     const cs = self.content_search orelse return false;
     const r = self.content_result orelse return false;
-    if (q.len < 3 or r != self.shown_content or std.mem.eql(u8, r.query, ContentSearch.clip(q))) return false;
+    if (q.len < 3 or r != self.shown_content or std.mem.eql(
+        u8,
+        r.query,
+        ContentSearch.clip(q),
+    )) return false;
     self.content_gen = cs.submit(q, t0);
     self.content_pending = true;
     return true;
@@ -1349,7 +1369,11 @@ fn fillContents(self: *Ui, a: std.mem.Allocator, q: []const u8, t0: u64) void {
     // here; meanwhile keep showing the last result. The worker searches the
     // clipped query: compare with that, or a query longer than the clip
     // never counts as answered.
-    const fresh = if (self.content_result) |r| std.mem.eql(u8, r.query, ContentSearch.clip(q)) else false;
+    const fresh = if (self.content_result) |r| std.mem.eql(
+        u8,
+        r.query,
+        ContentSearch.clip(q),
+    ) else false;
     if (!fresh) self.content_gen = cs.submit(q, t0);
     self.content_pending = !fresh;
     if (self.content_result) |r| {
@@ -1516,7 +1540,12 @@ fn fillFiltered(self: *Ui, a: std.mem.Allocator, q: []const u8, by_day: bool) vo
             const today = labels.startOfToday();
             var last: ?[:0]const u8 = null;
             for (self.base) |it| {
-                const section: [:0]const u8 = if (it.time_s >= today) "Today" else if (it.time_s >= today - std.time.s_per_day) "Yesterday" else "Earlier";
+                const section: [:0]const u8 = if (it.time_s >= today)
+                    "Today"
+                else if (it.time_s >= today - std.time.s_per_day)
+                    "Yesterday"
+                else
+                    "Earlier";
                 if (last == null or !std.mem.eql(u8, last.?, section)) {
                     self.addSection(section);
                     last = section;
@@ -1564,7 +1593,8 @@ pub fn addSection(self: *Ui, title: [:0]const u8) void {
 
 /// Queues a row past the first `eager_rows`; false: build it now.
 fn deferRow(self: *Ui, p: Pending) bool {
-    if (self.grid_mode or (self.rows.items.len < eager_rows and self.pending.items.len == 0)) return false;
+    if (self.grid_mode or
+        (self.rows.items.len < eager_rows and self.pending.items.len == 0)) return false;
     self.pending.append(self.query_arena.allocator(), p) catch return false;
     if (self.pending_idle == 0) self.pending_idle = c.g_idle_add_full(
         c.G_PRIORITY_LOW,
@@ -1675,7 +1705,9 @@ fn buildItemRow(self: *Ui, item_index: usize) void {
 
 pub fn nextSelectable(self: *Ui, from: ?usize, dir: i32) ?usize {
     // Past the rows built so far, or from the end: build the rest first.
-    if (self.pending.items.len > 0 and ((from == null and dir < 0) or (from != null and dir > 0 and from.? + 1 >= self.rows.items.len))) self.ensureRows();
+    if (self.pending.items.len > 0 and
+        ((from == null and dir < 0) or
+            (from != null and dir > 0 and from.? + 1 >= self.rows.items.len))) self.ensureRows();
     const n = self.rows.items.len;
     if (n == 0) return null;
     var i: i64 = if (from) |f| @as(
@@ -1718,7 +1750,8 @@ pub fn select(self: *Ui, row_index: ?usize) void {
     detail_pane.showDetail(self, it);
     // Change Theme shows each theme as the selection moves over it, and the
     // theme in use on a style.
-    if (self.view == .themes) self.applyAppearance(if (it.action == .setting and it.action.setting == .theme)
+    if (self.view == .themes) self.applyAppearance(if (it.action == .setting and
+        it.action.setting == .theme)
         themes.find(it.action.setting.theme, self.preferDark())
     else
         null);
@@ -2167,7 +2200,8 @@ fn emptyText(self: *Ui, a: std.mem.Allocator) [:0]const u8 {
             .{err},
             0,
         ) catch "Content search failed";
-    if (self.view == .clipboard and q.len == 0 and !self.settings.clipboard) return "Clipboard history is off: turn it on in Settings";
+    if (self.view == .clipboard and q.len == 0 and
+        !self.settings.clipboard) return "Clipboard history is off: turn it on in Settings";
     if (self.view == .ext) return ext_view.emptyText(self, a, q);
     if (self.view == .dmenu) return dmenu.emptyText(self);
     return "No Results";

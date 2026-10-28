@@ -76,7 +76,8 @@ fn isRule(line: []const u8) bool {
 }
 
 fn bullet(line: []const u8) ?[]const u8 {
-    if (line.len >= 2 and (line[0] == '-' or line[0] == '*' or line[0] == '+') and line[1] == ' ') return line[2..];
+    if (line.len >= 2 and (line[0] == '-' or line[0] == '*' or line[0] == '+') and
+        line[1] == ' ') return line[2..];
     return null;
 }
 

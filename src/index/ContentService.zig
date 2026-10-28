@@ -395,9 +395,10 @@ fn diff(
     for (docs) |d| {
         if (ids.get(d.path)) |id| {
             seen[id] = true;
-            if (ix.mtimes[id] == d.mtime and ix.sizes[id] == d.size and ix.sources[id] == @backingInt(
-                d.source,
-            )) continue;
+            if (ix.mtimes[id] == d.mtime and ix.sizes[id] == d.size and
+                ix.sources[id] == @backingInt(
+                    d.source,
+                )) continue;
             try gone.append(arena, id);
         }
         try added.append(arena, d);
@@ -501,7 +502,12 @@ fn refresh(s: *ContentService) void {
 /// What changed since the index was built: every file listed again (no
 /// index yet, names created or removed, or the listing is old), or only
 /// the indexed ones checked. A listing is left in `docs`.
-fn changes(s: *ContentService, arena: std.mem.Allocator, names: ?u64, docs: *?[]content.DocIn) ?Diff {
+fn changes(
+    s: *ContentService,
+    arena: std.mem.Allocator,
+    names: ?u64,
+    docs: *?[]content.DocIn,
+) ?Diff {
     const t = sys.monotonicNs();
     const must_list = s.index == null or names == null or s.listed_names == null or
         names.? != s.listed_names.? or t - s.last_listing_at >= s.opts.list_every_ns;
@@ -534,7 +540,8 @@ fn wantsWhole(s: *const ContentService, d: Diff) bool {
 fn buildNext(s: *ContentService, all: ?[]const content.DocIn, d: Diff) ?content.Index {
     const reader: content.TextReader = .{ .read = textOf, .ctx = s };
     if (std.mem.findScalarLast(u8, s.cache_path, '/')) |slash| sys.mkdirP(s.cache_path[0..slash]);
-    const appended: ?content.FileError!content.Index = if (all == null and s.index.?.mapped and !s.unsaved)
+    const appended: ?content.FileError!content.Index = if (all == null and s.index.?.mapped and
+        !s.unsaved)
         if (content.appendFile(
             s.gpa,
             s.build_pool,
@@ -550,7 +557,16 @@ fn buildNext(s: *ContentService, all: ?[]const content.DocIn, d: Diff) ?content.
     const written = appended orelse if (all) |docs|
         content.buildFile(s.gpa, s.build_pool, docs, reader, s.cache_path, null)
     else
-        content.updateFile(s.gpa, s.build_pool, &s.index.?, d.gone, d.added, reader, s.cache_path, null);
+        content.updateFile(
+            s.gpa,
+            s.build_pool,
+            &s.index.?,
+            d.gone,
+            d.added,
+            reader,
+            s.cache_path,
+            null,
+        );
     const fresh = written catch |file_err| blk: {
         if (file_err == error.OutOfMemory) {
             log.warn("building the content index: out of memory", .{});
@@ -563,7 +579,15 @@ fn buildNext(s: *ContentService, all: ?[]const content.DocIn, d: Diff) ?content.
         break :blk (if (all) |docs|
             content.build(s.gpa, s.build_pool, docs, reader, null)
         else
-            content.update(s.gpa, s.build_pool, &s.index.?, d.gone, d.added, reader, null)) catch |err| {
+            content.update(
+                s.gpa,
+                s.build_pool,
+                &s.index.?,
+                d.gone,
+                d.added,
+                reader,
+                null,
+            )) catch |err| {
             log.warn("building the content index: {t}", .{err});
             return null;
         };
@@ -621,7 +645,8 @@ fn run(s: *ContentService) void {
         const now_wake = s.wake.load(.acquire);
         const poked = now_wake != seen;
         seen = now_wake;
-        if (since >= s.opts.refresh_every_ns or (poked and since >= s.opts.poke_min_ns)) s.refresh();
+        if (since >= s.opts.refresh_every_ns or
+            (poked and since >= s.opts.poke_min_ns)) s.refresh();
     }
 }
 

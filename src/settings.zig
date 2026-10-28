@@ -24,7 +24,18 @@ pub const Density = enum { compact, default, comfortable };
 /// On/off settings.
 pub const Toggle = enum { files_in_root, suggestions, clipboard };
 /// Settings with a list of values to pick from.
-pub const Choice = enum { text_size, opacity, position, width, height, density, icon_theme, clipboard_keep, terminal, editor };
+pub const Choice = enum {
+    text_size,
+    opacity,
+    position,
+    width,
+    height,
+    density,
+    icon_theme,
+    clipboard_keep,
+    terminal,
+    editor,
+};
 
 pub const opacity_choices = [_]u8{ 100, 97, 90, 80 };
 pub const keep_choices = [_]u32{ 100, 500, 1000, 5000 };
@@ -438,7 +449,8 @@ fn parseBool(v: []const u8) ?bool {
 /// passed to programs, so no spaces, quotes or newlines.
 pub fn isToken(v: []const u8) bool {
     if (v.len == 0 or v.len > 200) return false;
-    for (v) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '.' or ch == '-' or ch == '_' or ch == '+')) return false;
+    for (v) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '.' or ch == '-' or ch == '_' or
+        ch == '+')) return false;
     return true;
 }
 

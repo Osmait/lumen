@@ -83,7 +83,8 @@ pub fn main(init: std.process.Init) !void {
         cli.specs.get(f).needs_daemon
     else
         false;
-    const flags = c.G_APPLICATION_HANDLES_COMMAND_LINE | if (client_only) c.G_APPLICATION_IS_LAUNCHER else 0;
+    const launcher = if (client_only) c.G_APPLICATION_IS_LAUNCHER else 0;
+    const flags = c.G_APPLICATION_HANDLES_COMMAND_LINE | launcher;
     const app = c.gtk_application_new(app_id.ptr, flags);
     the_app = @ptrCast(app);
     defer c.g_object_unref(app);

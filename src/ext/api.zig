@@ -480,7 +480,11 @@ fn layout(L: *lua.State) lua.Error!c_int {
                 "lumen.layout: {s} is a string",
                 .{key},
             );
-            const text = load.a.dupeSentinel(u8, p[0..@min(p.len, 64)], 0) catch return lua.failOom(L);
+            const text = load.a.dupeSentinel(
+                u8,
+                p[0..@min(p.len, 64)],
+                0,
+            ) catch return lua.failOom(L);
             if (key[1] == 'r') l.prompt = text else l.placeholder = text;
         } else if (std.mem.eql(u8, key, "show")) {
             try layoutShow(L, &l);
@@ -563,8 +567,16 @@ fn layoutValue(L: *lua.State, l: *layout_mod.Layout, key: []const u8) lua.Error!
         else => .{},
     };
     layout_mod.set(l, key, value) catch |err| return switch (err) {
-        error.UnknownKey => lua.fail(L, "lumen.layout: no \"{s}\" (it has {s})", .{ key, layout_mod.keys }),
-        error.BadValue => lua.fail(L, "lumen.layout: bad value for {s} (see EXTENSIONS.md)", .{key}),
+        error.UnknownKey => lua.fail(
+            L,
+            "lumen.layout: no \"{s}\" (it has {s})",
+            .{ key, layout_mod.keys },
+        ),
+        error.BadValue => lua.fail(
+            L,
+            "lumen.layout: bad value for {s} (see EXTENSIONS.md)",
+            .{key},
+        ),
     };
 }
 

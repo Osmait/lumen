@@ -174,7 +174,12 @@ pub fn formatWhen(a: std.mem.Allocator, unix: i64) [:0]const u8 {
     const dt = c.g_date_time_new_from_unix_local(unix) orelse return "";
     defer c.g_date_time_unref(dt);
     const today = startOfToday();
-    const fmt: [*:0]const u8 = if (unix >= today) "Today at %H:%M" else if (unix >= today - 86400) "Yesterday at %H:%M" else "%b %e at %H:%M";
+    const fmt: [*:0]const u8 = if (unix >= today)
+        "Today at %H:%M"
+    else if (unix >= today - 86400)
+        "Yesterday at %H:%M"
+    else
+        "%b %e at %H:%M";
     const s = c.g_date_time_format(dt, fmt) orelse return "";
     defer c.g_free(s);
     return a.dupeSentinel(u8, std.mem.span(s), 0) catch "";
