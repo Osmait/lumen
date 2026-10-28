@@ -51,6 +51,16 @@ All notable changes are listed here. The format follows
   of ~58 ms, and each copy
   into the clipboard history no longer starts a GTK process. Install both
   files (see the README).
+- Release builds compile the search modules (core, index) without safety
+  checks: 10-25 % faster file and content search (`-Dsafe-index=true`
+  keeps them).
+- Commands and apps start with one fork of the daemon instead of two.
+- Extension search commands no longer rebuild their rows on every
+  keystroke while the answer is on its way, root providers' late answers
+  for an older query are ignored, `--dmenu` rebuilds at most every 50 ms
+  while reading, and editing a style that is not in use no longer reloads.
+- `lumen --stats`: the search time of the root and clipboard views no
+  longer includes building rows (and counted file search twice).
 - Idle, the daemon wakes far less: the name index no longer polls every
   100 ms nor counts its 1.1 M entries after every batch of file events
   (50 ms of CPU and 629 wakeups per minute → ~0 and 44), and the content

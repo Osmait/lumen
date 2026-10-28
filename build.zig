@@ -15,17 +15,24 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // The search loops (fuzzy and folded matching, trigram lists, the
+    // content scan) are 10-25 % faster without safety checks (lumen-find,
+    // measured). The index validates what it maps from disk on open, and its
+    // decoders never read past their input, so a ReleaseSafe build compiles
+    // these two modules ReleaseFast; the rest keeps its checks.
+    const safe_index = b.option(bool, "safe-index", "Keep safety checks in the core and index modules in ReleaseSafe") orelse false;
+    const hot = if (optimize == .safe and !safe_index) .fast else optimize;
 
     const core = b.createModule(.{
         .root_source_file = b.path("src/core/root.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = hot,
     });
 
     const index = b.createModule(.{
         .root_source_file = b.path("src/index/root.zig"),
         .target = target,
-        .optimize = optimize,
+        .optimize = hot,
         .link_libc = true,
     });
     // Accent and case folding (core.fold) is shared by every search.

@@ -1335,13 +1335,29 @@ fn onIdle(data: ?*anyopaque) callconv(.c) c.gboolean {
 
 /// Changes when init.lua or any .lua file in an extension's folder (not
 /// subfolders) is added, removed or edited: then the files are reloaded.
-pub fn stamp(config_dir: []const u8) u64 {
+/// `style`: the style in use; edits to the others' files change nothing.
+pub fn stamp(config_dir: []const u8, style: []const u8) u64 {
     var hasher: std.hash.Wyhash = .init(0);
     var buf: [4096]u8 = undefined;
     if (std.fmt.bufPrintSentinel(&buf, "{s}/init.lua", .{config_dir}, 0)) |p| hashFile(&hasher, p) else |_| {}
     hashFolders(&hasher, config_dir, "extensions");
-    hashFolders(&hasher, config_dir, "styles");
+    hasher.update(style);
+    if (style.len > 0) if (std.fmt.bufPrintSentinel(&buf, "{s}/styles/{s}", .{ config_dir, style }, 0)) |dir| hashLua(&hasher, dir) else |_| {};
     return hasher.final();
+}
+
+/// The .lua files directly in `dir`.
+fn hashLua(hasher: *std.hash.Wyhash, dir: [:0]const u8) void {
+    hasher.update(dir);
+    const d = c.g_dir_open(dir.ptr, 0, null) orelse return;
+    defer c.g_dir_close(d);
+    while (c.g_dir_read_name(d)) |fname| {
+        const f = std.mem.span(fname);
+        if (!std.mem.endsWith(u8, f, ".lua")) continue;
+        var fbuf: [4096]u8 = undefined;
+        const p = std.fmt.bufPrintSentinel(&fbuf, "{s}/{s}", .{ dir, f }, 0) catch continue;
+        hashFile(hasher, p);
+    }
 }
 
 /// The .lua files in each folder of <config>/<kind>.
@@ -1353,16 +1369,7 @@ fn hashFolders(hasher: *std.hash.Wyhash, config_dir: []const u8, kind: []const u
     while (c.g_dir_read_name(d)) |n| {
         var sub_buf: [4096]u8 = undefined;
         const sub = std.fmt.bufPrintSentinel(&sub_buf, "{s}/{s}", .{ top, std.mem.span(n) }, 0) catch continue;
-        hasher.update(sub);
-        const sd = c.g_dir_open(sub.ptr, 0, null) orelse continue;
-        defer c.g_dir_close(sd);
-        while (c.g_dir_read_name(sd)) |fname| {
-            const f = std.mem.span(fname);
-            if (!std.mem.endsWith(u8, f, ".lua")) continue;
-            var fbuf: [4096]u8 = undefined;
-            const p = std.fmt.bufPrintSentinel(&fbuf, "{s}/{s}", .{ sub, f }, 0) catch continue;
-            hashFile(hasher, p);
-        }
+        hashLua(hasher, sub);
     }
 }
 

@@ -215,6 +215,8 @@ ext_stamp: u64 = 0,
 ext_cmd: u16 = 0,
 /// Its latest rows; they point into it.
 ext_result: ?*ExtHost.ListResult = null,
+/// The result the rows on screen were built from (see `shown_content`).
+ext_shown: ?*ExtHost.ListResult = null,
 /// Generation of the last list asked for; older answers are dropped.
 ext_gen: u32 = 0,
 ext_pending: bool = false,
@@ -1092,6 +1094,7 @@ pub fn clearRows(self: *Ui) void {
     if (self.pending_idle != 0) _ = c.g_source_remove(self.pending_idle);
     self.pending_idle = 0;
     self.shown_content = null;
+    self.ext_shown = null;
     self.selected = null;
     self.primary = "";
     c.gtk_list_box_remove_all(@ptrCast(self.list));
@@ -1102,6 +1105,7 @@ pub fn refresh(self: *Ui) void {
     // Contents: the rows on screen are the last result's; asking the worker
     // for the new query changes nothing on screen until it answers (which
     // refreshes again). Building them again cost a frame per keystroke.
+    if (self.view == .ext and ext_view.waitingForSearch(self, std.mem.trim(u8, self.query(), " "))) return;
     if (self.view == .contents) if (self.content_search) |cs| if (self.content_result) |r| {
         const q = std.mem.trim(u8, self.query(), " ");
         if (q.len >= 3 and r == self.shown_content and !std.mem.eql(u8, r.query, ContentSearch.clip(q))) {
@@ -1123,6 +1127,7 @@ pub fn refresh(self: *Ui) void {
     if (self.pending_idle != 0) _ = c.g_source_remove(self.pending_idle);
     self.pending_idle = 0;
     self.shown_content = null;
+    self.ext_shown = null;
     self.selected = null;
     self.confirm_key = "";
     c.gtk_list_box_remove_all(@ptrCast(self.list));
@@ -1161,7 +1166,10 @@ pub fn refresh(self: *Ui) void {
         },
         .settings, .themes, .default_apps, .choose => self.fillSectioned(a, q),
         // Search commands are asked for `q`; list commands filter here.
-        .ext => self.fillSectioned(a, if (ext_view.prepare(self, q)) q else ""),
+        .ext => {
+            self.fillSectioned(a, if (ext_view.prepare(self, q)) q else "");
+            self.ext_shown = self.ext_result;
+        },
         .dmenu => dmenu.fill(self, a, q),
         .prefs => self.fillSectioned(a, q),
         // What is typed is the value, not a filter.
@@ -1273,8 +1281,9 @@ fn fillRoot(self: *Ui, a: std.mem.Allocator, q: []const u8) void {
     // Extensions' answers (rows from `root = function(query)`).
     ext_view.addRootSections(self, q);
 
+    // Scoring and sorting only: rows are timed apart, and fileItems times
+    // itself (a deferred timer here counted it twice).
     const t_search = stats.now();
-    defer self.search_ns += stats.now() - t_search;
     var hits: std.ArrayList(Item) = .empty;
     for (self.base) |it| {
         const fields = [_][]const u8{ it.title, it.keywords, it.subtitle };
@@ -1285,6 +1294,7 @@ fn fillRoot(self: *Ui, a: std.mem.Allocator, q: []const u8) void {
         hits.append(a, copy) catch break;
     }
     sortByScore(hits.items);
+    self.search_ns += stats.now() - t_search;
     // Files from 3 letters on, right after the best few results so they are
     // visible without scrolling; the rest of the results follow.
     const files = if (q.len >= 3 and self.settings.files_in_root) file_results.fileItems(self, a, q, 5) else &.{};
@@ -1319,7 +1329,6 @@ fn fillFiltered(self: *Ui, a: std.mem.Allocator, q: []const u8, by_day: bool) vo
         return;
     }
     const t_search = stats.now();
-    defer self.search_ns += stats.now() - t_search;
     var hits: std.ArrayList(Item) = .empty;
     for (self.base) |it| {
         const text = if (it.detail.len > 0) it.detail[0..@min(it.detail.len, 2000)] else it.title;
@@ -1331,6 +1340,7 @@ fn fillFiltered(self: *Ui, a: std.mem.Allocator, q: []const u8, by_day: bool) vo
         hits.append(a, copy) catch break;
     }
     sortByScore(hits.items);
+    self.search_ns += stats.now() - t_search;
     for (hits.items[0..@min(hits.items.len, 200)]) |it| self.addItem(it);
 }
 

@@ -50,8 +50,12 @@ pub const Session = struct {
     finished: bool = false,
     done_reading: bool = false,
     ui: *Ui,
+    /// One rebuild per 50 ms while lines arrive: rebuilding the view for
+    /// every read made a slow producer keep the main thread busy.
+    rebuild_timer: c_uint = 0,
 
     fn destroy(s: *Session) void {
+        if (s.rebuild_timer != 0) _ = c.g_source_remove(s.rebuild_timer);
         if (s.stream) |st| c.g_object_unref(st);
         c.g_object_unref(s.cancel);
         s.partial.deinit(s.gpa);
@@ -84,7 +88,7 @@ pub fn start(ui: *Ui, cmdline: *c.GApplicationCommandLine, prompt: ?[]const u8, 
 
 fn readMore(s: *Session) void {
     s.reading = true;
-    c.g_input_stream_read_bytes_async(s.stream.?, 64 * 1024, 0, s.cancel, &onRead, s);
+    c.g_input_stream_read_bytes_async(s.stream.?, 256 * 1024, 0, s.cancel, &onRead, s);
 }
 
 fn onRead(_: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) void {
@@ -120,6 +124,22 @@ fn onRead(_: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) 
             s.done_reading = true;
         } else readMore(s);
     }
+    // The first lines at once, the end at once, the rest every 50 ms.
+    if (s.done_reading or s.lines.items.len <= 500) {
+        if (s.rebuild_timer != 0) _ = c.g_source_remove(s.rebuild_timer);
+        s.rebuild_timer = 0;
+        showLines(s);
+    } else if (s.rebuild_timer == 0) s.rebuild_timer = c.g_timeout_add(50, &onRebuildTimer, s);
+}
+
+fn onRebuildTimer(data: ?*anyopaque) callconv(.c) c.gboolean {
+    const s: *Session = @ptrCast(@alignCast(data.?));
+    s.rebuild_timer = 0;
+    showLines(s);
+    return 0;
+}
+
+fn showLines(s: *Session) void {
     const ui = s.ui;
     if (ui.view == .dmenu) {
         if (ui.selectedItem()) |it| ui.setReselect("{s}", .{it.key});

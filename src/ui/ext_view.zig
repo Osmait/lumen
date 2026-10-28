@@ -31,7 +31,7 @@ pub fn start(ui: *Ui) void {
         log.warn("extensions: {t}", .{err});
         return;
     };
-    ui.ext_stamp = Host.stamp(ui.config_dir);
+    ui.ext_stamp = Host.stamp(ui.config_dir, ui.settings.style);
     _ = ui.ext_host.?.setStyle(ui.settings.style);
     ui.ext_host.?.reload();
 }
@@ -53,7 +53,7 @@ pub fn shutdown(ui: *Ui) void {
 /// look (the window is about to open).
 pub fn checkReload(ui: *Ui) void {
     const h = ui.ext_host orelse return;
-    const s = Host.stamp(ui.config_dir);
+    const s = Host.stamp(ui.config_dir, ui.settings.style);
     if (s == ui.ext_stamp) return;
     ui.ext_stamp = s;
     h.reload();
@@ -62,7 +62,7 @@ pub fn checkReload(ui: *Ui) void {
 /// `lumen --reload`.
 pub fn reload(ui: *Ui) void {
     const h = ui.ext_host orelse return;
-    ui.ext_stamp = Host.stamp(ui.config_dir);
+    ui.ext_stamp = Host.stamp(ui.config_dir, ui.settings.style);
     h.reload();
 }
 
@@ -141,7 +141,8 @@ fn onRoot(res: *Host.RootResult, ctx: ?*anyopaque) void {
     const old = ui.ext_root;
     ui.ext_root = res;
     ui.ext_root_pending = false;
-    if (ui.view == .root and res.sections.len > 0) {
+    // Answers for a query typed over meanwhile change nothing on screen.
+    if (ui.view == .root and res.sections.len > 0 and std.mem.eql(u8, res.query, std.mem.trim(u8, ui.query(), " "))) {
         if (ui.selectedItem()) |it| ui.setReselect("{s}", .{it.key});
         ui.refresh();
     }
@@ -276,6 +277,20 @@ pub fn enter(ui: *Ui) void {
 /// On each refresh: search commands ask for the query typed, unless it is
 /// already answered or on its way. True when the rows are local (filtered
 /// by Lumen).
+/// A search command's next keystroke: while its answer is on its way, the
+/// rows on screen are the last answer's and stay as they are (rebuilding
+/// them cost a frame per keystroke; `onList` rebuilds when it comes). True
+/// when the request is made and nothing else is to be done.
+pub fn waitingForSearch(ui: *Ui, q: []const u8) bool {
+    const cmd = command(ui) orelse return false;
+    if (cmd.mode != .search) return false;
+    const r = ui.ext_result orelse return false;
+    if (r != ui.ext_shown) return false;
+    if (r.command == ui.ext_cmd and std.mem.eql(u8, r.query, q)) return false;
+    _ = prepare(ui, q);
+    return true;
+}
+
 pub fn prepare(ui: *Ui, q: []const u8) bool {
     const cmd = command(ui) orelse return true;
     if (cmd.mode != .search) return true;

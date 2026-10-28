@@ -14,8 +14,16 @@ pub fn spawn(argv: []const [:0]const u8) void {
     var buf: Argv = undefined;
     const ptr = buf.of(argv) orelse return;
     var err: ?*c.GError = null;
-    const ok = c.g_spawn_async(null, ptr, null, c.G_SPAWN_SEARCH_PATH, null, null, null, &err);
-    if (ok == 0) logError("spawn", argv[0], err);
+    // Reaped here rather than by an intermediate child: GLib otherwise forks
+    // the daemon twice (a ~200 MB process) for every command it starts.
+    var pid: c.GPid = 0;
+    const ok = c.g_spawn_async(null, ptr, null, c.G_SPAWN_SEARCH_PATH | c.G_SPAWN_DO_NOT_REAP_CHILD, null, null, &pid, &err);
+    if (ok == 0) return logError("spawn", argv[0], err);
+    _ = c.g_child_watch_add(pid, &reap, null);
+}
+
+fn reap(pid: c.GPid, _: c_int, _: ?*anyopaque) callconv(.c) void {
+    c.g_spawn_close_pid(pid);
 }
 
 /// `sh -c <cmd>`, fire and forget.
