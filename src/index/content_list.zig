@@ -17,10 +17,10 @@ const excludes = [_][]const u8{
     "!*.map",              "!*.lock",        "!*-lock.json",  "!*.svg",
 };
 
-/// Documents to index, sorted by path (stable doc ids between builds).
-/// Paths are owned by `arena`.
 pub const ListError = std.process.RunError || std.mem.Allocator.Error;
 
+/// Documents to index, sorted by path (stable doc ids between builds).
+/// Paths are owned by `arena`.
 pub fn list(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, root: []const u8, with_documents: bool) ListError![]content.DocIn {
     var argv: std.ArrayList([]const u8) = .empty;
     // --no-ignore-parent: ignore files above the root are not about it (and

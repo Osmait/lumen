@@ -21,7 +21,8 @@ const fine = @import("fine.zig");
 const sys = @import("sys.zig");
 const fold = @import("core").fold;
 
-const chunk = 8192;
+/// Candidates one pool task scores.
+const chunk_entries = 8192;
 /// Floor of candidates kept per chunk, in multiples of `limit`: keeping
 /// `limit` per chunk guarantees the global top-`limit` by cheap score is
 /// never lost (an item in the global top-`limit` is beaten by at most
@@ -62,9 +63,9 @@ const Pair = struct {
     }
 };
 
-/// Stateful: remembers the previous query's candidates to refine them.
-/// One query's refinement cache. Not thread-safe: the owner serializes
-/// searches (Service holds its lock).
+/// Remembers the previous query's candidates to refine them on the next
+/// keystroke. Not thread-safe: the owner serializes searches (Service holds
+/// its lock).
 pub const Engine = struct {
     pub const empty: Engine = .{};
 
@@ -112,7 +113,7 @@ pub const Engine = struct {
         // Fewer chunks when refining: split the finalist budget among them,
         // or the incremental case runs short of finalists (recall fell to
         // 52% with a fixed K in the Rust version).
-        const n_chunks = @max(std.math.divCeil(usize, source_len, chunk) catch 1, 1);
+        const n_chunks = @max(std.math.divCeil(usize, source_len, chunk_entries) catch 1, 1);
         const per_chunk = @max(limit * per_chunk_mul, std.math.divCeil(usize, keep, n_chunks) catch keep);
 
         const partials = try gpa.alloc(Partial, n_chunks);
@@ -237,8 +238,8 @@ const SiftCtx = struct {
 };
 
 fn siftChunk(ctx: *SiftCtx, ci: usize) void {
-    const lo = ci * chunk;
-    const hi = @min(lo + chunk, ctx.source_len);
+    const lo = ci * chunk_entries;
+    const hi = @min(lo + chunk_entries, ctx.source_len);
     // Out of memory: the chunk's candidates are incomplete, so they must not
     // be refined on the next keystroke as if they were all of them.
     sift(ctx, ci, lo, hi) catch {
@@ -429,7 +430,7 @@ fn adjust(store: *const Store, id: u32, cheap: i32) i32 {
     return s - @as(i32, store.depths()[id]) * 3;
 }
 
-/// Coarse on purpose: today vs this month vs old.
+/// Finalists per pool task for the fine scorer and the recency stats.
 const fine_block = 256;
 const recency_block = 64;
 
@@ -460,6 +461,7 @@ const RecencyCtx = struct {
     }
 };
 
+/// Coarse on purpose: today vs this month vs old.
 fn recencyBonus(store: *const Store, id: u32, now: i64, buf: *[4096]u8) i32 {
     const p = store.path(id, buf[0 .. buf.len - 1]);
     if (p.len == 0) return 0;
@@ -478,7 +480,7 @@ fn recencyBonus(store: *const Store, id: u32, now: i64, buf: *[4096]u8) i32 {
 
 /// Reference: scores every entry with the fine scorer, no cascade, no cuts.
 /// Defines the correct answer the cascade's recall is measured against.
-pub fn searchExhaustive(gpa: std.mem.Allocator, store: *const Store, query_in: []const u8, limit: usize, out: *std.ArrayList(Hit)) !void {
+pub fn searchExhaustive(gpa: std.mem.Allocator, store: *const Store, query_in: []const u8, limit: usize, out: *std.ArrayList(Hit)) std.mem.Allocator.Error!void {
     out.clearRetainingCapacity();
     var packed_buf: [max_query]u8 = undefined;
     const query = packQuery(query_in, &packed_buf);

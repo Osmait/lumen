@@ -67,10 +67,9 @@ pub fn count(w: *const Watcher) usize {
 
 /// Watches `path`, attributing its events to index entry `id`. The kernel
 /// keys watches by inode: watching the same directory again returns the same
-/// descriptor and only the id it maps to changes.
-/// Watches `path` as entry `id`. Failing is not fatal for the caller (the
-/// directory just goes unwatched until the next rescan), but hitting the
-/// kernel's limit is counted in `unwatched` and logged once.
+/// descriptor and only the id it maps to changes. Failing is not fatal for
+/// the caller (the directory goes unwatched until the next rescan); hitting
+/// the kernel's limit is counted in `unwatched` and logged once.
 pub fn watch(w: *Watcher, gpa: std.mem.Allocator, path: [*:0]const u8, id: u32) error{ WatchLimit, Watch, OutOfMemory }!void {
     const rc = linux.inotify_add_watch(w.fd, path, mask);
     switch (linux.errno(rc)) {
@@ -87,7 +86,9 @@ pub fn watch(w: *Watcher, gpa: std.mem.Allocator, path: [*:0]const u8, id: u32) 
 }
 
 /// Reads everything pending without waiting. Names live in `arena`.
-pub fn drain(w: *Watcher, arena: std.mem.Allocator, out: *std.ArrayList(Change)) !void {
+pub const DrainError = error{Read} || std.mem.Allocator.Error;
+
+pub fn drain(w: *Watcher, arena: std.mem.Allocator, out: *std.ArrayList(Change)) DrainError!void {
     while (true) {
         const rc = linux.read(w.fd, &w.buf, w.buf.len);
         switch (linux.errno(rc)) {

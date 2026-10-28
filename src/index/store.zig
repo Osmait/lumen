@@ -249,9 +249,8 @@ pub const Store = struct {
         return n;
     }
 
-    /// Writes the buffer as is (to a temp file, then rename: a crash midway
-    /// never leaves a corrupt index in place).
-    /// Writes the index to `path_z` atomically (see `sys.writeFileAtomic`).
+    /// Writes the buffer as is to `path_z`, atomically (a temporary file,
+    /// then rename: a crash midway never leaves a corrupt index in place).
     pub fn save(s: *const Store, path_z: [:0]const u8) sys.Error!void {
         try sys.writeFileAtomic(path_z, s.buf);
     }

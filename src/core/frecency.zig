@@ -8,8 +8,9 @@ const half_life_s: f64 = 7 * 24 * 3600;
 /// `count` uses, the last one at `last_used` (unix seconds), seen at `now`.
 pub fn value(count: u32, last_used: i64, now: i64) f64 {
     if (count == 0) return 0;
-    const age: f64 = @floatFromInt(@max(now - last_used, 0));
-    const decay = std.math.pow(f64, 0.5, age / half_life_s);
+    // Saturating: `last_used` comes from the database file.
+    const age_s: f64 = @floatFromInt(@max(now -| last_used, 0));
+    const decay = std.math.pow(f64, 0.5, age_s / half_life_s);
     return @as(f64, @floatFromInt(count)) * decay;
 }
 

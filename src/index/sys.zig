@@ -303,7 +303,7 @@ pub fn mapPrivate(path: [*:0]const u8) Error![]align(8) u8 {
 }
 
 /// Absolute-enough path of a testing tmp dir (tests run from the build root).
-pub fn tmpDirPath(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
+pub fn tmpDirPath(tmp: *std.testing.TmpDir, buf: []u8) std.mem.PrintError![]const u8 {
     return std.mem.print(buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 }
 

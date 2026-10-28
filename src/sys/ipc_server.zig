@@ -82,7 +82,7 @@ fn serve(conn: linux.fd_t) void {
     _ = linux.setsockopt(conn, linux.SOL.SOCKET, linux.SO.RCVTIMEO, @ptrCast(&timeout), @sizeOf(linux.timeval));
     // Large enough for a copy; mmap'd (Lumen's malloc threshold), so only
     // what is read is touched, and it goes back to the system after.
-    const buf = gpa.alloc(u8, ipc.max_request) catch return;
+    const buf = gpa.alloc(u8, ipc.max_request_bytes) catch return;
     defer gpa.free(buf);
     var got: usize = 0;
     while (got < buf.len) {

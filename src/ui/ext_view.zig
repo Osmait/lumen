@@ -274,9 +274,6 @@ pub fn enter(ui: *Ui) void {
     if (cmd.mode == .list) ask(ui, "");
 }
 
-/// On each refresh: search commands ask for the query typed, unless it is
-/// already answered or on its way. True when the rows are local (filtered
-/// by Lumen).
 /// A search command's next keystroke: while its answer is on its way, the
 /// rows on screen are the last answer's and stay as they are (rebuilding
 /// them cost a frame per keystroke; `onList` rebuilds when it comes). True
@@ -291,6 +288,9 @@ pub fn waitingForSearch(ui: *Ui, q: []const u8) bool {
     return true;
 }
 
+/// On each refresh: search commands ask for the query typed, unless it is
+/// already answered or on its way. True when the rows are local (filtered
+/// by Lumen).
 pub fn prepare(ui: *Ui, q: []const u8) bool {
     const cmd = command(ui) orelse return true;
     if (cmd.mode != .search) return true;

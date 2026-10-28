@@ -28,7 +28,7 @@ const Host = @This();
 const log = std.log.scoped(.ext);
 
 /// Per Lua state.
-const memory_limit = 64 << 20;
+const memory_limit_bytes = 64 << 20;
 const load_budget_ns = 5 * std.time.ns_per_s;
 const list_budget_ns = 10 * std.time.ns_per_s;
 const act_budget_ns = 30 * std.time.ns_per_s;
@@ -216,7 +216,7 @@ pub const Callbacks = struct {
 
 /// One loaded file and its Lua state. Worker thread only.
 pub const Ext = struct {
-    budget: lua.Budget = .{ .max = memory_limit },
+    budget: lua.Budget = .{ .max = memory_limit_bytes },
     L: *lua.State = undefined,
     host: *Host,
     id: [:0]const u8,
@@ -393,6 +393,13 @@ pub fn list(h: *Host, registry: u32, command: u16, query: []const u8) u32 {
 
 /// Calls form `command`'s submit with `values` (copied). Its answer comes
 /// like an action's.
+fn dropSubmit(h: *Host, req: *SubmitReq) u32 {
+    log.warn("submit: out of memory, not sent", .{});
+    req.arena.deinit();
+    h.gpa.destroy(req);
+    return h.next_gen;
+}
+
 pub fn submit(h: *Host, registry: u32, command: u16, values: []const FormValue) u32 {
     h.next_gen +%= 1;
     const req = h.gpa.create(SubmitReq) catch return h.next_gen;
@@ -403,9 +410,11 @@ pub fn submit(h: *Host, registry: u32, command: u16, values: []const FormValue) 
         h.gpa.destroy(req);
         return h.next_gen;
     };
+    // All of them or no submit: half-copied values would reach the
+    // extension as if the user had left fields empty.
     for (copy, values) |*d, v| d.* = .{
-        .name = a.dupe(u8, v.name) catch "",
-        .value = a.dupe(u8, v.value) catch "",
+        .name = a.dupe(u8, v.name) catch return h.dropSubmit(req),
+        .value = a.dupe(u8, v.value) catch return h.dropSubmit(req),
         .toggle = v.toggle,
     };
     req.values = copy;
@@ -526,15 +535,24 @@ fn doReload(h: *Host) void {
     const style = blk: {
         h.lock.lockUncancelable(h.io);
         defer h.lock.unlock(h.io);
-        break :blk wa.dupe(u8, h.style[0..h.style_len]) catch "";
+        break :blk wa.dupe(u8, h.style[0..h.style_len]) catch {
+            problem(&load, "style", "out of memory");
+            break :blk "";
+        };
     };
     if (style.len > 0) h.loadStyle(&load, style);
     if (wa.printSentinel("{s}/init.lua", .{h.config_dir}, 0)) |path| {
         if (index.sys.info(path) != null) h.loadFile(&load, "config", h.config_dir, path);
-    } else |_| {}
+    } else |_| problem(&load, "config", "out of memory");
     for (h.extensionDirs(wa)) |id| {
-        const dir = wa.printSentinel("{s}/extensions/{s}", .{ h.config_dir, id }, 0) catch continue;
-        const path = wa.printSentinel("{s}/init.lua", .{dir}, 0) catch continue;
+        const dir = wa.printSentinel("{s}/extensions/{s}", .{ h.config_dir, id }, 0) catch {
+            problem(&load, id, "out of memory");
+            continue;
+        };
+        const path = wa.printSentinel("{s}/init.lua", .{dir}, 0) catch {
+            problem(&load, id, "out of memory");
+            continue;
+        };
         if (!validId(id)) {
             problem(&load, id, "extension folder names may use only a-z, 0-9, - and _");
             continue;
@@ -546,7 +564,10 @@ fn doReload(h: *Host) void {
         h.loadFile(&load, id, dir, path);
     }
 
-    h.wcmds = h.gpa.dupe(WorkerCommand, load.wcmds.items) catch &.{};
+    h.wcmds = h.gpa.dupe(WorkerCommand, load.wcmds.items) catch blk: {
+        log.warn("reload: out of memory, extension commands left out", .{});
+        break :blk &.{};
+    };
     if (h.wcmds.len != load.commands.items.len) load.commands.clearRetainingCapacity();
     reg.commands = load.commands.items;
     reg.themes = load.themes.items;
@@ -618,13 +639,12 @@ fn loadFile(h: *Host, load: *Load, id: []const u8, dir: []const u8, path: [:0]co
 /// Runs a file (`path`), or `source` (then `path` names it in errors).
 fn loadSource(h: *Host, load: *Load, id: []const u8, dir: []const u8, path: [:0]const u8, source: ?[:0]const u8) void {
     const wa = h.warena.allocator();
+    // Empty paths would put its storage at "/storage.json".
+    const id_z = wa.dupeSentinel(u8, id, 0) catch return problem(load, id, "out of memory");
+    const dir_z = wa.dupeSentinel(u8, dir, 0) catch return problem(load, id, "out of memory");
+    const data = wa.printSentinel("{s}/extensions/{s}", .{ h.data_dir, id }, 0) catch return problem(load, id, "out of memory");
     const e = h.gpa.create(Ext) catch return problem(load, id, "out of memory");
-    e.* = .{
-        .host = h,
-        .id = wa.dupeSentinel(u8, id, 0) catch "",
-        .dir = wa.dupeSentinel(u8, dir, 0) catch "",
-        .data = wa.printSentinel("{s}/extensions/{s}", .{ h.data_dir, id }, 0) catch "",
-    };
+    e.* = .{ .host = h, .id = id_z, .dir = dir_z, .data = data };
     index.sys.mkdirP(e.data);
     e.L = lua.newState(&e.budget) orelse {
         h.gpa.destroy(e);
@@ -862,7 +882,7 @@ fn keywords(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8) []
     defer lua.c.lua_settop(L, -2);
     switch (lua.getField(L, t, "keywords")) {
         lua.c.LUA_TNIL => return "",
-        lua.c.LUA_TSTRING => return a.dupe(u8, lua.toSlice(L, -1).?) catch "",
+        lua.c.LUA_TSTRING => return a.dupe(u8, lua.toSlice(L, -1).?) catch lua.raise(L, "not enough memory", .{}),
         lua.c.LUA_TTABLE => {
             var out: std.ArrayList(u8) = .empty;
             const n = lua.c.lua_rawlen(L, -1);
@@ -870,8 +890,8 @@ fn keywords(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8) []
                 _ = lua.c.lua_rawgeti(L, -1, @intCast(i));
                 defer lua.c.lua_settop(L, -2);
                 const s = lua.toSlice(L, -1) orelse lua.raise(L, "{s}.keywords[{d}]: string expected", .{ where, i });
-                if (out.items.len > 0) out.append(a, ' ') catch {};
-                out.appendSlice(a, s) catch {};
+                if (out.items.len > 0) out.append(a, ' ') catch lua.raise(L, "not enough memory", .{});
+                out.appendSlice(a, s) catch lua.raise(L, "not enough memory", .{});
             }
             return out.items;
         },
@@ -909,7 +929,7 @@ pub fn parseIcon(L: *lua.State, a: std.mem.Allocator, idx: c_int, where: []const
 // ----------------------------------------------------------------- list
 
 fn doList(h: *Host, req: ListReq, query: []const u8) void {
-    const res = h.gpa.create(ListResult) catch return;
+    const res = h.gpa.create(ListResult) catch return log.warn("list: out of memory, no answer", .{});
     res.* = .{ .gen = req.gen, .command = req.command, .query = "", .arena = .init(h.gpa) };
     const a = res.arena.allocator();
     res.query = a.dupe(u8, query) catch "";
@@ -987,12 +1007,12 @@ fn parseItem(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8, o
     // A plain string is a row with that title.
     if (lua.toSlice(L, t)) |s| {
         const title = a.dupeSentinel(u8, s, 0) catch lua.raise(L, "not enough memory", .{});
-        return .{ .key = key(a, ext_id, title), .title = title, .action = .{ .ext_item = defaultActions(a, L, origin, pos, title) } };
+        return .{ .key = key(L, a, ext_id, title), .title = title, .action = .{ .ext_item = defaultActions(a, L, origin, pos, title) } };
     }
     if (lua.c.lua_type(L, t) != lua.c.LUA_TTABLE) lua.raise(L, "{s}: table or string expected, got {s}", .{ where, lua.typeName(L, t) });
     const title = lua.fieldString(L, a, t, "title", where) orelse lua.raise(L, "{s}.title is missing", .{where});
     var it: Item = .{
-        .key = key(a, ext_id, lua.fieldString(L, a, t, "id", where) orelse title),
+        .key = key(L, a, ext_id, lua.fieldString(L, a, t, "id", where) orelse title),
         .title = title,
         .subtitle = lua.fieldString(L, a, t, "subtitle", where) orelse "",
         .accessory = lua.fieldString(L, a, t, "accessory", where) orelse "",
@@ -1082,8 +1102,9 @@ fn pairPart(L: *lua.State, a: std.mem.Allocator, pair: c_int, i: c_int, where: [
     };
 }
 
-fn key(a: std.mem.Allocator, ext_id: []const u8, id: []const u8) []const u8 {
-    return a.print("x:{s}:{s}", .{ ext_id, id }) catch "";
+/// Raises when out of memory: an empty key would merge rows' rankings.
+fn key(L: *lua.State, a: std.mem.Allocator, ext_id: []const u8, id: []const u8) []const u8 {
+    return a.print("x:{s}:{s}", .{ ext_id, id }) catch lua.raise(L, "not enough memory", .{});
 }
 
 fn keysFor(j: usize) [:0]const u8 {
@@ -1144,7 +1165,7 @@ fn parseAction(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8)
 // ----------------------------------------------------------------- root
 
 fn doRoot(h: *Host, req: RootReq, query: []const u8) void {
-    const res = h.gpa.create(RootResult) catch return;
+    const res = h.gpa.create(RootResult) catch return log.warn("root: out of memory, no answer", .{});
     res.* = .{ .gen = req.gen, .query = "", .arena = .init(h.gpa) };
     const a = res.arena.allocator();
     res.query = a.dupe(u8, query) catch "";
@@ -1207,7 +1228,7 @@ fn doSubmit(h: *Host, req: *SubmitReq) void {
         req.arena.deinit();
         h.gpa.destroy(req);
     }
-    const res = h.gpa.create(ActResult) catch return;
+    const res = h.gpa.create(ActResult) catch return log.warn("action: out of memory, no answer", .{});
     res.* = .{ .gen = req.gen, .arena = .init(h.gpa) };
     defer h.deliver(.{ .act = res });
     if (req.registry != h.registry_gen or req.command >= h.wcmds.len) {
@@ -1255,7 +1276,7 @@ fn outcomeOf(L: *lua.State) Outcome {
 // ------------------------------------------------------------------ act
 
 fn doAct(h: *Host, req: ActReq) void {
-    const res = h.gpa.create(ActResult) catch return;
+    const res = h.gpa.create(ActResult) catch return log.warn("action: out of memory, no answer", .{});
     res.* = .{ .gen = req.gen, .arena = .init(h.gpa) };
     defer h.deliver(.{ .act = res });
     if (req.registry != h.registry_gen or req.command >= h.wcmds.len) {
@@ -1312,6 +1333,7 @@ const Hop = struct {
 
 fn deliver(h: *Host, what: @FieldType(Hop, "what")) void {
     const hop = h.gpa.create(Hop) catch {
+        log.warn("out of memory: an answer for the window is dropped", .{});
         switch (what) {
             inline else => |r| r.destroy(h.gpa),
         }

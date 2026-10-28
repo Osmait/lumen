@@ -111,7 +111,6 @@ pub fn forget(db: *Db, key: []const u8) Error!void {
     try db.run(stmt);
 }
 
-/// All usage, as key -> frecency value. Keys and the map live in `arena`.
 /// Forgets what decayed below any effect on the ranking: every file opened
 /// adds a key, and the table is read on every show.
 pub fn pruneFrecency(db: *Db, now: i64) Error!void {
@@ -134,6 +133,7 @@ pub fn pruneFrecency(db: *Db, now: i64) Error!void {
     }
 }
 
+/// All usage, as key -> frecency value. Keys and the map live in `arena`.
 pub fn loadFrecency(db: *Db, arena: std.mem.Allocator, now: i64) (Error || std.mem.Allocator.Error)!std.StringHashMapUnmanaged(f64) {
     var map: std.StringHashMapUnmanaged(f64) = .empty;
     const stmt = try db.prepare("SELECT key, count, last_used FROM frecency");

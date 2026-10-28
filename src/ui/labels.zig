@@ -17,7 +17,7 @@ pub fn homeRelative(a: std.mem.Allocator, dir: []const u8) [:0]const u8 {
     return displayText(a, shown);
 }
 
-/// Text fit for a widgets.label. Linux file names are bytes: they can hold invalid
+/// Text fit for a GtkLabel. Linux file names are bytes: they can hold invalid
 /// UTF-8 (Pango then warns and draws garbage, and `--dump` failed outright)
 /// or a newline (a two-line row). Invalid sequences become U+FFFD and
 /// control characters a space. Only for display: actions keep the raw path.

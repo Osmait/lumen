@@ -33,11 +33,12 @@ pub fn kindOf(path: []const u8) ?Kind {
     return std.meta.stringToEnum(Kind, std.ascii.lowerString(&buf, ext));
 }
 
-/// Extracted UTF-8 text of the document at `path` (absolute), owned by `gpa`, at most `max_bytes` long (truncate, never fail for size).
-/// Returns error on unreadable/corrupt files; callers skip those.
-/// error.ToolMissing: pdftotext/unzip is not installed.
 pub const ExtractError = Error || std.mem.Allocator.Error || std.process.SpawnError || std.process.Child.WaitError;
 
+/// Extracted UTF-8 text of the document at `path` (absolute), owned by
+/// `gpa`, at most `max_bytes` long (truncated, never failing for size).
+/// An error for unreadable or corrupt files, which callers skip;
+/// error.ToolMissing when pdftotext or unzip is not installed.
 pub fn extractText(gpa: std.mem.Allocator, io: std.Io, path: [:0]const u8, kind: Kind, max_bytes: usize) ExtractError![]u8 {
     const fd = try sys.openRegular(path);
     defer sys.close(fd);

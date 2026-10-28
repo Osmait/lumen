@@ -32,7 +32,7 @@ pub const Result = struct {
     query: []const u8,
     hits: []index.ContentService.Hit,
     /// Why the search stopped short (then `hits` may be empty or partial).
-    err: ?anyerror = null,
+    err: ?std.mem.Allocator.Error = null,
     arena: std.heap.ArenaAllocator,
 
     pub fn destroy(r: *Result, gpa: std.mem.Allocator) void {

@@ -28,7 +28,7 @@ pub fn buildDetail(ui: *Ui) void {
     ui.detail_text = widgets.label("", "detail-text");
     c.gtk_label_set_wrap(@ptrCast(ui.detail_text), 1);
     c.gtk_label_set_wrap_mode(@ptrCast(ui.detail_text), c.PANGO_WRAP_WORD_CHAR);
-    // A wrapping widgets.label asks for its unwrapped width unless told otherwise;
+    // A wrapping GtkLabel asks for its unwrapped width unless told otherwise;
     // this lets the list keep its share of the row.
     c.gtk_label_set_max_width_chars(@ptrCast(ui.detail_text), 1);
     c.gtk_widget_set_hexpand(ui.detail_text, 1);

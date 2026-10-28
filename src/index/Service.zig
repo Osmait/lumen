@@ -56,10 +56,10 @@ name_changes: std.atomic.Value(u64) = .init(0),
 rescans: std.atomic.Value(u32) = .init(0),
 last_rescan_ns: std.atomic.Value(u64) = .init(0),
 
-/// Starts on `root`, mapping `cache_path` if it exists. Thread-safe once
-/// started: searches and `status` may come from any thread.
 pub const StartError = std.mem.Allocator.Error || std.Thread.SpawnError || Watcher.CreateError;
 
+/// Starts on `root`, mapping `cache_path` if it exists. Thread-safe once
+/// started: searches and `status` may come from any thread.
 pub fn start(gpa: std.mem.Allocator, io: Io, root: []const u8, cache_path: []const u8) StartError!*Service {
     const s = try gpa.create(Service);
     errdefer gpa.destroy(s);
@@ -525,7 +525,7 @@ test "service: shutdown saves what was learned and the next start maps it" {
 }
 
 /// Waits until `nameChanges` differs from `from` (or, `from` null, is known).
-pub fn waitNames(s: *Service, from: ?u64) !u64 {
+pub fn waitNames(s: *Service, from: ?u64) error{NoNameChange}!u64 {
     for (0..600) |_| {
         if (s.nameChanges()) |n| if (from == null or n != from.?) return n;
         sys.sleepUs(5_000);

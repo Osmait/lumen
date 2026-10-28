@@ -110,16 +110,28 @@ fn onRead(_: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) 
     } else {
         s.bytes += chunk.len;
         var rest = chunk;
+        // Out of memory, a line would be cut and could be picked and printed
+        // as it is not: reading stops at the last whole line instead.
+        var oom = false;
         while (std.mem.findScalar(u8, rest, '\n')) |nl| {
             if (s.partial.items.len > 0) {
-                s.partial.appendSlice(s.gpa, rest[0..nl]) catch {};
+                s.partial.appendSlice(s.gpa, rest[0..nl]) catch {
+                    oom = true;
+                    break;
+                };
                 addLine(s, s.partial.items);
                 s.partial.clearRetainingCapacity();
             } else addLine(s, rest[0..nl]);
             rest = rest[nl + 1 ..];
         }
-        s.partial.appendSlice(s.gpa, rest) catch {};
-        if (s.lines.items.len >= max_lines or s.bytes >= max_bytes) {
+        if (!oom) s.partial.appendSlice(s.gpa, rest) catch {
+            oom = true;
+        };
+        if (oom) {
+            log.warn("out of memory: stopped reading after {d} lines", .{s.lines.items.len});
+            s.partial.clearRetainingCapacity();
+            s.done_reading = true;
+        } else if (s.lines.items.len >= max_lines or s.bytes >= max_bytes) {
             log.warn("stopped reading after {d} lines", .{s.lines.items.len});
             s.done_reading = true;
         } else readMore(s);

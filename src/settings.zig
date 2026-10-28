@@ -218,10 +218,10 @@ pub const Settings = struct {
         };
     }
 
-    /// `key` is a kind name or ".ext"; an empty `app` removes the entry
-    /// (back to the system default).
     pub const OpenWithError = error{ BadKey, BadApp } || std.mem.Allocator.Error;
 
+    /// `key` is a kind name or ".ext"; an empty `app` removes the entry
+    /// (back to the system default).
     pub fn setOpenWith(s: *Settings, key: []const u8, app: []const u8) OpenWithError!void {
         const valid_key = std.meta.stringToEnum(Kind, key) != null or
             (key.len >= 2 and key.len <= 16 and key[0] == '.' and isToken(key[1..]));

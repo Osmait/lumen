@@ -988,7 +988,6 @@ pub fn setView(self: *Ui, view: View) void {
     c.gtk_widget_set_visible(self.detail, @intFromBool(has_detail));
     // A preview needs room: the results take the full height then.
     c.gtk_widget_set_vexpand(self.results, @intFromBool(has_detail));
-    // With the detail pane, the list takes ~40%.
     // Beside the detail pane the list takes ~40%; above it, ~half the height.
     const detail_below = self.layout.detail == .bottom;
     c.gtk_widget_set_size_request(self.scroller, if (has_detail and !detail_below) @divTrunc(self.panelW() * 2, 5) else -1, -1);
@@ -1001,7 +1000,7 @@ pub fn setView(self: *Ui, view: View) void {
     };
     for (self.meta_keys, keys) |w, k| c.gtk_label_set_text(@ptrCast(w), k);
     // Code previews do not wrap, they clip long lines like an editor: a
-    // wrapping widgets.label makes GTK lay its text out at several widths per frame
+    // wrapping GtkLabel makes GTK lay its text out at several widths per frame
     // (~30 ms measured with `lumen --stats`). Clipboard text is prose: wrap.
     const wrap = view == .clipboard or view == .ext;
     c.gtk_label_set_wrap(@ptrCast(self.detail_text), @intFromBool(wrap));

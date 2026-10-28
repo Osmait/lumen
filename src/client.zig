@@ -16,7 +16,7 @@ const ipc = @import("ipc.zig");
 const plain = [_][]const u8{ "--toggle", "--show", "--hide", "--quit", "--reload", "--stats", "--dump" };
 const valued = [_][]const u8{ "--key", "--text", "--view", "--query", "--command" };
 
-var request: [ipc.max_request]u8 = undefined;
+var request: [ipc.max_request_bytes]u8 = undefined;
 var answer: [8 << 20]u8 = undefined;
 
 pub fn main(init: std.process.Init.Minimal) void {

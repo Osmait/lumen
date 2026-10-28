@@ -444,8 +444,7 @@ fn dieWithParent(_: ?*anyopaque) callconv(.c) void {
     _ = c.prctl(c.PR_SET_PDEATHSIG, @as(c_ulong, c.SIGTERM));
 }
 
-/// Reads one clipboard copy from stdin and stores it.
-/// A copy handed over the socket by `lumen --clip-store`.
+/// Stores a copy handed over the socket by `lumen --clip-store`.
 fn storeClip(content: []const u8) void {
     if (!ui_ready or !ui.settings.clipboard) return;
     if (!std.unicode.utf8ValidateSlice(content)) return;

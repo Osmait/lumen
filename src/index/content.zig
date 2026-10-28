@@ -136,7 +136,7 @@ pub const Index = struct {
     /// garbage. Everything later accesses index with is checked here, in
     /// linear passes over the doc table and the segment keys (no posting list
     /// is decoded; the decoders are bounds-safe instead): header offsets in
-    /// bounds and aligned, every path inside the paths blob, every source a
+    /// bounds and aligned, every path inside the file, every source a
     /// known kind, every segment's arrays in bounds, keys strictly ascending
     /// (binary search), offsets non-decreasing and within the postings.
     pub fn parse(whole: []align(8) u8, mapped: bool) error{BadIndex}!Index {
@@ -248,7 +248,7 @@ pub const Index = struct {
     /// folded characters; shorter ones cannot narrow anything and are checked
     /// on verify).
     /// Appends doc ids, ascending, to `out`.
-    pub fn candidates(ix: *const Index, gpa: std.mem.Allocator, words: []const []const u8, out: *std.ArrayList(u32)) !void {
+    pub fn candidates(ix: *const Index, gpa: std.mem.Allocator, words: []const []const u8, out: *std.ArrayList(u32)) std.mem.Allocator.Error!void {
         out.clearRetainingCapacity();
         var keys: std.ArrayList(u32) = .empty;
         defer keys.deinit(gpa);
@@ -1943,7 +1943,7 @@ test "corrupt content indexes are rejected, not trusted" {
         .{ .at = dir_off + 24, .v = good.len }, // postings past the end
         .{ .at = dir_off + 32, .v = good.len }, // postings longer than the file
         .{ .at = dir_off + 32, .v = 0 }, // offsets beyond the postings
-        // A path past the paths blob, an unknown document kind.
+        // A path past the end of the file, an unknown document kind.
         .{ .at = docs_off + n * 16, .v = 0xffff_fff0, .wide = false },
         .{ .at = docs_off + n * 22, .v = 9, .wide = false },
         // Keys out of order (binary search would miss), offsets going back.
