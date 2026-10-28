@@ -51,7 +51,7 @@ pub fn list(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, root: 
     var zbuf: [4096]u8 = undefined;
     while (it.next()) |line| {
         const rel = if (std.mem.startsWith(u8, line, "./")) line[2..] else line;
-        const z = std.fmt.bufPrintSentinel(&zbuf, "{s}{s}{s}", .{ root, sep, rel }, 0) catch continue;
+        const z = std.mem.printSentinel(&zbuf, "{s}{s}{s}", .{ root, sep, rel }, 0) catch continue;
         const p: []const u8 = z;
         const doc_kind = documentKind(p);
         if (doc_kind and !with_documents) continue;
@@ -112,7 +112,7 @@ pub const TestTree = struct {
         const rel = try sys.tmpDirPath(&tmp, &rel_buf);
         const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
         defer testing.allocator.free(cwd);
-        return .{ .tmp = tmp, .abs = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ cwd, rel }) };
+        return .{ .tmp = tmp, .abs = try testing.allocator.print("{s}/{s}", .{ cwd, rel }) };
     }
 
     pub fn deinit(t: *TestTree) void {
@@ -122,7 +122,7 @@ pub const TestTree = struct {
 
     /// Absolute path of `name` (static buffer per call site is the caller's).
     pub fn path(t: *const TestTree, buf: []u8, name: []const u8) ![:0]u8 {
-        return std.fmt.bufPrintSentinel(buf, "{s}/{s}", .{ t.abs, name }, 0);
+        return std.mem.printSentinel(buf, "{s}/{s}", .{ t.abs, name }, 0);
     }
 
     /// Writes `name` (creating parent dirs) with `data`.
@@ -220,7 +220,7 @@ test "list: what is indexed and what is excluded" {
     const got = try listRel(arena, &t, true);
 
     var want: std.ArrayList([]const u8) = .empty;
-    for (keep ++ docs) |k| try want.append(arena, try std.fmt.allocPrint(arena, "{s}/{s}", .{ t.abs, k }));
+    for (keep ++ docs) |k| try want.append(arena, try arena.print("{s}/{s}", .{ t.abs, k }));
     std.mem.sort([]const u8, want.items, {}, struct {
         fn lt(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.order(u8, a, b) == .lt;
@@ -236,7 +236,7 @@ test "list: what is indexed and what is excluded" {
     for (got) |d| {
         try testing.expectEqual(documentKind(d.path), d.source == .extracted);
         try testing.expect(d.mtime > now - 3600 and d.mtime <= now + 1);
-        const info = sys.info(try std.fmt.bufPrintSentinel(&buf, "{s}", .{d.path}, 0)).?;
+        const info = sys.info(try std.mem.printSentinel(&buf, "{s}", .{d.path}, 0)).?;
         try testing.expectEqual(info.size, d.size);
         try testing.expectEqual(info.mtime, d.mtime);
     }
@@ -259,7 +259,7 @@ test "list: a root below an excluded name still lists" {
     try t.write("build/target/node_modules/me/note.txt", "x");
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
-    const sub = try std.fmt.allocPrint(arena_state.allocator(), "{s}/build/target/node_modules/me/", .{t.abs});
+    const sub = try arena_state.allocator().print("{s}/build/target/node_modules/me/", .{t.abs});
     const got = list(arena_state.allocator(), testing.allocator, testing.io, sub, true) catch |err| switch (err) {
         error.FileNotFound => return error.SkipZigTest,
         else => return err,

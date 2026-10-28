@@ -112,19 +112,19 @@ pub fn build(b: *std.Build) void {
     const perf_mod = b.createModule(.{
         .root_source_file = b.path("src/index/perf.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = .fast,
         .link_libc = true,
     });
     const perf_index = b.createModule(.{
         .root_source_file = b.path("src/index/root.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = .fast,
         .link_libc = true,
     });
     perf_index.addImport("core", b.createModule(.{
         .root_source_file = b.path("src/core/root.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = .fast,
     }));
     perf_mod.addImport("index", perf_index);
     const perf_run = b.addRunArtifact(b.addExecutable(.{ .name = "lumen-perf", .root_module = perf_mod }));

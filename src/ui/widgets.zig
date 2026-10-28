@@ -234,7 +234,7 @@ pub fn iconWidget(icon: item_mod.Icon, size: c_int) *c.GtkWidget {
             c.gtk_image_set_pixel_size(@ptrCast(img), @divTrunc(size, 2) + 2);
             c.gtk_widget_add_css_class(img, "tile");
             var cls: [24:0]u8 = undefined;
-            const name = std.fmt.bufPrintSentinel(&cls, "tile-{t}", .{t.color}, 0) catch "tile-gray";
+            const name = std.mem.printSentinel(&cls, "tile-{t}", .{t.color}, 0) catch "tile-gray";
             c.gtk_widget_add_css_class(img, name.ptr);
             c.gtk_widget_set_valign(img, c.GTK_ALIGN_CENTER);
             return img;
@@ -258,7 +258,7 @@ pub fn iconWidget(icon: item_mod.Icon, size: c_int) *c.GtkWidget {
             const l = label(b.text, "badge");
             c.gtk_label_set_xalign(@ptrCast(l), 0.5);
             var cls: [24:0]u8 = undefined;
-            const name = std.fmt.bufPrintSentinel(&cls, "badge-{t}", .{b.color}, 0) catch "badge-gray";
+            const name = std.mem.printSentinel(&cls, "badge-{t}", .{b.color}, 0) catch "badge-gray";
             c.gtk_widget_add_css_class(l, name.ptr);
             // Longer extensions get a smaller font so the tile keeps its size.
             if (b.text.len >= 4) c.gtk_widget_add_css_class(l, "badge-long");

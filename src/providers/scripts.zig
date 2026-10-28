@@ -9,7 +9,7 @@ const Item = @import("../item.zig").Item;
 /// ~/.config/lumen/scripts, in `a`; null only when out of memory.
 pub fn dir(a: std.mem.Allocator) ?[:0]const u8 {
     const config = std.mem.span(c.g_get_user_config_dir());
-    return std.fmt.allocPrintSentinel(a, "{s}/lumen/scripts", .{config}, 0) catch null;
+    return a.printSentinel("{s}/lumen/scripts", .{config}, 0) catch null;
 }
 
 /// The last scan's scripts, and what the folder looked like then: the root
@@ -55,7 +55,7 @@ fn stamp(a: std.mem.Allocator) u64 {
     while (c.g_dir_read_name(d)) |name_c| {
         const name = std.mem.span(name_c);
         hasher.update(name);
-        const full = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ path, name }, 0) catch continue;
+        const full = std.mem.printSentinel(&buf, "{s}/{s}", .{ path, name }, 0) catch continue;
         if (index.sys.info(full)) |i| hasher.update(std.mem.asBytes(&.{ i.mtime, i.size }));
     }
     return hasher.final();
@@ -71,7 +71,7 @@ fn scan(a: std.mem.Allocator) []Item {
     while (c.g_dir_read_name(d)) |name_c| {
         const name = std.mem.span(name_c);
         if (name.len == 0 or name[0] == '.') continue;
-        const full = std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ path, name }, 0) catch continue;
+        const full = a.printSentinel("{s}/{s}", .{ path, name }, 0) catch continue;
 
         // The header is all that is read of it.
         var head_buf: [4096]u8 = undefined;
@@ -80,7 +80,7 @@ fn scan(a: std.mem.Allocator) []Item {
 
         const emoji = meta.icon.len > 0 and meta.icon.len <= 8 and meta.icon[0] >= 0x80;
         items.append(a, .{
-            .key = std.fmt.allocPrint(a, "script:{s}", .{name}) catch continue,
+            .key = a.print("script:{s}", .{name}) catch continue,
             .title = a.dupeSentinel(u8, meta.title, 0) catch continue,
             .subtitle = a.dupeSentinel(u8, if (meta.package_name.len > 0) meta.package_name else "Script Command", 0) catch continue,
             .accessory = "Script",

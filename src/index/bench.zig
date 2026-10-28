@@ -163,7 +163,7 @@ fn contentBench(gpa: std.mem.Allocator, io: std.Io, pool: *index.Pool, root: []c
 /// documents included, every query timed with a breakdown.
 fn contentLive(gpa: std.mem.Allocator, io: std.Io, pool: *index.Pool, xdg_cache: ?[]const u8, home: []const u8) !void {
     var buf: [4096]u8 = undefined;
-    const cache = if (xdg_cache) |x| try std.fmt.bufPrint(&buf, "{s}/lumen", .{x}) else try std.fmt.bufPrint(&buf, "{s}/.cache/lumen", .{home});
+    const cache = if (xdg_cache) |x| try std.mem.print(&buf, "{s}/lumen", .{x}) else try std.mem.print(&buf, "{s}/.cache/lumen", .{home});
     const build_pool = try index.Pool.create(gpa, io, index.Pool.halfCores());
     defer build_pool.destroy();
     const cs = try index.ContentService.start(gpa, io, home, cache, .{ .search = pool, .build = build_pool });

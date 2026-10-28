@@ -457,7 +457,7 @@ pub const TextReader = struct { read: TextFn, ctx: *anyopaque };
 pub fn readPlain(gpa: std.mem.Allocator, path: []const u8, buf: *std.ArrayList(u8)) std.mem.Allocator.Error!bool {
     buf.clearRetainingCapacity();
     var zbuf: [4096]u8 = undefined;
-    const z = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{path}, 0) catch return false;
+    const z = std.mem.printSentinel(&zbuf, "{s}", .{path}, 0) catch return false;
     // Not a plain open: the path may have become a FIFO since it was indexed.
     const fd = sys.openRegular(z) catch return false;
     defer sys.close(fd);
@@ -1194,7 +1194,7 @@ test "candidates equal a brute-force scan, across segments, after save/open" {
             try t.append(gpa, if (r.boolean()) ' ' else '\n');
         }
         try texts.append(gpa, try t.toOwnedSlice(gpa));
-        try docs.append(gpa, .{ .path = try std.fmt.allocPrint(gpa, "{d}", .{i}), .mtime = 0, .size = 0 });
+        try docs.append(gpa, .{ .path = try gpa.print("{d}", .{i}), .mtime = 0, .size = 0 });
     }
     const pool = try Pool.create(gpa, testing.io, 3);
     defer pool.destroy();
@@ -1207,7 +1207,7 @@ test "candidates equal a brute-force scan, across segments, after save/open" {
     var dbuf: [4096]u8 = undefined;
     const dir = try sys.tmpDirPath(&tmp, &dbuf);
     var pbuf: [4096]u8 = undefined;
-    const p = try std.fmt.bufPrintSentinel(&pbuf, "{s}/content.idx", .{dir}, 0);
+    const p = try std.mem.printSentinel(&pbuf, "{s}/content.idx", .{dir}, 0);
     try ix.save(p);
     var mapped = try Index.open(p);
     defer mapped.deinit(gpa);
@@ -1253,7 +1253,7 @@ test "update: edited and deleted documents leave, new ones join, old ids keep th
     var dbuf: [4096]u8 = undefined;
     const dir = try sys.tmpDirPath(&tmp, &dbuf);
     var pbuf: [4096]u8 = undefined;
-    const p = try std.fmt.bufPrintSentinel(&pbuf, "{s}/content.idx", .{dir}, 0);
+    const p = try std.mem.printSentinel(&pbuf, "{s}/content.idx", .{dir}, 0);
     try up.save(p);
     var mapped = try Index.open(p);
     defer mapped.deinit(gpa);
@@ -1276,7 +1276,7 @@ test "update: edited and deleted documents leave, new ones join, old ids keep th
 
     // Written to a file as they grow: the same bytes. The update overwrites
     // the file its old index is mapped from, as the service does.
-    const fp = try std.fmt.bufPrintSentinel(&pbuf, "{s}/streamed.idx", .{dir}, 0);
+    const fp = try std.mem.printSentinel(&pbuf, "{s}/streamed.idx", .{dir}, 0);
     var built = try buildFile(gpa, pool, &docs, .{ .read = TestDocs.text, .ctx = &before }, fp, null);
     defer built.deinit(gpa);
     try testing.expect(built.mapped);
@@ -1306,7 +1306,7 @@ test "appended updates: same results as rewritten ones, old mappings stay good, 
     var dbuf: [4096]u8 = undefined;
     const dir = try sys.tmpDirPath(&tmp, &dbuf);
     var pbuf: [4096]u8 = undefined;
-    const p = try std.fmt.bufPrintSentinel(&pbuf, "{s}/content.idx", .{dir}, 0);
+    const p = try std.mem.printSentinel(&pbuf, "{s}/content.idx", .{dir}, 0);
 
     // Texts by id: 0-2 at first, then one edit or new file per round.
     const texts = [_][]const u8{ "alpha zanzibar", "bravo kilimanjaro", "charlie zanzibar", "delta okavango", "echo zanzibar", "foxtrot serengeti", "golf okavango", "hotel kalahari", "india zanzibar" };
@@ -1327,7 +1327,7 @@ test "appended updates: same results as rewritten ones, old mappings stay good, 
     var round: usize = 3;
     while (round < texts.len) : (round += 1) {
         var nbuf: [8]u8 = undefined;
-        const added = [_]DocIn{.{ .path = try std.fmt.bufPrint(&nbuf, "{d}", .{round}), .mtime = 2, .size = 1 }};
+        const added = [_]DocIn{.{ .path = try std.mem.print(&nbuf, "{d}", .{round}), .mtime = 2, .size = 1 }};
         const gone = [_]u32{@intCast(round - 3)};
         const next = (try appendFile(gpa, pool, &cur, &gone, &added, reader, p, null)).?;
         const next_mem = try update(gpa, pool, &mem, &gone, &added, reader, null);
@@ -1411,7 +1411,7 @@ pub const SearchOptions = struct {
 /// For plain documents only (benchmarks, tests).
 pub fn plainPath(_: *anyopaque, doc: DocIn, buf: []u8) ?[:0]const u8 {
     if (doc.source != .plain) return null;
-    return std.fmt.bufPrintSentinel(buf, "{s}", .{doc.path}, 0) catch null;
+    return std.mem.printSentinel(buf, "{s}", .{doc.path}, 0) catch null;
 }
 
 /// A candidate in verification order: by `bound`, the most its score can
@@ -1743,12 +1743,12 @@ test "search: the top matches equal reading every document and ranking them all"
         const sub = if (i % 3 == 0) "/deep/er" else "";
         if (sub.len > 0) {
             var mb: [4096]u8 = undefined;
-            _ = linux.mkdir(try std.fmt.bufPrintSentinel(&mb, "{s}/deep", .{dir}, 0), 0o700);
-            _ = linux.mkdir(try std.fmt.bufPrintSentinel(&mb, "{s}/deep/er", .{dir}, 0), 0o700);
+            _ = linux.mkdir(try std.mem.printSentinel(&mb, "{s}/deep", .{dir}, 0), 0o700);
+            _ = linux.mkdir(try std.mem.printSentinel(&mb, "{s}/deep/er", .{dir}, 0), 0o700);
         }
-        const path = try std.fmt.allocPrint(a, "{s}{s}/{s}{d}.txt", .{ dir, sub, if (i % 7 == 0) "main" else "doc", i });
+        const path = try a.print("{s}{s}/{s}{d}.txt", .{ dir, sub, if (i % 7 == 0) "main" else "doc", i });
         var zb: [4096]u8 = undefined;
-        try sys.writeFile(try std.fmt.bufPrintSentinel(&zb, "{s}", .{path}, 0), t.items);
+        try sys.writeFile(try std.mem.printSentinel(&zb, "{s}", .{path}, 0), t.items);
         const ages = [_]i64{ 0, 3, 20, 100, 300, 900 };
         d.* = .{ .path = path, .mtime = now - ages[i % ages.len] * 86_400, .size = t.items.len };
     }
@@ -1802,9 +1802,9 @@ test "search: unaccented and capital queries find accented text" {
     var paths: [texts.len][]u8 = undefined;
     var docs: [texts.len]DocIn = undefined;
     for (texts, 0..) |t, i| {
-        paths[i] = try std.fmt.allocPrint(gpa, "{s}/doc{d}.txt", .{ dir, i });
+        paths[i] = try gpa.print("{s}/doc{d}.txt", .{ dir, i });
         var zb: [4096]u8 = undefined;
-        try sys.writeFile(try std.fmt.bufPrintSentinel(&zb, "{s}", .{paths[i]}, 0), t);
+        try sys.writeFile(try std.mem.printSentinel(&zb, "{s}", .{paths[i]}, 0), t);
         docs[i] = .{ .path = paths[i], .mtime = 0, .size = t.len };
     }
     defer for (paths) |p| gpa.free(p);
@@ -1859,7 +1859,7 @@ fn smallIndex(gpa: std.mem.Allocator) !Index {
             try t.appendSlice(gpa, vocab[r.uintLessThan(usize, vocab.len)]);
             try t.append(gpa, ' ');
         }
-        const p = try std.fmt.allocPrint(gpa, "{d}", .{i});
+        const p = try gpa.print("{d}", .{i});
         texts[i] = t.toOwnedSlice(gpa) catch |e| {
             gpa.free(p);
             return e;

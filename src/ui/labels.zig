@@ -11,7 +11,7 @@ const widgets = @import("widgets.zig");
 pub fn homeRelative(a: std.mem.Allocator, dir: []const u8) [:0]const u8 {
     const home = std.mem.span(c.g_get_home_dir());
     const shown = (if (std.mem.startsWith(u8, dir, home))
-        std.fmt.allocPrint(a, "~{s}", .{dir[home.len..]})
+        a.print("~{s}", .{dir[home.len..]})
     else
         a.dupe(u8, dir)) catch return "";
     return displayText(a, shown);
@@ -56,7 +56,7 @@ pub fn contextMarkup(a: std.mem.Allocator, text: []const u8, line: u32, words: [
         if (n < first) continue;
         if (n > line + after) break;
         const l = validUtf8Prefix(raw[0..@min(raw.len, 240)]);
-        const num = std.fmt.allocPrint(a, "<span alpha=\"45%\">{d: >4}  </span>", .{n}) catch return "";
+        const num = a.print("<span alpha=\"45%\">{d: >4}  </span>", .{n}) catch return "";
         out.appendSlice(a, num) catch return "";
         if (n == line) out.appendSlice(a, "<b>") catch return "";
         // Escape piece by piece, wrapping each hit.
@@ -105,7 +105,7 @@ pub fn kindLabel(a: std.mem.Allocator, path: []const u8, is_dir: bool, ctype: ?[
         // octet-stream is GLib's "no idea" (e.g. no shared-mime-info data).
         const media = std.mem.startsWith(u8, t, "video/") or std.mem.startsWith(u8, t, "audio/") or std.mem.eql(u8, t, "application/octet-stream");
         const unknown = desc == null or std.ascii.eqlIgnoreCase(std.mem.span(desc.?), "unknown");
-        if (media or unknown) return std.fmt.allocPrintSentinel(a, "{s} file", .{b.text}, 0) catch "File";
+        if (media or unknown) return a.printSentinel("{s} file", .{b.text}, 0) catch "File";
     }
     return if (desc) |d| a.dupeSentinel(u8, std.mem.span(d), 0) catch "File" else "File";
 }
@@ -126,9 +126,9 @@ pub fn formatSize(a: std.mem.Allocator, bytes: u64) [:0]const u8 {
     var u: usize = 0;
     while (v >= 1024 and u + 1 < units.len) : (u += 1) v /= 1024;
     return (if (u == 0)
-        std.fmt.allocPrintSentinel(a, "{d} bytes", .{bytes}, 0)
+        a.printSentinel("{d} bytes", .{bytes}, 0)
     else
-        std.fmt.allocPrintSentinel(a, "{d:.1} {s}", .{ v, units[u] }, 0)) catch "";
+        a.printSentinel("{d:.1} {s}", .{ v, units[u] }, 0)) catch "";
 }
 
 pub fn now() i64 {

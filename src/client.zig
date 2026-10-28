@@ -117,8 +117,8 @@ fn runFull(argv: []const [*:0]const u8, envp: [*:null]const ?[*:0]const u8) nore
     var path_buf: [4096]u8 = undefined;
     const n = linux.readlink("/proc/self/exe", &self_buf, self_buf.len);
     if (failed(n) == null and n < self_buf.len) {
-        const dir = std.fs.path.dirname(self_buf[0..n]) orelse "/";
-        if (std.fmt.bufPrintSentinel(&path_buf, "{s}/lumen-gtk", .{dir}, 0)) |p| {
+        const dir = std.Io.Dir.path.dirname(self_buf[0..n]) orelse "/";
+        if (std.mem.printSentinel(&path_buf, "{s}/lumen-gtk", .{dir}, 0)) |p| {
             _ = linux.execve(p.ptr, argv_z, envp);
         } else |_| {}
     }
@@ -128,7 +128,7 @@ fn runFull(argv: []const [*:0]const u8, envp: [*:null]const ?[*:0]const u8) nore
         if (!std.mem.startsWith(u8, e, "PATH=")) continue;
         var dirs = std.mem.tokenizeScalar(u8, e[5..], ':');
         while (dirs.next()) |d| {
-            const p = std.fmt.bufPrintSentinel(&path_buf, "{s}/lumen-gtk", .{d}, 0) catch continue;
+            const p = std.mem.printSentinel(&path_buf, "{s}/lumen-gtk", .{d}, 0) catch continue;
             _ = linux.execve(p.ptr, argv_z, envp);
         }
     }

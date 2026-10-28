@@ -75,7 +75,7 @@ pub fn showContentDetail(ui: *Ui, it: *const Item) void {
     const text = service.readText(a, f.path, if (info) |i| i.mtime else 0, f.extracted, f.line + labels.context_after) orelse it.detail;
     const words = index.content.splitWords(a, ui.query()) catch return;
     // The theme's accent behind matches, its text colour on top.
-    const hl_open = std.fmt.allocPrint(a, "<span background=\"{s}\" bgalpha=\"40%\" foreground=\"{s}\">", .{ std.mem.sliceTo(&ui.hl_bg, 0), std.mem.sliceTo(&ui.hl_fg, 0) }) catch return;
+    const hl_open = a.print("<span background=\"{s}\" bgalpha=\"40%\" foreground=\"{s}\">", .{ std.mem.sliceTo(&ui.hl_bg, 0), std.mem.sliceTo(&ui.hl_fg, 0) }) catch return;
     c.gtk_label_set_markup(@ptrCast(ui.detail_text), labels.contextMarkup(a, text, f.line, words, hl_open).ptr);
 
     const ctype = c.g_content_type_guess(f.path, null, 0, null);
@@ -240,7 +240,7 @@ pub fn showDetail(ui: *Ui, it: ?*const Item) void {
     var words: usize = 0;
     var tok = std.mem.tokenizeAny(u8, i.detail, " \t\r\n");
     while (tok.next()) |_| words += 1;
-    c.gtk_label_set_text(@ptrCast(ui.meta_values[1]), (std.fmt.allocPrintSentinel(a, "{d}", .{chars}, 0) catch return).ptr);
-    c.gtk_label_set_text(@ptrCast(ui.meta_values[2]), (std.fmt.allocPrintSentinel(a, "{d}", .{words}, 0) catch return).ptr);
+    c.gtk_label_set_text(@ptrCast(ui.meta_values[1]), (a.printSentinel("{d}", .{chars}, 0) catch return).ptr);
+    c.gtk_label_set_text(@ptrCast(ui.meta_values[2]), (a.printSentinel("{d}", .{words}, 0) catch return).ptr);
     c.gtk_label_set_text(@ptrCast(ui.meta_values[3]), labels.formatWhen(a, i.time_s).ptr);
 }

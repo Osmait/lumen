@@ -70,8 +70,8 @@ pub fn candidates(ui: *Ui, a: std.mem.Allocator) []Item {
     var out: std.ArrayList(Item) = .empty;
     for (cmd.fields, 0..) |*f, i| {
         out.append(a, .{
-            .key = std.fmt.allocPrint(a, "field:{s}", .{f.name}) catch continue,
-            .title = if (f.required) std.fmt.allocPrintSentinel(a, "{s} *", .{f.title}, 0) catch f.title else f.title,
+            .key = a.print("field:{s}", .{f.name}) catch continue,
+            .title = if (f.required) a.printSentinel("{s} *", .{f.title}, 0) catch f.title else f.title,
             .subtitle = f.description,
             .accessory = prefs_view.display(a, f, value(ui, i)),
             .icon = prefs_view.iconOf(f.kind),
@@ -115,7 +115,7 @@ pub fn choiceCandidates(ui: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item)
     const f = field(ui, i) orelse return;
     for (f.choices) |ch| {
         out.append(a, .{
-            .key = std.fmt.allocPrint(a, "pick:{s}", .{ch.value}) catch continue,
+            .key = a.print("pick:{s}", .{ch.value}) catch continue,
             .title = ch.label,
             .accessory = if (std.mem.eql(u8, ch.value, value(ui, i))) "✓" else "",
             .icon = .{ .tile = .{ .name = "object-select-symbolic", .color = .gray } },
@@ -138,7 +138,7 @@ pub fn submit(ui: *Ui) void {
     for (cmd.fields, 0..) |*f, i| {
         const v = value(ui, i);
         if (f.required and v.len == 0) {
-            const msg = std.fmt.allocPrintSentinel(ui.query_arena.allocator(), "Fill in {s} first", .{f.title}, 0) catch "Fill in the required fields";
+            const msg = ui.query_arena.allocator().printSentinel("Fill in {s} first", .{f.title}, 0) catch "Fill in the required fields";
             return ui.showFailure(msg);
         }
         buf[i] = .{ .name = f.name, .value = v, .toggle = f.kind == .toggle };

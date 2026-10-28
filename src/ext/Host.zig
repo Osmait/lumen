@@ -529,12 +529,12 @@ fn doReload(h: *Host) void {
         break :blk wa.dupe(u8, h.style[0..h.style_len]) catch "";
     };
     if (style.len > 0) h.loadStyle(&load, style);
-    if (std.fmt.allocPrintSentinel(wa, "{s}/init.lua", .{h.config_dir}, 0)) |path| {
+    if (wa.printSentinel("{s}/init.lua", .{h.config_dir}, 0)) |path| {
         if (index.sys.info(path) != null) h.loadFile(&load, "config", h.config_dir, path);
     } else |_| {}
     for (h.extensionDirs(wa)) |id| {
-        const dir = std.fmt.allocPrintSentinel(wa, "{s}/extensions/{s}", .{ h.config_dir, id }, 0) catch continue;
-        const path = std.fmt.allocPrintSentinel(wa, "{s}/init.lua", .{dir}, 0) catch continue;
+        const dir = wa.printSentinel("{s}/extensions/{s}", .{ h.config_dir, id }, 0) catch continue;
+        const path = wa.printSentinel("{s}/init.lua", .{dir}, 0) catch continue;
         if (!validId(id)) {
             problem(&load, id, "extension folder names may use only a-z, 0-9, - and _");
             continue;
@@ -565,14 +565,14 @@ fn doReload(h: *Host) void {
 
 /// Names of the folders under extensions/, sorted, in `a`.
 fn extensionDirs(h: *Host, a: std.mem.Allocator) []const [:0]const u8 {
-    const path = std.fmt.allocPrintSentinel(a, "{s}/extensions", .{h.config_dir}, 0) catch return &.{};
+    const path = a.printSentinel("{s}/extensions", .{h.config_dir}, 0) catch return &.{};
     const d = c.g_dir_open(path.ptr, 0, null) orelse return &.{};
     defer c.g_dir_close(d);
     var names: std.ArrayList([:0]const u8) = .empty;
     while (c.g_dir_read_name(d)) |n| {
         const name = std.mem.span(n);
         if (name.len == 0 or name[0] == '.') continue;
-        const full = std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ path, name }, 0) catch continue;
+        const full = a.printSentinel("{s}/{s}", .{ path, name }, 0) catch continue;
         const info = index.sys.info(full) orelse continue;
         if (!info.is_dir) continue;
         names.append(a, a.dupeSentinel(u8, name, 0) catch continue) catch continue;
@@ -602,8 +602,8 @@ fn problem(load: *Load, ext: []const u8, message: []const u8) void {
 /// file runs as the extension "style".
 fn loadStyle(h: *Host, load: *Load, name: []const u8) void {
     const wa = h.warena.allocator();
-    const dir = std.fmt.allocPrintSentinel(wa, "{s}/styles/{s}", .{ h.config_dir, name }, 0) catch return;
-    const path = std.fmt.allocPrintSentinel(wa, "{s}/init.lua", .{dir}, 0) catch return;
+    const dir = wa.printSentinel("{s}/styles/{s}", .{ h.config_dir, name }, 0) catch return;
+    const path = wa.printSentinel("{s}/init.lua", .{dir}, 0) catch return;
     if (index.sys.info(path) != null) return h.loadSource(load, "style", dir, path, null);
     // A style folder may hold only a style.css.
     if (index.sys.info(dir) != null) return;
@@ -623,7 +623,7 @@ fn loadSource(h: *Host, load: *Load, id: []const u8, dir: []const u8, path: [:0]
         .host = h,
         .id = wa.dupeSentinel(u8, id, 0) catch "",
         .dir = wa.dupeSentinel(u8, dir, 0) catch "",
-        .data = std.fmt.allocPrintSentinel(wa, "{s}/extensions/{s}", .{ h.data_dir, id }, 0) catch "",
+        .data = wa.printSentinel("{s}/extensions/{s}", .{ h.data_dir, id }, 0) catch "",
     };
     index.sys.mkdirP(e.data);
     e.L = lua.newState(&e.budget) orelse {
@@ -704,7 +704,7 @@ fn parseExtension(L: *lua.State, ctx: *LoadCtx, t: c_int) void {
         const n = lua.c.lua_rawlen(L, prefs);
         for (1..n + 1) |i| {
             var where_buf: [32]u8 = undefined;
-            const where = std.fmt.bufPrint(&where_buf, "preferences[{d}]", .{i}) catch "preferences";
+            const where = std.mem.print(&where_buf, "preferences[{d}]", .{i}) catch "preferences";
             if (lua.c.lua_rawgeti(L, prefs, @intCast(i)) != lua.c.LUA_TTABLE)
                 lua.raise(L, "{s}: table expected, got {s}", .{ where, lua.typeName(L, -1) });
             const pref = parseField(L, ctx, lua.absIndex(L, -1), where, title);
@@ -721,7 +721,7 @@ fn parseExtension(L: *lua.State, ctx: *LoadCtx, t: c_int) void {
     const n = lua.c.lua_rawlen(L, cmds);
     for (1..n + 1) |i| {
         var where_buf: [32]u8 = undefined;
-        const where = std.fmt.bufPrint(&where_buf, "commands[{d}]", .{i}) catch "commands";
+        const where = std.mem.print(&where_buf, "commands[{d}]", .{i}) catch "commands";
         if (lua.c.lua_rawgeti(L, cmds, @intCast(i)) != lua.c.LUA_TTABLE)
             lua.raise(L, "{s}: table expected, got {s}", .{ where, lua.typeName(L, -1) });
         parseCommand(L, ctx, lua.absIndex(L, -1), where, title, default_icon);
@@ -741,7 +741,7 @@ fn parseField(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_tit
     var pref: Pref = .{
         .ext = ctx.e.id,
         .ext_title = ext_title,
-        .file = std.fmt.allocPrintSentinel(a, "{s}/preferences.json", .{ctx.e.data}, 0) catch lua.raise(L, "not enough memory", .{}),
+        .file = a.printSentinel("{s}/preferences.json", .{ctx.e.data}, 0) catch lua.raise(L, "not enough memory", .{}),
         .name = name,
         .title = lua.fieldString(L, a, t, "title", where) orelse name,
         .description = lua.fieldString(L, a, t, "description", where) orelse "",
@@ -782,7 +782,7 @@ fn parseCommand(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_t
     const name = lua.fieldString(L, a, t, "name", where) orelse lua.raise(L, "{s}.name is missing", .{where});
     if (!validId(name)) lua.raise(L, "{s}.name: use only a-z, 0-9, - and _ (got \"{s}\")", .{ where, name });
     const title = lua.fieldString(L, a, t, "title", where) orelse lua.raise(L, "{s}.title is missing", .{where});
-    const id = std.fmt.allocPrintSentinel(a, "{s}.{s}", .{ ctx.e.id, name }, 0) catch lua.raise(L, "not enough memory", .{});
+    const id = a.printSentinel("{s}.{s}", .{ ctx.e.id, name }, 0) catch lua.raise(L, "not enough memory", .{});
     for (ctx.load.commands.items) |cmd| if (std.mem.eql(u8, cmd.id, id)) lua.raise(L, "two commands named \"{s}\"", .{name});
 
     const has_root = blk: {
@@ -817,7 +817,7 @@ fn parseCommand(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_t
         const out = a.alloc(Pref, n) catch lua.raise(L, "not enough memory", .{});
         for (out, 1..) |*f, i| {
             var wbuf: [48]u8 = undefined;
-            const fwhere = std.fmt.bufPrint(&wbuf, "{s}.fields[{d}]", .{ where, i }) catch where;
+            const fwhere = std.mem.print(&wbuf, "{s}.fields[{d}]", .{ where, i }) catch where;
             if (lua.c.lua_rawgeti(L, list_idx, @intCast(i)) != lua.c.LUA_TTABLE) lua.raise(L, "{s}: table expected", .{fwhere});
             f.* = parseField(L, ctx, lua.absIndex(L, -1), fwhere, ext_title);
             lua.c.lua_settop(L, -2);
@@ -889,7 +889,7 @@ pub fn parseIcon(L: *lua.State, a: std.mem.Allocator, idx: c_int, where: []const
             const s = lua.toSlice(L, t).?;
             // "~/icons/x.svg": a file in the home folder.
             const copy = (if (std.mem.startsWith(u8, s, "~/"))
-                std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ std.mem.span(c.g_get_home_dir()), s[2..] }, 0)
+                a.printSentinel("{s}/{s}", .{ std.mem.span(c.g_get_home_dir()), s[2..] }, 0)
             else
                 a.dupeSentinel(u8, s, 0)) catch lua.raise(L, "not enough memory", .{});
             if (s.len > 0 and s.len <= 32 and s[0] >= 0x80) return .{ .emoji = copy };
@@ -975,7 +975,7 @@ fn parseItems(L: *lua.State, a: std.mem.Allocator, list_idx: c_int, origin: Orig
     const items = a.alloc(Item, n) catch lua.raise(L, "not enough memory", .{});
     for (items, 1..) |*it, i| {
         var where_buf: [24]u8 = undefined;
-        const where = std.fmt.bufPrint(&where_buf, "items[{d}]", .{i}) catch "items";
+        const where = std.mem.print(&where_buf, "items[{d}]", .{i}) catch "items";
         _ = lua.c.lua_rawgeti(L, list_idx, @intCast(i));
         defer lua.c.lua_settop(L, -2);
         it.* = parseItem(L, a, lua.absIndex(L, -1), where, origin, @intCast(i - 1), ext_id);
@@ -1027,7 +1027,7 @@ fn parseItem(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8, o
     const entries = a.alloc(item_mod.Entry, n) catch lua.raise(L, "not enough memory", .{});
     for (actions, entries, 0..) |*act_out, *entry, j| {
         var wbuf: [48]u8 = undefined;
-        const awhere = std.fmt.bufPrint(&wbuf, "{s}.actions[{d}]", .{ where, j + 1 }) catch where;
+        const awhere = std.mem.print(&wbuf, "{s}.actions[{d}]", .{ where, j + 1 }) catch where;
         _ = lua.c.lua_rawgeti(L, acts_idx, @intCast(j + 1));
         defer lua.c.lua_settop(L, -2);
         const at = lua.absIndex(L, -1);
@@ -1055,7 +1055,7 @@ fn metadata(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8) []
     const out = a.alloc(item_mod.Meta, n) catch lua.raise(L, "not enough memory", .{});
     for (out, 1..) |*m, i| {
         var wbuf: [48]u8 = undefined;
-        const mwhere = std.fmt.bufPrint(&wbuf, "{s}.metadata[{d}]", .{ where, i }) catch where;
+        const mwhere = std.mem.print(&wbuf, "{s}.metadata[{d}]", .{ where, i }) catch where;
         if (lua.c.lua_rawgeti(L, pairs, @intCast(i)) != lua.c.LUA_TTABLE) lua.raise(L, "{s}: table expected", .{mwhere});
         defer lua.c.lua_settop(L, -2);
         const pair = lua.absIndex(L, -1);
@@ -1083,7 +1083,7 @@ fn pairPart(L: *lua.State, a: std.mem.Allocator, pair: c_int, i: c_int, where: [
 }
 
 fn key(a: std.mem.Allocator, ext_id: []const u8, id: []const u8) []const u8 {
-    return std.fmt.allocPrint(a, "x:{s}:{s}", .{ ext_id, id }) catch "";
+    return a.print("x:{s}:{s}", .{ ext_id, id }) catch "";
 }
 
 fn keysFor(j: usize) [:0]const u8 {
@@ -1342,10 +1342,10 @@ fn onIdle(data: ?*anyopaque) callconv(.c) c.gboolean {
 pub fn stamp(config_dir: []const u8, style: []const u8) u64 {
     var hasher: std.hash.Wyhash = .init(0);
     var buf: [4096]u8 = undefined;
-    if (std.fmt.bufPrintSentinel(&buf, "{s}/init.lua", .{config_dir}, 0)) |p| hashFile(&hasher, p) else |_| {}
+    if (std.mem.printSentinel(&buf, "{s}/init.lua", .{config_dir}, 0)) |p| hashFile(&hasher, p) else |_| {}
     hashFolders(&hasher, config_dir, "extensions");
     hasher.update(style);
-    if (style.len > 0) if (std.fmt.bufPrintSentinel(&buf, "{s}/styles/{s}", .{ config_dir, style }, 0)) |dir| hashLua(&hasher, dir) else |_| {};
+    if (style.len > 0) if (std.mem.printSentinel(&buf, "{s}/styles/{s}", .{ config_dir, style }, 0)) |dir| hashLua(&hasher, dir) else |_| {};
     return hasher.final();
 }
 
@@ -1358,7 +1358,7 @@ fn hashLua(hasher: *std.hash.Wyhash, dir: [:0]const u8) void {
         const f = std.mem.span(fname);
         if (!std.mem.endsWith(u8, f, ".lua")) continue;
         var fbuf: [4096]u8 = undefined;
-        const p = std.fmt.bufPrintSentinel(&fbuf, "{s}/{s}", .{ dir, f }, 0) catch continue;
+        const p = std.mem.printSentinel(&fbuf, "{s}/{s}", .{ dir, f }, 0) catch continue;
         hashFile(hasher, p);
     }
 }
@@ -1366,12 +1366,12 @@ fn hashLua(hasher: *std.hash.Wyhash, dir: [:0]const u8) void {
 /// The .lua files in each folder of <config>/<kind>.
 fn hashFolders(hasher: *std.hash.Wyhash, config_dir: []const u8, kind: []const u8) void {
     var buf: [4096]u8 = undefined;
-    const top = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ config_dir, kind }, 0) catch return;
+    const top = std.mem.printSentinel(&buf, "{s}/{s}", .{ config_dir, kind }, 0) catch return;
     const d = c.g_dir_open(top.ptr, 0, null) orelse return;
     defer c.g_dir_close(d);
     while (c.g_dir_read_name(d)) |n| {
         var sub_buf: [4096]u8 = undefined;
-        const sub = std.fmt.bufPrintSentinel(&sub_buf, "{s}/{s}", .{ top, std.mem.span(n) }, 0) catch continue;
+        const sub = std.mem.printSentinel(&sub_buf, "{s}/{s}", .{ top, std.mem.span(n) }, 0) catch continue;
         hashLua(hasher, sub);
     }
 }
@@ -1443,14 +1443,14 @@ const Probe = struct {
 
 fn writeTestFile(dir: []const u8, name: []const u8, data: []const u8) !void {
     var buf: [4096]u8 = undefined;
-    const p = try std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ dir, name }, 0);
+    const p = try std.mem.printSentinel(&buf, "{s}/{s}", .{ dir, name }, 0);
     if (std.mem.findScalarLast(u8, p, '/')) |s| index.sys.mkdirP(p[0..s]);
     try index.sys.writeFile(p, data);
 }
 
 fn testHost(probe: *Probe, dir: []const u8) !*Host {
     var buf: [4096]u8 = undefined;
-    const data = try std.fmt.bufPrint(&buf, "{s}/data", .{dir});
+    const data = try std.mem.print(&buf, "{s}/data", .{dir});
     return start(testing.allocator, testing.io, dir, data, .{ .ctx = probe, .registry = &Probe.onRegistry, .list = &Probe.onList, .act = &Probe.onAct, .root = &Probe.onRoot });
 }
 

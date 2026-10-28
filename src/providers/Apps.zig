@@ -71,7 +71,7 @@ pub fn reload(self: *Apps) void {
         if (c.g_desktop_app_info_get_generic_name(dai)) |g| generic = std.mem.span(g);
 
         items.append(a, .{
-            .key = std.fmt.allocPrint(a, "app:{s}", .{id}) catch {
+            .key = a.print("app:{s}", .{id}) catch {
                 dropped += 1;
                 continue;
             },

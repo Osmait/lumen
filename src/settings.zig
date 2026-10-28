@@ -66,7 +66,7 @@ pub const Settings = struct {
     /// in ~/.config/lumen/styles; empty is Lumen's own look.
     style: []const u8 = "",
     /// A kind's name ("pdf") or an extension (".log") → desktop file id.
-    open_with: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
+    open_with: std.array_hash_map.String([]const u8) = .empty,
     /// `key = value` lines this version does not know, kept as they were.
     unknown: std.ArrayList([]const u8) = .empty,
     /// Memory ran out while reading the file, or it was longer than what was
@@ -210,8 +210,8 @@ pub const Settings = struct {
             .width => @tagName(s.width),
             .height => @tagName(s.height),
             .density => @tagName(s.density),
-            .opacity => std.fmt.bufPrint(buf, "{d}", .{s.opacity}) catch "",
-            .clipboard_keep => std.fmt.bufPrint(buf, "{d}", .{s.clipboard_keep}) catch "",
+            .opacity => std.mem.print(buf, "{d}", .{s.opacity}) catch "",
+            .clipboard_keep => std.mem.print(buf, "{d}", .{s.clipboard_keep}) catch "",
             .terminal => s.terminal,
             .editor => s.editor,
             .icon_theme => s.icon_theme,
@@ -517,7 +517,7 @@ test "save is atomic and owner-only; load survives a missing file" {
     var rel: [4096]u8 = undefined;
     var buf: [4096]u8 = undefined;
     const dir = try sys.tmpDirPath(&tmp, &rel);
-    const path = try std.fmt.bufPrintSentinel(&buf, "{s}/sub/settings.conf", .{dir}, 0);
+    const path = try std.mem.printSentinel(&buf, "{s}/sub/settings.conf", .{dir}, 0);
 
     var missing = Settings.load(testing.allocator, path);
     defer missing.deinit();

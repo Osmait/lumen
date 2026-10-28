@@ -277,7 +277,7 @@ fn descends(l: *const Live, parent: []const u8, name: []const u8) bool {
     for (l.cfg.cachedir_probe) |probe| {
         if (!std.mem.eql(u8, probe, name)) continue;
         var buf: [4096]u8 = undefined;
-        const tag = std.fmt.bufPrintSentinel(&buf, "{s}/{s}/CACHEDIR.TAG", .{ parent, name }, 0) catch return true;
+        const tag = std.mem.printSentinel(&buf, "{s}/{s}/CACHEDIR.TAG", .{ parent, name }, 0) catch return true;
         if (sys.exists(tag)) return false;
     }
     return true;
@@ -363,7 +363,7 @@ fn add(l: *Live, parent: u32, name: []const u8, is_dir: bool) !bool {
         // inotify race: files may have appeared before the watch existed, so
         // a new directory is scanned whole.
         var fbuf: [4096]u8 = undefined;
-        const full = std.fmt.bufPrint(&fbuf, "{s}{s}{s}", .{ parent_path, if (std.mem.endsWith(u8, parent_path, "/")) "" else "/", name }) catch return false;
+        const full = std.mem.print(&fbuf, "{s}{s}{s}", .{ parent_path, if (std.mem.endsWith(u8, parent_path, "/")) "" else "/", name }) catch return false;
         var sub_cfg = l.cfg.*;
         sub_cfg.roots = &.{full};
         var sub = try scan.scan(l.gpa, l.scan_pool, &sub_cfg, null, null);
@@ -595,8 +595,8 @@ const Tree = struct {
         var cwd_buf: [4096]u8 = undefined;
         const cwd = std.mem.sliceTo(cwd_buf[0..linux.getcwd(&cwd_buf, cwd_buf.len)], 0);
         var rel_buf: [4096]u8 = undefined;
-        t.dir = try std.fmt.bufPrint(&t.dir_buf, "{s}/{s}", .{ cwd, try sys.tmpDirPath(&t.tmp, &rel_buf) });
-        t.root = try std.fmt.bufPrint(&t.root_buf, "{s}/root", .{t.dir});
+        t.dir = try std.mem.print(&t.dir_buf, "{s}/{s}", .{ cwd, try sys.tmpDirPath(&t.tmp, &rel_buf) });
+        t.root = try std.mem.print(&t.root_buf, "{s}/root", .{t.dir});
         t.roots = .{t.root};
         t.cfg = .{ .roots = &t.roots };
         t.mkAbs("root/");
@@ -618,7 +618,7 @@ const Tree = struct {
 
     /// Absolute path of `rel`, relative to the temp dir.
     fn abs(t: *Tree, rel: []const u8, buf: *[4096]u8) [:0]const u8 {
-        return std.fmt.bufPrintSentinel(buf, "{s}/{s}", .{ t.dir, std.mem.trimEnd(u8, rel, "/") }, 0) catch unreachable;
+        return std.mem.printSentinel(buf, "{s}/{s}", .{ t.dir, std.mem.trimEnd(u8, rel, "/") }, 0) catch unreachable;
     }
 
     fn mkAbs(t: *Tree, rel: []const u8) void {
@@ -634,14 +634,14 @@ const Tree = struct {
     /// Creates `rel` (relative to the root), parents included.
     fn mk(t: *Tree, rel: []const u8) void {
         var buf: [4096]u8 = undefined;
-        t.mkAbs(std.fmt.bufPrint(&buf, "root/{s}", .{rel}) catch unreachable);
+        t.mkAbs(std.mem.print(&buf, "root/{s}", .{rel}) catch unreachable);
     }
 
     /// Deletes `rel` (relative to the root): a file, or an empty directory.
     fn rm(t: *Tree, rel: []const u8) void {
         var rb: [4096]u8 = undefined;
         var buf: [4096]u8 = undefined;
-        const p = t.abs(std.fmt.bufPrint(&rb, "root/{s}", .{rel}) catch unreachable, &buf);
+        const p = t.abs(std.mem.print(&rb, "root/{s}", .{rel}) catch unreachable, &buf);
         if (std.mem.endsWith(u8, rel, "/")) _ = linux.rmdir(p) else _ = linux.unlink(p);
     }
 
@@ -671,7 +671,7 @@ const Tree = struct {
     /// Hits for `query` whose path ends in "<root>/<rel>".
     fn count(t: *Tree, query: []const u8, rel: []const u8) !usize {
         var buf: [4096]u8 = undefined;
-        const want = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ t.root, rel });
+        const want = try std.mem.print(&buf, "{s}/{s}", .{ t.root, rel });
         var n: usize = 0;
         for (try t.searchOpts(query, .{ .limit = 50, .recency = false })) |h| n += @intFromBool(std.mem.eql(u8, h.path, want));
         return n;
@@ -686,7 +686,7 @@ const Tree = struct {
     /// can match by chance.
     fn under(t: *Tree, query: []const u8, rel: []const u8) !usize {
         var buf: [4096]u8 = undefined;
-        const prefix = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ t.dir, rel });
+        const prefix = try std.mem.print(&buf, "{s}/{s}", .{ t.dir, rel });
         var n: usize = 0;
         for (try t.searchOpts(query, .{ .limit = 50, .recency = false })) |h| {
             n += @intFromBool(std.mem.startsWith(u8, h.path, prefix) and !std.mem.eql(u8, h.path, t.root));
@@ -705,7 +705,7 @@ const Tree = struct {
 
     fn scoreOf(t: *Tree, query: []const u8, rel: []const u8) !?i32 {
         var buf: [4096]u8 = undefined;
-        const want = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ t.root, rel });
+        const want = try std.mem.print(&buf, "{s}/{s}", .{ t.root, rel });
         for (try t.searchOpts(query, .{ .limit = 50, .recency = false })) |h| if (std.mem.eql(u8, h.path, want)) return h.score;
         return null;
     }
@@ -774,7 +774,7 @@ test "live: a MOVE_SELF read after the move was applied keeps the destination" {
     var it = t.live.watcher.wd_to_id.valueIterator();
     var buf: [4096]u8 = undefined;
     var want_buf: [4096]u8 = undefined;
-    const want = try std.fmt.bufPrint(&want_buf, "{s}/renombrado", .{t.root});
+    const want = try std.mem.print(&want_buf, "{s}/renombrado", .{t.root});
     while (it.next()) |id| {
         if (isDelta(id.*) and std.mem.eql(u8, t.live.pathOf(id.*, &buf) orelse "", want)) dest = id.*;
     }
@@ -863,7 +863,7 @@ test "live: an event for something already indexed adds no duplicate" {
     // is read: it is in the scan *and* queued as an event.
     const w = try Watcher.create(gpa);
     var buf: [4096]u8 = undefined;
-    try w.watch(gpa, try std.fmt.bufPrintSentinel(&buf, "{s}", .{t.root}, 0), 0);
+    try w.watch(gpa, try std.mem.printSentinel(&buf, "{s}", .{t.root}, 0), 0);
     t.mk("durante.rs");
     const base = try scan.scan(gpa, t.pool, &t.cfg, w, null);
     const old = try t.live.adopt(base, w);
@@ -952,7 +952,7 @@ test "live: adopt leaves a clean index that finds the same" {
 test "live: compaction thresholds" {
     var files: [40][]const u8 = undefined;
     var names: [40][16]u8 = undefined;
-    for (&files, &names, 0..) |*f, *n, i| f.* = try std.fmt.bufPrint(n, "f{d}.txt", .{i});
+    for (&files, &names, 0..) |*f, *n, i| f.* = try std.mem.print(n, "f{d}.txt", .{i});
     const t = try Tree.create(&files);
     defer t.destroy();
     // A long interval, so only the size thresholds speak.

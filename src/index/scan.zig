@@ -119,7 +119,7 @@ pub fn scan(gpa: std.mem.Allocator, pool: *Pool, cfg: *const Config, watcher: ?*
                 if (fl & store_mod.flag_dir != 0) {
                     st.dirs += 1;
                     if (depth < cfg.max_depth) {
-                        const child = try std.fmt.allocPrintSentinel(gpa, "{s}{s}{s}", .{ parent.path, if (std.mem.endsWith(u8, parent.path, "/")) "" else "/", name }, 0);
+                        const child = try gpa.printSentinel("{s}{s}{s}", .{ parent.path, if (std.mem.endsWith(u8, parent.path, "/")) "" else "/", name }, 0);
                         try next.append(gpa, .{ .id = id, .path = child, .hidden = fl & store_mod.flag_hidden != 0 });
                     }
                 } else st.files += 1;
@@ -152,7 +152,7 @@ fn readDir(gpa: std.mem.Allocator, path: [:0]const u8, cfg: *const Config, batch
         var kind = e.kind;
         if (kind == sys.Kind.unknown) {
             var buf: [4096]u8 = undefined;
-            const full = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ path, e.name }, 0) catch continue;
+            const full = std.mem.printSentinel(&buf, "{s}/{s}", .{ path, e.name }, 0) catch continue;
             kind = sys.kindOf(full);
         }
         var fl: u8 = 0;
@@ -179,7 +179,7 @@ fn shouldDescend(parent: []const u8, name: []const u8, cfg: *const Config) bool 
         if (!std.mem.eql(u8, probe, name)) continue;
         // One stat, only for the handful of suspicious names.
         var buf: [4096]u8 = undefined;
-        const tag = std.fmt.bufPrintSentinel(&buf, "{s}/{s}/CACHEDIR.TAG", .{ parent, name }, 0) catch return true;
+        const tag = std.mem.printSentinel(&buf, "{s}/{s}/CACHEDIR.TAG", .{ parent, name }, 0) catch return true;
         if (sys.exists(tag)) return false;
     }
     return true;

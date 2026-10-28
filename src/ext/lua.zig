@@ -178,7 +178,7 @@ pub fn fail(L: *State, comptime fmt: []const u8, args: anytype) Error {
 /// Pushes a formatted string (cut at 512 bytes).
 pub fn pushFmt(L: *State, comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..];
+    const msg = std.mem.print(&buf, fmt, args) catch buf[0..];
     _ = c.lua_pushlstring(L, msg.ptr, msg.len);
 }
 

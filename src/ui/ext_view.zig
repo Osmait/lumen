@@ -20,7 +20,7 @@ const log = std.log.scoped(.ext);
 /// window exists.
 pub fn start(ui: *Ui) void {
     var buf: [4096]u8 = undefined;
-    const data_dir = std.fmt.bufPrint(&buf, "{s}/lumen", .{std.mem.span(c.g_get_user_data_dir())}) catch return;
+    const data_dir = std.mem.print(&buf, "{s}/lumen", .{std.mem.span(c.g_get_user_data_dir())}) catch return;
     ui.ext_host = Host.start(ui.gpa, ui.io, ui.config_dir, data_dir, .{
         .ctx = ui,
         .registry = &onRegistry,
@@ -240,7 +240,7 @@ pub fn rootItems(ui: *Ui, a: std.mem.Allocator) []const Item {
     for (reg.commands, 0..) |cmd, i| {
         if (cmd.mode == .provider) continue;
         out.append(a, .{
-            .key = std.fmt.allocPrint(a, "ext:{s}", .{cmd.id}) catch continue,
+            .key = a.print("ext:{s}", .{cmd.id}) catch continue,
             .title = cmd.title,
             .subtitle = cmd.subtitle,
             .accessory = "Command",
@@ -251,7 +251,7 @@ pub fn rootItems(ui: *Ui, a: std.mem.Allocator) []const Item {
     }
     for (reg.problems) |p| {
         out.append(a, .{
-            .title = std.fmt.allocPrintSentinel(a, "Extension \"{s}\" failed to load", .{p.ext}, 0) catch continue,
+            .title = a.printSentinel("Extension \"{s}\" failed to load", .{p.ext}, 0) catch continue,
             .subtitle = firstLine(a, p.message),
             .accessory = "Error",
             .icon = .{ .tile = .{ .name = "dialog-warning-symbolic", .color = .red } },
@@ -313,7 +313,7 @@ fn ask(ui: *Ui, q: []const u8) void {
 pub fn emptyText(ui: *Ui, a: std.mem.Allocator, q: []const u8) [:0]const u8 {
     const cmd = command(ui) orelse return "No Results";
     if (ui.ext_result) |r| if (r.command == ui.ext_cmd) if (r.err) |e|
-        return std.fmt.allocPrintSentinel(a, "Error: {s}", .{firstLine(a, e)}, 0) catch "Error";
+        return a.printSentinel("Error: {s}", .{firstLine(a, e)}, 0) catch "Error";
     if (ui.ext_pending) return "Loading...";
     if (cmd.mode == .search and q.len == 0) return "Type to search";
     return "No Results";
@@ -324,7 +324,7 @@ pub fn placeholder(ui: *Ui, buf: []u8) [*:0]const u8 {
     if (cmd.placeholder.len > 0) return cmd.placeholder;
     // "Search Emoji" reads "Search Emoji...", not "Search Search Emoji...".
     const verb = if (std.mem.startsWith(u8, cmd.title, "Search ")) "" else "Search ";
-    const text = std.fmt.bufPrintSentinel(buf, "{s}{s}...", .{ verb, cmd.title }, 0) catch return "Search...";
+    const text = std.mem.printSentinel(buf, "{s}{s}...", .{ verb, cmd.title }, 0) catch return "Search...";
     return text.ptr;
 }
 
@@ -388,7 +388,7 @@ fn open(ui: *Ui, target: [:0]const u8) void {
     }
     var buf: [4096]u8 = undefined;
     const path = if (std.mem.startsWith(u8, target, "~/"))
-        std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ std.mem.span(c.g_get_home_dir()), target[2..] }, 0) catch return
+        std.mem.printSentinel(&buf, "{s}/{s}", .{ std.mem.span(c.g_get_home_dir()), target[2..] }, 0) catch return
     else
         target;
     const info = index.sys.info(path) orelse {

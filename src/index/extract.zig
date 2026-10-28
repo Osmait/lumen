@@ -446,7 +446,7 @@ const TestDir = struct {
         td.rel = try sys.tmpDirPath(&td.tmp, &td.rel_buf);
         const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
         defer testing.allocator.free(cwd);
-        td.abs = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ cwd, td.rel });
+        td.abs = try testing.allocator.print("{s}/{s}", .{ cwd, td.rel });
     }
     fn deinit(td: *TestDir) void {
         testing.allocator.free(td.abs);
@@ -454,12 +454,12 @@ const TestDir = struct {
     }
     fn write(td: *TestDir, name: []const u8, data: []const u8) !void {
         var buf: [512]u8 = undefined;
-        const p = try std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ td.rel, name }, 0);
+        const p = try std.mem.printSentinel(&buf, "{s}/{s}", .{ td.rel, name }, 0);
         if (std.mem.findScalarLast(u8, p, '/')) |s| sys.mkdirP(p[0..s]);
         try sys.writeFile(p, data);
     }
     fn absZ(td: *TestDir, name: []const u8) ![:0]u8 {
-        return std.fmt.allocPrintSentinel(testing.allocator, "{s}/{s}", .{ td.abs, name }, 0);
+        return testing.allocator.printSentinel("{s}/{s}", .{ td.abs, name }, 0);
     }
     fn extract(td: *TestDir, name: []const u8, max: usize) ![]u8 {
         const p = try td.absZ(name);
@@ -520,9 +520,9 @@ test "extract docx, xlsx, pptx (OOXML)" {
 /// between file systems (Office writes the body first; sorted names do too).
 fn zipInto(td: *TestDir, dir: []const u8, name: []const u8) !void {
     var buf: [256]u8 = undefined;
-    const rel = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ td.rel, dir });
+    const rel = try std.mem.print(&buf, "{s}/{s}", .{ td.rel, dir });
     var cmd_buf: [256]u8 = undefined;
-    const cmd = try std.fmt.bufPrint(&cmd_buf, "find . -type f | LC_ALL=C sort | zip -q -X -@ '../{s}'", .{name});
+    const cmd = try std.mem.print(&cmd_buf, "find . -type f | LC_ALL=C sort | zip -q -X -@ '../{s}'", .{name});
     const r = try std.process.run(testing.allocator, testing.io, .{
         .argv = &.{ "sh", "-c", cmd },
         .cwd = .{ .path = rel },
@@ -561,7 +561,7 @@ test "extract odt, ods (ODF)" {
 fn minimalPdf(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
     var pdf: std.ArrayList(u8) = .empty;
     errdefer pdf.deinit(gpa);
-    const stream = try std.fmt.allocPrint(gpa, "BT /F1 24 Tf 72 700 Td ({s}) Tj ET", .{text});
+    const stream = try gpa.print("BT /F1 24 Tf 72 700 Td ({s}) Tj ET", .{text});
     defer gpa.free(stream);
     var offsets: [5]usize = undefined;
     try pdf.appendSlice(gpa, "%PDF-1.4\n");

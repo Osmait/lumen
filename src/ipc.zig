@@ -20,12 +20,12 @@ pub const max_args = 64;
 pub fn socketPath(buf: []u8, runtime_dir: []const u8, app_id: []const u8) ?[:0]const u8 {
     if (runtime_dir.len == 0 or app_id.len == 0) return null;
     // sockaddr_un holds 108 bytes.
-    const p = std.fmt.bufPrintSentinel(buf, "{s}/lumen/{s}.sock", .{ runtime_dir, app_id }, 0) catch return null;
+    const p = std.mem.printSentinel(buf, "{s}/lumen/{s}.sock", .{ runtime_dir, app_id }, 0) catch return null;
     return if (p.len < 108) p else null;
 }
 
 pub fn dir(buf: []u8, runtime_dir: []const u8) ?[:0]const u8 {
-    return std.fmt.bufPrintSentinel(buf, "{s}/lumen", .{runtime_dir}, 0) catch null;
+    return std.mem.printSentinel(buf, "{s}/lumen", .{runtime_dir}, 0) catch null;
 }
 
 pub const Request = struct {

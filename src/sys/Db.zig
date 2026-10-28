@@ -269,7 +269,7 @@ test "the history keeps as many entries as the setting says" {
     defer db.close();
     for (0..8) |i| {
         var buf: [16]u8 = undefined;
-        try db.addClip(try std.fmt.bufPrint(&buf, "clip {d}", .{i}), @intCast(i), 5);
+        try db.addClip(try std.mem.print(&buf, "clip {d}", .{i}), @intCast(i), 5);
     }
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();

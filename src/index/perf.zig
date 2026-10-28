@@ -61,7 +61,7 @@ fn syntheticNames(gpa: std.mem.Allocator) !store_mod.Store {
         var next: std.ArrayList(u32) = .empty;
         for (level.items) |parent| {
             for (0..fan) |i| {
-                const n = try std.fmt.bufPrint(&nb, "{s}-{d}", .{ words[r.uintLessThan(usize, words.len)], i });
+                const n = try std.mem.print(&nb, "{s}-{d}", .{ words[r.uintLessThan(usize, words.len)], i });
                 try next.append(gpa, try b.push(gpa, n, parent, store_mod.flag_dir, @intCast(depth)));
             }
         }
@@ -71,7 +71,7 @@ fn syntheticNames(gpa: std.mem.Allocator) !store_mod.Store {
     }
     for (all_dirs.items) |d| {
         for (0..40) |_| {
-            const n = try std.fmt.bufPrint(&nb, "{s}_{s}{s}", .{ words[r.uintLessThan(usize, words.len)], words[r.uintLessThan(usize, words.len)], exts[r.uintLessThan(usize, exts.len)] });
+            const n = try std.mem.print(&nb, "{s}_{s}{s}", .{ words[r.uintLessThan(usize, words.len)], words[r.uintLessThan(usize, words.len)], exts[r.uintLessThan(usize, exts.len)] });
             _ = try b.push(gpa, n, d, 0, 4);
         }
     }
@@ -86,7 +86,7 @@ fn names(gpa: std.mem.Allocator, pool: *index.Pool, dir: []const u8) !void {
     std.debug.print("       {d} entries built in {d:.0} ms\n", .{ s.len(), ms(sys.monotonicNs() - t) });
 
     var pbuf: [4096]u8 = undefined;
-    const path = try std.fmt.bufPrintSentinel(&pbuf, "{s}/names.idx", .{dir}, 0);
+    const path = try std.mem.printSentinel(&pbuf, "{s}/names.idx", .{dir}, 0);
     try s.save(path);
     t = sys.monotonicNs();
     var m = try store_mod.Store.open(path);
@@ -105,7 +105,7 @@ fn names(gpa: std.mem.Allocator, pool: *index.Pool, dir: []const u8) !void {
         t = sys.monotonicNs();
         try e.search(gpa, pool, &m, q[0], .{ .limit = 60, .recency = false }, &hits);
         var label: [64]u8 = undefined;
-        check(try std.fmt.bufPrint(&label, "cold query \"{s}\"", .{q[0]}), ms(sys.monotonicNs() - t), q[1]);
+        check(try std.mem.print(&label, "cold query \"{s}\"", .{q[0]}), ms(sys.monotonicNs() - t), q[1]);
         // Recall against the exhaustive reference: exact, not timed.
         try index.search.searchExhaustive(gpa, &m, q[0], 60, &want);
         var same = want.items.len == hits.items.len;
@@ -170,7 +170,7 @@ fn contents(gpa: std.mem.Allocator, pool: *index.Pool, dir: []const u8) !void {
             }
             try text.append(a, '\n');
         }
-        const p = try std.fmt.allocPrintSentinel(a, "{s}/doc{d:0>5}.txt", .{ dir, i }, 0);
+        const p = try a.printSentinel("{s}/doc{d:0>5}.txt", .{ dir, i }, 0);
         try sys.writeFile(p, text.items);
         total += text.items.len;
         try docs.append(a, .{ .path = p, .mtime = 1_700_000_000 + @as(i64, @intCast(i)), .size = text.items.len });
@@ -189,7 +189,7 @@ fn contents(gpa: std.mem.Allocator, pool: *index.Pool, dir: []const u8) !void {
         t = sys.monotonicNs();
         try content.search(&ix, gpa, a, pool, q[0], .{ .limit = 50, .text_path = content.plainPath, .text_ctx = &dummy }, &matches);
         var label: [64]u8 = undefined;
-        check(try std.fmt.bufPrint(&label, "search \"{s}\" ({d} hits)", .{ q[0], matches.items.len }), ms(sys.monotonicNs() - t), q[1]);
+        check(try std.mem.print(&label, "search \"{s}\" ({d} hits)", .{ q[0], matches.items.len }), ms(sys.monotonicNs() - t), q[1]);
     }
 }
 
@@ -200,7 +200,7 @@ pub fn main(init: std.process.Init) !void {
     defer pool.destroy();
 
     var dbuf: [256]u8 = undefined;
-    const dir = try std.fmt.bufPrint(&dbuf, "/tmp/lumen-perf-{d}", .{std.os.linux.getpid()});
+    const dir = try std.mem.print(&dbuf, "/tmp/lumen-perf-{d}", .{std.os.linux.getpid()});
     sys.mkdirP(dir);
     defer {
         const argv = [_][]const u8{ "rm", "-rf", dir };

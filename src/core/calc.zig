@@ -68,7 +68,7 @@ pub fn formatDisplay(buf: []u8, v: f64) []const u8 {
 
 /// "{d:.4}" without trailing zeros: "1234.5", "6.2137", "-3".
 fn fixed4(buf: []u8, v: f64) []const u8 {
-    const s = std.fmt.bufPrint(buf, "{d:.4}", .{v}) catch return "?";
+    const s = std.mem.print(buf, "{d:.4}", .{v}) catch return "?";
     var end = s.len;
     if (std.mem.findScalar(u8, s, '.') != null) {
         while (s[end - 1] == '0') end -= 1;
@@ -83,12 +83,12 @@ fn fixed4(buf: []u8, v: f64) []const u8 {
 pub fn formatPlain(buf: []u8, v: f64) []const u8 {
     const r = if (@abs(v) < 1e-12) 0 else v;
     if (r == @trunc(r) and @abs(r) < 1e15) {
-        return std.fmt.bufPrint(buf, "{d}", .{@as(i64, @intFromFloat(r))}) catch "?";
+        return std.mem.print(buf, "{d}", .{@as(i64, @intFromFloat(r))}) catch "?";
     }
     if (@abs(r) >= 1e15 or @abs(r) < 1e-6) {
-        return std.fmt.bufPrint(buf, "{e:.6}", .{r}) catch "?";
+        return std.mem.print(buf, "{e:.6}", .{r}) catch "?";
     }
-    const s = std.fmt.bufPrint(buf, "{d:.10}", .{r}) catch return "?";
+    const s = std.mem.print(buf, "{d:.10}", .{r}) catch return "?";
     var end = s.len;
     while (end > 0 and s[end - 1] == '0') end -= 1;
     if (end > 0 and s[end - 1] == '.') end -= 1;

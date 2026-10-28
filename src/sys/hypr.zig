@@ -67,7 +67,7 @@ fn query(arena: std.mem.Allocator, comptime T: type, what: [:0]const u8) ?T {
 /// against 0.04. Null when the socket cannot be reached.
 fn request(arena: std.mem.Allocator, what: []const u8) ?[]const u8 {
     var msg_buf: [64]u8 = undefined;
-    const msg = std.fmt.bufPrint(&msg_buf, "j/{s}", .{what}) catch return null;
+    const msg = std.mem.print(&msg_buf, "j/{s}", .{what}) catch return null;
     return talk(arena, msg);
 }
 
@@ -77,7 +77,7 @@ fn connect(which: []const u8, flags: u32) ?linux.fd_t {
     const sig = std.mem.span(c.g_getenv("HYPRLAND_INSTANCE_SIGNATURE") orelse return null);
     const rt = std.mem.span(c.g_getenv("XDG_RUNTIME_DIR") orelse return null);
     var addr: linux.sockaddr.un = .{ .path = @splat(0) };
-    _ = std.fmt.bufPrint(addr.path[0 .. addr.path.len - 1], "{s}/hypr/{s}/{s}", .{ rt, sig, which }) catch return null;
+    _ = std.mem.print(addr.path[0 .. addr.path.len - 1], "{s}/hypr/{s}/{s}", .{ rt, sig, which }) catch return null;
     const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC | flags, 0);
     if (linux.errno(rc) != .SUCCESS) return null;
     const fd: linux.fd_t = @intCast(rc);
@@ -248,7 +248,7 @@ pub fn sendQueued() void {
     if (dispatchOver(msg)) return;
     // "[[BATCH]]dispatch a;dispatch b" is what `hyprctl --batch` sends.
     var zbuf: [8192]u8 = undefined;
-    const z = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{msg["[[BATCH]]".len..]}, 0) catch return;
+    const z = std.mem.printSentinel(&zbuf, "{s}", .{msg["[[BATCH]]".len..]}, 0) catch return;
     proc.spawn(&.{ "hyprctl", "--batch", z });
 }
 
@@ -351,9 +351,9 @@ pub fn layoutCommands(arena: std.mem.Allocator, win: Client, mon: geometry.Monit
     const r = geometry.place(layout, mon.usable(), win.size[0], win.size[1], 8);
     var cmds: std.ArrayList([]const u8) = .empty;
     if (win.fullscreen != 0) try cmds.append(arena, "fullscreen 0");
-    if (!win.floating) try cmds.append(arena, try std.fmt.allocPrint(arena, "setfloating address:{s}", .{win.address}));
-    try cmds.append(arena, try std.fmt.allocPrint(arena, "resizewindowpixel exact {d} {d},address:{s}", .{ r.w, r.h, win.address }));
-    try cmds.append(arena, try std.fmt.allocPrint(arena, "movewindowpixel exact {d} {d},address:{s}", .{ r.x, r.y, win.address }));
+    if (!win.floating) try cmds.append(arena, try arena.print("setfloating address:{s}", .{win.address}));
+    try cmds.append(arena, try arena.print("resizewindowpixel exact {d} {d},address:{s}", .{ r.w, r.h, win.address }));
+    try cmds.append(arena, try arena.print("movewindowpixel exact {d} {d},address:{s}", .{ r.x, r.y, win.address }));
     return cmds.items;
 }
 

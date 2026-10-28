@@ -244,7 +244,7 @@ pub fn fill(ui: *Ui, a: std.mem.Allocator, q: []const u8) void {
 
 fn itemOf(a: std.mem.Allocator, l: Line, i: u32) Item {
     return .{
-        .key = std.fmt.allocPrint(a, "d:{d}", .{i}) catch "",
+        .key = a.print("d:{d}", .{i}) catch "",
         .title = l.text,
         .icon = l.icon,
         .keywords = l.meta,

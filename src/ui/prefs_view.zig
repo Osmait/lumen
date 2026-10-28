@@ -23,14 +23,14 @@ pub fn extensionRows(ui: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item)) v
         var n: usize = 0;
         for (reg.prefs) |q| n += @intFromBool(std.mem.eql(u8, q.ext, e.id));
         out.append(a, .{
-            .key = std.fmt.allocPrint(a, "set:ext:{s}", .{e.id}) catch continue,
+            .key = a.print("set:ext:{s}", .{e.id}) catch continue,
             .section = "Extensions",
             .title = e.title,
             .subtitle = e.id,
             .accessory = (if (n > 0)
-                std.fmt.allocPrintSentinel(a, "{d} {s}", .{ n, if (n == 1) "setting" else "settings" }, 0)
+                a.printSentinel("{d} {s}", .{ n, if (n == 1) "setting" else "settings" }, 0)
             else
-                std.fmt.allocPrintSentinel(a, "{d} {s}", .{ e.commands, if (e.commands == 1) "command" else "commands" }, 0)) catch "",
+                a.printSentinel("{d} {s}", .{ e.commands, if (e.commands == 1) "command" else "commands" }, 0)) catch "",
             .icon = .{ .tile = .{ .name = "application-x-addon-symbolic", .color = .purple } },
             .keywords = "extension preferences update uninstall",
             .action = .{ .setting = .{ .ext_prefs = e.id } },
@@ -39,7 +39,7 @@ pub fn extensionRows(ui: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item)) v
     for (reg.problems) |p| {
         if (std.mem.eql(u8, p.ext, "config")) continue;
         out.append(a, .{
-            .key = std.fmt.allocPrint(a, "set:ext:{s}", .{p.ext}) catch continue,
+            .key = a.print("set:ext:{s}", .{p.ext}) catch continue,
             .section = "Extensions",
             .title = p.ext,
             .subtitle = "Failed to load",
@@ -77,7 +77,7 @@ pub fn candidates(ui: *Ui, a: std.mem.Allocator) []Item {
     for (reg.prefs, 0..) |p, i| {
         if (!std.mem.eql(u8, p.ext, extId(ui))) continue;
         out.append(a, .{
-            .key = std.fmt.allocPrint(a, "pref:{s}", .{p.name}) catch continue,
+            .key = a.print("pref:{s}", .{p.name}) catch continue,
             .section = "Preferences",
             .title = p.title,
             .subtitle = p.description,
@@ -93,8 +93,8 @@ pub fn candidates(ui: *Ui, a: std.mem.Allocator) []Item {
 /// The extension's folder, git pull when it is a checkout, removal.
 fn manageRows(ui: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item)) void {
     const id = a.dupeSentinel(u8, extId(ui), 0) catch return;
-    const dir = std.fmt.allocPrintSentinel(a, "{s}/extensions/{s}", .{ ui.config_dir, id }, 0) catch return;
-    const git = std.fmt.allocPrintSentinel(a, "{s}/.git", .{dir}, 0) catch return;
+    const dir = a.printSentinel("{s}/extensions/{s}", .{ ui.config_dir, id }, 0) catch return;
+    const git = a.printSentinel("{s}/.git", .{dir}, 0) catch return;
     out.append(a, .{
         .key = "manage:open",
         .section = "Manage",
@@ -218,7 +218,7 @@ pub fn choiceCandidates(ui: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item)
     const value = current(a, p);
     for (p.choices) |ch| {
         out.append(a, .{
-            .key = std.fmt.allocPrint(a, "pick:{s}", .{ch.value}) catch continue,
+            .key = a.print("pick:{s}", .{ch.value}) catch continue,
             .title = ch.label,
             .accessory = if (std.mem.eql(u8, ch.value, value)) "✓" else "",
             .icon = .{ .tile = .{ .name = "object-select-symbolic", .color = .gray } },
@@ -262,7 +262,7 @@ pub fn inputCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
     const row = a.alloc(Item, 1) catch return &.{};
     row[0] = .{
         .key = "input:save",
-        .title = if (ui.input == .field) std.fmt.allocPrintSentinel(a, "Set {s}", .{p.title}, 0) catch "Set" else std.fmt.allocPrintSentinel(a, "Save {s}", .{p.title}, 0) catch "Save",
+        .title = if (ui.input == .field) a.printSentinel("Set {s}", .{p.title}, 0) catch "Set" else a.printSentinel("Save {s}", .{p.title}, 0) catch "Save",
         .subtitle = if (p.description.len > 0) p.description else "Type the value above",
         .icon = iconOf(p.kind),
         .action = .{ .setting = .save_input },

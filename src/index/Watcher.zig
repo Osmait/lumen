@@ -152,7 +152,7 @@ fn tmpAbs(tmp: *testing.TmpDir, buf: []u8) ![]const u8 {
     var cwd_buf: [4096]u8 = undefined;
     const cwd = std.mem.sliceTo(cwd_buf[0..linux.getcwd(&cwd_buf, cwd_buf.len)], 0);
     var rel_buf: [4096]u8 = undefined;
-    return std.fmt.bufPrint(buf, "{s}/{s}", .{ cwd, try sys.tmpDirPath(tmp, &rel_buf) });
+    return std.mem.print(buf, "{s}/{s}", .{ cwd, try sys.tmpDirPath(tmp, &rel_buf) });
 }
 
 test "watcher: events become changes attributed to the watched entry" {
@@ -169,12 +169,12 @@ test "watcher: events become changes attributed to the watched entry" {
 
     var b1: [4096]u8 = undefined;
     var b2: [4096]u8 = undefined;
-    try w.watch(gpa, try std.fmt.bufPrintSentinel(&b1, "{s}", .{dir}, 0), 7);
-    try sys.writeFile(try std.fmt.bufPrintSentinel(&b1, "{s}/f", .{dir}, 0), "x");
-    const d = try std.fmt.bufPrintSentinel(&b2, "{s}/d", .{dir}, 0);
+    try w.watch(gpa, try std.mem.printSentinel(&b1, "{s}", .{dir}, 0), 7);
+    try sys.writeFile(try std.mem.printSentinel(&b1, "{s}/f", .{dir}, 0), "x");
+    const d = try std.mem.printSentinel(&b2, "{s}/d", .{dir}, 0);
     _ = linux.mkdir(d, 0o755);
-    try sys.rename(try std.fmt.bufPrintSentinel(&b1, "{s}/f", .{dir}, 0), try std.fmt.bufPrintSentinel(&b2, "{s}/g", .{dir}, 0));
-    _ = linux.unlink(try std.fmt.bufPrintSentinel(&b1, "{s}/g", .{dir}, 0));
+    try sys.rename(try std.mem.printSentinel(&b1, "{s}/f", .{dir}, 0), try std.mem.printSentinel(&b2, "{s}/g", .{dir}, 0));
+    _ = linux.unlink(try std.mem.printSentinel(&b1, "{s}/g", .{dir}, 0));
 
     var changes: std.ArrayList(Change) = .empty;
     try w.drain(arena, &changes);
@@ -192,9 +192,9 @@ test "watcher: events become changes attributed to the watched entry" {
     try testing.expectEqualStrings("g", c[4].removed.name);
 
     // The directory itself going away, and its watch with it.
-    try w.watch(gpa, try std.fmt.bufPrintSentinel(&b2, "{s}/d", .{dir}, 0), 8);
+    try w.watch(gpa, try std.mem.printSentinel(&b2, "{s}/d", .{dir}, 0), 8);
     try testing.expectEqual(2, w.count());
-    _ = linux.rmdir(try std.fmt.bufPrintSentinel(&b2, "{s}/d", .{dir}, 0));
+    _ = linux.rmdir(try std.mem.printSentinel(&b2, "{s}/d", .{dir}, 0));
     changes.clearRetainingCapacity();
     try w.drain(arena, &changes);
     var gone = false;
@@ -203,9 +203,9 @@ test "watcher: events become changes attributed to the watched entry" {
     try testing.expectEqual(1, w.count());
 
     // Watching an inode again re-points it: one watch, the new id.
-    try w.watch(gpa, try std.fmt.bufPrintSentinel(&b1, "{s}", .{dir}, 0), 9);
+    try w.watch(gpa, try std.mem.printSentinel(&b1, "{s}", .{dir}, 0), 9);
     try testing.expectEqual(1, w.count());
-    try sys.writeFile(try std.fmt.bufPrintSentinel(&b1, "{s}/h", .{dir}, 0), "x");
+    try sys.writeFile(try std.mem.printSentinel(&b1, "{s}/h", .{dir}, 0), "x");
     changes.clearRetainingCapacity();
     try w.drain(arena, &changes);
     try testing.expect(changes.items.len == 1 and changes.items[0].created.parent == 9);
@@ -225,11 +225,11 @@ test "watcher: a flooded queue reports the overflow in one drain" {
     defer w.destroy(gpa);
     var a: [4096]u8 = undefined;
     var b: [4096]u8 = undefined;
-    try w.watch(gpa, try std.fmt.bufPrintSentinel(&a, "{s}", .{dir}, 0), 0);
+    try w.watch(gpa, try std.mem.printSentinel(&a, "{s}", .{dir}, 0), 0);
     // 48-byte events: 64 KiB is not a whole number of them, so read() never
     // fills the buffer to the byte.
-    const pa = try std.fmt.bufPrintSentinel(&a, "{s}/rename_target_a_xx", .{dir}, 0);
-    const pb = try std.fmt.bufPrintSentinel(&b, "{s}/rename_target_b_xx", .{dir}, 0);
+    const pa = try std.mem.printSentinel(&a, "{s}/rename_target_a_xx", .{dir}, 0);
+    const pb = try std.mem.printSentinel(&b, "{s}/rename_target_b_xx", .{dir}, 0);
     try sys.writeFile(pa, "x");
     // Two events per rename, never coalesced (different cookies).
     for (0..max_queued / 2 + 100) |i| {

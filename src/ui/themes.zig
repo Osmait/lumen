@@ -61,7 +61,7 @@ pub fn find(id: []const u8, prefer_dark: bool) *const Theme {
 /// The name shown for a theme setting value ("Auto (Lumen Dark)").
 pub fn displayName(a: std.mem.Allocator, id: []const u8, prefer_dark: bool) [:0]const u8 {
     if (std.mem.eql(u8, id, auto_id))
-        return std.fmt.allocPrintSentinel(a, "Automatic ({s})", .{find(id, prefer_dark).name}, 0) catch "Automatic";
+        return a.printSentinel("Automatic ({s})", .{find(id, prefer_dark).name}, 0) catch "Automatic";
     return find(id, prefer_dark).name;
 }
 
@@ -107,7 +107,7 @@ pub fn onAccent(t: *const Theme) u24 {
 
 /// "#rrggbb" for Pango markup.
 pub fn hex(buf: *[8]u8, color: u24) [:0]const u8 {
-    return std.fmt.bufPrintSentinel(buf, "#{x:0>6}", .{color}, 0) catch "#ffffff";
+    return std.mem.printSentinel(buf, "#{x:0>6}", .{color}, 0) catch "#ffffff";
 }
 
 /// WCAG contrast ratio between two colours (1 to 21).
@@ -176,7 +176,7 @@ test "style.css only uses variables the themes define" {
         const start = at + 4;
         const end = std.mem.findScalarPos(u8, style, start, ')') orelse break;
         var buf: [64]u8 = undefined;
-        const decl = try std.fmt.bufPrint(&buf, "{s}:", .{style[start..end]});
+        const decl = try std.mem.print(&buf, "{s}:", .{style[start..end]});
         if (std.mem.find(u8, vars, decl) == null) {
             std.debug.print("style.css uses undefined {s}\n", .{style[start..end]});
             return error.UndefinedVariable;

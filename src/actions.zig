@@ -71,7 +71,7 @@ pub fn perform(ctx: Ctx, it: *const Item, op: item_mod.Op) Outcome {
         .close_window => {
             if (it.action == .focus_window) {
                 var buf: [64]u8 = undefined;
-                const cmd = std.fmt.bufPrint(&buf, "closewindow address:{s}", .{it.action.focus_window}) catch return .stay;
+                const cmd = std.mem.print(&buf, "closewindow address:{s}", .{it.action.focus_window}) catch return .stay;
                 hypr.dispatch(ctx.gpa, cmd);
             }
             return .refresh_view;
@@ -137,7 +137,7 @@ pub fn openFile(ctx: Ctx, path: [:0]const u8, is_dir: bool) void {
     const ext = if (is_dir) "" else core.file_kind.extKey(&ebuf, name);
     if (ctx.settings.appFor(ext, kind)) |app| {
         var idbuf: [256]u8 = undefined;
-        const id = std.fmt.bufPrintSentinel(&idbuf, "{s}", .{app}, 0) catch "";
+        const id = std.mem.printSentinel(&idbuf, "{s}", .{app}, 0) catch "";
         if (openWith(path, id)) return;
         // Uninstalled since it was chosen: the system default still works.
         log.warn("open with {s}: app not found, using the default", .{app});
@@ -213,9 +213,9 @@ pub const EditorCommand = struct { argv: []const [:0]const u8, in_terminal: bool
 /// How each editor is told to open a file at a line.
 pub fn editorCommand(a: std.mem.Allocator, editor: [:0]const u8, path: [:0]const u8, line: u32) std.mem.Allocator.Error!EditorCommand {
     const base = if (std.mem.findScalarLast(u8, editor, '/')) |s| editor[s + 1 ..] else editor;
-    const at = try std.fmt.allocPrintSentinel(a, "{s}:{d}", .{ path, line }, 0);
-    const plus = try std.fmt.allocPrintSentinel(a, "+{d}", .{line}, 0);
-    const n = try std.fmt.allocPrintSentinel(a, "{d}", .{line}, 0);
+    const at = try a.printSentinel("{s}:{d}", .{ path, line }, 0);
+    const plus = try a.printSentinel("+{d}", .{line}, 0);
+    const n = try a.printSentinel("{d}", .{line}, 0);
     const is = struct {
         fn any(x: []const u8, names: []const []const u8) bool {
             for (names) |name| if (std.mem.eql(u8, x, name)) return true;
@@ -245,7 +245,7 @@ pub fn terminalPrefix(a: std.mem.Allocator, term: [:0]const u8) std.mem.Allocato
 fn showInFolder(ctx: Ctx, path: [:0]const u8) void {
     const uri = c.g_filename_to_uri(path, null, null) orelse return;
     defer c.g_free(uri);
-    const arg = std.fmt.allocPrintSentinel(ctx.gpa, "['{s}']", .{uri}, 0) catch return;
+    const arg = ctx.gpa.printSentinel("['{s}']", .{uri}, 0) catch return;
     defer ctx.gpa.free(arg);
     proc.spawn(&.{ "gdbus", "call", "--session", "--dest", "org.freedesktop.FileManager1", "--object-path", "/org/freedesktop/FileManager1", "--method", "org.freedesktop.FileManager1.ShowItems", arg, "" });
 }
@@ -255,7 +255,7 @@ fn showInFolder(ctx: Ctx, path: [:0]const u8) void {
 fn copyFile(ctx: Ctx, path: [:0]const u8) void {
     const uri = c.g_filename_to_uri(path, null, null) orelse return;
     defer c.g_free(uri);
-    const list = std.fmt.allocPrint(ctx.gpa, "{s}\r\n", .{uri}) catch return;
+    const list = ctx.gpa.print("{s}\r\n", .{uri}) catch return;
     defer ctx.gpa.free(list);
     proc.pipeTo(&.{ "wl-copy", "--type", "text/uri-list" }, list);
 }
@@ -274,7 +274,7 @@ fn launch(info: *c.GAppInfo) void {
 
 fn focusWindow(ctx: Ctx, it: *const Item) void {
     var buf: [64]u8 = undefined;
-    const cmd = std.fmt.bufPrint(&buf, "focuswindow address:{s}", .{it.action.focus_window}) catch return;
+    const cmd = std.mem.print(&buf, "focuswindow address:{s}", .{it.action.focus_window}) catch return;
     hypr.dispatch(ctx.gpa, cmd);
 }
 
@@ -326,7 +326,7 @@ fn runScript(path: [:0]const u8, mode: @import("core").script_meta.Mode, title: 
     }
     // Other modes show the output: last lines as a desktop notification.
     var buf: [512:0]u8 = undefined;
-    const t = std.fmt.bufPrintSentinel(&buf, "{s}", .{title}, 0) catch "Script";
+    const t = std.mem.printSentinel(&buf, "{s}", .{title}, 0) catch "Script";
     proc.spawn(&.{
         "sh",           "-c",
         \\out=$("$1" 2>&1); notify-send -a Lumen "$2" "$(printf '%s' "$out" | tail -n 5)"

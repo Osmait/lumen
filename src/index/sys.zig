@@ -170,8 +170,8 @@ pub fn rename(from: [*:0]const u8, to: [*:0]const u8) Error!void {
 pub fn writeFileAtomic(path: []const u8, data: []const u8) Error!void {
     var pbuf: [4096]u8 = undefined;
     var tbuf: [4096]u8 = undefined;
-    const final = std.fmt.bufPrintSentinel(&pbuf, "{s}", .{path}, 0) catch return error.NameTooLong;
-    const tmp = std.fmt.bufPrintSentinel(&tbuf, "{s}.tmp", .{path}, 0) catch return error.NameTooLong;
+    const final = std.mem.printSentinel(&pbuf, "{s}", .{path}, 0) catch return error.NameTooLong;
+    const tmp = std.mem.printSentinel(&tbuf, "{s}.tmp", .{path}, 0) catch return error.NameTooLong;
     {
         const fd: i32 = @intCast(try check(linux.open(tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600)));
         defer close(fd);
@@ -196,8 +196,8 @@ pub const AtomicFile = struct {
 
     pub fn create(path: []const u8) Error!AtomicFile {
         var f: AtomicFile = .{ .fd = -1 };
-        const final = std.fmt.bufPrintSentinel(&f.final, "{s}", .{path}, 0) catch return error.NameTooLong;
-        const tmp = std.fmt.bufPrintSentinel(&f.tmp, "{s}.tmp", .{path}, 0) catch return error.NameTooLong;
+        const final = std.mem.printSentinel(&f.final, "{s}", .{path}, 0) catch return error.NameTooLong;
+        const tmp = std.mem.printSentinel(&f.tmp, "{s}.tmp", .{path}, 0) catch return error.NameTooLong;
         f.final_len = final.len;
         f.tmp_len = tmp.len;
         f.fd = @intCast(try check(linux.open(tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600)));
@@ -287,7 +287,7 @@ pub fn mkdirP(path: []const u8) void {
 /// earlier versions were 0755, with world-readable files inside.
 pub fn makePrivate(path: []const u8) void {
     var buf: [4096]u8 = undefined;
-    const z = std.fmt.bufPrintSentinel(&buf, "{s}", .{path}, 0) catch return;
+    const z = std.mem.printSentinel(&buf, "{s}", .{path}, 0) catch return;
     _ = linux.chmod(z, 0o700);
 }
 
@@ -304,7 +304,7 @@ pub fn mapPrivate(path: [*:0]const u8) Error![]align(8) u8 {
 
 /// Absolute-enough path of a testing tmp dir (tests run from the build root).
 pub fn tmpDirPath(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
-    return std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    return std.mem.print(buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 }
 
 /// Waits for child `pid` to exit, until `deadline_ns` (monotonic): true when
@@ -344,7 +344,7 @@ test "special files are refused without blocking" {
     var dbuf: [4096]u8 = undefined;
     const dir = try tmpDirPath(&tmp, &dbuf);
     var pbuf: [4096]u8 = undefined;
-    const fifo = try std.fmt.bufPrintSentinel(&pbuf, "{s}/pipe", .{dir}, 0);
+    const fifo = try std.mem.printSentinel(&pbuf, "{s}/pipe", .{dir}, 0);
     _ = linux.mknodat(linux.AT.FDCWD, fifo, linux.S.IFIFO | 0o600, 0);
     var buf: [64]u8 = undefined;
     // Each of these used to block forever on a FIFO with no writer.
@@ -361,15 +361,15 @@ test "atomic writes replace the file and leave no temporary behind" {
     var dbuf: [4096]u8 = undefined;
     const dir = try tmpDirPath(&tmp, &dbuf);
     var pbuf: [4096]u8 = undefined;
-    const p = try std.fmt.bufPrint(&pbuf, "{s}/f.conf", .{dir});
+    const p = try std.mem.print(&pbuf, "{s}/f.conf", .{dir});
     try writeFileAtomic(p, "old");
     try writeFileAtomic(p, "new");
     var rbuf: [16]u8 = undefined;
     var zbuf: [4096]u8 = undefined;
-    try std.testing.expectEqualStrings("new", readHead(try std.fmt.bufPrintSentinel(&zbuf, "{s}", .{p}, 0), &rbuf));
-    try std.testing.expect(!exists(try std.fmt.bufPrintSentinel(&zbuf, "{s}.tmp", .{p}, 0)));
+    try std.testing.expectEqualStrings("new", readHead(try std.mem.printSentinel(&zbuf, "{s}", .{p}, 0), &rbuf));
+    try std.testing.expect(!exists(try std.mem.printSentinel(&zbuf, "{s}.tmp", .{p}, 0)));
     // A directory that is not there: an error, and nothing left over.
-    const bad = try std.fmt.bufPrint(&pbuf, "{s}/missing/f.conf", .{dir});
+    const bad = try std.mem.print(&pbuf, "{s}/missing/f.conf", .{dir});
     try std.testing.expectError(error.NotFound, writeFileAtomic(bad, "x"));
 }
 
@@ -379,10 +379,10 @@ test "Lumen's files and directories are owner-only" {
     var dbuf: [4096]u8 = undefined;
     const dir = try tmpDirPath(&tmp, &dbuf);
     var pbuf: [4096]u8 = undefined;
-    const sub = try std.fmt.bufPrint(&pbuf, "{s}/cache/lumen", .{dir});
+    const sub = try std.mem.print(&pbuf, "{s}/cache/lumen", .{dir});
     mkdirP(sub);
     var fbuf: [4096]u8 = undefined;
-    const f = try std.fmt.bufPrintSentinel(&fbuf, "{s}/x.idx", .{sub}, 0);
+    const f = try std.mem.printSentinel(&fbuf, "{s}/x.idx", .{sub}, 0);
     try writeFile(f, "data");
     const mode = struct {
         fn of(p: [*:0]const u8) u32 {
@@ -392,9 +392,9 @@ test "Lumen's files and directories are owner-only" {
         }
     }.of;
     var zbuf: [4096]u8 = undefined;
-    try std.testing.expectEqual(@as(u32, 0o700), mode(try std.fmt.bufPrintSentinel(&zbuf, "{s}", .{sub}, 0)));
+    try std.testing.expectEqual(@as(u32, 0o700), mode(try std.mem.printSentinel(&zbuf, "{s}", .{sub}, 0)));
     try std.testing.expectEqual(@as(u32, 0o600), mode(f));
-    _ = linux.chmod(try std.fmt.bufPrintSentinel(&zbuf, "{s}", .{sub}, 0), 0o755);
+    _ = linux.chmod(try std.mem.printSentinel(&zbuf, "{s}", .{sub}, 0), 0o755);
     makePrivate(sub);
-    try std.testing.expectEqual(@as(u32, 0o700), mode(try std.fmt.bufPrintSentinel(&zbuf, "{s}", .{sub}, 0)));
+    try std.testing.expectEqual(@as(u32, 0o700), mode(try std.mem.printSentinel(&zbuf, "{s}", .{sub}, 0)));
 }

@@ -449,7 +449,7 @@ test "save and map give the same index; tombstones stay in memory" {
     var dir_buf: [4096]u8 = undefined;
     const dir = try sys.tmpDirPath(&tmp, &dir_buf);
     var p_buf: [4096]u8 = undefined;
-    const p = try std.fmt.bufPrintSentinel(&p_buf, "{s}/idx", .{dir}, 0);
+    const p = try std.mem.printSentinel(&p_buf, "{s}/idx", .{dir}, 0);
     try s.save(p);
 
     var m = try Store.open(p);
@@ -571,7 +571,7 @@ test "a truncated index file fails to open" {
     var dir_buf: [4096]u8 = undefined;
     const dir = try sys.tmpDirPath(&tmp, &dir_buf);
     var p_buf: [4096]u8 = undefined;
-    const p = try std.fmt.bufPrintSentinel(&p_buf, "{s}/idx", .{dir}, 0);
+    const p = try std.mem.printSentinel(&p_buf, "{s}/idx", .{dir}, 0);
     try sys.writeFile(p, good[0 .. good.len - 5]);
     try testing.expectError(error.BadIndex, Store.open(p));
     try sys.writeFile(p, "not an index at all, just text");

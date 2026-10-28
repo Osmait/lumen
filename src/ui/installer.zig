@@ -37,7 +37,7 @@ const Job = struct {
 
 /// The folder an extension `name` lives in, in `buf`.
 fn extDir(ui: *Ui, buf: []u8, name: []const u8) ?[:0]const u8 {
-    return std.fmt.bufPrintSentinel(buf, "{s}/extensions/{s}", .{ ui.config_dir, name }, 0) catch null;
+    return std.mem.printSentinel(buf, "{s}/extensions/{s}", .{ ui.config_dir, name }, 0) catch null;
 }
 
 /// "https://github.com/me/lumen-weather.git" → "weather".
@@ -63,7 +63,7 @@ pub fn nameFromUrl(buf: []u8, url: []const u8) []const u8 {
 /// A failure: to the caller's stderr (exit 1), or on the selected row.
 fn fail(ui: *Ui, cmdline: ?*c.GApplicationCommandLine, comptime fmt: []const u8, args: anytype) void {
     var buf: [1024]u8 = undefined;
-    const msg = std.fmt.bufPrintSentinel(&buf, fmt, args, 0) catch "failed";
+    const msg = std.mem.printSentinel(&buf, fmt, args, 0) catch "failed";
     const cl = cmdline orelse return note(ui, msg);
     c.g_application_command_line_printerr(cl, "lumen: %s\n", msg.ptr);
     c.g_application_command_line_set_exit_status(cl, 1);
@@ -90,7 +90,7 @@ pub fn install(ui: *Ui, cmdline: ?*c.GApplicationCommandLine, url: []const u8, a
     if (index.sys.info(dir) != null) return fail(ui, cmdline, "{s} already exists: lumen --update {s}, or --as another name", .{ dir, name });
     index.sys.mkdirP(dir[0 .. std.mem.findScalarLast(u8, dir, '/') orelse dir.len]);
     var ubuf: [2048]u8 = undefined;
-    const url_z = std.fmt.bufPrintSentinel(&ubuf, "{s}", .{url}, 0) catch return fail(ui, cmdline, "URL too long", .{});
+    const url_z = std.mem.printSentinel(&ubuf, "{s}", .{url}, 0) catch return fail(ui, cmdline, "URL too long", .{});
     // "--": a URL starting with "-" is not an option.
     var argv = [_:null]?[*:0]const u8{ "git", "clone", "--depth", "1", "--", url_z.ptr, dir.ptr };
     start(ui, cmdline, .install, name, dir, &argv);
@@ -106,7 +106,7 @@ pub fn update(ui: *Ui, cmdline: ?*c.GApplicationCommandLine, name: ?[]const u8) 
         return start(ui, cmdline, .update, n, dir, &argv);
     }
     // Every extension that is a git checkout.
-    const dir = std.fmt.bufPrintSentinel(&dbuf, "{s}/extensions", .{ui.config_dir}, 0) catch return fail(ui, cmdline, "path too long", .{});
+    const dir = std.mem.printSentinel(&dbuf, "{s}/extensions", .{ui.config_dir}, 0) catch return fail(ui, cmdline, "path too long", .{});
     var argv = [_:null]?[*:0]const u8{
         "sh",           "-c",
         \\cd "$1" || exit 1
@@ -184,7 +184,7 @@ fn onDone(_: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) 
     switch (job.kind) {
         .install => {
             var buf: [4200]u8 = undefined;
-            const init = std.fmt.bufPrintSentinel(&buf, "{s}/init.lua", .{job.dirZ()}, 0) catch "";
+            const init = std.mem.printSentinel(&buf, "{s}/init.lua", .{job.dirZ()}, 0) catch "";
             if (index.sys.info(init) == null) {
                 removeTree(job.dirZ());
                 return fail(ui, cmdline, "{s} has no init.lua: it is not a Lumen extension", .{job.nameSlice()});
@@ -207,7 +207,7 @@ fn onDone(_: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) 
 /// Success: to the caller's stdout, or on the selected row.
 fn print(ui: *Ui, cmdline: ?*c.GApplicationCommandLine, comptime fmt: []const u8, args: anytype) void {
     var buf: [8192]u8 = undefined;
-    const msg = std.fmt.bufPrintSentinel(&buf, fmt, args, 0) catch return;
+    const msg = std.mem.printSentinel(&buf, fmt, args, 0) catch return;
     const cl = cmdline orelse return note(ui, msg);
     c.g_application_command_line_print(cl, "%s", msg.ptr);
 }

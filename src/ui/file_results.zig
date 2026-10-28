@@ -55,12 +55,12 @@ pub fn itemsFromHits(ui: *Ui, a: std.mem.Allocator, hits: []const index.ContentS
             .title = labels.displayText(a, h.path[slash + 1 ..]),
             // The list is narrow beside the preview: the folder goes to the
             // detail pane, the name keeps the room.
-            .accessory = std.fmt.allocPrintSentinel(a, "line {d}", .{h.line}, 0) catch "",
+            .accessory = a.printSentinel("line {d}", .{h.line}, 0) catch "",
             .where = labels.homeRelative(a, h.path[0..slash]),
             .fact = (if (h.count > 1)
-                std.fmt.allocPrintSentinel(a, "line {d} · {d}{s} matches", .{ h.line, h.count, if (h.count >= index.content.count_cap) "+" else "" }, 0)
+                a.printSentinel("line {d} · {d}{s} matches", .{ h.line, h.count, if (h.count >= index.content.count_cap) "+" else "" }, 0)
             else
-                std.fmt.allocPrintSentinel(a, "line {d}", .{h.line}, 0)) catch "",
+                a.printSentinel("line {d}", .{h.line}, 0)) catch "",
             .icon = fileIcon(ui, path, false),
             .action = .{ .file = .{ .path = path, .is_dir = false, .line = h.line, .extracted = h.extracted } },
             .detail = h.snippet,
@@ -77,7 +77,7 @@ pub fn contentsHint(ui: *Ui, a: std.mem.Allocator, typed: usize) [:0]const u8 {
     if (typed > 0) return "Type at least 3 characters";
     var buf: [32]u8 = undefined;
     const n = core.calc.formatDisplay(&buf, @floatFromInt(st.docs));
-    return std.fmt.allocPrintSentinel(a, "Search inside {s} files", .{n}, 0) catch "";
+    return a.printSentinel("Search inside {s} files", .{n}, 0) catch "";
 }
 
 // ---------------------------------------------------------------- files
@@ -95,7 +95,7 @@ pub fn fileItems(self: *Ui, a: std.mem.Allocator, q: []const u8, limit: usize) [
         const slash = std.mem.findScalarLast(u8, h.path, '/') orelse 0;
         const where = labels.homeRelative(a, h.path[0..slash]);
         out.append(a, .{
-            .key = std.fmt.allocPrint(a, "file:{s}", .{h.path}) catch "",
+            .key = a.print("file:{s}", .{h.path}) catch "",
             .title = labels.displayText(a, h.path[slash + 1 ..]),
             .subtitle = where,
             .icon = fileIcon(self, path, h.is_dir),
@@ -117,7 +117,7 @@ pub fn fileIcon(ui: *Ui, path: [:0]const u8, is_dir: bool) item_mod.Icon {
         // lumen.icons { ["file:pdf"] = ... }, by extension.
         if (std.mem.findScalarLast(u8, name, '.')) |dot| if (name.len - dot <= 16) {
             var buf: [24]u8 = undefined;
-            const k = std.fmt.bufPrint(&buf, "file:{s}", .{name[dot + 1 ..]}) catch "";
+            const k = std.mem.print(&buf, "file:{s}", .{name[dot + 1 ..]}) catch "";
             if (ui.keyIcon(std.ascii.lowerString(buf[0..k.len], k))) |icon| return icon;
         };
         if (core.file_badge.logoOf(name)) |l| return .{ .logo = l };
@@ -156,5 +156,5 @@ pub fn filesHint(ui: *Ui, a: std.mem.Allocator) [:0]const u8 {
     if (st.entries == 0) return "Indexing your files...";
     var buf: [32]u8 = undefined;
     const n = core.calc.formatDisplay(&buf, @floatFromInt(st.entries));
-    return std.fmt.allocPrintSentinel(a, "Type to search {s} files", .{n}, 0) catch "";
+    return a.printSentinel("Type to search {s} files", .{n}, 0) catch "";
 }

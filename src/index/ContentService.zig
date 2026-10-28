@@ -98,9 +98,9 @@ pub fn startWith(gpa: std.mem.Allocator, io: Io, root: []const u8, cache_dir: []
     errdefer gpa.destroy(s);
     const root_copy = try gpa.dupe(u8, root);
     errdefer gpa.free(root_copy);
-    const cache_path = try std.fmt.allocPrintSentinel(gpa, "{s}/content.idx", .{cache_dir}, 0);
+    const cache_path = try gpa.printSentinel("{s}/content.idx", .{cache_dir}, 0);
     errdefer gpa.free(cache_path);
-    const text_dir = try std.fmt.allocPrint(gpa, "{s}/text", .{cache_dir});
+    const text_dir = try gpa.print("{s}/text", .{cache_dir});
     errdefer gpa.free(text_dir);
     s.* = .{
         .gpa = gpa,
@@ -220,7 +220,7 @@ pub fn search(s: *ContentService, arena: std.mem.Allocator, query: []const u8, l
 /// The file holding a document's text, for verification (see PathFn).
 fn pathOf(ctx: *anyopaque, d: content.DocIn, buf: []u8) ?[:0]const u8 {
     const s: *ContentService = @ptrCast(@alignCast(ctx));
-    if (d.source == .plain) return std.fmt.bufPrintSentinel(buf, "{s}", .{d.path}, 0) catch null;
+    if (d.source == .plain) return std.mem.printSentinel(buf, "{s}", .{d.path}, 0) catch null;
     return s.textPath(buf, d);
 }
 
@@ -233,7 +233,7 @@ pub fn readText(s: *ContentService, arena: std.mem.Allocator, path: []const u8, 
     const p: [:0]const u8 = if (extracted)
         s.textPath(&pbuf, .{ .path = path, .mtime = mtime, .size = 0, .source = .extracted }) orelse return null
     else
-        std.fmt.bufPrintSentinel(&pbuf, "{s}", .{path}, 0) catch return null;
+        std.mem.printSentinel(&pbuf, "{s}", .{path}, 0) catch return null;
     const fd = sys.openRegular(p) catch return null;
     defer sys.close(fd);
     const cap: usize = if (extracted) max_extracted else content.max_text;
@@ -270,7 +270,7 @@ fn textOf(ctx: *anyopaque, d: content.DocIn, buf: *std.ArrayList(u8), gpa: std.m
 }
 
 fn textPath(s: *ContentService, buf: []u8, d: content.DocIn) ?[:0]const u8 {
-    return std.fmt.bufPrintSentinel(buf, "{s}/{x:0>16}-{d}.txt", .{ s.text_dir, std.hash.Wyhash.hash(0, d.path), d.mtime }, 0) catch null;
+    return std.mem.printSentinel(buf, "{s}/{x:0>16}-{d}.txt", .{ s.text_dir, std.hash.Wyhash.hash(0, d.path), d.mtime }, 0) catch null;
 }
 
 /// Extracts what is missing from the text cache, on the background pool
@@ -299,7 +299,7 @@ fn extractMissing(s: *ContentService, docs: []const content.DocIn) void {
             var zbuf: [4096]u8 = undefined;
             const tp = svc.textPath(&tbuf, d) orelse return;
             const kind = extract.kindOf(d.path) orelse return;
-            const src = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{d.path}, 0) catch return;
+            const src = std.mem.printSentinel(&zbuf, "{s}", .{d.path}, 0) catch return;
             const text = extract.extractText(svc.gpa, svc.io, src, kind, max_extracted) catch |err| switch (err) {
                 error.ToolFailed, error.NotRegular, error.Access, error.NotFound => "",
                 else => {
@@ -371,7 +371,7 @@ fn indexedChanges(s: *ContentService, arena: std.mem.Allocator) std.mem.Allocato
         const id: u32 = @intCast(i);
         if (ix.removed(id)) continue;
         const d = ix.docIn(id);
-        const z = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{d.path}, 0) catch continue;
+        const z = std.mem.printSentinel(&zbuf, "{s}", .{d.path}, 0) catch continue;
         const now = content_list.stat(z, d.source == .extracted);
         if (now) |st| if (st.mtime == d.mtime and st.size == d.size) continue;
         try gone.append(arena, id);
@@ -604,7 +604,7 @@ fn setMtime(path: [:0]const u8, sec: i64) !void {
 /// Files in the text cache whose name starts with `prefix`.
 fn countText(s: *ContentService, prefix: []const u8) !usize {
     var buf: [4096]u8 = undefined;
-    const fd = try sys.openDir(try std.fmt.bufPrintSentinel(&buf, "{s}", .{s.text_dir}, 0));
+    const fd = try sys.openDir(try std.mem.printSentinel(&buf, "{s}", .{s.text_dir}, 0));
     defer sys.close(fd);
     var it: sys.DirIter = .{ .fd = fd };
     var n: usize = 0;
@@ -686,14 +686,14 @@ test "content service: a cache it cannot write still serves from memory, and sav
     try f.root.write("a.txt", "an unwritable cache lemur\n");
     // A directory where the index's temporary file goes: writing it fails.
     var bbuf: [4096]u8 = undefined;
-    const blocker = try std.fmt.bufPrintSentinel(&bbuf, "{s}/content.idx.tmp", .{f.cache.abs}, 0);
+    const blocker = try std.mem.printSentinel(&bbuf, "{s}/content.idx.tmp", .{f.cache.abs}, 0);
     try testing.expect(linux.errno(linux.mkdir(blocker, 0o700)) == .SUCCESS);
     const s = try f.start();
     defer s.shutdown();
     try waitChecks(s, 1);
     try testing.expectEqual(@as(usize, 1), (try f.find(s, "lemur")).len);
     var ibuf: [4096]u8 = undefined;
-    const saved = try std.fmt.bufPrintSentinel(&ibuf, "{s}/content.idx", .{f.cache.abs}, 0);
+    const saved = try std.mem.printSentinel(&ibuf, "{s}/content.idx", .{f.cache.abs}, 0);
     try testing.expect(!sys.exists(saved));
     // Writable again: the next check saves it, though nothing changed.
     _ = linux.rmdir(blocker);
@@ -708,7 +708,7 @@ test "content service: with the name index, checks without name changes only loo
     defer f.deinit();
     try f.root.write("a.txt", "first apricot\n");
     var ibuf: [4096]u8 = undefined;
-    const idx = try std.fmt.bufPrintSentinel(&ibuf, "{s}/files.idx", .{f.cache.abs}, 0);
+    const idx = try std.mem.printSentinel(&ibuf, "{s}/files.idx", .{f.cache.abs}, 0);
     const names = try Service.start(testing.allocator, testing.io, f.root.abs, idx);
     defer names.shutdown();
     _ = try Service.waitNames(names, null);
@@ -745,7 +745,7 @@ test "content service: rebuilt whole once removed versions pile up" {
     defer f.deinit();
     for (0..10) |i| {
         var nbuf: [32]u8 = undefined;
-        try f.root.write(try std.fmt.bufPrint(&nbuf, "n{d}.txt", .{i}), "plain words\n");
+        try f.root.write(try std.mem.print(&nbuf, "n{d}.txt", .{i}), "plain words\n");
     }
     const s = try f.startWith(.{ .refresh_every_ns = std.math.maxInt(u64), .poke_min_ns = 0, .max_removed_percent = 20 });
     defer s.shutdown();
@@ -759,7 +759,7 @@ test "content service: rebuilt whole once removed versions pile up" {
     // Three more: 4 removed of 14 is past 20 %, so rebuilt whole.
     for (1..4) |i| {
         var nbuf: [32]u8 = undefined;
-        const name = try std.fmt.bufPrint(&nbuf, "n{d}.txt", .{i});
+        const name = try std.mem.print(&nbuf, "n{d}.txt", .{i});
         try f.root.write(name, "later edit quokka\n");
         try setMtime(try f.root.path(&pbuf, name), sys.nowSeconds() - 50);
     }
@@ -792,7 +792,7 @@ test "content service: Office documents are extracted once per version" {
     const zipDoc = struct {
         fn run(st: *TestTree, out: [:0]const u8, word: []const u8) !void {
             var xbuf: [512]u8 = undefined;
-            try st.write("word/document.xml", try std.fmt.bufPrint(&xbuf,
+            try st.write("word/document.xml", try std.mem.print(&xbuf,
                 \\<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Minutes about the {s} project</w:t></w:r></w:p></w:body></w:document>
             , .{word}));
             _ = linux.unlink(out); // zip would add to an old one
@@ -811,7 +811,7 @@ test "content service: Office documents are extracted once per version" {
     try f.root.write("docs/broken.docx", "garbage, not a zip");
 
     var hash_buf: [32]u8 = undefined;
-    const prefix = try std.fmt.bufPrint(&hash_buf, "{x:0>16}-", .{std.hash.Wyhash.hash(0, report)});
+    const prefix = try std.mem.print(&hash_buf, "{x:0>16}-", .{std.hash.Wyhash.hash(0, report)});
 
     {
         const s = try f.start();
@@ -851,7 +851,7 @@ test "content service: Office documents are extracted once per version" {
         try testing.expectEqual(@as(u32, 2), st.builds);
         try testing.expectEqual(@as(usize, 1), try countText(s, prefix));
         var nbuf: [64]u8 = undefined;
-        const name = try std.fmt.bufPrint(&nbuf, "{s}{d}.txt", .{ prefix, v2 });
+        const name = try std.mem.print(&nbuf, "{s}{d}.txt", .{ prefix, v2 });
         try testing.expectEqual(@as(usize, 1), try countText(s, name));
         try testing.expectEqual(@as(usize, 0), (try f.find(s, "wombat")).len);
         hits = try f.find(s, "platypus");

@@ -24,7 +24,7 @@ const log = std.log.scoped(.ui);
 const labels = @import("labels.zig");
 
 pub fn settingKey(a: std.mem.Allocator, name: []const u8) []const u8 {
-    return std.fmt.allocPrint(a, "set:{s}", .{name}) catch "";
+    return a.print("set:{s}", .{name}) catch "";
 }
 
 pub fn settingsCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
@@ -118,7 +118,7 @@ pub fn choiceOptions(ui: *Ui, a: std.mem.Allocator, ch: settings_mod.Choice) []c
             for (list) |e| if (std.mem.eql(u8, e[0], auto_base)) {
                 auto_name = e[1];
             };
-            out.append(a, .{ .value = "", .label = std.fmt.allocPrintSentinel(a, "Automatic ({s})", .{auto_name}, 0) catch "Automatic" }) catch {};
+            out.append(a, .{ .value = "", .label = a.printSentinel("Automatic ({s})", .{auto_name}, 0) catch "Automatic" }) catch {};
             for (list) |e| if (proc.have(e[0])) out.append(a, .{ .value = e[0], .label = e[1] }) catch {};
             break :blk out.items;
         },
@@ -133,10 +133,10 @@ fn iconThemes(a: std.mem.Allocator) []const Option {
     out.append(a, .{ .value = "", .label = "Automatic (the desktop's)" }) catch return out.items;
     var roots: std.ArrayList([]const u8) = .empty;
     const home = std.mem.span(c.g_get_home_dir());
-    roots.append(a, std.fmt.allocPrint(a, "{s}/.icons", .{home}) catch "") catch {};
-    roots.append(a, std.fmt.allocPrint(a, "{s}/icons", .{std.mem.span(c.g_get_user_data_dir())}) catch "") catch {};
+    roots.append(a, a.print("{s}/.icons", .{home}) catch "") catch {};
+    roots.append(a, a.print("{s}/icons", .{std.mem.span(c.g_get_user_data_dir())}) catch "") catch {};
     var dirs = c.g_get_system_data_dirs();
-    while (dirs[0]) |d| : (dirs += 1) roots.append(a, std.fmt.allocPrint(a, "{s}/icons", .{std.mem.span(d)}) catch "") catch {};
+    while (dirs[0]) |d| : (dirs += 1) roots.append(a, a.print("{s}/icons", .{std.mem.span(d)}) catch "") catch {};
     for (roots.items) |root| {
         const rz = a.dupeSentinel(u8, root, 0) catch continue;
         const dir = c.g_dir_open(rz.ptr, 0, null) orelse continue;
@@ -147,7 +147,7 @@ fn iconThemes(a: std.mem.Allocator) []const Option {
             var dup = false;
             for (out.items) |o| dup = dup or std.mem.eql(u8, o.value, name);
             if (dup) continue;
-            const index_path = std.fmt.allocPrintSentinel(a, "{s}/{s}/index.theme", .{ root, name }, 0) catch continue;
+            const index_path = a.printSentinel("{s}/{s}/index.theme", .{ root, name }, 0) catch continue;
             var buf: [8192]u8 = undefined;
             const text = index.sys.readHead(index_path.ptr, &buf);
             if (std.mem.find(u8, text, "\nDirectories=") == null) continue;
@@ -219,7 +219,7 @@ pub fn chooseCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
             const current = ui.settings.choiceValue(ch, &buf);
             for (choiceOptions(ui, a, ch)) |o| {
                 out.append(a, .{
-                    .key = std.fmt.allocPrint(a, "pick:{s}", .{o.value}) catch "",
+                    .key = a.print("pick:{s}", .{o.value}) catch "",
                     .title = o.label,
                     .accessory = if (std.mem.eql(u8, o.value, current)) "✓" else "",
                     .icon = .{ .tile = .{ .name = "object-select-symbolic", .color = .gray } },
@@ -269,7 +269,7 @@ pub fn appOptions(self: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item), mi
             if (declared.contains(id) != want_declared) continue;
             const idz = a.dupeSentinel(u8, id, 0) catch continue;
             out.append(a, .{
-                .key = std.fmt.allocPrint(a, "pick:{s}", .{id}) catch "",
+                .key = a.print("pick:{s}", .{id}) catch "",
                 .section = if (want_declared) "Recommended" else "Other Apps",
                 .title = app.title,
                 .subtitle = app.subtitle,
@@ -293,7 +293,7 @@ pub fn appName(ui: *Ui, a: std.mem.Allocator, id: []const u8) [:0]const u8 {
 pub fn defaultAppsSummary(ui: *Ui, a: std.mem.Allocator) [:0]const u8 {
     const n = ui.settings.open_with.count();
     if (n == 0) return "System Defaults";
-    return std.fmt.allocPrintSentinel(a, "{d} chosen", .{n}, 0) catch "";
+    return a.printSentinel("{d} chosen", .{n}, 0) catch "";
 }
 
 pub fn defaultAppsCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
@@ -303,10 +303,10 @@ pub fn defaultAppsCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
         const accessory: [:0]const u8 = if (chosen) |id| appName(ui, a, id) else blk: {
             const def = c.g_app_info_get_default_for_type(k.sampleMime(), 0) orelse break :blk "System Default";
             defer c.g_object_unref(def);
-            break :blk std.fmt.allocPrintSentinel(a, "System: {s}", .{c.g_app_info_get_display_name(def) orelse ""}, 0) catch "";
+            break :blk a.printSentinel("System: {s}", .{c.g_app_info_get_display_name(def) orelse ""}, 0) catch "";
         };
         out.append(a, .{
-            .key = std.fmt.allocPrint(a, "kind:{t}", .{k}) catch "",
+            .key = a.print("kind:{t}", .{k}) catch "",
             .section = "File Kinds",
             .title = k.title(),
             .accessory = accessory,
@@ -349,7 +349,7 @@ pub fn themeCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
             out.append(a, themeItem(ui, a, t, if (want_dark) "Dark" else "Light")) catch break;
         }
     }
-    const style_section = std.fmt.allocPrintSentinel(a, "{s} Themes", .{styleTitle(a, ui.settings.style)}, 0) catch "Style Themes";
+    const style_section = a.printSentinel("{s} Themes", .{styleTitle(a, ui.settings.style)}, 0) catch "Style Themes";
     for (themes.custom) |*t| if (t.from_style) out.append(a, themeItem(ui, a, t, style_section)) catch break;
     for (themes.custom) |*t| if (!t.from_style) out.append(a, themeItem(ui, a, t, "Your Themes")) catch break;
     return out.items;
@@ -365,7 +365,7 @@ fn styleCandidates(ui: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item)) voi
         out.append(a, styleItem(a, s.id, s.name, s.description, "Styles", current)) catch return;
     }
     for (custom) |name| {
-        const sub = std.fmt.allocPrintSentinel(a, "~/.config/lumen/styles/{s}", .{name}, 0) catch "";
+        const sub = a.printSentinel("~/.config/lumen/styles/{s}", .{name}, 0) catch "";
         out.append(a, styleItem(a, name, titleOf(a, name), sub, "Custom", current)) catch return;
     }
 }
@@ -395,7 +395,7 @@ fn has(names: []const [:0]const u8, name: []const u8) bool {
 
 fn styleItem(a: std.mem.Allocator, id: []const u8, name: [:0]const u8, description: [:0]const u8, section: [:0]const u8, current: []const u8) Item {
     return .{
-        .key = std.fmt.allocPrint(a, "style:{s}", .{id}) catch "",
+        .key = a.print("style:{s}", .{id}) catch "",
         .section = section,
         .title = name,
         .subtitle = description,
@@ -407,14 +407,14 @@ fn styleItem(a: std.mem.Allocator, id: []const u8, name: [:0]const u8, descripti
 
 /// The folders in ~/.config/lumen/styles, sorted.
 fn customStyles(ui: *Ui, a: std.mem.Allocator) []const [:0]const u8 {
-    const path = std.fmt.allocPrintSentinel(a, "{s}/styles", .{ui.config_dir}, 0) catch return &.{};
+    const path = a.printSentinel("{s}/styles", .{ui.config_dir}, 0) catch return &.{};
     const d = c.g_dir_open(path.ptr, 0, null) orelse return &.{};
     defer c.g_dir_close(d);
     var names: std.ArrayList([:0]const u8) = .empty;
     while (c.g_dir_read_name(d)) |n| {
         const name = std.mem.span(n);
         if (name.len == 0 or name[0] == '.' or !settings_mod.isToken(name)) continue;
-        const full = std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ path, name }, 0) catch continue;
+        const full = a.printSentinel("{s}/{s}", .{ path, name }, 0) catch continue;
         const info = index.sys.info(full) orelse continue;
         if (!info.is_dir) continue;
         names.append(a, a.dupeSentinel(u8, name, 0) catch continue) catch continue;
@@ -429,7 +429,7 @@ fn customStyles(ui: *Ui, a: std.mem.Allocator) []const [:0]const u8 {
 
 fn themeItem(ui: *Ui, a: std.mem.Allocator, t: *const themes.Theme, section: [:0]const u8) Item {
     return .{
-        .key = std.fmt.allocPrint(a, "theme:{s}", .{t.id}) catch "",
+        .key = a.print("theme:{s}", .{t.id}) catch "",
         .section = section,
         .title = t.name,
         .accessory = if (std.mem.eql(u8, ui.settings.theme, t.id)) "✓" else "",

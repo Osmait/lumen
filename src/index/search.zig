@@ -527,13 +527,13 @@ fn synthetic(gpa: std.mem.Allocator, n_dirs: usize) !Store {
     defer dirs.deinit(gpa);
     for (0..n_dirs) |i| {
         var nb: [32]u8 = undefined;
-        const nm = try std.fmt.bufPrint(&nb, "{s}{d}", .{ words[r.uintLessThan(usize, words.len)], i });
+        const nm = try std.mem.print(&nb, "{s}{d}", .{ words[r.uintLessThan(usize, words.len)], i });
         try dirs.append(gpa, try b.push(gpa, nm, root, store_mod.flag_dir, 1));
     }
     for (dirs.items) |d| {
         for (0..40) |_| {
             var nb: [48]u8 = undefined;
-            const nm = try std.fmt.bufPrint(&nb, "{s}_{s}{s}", .{ words[r.uintLessThan(usize, words.len)], words[r.uintLessThan(usize, words.len)], exts[r.uintLessThan(usize, exts.len)] });
+            const nm = try std.mem.print(&nb, "{s}_{s}{s}", .{ words[r.uintLessThan(usize, words.len)], words[r.uintLessThan(usize, words.len)], exts[r.uintLessThan(usize, exts.len)] });
             _ = try b.push(gpa, nm, d, 0, 2);
         }
     }

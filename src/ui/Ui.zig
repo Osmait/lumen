@@ -323,8 +323,8 @@ pub fn build(self: *Ui) void {
     widgets.connect(monitor, "changed", &onAppsChanged, self);
 
     self.loadCss();
-    self.config_dir = std.fmt.allocPrintSentinel(self.gpa, "{s}/lumen", .{std.mem.span(c.g_get_user_config_dir())}, 0) catch "";
-    self.settings_path = std.fmt.allocPrintSentinel(self.gpa, "{s}/settings.conf", .{self.config_dir}, 0) catch "";
+    self.config_dir = self.gpa.printSentinel("{s}/lumen", .{std.mem.span(c.g_get_user_config_dir())}, 0) catch "";
+    self.settings_path = self.gpa.printSentinel("{s}/settings.conf", .{self.config_dir}, 0) catch "";
     self.watchColorScheme();
     self.reloadSettings();
 
@@ -494,7 +494,7 @@ fn scanIconDir(self: *Ui) void {
     widgets.renamed = .empty;
     if (self.icon_arena) |*ar| _ = ar.reset(.retain_capacity) else self.icon_arena = .init(self.gpa);
     const a = self.icon_arena.?.allocator();
-    const dir = std.fmt.allocPrintSentinel(a, "{s}/icons", .{self.config_dir}, 0) catch return;
+    const dir = a.printSentinel("{s}/icons", .{self.config_dir}, 0) catch return;
     const d = c.g_dir_open(dir.ptr, 0, null) orelse return;
     defer c.g_dir_close(d);
     while (c.g_dir_read_name(d)) |n| {
@@ -502,7 +502,7 @@ fn scanIconDir(self: *Ui) void {
         const dot = std.mem.findScalarLast(u8, name, '.') orelse continue;
         const ext = name[dot + 1 ..];
         if (!(std.ascii.eqlIgnoreCase(ext, "svg") or std.ascii.eqlIgnoreCase(ext, "png"))) continue;
-        const path = std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ dir, name }, 0) catch continue;
+        const path = a.printSentinel("{s}/{s}", .{ dir, name }, 0) catch continue;
         widgets.renamed.put(a, a.dupe(u8, name[0..dot]) catch continue, path) catch continue;
     }
 }
@@ -632,7 +632,7 @@ fn applyIconTheme(self: *Ui) void {
     const gs = c.gtk_settings_get_default() orelse return;
     if (self.settings.icon_theme.len == 0) return c.gtk_settings_reset_property(gs, "gtk-icon-theme-name");
     var buf: [128]u8 = undefined;
-    const name = std.fmt.bufPrintSentinel(&buf, "{s}", .{self.settings.icon_theme}, 0) catch return;
+    const name = std.mem.printSentinel(&buf, "{s}", .{self.settings.icon_theme}, 0) catch return;
     c.g_object_set(gs, "gtk-icon-theme-name", name.ptr, @as(?*anyopaque, null));
 }
 
@@ -701,14 +701,14 @@ fn appendStyleCss(self: *Ui, w: *std.Io.Writer) std.Io.Writer.Error!void {
     const name = self.settings.style;
     if (name.len == 0) return;
     var buf: [4096]u8 = undefined;
-    const dir = std.fmt.bufPrintSentinel(&buf, "{s}/styles/{s}", .{ self.config_dir, name }, 0) catch return;
+    const dir = std.mem.printSentinel(&buf, "{s}/styles/{s}", .{ self.config_dir, name }, 0) catch return;
     if (index.sys.info(dir) == null) {
         const s = styles.find(name) orelse return;
         try w.print("\n/* style {s} */\n", .{name});
         return w.writeAll(s.css);
     }
     var pbuf: [4096]u8 = undefined;
-    const path = std.fmt.bufPrintSentinel(&pbuf, "{s}/style.css", .{dir}, 0) catch return;
+    const path = std.mem.printSentinel(&pbuf, "{s}/style.css", .{dir}, 0) catch return;
     self.style_css_stamp = settings_mod.Stamp.of(path.ptr);
     var contents: ?[*:0]u8 = null;
     var len: usize = 0;
@@ -723,7 +723,7 @@ fn appendStyleCss(self: *Ui, w: *std.Io.Writer) std.Io.Writer.Error!void {
 /// classes it can use are listed in EXTENSIONS.md.
 fn appendUserCss(self: *Ui, w: *std.Io.Writer) std.Io.Writer.Error!void {
     var buf: [4096]u8 = undefined;
-    const path = std.fmt.bufPrintSentinel(&buf, "{s}/style.css", .{self.config_dir}, 0) catch return;
+    const path = std.mem.printSentinel(&buf, "{s}/style.css", .{self.config_dir}, 0) catch return;
     self.user_css_stamp = settings_mod.Stamp.of(path.ptr);
     var contents: ?[*:0]u8 = null;
     var len: usize = 0;
@@ -736,10 +736,10 @@ fn appendUserCss(self: *Ui, w: *std.Io.Writer) std.Io.Writer.Error!void {
 
 fn userCssChanged(self: *Ui) bool {
     var buf: [4096]u8 = undefined;
-    const path = std.fmt.bufPrintSentinel(&buf, "{s}/style.css", .{self.config_dir}, 0) catch return false;
+    const path = std.mem.printSentinel(&buf, "{s}/style.css", .{self.config_dir}, 0) catch return false;
     if (!settings_mod.Stamp.of(path.ptr).eql(self.user_css_stamp)) return true;
     if (self.settings.style.len == 0) return false;
-    const style = std.fmt.bufPrintSentinel(&buf, "{s}/styles/{s}/style.css", .{ self.config_dir, self.settings.style }, 0) catch return false;
+    const style = std.mem.printSentinel(&buf, "{s}/styles/{s}/style.css", .{ self.config_dir, self.settings.style }, 0) catch return false;
     return !settings_mod.Stamp.of(style.ptr).eql(self.style_css_stamp);
 }
 
@@ -769,7 +769,7 @@ fn onColorScheme(_: *c.GSettings, _: [*:0]const u8, data: ?*anyopaque) callconv(
 }
 
 pub fn setReselect(self: *Ui, comptime fmt: []const u8, args: anytype) void {
-    const k = std.fmt.bufPrint(&self.reselect, fmt, args) catch "";
+    const k = std.mem.print(&self.reselect, fmt, args) catch "";
     self.reselect_len = k.len;
 }
 
@@ -1011,7 +1011,7 @@ pub fn setView(self: *Ui, view: View) void {
     // lumen.layout's placeholder: "Go…" at the root, "<view>…" elsewhere.
     const custom: ?[*:0]const u8 = if (self.layout.placeholder.len == 0) null else if (view == .root)
         self.layout.placeholder.ptr
-    else if (std.fmt.bufPrintSentinel(&placeholder_buf, "{s}…", .{std.mem.span(self.viewTitle())}, 0)) |t| t.ptr else |_| "…";
+    else if (std.mem.printSentinel(&placeholder_buf, "{s}…", .{std.mem.span(self.viewTitle())}, 0)) |t| t.ptr else |_| "…";
     c.gtk_text_set_placeholder_text(@ptrCast(self.entry), custom orelse switch (view) {
         .root => "Search for apps and commands...",
         .clipboard => "Type to filter entries...",
@@ -1073,7 +1073,7 @@ fn windowCandidates(self: *Ui, a: std.mem.Allocator) []Item {
         out.append(a, .{
             .title = labels.displayText(a, if (cl.title.len > 0) cl.title else cl.class),
             .subtitle = labels.displayText(a, cl.class),
-            .accessory = std.fmt.allocPrintSentinel(a, "Workspace {s}", .{cl.workspace.name}, 0) catch "",
+            .accessory = a.printSentinel("Workspace {s}", .{cl.workspace.name}, 0) catch "",
             .icon = icon,
             .action = .{ .focus_window = a.dupeSentinel(u8, cl.address, 0) catch continue },
         }) catch break;
@@ -1390,7 +1390,7 @@ fn buildPending(self: *Ui, n: usize) void {
         .section => |t| self.buildSection(t),
     };
     // What is left moves to the front.
-    std.mem.copyForwards(Pending, self.pending.items, self.pending.items[k..]);
+    @memmove(self.pending.items[0 .. self.pending.items.len - k], self.pending.items[k..]);
     self.pending.items.len -= k;
 }
 
@@ -1519,7 +1519,7 @@ fn setHint(self: *Ui, text: []const u8, warn: bool) void {
     // Beside the detail pane the list is narrow: the action's name would
     // squeeze the title to a few letters, so only the key shows there.
     const narrow = c.gtk_widget_get_visible(self.detail) != 0;
-    const shown = if (warn) text else if (narrow) "↵" else std.fmt.allocPrint(self.query_arena.allocator(), "{s}  ↵", .{text}) catch return;
+    const shown = if (warn) text else if (narrow) "↵" else self.query_arena.allocator().print("{s}  ↵", .{text}) catch return;
     const z = self.query_arena.allocator().dupeSentinel(u8, shown, 0) catch return;
     c.gtk_label_set_text(@ptrCast(h), z.ptr);
     if (warn) c.gtk_widget_add_css_class(h, "warn") else c.gtk_widget_remove_css_class(h, "warn");
@@ -1641,7 +1641,7 @@ pub fn performEntry(self: *Ui, e: item_mod.Entry) void {
 pub fn needsConfirm(self: *Ui, it: *const Item) bool {
     if (std.mem.eql(u8, self.confirm_key, it.key)) return false;
     self.confirm_key = it.key;
-    self.primary = std.fmt.allocPrintSentinel(self.query_arena.allocator(), "Press ↵ again to {s}", .{it.title}, 0) catch return true;
+    self.primary = self.query_arena.allocator().printSentinel("Press ↵ again to {s}", .{it.title}, 0) catch return true;
     self.setHint(self.primary, true);
     return true;
 }
@@ -1838,7 +1838,7 @@ fn emptyText(self: *Ui, a: std.mem.Allocator) [:0]const u8 {
     if (self.view == .contents and q.len < 3) return file_results.contentsHint(self, a, q.len);
     if (self.view == .contents and self.content_pending) return "Searching...";
     if (self.view == .contents) if (self.content_result) |r| if (r.err) |err|
-        return std.fmt.allocPrintSentinel(a, "Content search failed ({t})", .{err}, 0) catch "Content search failed";
+        return a.printSentinel("Content search failed ({t})", .{err}, 0) catch "Content search failed";
     if (self.view == .clipboard and q.len == 0 and !self.settings.clipboard) return "Clipboard history is off: turn it on in Settings";
     if (self.view == .ext) return ext_view.emptyText(self, a, q);
     if (self.view == .dmenu) return dmenu.emptyText(self);

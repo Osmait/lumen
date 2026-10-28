@@ -26,7 +26,7 @@ pub fn install(L: *lua.State, e: *Host.Ext) void {
     // require("x") finds x.lua and x/init.lua in the extension's folder.
     _ = c.lua_getglobal(L, "package");
     var buf: [4200]u8 = undefined;
-    const path = std.fmt.bufPrintSentinel(&buf, "{s}/?.lua;{s}/?/init.lua", .{ e.dir, e.dir }, 0) catch lua.raise(L, "extension path too long", .{});
+    const path = std.mem.printSentinel(&buf, "{s}/?.lua;{s}/?/init.lua", .{ e.dir, e.dir }, 0) catch lua.raise(L, "extension path too long", .{});
     _ = c.lua_pushstring(L, path.ptr);
     c.lua_setfield(L, -2, "path");
     c.lua_settop(L, -2);
@@ -360,7 +360,7 @@ fn set(L: *lua.State) lua.Error!c_int {
         const value: []const u8 = switch (c.lua_type(L, -1)) {
             c.LUA_TBOOLEAN => if (c.lua_toboolean(L, -1) != 0) "true" else "false",
             c.LUA_TSTRING => lua.toSlice(L, -1).?,
-            c.LUA_TNUMBER => std.fmt.bufPrint(&buf, "{d}", .{c.lua_tointegerx(L, -1, null)}) catch "",
+            c.LUA_TNUMBER => std.mem.print(&buf, "{d}", .{c.lua_tointegerx(L, -1, null)}) catch "",
             else => return lua.fail(L, "lumen.set: {s} cannot be a {s}", .{ key, lua.typeName(L, -1) }),
         };
         switch (Settings.check(key, value)) {
@@ -456,7 +456,7 @@ fn icons(L: *lua.State) lua.Error!c_int {
         const icon = Host.parseIcon(L, a, -1, "lumen.icons") orelse return lua.fail(L, "lumen.icons: no icon for {s}", .{key});
         // "app:firefox" means firefox.desktop.
         const full = if (std.mem.startsWith(u8, key, "app:") and !std.mem.endsWith(u8, key, ".desktop"))
-            std.fmt.allocPrintSentinel(a, "{s}.desktop", .{key}, 0)
+            a.printSentinel("{s}.desktop", .{key}, 0)
         else
             a.dupeSentinel(u8, key, 0);
         load.icons.append(a, .{ .key = full catch return lua.fail(L, "not enough memory", .{}), .icon = icon }) catch
