@@ -392,19 +392,11 @@ pub fn perform(ui: *Ui, index_: u8) void {
 /// files, Default Apps included.
 fn open(ui: *Ui, target: [:0]const u8) void {
     if (std.mem.find(u8, target, "://") != null or std.mem.startsWith(u8, target, "mailto:")) {
-        const lctx = c.gdk_display_get_app_launch_context(
-            c.gdk_display_get_default() orelse return,
-        );
+        const lctx = proc.launchContext() orelse return;
         defer c.g_object_unref(lctx);
         var err: ?*c.GError = null;
-        if (c.g_app_info_launch_default_for_uri(
-            target.ptr,
-            @ptrCast(lctx),
-            &err,
-        ) == 0) if (err) |e| {
-            log.warn("open {s}: {s}", .{ target, e.message });
-            c.g_error_free(e);
-        };
+        if (c.g_app_info_launch_default_for_uri(target.ptr, lctx, &err) == 0)
+            proc.warnError(.ext, err, "open {s}", .{target});
         return;
     }
     var buf: [4096]u8 = undefined;

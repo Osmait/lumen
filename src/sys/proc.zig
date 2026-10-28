@@ -120,10 +120,27 @@ const Argv = struct {
 };
 
 fn logError(what: []const u8, prog: []const u8, err: ?*c.GError) void {
-    if (err) |e| {
-        log.warn("{s} {s}: {s}", .{ what, prog, e.message });
-        c.g_error_free(e);
-    }
+    warnError(.proc, err, "{s} {s}", .{ what, prog });
+}
+
+/// Logs a GError, if there is one, as a warning under `scope` ("<what>:
+/// <its message>"), and frees it.
+pub fn warnError(
+    comptime scope: @TypeOf(.enum_literal),
+    err: ?*c.GError,
+    comptime what: []const u8,
+    args: anytype,
+) void {
+    const e = err orelse return;
+    defer c.g_error_free(e);
+    std.log.scoped(scope).warn(what ++ ": {s}", args ++ .{e.message});
+}
+
+/// The display's context for launching apps (startup notification, the
+/// right screen); null without a display. The caller unrefs it.
+pub fn launchContext() ?*c.GAppLaunchContext {
+    const display = c.gdk_display_get_default() orelse return null;
+    return @ptrCast(c.gdk_display_get_app_launch_context(display));
 }
 
 test "argv longer than the buffer is refused, not overflowed" {

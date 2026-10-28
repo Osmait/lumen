@@ -31,6 +31,7 @@ pub const std_options: std.Options = .{
 };
 
 const log = std.log.scoped(.main);
+const proc = @import("sys/proc.zig");
 
 // The daemon's state, reached from GLib callbacks; main thread only.
 var ui: Ui = undefined;
@@ -457,10 +458,7 @@ fn startClipboardWatcher() void {
         &watcher_pid,
         &err,
     ) == 0) {
-        if (err) |e| {
-            log.warn("clipboard watcher: {s}", .{e.message});
-            c.g_error_free(e);
-        }
+        proc.warnError(.main, err, "clipboard watcher", .{});
         return;
     }
     watcher_started_ns = stats.now();

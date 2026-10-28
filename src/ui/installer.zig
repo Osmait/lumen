@@ -14,6 +14,7 @@ const Ui = @import("Ui.zig");
 const ext_view = @import("ext_view.zig");
 
 const log = std.log.scoped(.install);
+const proc = @import("../sys/proc.zig");
 
 const Kind = enum { install, update, uninstall };
 
@@ -305,10 +306,7 @@ fn removeTree(dir: [:0]const u8) void {
         null,
         &err,
     ) == 0) {
-        if (err) |e| {
-            log.warn("rm {s}: {s}", .{ dir, e.message });
-            c.g_error_free(e);
-        }
+        proc.warnError(.install, err, "rm {s}", .{dir});
     }
 }
 

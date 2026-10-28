@@ -62,10 +62,7 @@ pub fn perform(ctx: Ctx, it: *const Item, op: item_mod.Op) Outcome {
             defer c.g_object_unref(f);
             var err: ?*c.GError = null;
             if (c.g_file_trash(f, null, &err) == 0) {
-                if (err) |e| {
-                    log.warn("trash {s}: {s}", .{ it.action.file.path, e.message });
-                    c.g_error_free(e);
-                }
+                proc.warnError(.actions, err, "trash {s}", .{it.action.file.path});
                 return .{ .failed = "Could not move it to the trash" };
             }
             return .refresh_view;
@@ -157,9 +154,11 @@ pub fn openFile(ctx: Ctx, path: [:0]const u8, is_dir: bool) void {
     }
     const uri = c.g_filename_to_uri(path, null, null) orelse return;
     defer c.g_free(uri);
-    const lctx = c.gdk_display_get_app_launch_context(c.gdk_display_get_default() orelse return);
+    const lctx = proc.launchContext() orelse return;
     defer c.g_object_unref(lctx);
-    _ = c.g_app_info_launch_default_for_uri(uri, @ptrCast(lctx), null);
+    var err: ?*c.GError = null;
+    if (c.g_app_info_launch_default_for_uri(uri, lctx, &err) == 0)
+        proc.warnError(.actions, err, "open {s}", .{path});
 }
 
 /// Opens `path` with the app whose desktop file id is `app_id`; false when
@@ -171,17 +170,11 @@ pub fn openWith(path: [:0]const u8, app_id: [:0]const u8) bool {
     defer c.g_free(uri);
     const uris = c.g_list_append(null, uri);
     defer c.g_list_free(uris);
-    const lctx = c.gdk_display_get_app_launch_context(
-        c.gdk_display_get_default() orelse return false,
-    );
+    const lctx = proc.launchContext() orelse return false;
     defer c.g_object_unref(lctx);
     var err: ?*c.GError = null;
-    if (c.g_app_info_launch_uris(@ptrCast(dai), uris, @ptrCast(lctx), &err) == 0) {
-        if (err) |e| {
-            log.warn("open with {s}: {s}", .{ app_id, e.message });
-            c.g_error_free(e);
-        }
-    }
+    if (c.g_app_info_launch_uris(@ptrCast(dai), uris, lctx, &err) == 0)
+        proc.warnError(.actions, err, "open with {s}", .{app_id});
     return true;
 }
 
@@ -317,15 +310,10 @@ fn copyFile(ctx: Ctx, path: [:0]const u8) void {
 }
 
 fn launch(info: *c.GAppInfo) void {
-    const ctx = c.gdk_display_get_app_launch_context(c.gdk_display_get_default() orelse return);
+    const ctx = proc.launchContext() orelse return;
     defer c.g_object_unref(ctx);
     var err: ?*c.GError = null;
-    if (c.g_app_info_launch(info, null, @ptrCast(ctx), &err) == 0) {
-        if (err) |e| {
-            log.warn("launch: {s}", .{e.message});
-            c.g_error_free(e);
-        }
-    }
+    if (c.g_app_info_launch(info, null, ctx, &err) == 0) proc.warnError(.actions, err, "launch", .{});
 }
 
 fn focusWindow(ctx: Ctx, it: *const Item) void {
