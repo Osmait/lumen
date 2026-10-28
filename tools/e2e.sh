@@ -289,6 +289,7 @@ expect_not "password-manager copies are skipped" 'secret'
 query clipboard "42"
 expect "clipboard filter" '> e2e clipboard entry 42'
 expect "clipboard detail" 'Characters = 22'
+expect "a filtered entry keeps its copy time" 'Copied = Today'
 
 echo "windows"
 L --view windows; sleep 0.2
@@ -458,7 +459,14 @@ L --key enter; sleep 0.2
 expect "preferences view" '> Loud Fruit .*\| Off'
 L --key enter; sleep 0.5
 expect "toggling a preference" '> Loud Fruit .*\| On'
-grep -q '"loud": true' "$T/data/lumen/extensions/fixture/preferences.json" && ok "preference saved" || ko "preference saved" "$(cat "$T/data/lumen/extensions/fixture/preferences.json" 2>&1)"
+PF="$T/data/lumen/extensions/fixture/preferences.json"
+grep -q '"loud": true' "$PF" && ok "preference saved" || ko "preference saved" "$(cat "$PF" 2>&1)"
+# A file it cannot read is never written over (it held every other value).
+printf 'not json, but somebody else'"'"'s values' >"$PF"
+L --key enter; sleep 0.3
+expect "an unreadable preferences file is reported" '^primary: Could not read the preferences file'
+grep -q 'somebody else' "$PF" && ok "an unreadable preferences file is kept" || ko "an unreadable preferences file is kept" "$(cat "$PF" 2>&1)"
+printf '{\n  "loud": true\n}\n' >"$PF"
 query root "search files"
 expect "lumen.icons replaces a command's icon" 'Search Files \| Lumen \| Command \| emoji:🗂️'
 query root "kitty e2e"

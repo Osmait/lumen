@@ -69,8 +69,9 @@ pub const Settings = struct {
     open_with: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
     /// `key = value` lines this version does not know, kept as they were.
     unknown: std.ArrayList([]const u8) = .empty,
-    /// Memory ran out while reading the file: some of it is missing here,
-    /// so `save` refuses to write this back over it.
+    /// Memory ran out while reading the file, or it was longer than what was
+    /// read: some of it is missing here, so `save` refuses to write this
+    /// back over it.
     incomplete: bool = false,
 
     pub fn init(gpa: std.mem.Allocator) Settings {
@@ -322,7 +323,12 @@ pub const Settings = struct {
     /// Reads `path`; a missing or unreadable file gives the defaults.
     pub fn load(gpa: std.mem.Allocator, path: [*:0]const u8) Settings {
         var buf: [64 * 1024]u8 = undefined;
-        return parse(gpa, sys.readHead(path, &buf));
+        const text = sys.readHead(path, &buf);
+        var s = parse(gpa, text);
+        // Filled up: the file goes on past what was read, and saving would
+        // cut it there.
+        if (text.len == buf.len) s.incomplete = true;
+        return s;
     }
 
     pub const SaveError = sys.Error || std.Io.Writer.Error || error{Incomplete};

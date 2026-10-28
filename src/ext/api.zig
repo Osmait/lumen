@@ -202,13 +202,17 @@ fn execFn(L: *lua.State) lua.Error!c_int {
         } });
         return 2;
     };
-    defer r.deinit(e.gpa());
+    // Freed before anything is pushed outside tryCall: a push can raise (the
+    // memory cap) and a raise skips defers (lua.zig), leaking the output.
     if (r.timed_out) {
+        r.deinit(e.gpa());
         c.lua_pushnil(L);
         lua.pushFmt(L, "lumen.exec: {s} timed out", .{argv[0]});
         return 2;
     }
-    if (!lua.tryCall(L, exec.Result, &r, pushExec, 0, 3)) return error.Raise;
+    const pushed = lua.tryCall(L, exec.Result, &r, pushExec, 0, 3);
+    r.deinit(e.gpa());
+    if (!pushed) return error.Raise;
     return 3;
 }
 

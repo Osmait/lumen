@@ -64,7 +64,7 @@ pub fn itemsFromHits(ui: *Ui, a: std.mem.Allocator, hits: []const index.ContentS
             .icon = fileIcon(ui, path, false),
             .action = .{ .file = .{ .path = path, .is_dir = false, .line = h.line, .extracted = h.extracted } },
             .detail = h.snippet,
-            .score = std.math.lossyCast(i32, h.mtime),
+            .time_s = h.mtime,
         }) catch break;
     }
     return out.items;

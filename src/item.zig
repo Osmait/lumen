@@ -181,6 +181,10 @@ pub const Item = struct {
     /// Section header above the row in lists grouped by section.
     section: [:0]const u8 = "",
     score: i32 = 0,
+    /// When it was copied or last changed, in Unix seconds (0: unknown).
+    /// Apart from `score`: filtering rewrites the score, and the clipboard
+    /// detail then dated copies to 1969.
+    time_s: i64 = 0,
 };
 
 pub const Op = enum {

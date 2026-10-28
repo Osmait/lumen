@@ -242,5 +242,5 @@ pub fn showDetail(ui: *Ui, it: ?*const Item) void {
     while (tok.next()) |_| words += 1;
     c.gtk_label_set_text(@ptrCast(ui.meta_values[1]), (std.fmt.allocPrintSentinel(a, "{d}", .{chars}, 0) catch return).ptr);
     c.gtk_label_set_text(@ptrCast(ui.meta_values[2]), (std.fmt.allocPrintSentinel(a, "{d}", .{words}, 0) catch return).ptr);
-    c.gtk_label_set_text(@ptrCast(ui.meta_values[3]), labels.formatWhen(a, i.score).ptr);
+    c.gtk_label_set_text(@ptrCast(ui.meta_values[3]), labels.formatWhen(a, i.time_s).ptr);
 }

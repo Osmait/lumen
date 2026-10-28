@@ -51,6 +51,16 @@ All notable changes are listed here. The format follows
   of ~58 ms, and each copy
   into the clipboard history no longer starts a GTK process. Install both
   files (see the README).
+- Fixed: window actions ran twice (a toggle undid itself).
+- Fixed: filtering the clipboard history dated the entries to 1969.
+- Fixed: saving an extension preference over a preferences.json Lumen
+  could not read (damaged, or over 64 KB) erased the other values; it now
+  refuses and says so. A settings.conf over 64 KB is no longer cut when
+  saved.
+- Fixed: an extension that removed a row's actions from inside an action
+  could crash Lumen when the action was pressed again.
+- Fixed: text extraction (PDF, Office) and `lumen.exec` could wait for a
+  program past their deadline once it had closed its output.
 - Smaller things on the paths taken most: the clipboard history trims
   through its index (it scanned the whole table on every copy), usage
   counts that decayed to nothing are forgotten at start (every file opened

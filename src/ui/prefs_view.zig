@@ -144,13 +144,33 @@ pub fn display(a: std.mem.Allocator, p: *const Host.Pref, value: []const u8) [:0
 }
 
 /// The saved value as text ("true"/"false" for toggles), else the default.
+/// An extension's preferences.json: absent is empty; anything else that
+/// does not read as one JSON object is `unreadable`, never treated as empty
+/// (saving over it would lose every other value).
+const Stored = union(enum) { absent, unreadable, values: std.json.ObjectMap };
+
+/// Larger is not a preferences file Lumen wrote.
+const prefs_bytes_max = 1 << 20;
+
+fn readStored(arena: std.mem.Allocator, file: [:0]const u8) Stored {
+    if (index.sys.info(file.ptr) == null) return .absent;
+    var contents: ?[*:0]u8 = null;
+    var len: usize = 0;
+    if (c.g_file_get_contents(file.ptr, &contents, &len, null) == 0) return .unreadable;
+    defer c.g_free(contents);
+    if (len > prefs_bytes_max) return .unreadable;
+    const text = contents.?[0..len];
+    if (std.mem.trim(u8, text, " \t\r\n").len == 0) return .absent;
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{ .allocate = .alloc_always }) catch return .unreadable;
+    return if (v == .object) .{ .values = v.object } else .unreadable;
+}
+
 pub fn current(a: std.mem.Allocator, p: *const Host.Pref) []const u8 {
-    const buf = a.alloc(u8, 64 * 1024) catch return p.default;
-    const text = index.sys.readHead(p.file.ptr, buf);
-    if (text.len == 0) return p.default;
-    const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch return p.default;
-    if (parsed != .object) return p.default;
-    const v = parsed.object.get(p.name) orelse return p.default;
+    const stored = switch (readStored(a, p.file)) {
+        .values => |o| o,
+        .absent, .unreadable => return p.default,
+    };
+    const v = stored.get(p.name) orelse return p.default;
     return switch (v) {
         .bool => |b| if (b) "true" else "false",
         .string => |s| s,
@@ -169,7 +189,8 @@ pub fn edit(ui: *Ui, i: u16) void {
     const value = current(arena.allocator(), p);
     switch (p.kind) {
         .toggle => {
-            save(ui, p, .{ .bool = !std.mem.eql(u8, value, "true") });
+            // Not saved: the row keeps saying why.
+            if (!save(ui, p, .{ .bool = !std.mem.eql(u8, value, "true") })) return;
             ui.setReselect("pref:{s}", .{p.name});
             ui.rebuild();
         },
@@ -210,7 +231,7 @@ pub fn choiceCandidates(ui: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item)
 pub fn pick(ui: *Ui, i: u16, value: []const u8) void {
     const reg = ui.ext_registry orelse return;
     if (i >= reg.prefs.len) return;
-    save(ui, &reg.prefs[i], .{ .string = value });
+    if (!save(ui, &reg.prefs[i], .{ .string = value })) return;
     ui.goBack();
 }
 
@@ -252,31 +273,42 @@ pub fn inputCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
 pub fn saveInput(ui: *Ui) void {
     const p = inputPref(ui) orelse return;
     switch (ui.input) {
-        .pref => save(ui, p, .{ .string = ui.query() }),
+        .pref => if (!save(ui, p, .{ .string = ui.query() })) return,
         .field => |i| form_view.setValue(ui, i, ui.query()),
     }
     ui.goBack();
 }
 
 /// Writes one value into the extension's preferences.json (atomically,
-/// owner-only), then reloads the extensions so Lua sees it.
-fn save(ui: *Ui, p: *const Host.Pref, value: std.json.Value) void {
+/// owner-only), then reloads the extensions so Lua sees it. False when it
+/// was not saved; the selected row says why.
+fn save(ui: *Ui, p: *const Host.Pref, value: std.json.Value) bool {
     var arena: std.heap.ArenaAllocator = .init(ui.gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    const buf = a.alloc(u8, 64 * 1024) catch return;
-    const text = index.sys.readHead(p.file.ptr, buf);
-    var obj: std.json.ObjectMap = .empty;
-    if (text.len > 0) if (std.json.parseFromSliceLeaky(std.json.Value, a, text, .{})) |v| {
-        if (v == .object) obj = v.object;
-    } else |_| {};
-    obj.put(a, p.name, value) catch return;
-    const json = std.json.Stringify.valueAlloc(a, std.json.Value{ .object = obj }, .{ .whitespace = .indent_2 }) catch return;
+    var obj: std.json.ObjectMap = switch (readStored(a, p.file)) {
+        .absent => .empty,
+        .values => |o| o,
+        .unreadable => {
+            log.warn("{s}: not a JSON object Lumen can read; not overwritten", .{p.file});
+            ui.showFailure("Could not read the preferences file");
+            return false;
+        },
+    };
+    obj.put(a, p.name, value) catch {
+        ui.showFailure("Could not save the setting");
+        return false;
+    };
+    const json = std.json.Stringify.valueAlloc(a, std.json.Value{ .object = obj }, .{ .whitespace = .indent_2 }) catch {
+        ui.showFailure("Could not save the setting");
+        return false;
+    };
     if (std.mem.findScalarLast(u8, p.file, '/')) |s| index.sys.mkdirP(p.file[0..s]);
     index.sys.writeFileAtomic(p.file, json) catch |err| {
         log.warn("{s}: {t}", .{ p.file, err });
         ui.showFailure("Could not save the setting");
-        return;
+        return false;
     };
     if (ui.ext_host) |h| h.reload();
+    return true;
 }

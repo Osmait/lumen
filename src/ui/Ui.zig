@@ -1056,7 +1056,7 @@ fn clipCandidates(self: *Ui, a: std.mem.Allocator) []Item {
             .icon = .{ .tile = .{ .name = "edit-copy-symbolic", .color = .gray } },
             .action = .{ .clip = clip.id },
             .detail = clip.content,
-            .score = std.math.lossyCast(i32, clip.last_copied),
+            .time_s = clip.last_copied,
         }) catch break;
     }
     return out.items;
@@ -1322,8 +1322,7 @@ fn fillFiltered(self: *Ui, a: std.mem.Allocator, q: []const u8, by_day: bool) vo
             const today = labels.startOfToday();
             var last: ?[:0]const u8 = null;
             for (self.base) |it| {
-                // `score` holds the last-copied time until a query re-scores.
-                const section: [:0]const u8 = if (it.score >= today) "Today" else if (it.score >= today - 86400) "Yesterday" else "Earlier";
+                const section: [:0]const u8 = if (it.time_s >= today) "Today" else if (it.time_s >= today - std.time.s_per_day) "Yesterday" else "Earlier";
                 if (last == null or !std.mem.eql(u8, last.?, section)) {
                     self.addSection(section);
                     last = section;

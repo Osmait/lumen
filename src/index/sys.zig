@@ -307,6 +307,19 @@ pub fn tmpDirPath(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
     return std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 }
 
+/// Waits for child `pid` to exit, until `deadline_ns` (monotonic): true when
+/// it did (it is left to be reaped). Without a pidfd (old kernel, no free
+/// descriptor) it does not wait: false, so the caller kills it, and
+/// reaping a killed child cannot hang.
+pub fn waitExit(pid: linux.pid_t, deadline_ns: u64) bool {
+    const fd = linux.pidfd_open(pid, 0);
+    if (linux.errno(fd) != .SUCCESS) return false;
+    defer close(@intCast(fd));
+    const left_ns = deadline_ns -| monotonicNs();
+    const left_ms: i32 = @intCast(@min(left_ns / std.time.ns_per_ms, std.math.maxInt(i32)));
+    return waitReadable(@intCast(fd), left_ms);
+}
+
 /// Waits until `fd` is readable (true) or `wake` is written (false). Without
 /// `wake` (-1), it gives up every 100 ms so the caller can look around.
 pub fn waitEvents(fd: i32, wake: i32) bool {

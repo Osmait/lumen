@@ -114,7 +114,9 @@ fn runTool(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, input: 
         }
     } else false;
 
-    if (!finished) {
+    // Its output is closed, but it may live on: no waiting past the deadline
+    // for its exit either.
+    if (!finished or !sys.waitExit(child.id.?, deadline)) {
         // Cap or timeout: stop it now, even if it ignores SIGTERM.
         _ = linux.kill(child.id.?, .KILL);
         child.kill(io);
@@ -650,6 +652,11 @@ test "runTool: size cap and timeout kill the tool" {
     const t0 = sys.monotonicNs();
     try testing.expectError(error.Timeout, runTool(gpa, testing.io, &.{ "sh", "-c", "exec sleep 30" }, in, 1000, &.{0}, 200));
     try testing.expect(sys.monotonicNs() - t0 < 5 * std.time.ns_per_s);
+
+    // Its output closed, alive: not waited for past the limit either.
+    const t1 = sys.monotonicNs();
+    try testing.expectError(error.Timeout, runTool(gpa, testing.io, &.{ "sh", "-c", "exec >&-; exec sleep 30" }, in, 1000, &.{0}, 200));
+    try testing.expect(sys.monotonicNs() - t1 < 5 * std.time.ns_per_s);
 
     // Output, then stuck: what came out is kept.
     const partial = try runTool(gpa, testing.io, &.{ "sh", "-c", "echo hi; exec sleep 30" }, in, 1000, &.{0}, 200);

@@ -125,15 +125,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, opts: O
 
     // Both outputs closed, but the program may live on (it closed them, or
     // a background child holds them): wait for its exit up to the deadline.
-    if (!timed_out) {
-        const pidfd = linux.pidfd_open(child.id.?, 0);
-        if (linux.errno(pidfd) == .SUCCESS) {
-            defer _ = linux.close(@intCast(pidfd));
-            const left = opts.deadline_ns -| index.sys.monotonicNs();
-            const left_ms: i32 = @intCast(@min(left / std.time.ns_per_ms, std.math.maxInt(i32)));
-            if (!index.sys.waitReadable(@intCast(pidfd), left_ms)) timed_out = true;
-        }
-    }
+    if (!timed_out and !index.sys.waitExit(child.id.?, opts.deadline_ns)) timed_out = true;
     var code: ?u8 = null;
     if (!timed_out) {
         if (child.wait(io)) |term| switch (term) {

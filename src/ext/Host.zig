@@ -1285,7 +1285,10 @@ const ActCtx = struct {
             _ = lua.pushRef(L, k.ref);
             if (lua.c.lua_rawgeti(L, -1, @intCast(item + 1)) != lua.c.LUA_TTABLE) lua.raise(L, "that row has no actions", .{});
             const row = lua.absIndex(L, -1);
-            _ = lua.getField(L, row, "actions");
+            // The row is a live table the extension may have changed since:
+            // rawgeti on a non-table reads garbage (no API checks in
+            // distribution builds of Lua).
+            if (lua.getField(L, row, "actions") != lua.c.LUA_TTABLE) lua.raise(L, "that row has no actions", .{});
             _ = lua.c.lua_rawgeti(L, -1, @as(c_int, req.action) + 1);
             if (lua.c.lua_type(L, -1) != lua.c.LUA_TTABLE or lua.getField(L, -1, "run") != lua.c.LUA_TFUNCTION)
                 lua.raise(L, "that action is not a Lua function", .{});
@@ -1473,7 +1476,7 @@ test "extensions load, list, search and run actions" {
         \\    { name = "fruits", title = "Fruits", detail = true, items = {
         \\        "Apple",
         \\        { title = "Banana", subtitle = "yellow", section = "Long", detail = "a long fruit",
-        \\          actions = { lumen.action.copy("banana"), { title = "Eat", run = function(row) util.eaten = row.title end } } },
+        \\          actions = { lumen.action.copy("banana"), { title = "Eat", run = function(row) util.eaten = row.title; row.actions = nil end } } },
         \\    } },
         \\    { name = "echo", title = "Echo", search = function(q)
         \\        local out = lumen.exec({ "sh", "-c", "printf %s \"$1\"", "sh", q })
@@ -1554,6 +1557,12 @@ test "extensions load, list, search and run actions" {
     try testing.expectEqual(ga, done.gen);
     try testing.expect(done.err == null);
     try testing.expectEqual(Outcome.close, done.outcome);
+    // The action took its row's actions away: pressing it again is an
+    // error, not a read of whatever `row.actions` is now.
+    _ = h.act(reg.gen, 1, false, fruits.gen, 1, 1);
+    const again = try probe.take("act");
+    defer again.destroy(testing.allocator);
+    try testing.expect(std.mem.find(u8, again.err.?, "no actions") != null);
     _ = h.list(reg.gen, 3, "");
     const eaten = try probe.take("res");
     defer eaten.destroy(testing.allocator);
