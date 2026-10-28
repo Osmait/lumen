@@ -66,7 +66,7 @@ pub fn main(init: std.process.Init) !void {
     defer hits.deinit(gpa);
     var want: std.ArrayList(index.search.Hit) = .empty;
     defer want.deinit(gpa);
-    std.debug.print("\n{s:<12} {s:>10} {s:>10} {s:>10} {s:>8}\n", .{ "query", "cold ms", "+recency", "exhaust.", "recall" });
+    std.debug.print("\n{s:<12} {s:>10} {s:>10} {s:>10} {s:>10} {s:>8}\n", .{ "query", "cold ms", "+recency", "UI (60)", "exhaust.", "recall" });
     for (queries) |q| {
         var e: index.search.Engine = .empty;
         defer e.deinit(gpa);
@@ -77,6 +77,11 @@ pub fn main(init: std.process.Init) !void {
         t = sys.monotonicNs();
         try e.search(gpa, pool, &mapped, q, .{ .limit = 20 }, &hits);
         const rec = ms(sys.monotonicNs() - t);
+        // What Search Files asks: 60 results, with recency.
+        e.reset();
+        t = sys.monotonicNs();
+        try e.search(gpa, pool, &mapped, q, .{ .limit = 60 }, &hits);
+        const ui = ms(sys.monotonicNs() - t);
         try e.search(gpa, pool, &mapped, q, .{ .limit = 20, .recency = false }, &hits);
         t = sys.monotonicNs();
         try index.search.searchExhaustive(gpa, &mapped, q, 20, &want);
@@ -89,16 +94,16 @@ pub fn main(init: std.process.Init) !void {
             };
         }
         const recall = if (want.items.len == 0) 100.0 else 100.0 * @as(f64, @floatFromInt(same)) / @as(f64, @floatFromInt(want.items.len));
-        std.debug.print("{s:<12} {d:>10.3} {d:>10.3} {d:>10.1} {d:>7.0}%\n", .{ q, cold, rec, ex, recall });
+        std.debug.print("{s:<12} {d:>10.3} {d:>10.3} {d:>10.3} {d:>10.1} {d:>7.0}%\n", .{ q, cold, rec, ui, ex, recall });
     }
 
-    std.debug.print("\ntyping \"cargo.toml\" letter by letter (engine reused):\n", .{});
+    std.debug.print("\ntyping \"cargo.toml\" letter by letter (engine reused, 60 results with recency as the UI asks):\n", .{});
     var e: index.search.Engine = .empty;
     defer e.deinit(gpa);
     const typed = "cargo.toml";
     for (1..typed.len + 1) |n| {
         t = sys.monotonicNs();
-        try e.search(gpa, pool, &mapped, typed[0..n], .{ .limit = 20 }, &hits);
+        try e.search(gpa, pool, &mapped, typed[0..n], .{ .limit = 60 }, &hits);
         std.debug.print("  {s:<12} {d:>8.3} ms\n", .{ typed[0..n], ms(sys.monotonicNs() - t) });
     }
     var buf: [4096]u8 = undefined;

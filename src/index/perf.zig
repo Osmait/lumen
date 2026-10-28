@@ -103,11 +103,11 @@ fn names(gpa: std.mem.Allocator, pool: *index.Pool, dir: []const u8) !void {
         var e: index.search.Engine = .empty;
         defer e.deinit(gpa);
         t = sys.monotonicNs();
-        try e.search(gpa, pool, &m, q[0], .{ .limit = 20, .recency = false }, &hits);
+        try e.search(gpa, pool, &m, q[0], .{ .limit = 60, .recency = false }, &hits);
         var label: [64]u8 = undefined;
         check(try std.fmt.bufPrint(&label, "cold query \"{s}\"", .{q[0]}), ms(sys.monotonicNs() - t), q[1]);
         // Recall against the exhaustive reference: exact, not timed.
-        try index.search.searchExhaustive(gpa, &m, q[0], 20, &want);
+        try index.search.searchExhaustive(gpa, &m, q[0], 60, &want);
         var same = want.items.len == hits.items.len;
         if (same) for (want.items, hits.items) |w, h| {
             if (w.score != h.score) same = false;
@@ -138,7 +138,7 @@ fn names(gpa: std.mem.Allocator, pool: *index.Pool, dir: []const u8) !void {
     var worst: u64 = 0;
     for (1..typed.len + 1) |n| {
         t = sys.monotonicNs();
-        try e.search(gpa, pool, &m, typed[0..n], .{ .limit = 20, .recency = false }, &hits);
+        try e.search(gpa, pool, &m, typed[0..n], .{ .limit = 60, .recency = false }, &hits);
         worst = @max(worst, sys.monotonicNs() - t);
     }
     check("typing \"handler.rs\", worst keystroke", ms(worst), 25);

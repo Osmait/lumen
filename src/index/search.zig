@@ -152,14 +152,14 @@ pub const Engine = struct {
             finalists.shrinkRetainingCapacity(keep);
         }
 
-        // Layer 4: the fine scorer ranks, with no volume pressure left.
+        // Layer 4: the fine scorer ranks, with no volume pressure left. In
+        // blocks on the pool: the UI's 60 results make 3840 finalists, ~1.2
+        // ms on one core.
         var hits: std.ArrayList(Pair) = .empty;
         defer hits.deinit(gpa);
-        try hits.ensureTotalCapacity(gpa, finalists.items.len);
-        for (finalists.items) |f| {
-            const fs = fine.score(store.name(f.id), ql) orelse 0;
-            hits.appendAssumeCapacity(.{ .score = fs * 4 + f.score, .id = f.id });
-        }
+        try hits.resize(gpa, finalists.items.len);
+        var fctx: FineCtx = .{ .store = store, .q = ql, .in = finalists.items, .out = hits.items };
+        pool.run(std.math.divCeil(usize, finalists.items.len, fine_block) catch 1, &fctx, FineCtx.block);
         std.mem.sort(Pair, hits.items, {}, lessThan);
 
         // Without this the thousands of "Cargo.toml" tie and their order is
@@ -173,9 +173,9 @@ pub const Engine = struct {
             var n: usize = 0;
             while (n < hits.items.len and hits.items[n].score >= floor) n += 1;
             n = @min(n, limit * recency_mul);
-            const now = sys.nowSeconds();
-            var buf: [4096]u8 = undefined;
-            for (hits.items[0..n]) |*h| h.score += recencyBonus(store, h.id, now, &buf);
+            // Up to 960 path rebuilds and stats for the UI's 60: on the pool.
+            var rctx: RecencyCtx = .{ .store = store, .hits = hits.items[0..n], .now = sys.nowSeconds() };
+            pool.run(std.math.divCeil(usize, n, recency_block) catch 1, &rctx, RecencyCtx.block);
             std.mem.sort(Pair, hits.items[0..n], {}, lessThan);
         }
 
@@ -428,6 +428,36 @@ fn adjust(store: *const Store, id: u32, cheap: i32) i32 {
 }
 
 /// Coarse on purpose: today vs this month vs old.
+const fine_block = 256;
+const recency_block = 64;
+
+const FineCtx = struct {
+    store: *const Store,
+    q: []const u8,
+    in: []const Pair,
+    out: []Pair,
+
+    fn block(ctx: *FineCtx, b: usize) void {
+        const lo = b * fine_block;
+        for (ctx.in[lo..@min(lo + fine_block, ctx.in.len)], ctx.out[lo..@min(lo + fine_block, ctx.in.len)]) |f, *h| {
+            const fs = fine.score(ctx.store.name(f.id), ctx.q) orelse 0;
+            h.* = .{ .score = fs * 4 + f.score, .id = f.id };
+        }
+    }
+};
+
+const RecencyCtx = struct {
+    store: *const Store,
+    hits: []Pair,
+    now: i64,
+
+    fn block(ctx: *RecencyCtx, b: usize) void {
+        var buf: [4096]u8 = undefined;
+        const lo = b * recency_block;
+        for (ctx.hits[lo..@min(lo + recency_block, ctx.hits.len)]) |*h| h.score += recencyBonus(ctx.store, h.id, ctx.now, &buf);
+    }
+};
+
 fn recencyBonus(store: *const Store, id: u32, now: i64, buf: *[4096]u8) i32 {
     const p = store.path(id, buf[0 .. buf.len - 1]);
     if (p.len == 0) return 0;

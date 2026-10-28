@@ -51,6 +51,10 @@ All notable changes are listed here. The format follows
   of ~58 ms, and each copy
   into the clipboard history no longer starts a GTK process. Install both
   files (see the README).
+- File search scores its finalists and checks their recency on all cores:
+  with the 60 results Search Files asks for, "cargo" 5.1 → 2.3 ms and
+  "config" ~4.5 → 1.6 ms. `lumen-find bench` and `zig build perf` now
+  measure with those 60 results.
 - Keeping the content index current writes 1.5 MB per change instead of
   rewriting the whole 79 MB file (11 ms instead of 180): changes are
   appended to it. The index format changes (LUMCTX04): it is rebuilt once.
