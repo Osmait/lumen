@@ -129,12 +129,25 @@ pub fn fileIcon(ui: *Ui, path: [:0]const u8, is_dir: bool) item_mod.Icon {
     }
     const ctype = if (is_dir) null else c.g_content_type_guess(path, null, 0, null);
     defer if (ctype) |t| c.g_free(t);
-    const icon = c.g_content_type_get_icon(if (ctype) |t| t else "inode/directory");
-    ui.icons.append(ui.gpa, icon) catch {
+    return .{ .gicon = typeIcon(if (ctype) |t| t else "inode/directory") orelse return .none };
+}
+
+/// One GIcon per content type, kept for good (a few dozen): the files view
+/// made a new one for every row of every keystroke.
+var type_icons: std.StringHashMapUnmanaged(*c.GIcon) = .empty;
+
+fn typeIcon(ctype: [*:0]const u8) ?*c.GIcon {
+    const key = std.mem.span(ctype);
+    if (type_icons.get(key)) |icon| return icon;
+    const icon = c.g_content_type_get_icon(ctype);
+    const gpa = std.heap.c_allocator;
+    const owned = gpa.dupe(u8, key) catch return null;
+    type_icons.put(gpa, owned, icon) catch {
+        gpa.free(owned);
         c.g_object_unref(icon);
-        return .none;
+        return null;
     };
-    return .{ .gicon = icon };
+    return icon;
 }
 
 pub fn filesHint(ui: *Ui, a: std.mem.Allocator) [:0]const u8 {

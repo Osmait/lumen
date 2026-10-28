@@ -256,6 +256,8 @@ fn sift(ctx: *SiftCtx, ci: usize, lo: usize, hi: usize) !void {
     const k = ctx.per_chunk;
     const compact_at = k * 2;
     try p.top.ensureTotalCapacity(ctx.gpa, compact_at);
+    // Room for the chunk's candidates at once, not grown one by one.
+    if (ctx.cache_cap > 0) try p.cands.ensureTotalCapacity(ctx.gpa, @min(hi - lo, ctx.cache_cap));
     var threshold: i32 = std.math.minInt(i32);
 
     var idx = lo;

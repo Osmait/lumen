@@ -43,7 +43,8 @@ pub fn open(path: [:0]const u8) Error!Db {
         \\  created_at INTEGER NOT NULL,
         \\  last_copied INTEGER NOT NULL
         \\);
-        \\CREATE INDEX IF NOT EXISTS clipboard_recent ON clipboard(last_copied DESC);
+        \\DROP INDEX IF EXISTS clipboard_recent;
+        \\CREATE INDEX IF NOT EXISTS clipboard_by_time ON clipboard(last_copied);
     );
     return db;
 }
@@ -111,6 +112,28 @@ pub fn forget(db: *Db, key: []const u8) Error!void {
 }
 
 /// All usage, as key -> frecency value. Keys and the map live in `arena`.
+/// Forgets what decayed below any effect on the ranking: every file opened
+/// adds a key, and the table is read on every show.
+pub fn pruneFrecency(db: *Db, now: i64) Error!void {
+    const stmt = try db.prepare("SELECT key, count, last_used FROM frecency");
+    defer _ = c.sqlite3_finalize(stmt);
+    const del = try db.prepare("DELETE FROM frecency WHERE key = ?1");
+    defer _ = c.sqlite3_finalize(del);
+    var stale: std.ArrayList([]u8) = .empty;
+    var arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
+    defer arena.deinit();
+    while (try db.nextRow(stmt)) {
+        const count = std.math.cast(u32, c.sqlite3_column_int64(stmt, 1)) orelse std.math.maxInt(u32);
+        if (frecency.value(count, c.sqlite3_column_int64(stmt, 2), now) >= 0.01) continue;
+        stale.append(arena.allocator(), arena.allocator().dupe(u8, columnText(stmt, 0)) catch continue) catch continue;
+    }
+    for (stale.items) |key| {
+        _ = c.sqlite3_reset(del);
+        bindText(del, 1, key);
+        try db.run(del);
+    }
+}
+
 pub fn loadFrecency(db: *Db, arena: std.mem.Allocator, now: i64) (Error || std.mem.Allocator.Error)!std.StringHashMapUnmanaged(f64) {
     var map: std.StringHashMapUnmanaged(f64) = .empty;
     const stmt = try db.prepare("SELECT key, count, last_used FROM frecency");
@@ -145,9 +168,11 @@ pub fn addClip(db: *Db, content: []const u8, now: i64, keep: u32) Error!void {
     bindText(stmt, 2, content);
     _ = c.sqlite3_bind_int64(stmt, 3, now);
     try db.run(stmt);
+    // What is past the newest `keep`, found through the index (scanned
+    // backwards: newest first, ties by id); NOT IN read the whole table.
     const trim = try db.prepare(
-        \\DELETE FROM clipboard WHERE id NOT IN
-        \\  (SELECT id FROM clipboard ORDER BY last_copied DESC, id DESC LIMIT ?1)
+        \\DELETE FROM clipboard WHERE id IN
+        \\  (SELECT id FROM clipboard ORDER BY last_copied DESC, id DESC LIMIT -1 OFFSET ?1)
     );
     defer _ = c.sqlite3_finalize(trim);
     _ = c.sqlite3_bind_int64(trim, 1, @max(keep, 1));
@@ -265,6 +290,24 @@ test "frecency accumulates" {
     var map = try db.loadFrecency(arena.allocator(), 100);
     try std.testing.expect(map.get("app:a").? > map.get("app:b").?);
     _ = &map;
+}
+
+test "frecency forgets what decayed to nothing, keeps the rest" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+    const day = 86_400;
+    const now: i64 = 1000 * day;
+    try db.recordUse("file:/old", now - 100 * day);
+    try db.recordUse("app:recent", now - 2 * day);
+    for (0..50) |_| try db.recordUse("app:much-used", now - 40 * day);
+    try db.pruneFrecency(now);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const map = try db.loadFrecency(arena.allocator(), now);
+    try std.testing.expect(map.get("file:/old") == null);
+    try std.testing.expect(map.get("app:recent") != null);
+    // 50 uses 40 days ago still weigh 0.96.
+    try std.testing.expect(map.get("app:much-used") != null);
 }
 
 test "a failed write is an error, not silence" {

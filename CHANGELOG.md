@@ -51,6 +51,12 @@ All notable changes are listed here. The format follows
   of ~58 ms, and each copy
   into the clipboard history no longer starts a GTK process. Install both
   files (see the README).
+- Smaller things on the paths taken most: the clipboard history trims
+  through its index (it scanned the whole table on every copy), usage
+  counts that decayed to nothing are forgotten at start (every file opened
+  added one, read on every show), script commands are read again only when
+  their folder changes (and only their header), file-type icons are made
+  once per type, and selecting the first row no longer waits a frame.
 - Release builds compile the search modules (core, index) without safety
   checks: 10-25 % faster file and content search (`-Dsafe-index=true`
   keeps them).

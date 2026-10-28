@@ -103,10 +103,11 @@ fn onStartup(app: *c.GtkApplication, data: ?*anyopaque) callconv(.c) void {
         return;
     };
     defer c.g_free(path);
-    const db = Db.open(std.mem.span(path)) catch |err| {
+    var db = Db.open(std.mem.span(path)) catch |err| {
         log.err("cannot open {s}: {t}", .{ path, err });
         return;
     };
+    db.pruneFrecency(@divTrunc(c.g_get_real_time(), std.time.us_per_s)) catch {};
     ui = Ui.init(start.gpa, start.io, app, db);
     ui.build();
     ui.on_settings_changed = &onSettingsChanged;

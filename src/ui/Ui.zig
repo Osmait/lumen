@@ -203,6 +203,8 @@ style_css_stamp: settings_mod.Stamp = .none,
 style_defaults_pending: bool = false,
 /// Scrolls to the selection once the rebuilt list has its layout.
 scroll_tick: c_uint = 0,
+/// Set while `refresh` selects the first row (see there).
+no_scroll: bool = false,
 scroll_tries: u8 = 0,
 
 /// Lua extensions and init.lua (null when they could not start).
@@ -1199,6 +1201,7 @@ pub fn refresh(self: *Ui) void {
     const adj = c.gtk_scrolled_window_get_vadjustment(@ptrCast(self.scroller));
     c.gtk_adjustment_set_value(adj, 0);
     var first = self.nextSelectable(null, 1);
+    const top = first;
     if (self.reselect_len > 0) {
         // The row to select back may be any of them.
         self.ensureRows();
@@ -1212,7 +1215,11 @@ pub fn refresh(self: *Ui) void {
             }
         }
     }
+    // The list was just scrolled to the top, where the first row is: no
+    // need to wait a frame for its place to scroll to it.
+    self.no_scroll = first == top;
     self.select(first);
+    self.no_scroll = false;
 }
 
 /// Settings-style lists: grouped by section, filtered by typing.
@@ -1477,7 +1484,7 @@ pub fn select(self: *Ui, row_index: ?usize) void {
         c.gtk_flow_box_select_child(@ptrCast(self.grid), @ptrCast(row.widget))
     else
         c.gtk_list_box_select_row(@ptrCast(self.list), @ptrCast(row.widget));
-    self.scrollTo(row.widget);
+    if (!self.no_scroll) self.scrollTo(row.widget);
     const it = &self.items.items[row.item.?];
     self.primary = item_mod.actionsFor(it)[0].label;
     self.setHint(self.primary, false);
