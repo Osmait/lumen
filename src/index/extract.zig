@@ -342,13 +342,13 @@ fn decodeEntity(s: []const u8) struct { len: usize, cp: ?u21 } {
         ';',
     ) orelse return .{ .len = 0, .cp = null };
     const body = s[1..semi];
-    const named = [_]struct { []const u8, u21 }{ .{ "amp", '&' }, .{ "lt", '<' }, .{ "gt", '>' }, .{
-        "quot",
-        '"',
-    }, .{
-        "apos",
-        '\'',
-    } };
+    const named = [_]struct { []const u8, u21 }{
+        .{ "amp", '&' },
+        .{ "lt", '<' },
+        .{ "gt", '>' },
+        .{ "quot", '"' },
+        .{ "apos", '\'' },
+    };
     for (named) |n| if (std.mem.eql(u8, body, n[0])) return .{ .len = semi + 1, .cp = n[1] };
     if (body.len < 2 or body[0] != '#') return .{ .len = 0, .cp = null };
     const v = if (body[1] == 'x' or body[1] == 'X')

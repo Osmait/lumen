@@ -161,9 +161,11 @@ const prelude =
 /// `lumen.exec(argv [, { stdin = "", timeout = seconds }])` returns
 /// stdout, exit code (nil when killed) and stderr; or nil and a message
 /// when it cannot run or times out.
-fn execFn(L: *lua.State) lua.Error!c_int {
-    try lua.argTable(L, 1, "lumen.exec");
-    var argv: [64][]const u8 = undefined;
+const ExecArgs = struct { argc: usize, stdin: []const u8, timeout_ns: u64 };
+
+/// lumen.exec's arguments: the argv list (into `argv`) and the options
+/// table. The strings stay alive in the arguments' tables.
+fn execArgs(L: *lua.State, argv: *[64][]const u8) lua.Error!ExecArgs {
     const n = c.lua_rawlen(L, 1);
     if (n == 0 or n > argv.len) return lua.fail(
         L,
@@ -209,6 +211,16 @@ fn execFn(L: *lua.State) lua.Error!c_int {
             .{lua.typeName(L, 2)},
         ),
     }
+    return .{ .argc = n, .stdin = stdin, .timeout_ns = timeout_ns };
+}
+
+fn execFn(L: *lua.State) lua.Error!c_int {
+    try lua.argTable(L, 1, "lumen.exec");
+    var argv: [64][]const u8 = undefined;
+    const req = try execArgs(L, &argv);
+    const n = req.argc;
+    const stdin = req.stdin;
+    const timeout_ns = req.timeout_ns;
 
     const e = extOf(L);
     // Never past the deadline of the call that runs it.

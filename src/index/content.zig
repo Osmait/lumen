@@ -1874,6 +1874,51 @@ pub const max_candidates = 4000;
 
 /// Full query: candidates from the trigram lists, verified in parallel by
 /// reading each file, ranked. Snippets live in `arena`; at most `limit`.
+/// The candidates, best bound first: what is known without reading them
+/// (recency, depth, name) plus the most reading can add, so verification
+/// stops as soon as the next one cannot beat the `limit`-th match. Owned
+/// by `gpa`.
+fn orderCandidates(
+    ix: *const Index,
+    gpa: std.mem.Allocator,
+    words: []const []const u8,
+    phrase: []const u8,
+    cands: []const u32,
+    now: i64,
+) std.mem.Allocator.Error![]Cand {
+    // Only documents holding every trigram of the whole phrase (spaces
+    // included) can get its bonus: the others' bound leaves it out, so they
+    // need not be read once enough better matches are in. Too short to
+    // have trigrams, the phrase could be anywhere.
+    const several = words.len > 1;
+    var phrase_docs: std.ArrayList(u32) = .empty;
+    defer phrase_docs.deinit(gpa);
+    const phrase_known = several and phrase.len >= 3;
+    if (phrase_known) try ix.candidates(gpa, &.{phrase}, &phrase_docs);
+
+    const ordered = try gpa.alloc(Cand, cands.len);
+    errdefer gpa.free(ordered);
+    var pi: usize = 0;
+    for (cands, ordered) |doc, *o| {
+        // Both lists ascend.
+        while (pi < phrase_docs.items.len and phrase_docs.items[pi] < doc) pi += 1;
+        const maybe_phrase = several and
+            (!phrase_known or (pi < phrase_docs.items.len and phrase_docs.items[pi] == doc));
+        const d: DocIn = .{ .path = ix.path(doc), .mtime = ix.mtimes[doc], .size = ix.sizes[doc] };
+        o.* = .{
+            .doc = doc,
+            .maybe_phrase = maybe_phrase,
+            .bound = staticScore(d, words, now) + count_max + if (maybe_phrase) phrase_max else 0,
+        };
+    }
+    std.mem.sort(Cand, ordered, {}, struct {
+        fn gt(_: void, x: Cand, y: Cand) bool {
+            return x.bound > y.bound or (x.bound == y.bound and x.doc < y.doc);
+        }
+    }.gt);
+    return ordered;
+}
+
 pub fn search(
     ix: *const Index,
     gpa: std.mem.Allocator,
@@ -1899,39 +1944,8 @@ pub fn search(
     if (cands.items.len == 0) return;
     const now = sys.nowSeconds();
 
-    // Only documents holding every trigram of the whole phrase (spaces
-    // included) can get its bonus: the others' bound leaves it out, so they
-    // need not be read once enough better matches are in. Too short to
-    // have trigrams, the phrase could be anywhere.
-    const several = words.len > 1;
-    var phrase_docs: std.ArrayList(u32) = .empty;
-    defer phrase_docs.deinit(gpa);
-    const phrase_known = several and phrase.len >= 3;
-    if (phrase_known) try ix.candidates(gpa, &.{phrase}, &phrase_docs);
-
-    // Order candidates by what is known without reading them (recency,
-    // depth, name) plus the most reading can add, so verification stops
-    // as soon as the next one cannot beat the `limit`-th match.
-    const ordered = try gpa.alloc(Cand, cands.items.len);
+    const ordered = try orderCandidates(ix, gpa, words, phrase, cands.items, now);
     defer gpa.free(ordered);
-    var pi: usize = 0;
-    for (cands.items, ordered) |doc, *o| {
-        // Both lists ascend.
-        while (pi < phrase_docs.items.len and phrase_docs.items[pi] < doc) pi += 1;
-        const maybe_phrase = several and
-            (!phrase_known or (pi < phrase_docs.items.len and phrase_docs.items[pi] == doc));
-        const d: DocIn = .{ .path = ix.path(doc), .mtime = ix.mtimes[doc], .size = ix.sizes[doc] };
-        o.* = .{
-            .doc = doc,
-            .maybe_phrase = maybe_phrase,
-            .bound = staticScore(d, words, now) + count_max + if (maybe_phrase) phrase_max else 0,
-        };
-    }
-    std.mem.sort(Cand, ordered, {}, struct {
-        fn gt(_: void, x: Cand, y: Cand) bool {
-            return x.bound > y.bound or (x.bound == y.bound and x.doc < y.doc);
-        }
-    }.gt);
 
     const tasks = pool.threads.len + 1;
     const arenas = try gpa.alloc(std.heap.ArenaAllocator, tasks);

@@ -997,6 +997,20 @@ fn formFields(
     return out;
 }
 
+/// "<extension>.<name>" from the command's `name`, checked and unique.
+fn commandId(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8) [:0]const u8 {
+    const a = ctx.load.a;
+    const name = lua.fieldString(L, a, t, "name", where) orelse
+        lua.raise(L, "{s}.name is missing", .{where});
+    if (!validId(name))
+        lua.raise(L, "{s}.name: use only a-z, 0-9, - and _ (got \"{s}\")", .{ where, name });
+    const id = a.printSentinel("{s}.{s}", .{ ctx.e.id, name }, 0) catch lua.oom(L);
+    for (ctx.load.commands.items) |cmd| {
+        if (std.mem.eql(u8, cmd.id, id)) lua.raise(L, "two commands named \"{s}\"", .{name});
+    }
+    return id;
+}
+
 fn parseCommand(
     L: *lua.State,
     ctx: *LoadCtx,
@@ -1006,30 +1020,11 @@ fn parseCommand(
     default_icon: item_mod.Icon,
 ) void {
     const a = ctx.load.a;
-    const name = lua.fieldString(L, a, t, "name", where) orelse lua.raise(
-        L,
-        "{s}.name is missing",
-        .{where},
-    );
-    if (!validId(name)) lua.raise(
-        L,
-        "{s}.name: use only a-z, 0-9, - and _ (got \"{s}\")",
-        .{ where, name },
-    );
+    const id = commandId(L, ctx, t, where);
     const title = lua.fieldString(L, a, t, "title", where) orelse lua.raise(
         L,
         "{s}.title is missing",
         .{where},
-    );
-    const id = a.printSentinel(
-        "{s}.{s}",
-        .{ ctx.e.id, name },
-        0,
-    ) catch lua.oom(L);
-    for (ctx.load.commands.items) |cmd| if (std.mem.eql(u8, cmd.id, id)) lua.raise(
-        L,
-        "two commands named \"{s}\"",
-        .{name},
     );
 
     const has_root = blk: {
@@ -1314,10 +1309,24 @@ fn parseItem(
     it.meta = metadata(L, a, t, where);
     it.image = lua.fieldString(L, a, t, "image", where) orelse "";
 
+    it.action = .{ .ext_item = rowActions(L, a, t, where, origin, pos, title) };
+    return it;
+}
+
+/// A row's `actions` (up to `max_actions`, Lua functions or lumen.action
+/// values), or the default ones when it has none.
+fn rowActions(
+    L: *lua.State,
+    a: std.mem.Allocator,
+    t: c_int,
+    where: []const u8,
+    origin: Origin,
+    pos: u32,
+    title: [:0]const u8,
+) item_mod.ExtItem {
     if (lua.getField(L, t, "actions") == lua.c.LUA_TNIL) {
         lua.c.lua_settop(L, -2);
-        it.action = .{ .ext_item = defaultActions(a, L, origin, pos, title) };
-        return it;
+        return defaultActions(a, L, origin, pos, title);
     }
     const acts_idx = lua.absIndex(L, -1);
     if (lua.c.lua_type(L, acts_idx) != lua.c.LUA_TTABLE) lua.raise(
@@ -1339,15 +1348,14 @@ fn parseItem(
         entry.* = .{ .label = parsed.label, .keys = keysFor(j), .op = .ext, .index = @intCast(j) };
     }
     lua.c.lua_settop(L, -2);
-    it.action = .{ .ext_item = .{
+    return .{
         .command = origin.command,
         .root = origin.root,
         .gen = origin.gen,
         .index = pos,
         .actions = actions,
         .entries = entries,
-    } };
-    return it;
+    };
 }
 
 /// `metadata = { { "Label", "value" }, { label = "Size", value = 42 } }`:

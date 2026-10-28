@@ -43,39 +43,26 @@ pub const keep_choices = [_]u32{ 100, 500, 1000, 5000 };
 /// Terminal emulators and editors offered when installed (first word is the
 /// command, the rest its display name).
 pub const terminals = [_][2][:0]const u8{
-    .{ "ghostty", "Ghostty" }, .{ "kitty", "Kitty" },
-    .{
-        "alacritty",
-        "Alacritty",
-    },
-    .{ "foot", "Foot" },       .{ "wezterm", "WezTerm" },
+    .{ "ghostty", "Ghostty" },
+    .{ "kitty", "Kitty" },
+    .{ "alacritty", "Alacritty" },
+    .{ "foot", "Foot" },
+    .{ "wezterm", "WezTerm" },
     .{ "konsole", "Konsole" },
-    .{
-        "gnome-terminal",
-        "GNOME Terminal",
-    },
+    .{ "gnome-terminal", "GNOME Terminal" },
     .{ "xterm", "XTerm" },
 };
 pub const editors = [_][2][:0]const u8{
-    .{
-        "nvim",
-        "Neovim",
-    },
+    .{ "nvim", "Neovim" },
     .{ "vim", "Vim" },
     .{ "hx", "Helix" },
     .{ "nano", "nano" },
     .{ "micro", "micro" },
     .{ "emacs", "Emacs" },
     .{ "code", "VS Code" },
-    .{
-        "codium",
-        "VSCodium",
-    },
+    .{ "codium", "VSCodium" },
     .{ "zed", "Zed" },
-    .{
-        "subl",
-        "Sublime Text",
-    },
+    .{ "subl", "Sublime Text" },
     .{ "kate", "Kate" },
     .{ "gedit", "gedit" },
     .{ "gnome-text-editor", "GNOME Text Editor" },
@@ -344,24 +331,21 @@ pub const Settings = struct {
             \\editor = {s}
             \\
         , .{
-            p.of("style").style,             p.of("theme").theme,
-            p.of(
-                "text_size",
-            ).text_size,
+            p.of("style").style,
+            p.of("theme").theme,
+            p.of("text_size").text_size,
             p.of("opacity").opacity,
-            p.of(
-                "position",
-            ).position,
-            p.of("width").width,             p.of("height").height,
-            p.of("density").density,         p.of("icon_theme").icon_theme,
-            p.of(
-                "files_in_root",
-            ).files_in_root,
-            p.of("suggestions").suggestions, p.of("clipboard").clipboard,
-            p.of(
-                "clipboard_keep",
-            ).clipboard_keep,
-            p.of("terminal").terminal,       p.of("editor").editor,
+            p.of("position").position,
+            p.of("width").width,
+            p.of("height").height,
+            p.of("density").density,
+            p.of("icon_theme").icon_theme,
+            p.of("files_in_root").files_in_root,
+            p.of("suggestions").suggestions,
+            p.of("clipboard").clipboard,
+            p.of("clipboard_keep").clipboard_keep,
+            p.of("terminal").terminal,
+            p.of("editor").editor,
         });
         if (s.unknown.items.len > 0) {
             try w.writeAll("\n# Not known to this version of Lumen\n");
