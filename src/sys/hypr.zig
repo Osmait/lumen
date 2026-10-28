@@ -88,6 +88,26 @@ fn connect(which: []const u8, flags: u32) ?linux.fd_t {
     return fd;
 }
 
+/// Sends dispatches and waits until Hyprland has run them. False only when
+/// nothing was sent (no socket), so hyprctl may try instead: once sent, a
+/// dispatch must never go twice (a toggle would undo itself). What Hyprland
+/// answers ("ok" per dispatch) does not matter.
+fn dispatchOver(msg: []const u8) bool {
+    const fd = connect(".socket.sock", 0) orelse return false;
+    defer _ = linux.close(fd);
+    const timeout: linux.timeval = .{ .sec = 1, .usec = 0 };
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO, @ptrCast(&timeout), @sizeOf(linux.timeval));
+    const n = linux.write(fd, msg.ptr, msg.len);
+    if (linux.errno(n) != .SUCCESS or n == 0) return false;
+    var answer: [256]u8 = undefined;
+    while (true) {
+        const r = linux.read(fd, &answer, answer.len);
+        if (linux.errno(r) == .INTR) continue;
+        if (linux.errno(r) != .SUCCESS or r == 0) break;
+    }
+    return true;
+}
+
 /// Sends `msg` to the request socket and reads the whole answer.
 fn talk(arena: std.mem.Allocator, msg: []const u8) ?[]const u8 {
     const fd = connect(".socket.sock", 0) orelse return null;
@@ -225,9 +245,7 @@ pub fn sendQueued() void {
     if (queued_len == 0) return;
     const msg = queued_buf[0..queued_len];
     queued_len = 0;
-    var buf: [4096]u8 = undefined;
-    var fba: std.heap.FixedBufferAllocator = .init(&buf);
-    if (talk(fba.allocator(), msg) != null) return;
+    if (dispatchOver(msg)) return;
     // "[[BATCH]]dispatch a;dispatch b" is what `hyprctl --batch` sends.
     var zbuf: [8192]u8 = undefined;
     const z = std.fmt.bufPrintSentinel(&zbuf, "{s}", .{msg["[[BATCH]]".len..]}, 0) catch return;
