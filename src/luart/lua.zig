@@ -132,6 +132,7 @@ pub fn tryCall(
     nargs: c_int,
     nresults: c_int,
 ) bool {
+    std.debug.assert(nargs >= 0 and nargs <= c.lua_gettop(L));
     if (c.lua_checkstack(L, 2) == 0) {
         c.lua_settop(L, -nargs - 1);
         _ = c.lua_pushstring(L, "Lua stack overflow");
@@ -176,7 +177,15 @@ pub const Error = error{Raise};
 pub fn wrap(comptime f: fn (*State) Error!c_int) c.lua_CFunction {
     return &struct {
         fn call(L: ?*State) callconv(.c) c_int {
-            return f(L.?) catch c.lua_error(L);
+            const n = f(L.?) catch {
+                // `fail` pushed the message raised.
+                std.debug.assert(c.lua_gettop(L) >= 1);
+                return c.lua_error(L);
+            };
+            // Lua takes the top `n` values as the results, unchecked in
+            // distribution builds: they must be there.
+            std.debug.assert(n >= 0 and n <= c.lua_gettop(L));
+            return n;
         }
     }.call;
 }

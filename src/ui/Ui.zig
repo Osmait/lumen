@@ -1532,6 +1532,16 @@ fn deferRow(self: *Ui, p: Pending) bool {
     return true;
 }
 
+/// The item of the last row that has one.
+fn lastItemRow(self: *const Ui) ?usize {
+    var i = self.rows.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (self.rows.items[i].item) |item| return item;
+    }
+    return null;
+}
+
 /// Builds every queued row now.
 pub fn ensureRows(self: *Ui) void {
     if (self.pending_idle != 0) _ = c.g_source_remove(self.pending_idle);
@@ -1584,6 +1594,12 @@ pub fn addItem(self: *Ui, it_in: Item) void {
 }
 
 fn buildItemRow(self: *Ui, item_index: usize) void {
+    // Rows follow the items in order: a row queued for an earlier list
+    // would point at the wrong item.
+    std.debug.assert(item_index < self.items.items.len);
+    if (self.lastItemRow()) |prev| std.debug.assert(prev < item_index);
+    // The grid has no section rows: a child's index is its item's.
+    if (self.grid_mode) std.debug.assert(self.rows.items.len == item_index);
     const a = self.query_arena.allocator();
     const it = self.items.items[item_index];
     // Room first: a widget without its `rows` entry would shift every later
@@ -1646,6 +1662,8 @@ pub fn select(self: *Ui, row_index: ?usize) void {
         return;
     };
     const row = self.rows.items[ri];
+    // Section titles are never selected (keyboard.zig skips them).
+    std.debug.assert(row.item != null and row.item.? < self.items.items.len);
     if (self.grid_mode)
         c.gtk_flow_box_select_child(@ptrCast(self.grid), @ptrCast(row.widget))
     else

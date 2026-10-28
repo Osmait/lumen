@@ -1074,14 +1074,20 @@ fn closeSegment(
     defer offs.deinit(gpa);
     var post: std.ArrayList(u8) = .empty;
     defer post.deinit(gpa);
+    // What `validate` checks on open, made sure of here: keys strictly
+    // ascending (binary search), each list's docs too (deltas never wrap).
     var i: usize = 0;
     while (i < pairs.len) {
         const k: u32 = @intCast(pairs[i] >> 32);
+        if (keys.items.len > 0) std.debug.assert(keys.items[keys.items.len - 1] < k);
         try keys.append(gpa, k);
         try offs.append(gpa, @intCast(post.items.len));
         var prev: u32 = 0;
+        var first = true;
         while (i < pairs.len and pairs[i] >> 32 == k) : (i += 1) {
             const d: u32 = @truncate(pairs[i]);
+            std.debug.assert(first or d > prev);
+            first = false;
             try writeVarint(gpa, &post, d - prev);
             prev = d;
         }

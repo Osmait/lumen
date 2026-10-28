@@ -64,8 +64,12 @@ pub fn stop() void {
     _ = linux.unlink(path.ptr);
 }
 
+/// Connections served per turn of the main loop: the rest wait for the
+/// next, so a flood of them cannot hold the window.
+const accepts_max = 16;
+
 fn onReady(fd: c_int, _: c_uint, _: ?*anyopaque) callconv(.c) c.gboolean {
-    while (true) {
+    for (0..accepts_max) |_| {
         const rc = linux.accept4(fd, null, null, linux.SOCK.CLOEXEC);
         if (linux.errno(rc) != .SUCCESS) break;
         const conn: linux.fd_t = @intCast(rc);

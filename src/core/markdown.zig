@@ -36,24 +36,24 @@ pub fn toMarkup(w: *std.Io.Writer, md: []const u8) Error!void {
                 2 => "<span size=\"large\" weight=\"bold\">",
                 else => "<span weight=\"bold\">",
             });
-            try inline_(w, h.text);
+            try inline_(w, h.text, 0);
             try w.writeAll("</span>");
         } else if (isRule(trimmed)) {
             try w.writeAll("<span fgalpha=\"40%\">────────────────</span>");
         } else if (bullet(trimmed)) |rest| {
             try w.writeAll("  •  ");
-            try inline_(w, rest);
+            try inline_(w, rest, 0);
         } else if (numbered(trimmed)) |n| {
             try w.writeAll("  ");
             try escape(w, n.number);
             try w.writeAll("  ");
-            try inline_(w, n.text);
+            try inline_(w, n.text, 0);
         } else if (std.mem.startsWith(u8, trimmed, ">")) {
             try w.writeAll("<span fgalpha=\"70%\"><i>");
-            try inline_(w, std.mem.trimStart(u8, trimmed[1..], " "));
+            try inline_(w, std.mem.trimStart(u8, trimmed[1..], " "), 0);
             try w.writeAll("</i></span>");
         } else {
-            try inline_(w, line);
+            try inline_(w, line, 0);
         }
     }
 }
@@ -87,8 +87,13 @@ fn numbered(line: []const u8) ?struct { number: []const u8, text: []const u8 } {
     return .{ .number = line[0 .. i + 1], .text = line[i + 2 ..] };
 }
 
-/// Inline spans of one line.
-fn inline_(w: *std.Io.Writer, s: []const u8) Error!void {
+/// Spans nest at most this deep: one ends at the next occurrence of its own
+/// marker, so "**" holds no "**", "*" no "*" and "_" no "_".
+const max_depth = 3;
+
+/// Inline spans of one line; `depth` spans around it.
+fn inline_(w: *std.Io.Writer, s: []const u8, depth: u8) Error!void {
+    std.debug.assert(depth <= max_depth);
     var i: usize = 0;
     while (i < s.len) {
         const ch = s[i];
@@ -103,7 +108,7 @@ fn inline_(w: *std.Io.Writer, s: []const u8) Error!void {
         } else if (ch == '*' and i + 1 < s.len and s[i + 1] == '*') {
             if (closing(s, i + 2, "**")) |end| {
                 try w.writeAll("<b>");
-                try inline_(w, s[i + 2 .. end]);
+                try inline_(w, s[i + 2 .. end], depth + 1);
                 try w.writeAll("</b>");
                 i = end + 2;
                 continue;
@@ -113,7 +118,7 @@ fn inline_(w: *std.Io.Writer, s: []const u8) Error!void {
             const word_inside = ch == '_' and i > 0 and std.ascii.isAlphanumeric(s[i - 1]);
             if (!word_inside) if (closing(s, i + 1, s[i .. i + 1])) |end| {
                 try w.writeAll("<i>");
-                try inline_(w, s[i + 1 .. end]);
+                try inline_(w, s[i + 1 .. end], depth + 1);
                 try w.writeAll("</i>");
                 i = end + 1;
                 continue;
@@ -205,4 +210,24 @@ test "unclosed or stray markers stay as text" {
     try expectMarkup("`open", "`open");
     try expectMarkup("#nohash", "#nohash");
     try expectMarkup("a < b > c \"q\"", "a &lt; b &gt; c &quot;q&quot;");
+}
+
+test "spans nest no deeper than max_depth, whatever the input" {
+    // Every way to open spans inside spans, many times over: the depth
+    // assertion in inline_ holds (a deeper recursion would trip it).
+    var prng: std.Random.DefaultPrng = .init(42);
+    const r = prng.random();
+    const pieces = [_][]const u8{ "**", "*", "_", "x", " ", "`", "[a](b)" };
+    var md: [256]u8 = undefined;
+    var out: [8192]u8 = undefined;
+    for (0..3000) |_| {
+        var len: usize = 0;
+        while (len < 240) {
+            const p = pieces[r.uintLessThan(usize, pieces.len)];
+            @memcpy(md[len..][0..p.len], p);
+            len += p.len;
+        }
+        var w: std.Io.Writer = .fixed(&out);
+        toMarkup(&w, md[0..len]) catch {};
+    }
 }

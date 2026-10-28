@@ -17,8 +17,22 @@ pub const Monitor = struct {
     /// Space taken by bars: left, top, right, bottom (logical pixels).
     reserved: [4]i32,
 
+    /// Bounds no real monitor reaches, so nothing below can overflow
+    /// (checked where the numbers come in: Hyprland's reply).
+    pub const max_pixels = 1 << 16;
+    pub const max_position = 1 << 20;
+
+    pub fn plausible(x: i32, y: i32, width: i32, height: i32, scale: f64, reserved: [4]i32) bool {
+        if (!(scale >= 0.1 and scale <= 16)) return false; // NaN fails too
+        if (width <= 0 or width > max_pixels or height <= 0 or height > max_pixels) return false;
+        if (@abs(x) > max_position or @abs(y) > max_position) return false;
+        for (reserved) |r| if (r < 0 or r > max_pixels) return false;
+        return true;
+    }
+
     /// The area windows may use, in global layout coordinates.
     pub fn usable(m: Monitor) Rect {
+        std.debug.assert(plausible(m.x, m.y, m.width, m.height, m.scale, m.reserved));
         var w: f64 = @floatFromInt(m.width);
         var h: f64 = @floatFromInt(m.height);
         if (@mod(m.transform, 2) == 1) std.mem.swap(f64, &w, &h);

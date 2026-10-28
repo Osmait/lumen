@@ -84,6 +84,8 @@ fn connect(which: []const u8, opts: os.unix.ConnectOptions) ?linux.fd_t {
 
 /// A compositor that does not answer must not freeze the window.
 const answer_ns = std.time.ns_per_s;
+/// Nor one that never stops: `j/clients` with 200 windows is ~300 KB.
+const answer_bytes_max = 16 << 20;
 
 /// Sends dispatches and waits until Hyprland has run them. False only when
 /// nothing was sent (no socket), so hyprctl may try instead: once sent, a
@@ -112,6 +114,10 @@ fn talk(arena: std.mem.Allocator, msg: []const u8) ?[]const u8 {
     const deadline_ns = os.monotonicNs() + answer_ns;
     var out: std.ArrayList(u8) = .empty;
     while (true) {
+        if (out.items.len >= answer_bytes_max) {
+            log.warn("{s}: answer over {d} bytes, dropped", .{ msg, answer_bytes_max });
+            return null;
+        }
         out.ensureUnusedCapacity(arena, 16 * 1024) catch return null;
         const n = os.unix.readSome(fd, out.unusedCapacitySlice(), deadline_ns) catch return null;
         if (n == 0) break;
@@ -148,9 +154,16 @@ pub fn monitor(arena: std.mem.Allocator, id: i64) ?geometry.Monitor {
 
 pub fn findMonitor(all: []const MonitorJson, id: i64) ?geometry.Monitor {
     for (all) |m| {
-        // Sizes are divided by the scale: a zero, negative or NaN one from a
-        // broken reply would make the geometry meaningless.
-        if (m.id == id and !(m.scale > 0 and std.math.isFinite(m.scale))) return null;
+        // The geometry runs without overflow checks (core is ReleaseFast):
+        // a broken reply stops here, never reaching its arithmetic.
+        if (m.id == id and !geometry.Monitor.plausible(
+            m.x,
+            m.y,
+            m.width,
+            m.height,
+            m.scale,
+            m.reserved,
+        )) return null;
         if (m.id == id) return .{
             .x = m.x,
             .y = m.y,
@@ -298,7 +311,8 @@ fn onFallback(_: ?*anyopaque) callconv(.c) c.gboolean {
 }
 
 fn onEvents(fd: c_int, _: c_uint, _: ?*anyopaque) callconv(.c) c.gboolean {
-    while (true) {
+    // A burst is read over several turns of the main loop, never holding it.
+    for (0..events_reads_max) |_| {
         if (events_len == events_buf.len) events_len = 0;
         const n = linux.read(fd, events_buf[events_len..].ptr, events_buf.len - events_len);
         if (linux.errno(n) != .SUCCESS or n == 0) break;
@@ -312,6 +326,8 @@ fn onEvents(fd: c_int, _: c_uint, _: ?*anyopaque) callconv(.c) c.gboolean {
     }
     return 1;
 }
+
+const events_reads_max = 64;
 
 /// Whether Hyprland's event text holds a focus change.
 fn focusEvent(text: []const u8) bool {
@@ -398,6 +414,19 @@ test "monitors: rotation and scale give the usable area" {
     const dp = findMonitor(mons, 1).?.usable();
     try testing.expectEqual(geometry.Rect{ .x = 2387, .y = 38, .w = 1536, .h = 826 }, dp);
     try testing.expect(findMonitor(mons, 7) == null);
+
+    // Replies no monitor gives are refused, not computed with.
+    var bad = mons[1];
+    for ([_]f64{ 0, -1, 1e-300, std.math.nan(f64), std.math.inf(f64) }) |s| {
+        bad.scale = s;
+        try testing.expect(findMonitor(&.{bad}, bad.id) == null);
+    }
+    bad = mons[1];
+    bad.width = std.math.maxInt(i32);
+    try testing.expect(findMonitor(&.{bad}, bad.id) == null);
+    bad = mons[1];
+    bad.reserved[0] = -5;
+    try testing.expect(findMonitor(&.{bad}, bad.id) == null);
 }
 
 test "layout commands: tiled window floats first, fullscreen leaves first" {

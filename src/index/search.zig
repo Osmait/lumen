@@ -511,7 +511,8 @@ fn recencyBonus(store: *const Store, id: u32, now: i64, buf: *[4096]u8) i32 {
     buf[p.len] = 0;
     const mt = sys.mtime(buf[0..p.len :0]) orelse return 0;
     if (mt > now) return recency_max;
-    return switch (@divTrunc(now - mt, 86_400)) {
+    // Saturating: an mtime is whatever the file system says.
+    return switch (@divTrunc(now -| mt, 86_400)) {
         0 => 300,
         1...6 => 220,
         7...29 => 140,

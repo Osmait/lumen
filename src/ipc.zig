@@ -73,6 +73,11 @@ pub fn encode(buf: []u8, args: []const []const u8) ?[]const u8 {
         @memcpy(buf[at .. at + a.len], a);
         at += a.len;
     }
+    // What is written is what the daemon will read.
+    if (std.debug.runtime_safety) {
+        const back = parse(buf[0..at]).?;
+        std.debug.assert(back.argc == args.len and back.payload.len == 0);
+    }
     return buf[0..at];
 }
 
