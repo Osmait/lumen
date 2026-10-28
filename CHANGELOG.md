@@ -61,6 +61,24 @@ All notable changes are listed here. The format follows
   could crash Lumen when the action was pressed again.
 - Fixed: text extraction (PDF, Office) and `lumen.exec` could wait for a
   program past their deadline once it had closed its output.
+- `lumen --help` lists the options, grouped, without starting or asking a
+  daemon. Unknown options print the same list.
+- Ctrl shortcuts on a row (Ctrl X, Ctrl O, Ctrl Shift C, Ctrl Shift F) run
+  the action the action panel shows with those keys, so the two always
+  agree; extension actions get the shortcuts they declare.
+- A text file with a stray non-UTF-8 byte no longer costs a few
+  milliseconds of preview on every selection change.
+- Long text kept in fixed space (a search query, a message, the row to
+  select again) is cut between characters, never in the middle of one.
+- A program that sends Lumen's socket its request slowly can no longer
+  hold the window: the whole request gets half a second. Hyprland's
+  answers are capped too (16 MB, one second), and a burst of its events is
+  read over several turns of the main loop.
+- A broken monitor description from Hyprland (a zero or absurd scale or
+  size) is ignored instead of laying the window out with it.
+- Writing a file (settings, preferences, indexes) no longer fails when a
+  signal interrupts it; it carries on.
+- Failures opening a file with its default app are logged.
 - Smaller things on the paths taken most: the clipboard history trims
   through its index (it scanned the whole table on every copy), usage
   counts that decayed to nothing are forgotten at start (every file opened
