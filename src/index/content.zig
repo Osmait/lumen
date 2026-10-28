@@ -27,6 +27,7 @@ const linux = std.os.linux;
 const Pool = @import("Pool.zig");
 const sys = @import("os");
 const fold = @import("core").fold;
+const utf8 = @import("core").utf8;
 
 /// 02: trigrams of folded text (accents and case, `core.fold`).
 /// 03: a flags column (documents removed by an incremental update).
@@ -1315,17 +1316,9 @@ pub fn verify(
     return .{
         .count = count,
         .line = line_no,
-        .snippet = arena.dupe(u8, validUtf8(raw)) catch "",
+        .snippet = arena.dupe(u8, utf8.validWindow(raw)) catch "",
         .phrase = phrase_hit != null,
     };
-}
-
-fn validUtf8(s: []const u8) []const u8 {
-    var lo: usize = 0;
-    while (lo < s.len and lo < 4 and s[lo] & 0xc0 == 0x80) lo += 1;
-    var end = s.len;
-    while (end > lo and !std.unicode.utf8ValidateSlice(s[lo..end])) end -= 1;
-    return s[lo..end];
 }
 
 // ---------------------------------------------------------------- tests

@@ -1,6 +1,7 @@
 //! The detail pane: clipboard text, file previews, content context.
 
 const std = @import("std");
+const core = @import("core");
 const c = @import("c");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
@@ -198,7 +199,7 @@ pub fn showFileDetail(ui: *Ui, it: *const Item) void {
     var text: []const u8 = "";
     if (!image and !f.is_dir) {
         const head = os.readHead(f.path, a.alloc(u8, 4096) catch return);
-        const valid = labels.validUtf8Prefix(head);
+        const valid = core.utf8.validPrefix(head);
         if (valid.len + 4 >= head.len and std.mem.findScalar(
             u8,
             valid,
@@ -247,7 +248,7 @@ fn showExtDetail(ui: *Ui, it: ?*const Item) void {
         const text = if (it) |i| i.detail[0..@min(i.detail.len, 20_000)] else "";
         c.gtk_label_set_text(
             label,
-            (a.dupeSentinel(u8, labels.validUtf8Prefix(text), 0) catch return).ptr,
+            (a.dupeSentinel(u8, core.utf8.validPrefix(text), 0) catch return).ptr,
         );
         c.gtk_widget_remove_css_class(ui.detail_text, "markdown");
     }
@@ -284,7 +285,7 @@ pub fn showDetail(ui: *Ui, it: ?*const Item) void {
     const text = i.detail[0..@min(i.detail.len, 20_000)];
     c.gtk_label_set_text(
         @ptrCast(ui.detail_text),
-        (a.dupeSentinel(u8, labels.validUtf8Prefix(text), 0) catch return).ptr,
+        (a.dupeSentinel(u8, core.utf8.validPrefix(text), 0) catch return).ptr,
     );
     c.gtk_label_set_text(@ptrCast(ui.meta_values[0]), "Text");
     const chars = std.unicode.utf8CountCodepoints(i.detail) catch i.detail.len;

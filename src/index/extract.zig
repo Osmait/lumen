@@ -132,11 +132,7 @@ fn runTool(
 
 /// `s` cut to at most `max` bytes at a UTF-8 boundary, reallocated to fit.
 fn shrink(gpa: std.mem.Allocator, s: []u8, max: usize) ![]u8 {
-    var n = @min(s.len, max);
-    if (n < s.len) {
-        // Never split a character: cut before its lead byte.
-        while (n > 0 and s[n] & 0xC0 == 0x80) n -= 1;
-    }
+    const n = @import("core").utf8.floorBoundary(s, max);
     if (n == s.len) return s;
     if (gpa.resize(s, n)) return s[0..n];
     defer gpa.free(s);

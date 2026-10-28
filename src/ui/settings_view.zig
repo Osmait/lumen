@@ -415,7 +415,7 @@ pub fn setChoosing(ui: *Ui, next: Ui.Choosing) void {
         ) catch {},
         .field => |i| if (form_view.field(ui, i)) |f| w.writeAll(f.title) catch {},
     }
-    const n = labels.validUtf8Prefix(w.buffered()).len;
+    const n = core.utf8.validPrefix(w.buffered()).len;
     ui.choose_title[n] = 0;
 }
 

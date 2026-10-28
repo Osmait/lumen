@@ -61,7 +61,7 @@ pub fn contextMarkup(
     while (it.next()) |raw| : (n += 1) {
         if (n < first) continue;
         if (n > line + after) break;
-        const l = validUtf8Prefix(raw[0..@min(raw.len, 240)]);
+        const l = core.utf8.validPrefix(raw[0..@min(raw.len, 240)]);
         const num = a.print("<span alpha=\"45%\">{d: >4}  </span>", .{n}) catch return "";
         out.appendSlice(a, num) catch return "";
         if (n == line) out.appendSlice(a, "<b>") catch return "";
@@ -186,16 +186,9 @@ pub fn firstLine(a: std.mem.Allocator, text: []const u8) [:0]const u8 {
     while (lines.next()) |l| {
         const t = std.mem.trim(u8, l, " \t\r");
         if (t.len == 0) continue;
-        return a.dupeSentinel(u8, validUtf8Prefix(t[0..@min(t.len, 120)]), 0) catch "";
+        return a.dupeSentinel(u8, core.utf8.validPrefix(t[0..@min(t.len, 120)]), 0) catch "";
     }
     return "";
-}
-
-/// Longest prefix of `s` that is valid UTF-8 (cuts never split a character).
-pub fn validUtf8Prefix(s: []const u8) []const u8 {
-    var end = s.len;
-    while (end > 0 and !std.unicode.utf8ValidateSlice(s[0..end])) end -= 1;
-    return s[0..end];
 }
 
 test "displayText makes any file name safe for a label" {
