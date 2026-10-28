@@ -508,7 +508,10 @@ fn run(s: *ContentService) void {
     while (!s.stop.load(.acquire)) {
         // Sleep until poked or until the next periodic check.
         // Canceled never happens: this thread is joined, not canceled.
-        s.io.futexWaitTimeout(u32, &s.wake.raw, seen, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } }) catch {};
+        // Until the next periodic check (pokes and `stop` wake it sooner):
+        // it used to wake every 5 s to see whether 5 minutes had passed.
+        const due = s.opts.refresh_every_ns -| (sys.monotonicNs() - s.last_check_ns.load(.acquire));
+        s.io.futexWaitTimeout(u32, &s.wake.raw, seen, .{ .duration = .{ .raw = .fromNanoseconds(@max(due, std.time.ns_per_s)), .clock = .awake } }) catch {};
         if (s.stop.load(.acquire)) return;
         const since = sys.monotonicNs() - s.last_check_ns.load(.acquire);
         const now_wake = s.wake.load(.acquire);

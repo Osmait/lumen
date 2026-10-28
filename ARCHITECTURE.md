@@ -246,6 +246,7 @@ documents indexed):
 | contents, key to frame p50 | 131 ms | 18 ms | previews clip long lines instead of wrapping |
 | files, key to frame p50 | 73 ms | 23 ms | preview capped at 40 lines, no wrapping |
 | CPU idle | 0 % | 0 % | nothing polls: inotify and futex waits |
+| name index thread, idle | 50 ms CPU, 629 wakeups per minute | ~0 ms, 44 | tombstones counted as they happen instead of 1.1 M masks after each event batch; no 100 ms poll timeout (an eventfd wakes it to stop); the content service sleeps until its next check instead of every 5 s |
 | anonymous memory | 44 MB | 37 MB | glibc's malloc in release builds (Zig 0.17's ReleaseSafe default is a checking allocator mapping every allocation of 6 KB or more, so the tuning above did not apply), no 256 KB signal stack in each of 31 threads' TLS |
 | disk writes, idle | ~1 GB/h | — | the name index rescanned every 10 minutes whenever caches changed (always); now only on start |
 | key press to window (p50) | 58.5 ms | 7.8 ms | `lumen` without GTK: 42.8 ms of client became 0.9 ms (Hyprland's `openlayer` event, 15 runs); the focused monitor read from Hyprland's socket instead of starting `hyprctl` (daemon's show 16.3 → 6.8 ms) |

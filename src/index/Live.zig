@@ -86,6 +86,10 @@ pending_resync: bool = false,
 /// running lived only in the delta and died with the process.
 dirty: bool = false,
 last_compact_ns: u64,
+/// Tombstoned base entries, counted as they die: `needsCompaction` runs
+/// after every batch of events, and counting 1.1 M masks there took ~1 ms
+/// under the lock searches wait on.
+graves: usize = 0,
 stats: Stats = .{},
 limits: Limits = .{},
 
@@ -107,6 +111,7 @@ pub fn initUnarmed(gpa: std.mem.Allocator, base: Store, cfg: *const scan.Config,
         .scan_pool = scan_pool,
         .arm_cursor = 0,
         .last_compact_ns = sys.monotonicNs(),
+        .graves = base.len() - base.liveLen(),
     };
 }
 
@@ -303,6 +308,7 @@ fn tombstoneBaseTree(l: *Live, root: u32) usize {
         l.base.tombstone(id);
         n += 1;
     }
+    l.graves += n;
     return n;
 }
 
@@ -498,6 +504,7 @@ pub fn adopt(l: *Live, base: Store, watcher: *Watcher) std.mem.Allocator.Error!R
     const delta = try empty.finish(l.gpa);
     const old: Replaced = .{ .base = l.base, .watcher = l.watcher };
     l.base = base;
+    l.graves = base.len() - base.liveLen();
     l.watcher = watcher;
     l.stats.watches = watcher.count();
     l.arm_cursor = std.math.maxInt(u32);
@@ -516,7 +523,7 @@ pub fn adopt(l: *Live, base: Store, watcher: *Watcher) std.mem.Allocator.Error!R
 /// True when the layers on top weigh enough to be worth a rescan, or when
 /// changes have been waiting too long to reach the file.
 pub fn needsCompaction(l: *const Live) bool {
-    const graves = l.base.len() - l.base.liveLen();
+    const graves = l.graves;
     const lim = l.limits;
     if (l.delta.len() > lim.delta_max or (graves > lim.graves_min and graves > l.base.len() / lim.graves_div)) return true;
     return l.dirty and sys.monotonicNs() -| l.last_compact_ns >= lim.interval_ns;

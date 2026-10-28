@@ -26,8 +26,9 @@ const log = std.log.scoped(.files);
 
 /// Watches per batch: ~2.3 us each, so a search waits ~4.6 ms at worst.
 const arm_batch = 2_000;
-/// How long the thread blocks on inotify before checking for `stop`.
-const poll_ms = 100;
+/// No eventfd for `shutdown` (`wake_fd`): the thread then waits at most
+/// 100 ms at a time on inotify, to look at `stop`.
+const no_fd: i32 = -1;
 /// Pause between arming batches: without it the thread re-takes the lock at
 /// once and a reader can starve for the whole arming (149 ms measured).
 const arm_yield_us = 300;
@@ -37,6 +38,9 @@ io: Io,
 live: Live,
 lock: Io.RwLock = .init,
 stop: std.atomic.Value(bool) = .init(false),
+/// Written by `shutdown`: the thread waits on inotify and this, with no
+/// timeout (it used to wake every 100 ms to look at `stop`).
+wake_fd: i32 = no_fd,
 thread: ?std.Thread = null,
 search_pool: *Pool,
 scan_pool: *Pool,
@@ -91,6 +95,8 @@ pub fn start(gpa: std.mem.Allocator, io: Io, root: []const u8, cache_path: []con
     };
     errdefer s.live.deinit();
     s.live.pending_resync = true;
+    const efd = std.os.linux.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
+    if (std.os.linux.errno(efd) == .SUCCESS) s.wake_fd = @intCast(efd);
     s.thread = try std.Thread.spawn(.{}, run, .{s});
     s.thread.?.setName(io, "lm-files") catch {};
     return s;
@@ -100,7 +106,12 @@ pub fn start(gpa: std.mem.Allocator, io: Io, root: []const u8, cache_path: []con
 /// The flush is what makes today's files still be there tomorrow.
 pub fn shutdown(s: *Service) void {
     s.stop.store(true, .release);
+    if (s.wake_fd != no_fd) {
+        const one: u64 = 1;
+        _ = std.os.linux.write(s.wake_fd, std.mem.asBytes(&one), 8);
+    }
     if (s.thread) |t| t.join();
+    if (s.wake_fd != no_fd) sys.close(s.wake_fd);
     if (s.live.dirty or s.live.pending_resync) {
         if (Live.prepareCompaction(s.gpa, s.scan_pool, &s.cfg, s.cache_path)) |fresh| {
             if (s.live.adopt(fresh.base, fresh.watcher)) |old| freeReplaced(s.gpa, old) else |err| {
@@ -234,7 +245,7 @@ fn run(s: *Service) void {
         s.lock.lockSharedUncancelable(s.io);
         const fd = s.live.watcher.fd;
         s.lock.unlockShared(s.io);
-        if (!sys.waitReadable(fd, poll_ms)) continue;
+        if (!sys.waitEvents(fd, s.wake_fd)) continue;
 
         _ = arena_state.reset(.retain_capacity);
         const arena = arena_state.allocator();

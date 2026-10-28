@@ -307,6 +307,18 @@ pub fn tmpDirPath(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
     return std.fmt.bufPrint(buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 }
 
+/// Waits until `fd` is readable (true) or `wake` is written (false). Without
+/// `wake` (-1), it gives up every 100 ms so the caller can look around.
+pub fn waitEvents(fd: i32, wake: i32) bool {
+    var pfd = [2]linux.pollfd{
+        .{ .fd = fd, .events = linux.POLL.IN, .revents = 0 },
+        .{ .fd = wake, .events = linux.POLL.IN, .revents = 0 },
+    };
+    const n: usize = if (wake < 0) 1 else 2;
+    const rc = linux.poll(&pfd, n, if (wake < 0) 100 else -1);
+    return linux.errno(rc) == .SUCCESS and rc > 0 and pfd[0].revents & linux.POLL.IN != 0;
+}
+
 pub fn waitReadable(fd: i32, timeout_ms: i32) bool {
     var pfd = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
     const rc = linux.poll(&pfd, 1, timeout_ms);

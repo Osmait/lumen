@@ -51,6 +51,10 @@ All notable changes are listed here. The format follows
   of ~58 ms, and each copy
   into the clipboard history no longer starts a GTK process. Install both
   files (see the README).
+- Idle, the daemon wakes far less: the name index no longer polls every
+  100 ms nor counts its 1.1 M entries after every batch of file events
+  (50 ms of CPU and 629 wakeups per minute → ~0 and 44), and the content
+  index sleeps until its next check.
 - File search scores its finalists and checks their recency on all cores:
   with the 60 results Search Files asks for, "cargo" 5.1 → 2.3 ms and
   "config" ~4.5 → 1.6 ms. `lumen-find bench` and `zig build perf` now
