@@ -11,21 +11,10 @@
 const std = @import("std");
 const linux = std.os.linux;
 const ipc = @import("ipc.zig");
+const cli = @import("cli.zig");
 const unix = @import("os").unix;
 const failed = unix.failed;
 const writeAll = unix.writeAll;
-
-/// Flags passed on as they are, and those taking a value.
-const plain = [_][]const u8{
-    "--toggle",
-    "--show",
-    "--hide",
-    "--quit",
-    "--reload",
-    "--stats",
-    "--dump",
-};
-const valued = [_][]const u8{ "--key", "--text", "--view", "--query", "--command" };
 
 var request: [ipc.max_request_bytes]u8 = undefined;
 var answer: [8 << 20]u8 = undefined;
@@ -34,6 +23,11 @@ pub fn main(init: std.process.Init.Minimal) void {
     const argv = init.args.vector;
     const envp: [*:null]const ?[*:0]const u8 = init.environ.block.slice.ptr;
     const args = argv[1..];
+    // No daemon, no GTK needed for it.
+    if (args.len == 1 and cli.parse(std.mem.span(args[0])) == .help) {
+        _ = writeAll(1, cli.usage);
+        linux.exit_group(0);
+    }
     if (std.process.Environ.getPosix(init.environ, "XDG_RUNTIME_DIR")) |rt| {
         const app_id = std.process.Environ.getPosix(
             init.environ,
@@ -55,16 +49,17 @@ fn clipStore(args: []const [*:0]const u8) bool {
     return args.len == 1 and std.mem.eql(u8, std.mem.span(args[0]), "--clip-store");
 }
 
+/// Every flag one the daemon's socket takes, with its value.
 fn passable(args: []const [*:0]const u8) bool {
     var i: usize = 0;
-    next: while (i < args.len) : (i += 1) {
-        const a = std.mem.span(args[i]);
-        for (plain) |f| if (std.mem.eql(u8, a, f)) continue :next;
-        for (valued) |f| if (std.mem.eql(u8, a, f) and i + 1 < args.len) {
+    while (i < args.len) : (i += 1) {
+        const flag = cli.parse(std.mem.span(args[i])) orelse return false;
+        const spec = cli.specs.get(flag);
+        if (!spec.socket) return false;
+        if (spec.value == .required) {
+            if (i + 1 == args.len) return false;
             i += 1;
-            continue :next;
-        };
-        return false;
+        }
     }
     return true;
 }

@@ -20,6 +20,7 @@ const index = @import("index");
 const stats = @import("stats.zig");
 const Settings = @import("settings.zig").Settings;
 const ipc = @import("ipc.zig");
+const cli = @import("cli.zig");
 const ipc_server = @import("sys/ipc_server.zig");
 
 pub const std_options: std.Options = .{
@@ -62,9 +63,14 @@ pub fn main(init: std.process.Init) !void {
     var it = init.minimal.args.iterate();
     while (it.next()) |arg| try argv.append(init.gpa, arg.ptr);
 
-    if (argv.items.len > 1 and std.mem.eql(u8, std.mem.span(argv.items[1].?), "--clip-store")) {
+    if (argv.items.len > 1 and cli.parse(std.mem.span(argv.items[1].?)) == .clip_store) {
         return clipStore(init);
     }
+    // Never a reason to start or ask a daemon.
+    for (argv.items[1..]) |arg| if (cli.parse(std.mem.span(arg.?)) == .help) {
+        std.Io.File.stdout().writeStreamingAll(init.io, cli.usage) catch {};
+        return;
+    };
 
     if (c.g_getenv("LUMEN_APP_ID")) |id| app_id = std.mem.span(id);
     // Commands that only talk to a running daemon must not become one: with
@@ -72,7 +78,10 @@ pub fn main(init: std.process.Init) !void {
     // `lumen --stats` would start a whole new daemon and never return. As a
     // launcher it never takes the bus name either (taking it even briefly
     // made a daemon starting at the same moment fail to register).
-    const client_only = argv.items.len > 1 and clientOnly(std.mem.span(argv.items[1].?));
+    const client_only = argv.items.len > 1 and if (cli.parse(std.mem.span(argv.items[1].?))) |f|
+        cli.specs.get(f).needs_daemon
+    else
+        false;
     const flags = c.G_APPLICATION_HANDLES_COMMAND_LINE | if (client_only) c.G_APPLICATION_IS_LAUNCHER else 0;
     const app = c.gtk_application_new(app_id.ptr, flags);
     the_app = @ptrCast(app);
@@ -208,81 +217,89 @@ fn run(app: *c.GApplication, args: []const [:0]const u8, out: *const Out) c_int 
     var query: ?[*:0]const u8 = null;
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
-        const a = args[i];
-        const next: ?[:0]const u8 = if (i + 1 < args.len) args[i + 1] else null;
-        if (std.mem.eql(u8, a, "--dump")) {
-            if (!ui_ready) return 1;
-            const text = ui.dump(ui.gpa) catch return 1;
-            defer ui.gpa.free(text);
-            out.print(text);
-            return 0;
-        } else if (std.mem.eql(u8, a, "--key") and next != null) {
-            if (!ui_ready) return 1;
-            if (!ui.injectKey(next.?)) return usage(out);
-            return 0;
-        } else if (std.mem.eql(u8, a, "--stats")) {
-            if (!ui_ready) return 1;
-            const text = stats.report(ui.gpa, ui.files, ui.contents) catch return 1;
-            defer ui.gpa.free(text);
-            out.print(text);
-            return 0;
-        } else if (std.mem.eql(u8, a, "--text") and next != null) {
-            // Types into the search bar of the view shown (tests).
-            if (!ui_ready) return 1;
-            c.gtk_editable_set_text(@ptrCast(ui.entry), next.?.ptr);
-            return 0;
-        } else if (std.mem.eql(u8, a, "--reload")) {
-            if (!ui_ready) return 1;
-            Ui.ext_view.reload(&ui);
-            return 0;
-        } else if (std.mem.eql(u8, a, "--install") and next != null) {
-            job = .install;
-            job_arg = next.?;
-            i += 1;
-        } else if (std.mem.eql(u8, a, "--uninstall") and next != null) {
-            job = .uninstall;
-            job_arg = next.?;
-            i += 1;
-        } else if (std.mem.eql(u8, a, "--update")) {
-            job = .update;
-            // The name is optional: without it, every git extension.
-            if (next) |n| if (!std.mem.startsWith(u8, n, "-")) {
-                job_arg = n;
+        const flag = cli.parse(args[i]) orelse return usage(out);
+        const value: [:0]const u8 = switch (cli.specs.get(flag).value) {
+            .none => "",
+            .required => if (i + 1 < args.len) v: {
                 i += 1;
-            };
-        } else if (std.mem.eql(u8, a, "--as") and next != null) {
-            as = next.?;
-            i += 1;
-        } else if (std.mem.eql(u8, a, "--dmenu")) {
-            pick = true;
-        } else if (std.mem.eql(u8, a, "--prompt") and next != null) {
-            prompt = next.?;
-            i += 1;
-        } else if (std.mem.eql(u8, a, "--command") and next != null) {
-            command = next.?;
-            i += 1;
-        } else if (std.mem.eql(u8, a, "--quit")) {
-            c.g_application_quit(app);
-            return 0;
-        } else if (std.mem.eql(u8, a, "--daemon")) {
-            mode = .daemon;
-        } else if (std.mem.eql(u8, a, "--show")) {
-            mode = .show;
-        } else if (std.mem.eql(u8, a, "--hide")) {
-            mode = .hide;
-        } else if (std.mem.eql(u8, a, "--toggle")) {
-            mode = .toggle;
-        } else if (std.mem.eql(u8, a, "--query") and next != null) {
-            query = next.?.ptr;
-            i += 1;
-        } else if (std.mem.eql(u8, a, "--view") and next != null) {
-            view = std.meta.stringToEnum(Ui.View, next.?) orelse return usage(out);
-            if (view == .ext) return usage(out);
-            i += 1;
-        } else if (std.mem.eql(u8, a, "--clip-store") and out.payload != null) {
-            storeClip(out.payload.?);
-            return 0;
-        } else return usage(out);
+                break :v args[i];
+            } else return usage(out),
+            // Not the next flag.
+            .optional => if (i + 1 < args.len and !std.mem.startsWith(u8, args[i + 1], "-")) v: {
+                i += 1;
+                break :v args[i];
+            } else "",
+        };
+        switch (flag) {
+            .dump => {
+                if (!ui_ready) return 1;
+                const text = ui.dump(ui.gpa) catch return 1;
+                defer ui.gpa.free(text);
+                out.print(text);
+                return 0;
+            },
+            .key => {
+                if (!ui_ready) return 1;
+                if (!ui.injectKey(value)) return usage(out);
+                return 0;
+            },
+            .stats => {
+                if (!ui_ready) return 1;
+                const text = stats.report(ui.gpa, ui.files, ui.contents) catch return 1;
+                defer ui.gpa.free(text);
+                out.print(text);
+                return 0;
+            },
+            .text => {
+                // Types into the search bar of the view shown (tests).
+                if (!ui_ready) return 1;
+                c.gtk_editable_set_text(@ptrCast(ui.entry), value.ptr);
+                return 0;
+            },
+            .reload => {
+                if (!ui_ready) return 1;
+                Ui.ext_view.reload(&ui);
+                return 0;
+            },
+            .help => {
+                out.print(cli.usage);
+                return 0;
+            },
+            .install => {
+                job = .install;
+                job_arg = value;
+            },
+            .uninstall => {
+                job = .uninstall;
+                job_arg = value;
+            },
+            .update => {
+                job = .update;
+                // The name is optional: without it, every git extension.
+                if (value.len > 0) job_arg = value;
+            },
+            .as => as = value,
+            .dmenu => pick = true,
+            .prompt => prompt = value,
+            .command => command = value,
+            .quit => {
+                c.g_application_quit(app);
+                return 0;
+            },
+            .daemon => mode = .daemon,
+            .show => mode = .show,
+            .hide => mode = .hide,
+            .toggle => mode = .toggle,
+            .query => query = value.ptr,
+            .view => {
+                view = std.meta.stringToEnum(Ui.View, value) orelse return usage(out);
+                if (view == .ext) return usage(out);
+            },
+            .clip_store => {
+                storeClip(out.payload orelse return usage(out));
+                return 0;
+            },
+        }
     }
     if (!ui_ready) return 1;
     // Answered later, through the GApplication client (lumen-gtk).
@@ -328,34 +345,8 @@ fn run(app: *c.GApplication, args: []const [:0]const u8, out: *const Out) c_int 
     return 0;
 }
 
-fn clientOnly(flag: []const u8) bool {
-    const flags = [_][]const u8{
-        "--dump",
-        "--key",
-        "--text",
-        "--stats",
-        "--hide",
-        "--quit",
-        "--reload",
-        "--dmenu",
-        "--install",
-        "--update",
-        "--uninstall",
-    };
-    for (flags) |f| if (std.mem.eql(u8, flag, f)) return true;
-    return false;
-}
-
 fn usage(out: *const Out) c_int {
-    out.printErr(
-        \\usage: lumen [--toggle | --show | --hide | --daemon | --quit | --reload | --stats | --dump]
-        \\             [--key down|up|enter|ctrl+enter|ctrl+k|escape|backspace|pagedown|pageup|ctrl+x|ctrl+o|ctrl+KEY]
-        \\             [--view root|clipboard|windows|files|contents|settings|themes|default_apps]
-        \\             [--command EXTENSION.COMMAND] [--query TEXT]
-        \\       lumen --dmenu [--prompt TEXT] [--query TEXT]   < lines
-        \\       lumen --install URL [--as NAME] | --update [NAME] | --uninstall NAME
-        \\
-    );
+    out.printErr(cli.usage);
     return 2;
 }
 
@@ -605,6 +596,7 @@ test {
 
 test {
     _ = @import("ui/logos.zig");
+    _ = @import("cli.zig");
     _ = @import("ext/lua.zig");
     _ = @import("ext/json.zig");
     _ = @import("ext/api.zig");
@@ -612,4 +604,9 @@ test {
     _ = @import("ui/ext_view.zig");
     _ = @import("ui/installer.zig");
     _ = @import("layout.zig");
+}
+
+test "the views the usage lists open" {
+    var it = std.mem.tokenizeAny(u8, cli.views, ", \n");
+    while (it.next()) |v| try std.testing.expect(std.meta.stringToEnum(Ui.View, v) != null);
 }
