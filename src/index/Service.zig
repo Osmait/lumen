@@ -294,9 +294,13 @@ fn touch(dir: []const u8, name: []const u8) !void {
     try sys.writeFile(p, "x");
 }
 
+/// Ceilings, not expectations: the whole test suite runs at once, every
+/// test with its own thread pool, and a loaded machine is slow.
+const wait_tries = 1000;
+
 fn waitFor(s: *Service, arena: std.mem.Allocator, query: []const u8, want: bool) !bool {
     var hits: std.ArrayList(Live.Hit) = .empty;
-    for (0..300) |_| {
+    for (0..wait_tries) |_| {
         try s.search(arena, query, 10, &hits);
         if ((hits.items.len > 0) == want) return true;
         sys.sleepUs(10_000);
@@ -308,13 +312,8 @@ test "live: new, nested and deleted files show up without a rescan" {
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var rel_buf: [4096]u8 = undefined;
-    const rel = try sys.tmpDirPath(&tmp, &rel_buf);
-    var cwd_buf: [4096]u8 = undefined;
-    const cwd_rc = std.os.linux.getcwd(&cwd_buf, cwd_buf.len);
-    const cwd = std.mem.sliceTo(cwd_buf[0..cwd_rc], 0);
     var abs_buf: [4096]u8 = undefined;
-    const abs = try std.mem.print(&abs_buf, "{s}/{s}", .{ cwd, rel });
+    const abs = try sys.tmpDirAbs(&tmp, &abs_buf);
     try touch(abs, "first_note.md");
 
     var idx_buf: [4096]u8 = undefined;
@@ -351,20 +350,14 @@ test "live: new, nested and deleted files show up without a rescan" {
     _ = std.os.linux.unlink(try std.mem.printSentinel(&cbuf, "{s}", .{idx}, 0));
 }
 
-/// Absolute path of a testing tmp dir.
-fn tmpAbs(tmp: *testing.TmpDir, buf: []u8) ![]const u8 {
-    var cwd_buf: [4096]u8 = undefined;
-    const cwd = std.mem.sliceTo(cwd_buf[0..std.os.linux.getcwd(&cwd_buf, cwd_buf.len)], 0);
-    var rel_buf: [4096]u8 = undefined;
-    return std.mem.print(buf, "{s}/{s}", .{ cwd, try sys.tmpDirPath(tmp, &rel_buf) });
-}
+const tmpAbs = sys.tmpDirAbs;
 
 /// Waits until the thread has nothing pending: armed and not rescanning.
 fn settle(s: *Service) !void {
-    for (0..2_000) |_| {
+    for (0..wait_tries) |_| {
         const st = s.status();
         if (st.armed and !st.rescanning) return;
-        sys.sleepUs(5_000);
+        sys.sleepUs(20_000);
     }
     return error.NeverSettled;
 }
@@ -377,7 +370,7 @@ fn has(s: *Service, arena: std.mem.Allocator, query: []const u8, suffix: []const
 }
 
 fn waitHas(s: *Service, arena: std.mem.Allocator, query: []const u8, suffix: []const u8) !bool {
-    for (0..500) |_| {
+    for (0..wait_tries) |_| {
         if (try has(s, arena, query, suffix)) return true;
         sys.sleepUs(10_000);
     }
@@ -561,9 +554,9 @@ test "service: shutdown saves what was learned and the next start maps it" {
 
 /// Waits until `nameChanges` differs from `from` (or, `from` null, is known).
 pub fn waitNames(s: *Service, from: ?u64) error{NoNameChange}!u64 {
-    for (0..600) |_| {
+    for (0..wait_tries) |_| {
         if (s.nameChanges()) |n| if (from == null or n != from.?) return n;
-        sys.sleepUs(5_000);
+        sys.sleepUs(10_000);
     }
     return error.NoNameChange;
 }
@@ -624,9 +617,9 @@ test "service: the delta threshold triggers a compaction" {
         var nb: [32]u8 = undefined;
         try touch(root, try std.mem.print(&nb, "umbral_{d}.txt", .{i}));
     }
-    for (0..1_000) |_| {
+    for (0..wait_tries) |_| {
         if (s.status().rescans > rescans) break;
-        sys.sleepUs(5_000);
+        sys.sleepUs(20_000);
     }
     try settle(s);
     try testing.expect(s.status().rescans > rescans);

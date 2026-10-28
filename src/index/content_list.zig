@@ -167,45 +167,7 @@ fn binaryByName(path: []const u8) bool {
 const testing = std.testing;
 const sys = @import("os");
 
-/// A testing tmp dir with its absolute path (`list` takes an absolute root;
-/// tests run from the build root).
-pub const TestTree = struct {
-    tmp: testing.TmpDir,
-    abs: []u8,
-
-    pub fn init() !TestTree {
-        var tmp = testing.tmpDir(.{});
-        errdefer tmp.cleanup();
-        var rel_buf: [256]u8 = undefined;
-        const rel = try sys.tmpDirPath(&tmp, &rel_buf);
-        const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
-        defer testing.allocator.free(cwd);
-        return .{ .tmp = tmp, .abs = try testing.allocator.print("{s}/{s}", .{ cwd, rel }) };
-    }
-
-    pub fn deinit(t: *TestTree) void {
-        testing.allocator.free(t.abs);
-        t.tmp.cleanup();
-    }
-
-    /// Absolute path of `name` (static buffer per call site is the caller's).
-    pub fn path(t: *const TestTree, buf: []u8, name: []const u8) ![:0]u8 {
-        return std.mem.printSentinel(buf, "{s}/{s}", .{ t.abs, name }, 0);
-    }
-
-    /// Writes `name` (creating parent dirs) with `data`.
-    pub fn write(t: *const TestTree, name: []const u8, data: []const u8) !void {
-        var buf: [4096]u8 = undefined;
-        const p = try t.path(&buf, name);
-        if (std.mem.findScalarLast(u8, p, '/')) |slash| sys.mkdirP(p[0..slash]);
-        try sys.writeFile(p, data);
-    }
-
-    pub fn mkdir(t: *const TestTree, name: []const u8) !void {
-        var buf: [4096]u8 = undefined;
-        sys.mkdirP(try t.path(&buf, name));
-    }
-};
+const TestTree = sys.TestDir;
 
 /// `list` relative to the tree, or SkipZigTest without ripgrep.
 fn listRel(arena: std.mem.Allocator, t: *const TestTree, with_documents: bool) ![]content.DocIn {

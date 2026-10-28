@@ -161,12 +161,7 @@ fn parse(w: *Watcher, arena: std.mem.Allocator, n: usize, out: *std.ArrayList(Ch
 
 const testing = std.testing;
 
-fn tmpAbs(tmp: *testing.TmpDir, buf: []u8) ![]const u8 {
-    var cwd_buf: [4096]u8 = undefined;
-    const cwd = std.mem.sliceTo(cwd_buf[0..linux.getcwd(&cwd_buf, cwd_buf.len)], 0);
-    var rel_buf: [4096]u8 = undefined;
-    return std.mem.print(buf, "{s}/{s}", .{ cwd, try sys.tmpDirPath(tmp, &rel_buf) });
-}
+const tmpAbs = sys.tmpDirAbs;
 
 test "watcher: events become changes attributed to the watched entry" {
     const gpa = testing.allocator;

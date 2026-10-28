@@ -305,13 +305,7 @@ fn textOf(
     buf.clearRetainingCapacity();
     const fd = sys.openRegular(p) catch return false;
     defer sys.close(fd);
-    while (buf.items.len < max_extracted) {
-        try buf.ensureUnusedCapacity(gpa, 64 * 1024);
-        const spare = buf.unusedCapacitySlice();
-        const n = std.os.linux.read(fd, spare.ptr, spare.len);
-        if (std.os.linux.errno(n) != .SUCCESS or n == 0) break;
-        buf.items.len += n;
-    }
+    try sys.readUpTo(gpa, fd, buf, max_extracted);
     return buf.items.len > 0;
 }
 
@@ -636,7 +630,7 @@ fn run(s: *ContentService) void {
 
 const testing = std.testing;
 const linux = std.os.linux;
-const TestTree = content_list.TestTree;
+const TestTree = sys.TestDir;
 
 fn haveTool(name: []const u8) bool {
     const r = std.process.run(testing.allocator, testing.io, .{

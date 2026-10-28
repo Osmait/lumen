@@ -134,12 +134,22 @@ pub fn of(mime: []const u8, name: []const u8, is_dir: bool) ?Kind {
     return null;
 }
 
+/// "log" for "server.LOG", in `buf`: null when the name has none (no dot,
+/// only a leading one, a trailing one) or it is longer than `buf`.
+pub fn lowerExt(buf: []u8, name: []const u8) ?[]const u8 {
+    const dot = std.mem.findScalarLast(u8, name, '.') orelse return null;
+    const ext = name[dot + 1 ..];
+    if (dot == 0 or ext.len == 0 or ext.len > buf.len) return null;
+    return std.ascii.lowerString(buf, ext);
+}
+
 /// ".log" for "server.LOG": the key an extension override is stored under
 /// (lowercase, with the dot). Empty when the name has no extension.
 pub fn extKey(buf: []u8, name: []const u8) []const u8 {
-    const dot = std.mem.findScalarLast(u8, name, '.') orelse return "";
-    if (dot == 0 or name.len - dot > buf.len or name.len - dot < 2) return "";
-    return std.ascii.lowerString(buf, name[dot..]);
+    if (buf.len < 2) return "";
+    const ext = lowerExt(buf[1..], name) orelse return "";
+    buf[0] = '.';
+    return buf[0 .. 1 + ext.len];
 }
 
 fn hasExt(name: []const u8, exts: []const []const u8) bool {
@@ -181,4 +191,15 @@ test "extension keys" {
     try std.testing.expectEqualStrings("", extKey(&buf, ".bashrc"));
     try std.testing.expectEqualStrings("", extKey(&buf, "Makefile"));
     try std.testing.expectEqualStrings("", extKey(&buf, "trailing."));
+}
+
+test "lowerExt and extKey" {
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("log", lowerExt(&buf, "server.LOG").?);
+    try std.testing.expectEqualStrings("gz", lowerExt(&buf, "a.tar.gz").?);
+    for ([_][]const u8{ "README", ".bashrc", "trailing.", "x.toolongext" }) |n|
+        try std.testing.expect(lowerExt(&buf, n) == null);
+    try std.testing.expectEqualStrings(".log", extKey(&buf, "server.LOG"));
+    try std.testing.expectEqualStrings("", extKey(&buf, ".bashrc"));
+    try std.testing.expectEqualStrings("", extKey(buf[0..4], "x.abcd"));
 }

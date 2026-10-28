@@ -34,15 +34,7 @@ pub fn connect(path: []const u8, opts: ConnectOptions) ?linux.fd_t {
 
 /// Writes all of `bytes`; false when the descriptor failed first.
 pub fn writeAll(fd: linux.fd_t, bytes: []const u8) bool {
-    var at: usize = 0;
-    while (at < bytes.len) {
-        const n = linux.write(fd, bytes[at..].ptr, bytes.len - at);
-        if (failed(n)) |e| {
-            if (e == .INTR) continue;
-            return false;
-        }
-        at += n;
-    }
+    os.writeAll(fd, bytes) catch return false;
     return true;
 }
 

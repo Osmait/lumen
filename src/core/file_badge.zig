@@ -5,6 +5,7 @@
 //! their icons say more than letters, so those get no badge.
 
 const std = @import("std");
+const lowerExt = @import("file_kind.zig").lowerExt;
 
 pub const Color = enum { cyan, blue, yellow, orange, red, green, purple, pink, brown, gray };
 
@@ -68,12 +69,9 @@ const named = [_]struct { []const u8, []const u8, Color }{
 /// gray badge: still more telling than a blank page.
 pub fn of(name: []const u8, upper_buf: *[4]u8) ?Badge {
     for (named) |n| if (std.mem.eql(u8, name, n[0])) return .{ .text = n[1], .color = n[2] };
-    const dot = std.mem.findScalarLast(u8, name, '.') orelse return null;
-    if (dot == 0 or dot + 1 >= name.len) return null;
-    const ext = name[dot + 1 ..];
     var lower_buf: [16]u8 = undefined;
-    if (ext.len > lower_buf.len) return null;
-    const lower = std.ascii.lowerString(&lower_buf, ext);
+    const lower = lowerExt(&lower_buf, name) orelse return null;
+    const ext = name[name.len - lower.len ..];
     for (themed) |t| if (std.mem.eql(u8, lower, t)) return null;
     var color: ?Color = null;
     for (known) |k| if (std.mem.eql(u8, lower, k[0])) {
@@ -91,10 +89,8 @@ pub fn of(name: []const u8, upper_buf: *[4]u8) ?Badge {
 /// extension (those get a gray badge but may be anything, binaries too).
 pub fn isKnown(name: []const u8) bool {
     for (named) |n| if (std.mem.eql(u8, name, n[0])) return true;
-    const dot = std.mem.findScalarLast(u8, name, '.') orelse return false;
     var lower_buf: [16]u8 = undefined;
-    if (dot == 0 or name.len - dot - 1 > lower_buf.len) return false;
-    const lower = std.ascii.lowerString(&lower_buf, name[dot + 1 ..]);
+    const lower = lowerExt(&lower_buf, name) orelse return false;
     for (known) |k| if (std.mem.eql(u8, lower, k[0])) return true;
     return false;
 }
@@ -202,12 +198,8 @@ pub const logo_names = [_]struct { []const u8, Logo }{
 /// The official logo for a file name, or null (then `of` gives a badge).
 pub fn logoOf(name: []const u8) ?Logo {
     for (logo_names) |n| if (std.mem.eql(u8, name, n[0])) return n[1];
-    const dot = std.mem.findScalarLast(u8, name, '.') orelse return null;
-    if (dot == 0 or dot + 1 >= name.len) return null;
     var lower_buf: [16]u8 = undefined;
-    const ext = name[dot + 1 ..];
-    if (ext.len > lower_buf.len) return null;
-    const lower = std.ascii.lowerString(&lower_buf, ext);
+    const lower = lowerExt(&lower_buf, name) orelse return null;
     for (logos) |l| if (std.mem.eql(u8, lower, l[0])) return l[1];
     return null;
 }

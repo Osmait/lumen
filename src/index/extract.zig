@@ -26,11 +26,9 @@ pub const timeout_ms = 15_000;
 pub fn kindOf(path: []const u8) ?Kind {
     const base = path[if (std.mem.findScalarLast(u8, path, '/')) |s| s + 1 else 0..];
     if (std.mem.startsWith(u8, base, "~$")) return null;
-    const dot = std.mem.findScalarLast(u8, base, '.') orelse return null;
-    const ext = base[dot + 1 ..];
-    if (dot == 0 or ext.len == 0 or ext.len > 4) return null;
     var buf: [4]u8 = undefined;
-    return std.meta.stringToEnum(Kind, std.ascii.lowerString(&buf, ext));
+    const ext = @import("core").file_kind.lowerExt(&buf, base) orelse return null;
+    return std.meta.stringToEnum(Kind, ext);
 }
 
 pub const ExtractError = Error || std.mem.Allocator.Error || sys.child.Error;
@@ -453,27 +451,18 @@ test "shrink cuts at a UTF-8 boundary" {
 }
 
 const TestDir = struct {
-    tmp: testing.TmpDir,
-    rel: []const u8,
+    t: sys.TestDir,
     abs: []const u8,
-    rel_buf: [128]u8,
 
     fn init(td: *TestDir) !void {
-        td.tmp = testing.tmpDir(.{});
-        td.rel = try sys.tmpDirPath(&td.tmp, &td.rel_buf);
-        const cwd = try std.process.currentPathAlloc(testing.io, testing.allocator);
-        defer testing.allocator.free(cwd);
-        td.abs = try testing.allocator.print("{s}/{s}", .{ cwd, td.rel });
+        td.t = try .init();
+        td.abs = td.t.abs;
     }
     fn deinit(td: *TestDir) void {
-        testing.allocator.free(td.abs);
-        td.tmp.cleanup();
+        td.t.deinit();
     }
     fn write(td: *TestDir, name: []const u8, data: []const u8) !void {
-        var buf: [512]u8 = undefined;
-        const p = try std.mem.printSentinel(&buf, "{s}/{s}", .{ td.rel, name }, 0);
-        if (std.mem.findScalarLast(u8, p, '/')) |s| sys.mkdirP(p[0..s]);
-        try sys.writeFile(p, data);
+        try td.t.write(name, data);
     }
     fn absZ(td: *TestDir, name: []const u8) ![:0]u8 {
         return testing.allocator.printSentinel("{s}/{s}", .{ td.abs, name }, 0);
@@ -554,14 +543,13 @@ test "extract docx, xlsx, pptx (OOXML)" {
     try expectExtract(&td, "bo*.xlsx", "Revenue\nCoste unitario");
 }
 
-/// Zips the contents of `dir` (relative member names) into `name` at the
-/// test dir's top level.
-/// Zips `dir` into `name`, members in name order. `unzip -p` prints members in
+/// Zips `dir` into `name` at the test dir's top level, members (relative
+/// names) in name order. `unzip -p` prints members in
 /// archive order, and `zip -r` would follow readdir's order, which differs
 /// between file systems (Office writes the body first; sorted names do too).
 fn zipInto(td: *TestDir, dir: []const u8, name: []const u8) !void {
     var buf: [256]u8 = undefined;
-    const rel = try std.mem.print(&buf, "{s}/{s}", .{ td.rel, dir });
+    const rel = try std.mem.print(&buf, "{s}/{s}", .{ td.abs, dir });
     var cmd_buf: [256]u8 = undefined;
     const cmd = try std.mem.print(
         &cmd_buf,

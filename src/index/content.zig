@@ -482,14 +482,8 @@ pub fn readPlain(
     // Not a plain open: the path may have become a FIFO since it was indexed.
     const fd = sys.openRegular(z) catch return false;
     defer sys.close(fd);
-    try buf.ensureTotalCapacity(gpa, 16 * 1024);
-    while (buf.items.len <= max_text) {
-        try buf.ensureUnusedCapacity(gpa, 64 * 1024);
-        const spare = buf.unusedCapacitySlice();
-        const n = linux.read(fd, spare.ptr, spare.len);
-        if (linux.errno(n) != .SUCCESS or n == 0) break;
-        buf.items.len += n;
-    }
+    // One byte past the limit tells a file over it.
+    try sys.readUpTo(gpa, fd, buf, max_text + 1);
     if (buf.items.len > max_text) return false;
     const head = buf.items[0..@min(buf.items.len, 8000)];
     return std.mem.findScalar(u8, head, 0) == null;

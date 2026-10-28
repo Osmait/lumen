@@ -244,9 +244,41 @@ pub fn writeFile(path: [*:0]const u8, data: []const u8) Error!void {
         0o600,
     )));
     defer close(fd);
+    try writeAll(fd, data);
+}
+
+/// Writes all of `data` at the descriptor's position, or at `at` (pwrite).
+pub fn writeAll(fd: i32, data: []const u8) Error!void {
+    return writeAllAt(fd, data, null);
+}
+
+pub fn writeAllAt(fd: i32, data: []const u8, at: ?usize) Error!void {
     var off: usize = 0;
     while (off < data.len) {
-        off += try check(linux.write(fd, data[off..].ptr, data.len - off));
+        const rest = data[off..];
+        const rc = if (at) |a|
+            linux.pwrite(fd, rest.ptr, rest.len, @intCast(a + off))
+        else
+            linux.write(fd, rest.ptr, rest.len);
+        if (linux.errno(rc) == .INTR) continue;
+        off += try check(rc);
+    }
+}
+
+/// Reads `fd` into `buf` until its end or `buf` holds `max_bytes` (it can
+/// hold a little more: a read is not cut short). A read error ends it.
+pub fn readUpTo(gpa: std.mem.Allocator, fd: i32, buf: *std.ArrayList(u8), max_bytes: usize) std.mem.Allocator.Error!void {
+    while (buf.items.len < max_bytes) {
+        try buf.ensureUnusedCapacity(gpa, 64 * 1024);
+        const spare = buf.unusedCapacitySlice();
+        const n = linux.read(fd, spare.ptr, spare.len);
+        switch (linux.errno(n)) {
+            .SUCCESS => if (n == 0) return else {
+                buf.items.len += n;
+            },
+            .INTR => {},
+            else => return,
+        }
     }
 }
 
@@ -258,24 +290,10 @@ pub fn rename(from: [*:0]const u8, to: [*:0]const u8) Error!void {
 /// full disk never leaves a truncated `path` behind, and a failed write
 /// leaves no `.tmp`. Owner-only.
 pub fn writeFileAtomic(path: []const u8, data: []const u8) Error!void {
-    var pbuf: [4096]u8 = undefined;
-    var tbuf: [4096]u8 = undefined;
-    const final = std.mem.printSentinel(&pbuf, "{s}", .{path}, 0) catch return error.NameTooLong;
-    const tmp = std.mem.printSentinel(&tbuf, "{s}.tmp", .{path}, 0) catch return error.NameTooLong;
-    {
-        const fd: i32 = @intCast(try check(linux.open(
-            tmp,
-            .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true },
-            0o600,
-        )));
-        defer close(fd);
-        errdefer _ = linux.unlink(tmp);
-        var off: usize = 0;
-        while (off < data.len) off += try check(linux.write(fd, data[off..].ptr, data.len - off));
-        _ = try check(linux.fsync(fd));
-    }
-    errdefer _ = linux.unlink(tmp);
-    try rename(tmp, final);
+    var f = try AtomicFile.create(path);
+    errdefer f.abort();
+    try f.write(data);
+    try f.commit();
 }
 
 /// `writeFileAtomic` a piece at a time: `<path>.tmp`, written in order, a
@@ -313,18 +331,11 @@ pub const AtomicFile = struct {
     }
 
     pub fn write(f: *AtomicFile, data: []const u8) Error!void {
-        var off: usize = 0;
-        while (off < data.len) off += try check(linux.write(f.fd, data[off..].ptr, data.len - off));
+        try writeAll(f.fd, data);
     }
 
     pub fn writeAt(f: *AtomicFile, data: []const u8, at: usize) Error!void {
-        var off: usize = 0;
-        while (off < data.len) off += try check(linux.pwrite(
-            f.fd,
-            data[off..].ptr,
-            data.len - off,
-            @intCast(at + off),
-        ));
+        try writeAllAt(f.fd, data, at);
     }
 
     pub fn commit(f: *AtomicFile) Error!void {
@@ -373,13 +384,7 @@ pub const AppendFile = struct {
     }
 
     pub fn writeAt(f: *AppendFile, data: []const u8, at: usize) Error!void {
-        var off: usize = 0;
-        while (off < data.len) off += try check(linux.pwrite(
-            f.fd,
-            data[off..].ptr,
-            data.len - off,
-            @intCast(at + off),
-        ));
+        try writeAllAt(f.fd, data, at);
     }
 
     pub fn sync(f: *AppendFile) Error!void {
@@ -432,6 +437,54 @@ pub fn mapPrivate(path: [*:0]const u8) Error![]align(8) u8 {
 }
 
 /// Absolute-enough path of a testing tmp dir (tests run from the build root).
+/// A testing tmp dir with its absolute path (tests run from the build
+/// root; what they test often takes absolute paths), and files in it.
+pub const TestDir = struct {
+    tmp: std.testing.TmpDir,
+    abs: []u8,
+
+    pub fn init() !TestDir {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        var rel_buf: [256]u8 = undefined;
+        const rel = try tmpDirPath(&tmp, &rel_buf);
+        const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+        defer std.testing.allocator.free(cwd);
+        return .{ .tmp = tmp, .abs = try std.testing.allocator.print("{s}/{s}", .{ cwd, rel }) };
+    }
+
+    pub fn deinit(t: *TestDir) void {
+        std.testing.allocator.free(t.abs);
+        t.tmp.cleanup();
+    }
+
+    /// Absolute path of `name` (static buffer per call site is the caller's).
+    pub fn path(t: *const TestDir, buf: []u8, name: []const u8) ![:0]u8 {
+        return std.mem.printSentinel(buf, "{s}/{s}", .{ t.abs, name }, 0);
+    }
+
+    /// Writes `name` (creating parent dirs) with `data`.
+    pub fn write(t: *const TestDir, name: []const u8, data: []const u8) !void {
+        var buf: [4096]u8 = undefined;
+        const p = try t.path(&buf, name);
+        if (std.mem.findScalarLast(u8, p, '/')) |slash| mkdirP(p[0..slash]);
+        try writeFile(p, data);
+    }
+
+    pub fn mkdir(t: *const TestDir, name: []const u8) !void {
+        var buf: [4096]u8 = undefined;
+        mkdirP(try t.path(&buf, name));
+    }
+};
+
+/// Absolute path of a testing tmp dir, in `buf`.
+pub fn tmpDirAbs(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
+    var cwd_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const cwd = std.mem.sliceTo(cwd_buf[0..linux.getcwd(&cwd_buf, cwd_buf.len)], 0);
+    var rel_buf: [256]u8 = undefined;
+    return std.mem.print(buf, "{s}/{s}", .{ cwd, try tmpDirPath(tmp, &rel_buf) });
+}
+
 pub fn tmpDirPath(tmp: *std.testing.TmpDir, buf: []u8) std.mem.PrintError![]const u8 {
     return std.mem.print(buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 }

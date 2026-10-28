@@ -657,13 +657,7 @@ const Tree = struct {
             .pool = try Pool.create(gpa, testing.io, 2),
             .arena = .init(gpa),
         };
-        var cwd_buf: [4096]u8 = undefined;
-        const cwd = std.mem.sliceTo(cwd_buf[0..linux.getcwd(&cwd_buf, cwd_buf.len)], 0);
-        var rel_buf: [4096]u8 = undefined;
-        t.dir = try std.mem.print(&t.dir_buf, "{s}/{s}", .{
-            cwd,
-            try sys.tmpDirPath(&t.tmp, &rel_buf),
-        });
+        t.dir = try sys.tmpDirAbs(&t.tmp, &t.dir_buf);
         t.root = try std.mem.print(&t.root_buf, "{s}/root", .{t.dir});
         t.roots = .{t.root};
         t.cfg = .{ .roots = &t.roots };
