@@ -58,11 +58,20 @@ pub fn itemsFromHits(ui: *Ui, a: std.mem.Allocator, hits: []const index.ContentS
             .accessory = a.printSentinel("line {d}", .{h.line}, 0) catch "",
             .where = labels.homeRelative(a, h.path[0..slash]),
             .fact = (if (h.count > 1)
-                a.printSentinel("line {d} · {d}{s} matches", .{ h.line, h.count, if (h.count >= index.content.count_cap) "+" else "" }, 0)
+                a.printSentinel(
+                    "line {d} · {d}{s} matches",
+                    .{ h.line, h.count, if (h.count >= index.content.count_cap) "+" else "" },
+                    0,
+                )
             else
                 a.printSentinel("line {d}", .{h.line}, 0)) catch "",
             .icon = fileIcon(ui, path, false),
-            .action = .{ .file = .{ .path = path, .is_dir = false, .line = h.line, .extracted = h.extracted } },
+            .action = .{ .file = .{
+                .path = path,
+                .is_dir = false,
+                .line = h.line,
+                .extracted = h.extracted,
+            } },
             .detail = h.snippet,
             .time_s = h.mtime,
         }) catch break;

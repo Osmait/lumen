@@ -39,12 +39,26 @@ pub const ExtractError = Error || std.mem.Allocator.Error || std.process.SpawnEr
 /// `gpa`, at most `max_bytes` long (truncated, never failing for size).
 /// An error for unreadable or corrupt files, which callers skip;
 /// error.ToolMissing when pdftotext or unzip is not installed.
-pub fn extractText(gpa: std.mem.Allocator, io: std.Io, path: [:0]const u8, kind: Kind, max_bytes: usize) ExtractError![]u8 {
+pub fn extractText(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    path: [:0]const u8,
+    kind: Kind,
+    max_bytes: usize,
+) ExtractError![]u8 {
     const fd = try sys.openRegular(path);
     defer sys.close(fd);
 
     if (kind == .pdf) {
-        const raw = try runTool(gpa, io, &.{ "pdftotext", "-q", "-enc", "UTF-8", "/dev/stdin", "-" }, fd, max_bytes, &.{0}, timeout_ms);
+        const raw = try runTool(
+            gpa,
+            io,
+            &.{ "pdftotext", "-q", "-enc", "UTF-8", "/dev/stdin", "-" },
+            fd,
+            max_bytes,
+            &.{0},
+            timeout_ms,
+        );
         // Pages are separated by form feeds.
         std.mem.replaceScalar(u8, raw, '\x0c', '\n');
         return shrink(gpa, raw, max_bytes);
@@ -67,7 +81,15 @@ pub fn extractText(gpa: std.mem.Allocator, io: std.Io, path: [:0]const u8, kind:
     const xml_cap = @max(max_bytes, @min(max_bytes *| 8, 256 << 20));
     // unzip: 11 = some member not found (optional ones, or an xlsx without
     // strings); a corrupt archive is 9.
-    const xml = try runTool(gpa, io, argv[0 .. 3 + members.len], fd, xml_cap, &.{ 0, 11 }, timeout_ms);
+    const xml = try runTool(
+        gpa,
+        io,
+        argv[0 .. 3 + members.len],
+        fd,
+        xml_cap,
+        &.{ 0, 11 },
+        timeout_ms,
+    );
     defer gpa.free(xml);
     return shrink(gpa, try xmlToText(gpa, xml), max_bytes);
 }
@@ -78,7 +100,15 @@ pub const Error = sys.Error || error{ ToolMissing, ToolFailed, Timeout };
 /// stdout. Reaching the cap or the timeout kills the tool and keeps what was
 /// read; otherwise its exit code must be in `ok_codes`. The child is always
 /// reaped and the pipe closed (`Child.kill` is a no-op after `wait`).
-fn runTool(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, input: i32, cap: usize, ok_codes: []const u8, limit_ms: u64) ![]u8 {
+fn runTool(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    input: i32,
+    cap: usize,
+    ok_codes: []const u8,
+    limit_ms: u64,
+) ![]u8 {
     var env = std.process.Environ.Map.init(gpa);
     defer env.deinit();
     var child = std.process.spawn(io, .{
@@ -100,7 +130,10 @@ fn runTool(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, input: 
     const finished = while (out.items.len < cap) {
         const now = sys.monotonicNs();
         if (now >= deadline) break false;
-        const left_ms: i32 = @intCast(@min((deadline - now) / std.time.ns_per_ms + 1, std.math.maxInt(i32)));
+        const left_ms: i32 = @intCast(@min(
+            (deadline - now) / std.time.ns_per_ms + 1,
+            std.math.maxInt(i32),
+        ));
         // EOF shows up as POLLHUP, then read returns 0.
         if (!sys.waitReadable(out_fd, left_ms)) continue;
         try out.ensureUnusedCapacity(gpa, @min(64 * 1024, cap - out.items.len));
@@ -125,7 +158,11 @@ fn runTool(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, input: 
         return out.toOwnedSlice(gpa);
     }
     switch (try child.wait(io)) {
-        .exited => |code| if (std.mem.findScalar(u8, ok_codes, code) == null) return error.ToolFailed,
+        .exited => |code| if (std.mem.findScalar(
+            u8,
+            ok_codes,
+            code,
+        ) == null) return error.ToolFailed,
         else => return error.ToolFailed,
     }
     return out.toOwnedSlice(gpa);
@@ -226,7 +263,9 @@ fn xmlToText(gpa: std.mem.Allocator, xml: []const u8) ![]u8 {
                         switch (cp) {
                             '\n' => w.sep(.newline),
                             ' ', '\t', '\r' => w.sep(.space),
-                            else => try w.text(buf[0 .. std.unicode.utf8Encode(cp, &buf) catch unreachable]), // decodeEntity returns only encodable code points
+                            else => try w.text(
+                                buf[0 .. std.unicode.utf8Encode(cp, &buf) catch unreachable],
+                            ), // decodeEntity returns only encodable code points
                         }
                     }
                 }
@@ -302,9 +341,19 @@ fn isSpace(c: u8) bool {
 /// `&...;` at the start of `s`: bytes consumed (0 if not an entity) and the
 /// code point (null for an invalid numeric reference, which is dropped).
 fn decodeEntity(s: []const u8) struct { len: usize, cp: ?u21 } {
-    const semi = std.mem.findScalar(u8, s[0..@min(s.len, 12)], ';') orelse return .{ .len = 0, .cp = null };
+    const semi = std.mem.findScalar(
+        u8,
+        s[0..@min(s.len, 12)],
+        ';',
+    ) orelse return .{ .len = 0, .cp = null };
     const body = s[1..semi];
-    const named = [_]struct { []const u8, u21 }{ .{ "amp", '&' }, .{ "lt", '<' }, .{ "gt", '>' }, .{ "quot", '"' }, .{ "apos", '\'' } };
+    const named = [_]struct { []const u8, u21 }{ .{ "amp", '&' }, .{ "lt", '<' }, .{ "gt", '>' }, .{
+        "quot",
+        '"',
+    }, .{
+        "apos",
+        '\'',
+    } };
     for (named) |n| if (std.mem.eql(u8, body, n[0])) return .{ .len = semi + 1, .cp = n[1] };
     if (body.len < 2 or body[0] != '#') return .{ .len = 0, .cp = null };
     const v = if (body[1] == 'x' or body[1] == 'X')
@@ -371,7 +420,10 @@ test "xmlToText: entities and numeric references" {
 }
 
 test "xmlToText: multibyte UTF-8 passes through" {
-    try expectText("<w:p><w:r><w:t>Ñandú — 日本語 “quoted” 🙂</w:t></w:r></w:p><w:p><w:r><w:t>Ünïcödé</w:t></w:r></w:p>", "Ñandú — 日本語 “quoted” 🙂\nÜnïcödé");
+    try expectText(
+        "<w:p><w:r><w:t>Ñandú — 日本語 “quoted” 🙂</w:t></w:r></w:p><w:p><w:r><w:t>Ünïcödé</w:t></w:r></w:p>",
+        "Ñandú — 日本語 “quoted” 🙂\nÜnïcödé",
+    );
 }
 
 test "xmlToText: whitespace collapsing and trimming" {
@@ -382,7 +434,10 @@ test "xmlToText: whitespace collapsing and trimming" {
 }
 
 test "xmlToText: comments, CDATA, PIs, doctype, quoted >" {
-    try expectText("<!DOCTYPE x><!-- <p>hidden</p> --><t>a<![CDATA[ <b>&amp; ]]>c</t>", "a <b>&amp; c");
+    try expectText(
+        "<!DOCTYPE x><!-- <p>hidden</p> --><t>a<![CDATA[ <b>&amp; ]]>c</t>",
+        "a <b>&amp; c",
+    );
     try expectText("<a:p><a:r><a:t attr=\"x>y\" b='>'>ok</a:t></a:r></a:p>", "ok");
 }
 
@@ -393,7 +448,10 @@ test "xmlToText: pptx, xlsx, ODF shapes" {
             "<?xml version=\"1.0\"?><p:sld><a:p><a:r><a:t>Two</a:t></a:r></a:p></p:sld>",
         "SlideOne\nTwo",
     );
-    try expectText("<sst><si><t>alpha</t></si><si><r><t>be</t></r><r><t>ta</t></r><rPh><t>ベータ</t></rPh></si></sst>", "alpha\nbeta");
+    try expectText(
+        "<sst><si><t>alpha</t></si><si><r><t>be</t></r><r><t>ta</t></r><rPh><t>ベータ</t></rPh></si></sst>",
+        "alpha\nbeta",
+    );
     try expectText(
         "<office:text><text:h>Title</text:h><text:p>one<text:s/>two<text:tab/>three<text:line-break/>four</text:p>" ++
             "<text:p>sp<text:span text:style-name=\"T1\">an</text:span>ned</text:p></office:text>",
@@ -465,7 +523,13 @@ const TestDir = struct {
     fn extract(td: *TestDir, name: []const u8, max: usize) ![]u8 {
         const p = try td.absZ(name);
         defer testing.allocator.free(p);
-        return extractText(testing.allocator, testing.io, p, kindOf(name).?, max) catch |err| switch (err) {
+        return extractText(
+            testing.allocator,
+            testing.io,
+            p,
+            kindOf(name).?,
+            max,
+        ) catch |err| switch (err) {
             error.ToolMissing => error.SkipZigTest,
             else => err,
         };
@@ -488,11 +552,17 @@ test "extract docx, xlsx, pptx (OOXML)" {
         \\<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
         \\<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Quarterly</w:t></w:r><w:r><w:t xml:space="preserve"> report</w:t></w:r></w:p><w:p><w:r><w:t>Ingresos &amp; gastos — año</w:t></w:r></w:p></w:body></w:document>
     );
-    try td.write("d/word/footnotes.xml", "<?xml version=\"1.0\"?><w:footnotes><w:footnote><w:p><w:r><w:t>A footnote</w:t></w:r></w:p></w:footnote></w:footnotes>");
+    try td.write(
+        "d/word/footnotes.xml",
+        "<?xml version=\"1.0\"?><w:footnotes><w:footnote><w:p><w:r><w:t>A footnote</w:t></w:r></w:p></w:footnote></w:footnotes>",
+    );
     try zipInto(&td, "d", "doc.docx");
     try expectExtract(&td, "doc.docx", "Quarterly report\nIngresos & gastos — año\nA footnote");
 
-    try td.write("x/xl/sharedStrings.xml", "<?xml version=\"1.0\"?><sst count=\"2\"><si><t>Revenue</t></si><si><t>Coste unitario</t></si></sst>");
+    try td.write(
+        "x/xl/sharedStrings.xml",
+        "<?xml version=\"1.0\"?><sst count=\"2\"><si><t>Revenue</t></si><si><t>Coste unitario</t></si></sst>",
+    );
     try td.write("x/xl/workbook.xml", "<workbook/>");
     try zipInto(&td, "x", "book.xlsx");
     try expectExtract(&td, "book.xlsx", "Revenue\nCoste unitario");
@@ -502,10 +572,22 @@ test "extract docx, xlsx, pptx (OOXML)" {
     try zipInto(&td, "y", "nums.xlsx");
     try expectExtract(&td, "nums.xlsx", "");
 
-    try td.write("p/ppt/slides/slide1.xml", "<?xml version=\"1.0\"?><p:sld><a:p><a:r><a:t>First slide</a:t></a:r></a:p></p:sld>");
-    try td.write("p/ppt/slides/slide2.xml", "<?xml version=\"1.0\"?><p:sld><a:p><a:r><a:t>Second slide</a:t></a:r></a:p></p:sld>");
-    try td.write("p/ppt/slides/_rels/slide1.xml.rels", "<Relationships><Relationship Target=\"nope\"/></Relationships>");
-    try td.write("p/ppt/presentation.xml", "<p:presentation><a:t>not a slide</a:t></p:presentation>");
+    try td.write(
+        "p/ppt/slides/slide1.xml",
+        "<?xml version=\"1.0\"?><p:sld><a:p><a:r><a:t>First slide</a:t></a:r></a:p></p:sld>",
+    );
+    try td.write(
+        "p/ppt/slides/slide2.xml",
+        "<?xml version=\"1.0\"?><p:sld><a:p><a:r><a:t>Second slide</a:t></a:r></a:p></p:sld>",
+    );
+    try td.write(
+        "p/ppt/slides/_rels/slide1.xml.rels",
+        "<Relationships><Relationship Target=\"nope\"/></Relationships>",
+    );
+    try td.write(
+        "p/ppt/presentation.xml",
+        "<p:presentation><a:t>not a slide</a:t></p:presentation>",
+    );
     try zipInto(&td, "p", "deck.pptx");
     try expectExtract(&td, "deck.pptx", "First slide\nSecond slide");
 
@@ -523,7 +605,11 @@ fn zipInto(td: *TestDir, dir: []const u8, name: []const u8) !void {
     var buf: [256]u8 = undefined;
     const rel = try std.mem.print(&buf, "{s}/{s}", .{ td.rel, dir });
     var cmd_buf: [256]u8 = undefined;
-    const cmd = try std.mem.print(&cmd_buf, "find . -type f | LC_ALL=C sort | zip -q -X -@ '../{s}'", .{name});
+    const cmd = try std.mem.print(
+        &cmd_buf,
+        "find . -type f | LC_ALL=C sort | zip -q -X -@ '../{s}'",
+        .{name},
+    );
     const r = try std.process.run(testing.allocator, testing.io, .{
         .argv = &.{ "sh", "-c", cmd },
         .cwd = .{ .path = rel },
@@ -545,7 +631,10 @@ test "extract odt, ods (ODF)" {
         \\<?xml version="1.0" encoding="UTF-8"?>
         \\<office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"><office:body><office:text><text:h text:outline-level="1">Acta de reunión</text:h><text:p>Asistentes:<text:s/>Ana<text:tab/>Luis</text:p><text:p>Pro<text:span text:style-name="T1">yec</text:span>to Lumen</text:p></office:text></office:body></office:document-content>
     );
-    try td.write("t/styles.xml", "<office:document-styles><text:p>not content</text:p></office:document-styles>");
+    try td.write(
+        "t/styles.xml",
+        "<office:document-styles><text:p>not content</text:p></office:document-styles>",
+    );
     try zipInto(&td, "t", "minutes.odt");
     try expectExtract(&td, "minutes.odt", "Acta de reunión\nAsistentes: Ana Luis\nProyecto Lumen");
 
@@ -576,7 +665,11 @@ fn minimalPdf(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
     for (objs, 0..) |o, k| {
         offsets[k] = pdf.items.len;
         if (k == 3) {
-            try pdf.print(gpa, "4 0 obj\n<< /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ stream.len, stream });
+            try pdf.print(
+                gpa,
+                "4 0 obj\n<< /Length {d} >>\nstream\n{s}\nendstream\nendobj\n",
+                .{ stream.len, stream },
+            );
         } else {
             try pdf.print(gpa, "{d} 0 obj\n{s}\nendobj\n", .{ k + 1, o });
         }
@@ -651,34 +744,118 @@ test "runTool: size cap and timeout kill the tool" {
 
     // Silent and stuck: a timeout error.
     const t0 = sys.monotonicNs();
-    try testing.expectError(error.Timeout, runTool(gpa, testing.io, &.{ "sh", "-c", "exec sleep 30" }, in, 1000, &.{0}, 200));
+    try testing.expectError(error.Timeout, runTool(
+        gpa,
+        testing.io,
+        &.{ "sh", "-c", "exec sleep 30" },
+        in,
+        1000,
+        &.{0},
+        200,
+    ));
     try testing.expect(sys.monotonicNs() - t0 < 5 * std.time.ns_per_s);
 
     // Its output closed, alive: not waited for past the limit either.
     const t1 = sys.monotonicNs();
-    try testing.expectError(error.Timeout, runTool(gpa, testing.io, &.{ "sh", "-c", "exec >&-; exec sleep 30" }, in, 1000, &.{0}, 200));
+    try testing.expectError(error.Timeout, runTool(
+        gpa,
+        testing.io,
+        &.{ "sh", "-c", "exec >&-; exec sleep 30" },
+        in,
+        1000,
+        &.{0},
+        200,
+    ));
     try testing.expect(sys.monotonicNs() - t1 < 5 * std.time.ns_per_s);
 
     // Output, then stuck: what came out is kept.
-    const partial = try runTool(gpa, testing.io, &.{ "sh", "-c", "echo hi; exec sleep 30" }, in, 1000, &.{0}, 200);
+    const partial = try runTool(
+        gpa,
+        testing.io,
+        &.{ "sh", "-c", "echo hi; exec sleep 30" },
+        in,
+        1000,
+        &.{0},
+        200,
+    );
     defer gpa.free(partial);
     try testing.expectEqualStrings("hi\n", partial);
 
     // Exit codes.
-    try testing.expectError(error.ToolFailed, runTool(gpa, testing.io, &.{ "sh", "-c", "exit 3" }, in, 1000, &.{0}, 10_000));
-    const ok = try runTool(gpa, testing.io, &.{ "sh", "-c", "exit 11" }, in, 1000, &.{ 0, 11 }, 10_000);
+    try testing.expectError(error.ToolFailed, runTool(
+        gpa,
+        testing.io,
+        &.{ "sh", "-c", "exit 3" },
+        in,
+        1000,
+        &.{0},
+        10_000,
+    ));
+    const ok = try runTool(
+        gpa,
+        testing.io,
+        &.{ "sh", "-c", "exit 11" },
+        in,
+        1000,
+        &.{ 0, 11 },
+        10_000,
+    );
     defer gpa.free(ok);
-    try testing.expectError(error.ToolMissing, runTool(gpa, testing.io, &.{"lumen-no-such-tool"}, in, 1000, &.{0}, 10_000));
+    try testing.expectError(error.ToolMissing, runTool(
+        gpa,
+        testing.io,
+        &.{"lumen-no-such-tool"},
+        in,
+        1000,
+        &.{0},
+        10_000,
+    ));
 }
 
 fn fuzzXml(_: void, smith: *testing.Smith) anyerror!void {
     // Markup bytes weigh more, so the fuzzer forms tags, entities, comments.
     const w: []const testing.Smith.Weight = &.{
-        .value(u8, '<', 10),         .value(u8, '>', 10), .value(u8, '/', 6),            .value(u8, '&', 6),
-        .value(u8, ';', 6),          .value(u8, '#', 4),  .value(u8, 'x', 4),            .value(u8, '!', 3),
-        .value(u8, '-', 3),          .value(u8, '[', 2),  .value(u8, ']', 2),            .value(u8, '?', 3),
-        .value(u8, '"', 3),          .value(u8, ' ', 4),  .value(u8, ':', 3),            .value(u8, 'p', 4),
-        .value(u8, 'w', 4),          .value(u8, 't', 4),  .rangeAtMost(u8, '0', '9', 1), .rangeAtMost(u8, 0x80, 0xff, 1),
+        .value(
+            u8,
+            '<',
+            10,
+        ),
+        .value(u8, '>', 10),
+        .value(u8, '/', 6),
+        .value(u8, '&', 6),
+        .value(
+            u8,
+            ';',
+            6,
+        ),
+        .value(u8, '#', 4),
+        .value(u8, 'x', 4),
+        .value(u8, '!', 3),
+        .value(
+            u8,
+            '-',
+            3,
+        ),
+        .value(u8, '[', 2),
+        .value(u8, ']', 2),
+        .value(u8, '?', 3),
+        .value(
+            u8,
+            '"',
+            3,
+        ),
+        .value(u8, ' ', 4),
+        .value(u8, ':', 3),
+        .value(u8, 'p', 4),
+        .value(u8, 'w', 4),
+        .value(u8, 't', 4),
+        .rangeAtMost(u8, '0', '9', 1),
+        .rangeAtMost(
+            u8,
+            0x80,
+            0xff,
+            1,
+        ),
         .rangeAtMost(u8, 0, 255, 1),
     };
     var in: [1024]u8 = undefined;
@@ -699,8 +876,14 @@ test "fuzz: xmlToText on arbitrary bytes" {
         }
     };
     try testing.fuzz({}, fuzzXml, .{ .corpus = &.{
-        comptime P.lp("<?xml version=\"1.0\"?><w:document><w:body><w:p><w:r><w:t>Hel</w:t></w:r><w:r><w:t>lo &amp; caf&#xE9;</w:t></w:r></w:p></w:body></w:document>"),
-        comptime P.lp("<a:p><a:t>x &#128512; &#0; &#xD800; &bogus; &</a:t></a:p><!-- c --><![CDATA[<raw>]]><!DOCTYPE x><t a=\"1>2\">y</t><w:instrText>skip</w:instrText>"),
-        comptime P.lp("<text:p>é\u{00a0}ü<text:span>日本</text:span></text:p><table:table-cell>1</table:table-cell><"),
+        comptime P.lp(
+            "<?xml version=\"1.0\"?><w:document><w:body><w:p><w:r><w:t>Hel</w:t></w:r><w:r><w:t>lo &amp; caf&#xE9;</w:t></w:r></w:p></w:body></w:document>",
+        ),
+        comptime P.lp(
+            "<a:p><a:t>x &#128512; &#0; &#xD800; &bogus; &</a:t></a:p><!-- c --><![CDATA[<raw>]]><!DOCTYPE x><t a=\"1>2\">y</t><w:instrText>skip</w:instrText>",
+        ),
+        comptime P.lp(
+            "<text:p>é\u{00a0}ü<text:span>日本</text:span></text:p><table:table-cell>1</table:table-cell><",
+        ),
     } });
 }

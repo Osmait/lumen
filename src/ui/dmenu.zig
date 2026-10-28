@@ -65,7 +65,12 @@ pub const Session = struct {
 };
 
 /// Starts a session for `cmdline` and shows it. Main thread.
-pub fn start(ui: *Ui, cmdline: *c.GApplicationCommandLine, prompt: ?[]const u8, query: ?[*:0]const u8) void {
+pub fn start(
+    ui: *Ui,
+    cmdline: *c.GApplicationCommandLine,
+    prompt: ?[]const u8,
+    query: ?[*:0]const u8,
+) void {
     if (ui.picker != null) finish(ui, null);
     const s = ui.gpa.create(Session) catch {
         c.g_application_command_line_set_exit_status(cmdline, 1);
@@ -101,7 +106,10 @@ fn onRead(_: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) 
     if (s.finished) return s.destroy();
 
     var len: usize = 0;
-    const chunk: []const u8 = if (bytes) |b| if (c.g_bytes_get_data(b, &len)) |p| p[0..len] else "" else "";
+    const chunk: []const u8 = if (bytes) |b| if (c.g_bytes_get_data(
+        b,
+        &len,
+    )) |p| p[0..len] else "" else "";
     if (chunk.len == 0) {
         // End of input (or an error): the last line may lack its newline.
         if (s.partial.items.len > 0) addLine(s, s.partial.items);
@@ -172,7 +180,9 @@ fn addLine(s: *Session, raw: []const u8) void {
             const value = opts.next() orelse break;
             if (std.mem.eql(u8, key, "icon")) {
                 const name = a.dupeSentinel(u8, value, 0) catch continue;
-                line.icon = if (value.len > 0 and value[0] >= 0x80) .{ .emoji = name } else .byName(name);
+                line.icon = if (value.len > 0 and value[0] >= 0x80) .{
+                    .emoji = name,
+                } else .byName(name);
             } else if (std.mem.eql(u8, key, "meta")) {
                 line.meta = a.dupe(u8, value) catch "";
             } else if (std.mem.eql(u8, key, "nonselectable")) {
@@ -192,7 +202,12 @@ pub fn finish(ui: *Ui, choice: ?[]const u8) void {
     const s = ui.picker orelse return;
     ui.picker = null;
     if (choice) |t| {
-        c.g_application_command_line_print(s.cmdline, "%.*s\n", @as(c_int, @intCast(@min(t.len, std.math.maxInt(c_int)))), t.ptr);
+        c.g_application_command_line_print(
+            s.cmdline,
+            "%.*s\n",
+            @as(c_int, @intCast(@min(t.len, std.math.maxInt(c_int)))),
+            t.ptr,
+        );
         c.g_application_command_line_set_exit_status(s.cmdline, 0);
     } else c.g_application_command_line_set_exit_status(s.cmdline, 1);
     // The caller's `lumen --dmenu` returns once this is released.
@@ -234,7 +249,9 @@ pub fn fill(ui: *Ui, a: std.mem.Allocator, q: []const u8) void {
     const s = ui.picker orelse return;
     const lines = s.lines.items;
     if (q.len == 0) {
-        for (lines[0..@min(lines.len, shown_all)], 0..) |l, i| ui.addItem(itemOf(a, l, @intCast(i)));
+        for (lines[0..@min(lines.len, shown_all)], 0..) |l, i| ui.addItem(
+            itemOf(a, l, @intCast(i)),
+        );
         return;
     }
     const Hit = struct { score: i32, i: u32 };
@@ -251,7 +268,10 @@ pub fn fill(ui: *Ui, a: std.mem.Allocator, q: []const u8) void {
             return if (x.score != y.score) x.score > y.score else x.i < y.i;
         }
     }.gt);
-    for (hits.items[0..@min(hits.items.len, shown_matches)]) |h| ui.addItem(itemOf(a, lines[h.i], h.i));
+    for (hits.items[0..@min(
+        hits.items.len,
+        shown_matches,
+    )]) |h| ui.addItem(itemOf(a, lines[h.i], h.i));
 }
 
 fn itemOf(a: std.mem.Allocator, l: Line, i: u32) Item {

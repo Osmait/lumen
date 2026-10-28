@@ -89,7 +89,13 @@ fn fileTexture(path: [:0]const u8, size: c_int) ?*c.GdkTexture {
     const k = h.final();
     for (Cache.keys[0..Cache.len], Cache.textures[0..Cache.len]) |ck, t| if (ck == k) return t;
     if (!index.sys.isRegular(path.ptr)) return null;
-    const pb = c.gdk_pixbuf_new_from_file_at_scale(path.ptr, size * 2, size * 2, 1, null) orelse return null;
+    const pb = c.gdk_pixbuf_new_from_file_at_scale(
+        path.ptr,
+        size * 2,
+        size * 2,
+        1,
+        null,
+    ) orelse return null;
     defer c.g_object_unref(pb);
     const tex = c.gdk_texture_new_for_pixbuf(pb);
     const slot = if (Cache.len < Cache.keys.len) Cache.len else Cache.next;

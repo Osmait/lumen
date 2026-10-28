@@ -72,17 +72,35 @@ pub fn showContentDetail(ui: *Ui, it: *const Item) void {
 
     const info = index.sys.info(f.path);
     const service = ui.contents orelse return;
-    const text = service.readText(a, f.path, if (info) |i| i.mtime else 0, f.extracted, f.line + labels.context_after) orelse it.detail;
+    const text = service.readText(
+        a,
+        f.path,
+        if (info) |i| i.mtime else 0,
+        f.extracted,
+        f.line + labels.context_after,
+    ) orelse it.detail;
     const words = index.content.splitWords(a, ui.query()) catch return;
     // The theme's accent behind matches, its text colour on top.
-    const hl_open = a.print("<span background=\"{s}\" bgalpha=\"40%\" foreground=\"{s}\">", .{ std.mem.sliceTo(&ui.hl_bg, 0), std.mem.sliceTo(&ui.hl_fg, 0) }) catch return;
-    c.gtk_label_set_markup(@ptrCast(ui.detail_text), labels.contextMarkup(a, text, f.line, words, hl_open).ptr);
+    const hl_open = a.print("<span background=\"{s}\" bgalpha=\"40%\" foreground=\"{s}\">", .{
+        std.mem.sliceTo(&ui.hl_bg, 0),
+        std.mem.sliceTo(&ui.hl_fg, 0),
+    }) catch return;
+    c.gtk_label_set_markup(
+        @ptrCast(ui.detail_text),
+        labels.contextMarkup(a, text, f.line, words, hl_open).ptr,
+    );
 
     const ctype = c.g_content_type_guess(f.path, null, 0, null);
     defer if (ctype) |t| c.g_free(t);
-    c.gtk_label_set_text(@ptrCast(ui.meta_values[0]), labels.kindLabel(a, f.path, false, ctype).ptr);
+    c.gtk_label_set_text(
+        @ptrCast(ui.meta_values[0]),
+        labels.kindLabel(a, f.path, false, ctype).ptr,
+    );
     c.gtk_label_set_text(@ptrCast(ui.meta_values[1]), it.fact.ptr);
-    c.gtk_label_set_text(@ptrCast(ui.meta_values[2]), if (info) |i| labels.formatWhen(a, i.mtime).ptr else "—");
+    c.gtk_label_set_text(
+        @ptrCast(ui.meta_values[2]),
+        if (info) |i| labels.formatWhen(a, i.mtime).ptr else "—",
+    );
     c.gtk_label_set_text(@ptrCast(ui.meta_values[3]), it.where.ptr);
 }
 
@@ -98,7 +116,11 @@ var image_gen: u32 = 0;
 const ImageJob = struct { gen: u32, path: [:0]u8, ui: *Ui };
 
 fn showImage(ui: *Ui, path: [:0]const u8, mtime: i64) void {
-    if (image_len == path.len and image_mtime == mtime and std.mem.eql(u8, image_path[0..image_len], path)) return;
+    if (image_len == path.len and image_mtime == mtime and std.mem.eql(
+        u8,
+        image_path[0..image_len],
+        path,
+    )) return;
     forgetImage(ui);
     if (path.len > image_path.len) return;
     @memcpy(image_path[0..path.len], path);
@@ -122,7 +144,12 @@ fn forgetImage(ui: *Ui) void {
     c.gtk_picture_set_paintable(ui.detail_picture, null);
 }
 
-fn loadImage(task: *c.GTask, _: ?*c.GObject, data: ?*anyopaque, _: ?*c.GCancellable) callconv(.c) void {
+fn loadImage(
+    task: *c.GTask,
+    _: ?*c.GObject,
+    data: ?*anyopaque,
+    _: ?*c.GCancellable,
+) callconv(.c) void {
     const job: *ImageJob = @ptrCast(@alignCast(data.?));
     const tex = c.gdk_texture_new_from_filename(job.path.ptr, null);
     c.g_task_return_pointer(task, tex, &unrefObject);
@@ -157,7 +184,11 @@ pub fn showFileDetail(ui: *Ui, it: *const Item) void {
 
     // Only regular files: GTK reads the picture synchronously, and a FIFO
     // named *.png would block the UI.
-    const image = (c.g_content_type_is_a(ct, "image/*") != 0 or std.mem.startsWith(u8, std.mem.span(ct), "image/")) and index.sys.isRegular(f.path);
+    const image = (c.g_content_type_is_a(ct, "image/*") != 0 or std.mem.startsWith(
+        u8,
+        std.mem.span(ct),
+        "image/",
+    )) and index.sys.isRegular(f.path);
     const info = index.sys.info(f.path);
     c.gtk_widget_set_visible(ui.detail_picture, @intFromBool(image));
     if (image) showImage(ui, f.path, if (info) |i| i.mtime else 0) else forgetImage(ui);
@@ -167,13 +198,26 @@ pub fn showFileDetail(ui: *Ui, it: *const Item) void {
     if (!image and !f.is_dir) {
         const head = index.sys.readHead(f.path, a.alloc(u8, 4096) catch return);
         const valid = labels.validUtf8Prefix(head);
-        if (valid.len + 4 >= head.len and std.mem.findScalar(u8, valid, 0) == null) text = labels.firstLines(valid, preview_lines);
+        if (valid.len + 4 >= head.len and std.mem.findScalar(
+            u8,
+            valid,
+            0,
+        ) == null) text = labels.firstLines(
+            valid,
+            preview_lines,
+        );
     }
     c.gtk_label_set_text(@ptrCast(ui.detail_text), (a.dupeSentinel(u8, text, 0) catch return).ptr);
 
-    c.gtk_label_set_text(@ptrCast(ui.meta_values[0]), labels.kindLabel(a, f.path, f.is_dir, ct).ptr);
+    c.gtk_label_set_text(
+        @ptrCast(ui.meta_values[0]),
+        labels.kindLabel(a, f.path, f.is_dir, ct).ptr,
+    );
     if (info) |inf| {
-        c.gtk_label_set_text(@ptrCast(ui.meta_values[1]), if (f.is_dir) "—" else labels.formatSize(a, inf.size).ptr);
+        c.gtk_label_set_text(
+            @ptrCast(ui.meta_values[1]),
+            if (f.is_dir) "—" else labels.formatSize(a, inf.size).ptr,
+        );
         c.gtk_label_set_text(@ptrCast(ui.meta_values[2]), labels.formatWhen(a, inf.mtime).ptr);
     } else {
         c.gtk_label_set_text(@ptrCast(ui.meta_values[1]), "—");
@@ -200,7 +244,10 @@ fn showExtDetail(ui: *Ui, it: ?*const Item) void {
         c.gtk_widget_add_css_class(ui.detail_text, "markdown");
     } else {
         const text = if (it) |i| i.detail[0..@min(i.detail.len, 20_000)] else "";
-        c.gtk_label_set_text(label, (a.dupeSentinel(u8, labels.validUtf8Prefix(text), 0) catch return).ptr);
+        c.gtk_label_set_text(
+            label,
+            (a.dupeSentinel(u8, labels.validUtf8Prefix(text), 0) catch return).ptr,
+        );
         c.gtk_widget_remove_css_class(ui.detail_text, "markdown");
     }
     const meta = if (it) |i| i.meta else &.{};
@@ -234,13 +281,22 @@ pub fn showDetail(ui: *Ui, it: ?*const Item) void {
     defer arena.deinit();
     const a = arena.allocator();
     const text = i.detail[0..@min(i.detail.len, 20_000)];
-    c.gtk_label_set_text(@ptrCast(ui.detail_text), (a.dupeSentinel(u8, labels.validUtf8Prefix(text), 0) catch return).ptr);
+    c.gtk_label_set_text(
+        @ptrCast(ui.detail_text),
+        (a.dupeSentinel(u8, labels.validUtf8Prefix(text), 0) catch return).ptr,
+    );
     c.gtk_label_set_text(@ptrCast(ui.meta_values[0]), "Text");
     const chars = std.unicode.utf8CountCodepoints(i.detail) catch i.detail.len;
     var words: usize = 0;
     var tok = std.mem.tokenizeAny(u8, i.detail, " \t\r\n");
     while (tok.next()) |_| words += 1;
-    c.gtk_label_set_text(@ptrCast(ui.meta_values[1]), (a.printSentinel("{d}", .{chars}, 0) catch return).ptr);
-    c.gtk_label_set_text(@ptrCast(ui.meta_values[2]), (a.printSentinel("{d}", .{words}, 0) catch return).ptr);
+    c.gtk_label_set_text(
+        @ptrCast(ui.meta_values[1]),
+        (a.printSentinel("{d}", .{chars}, 0) catch return).ptr,
+    );
+    c.gtk_label_set_text(
+        @ptrCast(ui.meta_values[2]),
+        (a.printSentinel("{d}", .{words}, 0) catch return).ptr,
+    );
     c.gtk_label_set_text(@ptrCast(ui.meta_values[3]), labels.formatWhen(a, i.time_s).ptr);
 }

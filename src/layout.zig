@@ -103,16 +103,32 @@ pub fn set(l: *Layout, key: []const u8, value: Value) SetError!void {
         if (!(n >= -2000 and n <= 2000)) return error.BadValue;
         l.offset = @intFromFloat(n);
     } else if (eql(u8, key, "position")) {
-        l.position = std.meta.stringToEnum(Position, value.string orelse return error.BadValue) orelse return error.BadValue;
+        l.position = std.meta.stringToEnum(
+            Position,
+            value.string orelse return error.BadValue,
+        ) orelse return error.BadValue;
     } else if (eql(u8, key, "panels")) {
-        l.panels = std.meta.stringToEnum(Panels, value.string orelse return error.BadValue) orelse return error.BadValue;
+        l.panels = std.meta.stringToEnum(
+            Panels,
+            value.string orelse return error.BadValue,
+        ) orelse return error.BadValue;
     } else if (eql(u8, key, "search")) {
-        l.search = std.meta.stringToEnum(Search, value.string orelse return error.BadValue) orelse return error.BadValue;
+        l.search = std.meta.stringToEnum(
+            Search,
+            value.string orelse return error.BadValue,
+        ) orelse return error.BadValue;
     } else if (eql(u8, key, "detail")) {
-        l.detail = std.meta.stringToEnum(Detail, value.string orelse return error.BadValue) orelse return error.BadValue;
+        l.detail = std.meta.stringToEnum(
+            Detail,
+            value.string orelse return error.BadValue,
+        ) orelse return error.BadValue;
     } else if (eql(u8, key, "rows")) {
         const v = value.string orelse return error.BadValue;
-        l.rows = if (eql(u8, v, "stacked")) .stacked else if (eql(u8, v, "inline")) .inline_ else return error.BadValue;
+        l.rows = if (eql(
+            u8,
+            v,
+            "stacked",
+        )) .stacked else if (eql(u8, v, "inline")) .inline_ else return error.BadValue;
     } else if (eql(u8, key, "footer")) {
         l.footer = value.boolean orelse return error.BadValue;
     } else return error.UnknownKey;
@@ -130,7 +146,12 @@ pub fn setShow(s: *Show, key: []const u8, on: bool) SetError!void {
 }
 
 /// Sets an order of parts from their names; it must keep `required`.
-pub fn setParts(comptime T: type, p: *Parts(T), names: []const []const u8, required: T) SetError!void {
+pub fn setParts(
+    comptime T: type,
+    p: *Parts(T),
+    names: []const []const u8,
+    required: T,
+) SetError!void {
     if (names.len == 0 or names.len > p.items.len) return error.BadValue;
     var out: Parts(T) = .{ .len = 0 };
     for (names) |n| {
@@ -156,8 +177,18 @@ test "orders of parts" {
     try std.testing.expectEqualSlices(RowPart, &.{ .text, .icon }, l.row.slice());
     try std.testing.expect(!l.row.has(.accessory));
     try std.testing.expectError(error.BadValue, setParts(RowPart, &l.row, &.{"icon"}, .text));
-    try std.testing.expectError(error.BadValue, setParts(BarPart, &l.searchbar, &.{ "entry", "entry" }, .entry));
-    try std.testing.expectError(error.UnknownKey, setParts(BarPart, &l.searchbar, &.{ "entry", "logo" }, .entry));
+    try std.testing.expectError(error.BadValue, setParts(
+        BarPart,
+        &l.searchbar,
+        &.{ "entry", "entry" },
+        .entry,
+    ));
+    try std.testing.expectError(error.UnknownKey, setParts(
+        BarPart,
+        &l.searchbar,
+        &.{ "entry", "logo" },
+        .entry,
+    ));
 }
 
 test "layout keys and values" {

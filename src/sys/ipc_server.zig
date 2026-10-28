@@ -29,7 +29,11 @@ pub fn start(allocator: std.mem.Allocator, app_id: []const u8, h: Handler) void 
     const dir = ipc.dir(&dir_buf, rt) orelse return;
     if (c.g_mkdir_with_parents(dir.ptr, 0o700) != 0) return;
     path = ipc.socketPath(&path_buf, rt, app_id) orelse return;
-    const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK, 0);
+    const rc = linux.socket(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
+        0,
+    );
     if (linux.errno(rc) != .SUCCESS) return;
     const fd: linux.fd_t = @intCast(rc);
     // A socket left by a daemon that crashed; only the primary instance
@@ -74,12 +78,24 @@ fn serve(conn: linux.fd_t) void {
     // Only our own user (the folder is owner-only already).
     var cred: Ucred = undefined;
     var len: linux.socklen_t = @sizeOf(Ucred);
-    if (linux.errno(linux.getsockopt(conn, linux.SOL.SOCKET, linux.SO.PEERCRED, @ptrCast(&cred), &len)) != .SUCCESS or
+    if (linux.errno(linux.getsockopt(
+        conn,
+        linux.SOL.SOCKET,
+        linux.SO.PEERCRED,
+        @ptrCast(&cred),
+        &len,
+    )) != .SUCCESS or
         cred.uid != linux.getuid()) return;
     // The client writes everything at once; a stuck one cannot hold the
     // main loop for long.
     const timeout: linux.timeval = .{ .sec = 0, .usec = 500_000 };
-    _ = linux.setsockopt(conn, linux.SOL.SOCKET, linux.SO.RCVTIMEO, @ptrCast(&timeout), @sizeOf(linux.timeval));
+    _ = linux.setsockopt(
+        conn,
+        linux.SOL.SOCKET,
+        linux.SO.RCVTIMEO,
+        @ptrCast(&timeout),
+        @sizeOf(linux.timeval),
+    );
     // Large enough for a copy; mmap'd (Lumen's malloc threshold), so only
     // what is read is touched, and it goes back to the system after.
     const buf = gpa.alloc(u8, ipc.max_request_bytes) catch return;

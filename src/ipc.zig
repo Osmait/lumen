@@ -20,7 +20,12 @@ pub const max_args = 64;
 pub fn socketPath(buf: []u8, runtime_dir: []const u8, app_id: []const u8) ?[:0]const u8 {
     if (runtime_dir.len == 0 or app_id.len == 0) return null;
     // sockaddr_un holds 108 bytes.
-    const p = std.mem.printSentinel(buf, "{s}/lumen/{s}.sock", .{ runtime_dir, app_id }, 0) catch return null;
+    const p = std.mem.printSentinel(
+        buf,
+        "{s}/lumen/{s}.sock",
+        .{ runtime_dir, app_id },
+        0,
+    ) catch return null;
     return if (p.len < 108) p else null;
 }
 
@@ -92,7 +97,10 @@ test "malformed requests are refused" {
 
 test "socket paths" {
     var buf: [256]u8 = undefined;
-    try std.testing.expectEqualStrings("/run/user/1000/lumen/dev.osmait.Lumen.sock", socketPath(&buf, "/run/user/1000", default_app_id).?);
+    try std.testing.expectEqualStrings(
+        "/run/user/1000/lumen/dev.osmait.Lumen.sock",
+        socketPath(&buf, "/run/user/1000", default_app_id).?,
+    );
     try std.testing.expect(socketPath(&buf, "", default_app_id) == null);
     var long: [121]u8 = @splat('x');
     long[0] = '/';

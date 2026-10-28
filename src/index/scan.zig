@@ -24,7 +24,14 @@ pub const Config = struct {
     /// Directory names never opened. "a/b" means "b inside a dir ending in a".
     skip: []const []const u8 = &default_skip,
     /// Opened only if they do not contain CACHEDIR.TAG.
-    cachedir_probe: []const []const u8 = &.{ "target", "build", ".cache", "Cache", "cache", "dist" },
+    cachedir_probe: []const []const u8 = &.{
+        "target",
+        "build",
+        ".cache",
+        "Cache",
+        "cache",
+        "dist",
+    },
     max_depth: u16 = std.math.maxInt(u16),
 };
 
@@ -68,7 +75,13 @@ const LevelCtx = struct {
 /// is read: a change is then either in the read or arrives as an event,
 /// never lost in between (scanning first and arming later leaves a blind
 /// window as long as the arming).
-pub fn scan(gpa: std.mem.Allocator, pool: *Pool, cfg: *const Config, watcher: ?*Watcher, stats: ?*Stats) std.mem.Allocator.Error!Store {
+pub fn scan(
+    gpa: std.mem.Allocator,
+    pool: *Pool,
+    cfg: *const Config,
+    watcher: ?*Watcher,
+    stats: ?*Stats,
+) std.mem.Allocator.Error!Store {
     const t0 = sys.monotonicNs();
     var st: Stats = .{};
     var b: Builder = .empty;
@@ -83,7 +96,11 @@ pub fn scan(gpa: std.mem.Allocator, pool: *Pool, cfg: *const Config, watcher: ?*
     for (cfg.roots) |root| {
         const id = try b.push(gpa, root, store_mod.no_parent, store_mod.flag_dir, 0);
         st.dirs += 1;
-        try frontier.append(gpa, .{ .id = id, .path = try gpa.dupeSentinel(u8, root, 0), .hidden = false });
+        try frontier.append(gpa, .{
+            .id = id,
+            .path = try gpa.dupeSentinel(u8, root, 0),
+            .hidden = false,
+        });
     }
 
     var depth: u16 = 1;
@@ -98,7 +115,12 @@ pub fn scan(gpa: std.mem.Allocator, pool: *Pool, cfg: *const Config, watcher: ?*
             gpa.free(batches);
         }
         for (batches) |*bt| bt.* = .{};
-        var ctx: LevelCtx = .{ .gpa = gpa, .cfg = cfg, .frontier = frontier.items, .batches = batches };
+        var ctx: LevelCtx = .{
+            .gpa = gpa,
+            .cfg = cfg,
+            .frontier = frontier.items,
+            .batches = batches,
+        };
         pool.run(frontier.items.len, &ctx, readOne);
 
         var next: std.ArrayList(Frontier) = .empty;
@@ -119,8 +141,20 @@ pub fn scan(gpa: std.mem.Allocator, pool: *Pool, cfg: *const Config, watcher: ?*
                 if (fl & store_mod.flag_dir != 0) {
                     st.dirs += 1;
                     if (depth < cfg.max_depth) {
-                        const child = try gpa.printSentinel("{s}{s}{s}", .{ parent.path, if (std.mem.endsWith(u8, parent.path, "/")) "" else "/", name }, 0);
-                        try next.append(gpa, .{ .id = id, .path = child, .hidden = fl & store_mod.flag_hidden != 0 });
+                        const child = try gpa.printSentinel(
+                            "{s}{s}{s}",
+                            .{
+                                parent.path,
+                                if (std.mem.endsWith(u8, parent.path, "/")) "" else "/",
+                                name,
+                            },
+                            0,
+                        );
+                        try next.append(gpa, .{
+                            .id = id,
+                            .path = child,
+                            .hidden = fl & store_mod.flag_hidden != 0,
+                        });
                     }
                 } else st.files += 1;
             }
@@ -152,14 +186,22 @@ fn readDir(gpa: std.mem.Allocator, path: [:0]const u8, cfg: *const Config, batch
         var kind = e.kind;
         if (kind == sys.Kind.unknown) {
             var buf: [4096]u8 = undefined;
-            const full = std.mem.printSentinel(&buf, "{s}/{s}", .{ path, e.name }, 0) catch continue;
+            const full = std.mem.printSentinel(
+                &buf,
+                "{s}/{s}",
+                .{ path, e.name },
+                0,
+            ) catch continue;
             kind = sys.kindOf(full);
         }
         var fl: u8 = 0;
         // Dot-dirs and caches are noise: searchable, ranked low, and the
         // flag is inherited by everything below ("~/orca/skein-zig-pkg-cache"
         // READMEs outranked the user's own).
-        if (e.name[0] == '.' or std.ascii.findIgnoreCase(e.name, "cache") != null) fl |= store_mod.flag_hidden;
+        if (e.name[0] == '.' or std.ascii.findIgnoreCase(
+            e.name,
+            "cache",
+        ) != null) fl |= store_mod.flag_hidden;
         if (kind == sys.Kind.symlink) fl |= store_mod.flag_symlink;
         // A skipped directory is still indexed (searchable), just not opened.
         if (kind == sys.Kind.dir and shouldDescend(path, e.name, cfg)) fl |= store_mod.flag_dir;
@@ -172,14 +214,23 @@ fn readDir(gpa: std.mem.Allocator, path: [:0]const u8, cfg: *const Config, batch
 fn shouldDescend(parent: []const u8, name: []const u8, cfg: *const Config) bool {
     for (cfg.skip) |rule| {
         if (std.mem.findScalarLast(u8, rule, '/')) |slash| {
-            if (std.mem.eql(u8, rule[slash + 1 ..], name) and std.mem.endsWith(u8, parent, rule[0..slash])) return false;
+            if (std.mem.eql(
+                u8,
+                rule[slash + 1 ..],
+                name,
+            ) and std.mem.endsWith(u8, parent, rule[0..slash])) return false;
         } else if (std.mem.eql(u8, rule, name)) return false;
     }
     for (cfg.cachedir_probe) |probe| {
         if (!std.mem.eql(u8, probe, name)) continue;
         // One stat, only for the handful of suspicious names.
         var buf: [4096]u8 = undefined;
-        const tag = std.mem.printSentinel(&buf, "{s}/{s}/CACHEDIR.TAG", .{ parent, name }, 0) catch return true;
+        const tag = std.mem.printSentinel(
+            &buf,
+            "{s}/{s}/CACHEDIR.TAG",
+            .{ parent, name },
+            0,
+        ) catch return true;
         if (sys.exists(tag)) return false;
     }
     return true;

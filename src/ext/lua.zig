@@ -97,7 +97,13 @@ fn panic(L: ?*State) callconv(.c) c_int {
 
 /// Runs `handler(L, ctx)` in protected mode. Returns null on success, else
 /// the error message with a traceback, in `a`. The stack is left as found.
-pub fn protect(L: *State, a: std.mem.Allocator, comptime T: type, ctx: *T, comptime handler: fn (*State, *T) void) ?[:0]const u8 {
+pub fn protect(
+    L: *State,
+    a: std.mem.Allocator,
+    comptime T: type,
+    ctx: *T,
+    comptime handler: fn (*State, *T) void,
+) ?[:0]const u8 {
     const top = c.lua_gettop(L);
     defer c.lua_settop(L, top);
     if (c.lua_checkstack(L, 3) == 0) return "Lua stack overflow";
@@ -118,7 +124,14 @@ pub fn protect(L: *State, a: std.mem.Allocator, comptime T: type, ctx: *T, compt
 /// returns true; on a Lua error leaves the error value and returns false.
 /// For Zig functions called from Lua that hold resources: free them, then
 /// raise the error (`return error.Raise`).
-pub fn tryCall(L: *State, comptime T: type, ctx: *T, comptime f: fn (*State, *T) void, nargs: c_int, nresults: c_int) bool {
+pub fn tryCall(
+    L: *State,
+    comptime T: type,
+    ctx: *T,
+    comptime f: fn (*State, *T) void,
+    nargs: c_int,
+    nresults: c_int,
+) bool {
     if (c.lua_checkstack(L, 2) == 0) {
         c.lua_settop(L, -nargs - 1);
         _ = c.lua_pushstring(L, "Lua stack overflow");
@@ -204,12 +217,20 @@ pub fn toSlice(L: *State, idx: c_int) ?[:0]const u8 {
 }
 
 pub fn argString(L: *State, arg: c_int, func: []const u8) Error![:0]const u8 {
-    return toSlice(L, arg) orelse fail(L, "bad argument #{d} to '{s}' (string expected, got {s})", .{ arg, func, typeName(L, arg) });
+    return toSlice(L, arg) orelse fail(
+        L,
+        "bad argument #{d} to '{s}' (string expected, got {s})",
+        .{ arg, func, typeName(L, arg) },
+    );
 }
 
 pub fn argTable(L: *State, arg: c_int, func: []const u8) Error!void {
     if (c.lua_type(L, arg) != c.LUA_TTABLE)
-        return fail(L, "bad argument #{d} to '{s}' (table expected, got {s})", .{ arg, func, typeName(L, arg) });
+        return fail(L, "bad argument #{d} to '{s}' (table expected, got {s})", .{
+            arg,
+            func,
+            typeName(L, arg),
+        });
 }
 
 pub fn pushString(L: *State, s: []const u8) void {
@@ -226,11 +247,21 @@ pub fn getField(L: *State, t: c_int, name: [:0]const u8) c_int {
 }
 
 /// `t[name]` as a string copied into `a`, or null when nil.
-pub fn fieldString(L: *State, a: std.mem.Allocator, t: c_int, name: [:0]const u8, where: []const u8) ?[:0]const u8 {
+pub fn fieldString(
+    L: *State,
+    a: std.mem.Allocator,
+    t: c_int,
+    name: [:0]const u8,
+    where: []const u8,
+) ?[:0]const u8 {
     defer c.lua_settop(L, -2);
     return switch (getField(L, t, name)) {
         c.LUA_TNIL => null,
-        c.LUA_TSTRING => a.dupeSentinel(u8, toSlice(L, -1).?, 0) catch raise(L, "not enough memory", .{}),
+        c.LUA_TSTRING => a.dupeSentinel(u8, toSlice(L, -1).?, 0) catch raise(
+            L,
+            "not enough memory",
+            .{},
+        ),
         // A number reads as text: `subtitle = 42` is fine.
         c.LUA_TNUMBER => blk: {
             var len: usize = 0;
@@ -325,9 +356,19 @@ test "errors come back as messages, and the sandbox holds" {
     try testing.expect(std.mem.find(u8, msg, "boom") != null);
     try testing.expect(std.mem.find(u8, msg, "traceback") != null);
     // Nothing that ends the daemon or runs native code is reachable.
-    try testing.expect(runCode(L, a, "assert(os.exit == nil and os.execute == nil and io.popen == nil)") == null);
-    try testing.expect(runCode(L, a, "assert(debug == nil and package.loadlib == nil and package.cpath == '')") == null);
-    try testing.expect(runCode(L, a, "assert(string.format('%d', 3) == '3' and os.time() > 0)") == null);
+    try testing.expect(
+        runCode(L, a, "assert(os.exit == nil and os.execute == nil and io.popen == nil)") == null,
+    );
+    try testing.expect(
+        runCode(
+            L,
+            a,
+            "assert(debug == nil and package.loadlib == nil and package.cpath == '')",
+        ) == null,
+    );
+    try testing.expect(
+        runCode(L, a, "assert(string.format('%d', 3) == '3' and os.time() > 0)") == null,
+    );
     try testing.expectEqual(@as(c_int, 0), c.lua_gettop(L));
 }
 
@@ -350,7 +391,11 @@ test "memory is capped per state" {
     defer c.lua_close(L);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const msg = runCode(L, arena.allocator(), "local t = {} for i = 1, 1e8 do t[i] = ('x'):rep(100) .. i end").?;
+    const msg = runCode(
+        L,
+        arena.allocator(),
+        "local t = {} for i = 1, 1e8 do t[i] = ('x'):rep(100) .. i end",
+    ).?;
     try testing.expect(std.mem.find(u8, msg, "memory") != null);
     try testing.expect(budget.used <= budget.max);
     // Still usable afterwards.

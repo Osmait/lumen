@@ -37,7 +37,10 @@ pub fn perform(ctx: Ctx, it: *const Item, op: item_mod.Op) Outcome {
     switch (op) {
         .open, .run => return primary(ctx, it),
         .open_with => if (it.action == .file) return .{ .choose_app = it.action.file.path },
-        .always_use => if (it.action == .setting) return .{ .setting = .{ .setting = it.action.setting, .op = op } },
+        .always_use => if (it.action == .setting) return .{ .setting = .{
+            .setting = it.action.setting,
+            .op = op,
+        } },
         .copy_name => copy(it.title),
         .copy_path => switch (it.action) {
             .app => |info| {
@@ -48,7 +51,11 @@ pub fn perform(ctx: Ctx, it: *const Item, op: item_mod.Op) Outcome {
             else => {},
         },
         .show_in_folder => if (it.action == .file) showInFolder(ctx, it.action.file.path),
-        .open_at_line => if (it.action == .file) openAtLine(ctx, it.action.file.path, it.action.file.line),
+        .open_at_line => if (it.action == .file) openAtLine(
+            ctx,
+            it.action.file.path,
+            it.action.file.line,
+        ),
         .copy_file => if (it.action == .file) copyFile(ctx, it.action.file.path),
         .trash => if (it.action == .file) {
             const f = c.g_file_new_for_path(it.action.file.path);
@@ -71,7 +78,11 @@ pub fn perform(ctx: Ctx, it: *const Item, op: item_mod.Op) Outcome {
         .close_window => {
             if (it.action == .focus_window) {
                 var buf: [64]u8 = undefined;
-                const cmd = std.mem.print(&buf, "closewindow address:{s}", .{it.action.focus_window}) catch return .stay;
+                const cmd = std.mem.print(
+                    &buf,
+                    "closewindow address:{s}",
+                    .{it.action.focus_window},
+                ) catch return .stay;
                 hypr.dispatch(ctx.gpa, cmd);
             }
             return .refresh_view;
@@ -86,7 +97,9 @@ pub fn perform(ctx: Ctx, it: *const Item, op: item_mod.Op) Outcome {
             copy(it.detail);
         },
         .clip_delete => {
-            ctx.db.deleteClip(it.action.clip) catch return .{ .failed = "Could not delete the entry" };
+            ctx.db.deleteClip(it.action.clip) catch return .{
+                .failed = "Could not delete the entry",
+            };
             return .refresh_view;
         },
         .clip_clear => {
@@ -158,7 +171,9 @@ pub fn openWith(path: [:0]const u8, app_id: [:0]const u8) bool {
     defer c.g_free(uri);
     const uris = c.g_list_append(null, uri);
     defer c.g_list_free(uris);
-    const lctx = c.gdk_display_get_app_launch_context(c.gdk_display_get_default() orelse return false);
+    const lctx = c.gdk_display_get_app_launch_context(
+        c.gdk_display_get_default() orelse return false,
+    );
     defer c.g_object_unref(lctx);
     var err: ?*c.GError = null;
     if (c.g_app_info_launch_uris(@ptrCast(dai), uris, @ptrCast(lctx), &err) == 0) {
@@ -180,7 +195,10 @@ fn openAtLine(ctx: Ctx, path: [:0]const u8, line: u32) void {
     const editor = a.dupeSentinel(u8, resolveEditor(ctx.settings), 0) catch return;
     var argv: std.ArrayList([:0]const u8) = .empty;
     const cmd = editorCommand(a, editor, path, line) catch return;
-    if (cmd.in_terminal) argv.appendSlice(a, terminalPrefix(a, resolveTerminal(ctx.settings)) catch return) catch return;
+    if (cmd.in_terminal) argv.appendSlice(
+        a,
+        terminalPrefix(a, resolveTerminal(ctx.settings)) catch return,
+    ) catch return;
     argv.appendSlice(a, cmd.argv) catch return;
     proc.spawn(argv.items);
 }
@@ -211,7 +229,12 @@ pub fn autoTerminal() [:0]const u8 {
 pub const EditorCommand = struct { argv: []const [:0]const u8, in_terminal: bool };
 
 /// How each editor is told to open a file at a line.
-pub fn editorCommand(a: std.mem.Allocator, editor: [:0]const u8, path: [:0]const u8, line: u32) std.mem.Allocator.Error!EditorCommand {
+pub fn editorCommand(
+    a: std.mem.Allocator,
+    editor: [:0]const u8,
+    path: [:0]const u8,
+    line: u32,
+) std.mem.Allocator.Error!EditorCommand {
     const base = if (std.mem.findScalarLast(u8, editor, '/')) |s| editor[s + 1 ..] else editor;
     const at = try a.printSentinel("{s}:{d}", .{ path, line }, 0);
     const plus = try a.printSentinel("+{d}", .{line}, 0);
@@ -222,19 +245,40 @@ pub fn editorCommand(a: std.mem.Allocator, editor: [:0]const u8, path: [:0]const
             return false;
         }
     }.any;
-    if (is(base, &.{ "code", "codium", "code-oss" })) return .{ .argv = try a.dupe([:0]const u8, &.{ editor, "-g", at }), .in_terminal = false };
-    if (is(base, &.{ "zed", "zeditor", "subl" })) return .{ .argv = try a.dupe([:0]const u8, &.{ editor, at }), .in_terminal = false };
-    if (is(base, &.{"kate"})) return .{ .argv = try a.dupe([:0]const u8, &.{ editor, "-l", n, path }), .in_terminal = false };
-    if (is(base, &.{ "gedit", "gnome-text-editor", "emacs" })) return .{ .argv = try a.dupe([:0]const u8, &.{ editor, plus, path }), .in_terminal = false };
-    if (is(base, &.{ "hx", "helix", "micro" })) return .{ .argv = try a.dupe([:0]const u8, &.{ editor, at }), .in_terminal = true };
+    if (is(base, &.{ "code", "codium", "code-oss" })) return .{
+        .argv = try a.dupe([:0]const u8, &.{ editor, "-g", at }),
+        .in_terminal = false,
+    };
+    if (is(base, &.{ "zed", "zeditor", "subl" })) return .{
+        .argv = try a.dupe([:0]const u8, &.{ editor, at }),
+        .in_terminal = false,
+    };
+    if (is(base, &.{"kate"})) return .{
+        .argv = try a.dupe([:0]const u8, &.{ editor, "-l", n, path }),
+        .in_terminal = false,
+    };
+    if (is(base, &.{ "gedit", "gnome-text-editor", "emacs" })) return .{
+        .argv = try a.dupe([:0]const u8, &.{ editor, plus, path }),
+        .in_terminal = false,
+    };
+    if (is(base, &.{ "hx", "helix", "micro" })) return .{
+        .argv = try a.dupe([:0]const u8, &.{ editor, at }),
+        .in_terminal = true,
+    };
     // vi, vim, nvim, nano, and anything unknown: `+LINE path` in a terminal.
     return .{ .argv = try a.dupe([:0]const u8, &.{ editor, plus, path }), .in_terminal = true };
 }
 
 /// The words that make a terminal run a command (most take `-e`), in `a`.
-pub fn terminalPrefix(a: std.mem.Allocator, term: [:0]const u8) std.mem.Allocator.Error![]const [:0]const u8 {
+pub fn terminalPrefix(
+    a: std.mem.Allocator,
+    term: [:0]const u8,
+) std.mem.Allocator.Error![]const [:0]const u8 {
     const base = if (std.mem.findScalarLast(u8, term, '/')) |s| term[s + 1 ..] else term;
-    if (std.mem.eql(u8, base, "kitty") or std.mem.eql(u8, base, "foot")) return a.dupe([:0]const u8, &.{term});
+    if (std.mem.eql(u8, base, "kitty") or std.mem.eql(u8, base, "foot")) return a.dupe(
+        [:0]const u8,
+        &.{term},
+    );
     if (std.mem.eql(u8, base, "wezterm")) return a.dupe([:0]const u8, &.{ term, "start", "--" });
     if (std.mem.eql(u8, base, "gnome-terminal")) return a.dupe([:0]const u8, &.{ term, "--" });
     return a.dupe([:0]const u8, &.{ term, "-e" });
@@ -247,7 +291,19 @@ fn showInFolder(ctx: Ctx, path: [:0]const u8) void {
     defer c.g_free(uri);
     const arg = ctx.gpa.printSentinel("['{s}']", .{uri}, 0) catch return;
     defer ctx.gpa.free(arg);
-    proc.spawn(&.{ "gdbus", "call", "--session", "--dest", "org.freedesktop.FileManager1", "--object-path", "/org/freedesktop/FileManager1", "--method", "org.freedesktop.FileManager1.ShowItems", arg, "" });
+    proc.spawn(&.{
+        "gdbus",
+        "call",
+        "--session",
+        "--dest",
+        "org.freedesktop.FileManager1",
+        "--object-path",
+        "/org/freedesktop/FileManager1",
+        "--method",
+        "org.freedesktop.FileManager1.ShowItems",
+        arg,
+        "",
+    });
 }
 
 /// Puts the file itself on the clipboard (paste it in a file manager or a
@@ -274,18 +330,31 @@ fn launch(info: *c.GAppInfo) void {
 
 fn focusWindow(ctx: Ctx, it: *const Item) void {
     var buf: [64]u8 = undefined;
-    const cmd = std.mem.print(&buf, "focuswindow address:{s}", .{it.action.focus_window}) catch return;
+    const cmd = std.mem.print(
+        &buf,
+        "focuswindow address:{s}",
+        .{it.action.focus_window},
+    ) catch return;
     hypr.dispatch(ctx.gpa, cmd);
 }
 
 fn system(ctx: Ctx, s: item_mod.System) void {
     switch (s) {
-        .lock => if (proc.have("hyprlock")) proc.spawn(&.{"hyprlock"}) else proc.spawn(&.{ "loginctl", "lock-session" }),
+        .lock => if (proc.have("hyprlock")) proc.spawn(&.{"hyprlock"}) else proc.spawn(
+            &.{ "loginctl", "lock-session" },
+        ),
         .sleep => proc.spawn(&.{ "systemctl", "suspend" }),
         .restart => proc.spawn(&.{ "systemctl", "reboot" }),
         .shutdown => proc.spawn(&.{ "systemctl", "poweroff" }),
         .logout => hypr.dispatch(ctx.gpa, "exit"),
-        .volume_up => proc.spawn(&.{ "wpctl", "set-volume", "-l", "1.5", "@DEFAULT_AUDIO_SINK@", "5%+" }),
+        .volume_up => proc.spawn(&.{
+            "wpctl",
+            "set-volume",
+            "-l",
+            "1.5",
+            "@DEFAULT_AUDIO_SINK@",
+            "5%+",
+        }),
         .volume_down => proc.spawn(&.{ "wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "5%-" }),
         .volume_mute => proc.spawn(&.{ "wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle" }),
         .mic_mute => proc.spawn(&.{ "wpctl", "set-mute", "@DEFAULT_AUDIO_SOURCE@", "toggle" }),
@@ -363,7 +432,19 @@ fn sendPaste(_: ?*anyopaque) callconv(.c) c.gboolean {
     const class = if (hypr.activeWindow(fba.allocator())) |w| w.class else "";
     switch (pasteChord(class)) {
         .ctrl_v => proc.spawn(&.{ "wtype", "-M", "ctrl", "-k", "v", "-m", "ctrl" }),
-        .ctrl_shift_v => proc.spawn(&.{ "wtype", "-M", "ctrl", "-M", "shift", "-k", "v", "-m", "shift", "-m", "ctrl" }),
+        .ctrl_shift_v => proc.spawn(&.{
+            "wtype",
+            "-M",
+            "ctrl",
+            "-M",
+            "shift",
+            "-k",
+            "v",
+            "-m",
+            "shift",
+            "-m",
+            "ctrl",
+        }),
     }
     return 0;
 }
@@ -372,7 +453,24 @@ pub const Chord = enum { ctrl_v, ctrl_shift_v };
 
 /// Terminal emulators by Wayland app id / window class (lowercased match).
 pub fn pasteChord(class: []const u8) Chord {
-    const terminals = [_][]const u8{ "ghostty", "kitty", "alacritty", "foot", "wezterm", "konsole", "terminal", "console", "xterm", "terminator", "tilix", "urxvt", "st-256color", "rio", "contour", "blackbox" };
+    const terminals = [_][]const u8{
+        "ghostty",
+        "kitty",
+        "alacritty",
+        "foot",
+        "wezterm",
+        "konsole",
+        "terminal",
+        "console",
+        "xterm",
+        "terminator",
+        "tilix",
+        "urxvt",
+        "st-256color",
+        "rio",
+        "contour",
+        "blackbox",
+    };
     var buf: [128]u8 = undefined;
     if (class.len > buf.len) return .ctrl_v;
     const lower = std.ascii.lowerString(&buf, class);

@@ -45,7 +45,13 @@ pub const context_after = 14;
 
 /// Pango markup of the lines around `line` (1-based), with line numbers and
 /// every occurrence of `words` highlighted.
-pub fn contextMarkup(a: std.mem.Allocator, text: []const u8, line: u32, words: []const []const u8, hl_open: []const u8) [:0]const u8 {
+pub fn contextMarkup(
+    a: std.mem.Allocator,
+    text: []const u8,
+    line: u32,
+    words: []const []const u8,
+    hl_open: []const u8,
+) [:0]const u8 {
     const before = 6;
     const after = context_after;
     const first = if (line > before) line - before else 1;
@@ -94,7 +100,12 @@ pub fn appendEscaped(a: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u
 /// "Kind" in the detail pane. GLib guesses from the extension and is wrong
 /// for some source files: .zig is "unknown", .mts is a video ("MPEG-2
 /// transport stream"). A file with a code badge is named after it then.
-pub fn kindLabel(a: std.mem.Allocator, path: []const u8, is_dir: bool, ctype: ?[*:0]const u8) [:0]const u8 {
+pub fn kindLabel(
+    a: std.mem.Allocator,
+    path: []const u8,
+    is_dir: bool,
+    ctype: ?[*:0]const u8,
+) [:0]const u8 {
     if (is_dir) return "Folder";
     const desc = if (ctype) |t| c.g_content_type_get_description(t) else null;
     defer if (desc) |d| c.g_free(d);
@@ -103,7 +114,15 @@ pub fn kindLabel(a: std.mem.Allocator, path: []const u8, is_dir: bool, ctype: ?[
     if (core.file_badge.of(name, &upper)) |b| {
         const t = if (ctype) |t| std.mem.span(t) else "";
         // octet-stream is GLib's "no idea" (e.g. no shared-mime-info data).
-        const media = std.mem.startsWith(u8, t, "video/") or std.mem.startsWith(u8, t, "audio/") or std.mem.eql(u8, t, "application/octet-stream");
+        const media = std.mem.startsWith(
+            u8,
+            t,
+            "video/",
+        ) or std.mem.startsWith(u8, t, "audio/") or std.mem.eql(
+            u8,
+            t,
+            "application/octet-stream",
+        );
         const unknown = desc == null or std.ascii.eqlIgnoreCase(std.mem.span(desc.?), "unknown");
         if (media or unknown) return a.printSentinel("{s} file", .{b.text}, 0) catch "File";
     }
@@ -139,7 +158,14 @@ pub fn startOfToday() i64 {
     // Null only for a date GLib cannot represent: then everything is "Earlier".
     const dt = c.g_date_time_new_now_local() orelse return std.math.maxInt(i64);
     defer c.g_date_time_unref(dt);
-    const midnight = c.g_date_time_new_local(c.g_date_time_get_year(dt), c.g_date_time_get_month(dt), c.g_date_time_get_day_of_month(dt), 0, 0, 0) orelse return std.math.maxInt(i64);
+    const midnight = c.g_date_time_new_local(
+        c.g_date_time_get_year(dt),
+        c.g_date_time_get_month(dt),
+        c.g_date_time_get_day_of_month(dt),
+        0,
+        0,
+        0,
+    ) orelse return std.math.maxInt(i64);
     defer c.g_date_time_unref(midnight);
     return c.g_date_time_to_unix(midnight);
 }
@@ -176,7 +202,10 @@ test "displayText makes any file name safe for a label" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try std.testing.expectEqualStrings("bad-\u{FFFD}\u{FFFD}-name.txt", displayText(a, "bad-\xff\xfe-name.txt"));
+    try std.testing.expectEqualStrings(
+        "bad-\u{FFFD}\u{FFFD}-name.txt",
+        displayText(a, "bad-\xff\xfe-name.txt"),
+    );
     try std.testing.expectEqualStrings("line1 line2.txt", displayText(a, "line1\nline2.txt"));
     try std.testing.expectEqualStrings("acción ñandú 🔊", displayText(a, "acción ñandú 🔊"));
     try std.testing.expectEqualStrings("trunc\u{FFFD}", displayText(a, "trunc\xc3"));

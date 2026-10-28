@@ -74,8 +74,15 @@ pub const Kind = enum {
 /// system default opens it).
 pub fn of(mime: []const u8, name: []const u8, is_dir: bool) ?Kind {
     if (is_dir or std.mem.eql(u8, mime, "inode/directory")) return .folder;
-    if (std.mem.eql(u8, mime, "text/markdown") or hasExt(name, &.{ ".md", ".markdown" })) return .markdown;
-    if (std.mem.eql(u8, mime, "text/html") or std.mem.eql(u8, mime, "application/xhtml+xml")) return .html;
+    if (std.mem.eql(u8, mime, "text/markdown") or hasExt(
+        name,
+        &.{ ".md", ".markdown" },
+    )) return .markdown;
+    if (std.mem.eql(u8, mime, "text/html") or std.mem.eql(
+        u8,
+        mime,
+        "application/xhtml+xml",
+    )) return .html;
     if (std.mem.eql(u8, mime, "application/pdf")) return .pdf;
     if (std.mem.startsWith(u8, mime, "image/")) return .image;
     if (std.mem.startsWith(u8, mime, "audio/")) return .audio;
@@ -85,12 +92,44 @@ pub fn of(mime: []const u8, name: []const u8, is_dir: bool) ?Kind {
     if (std.mem.startsWith(u8, mime, "video/")) return if (code) .text else .video;
     if (std.mem.startsWith(u8, mime, "application/vnd.oasis.opendocument.") or
         std.mem.startsWith(u8, mime, "application/vnd.openxmlformats-officedocument.") or
-        std.mem.eql(u8, mime, "application/msword") or std.mem.eql(u8, mime, "application/vnd.ms-excel") or
-        std.mem.eql(u8, mime, "application/vnd.ms-powerpoint") or std.mem.eql(u8, mime, "application/rtf")) return .office;
-    const archives = [_][]const u8{ "application/zip", "application/x-tar", "application/gzip", "application/x-compressed-tar", "application/x-7z-compressed", "application/vnd.rar", "application/x-rar", "application/x-xz", "application/x-xz-compressed-tar", "application/zstd", "application/x-zstd-compressed-tar", "application/x-bzip2", "application/x-bzip2-compressed-tar" };
+        std.mem.eql(u8, mime, "application/msword") or std.mem.eql(
+        u8,
+        mime,
+        "application/vnd.ms-excel",
+    ) or
+        std.mem.eql(
+            u8,
+            mime,
+            "application/vnd.ms-powerpoint",
+        ) or std.mem.eql(u8, mime, "application/rtf")) return .office;
+    const archives = [_][]const u8{
+        "application/zip",
+        "application/x-tar",
+        "application/gzip",
+        "application/x-compressed-tar",
+        "application/x-7z-compressed",
+        "application/vnd.rar",
+        "application/x-rar",
+        "application/x-xz",
+        "application/x-xz-compressed-tar",
+        "application/zstd",
+        "application/x-zstd-compressed-tar",
+        "application/x-bzip2",
+        "application/x-bzip2-compressed-tar",
+    };
     for (archives) |a| if (std.mem.eql(u8, mime, a)) return .archive;
     if (std.mem.startsWith(u8, mime, "text/") or code) return .text;
-    const texty = [_][]const u8{ "application/json", "application/xml", "application/x-shellscript", "application/javascript", "application/toml", "application/x-yaml", "application/yaml", "application/sql", "application/x-desktop" };
+    const texty = [_][]const u8{
+        "application/json",
+        "application/xml",
+        "application/x-shellscript",
+        "application/javascript",
+        "application/toml",
+        "application/x-yaml",
+        "application/yaml",
+        "application/sql",
+        "application/x-desktop",
+    };
     for (texty) |t| if (std.mem.eql(u8, mime, t)) return .text;
     return null;
 }
@@ -121,7 +160,11 @@ test "kinds from MIME type and name" {
     try t.expectEqual(Kind.text, of("text/plain", "a.txt", false));
     try t.expectEqual(Kind.text, of("text/rust", "lib.rs", false));
     try t.expectEqual(Kind.text, of("application/json", "a.json", false));
-    try t.expectEqual(Kind.office, of("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "a.docx", false));
+    try t.expectEqual(Kind.office, of(
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "a.docx",
+        false,
+    ));
     try t.expectEqual(Kind.archive, of("application/zip", "a.zip", false));
     // GLib's guesses for code it does not know.
     try t.expectEqual(Kind.text, of("application/octet-stream", "main.zig", false));

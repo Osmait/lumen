@@ -113,7 +113,10 @@ test "accents and case fold both ways" {
     try std.testing.expect(score("configuracion", "Configuración") > 0);
     try std.testing.expect(score("CONFIGURACIÓN", "Configuracion") > 0);
     try std.testing.expect(score("configuración", "Configuración del sistema") > 0);
-    try std.testing.expectEqual(score("configuracion", "Configuración"), score("Configuración", "configuracion"));
+    try std.testing.expectEqual(score("configuracion", "Configuración"), score(
+        "Configuración",
+        "configuracion",
+    ));
     try std.testing.expect(score("nandu", "Ñandú") > 0);
     // Word starts survive folding: "ae" = Árbol Épico, camelCase too.
     try std.testing.expect(score("ae", "Árbol Épico") > 0);

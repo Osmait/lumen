@@ -24,13 +24,23 @@ fn check(name: []const u8, got_ms: f64, limit_ms: f64) void {
     const limit = limit_ms * scale;
     const ok = got_ms <= limit;
     if (!ok) failures += 1;
-    std.debug.print("  {s} {s:<44} {d:>9.3} ms  (limit {d:.1})\n", .{ if (ok) "ok  " else "FAIL", name, got_ms, limit });
+    std.debug.print("  {s} {s:<44} {d:>9.3} ms  (limit {d:.1})\n", .{
+        if (ok) "ok  " else "FAIL",
+        name,
+        got_ms,
+        limit,
+    });
 }
 
 fn checkMB(name: []const u8, got: f64, limit: f64) void {
     const ok = got <= limit * scale;
     if (!ok) failures += 1;
-    std.debug.print("  {s} {s:<44} {d:>9.1} MB  (limit {d:.0})\n", .{ if (ok) "ok  " else "FAIL", name, got, limit * scale });
+    std.debug.print("  {s} {s:<44} {d:>9.1} MB  (limit {d:.0})\n", .{
+        if (ok) "ok  " else "FAIL",
+        name,
+        got,
+        limit * scale,
+    });
 }
 
 fn peakRssMB() f64 {
@@ -41,7 +51,32 @@ fn peakRssMB() f64 {
     return @as(f64, @floatFromInt(std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0)) / 1024;
 }
 
-const words = [_][]const u8{ "cargo", "config", "main", "readme", "notes", "src", "test", "build", "lib", "index", "photo", "draft", "server", "client", "handler", "model", "store", "query", "parser", "token", "window", "theme", "invoice", "report" };
+const words = [_][]const u8{
+    "cargo",
+    "config",
+    "main",
+    "readme",
+    "notes",
+    "src",
+    "test",
+    "build",
+    "lib",
+    "index",
+    "photo",
+    "draft",
+    "server",
+    "client",
+    "handler",
+    "model",
+    "store",
+    "query",
+    "parser",
+    "token",
+    "window",
+    "theme",
+    "invoice",
+    "report",
+};
 const exts = [_][]const u8{ ".toml", ".rs", ".md", ".zig", ".json", ".png", ".go", ".ts", "" };
 
 /// ~1M entries: 25k directories over three levels, 40 files each.
@@ -61,8 +96,17 @@ fn syntheticNames(gpa: std.mem.Allocator) !store_mod.Store {
         var next: std.ArrayList(u32) = .empty;
         for (level.items) |parent| {
             for (0..fan) |i| {
-                const n = try std.mem.print(&nb, "{s}-{d}", .{ words[r.uintLessThan(usize, words.len)], i });
-                try next.append(gpa, try b.push(gpa, n, parent, store_mod.flag_dir, @intCast(depth)));
+                const n = try std.mem.print(&nb, "{s}-{d}", .{
+                    words[r.uintLessThan(usize, words.len)],
+                    i,
+                });
+                try next.append(gpa, try b.push(
+                    gpa,
+                    n,
+                    parent,
+                    store_mod.flag_dir,
+                    @intCast(depth),
+                ));
             }
         }
         try all_dirs.appendSlice(gpa, next.items);
@@ -71,7 +115,11 @@ fn syntheticNames(gpa: std.mem.Allocator) !store_mod.Store {
     }
     for (all_dirs.items) |d| {
         for (0..40) |_| {
-            const n = try std.mem.print(&nb, "{s}_{s}{s}", .{ words[r.uintLessThan(usize, words.len)], words[r.uintLessThan(usize, words.len)], exts[r.uintLessThan(usize, exts.len)] });
+            const n = try std.mem.print(&nb, "{s}_{s}{s}", .{
+                words[r.uintLessThan(usize, words.len)],
+                words[r.uintLessThan(usize, words.len)],
+                exts[r.uintLessThan(usize, exts.len)],
+            });
             _ = try b.push(gpa, n, d, 0, 4);
         }
     }
@@ -83,7 +131,10 @@ fn names(gpa: std.mem.Allocator, pool: *index.Pool, dir: []const u8) !void {
     var t = sys.monotonicNs();
     var s = try syntheticNames(gpa);
     defer s.deinit(gpa);
-    std.debug.print("       {d} entries built in {d:.0} ms\n", .{ s.len(), ms(sys.monotonicNs() - t) });
+    std.debug.print("       {d} entries built in {d:.0} ms\n", .{
+        s.len(),
+        ms(sys.monotonicNs() - t),
+    });
 
     var pbuf: [4096]u8 = undefined;
     const path = try std.mem.printSentinel(&pbuf, "{s}/names.idx", .{dir}, 0);
@@ -98,14 +149,21 @@ fn names(gpa: std.mem.Allocator, pool: *index.Pool, dir: []const u8) !void {
     var want: std.ArrayList(index.search.Hit) = .empty;
     defer want.deinit(gpa);
     // Worst cases are 1-2 letters (almost everything passes the mask).
-    const cold = [_]struct { []const u8, f64 }{ .{ "c", 20 }, .{ "ca", 25 }, .{ "cargo", 15 }, .{ "cargo.toml", 10 }, .{ "hndlr", 15 } };
+    const cold = [_]struct { []const u8, f64 }{ .{ "c", 20 }, .{ "ca", 25 }, .{ "cargo", 15 }, .{
+        "cargo.toml",
+        10,
+    }, .{ "hndlr", 15 } };
     for (cold) |q| {
         var e: index.search.Engine = .empty;
         defer e.deinit(gpa);
         t = sys.monotonicNs();
         try e.search(gpa, pool, &m, q[0], .{ .limit = 60, .recency = false }, &hits);
         var label: [64]u8 = undefined;
-        check(try std.mem.print(&label, "cold query \"{s}\"", .{q[0]}), ms(sys.monotonicNs() - t), q[1]);
+        check(
+            try std.mem.print(&label, "cold query \"{s}\"", .{q[0]}),
+            ms(sys.monotonicNs() - t),
+            q[1],
+        );
         // Recall against the exhaustive reference: exact, not timed.
         try index.search.searchExhaustive(gpa, &m, q[0], 60, &want);
         var same = want.items.len == hits.items.len;
@@ -121,11 +179,20 @@ fn names(gpa: std.mem.Allocator, pool: *index.Pool, dir: []const u8) !void {
                     break;
                 };
             }
-            std.debug.print("  FAIL recall for \"{s}\": {d}/{d} of the exhaustive top found\n", .{ q[0], found, want.items.len });
+            std.debug.print("  FAIL recall for \"{s}\": {d}/{d} of the exhaustive top found\n", .{
+                q[0],
+                found,
+                want.items.len,
+            });
             for (want.items[0..@min(5, want.items.len)], 0..) |w, i| {
                 var b1: [256]u8 = undefined;
                 var b2: [256]u8 = undefined;
-                std.debug.print("       want {d} {s}   got {d} {s}\n", .{ w.score, m.name(w.id), if (i < hits.items.len) hits.items[i].score else 0, if (i < hits.items.len) m.name(hits.items[i].id) else "" });
+                std.debug.print("       want {d} {s}   got {d} {s}\n", .{
+                    w.score,
+                    m.name(w.id),
+                    if (i < hits.items.len) hits.items[i].score else 0,
+                    if (i < hits.items.len) m.name(hits.items[i].id) else "",
+                });
                 _ = &b1;
                 _ = &b2;
             }
@@ -144,9 +211,44 @@ fn names(gpa: std.mem.Allocator, pool: *index.Pool, dir: []const u8) !void {
     check("typing \"handler.rs\", worst keystroke", ms(worst), 25);
 }
 
-const vocab = [_][]const u8{ "const", "return", "struct", "allocator", "buffer", "index", "query", "token", "parser", "window", "render", "TODO", "error", "result", "value", "string", "async", "await", "import", "export", "function", "useState", "SELECT", "FROM", "WHERE", "zebrafish", "the", "and", "for" };
+const vocab = [_][]const u8{
+    "const",
+    "return",
+    "struct",
+    "allocator",
+    "buffer",
+    "index",
+    "query",
+    "token",
+    "parser",
+    "window",
+    "render",
+    "TODO",
+    "error",
+    "result",
+    "value",
+    "string",
+    "async",
+    "await",
+    "import",
+    "export",
+    "function",
+    "useState",
+    "SELECT",
+    "FROM",
+    "WHERE",
+    "zebrafish",
+    "the",
+    "and",
+    "for",
+};
 
-fn plainText(_: *anyopaque, d: content.DocIn, buf: *std.ArrayList(u8), gpa: std.mem.Allocator) std.mem.Allocator.Error!bool {
+fn plainText(
+    _: *anyopaque,
+    d: content.DocIn,
+    buf: *std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+) std.mem.Allocator.Error!bool {
     return content.readPlain(gpa, d.path, buf);
 }
 
@@ -173,9 +275,16 @@ fn contents(gpa: std.mem.Allocator, pool: *index.Pool, dir: []const u8) !void {
         const p = try a.printSentinel("{s}/doc{d:0>5}.txt", .{ dir, i }, 0);
         try sys.writeFile(p, text.items);
         total += text.items.len;
-        try docs.append(a, .{ .path = p, .mtime = 1_700_000_000 + @as(i64, @intCast(i)), .size = text.items.len });
+        try docs.append(a, .{
+            .path = p,
+            .mtime = 1_700_000_000 + @as(i64, @intCast(i)),
+            .size = text.items.len,
+        });
     }
-    std.debug.print("       {d} documents, {d:.1} MB of text\n", .{ docs.items.len, @as(f64, @floatFromInt(total)) / 1e6 });
+    std.debug.print("       {d} documents, {d:.1} MB of text\n", .{
+        docs.items.len,
+        @as(f64, @floatFromInt(total)) / 1e6,
+    });
 
     var dummy: u8 = 0;
     var t = sys.monotonicNs();
@@ -184,12 +293,33 @@ fn contents(gpa: std.mem.Allocator, pool: *index.Pool, dir: []const u8) !void {
     check("build", ms(sys.monotonicNs() - t), 1500);
 
     var matches: std.ArrayList(content.Match) = .empty;
-    const queries = [_]struct { []const u8, f64 }{ .{ "zebrafish", 30 }, .{ "allocator", 40 }, .{ "the", 40 }, .{ "useState return", 40 }, .{ "SELECT FROM WHERE", 50 }, .{ "nothinghere", 5 } };
+    const queries = [_]struct { []const u8, f64 }{ .{
+        "zebrafish",
+        30,
+    }, .{ "allocator", 40 }, .{ "the", 40 }, .{
+        "useState return",
+        40,
+    }, .{
+        "SELECT FROM WHERE",
+        50,
+    }, .{ "nothinghere", 5 } };
     for (queries) |q| {
         t = sys.monotonicNs();
-        try content.search(&ix, gpa, a, pool, q[0], .{ .limit = 50, .text_path = content.plainPath, .text_ctx = &dummy }, &matches);
+        try content.search(
+            &ix,
+            gpa,
+            a,
+            pool,
+            q[0],
+            .{ .limit = 50, .text_path = content.plainPath, .text_ctx = &dummy },
+            &matches,
+        );
         var label: [64]u8 = undefined;
-        check(try std.mem.print(&label, "search \"{s}\" ({d} hits)", .{ q[0], matches.items.len }), ms(sys.monotonicNs() - t), q[1]);
+        check(
+            try std.mem.print(&label, "search \"{s}\" ({d} hits)", .{ q[0], matches.items.len }),
+            ms(sys.monotonicNs() - t),
+            q[1],
+        );
     }
 }
 

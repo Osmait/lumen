@@ -17,7 +17,16 @@ pub fn spawn(argv: []const [:0]const u8) void {
     // Reaped here rather than by an intermediate child: GLib otherwise forks
     // the daemon twice (a ~200 MB process) for every command it starts.
     var pid: c.GPid = 0;
-    const ok = c.g_spawn_async(null, ptr, null, c.G_SPAWN_SEARCH_PATH | c.G_SPAWN_DO_NOT_REAP_CHILD, null, null, &pid, &err);
+    const ok = c.g_spawn_async(
+        null,
+        ptr,
+        null,
+        c.G_SPAWN_SEARCH_PATH | c.G_SPAWN_DO_NOT_REAP_CHILD,
+        null,
+        null,
+        &pid,
+        &err,
+    );
     if (ok == 0) return logError("spawn", argv[0], err);
     _ = c.g_child_watch_add(pid, &reap, null);
 }
@@ -39,7 +48,18 @@ pub fn output(argv: []const [:0]const u8) ?[:0]u8 {
     var out: ?[*:0]u8 = null;
     var status: c_int = 0;
     var err: ?*c.GError = null;
-    const ok = c.g_spawn_sync(null, ptr, null, c.G_SPAWN_SEARCH_PATH | c.G_SPAWN_STDERR_TO_DEV_NULL, null, null, &out, null, &status, &err);
+    const ok = c.g_spawn_sync(
+        null,
+        ptr,
+        null,
+        c.G_SPAWN_SEARCH_PATH | c.G_SPAWN_STDERR_TO_DEV_NULL,
+        null,
+        null,
+        &out,
+        null,
+        &status,
+        &err,
+    );
     if (ok == 0) {
         logError("run", argv[0], err);
         return null;
@@ -65,7 +85,14 @@ pub fn pipeTo(argv: []const [:0]const u8, input: []const u8) void {
     // Not null: the process was started with a stdin pipe.
     const stdin = c.g_subprocess_get_stdin_pipe(sp);
     var written: usize = 0;
-    if (c.g_output_stream_write_all(stdin, input.ptr, input.len, &written, null, &err) == 0) logError("write to", argv[0], err);
+    if (c.g_output_stream_write_all(
+        stdin,
+        input.ptr,
+        input.len,
+        &written,
+        null,
+        &err,
+    ) == 0) logError("write to", argv[0], err);
     _ = c.g_output_stream_close(stdin, null, null);
 }
 

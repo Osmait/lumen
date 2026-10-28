@@ -71,7 +71,11 @@ pub fn candidates(ui: *Ui, a: std.mem.Allocator) []Item {
     for (cmd.fields, 0..) |*f, i| {
         out.append(a, .{
             .key = a.print("field:{s}", .{f.name}) catch continue,
-            .title = if (f.required) a.printSentinel("{s} *", .{f.title}, 0) catch f.title else f.title,
+            .title = if (f.required) a.printSentinel(
+                "{s} *",
+                .{f.title},
+                0,
+            ) catch f.title else f.title,
             .subtitle = f.description,
             .accessory = prefs_view.display(a, f, value(ui, i)),
             .icon = prefs_view.iconOf(f.kind),
@@ -138,7 +142,11 @@ pub fn submit(ui: *Ui) void {
     for (cmd.fields, 0..) |*f, i| {
         const v = value(ui, i);
         if (f.required and v.len == 0) {
-            const msg = ui.query_arena.allocator().printSentinel("Fill in {s} first", .{f.title}, 0) catch "Fill in the required fields";
+            const msg = ui.query_arena.allocator().printSentinel(
+                "Fill in {s} first",
+                .{f.title},
+                0,
+            ) catch "Fill in the required fields";
             return ui.showFailure(msg);
         }
         buf[i] = .{ .name = f.name, .value = v, .toggle = f.kind == .toggle };

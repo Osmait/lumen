@@ -323,8 +323,16 @@ pub fn build(self: *Ui) void {
     widgets.connect(monitor, "changed", &onAppsChanged, self);
 
     self.loadCss();
-    self.config_dir = self.gpa.printSentinel("{s}/lumen", .{std.mem.span(c.g_get_user_config_dir())}, 0) catch "";
-    self.settings_path = self.gpa.printSentinel("{s}/settings.conf", .{self.config_dir}, 0) catch "";
+    self.config_dir = self.gpa.printSentinel(
+        "{s}/lumen",
+        .{std.mem.span(c.g_get_user_config_dir())},
+        0,
+    ) catch "";
+    self.settings_path = self.gpa.printSentinel(
+        "{s}/settings.conf",
+        .{self.config_dir},
+        0,
+    ) catch "";
     self.watchColorScheme();
     self.reloadSettings();
 
@@ -336,12 +344,19 @@ pub fn build(self: *Ui) void {
     c.gtk_window_set_decorated(@ptrCast(win), 0);
     // A fixed size: the layer surface would otherwise grow to its content's
     // natural size (a large image preview, a long path).
-    c.gtk_window_set_default_size(@ptrCast(win), self.panelW() + 2 * shell_margin, self.panelH() + 2 * shell_margin);
+    c.gtk_window_set_default_size(
+        @ptrCast(win),
+        self.panelW() + 2 * shell_margin,
+        self.panelH() + 2 * shell_margin,
+    );
 
     const w: *c.GtkWindow = @ptrCast(win);
     c.gtk_layer_init_for_window(w);
     c.gtk_layer_set_layer(w, c.GTK_LAYER_SHELL_LAYER_OVERLAY);
-    c.gtk_layer_set_keyboard_mode(w, if (testMode()) c.GTK_LAYER_SHELL_KEYBOARD_MODE_NONE else c.GTK_LAYER_SHELL_KEYBOARD_MODE_EXCLUSIVE);
+    c.gtk_layer_set_keyboard_mode(
+        w,
+        if (testMode()) c.GTK_LAYER_SHELL_KEYBOARD_MODE_NONE else c.GTK_LAYER_SHELL_KEYBOARD_MODE_EXCLUSIVE,
+    );
     c.gtk_layer_set_namespace(w, "lumen");
     c.gtk_layer_set_anchor(w, c.GTK_LAYER_SHELL_EDGE_TOP, 1);
 
@@ -404,7 +419,11 @@ pub fn build(self: *Ui) void {
     c.gtk_widget_add_css_class(body, "results-island");
     self.results = body;
     self.scroller = c.gtk_scrolled_window_new();
-    c.gtk_scrolled_window_set_policy(@ptrCast(self.scroller), c.GTK_POLICY_NEVER, c.GTK_POLICY_AUTOMATIC);
+    c.gtk_scrolled_window_set_policy(
+        @ptrCast(self.scroller),
+        c.GTK_POLICY_NEVER,
+        c.GTK_POLICY_AUTOMATIC,
+    );
     // As tall as the rows, up to the space left under the search bar.
     c.gtk_scrolled_window_set_propagate_natural_height(@ptrCast(self.scroller), 1);
     c.gtk_scrolled_window_set_max_content_height(@ptrCast(self.scroller), self.listMaxH());
@@ -492,7 +511,9 @@ pub fn build(self: *Ui) void {
 /// (widgets.renamed). Read when the window opens: a handful of files.
 fn scanIconDir(self: *Ui) void {
     widgets.renamed = .empty;
-    if (self.icon_arena) |*ar| _ = ar.reset(.retain_capacity) else self.icon_arena = .init(self.gpa);
+    if (self.icon_arena) |*ar| _ = ar.reset(
+        .retain_capacity,
+    ) else self.icon_arena = .init(self.gpa);
     const a = self.icon_arena.?.allocator();
     const dir = a.printSentinel("{s}/icons", .{self.config_dir}, 0) catch return;
     const d = c.g_dir_open(dir.ptr, 0, null) orelse return;
@@ -547,8 +568,12 @@ pub fn applyStructure(self: *Ui) void {
         prev = w;
     }
     c.gtk_label_set_text(@ptrCast(self.prompt_label), l.prompt.ptr);
-    c.gtk_widget_set_visible(self.prompt_label, @intFromBool(l.prompt.len > 0 and l.searchbar.has(.prompt)));
-    c.gtk_widget_set_visible(self.search_icon, @intFromBool(l.show.search_icon and l.searchbar.has(.icon)));
+    c.gtk_widget_set_visible(self.prompt_label, @intFromBool(
+        l.prompt.len > 0 and l.searchbar.has(.prompt),
+    ));
+    c.gtk_widget_set_visible(self.search_icon, @intFromBool(
+        l.show.search_icon and l.searchbar.has(.icon),
+    ));
     const col: *c.GtkBox = @ptrCast(self.column);
     c.gtk_box_set_spacing(col, if (l.panels == .single) 0 else 10);
     cssClass(self.column, "single", l.panels == .single);
@@ -556,22 +581,41 @@ pub fn applyStructure(self: *Ui) void {
     cssClass(self.column, "with-footer", l.footer);
     // spacer, then search and results in the chosen order, footer last.
     c.gtk_box_reorder_child_after(col, self.spacer, null);
-    const first, const second = if (l.search == .bottom) .{ self.results, self.search_bar } else .{ self.search_bar, self.results };
+    const first, const second = if (l.search == .bottom) .{
+        self.results,
+        self.search_bar,
+    } else .{ self.search_bar, self.results };
     c.gtk_box_reorder_child_after(col, first, self.spacer);
     c.gtk_box_reorder_child_after(col, second, first);
     c.gtk_box_reorder_child_after(col, self.footer, second);
     c.gtk_widget_set_visible(self.spacer, @intFromBool(l.search == .bottom));
     c.gtk_widget_set_visible(self.footer, @intFromBool(l.footer));
-    c.gtk_widget_set_visible(self.key_chip, @intFromBool(l.show.key_hints and l.searchbar.has(.keys)));
+    c.gtk_widget_set_visible(self.key_chip, @intFromBool(
+        l.show.key_hints and l.searchbar.has(.keys),
+    ));
     // With a footer, or the search bar at the bottom, the action panel opens
     // down there, above them.
-    c.gtk_widget_set_valign(self.panel, if (l.footer or l.search == .bottom) c.GTK_ALIGN_END else c.GTK_ALIGN_START);
+    c.gtk_widget_set_valign(
+        self.panel,
+        if (l.footer or l.search == .bottom) c.GTK_ALIGN_END else c.GTK_ALIGN_START,
+    );
     cssClass(self.panel, "from-footer", l.footer);
     cssClass(self.panel, "from-bottom", l.search == .bottom);
 
     const island: *c.GtkBox = @ptrCast(self.results);
-    c.gtk_orientable_set_orientation(self.results, if (l.detail == .bottom) c.GTK_ORIENTATION_VERTICAL else c.GTK_ORIENTATION_HORIZONTAL);
-    if (l.detail == .left) c.gtk_box_reorder_child_after(island, self.detail, null) else c.gtk_box_reorder_child_after(island, self.detail, self.scroller);
+    c.gtk_orientable_set_orientation(
+        self.results,
+        if (l.detail == .bottom) c.GTK_ORIENTATION_VERTICAL else c.GTK_ORIENTATION_HORIZONTAL,
+    );
+    if (l.detail == .left) c.gtk_box_reorder_child_after(
+        island,
+        self.detail,
+        null,
+    ) else c.gtk_box_reorder_child_after(
+        island,
+        self.detail,
+        self.scroller,
+    );
     cssClass(self.results, "detail-left", l.detail == .left);
     cssClass(self.results, "detail-bottom", l.detail == .bottom);
     self.applyLayout();
@@ -594,20 +638,32 @@ fn applyLayout(self: *Ui) void {
     c.gtk_widget_get_size_request(self.column, &cw, &ch);
     if (cw == w and ch == h) return;
     c.gtk_widget_set_size_request(self.column, w, h);
-    c.gtk_window_set_default_size(@ptrCast(self.window), w + 2 * shell_margin, h + 2 * shell_margin);
+    c.gtk_window_set_default_size(
+        @ptrCast(self.window),
+        w + 2 * shell_margin,
+        h + 2 * shell_margin,
+    );
     if (c.gtk_widget_get_visible(self.window) != 0) {
         c.gtk_widget_set_visible(self.window, 0);
         c.gtk_widget_set_visible(self.window, 1);
         _ = c.gtk_widget_grab_focus(self.entry);
     }
     // The list beside a detail pane keeps ~40% of the width.
-    if (c.gtk_widget_get_visible(self.detail) != 0) c.gtk_widget_set_size_request(self.scroller, @divTrunc(w * 2, 5), -1);
+    if (c.gtk_widget_get_visible(self.detail) != 0) c.gtk_widget_set_size_request(
+        self.scroller,
+        @divTrunc(w * 2, 5),
+        -1,
+    );
 }
 
 fn loadCss(self: *Ui) void {
     self.css = c.gtk_css_provider_new();
     const display = c.gdk_display_get_default() orelse return;
-    c.gtk_style_context_add_provider_for_display(display, @ptrCast(self.css), c.GTK_STYLE_PROVIDER_PRIORITY_USER);
+    c.gtk_style_context_add_provider_for_display(
+        display,
+        @ptrCast(self.css),
+        c.GTK_STYLE_PROVIDER_PRIORITY_USER,
+    );
 }
 
 // ------------------------------------------------------------ settings
@@ -630,7 +686,10 @@ pub fn reloadSettings(self: *Ui) void {
 /// The Icon Theme setting, for Lumen's process only.
 fn applyIconTheme(self: *Ui) void {
     const gs = c.gtk_settings_get_default() orelse return;
-    if (self.settings.icon_theme.len == 0) return c.gtk_settings_reset_property(gs, "gtk-icon-theme-name");
+    if (self.settings.icon_theme.len == 0) return c.gtk_settings_reset_property(
+        gs,
+        "gtk-icon-theme-name",
+    );
     var buf: [128]u8 = undefined;
     const name = std.mem.printSentinel(&buf, "{s}", .{self.settings.icon_theme}, 0) catch return;
     c.g_object_set(gs, "gtk-icon-theme-name", name.ptr, @as(?*anyopaque, null));
@@ -644,7 +703,11 @@ pub fn saveSettings(self: *Ui) void {
         kept[n] = o.key;
         n += 1;
     };
-    self.settings.save(self.gpa, self.settings_path, kept[0..n]) catch |err| log.warn("saving settings: {t}", .{err});
+    self.settings.save(
+        self.gpa,
+        self.settings_path,
+        kept[0..n],
+    ) catch |err| log.warn("saving settings: {t}", .{err});
     self.settings_stamp = settings_mod.Stamp.of(self.settings_path.ptr);
     self.applyAppearance(null);
     self.applyLayout();
@@ -701,7 +764,12 @@ fn appendStyleCss(self: *Ui, w: *std.Io.Writer) std.Io.Writer.Error!void {
     const name = self.settings.style;
     if (name.len == 0) return;
     var buf: [4096]u8 = undefined;
-    const dir = std.mem.printSentinel(&buf, "{s}/styles/{s}", .{ self.config_dir, name }, 0) catch return;
+    const dir = std.mem.printSentinel(
+        &buf,
+        "{s}/styles/{s}",
+        .{ self.config_dir, name },
+        0,
+    ) catch return;
     if (index.sys.info(dir) == null) {
         const s = styles.find(name) orelse return;
         try w.print("\n/* style {s} */\n", .{name});
@@ -736,10 +804,20 @@ fn appendUserCss(self: *Ui, w: *std.Io.Writer) std.Io.Writer.Error!void {
 
 fn userCssChanged(self: *Ui) bool {
     var buf: [4096]u8 = undefined;
-    const path = std.mem.printSentinel(&buf, "{s}/style.css", .{self.config_dir}, 0) catch return false;
+    const path = std.mem.printSentinel(
+        &buf,
+        "{s}/style.css",
+        .{self.config_dir},
+        0,
+    ) catch return false;
     if (!settings_mod.Stamp.of(path.ptr).eql(self.user_css_stamp)) return true;
     if (self.settings.style.len == 0) return false;
-    const style = std.mem.printSentinel(&buf, "{s}/styles/{s}/style.css", .{ self.config_dir, self.settings.style }, 0) catch return false;
+    const style = std.mem.printSentinel(
+        &buf,
+        "{s}/styles/{s}/style.css",
+        .{ self.config_dir, self.settings.style },
+        0,
+    ) catch return false;
     return !settings_mod.Stamp.of(style.ptr).eql(self.style_css_stamp);
 }
 
@@ -748,13 +826,21 @@ pub fn preferDark(self: *Ui) bool {
     const gs = self.interface_settings orelse return true;
     const v = c.g_settings_get_string(gs, "color-scheme");
     defer c.g_free(v);
-    return !std.mem.eql(u8, std.mem.span(v), "prefer-light") and !std.mem.eql(u8, std.mem.span(v), "default");
+    return !std.mem.eql(
+        u8,
+        std.mem.span(v),
+        "prefer-light",
+    ) and !std.mem.eql(u8, std.mem.span(v), "default");
 }
 
 fn watchColorScheme(self: *Ui) void {
     const source = c.g_settings_schema_source_get_default() orelse return;
     // Looking the schema up first: g_settings_new aborts on a missing one.
-    const schema = c.g_settings_schema_source_lookup(source, "org.gnome.desktop.interface", 1) orelse return;
+    const schema = c.g_settings_schema_source_lookup(
+        source,
+        "org.gnome.desktop.interface",
+        1,
+    ) orelse return;
     defer c.g_settings_schema_unref(schema);
     if (c.g_settings_schema_has_key(schema, "color-scheme") == 0) return;
     self.interface_settings = c.g_settings_new("org.gnome.desktop.interface");
@@ -796,7 +882,9 @@ pub fn showWith(self: *Ui, view: View, text: ?[*:0]const u8) void {
     self.frec = self.db.loadFrecency(self.frec_arena.allocator(), labels.now()) catch .empty;
     if (c.gtk_widget_get_visible(self.window) == 0) {
         // Edited by hand since the last look?
-        if (!settings_mod.Stamp.of(self.settings_path.ptr).eql(self.settings_stamp)) self.reloadSettings();
+        if (!settings_mod.Stamp.of(
+            self.settings_path.ptr,
+        ).eql(self.settings_stamp)) self.reloadSettings();
         if (self.userCssChanged()) self.applyAppearance(null);
         self.scanIconDir();
         ext_view.checkReload(self);
@@ -807,7 +895,9 @@ pub fn showWith(self: *Ui, view: View, text: ?[*:0]const u8) void {
     self.nav_len = 0;
     // The choose view only means something reached from a setting, the
     // ext view from a command.
-    self.setView(if (view == .choose and self.choosing == .none) .settings else if (view == .ext and ext_view.command(self) == null) .root else view);
+    self.setView(
+        if (view == .choose and self.choosing == .none) .settings else if (view == .ext and ext_view.command(self) == null) .root else view,
+    );
     if (text) |t| c.gtk_editable_set_text(@ptrCast(self.entry), t);
     if (was_hidden) backdrop.showBackdrops(self);
     c.gtk_widget_set_visible(self.window, 1);
@@ -892,9 +982,19 @@ fn placeOnFocusedMonitor(self: *Ui) void {
         c.gtk_layer_set_anchor(w, c.GTK_LAYER_SHELL_EDGE_BOTTOM, @intFromBool(at_bottom));
         const margin: c_int = switch (pos) {
             .top, .bottom => off - shell_margin,
-            .upper_third, .center => @max(@divTrunc((geo.height - self.panelH()) * @as(c_int, if (pos == .center) 5 else 3), 10) - shell_margin, 0) + off,
+            .upper_third, .center => @max(
+                @divTrunc(
+                    (geo.height - self.panelH()) * @as(c_int, if (pos == .center) 5 else 3),
+                    10,
+                ) - shell_margin,
+                0,
+            ) + off,
         };
-        c.gtk_layer_set_margin(w, if (at_bottom) c.GTK_LAYER_SHELL_EDGE_BOTTOM else c.GTK_LAYER_SHELL_EDGE_TOP, margin);
+        c.gtk_layer_set_margin(
+            w,
+            if (at_bottom) c.GTK_LAYER_SHELL_EDGE_BOTTOM else c.GTK_LAYER_SHELL_EDGE_TOP,
+            margin,
+        );
         return;
     }
 }
@@ -958,7 +1058,10 @@ pub fn setView(self: *Ui, view: View) void {
     // Somewhere else now: the dmenu caller gets no answer.
     if (self.view == .dmenu and view != .dmenu) dmenu.finish(self, null);
     // Change Theme starts on the theme in use.
-    if (view == .themes and self.reselect_len == 0) self.setReselect("theme:{s}", .{self.settings.theme});
+    if (view == .themes and self.reselect_len == 0) self.setReselect(
+        "theme:{s}",
+        .{self.settings.theme},
+    );
     self.view = view;
     if (view == .root) self.nav_len = 0;
     if (leaving_themes) self.applyAppearance(null);
@@ -967,7 +1070,9 @@ pub fn setView(self: *Ui, view: View) void {
     _ = self.data_arena.reset(.retain_capacity);
     if (view == .ext) ext_view.enter(self);
     // Passwords are typed unseen.
-    c.gtk_text_set_visibility(@ptrCast(self.entry), @intFromBool(!(view == .input and prefs_view.isPassword(self))));
+    c.gtk_text_set_visibility(@ptrCast(self.entry), @intFromBool(
+        !(view == .input and prefs_view.isPassword(self)),
+    ));
     self.base = self.loadBase(self.data_arena.allocator());
 
     const has_detail = view == .clipboard or view == .files or view == .contents or
@@ -984,15 +1089,24 @@ pub fn setView(self: *Ui, view: View) void {
     const back_shows = view != .root and self.layout.show.back and bar.has(.back);
     c.gtk_widget_set_visible(self.back, @intFromBool(back_shows));
     // The magnifier gives way to the back arrow inside a view.
-    c.gtk_widget_set_visible(self.search_icon, @intFromBool(self.layout.show.search_icon and bar.has(.icon) and !back_shows));
+    c.gtk_widget_set_visible(self.search_icon, @intFromBool(
+        self.layout.show.search_icon and bar.has(.icon) and !back_shows,
+    ));
     c.gtk_widget_set_visible(self.detail, @intFromBool(has_detail));
     // A preview needs room: the results take the full height then.
     c.gtk_widget_set_vexpand(self.results, @intFromBool(has_detail));
     // Beside the detail pane the list takes ~40%; above it, ~half the height.
     const detail_below = self.layout.detail == .bottom;
-    c.gtk_widget_set_size_request(self.scroller, if (has_detail and !detail_below) @divTrunc(self.panelW() * 2, 5) else -1, -1);
+    c.gtk_widget_set_size_request(
+        self.scroller,
+        if (has_detail and !detail_below) @divTrunc(self.panelW() * 2, 5) else -1,
+        -1,
+    );
     c.gtk_widget_set_hexpand(self.scroller, @intFromBool(!has_detail or detail_below));
-    c.gtk_scrolled_window_set_max_content_height(@ptrCast(self.scroller), if (has_detail and detail_below) @divTrunc(self.listMaxH(), 2) else self.listMaxH());
+    c.gtk_scrolled_window_set_max_content_height(
+        @ptrCast(self.scroller),
+        if (has_detail and detail_below) @divTrunc(self.listMaxH(), 2) else self.listMaxH(),
+    );
     const keys: [4][:0]const u8 = switch (view) {
         .files => .{ "Kind", "Size", "Modified", "Where" },
         .contents => .{ "Kind", "Matches", "Modified", "Where" },
@@ -1004,13 +1118,21 @@ pub fn setView(self: *Ui, view: View) void {
     // (~30 ms measured with `lumen --stats`). Clipboard text is prose: wrap.
     const wrap = view == .clipboard or view == .ext;
     c.gtk_label_set_wrap(@ptrCast(self.detail_text), @intFromBool(wrap));
-    c.gtk_label_set_ellipsize(@ptrCast(self.detail_text), if (wrap) c.PANGO_ELLIPSIZE_NONE else c.PANGO_ELLIPSIZE_END);
+    c.gtk_label_set_ellipsize(
+        @ptrCast(self.detail_text),
+        if (wrap) c.PANGO_ELLIPSIZE_NONE else c.PANGO_ELLIPSIZE_END,
+    );
     c.gtk_widget_set_visible(self.detail_picture, 0);
     var placeholder_buf: [128]u8 = undefined;
     // lumen.layout's placeholder: "Go…" at the root, "<view>…" elsewhere.
     const custom: ?[*:0]const u8 = if (self.layout.placeholder.len == 0) null else if (view == .root)
         self.layout.placeholder.ptr
-    else if (std.mem.printSentinel(&placeholder_buf, "{s}…", .{std.mem.span(self.viewTitle())}, 0)) |t| t.ptr else |_| "…";
+    else if (std.mem.printSentinel(
+        &placeholder_buf,
+        "{s}…",
+        .{std.mem.span(self.viewTitle())},
+        0,
+    )) |t| t.ptr else |_| "…";
     c.gtk_text_set_placeholder_text(@ptrCast(self.entry), custom orelse switch (view) {
         .root => "Search for apps and commands...",
         .clipboard => "Type to filter entries...",
@@ -1028,11 +1150,18 @@ pub fn setView(self: *Ui, view: View) void {
         .form => "Search fields...",
     });
     c.gtk_label_set_text(@ptrCast(self.scope), self.viewTitle());
-    c.gtk_widget_set_visible(self.scope, @intFromBool(view != .root and self.layout.show.scope and bar.has(.scope)));
+    c.gtk_widget_set_visible(self.scope, @intFromBool(
+        view != .root and self.layout.show.scope and bar.has(.scope),
+    ));
     c.gtk_label_set_text(@ptrCast(self.footer_title), self.viewTitle());
 
     // Setting the text triggers `changed`, which refreshes.
-    if (c.gtk_editable_get_text(@ptrCast(self.entry))[0] == 0) self.refresh() else c.gtk_editable_set_text(@ptrCast(self.entry), "");
+    if (c.gtk_editable_get_text(
+        @ptrCast(self.entry),
+    )[0] == 0) self.refresh() else c.gtk_editable_set_text(
+        @ptrCast(self.entry),
+        "",
+    );
     // The rows are this base's now: nothing points into replaced app lists.
     self.apps.dropStale();
 }
@@ -1106,10 +1235,17 @@ pub fn refresh(self: *Ui) void {
     // Contents: the rows on screen are the last result's; asking the worker
     // for the new query changes nothing on screen until it answers (which
     // refreshes again). Building them again cost a frame per keystroke.
-    if (self.view == .ext and ext_view.waitingForSearch(self, std.mem.trim(u8, self.query(), " "))) return;
+    if (self.view == .ext and ext_view.waitingForSearch(
+        self,
+        std.mem.trim(u8, self.query(), " "),
+    )) return;
     if (self.view == .contents) if (self.content_search) |cs| if (self.content_result) |r| {
         const q = std.mem.trim(u8, self.query(), " ");
-        if (q.len >= 3 and r == self.shown_content and !std.mem.eql(u8, r.query, ContentSearch.clip(q))) {
+        if (q.len >= 3 and r == self.shown_content and !std.mem.eql(
+            u8,
+            r.query,
+            ContentSearch.clip(q),
+        )) {
             self.content_gen = cs.submit(q, t0);
             self.content_pending = true;
             return;
@@ -1118,7 +1254,13 @@ pub fn refresh(self: *Ui) void {
     self.search_ns = 0;
     defer {
         const total = stats.now() - t0;
-        stats.pending = .{ .t0 = t0, .view = self.view, .search = self.search_ns, .rows = total -| self.search_ns, .is_show = false };
+        stats.pending = .{
+            .t0 = t0,
+            .view = self.view,
+            .search = self.search_ns,
+            .rows = total -| self.search_ns,
+            .is_show = false,
+        };
     }
     _ = self.query_arena.reset(.retain_capacity);
     const a = self.query_arena.allocator();
@@ -1152,7 +1294,11 @@ pub fn refresh(self: *Ui) void {
                 // already here; meanwhile keep showing the last result.
                 // The worker searches the clipped query: compare with that,
                 // or a query longer than the clip never counts as answered.
-                const fresh = if (self.content_result) |r| std.mem.eql(u8, r.query, ContentSearch.clip(q)) else false;
+                const fresh = if (self.content_result) |r| std.mem.eql(
+                    u8,
+                    r.query,
+                    ContentSearch.clip(q),
+                ) else false;
                 if (!fresh) self.content_gen = cs.submit(q, t0);
                 self.content_pending = !fresh;
                 if (self.content_result) |r| {
@@ -1303,7 +1449,12 @@ fn fillRoot(self: *Ui, a: std.mem.Allocator, q: []const u8) void {
     self.search_ns += stats.now() - t_search;
     // Files from 3 letters on, right after the best few results so they are
     // visible without scrolling; the rest of the results follow.
-    const files = if (q.len >= 3 and self.settings.files_in_root) file_results.fileItems(self, a, q, 5) else &.{};
+    const files = if (q.len >= 3 and self.settings.files_in_root) file_results.fileItems(
+        self,
+        a,
+        q,
+        5,
+    ) else &.{};
     const shown = @min(hits.items.len, max_results);
     const head = if (files.len > 0) @min(shown, 6) else shown;
     for (hits.items[0..head]) |it| self.addItem(it);
@@ -1371,7 +1522,12 @@ pub fn addSection(self: *Ui, title: [:0]const u8) void {
 fn deferRow(self: *Ui, p: Pending) bool {
     if (self.grid_mode or (self.rows.items.len < eager_rows and self.pending.items.len == 0)) return false;
     self.pending.append(self.query_arena.allocator(), p) catch return false;
-    if (self.pending_idle == 0) self.pending_idle = c.g_idle_add_full(c.G_PRIORITY_LOW, &onPendingRows, self, null);
+    if (self.pending_idle == 0) self.pending_idle = c.g_idle_add_full(
+        c.G_PRIORITY_LOW,
+        &onPendingRows,
+        self,
+        null,
+    );
     return true;
 }
 
@@ -1436,7 +1592,10 @@ fn buildItemRow(self: *Ui, item_index: usize) void {
         const gap = 6 * (self.grid_columns - 1) + 24;
         const cell = widgets.gridCell(it, @divTrunc(self.panelW() - gap, self.grid_columns) - 12);
         c.gtk_flow_box_append(@ptrCast(self.grid), cell);
-        const child = c.gtk_flow_box_get_child_at_index(@ptrCast(self.grid), @intCast(item_index)) orelse return;
+        const child = c.gtk_flow_box_get_child_at_index(
+            @ptrCast(self.grid),
+            @intCast(item_index),
+        ) orelse return;
         self.rows.appendAssumeCapacity(.{ .widget = @ptrCast(child), .item = item_index });
         return;
     }
@@ -1444,7 +1603,12 @@ fn buildItemRow(self: *Ui, item_index: usize) void {
     const row = if (it.action == .calc) widgets.calcRow(it) else widgets.itemRow(it, &parts);
     c.g_object_set_data(@ptrCast(row), "lumen-row", @ptrFromInt(self.rows.items.len + 1));
     c.gtk_list_box_append(@ptrCast(self.list), row);
-    self.rows.appendAssumeCapacity(.{ .widget = row, .item = item_index, .hint = parts.hint, .accessory = parts.accessory });
+    self.rows.appendAssumeCapacity(.{
+        .widget = row,
+        .item = item_index,
+        .hint = parts.hint,
+        .accessory = parts.accessory,
+    });
 }
 
 // ----------------------------------------------------------- selection
@@ -1454,7 +1618,10 @@ pub fn nextSelectable(self: *Ui, from: ?usize, dir: i32) ?usize {
     if (self.pending.items.len > 0 and ((from == null and dir < 0) or (from != null and dir > 0 and from.? + 1 >= self.rows.items.len))) self.ensureRows();
     const n = self.rows.items.len;
     if (n == 0) return null;
-    var i: i64 = if (from) |f| @as(i64, @intCast(f)) + dir else if (dir > 0) 0 else @as(i64, @intCast(n)) - 1;
+    var i: i64 = if (from) |f| @as(
+        i64,
+        @intCast(f),
+    ) + dir else if (dir > 0) 0 else @as(i64, @intCast(n)) - 1;
     while (i >= 0 and i < n) : (i += dir) {
         if (self.rows.items[@intCast(i)].item != null) return @intCast(i);
     }
@@ -1518,7 +1685,10 @@ fn setHint(self: *Ui, text: []const u8, warn: bool) void {
     // Beside the detail pane the list is narrow: the action's name would
     // squeeze the title to a few letters, so only the key shows there.
     const narrow = c.gtk_widget_get_visible(self.detail) != 0;
-    const shown = if (warn) text else if (narrow) "↵" else self.query_arena.allocator().print("{s}  ↵", .{text}) catch return;
+    const shown = if (warn) text else if (narrow) "↵" else self.query_arena.allocator().print(
+        "{s}  ↵",
+        .{text},
+    ) catch return;
     const z = self.query_arena.allocator().dupeSentinel(u8, shown, 0) catch return;
     c.gtk_label_set_text(@ptrCast(h), z.ptr);
     if (warn) c.gtk_widget_add_css_class(h, "warn") else c.gtk_widget_remove_css_class(h, "warn");
@@ -1528,10 +1698,19 @@ fn setHint(self: *Ui, text: []const u8, warn: bool) void {
 fn scrollTo(self: *Ui, row: *c.GtkWidget) void {
     var b: c.graphene_rect_t = undefined;
     // A row just added has no place yet: once the list's layout is done.
-    if (c.gtk_widget_compute_bounds(row, if (self.grid_mode) self.grid else self.list, &b) == 0 or b.size.height == 0) {
+    if (c.gtk_widget_compute_bounds(
+        row,
+        if (self.grid_mode) self.grid else self.list,
+        &b,
+    ) == 0 or b.size.height == 0) {
         if (self.scroll_tick == 0) {
             self.scroll_tries = 0;
-            self.scroll_tick = c.gtk_widget_add_tick_callback(self.scroller, &onScrollTick, self, null);
+            self.scroll_tick = c.gtk_widget_add_tick_callback(
+                self.scroller,
+                &onScrollTick,
+                self,
+                null,
+            );
         }
         return;
     }
@@ -1542,7 +1721,13 @@ fn scrollTo(self: *Ui, row: *c.GtkWidget) void {
     const bottom: f64 = top + b.size.height;
     // Keep a section header above the first item visible, and the selection
     // clear of the fade at the bottom edge (style.css, undershoot).
-    if (top < value + 4) c.gtk_adjustment_set_value(adj, @max(top - 30, 0)) else if (bottom > value + page - 20) c.gtk_adjustment_set_value(adj, bottom - page + 20);
+    if (top < value + 4) c.gtk_adjustment_set_value(
+        adj,
+        @max(top - 30, 0),
+    ) else if (bottom > value + page - 20) c.gtk_adjustment_set_value(
+        adj,
+        bottom - page + 20,
+    );
 }
 
 fn onScrollTick(_: ?*c.GtkWidget, _: ?*c.GdkFrameClock, data: ?*anyopaque) callconv(.c) c.gboolean {
@@ -1558,7 +1743,11 @@ fn onScrollTick(_: ?*c.GtkWidget, _: ?*c.GdkFrameClock, data: ?*anyopaque) callc
     }
     const row = self.rows.items[ri].widget;
     var b: c.graphene_rect_t = undefined;
-    const placed = c.gtk_widget_compute_bounds(row, if (self.grid_mode) self.grid else self.list, &b) != 0 and b.size.height > 0;
+    const placed = c.gtk_widget_compute_bounds(
+        row,
+        if (self.grid_mode) self.grid else self.list,
+        &b,
+    ) != 0 and b.size.height > 0;
     if (!placed and self.scroll_tries < 10) return 1;
     self.scroll_tick = 0;
     if (placed) self.scrollTo(row);
@@ -1640,7 +1829,11 @@ pub fn performEntry(self: *Ui, e: item_mod.Entry) void {
 pub fn needsConfirm(self: *Ui, it: *const Item) bool {
     if (std.mem.eql(u8, self.confirm_key, it.key)) return false;
     self.confirm_key = it.key;
-    self.primary = self.query_arena.allocator().printSentinel("Press ↵ again to {s}", .{it.title}, 0) catch return true;
+    self.primary = self.query_arena.allocator().printSentinel(
+        "Press ↵ again to {s}",
+        .{it.title},
+        0,
+    ) catch return true;
     self.setHint(self.primary, true);
     return true;
 }
@@ -1662,9 +1855,18 @@ pub fn perform(self: *Ui, op: item_mod.Op) void {
     if (it.confirm and (op == .run or op == .open) and self.needsConfirm(it)) return;
     self.closePanel();
     // Ranking only (Db logs failures): the action goes ahead regardless.
-    if (it.key.len > 0 and it.action != .setting and (op == .run or op == .open)) self.db.recordUse(it.key, labels.now()) catch {};
-    if (it.action == .ext_command and (op == .run or op == .open)) return ext_view.activate(self, it.action.ext_command.index);
-    if (it.action == .pick) return if (op == .pick_typed) dmenu.chooseTyped(self) else dmenu.choose(self, it.action.pick.index);
+    if (it.key.len > 0 and it.action != .setting and (op == .run or op == .open)) self.db.recordUse(
+        it.key,
+        labels.now(),
+    ) catch {};
+    if (it.action == .ext_command and (op == .run or op == .open)) return ext_view.activate(
+        self,
+        it.action.ext_command.index,
+    );
+    if (it.action == .pick) return if (op == .pick_typed) dmenu.chooseTyped(self) else dmenu.choose(
+        self,
+        it.action.pick.index,
+    );
 
     const outcome = run.perform(self.actionCtx(), it, op);
     switch (outcome) {
@@ -1697,7 +1899,11 @@ fn onRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, data: ?*anyopaque) ca
     self.performEntry(item_mod.actionsFor(it)[0]);
 }
 
-fn onGridActivated(_: *c.GtkFlowBox, child: *c.GtkFlowBoxChild, data: ?*anyopaque) callconv(.c) void {
+fn onGridActivated(
+    _: *c.GtkFlowBox,
+    child: *c.GtkFlowBoxChild,
+    data: ?*anyopaque,
+) callconv(.c) void {
     const self: *Ui = @ptrCast(@alignCast(data));
     const i = c.gtk_flow_box_child_get_index(child);
     if (i < 0 or i >= self.rows.items.len) return;
@@ -1706,13 +1912,23 @@ fn onGridActivated(_: *c.GtkFlowBox, child: *c.GtkFlowBoxChild, data: ?*anyopaqu
     self.performEntry(item_mod.actionsFor(it)[0]);
 }
 
-fn onPanelRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, data: ?*anyopaque) callconv(.c) void {
+fn onPanelRowActivated(
+    _: *c.GtkListBox,
+    row: *c.GtkListBoxRow,
+    data: ?*anyopaque,
+) callconv(.c) void {
     const self: *Ui = @ptrCast(@alignCast(data));
     const i: usize = @intCast(c.gtk_list_box_row_get_index(row));
     if (i < self.panel_entries.len) self.performEntry(self.panel_entries[i]);
 }
 
-fn onBackClicked(_: *c.GtkEventController, _: c_int, _: f64, _: f64, data: ?*anyopaque) callconv(.c) void {
+fn onBackClicked(
+    _: *c.GtkEventController,
+    _: c_int,
+    _: f64,
+    _: f64,
+    data: ?*anyopaque,
+) callconv(.c) void {
     const self: *Ui = @ptrCast(@alignCast(data));
     if (self.view != .root) self.goBack();
     _ = c.gtk_widget_grab_focus(self.entry);
@@ -1722,7 +1938,11 @@ fn onBackClicked(_: *c.GtkEventController, _: c_int, _: f64, _: f64, data: ?*any
 /// parsing) for the burst. Hidden, the next show builds its view anew.
 fn onAppsChanged(_: *c.GAppInfoMonitor, data: ?*anyopaque) callconv(.c) void {
     const self: *Ui = @ptrCast(@alignCast(data));
-    if (self.apps_reload_timer == 0) self.apps_reload_timer = c.g_timeout_add(500, &reloadApps, self);
+    if (self.apps_reload_timer == 0) self.apps_reload_timer = c.g_timeout_add(
+        500,
+        &reloadApps,
+        self,
+    );
 }
 
 fn reloadApps(data: ?*anyopaque) callconv(.c) c.gboolean {
@@ -1736,7 +1956,13 @@ fn reloadApps(data: ?*anyopaque) callconv(.c) c.gboolean {
     return 0;
 }
 
-fn onKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, state: c.GdkModifierType, data: ?*anyopaque) callconv(.c) c.gboolean {
+fn onKey(
+    _: *c.GtkEventControllerKey,
+    keyval: c_uint,
+    _: c_uint,
+    state: c.GdkModifierType,
+    data: ?*anyopaque,
+) callconv(.c) c.gboolean {
     const self: *Ui = @ptrCast(@alignCast(data));
     return keyboard.handleKey(self, keyval, state);
 }
@@ -1747,10 +1973,20 @@ fn onKey(_: *c.GtkEventControllerKey, keyval: c_uint, _: c_uint, state: c.GdkMod
 pub fn injectKey(self: *Ui, name: []const u8) bool {
     const keys = [_]struct { []const u8, c_uint, c.GdkModifierType }{
         .{ "down", c.GDK_KEY_Down, 0 },                 .{ "up", c.GDK_KEY_Up, 0 },
-        .{ "enter", c.GDK_KEY_Return, 0 },              .{ "ctrl+enter", c.GDK_KEY_Return, c.GDK_CONTROL_MASK },
+        .{ "enter", c.GDK_KEY_Return, 0 },
+        .{
+            "ctrl+enter",
+            c.GDK_KEY_Return,
+            c.GDK_CONTROL_MASK,
+        },
         .{ "ctrl+k", c.GDK_KEY_k, c.GDK_CONTROL_MASK }, .{ "escape", c.GDK_KEY_Escape, 0 },
         .{ "backspace", c.GDK_KEY_BackSpace, 0 },       .{ "pagedown", c.GDK_KEY_Page_Down, 0 },
-        .{ "pageup", c.GDK_KEY_Page_Up, 0 },            .{ "ctrl+x", c.GDK_KEY_x, c.GDK_CONTROL_MASK },
+        .{ "pageup", c.GDK_KEY_Page_Up, 0 },
+        .{
+            "ctrl+x",
+            c.GDK_KEY_x,
+            c.GDK_CONTROL_MASK,
+        },
         .{ "ctrl+o", c.GDK_KEY_o, c.GDK_CONTROL_MASK }, .{ "left", c.GDK_KEY_Left, 0 },
         .{ "right", c.GDK_KEY_Right, 0 },
     };
@@ -1766,24 +2002,42 @@ pub fn injectKey(self: *Ui, name: []const u8) bool {
 
 /// `lumen --dump`: what the window shows, as text (for end-to-end tests).
 /// Caller owns the result, allocated with `gpa`.
-pub fn dump(self: *Ui, gpa: std.mem.Allocator) (std.Io.Writer.Error || std.mem.Allocator.Error)![:0]u8 {
+pub fn dump(
+    self: *Ui,
+    gpa: std.mem.Allocator,
+) (std.Io.Writer.Error || std.mem.Allocator.Error)![:0]u8 {
     var scratch_state: std.heap.ArenaAllocator = .init(gpa);
     defer scratch_state.deinit();
     const a = scratch_state.allocator();
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
     const w = &out.writer;
-    try w.print("view: {t}\nvisible: {}\nquery: {s}\n", .{ self.view, c.gtk_widget_get_visible(self.window) != 0, self.query() });
+    try w.print("view: {t}\nvisible: {}\nquery: {s}\n", .{
+        self.view,
+        c.gtk_widget_get_visible(self.window) != 0,
+        self.query(),
+    });
     try w.print("title: {s}\nprimary: {s}\n", .{ self.viewTitle(), self.primary });
     const lay = self.layout;
     try w.print("style: {s}\n", .{if (self.settings.style.len > 0) self.settings.style else "-"});
-    try w.print("layout: {d}x{d} panels={t} search={t} detail={t} rows={s} footer={}", .{ self.panelW(), self.panelH(), lay.panels, lay.search, lay.detail, if (lay.rows == .inline_) "inline" else "stacked", lay.footer });
+    try w.print("layout: {d}x{d} panels={t} search={t} detail={t} rows={s} footer={}", .{
+        self.panelW(),
+        self.panelH(),
+        lay.panels,
+        lay.search,
+        lay.detail,
+        if (lay.rows == .inline_) "inline" else "stacked",
+        lay.footer,
+    });
     try w.writeAll(" bar=");
     for (lay.searchbar.slice(), 0..) |p, i| try w.print("{s}{t}", .{ if (i > 0) "," else "", p });
     try w.writeAll(" row=");
     for (lay.row.slice(), 0..) |p, i| try w.print("{s}{t}", .{ if (i > 0) "," else "", p });
     try w.print(" prompt={s} placeholder={s}\n", .{ lay.prompt, lay.placeholder });
-    if (lay.footer) try w.print("footer: {s} | {s}\n", .{ c.gtk_label_get_text(@ptrCast(self.footer_title)), c.gtk_label_get_text(@ptrCast(self.footer_action)) });
+    if (lay.footer) try w.print("footer: {s} | {s}\n", .{
+        c.gtk_label_get_text(@ptrCast(self.footer_title)),
+        c.gtk_label_get_text(@ptrCast(self.footer_action)),
+    });
     try w.print("rows:\n", .{});
     self.ensureRows();
     if (self.rows.items.len == 0) try w.print("  (empty) {s}\n", .{self.emptyText(a)});
@@ -1814,18 +2068,27 @@ pub fn dump(self: *Ui, gpa: std.mem.Allocator) (std.Io.Writer.Error || std.mem.A
         try w.print("detail:\n", .{});
         if (self.view == .ext) {
             const text = std.mem.span(c.gtk_label_get_text(@ptrCast(self.detail_text)));
-            try w.print("  text = {s}\n", .{text[0 .. std.mem.findScalar(u8, text, '\n') orelse text.len]});
+            try w.print("  text = {s}\n", .{
+                text[0 .. std.mem.findScalar(u8, text, '\n') orelse text.len],
+            });
         }
         if (c.gtk_widget_get_visible(self.detail_meta) != 0) {
             for (self.meta_lines, self.meta_keys, self.meta_values) |l, k, v| {
                 if (c.gtk_widget_get_visible(l) == 0) continue;
-                try w.print("  {s} = {s}\n", .{ c.gtk_label_get_text(@ptrCast(k)), c.gtk_label_get_text(@ptrCast(v)) });
+                try w.print("  {s} = {s}\n", .{
+                    c.gtk_label_get_text(@ptrCast(k)),
+                    c.gtk_label_get_text(@ptrCast(v)),
+                });
             }
         }
     }
     if (self.panel_open) {
         try w.print("panel:\n", .{});
-        for (self.panel_entries, 0..) |e, i| try w.print("  {s} {s} [{s}]\n", .{ if (i == self.panel_selected) ">" else " ", e.label, e.keys });
+        for (self.panel_entries, 0..) |e, i| try w.print("  {s} {s} [{s}]\n", .{
+            if (i == self.panel_selected) ">" else " ",
+            e.label,
+            e.keys,
+        });
     }
     return out.toOwnedSliceSentinel(0);
 }
@@ -1837,7 +2100,11 @@ fn emptyText(self: *Ui, a: std.mem.Allocator) [:0]const u8 {
     if (self.view == .contents and q.len < 3) return file_results.contentsHint(self, a, q.len);
     if (self.view == .contents and self.content_pending) return "Searching...";
     if (self.view == .contents) if (self.content_result) |r| if (r.err) |err|
-        return a.printSentinel("Content search failed ({t})", .{err}, 0) catch "Content search failed";
+        return a.printSentinel(
+            "Content search failed ({t})",
+            .{err},
+            0,
+        ) catch "Content search failed";
     if (self.view == .clipboard and q.len == 0 and !self.settings.clipboard) return "Clipboard history is off: turn it on in Settings";
     if (self.view == .ext) return ext_view.emptyText(self, a, q);
     if (self.view == .dmenu) return dmenu.emptyText(self);

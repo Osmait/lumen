@@ -45,7 +45,15 @@ pub fn settingsCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
             keywords: []const u8 = "",
         };
         fn row(al: std.mem.Allocator, r: Row) Item {
-            return .{ .key = settingKey(al, r.name), .section = r.section, .title = r.title, .accessory = r.value, .icon = .{ .tile = .{ .name = r.icon, .color = r.color } }, .action = .{ .setting = r.action }, .keywords = r.keywords };
+            return .{
+                .key = settingKey(al, r.name),
+                .section = r.section,
+                .title = r.title,
+                .accessory = r.value,
+                .icon = .{ .tile = .{ .name = r.icon, .color = r.color } },
+                .action = .{ .setting = r.action },
+                .keywords = r.keywords,
+            };
         }
         fn onOff(b: bool) [:0]const u8 {
             return if (b) "On" else "Off";
@@ -56,26 +64,179 @@ pub fn settingsCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
             return .{ .choose = ch };
         }
     }.f;
-    out.append(a, S.row(a, .{ .section = "Appearance", .name = "theme", .title = "Theme", .value = themes.displayName(a, st.theme, ui.preferDark()), .icon = "applications-graphics-symbolic", .color = .purple, .action = .{ .go = .themes }, .keywords = "color dark light appearance" })) catch {};
-    out.append(a, S.row(a, .{ .section = "Appearance", .name = "text_size", .title = "Text Size", .value = choiceLabel(ui, a, .text_size), .icon = "preferences-desktop-font-symbolic", .color = .purple, .action = choose(.text_size), .keywords = "font scale zoom bigger smaller" })) catch {};
-    out.append(a, S.row(a, .{ .section = "Appearance", .name = "opacity", .title = "Window Opacity", .value = choiceLabel(ui, a, .opacity), .icon = "display-brightness-symbolic", .color = .purple, .action = choose(.opacity), .keywords = "transparency translucent background" })) catch {};
-    out.append(a, S.row(a, .{ .section = "Appearance", .name = "position", .title = "Window Position", .value = choiceLabel(ui, a, .position), .icon = "preferences-desktop-display-symbolic", .color = .purple, .action = choose(.position), .keywords = "center top place" })) catch {};
-    out.append(a, S.row(a, .{ .section = "Appearance", .name = "icon_theme", .title = "Icon Theme", .value = choiceLabel(ui, a, .icon_theme), .icon = "preferences-desktop-icons-symbolic", .color = .purple, .action = choose(.icon_theme), .keywords = "icons pack papirus adwaita" })) catch {};
-    out.append(a, S.row(a, .{ .section = "Layout", .name = "width", .title = "Window Width", .value = choiceLabel(ui, a, .width), .icon = "view-dual-symbolic", .color = .green, .action = choose(.width), .keywords = "size wide narrow layout" })) catch {};
-    out.append(a, S.row(a, .{ .section = "Layout", .name = "height", .title = "Window Height", .value = choiceLabel(ui, a, .height), .icon = "view-list-symbolic", .color = .green, .action = choose(.height), .keywords = "size tall short rows results layout" })) catch {};
-    out.append(a, S.row(a, .{ .section = "Layout", .name = "density", .title = "Density", .value = choiceLabel(ui, a, .density), .icon = "view-grid-symbolic", .color = .green, .action = choose(.density), .keywords = "compact comfortable spacing icons rows layout" })) catch {};
-    out.append(a, S.row(a, .{ .section = "Search", .name = "files_in_root", .title = "Show Files in Main Search", .value = S.onOff(st.files_in_root), .icon = "folder-saved-search-symbolic", .color = .orange, .action = .{ .toggle = .files_in_root }, .keywords = "results" })) catch {};
-    out.append(a, S.row(a, .{ .section = "Search", .name = "suggestions", .title = "Show Suggestions", .value = S.onOff(st.suggestions), .icon = "starred-symbolic", .color = .orange, .action = .{ .toggle = .suggestions }, .keywords = "frecency recent most used" })) catch {};
-    out.append(a, S.row(a, .{ .section = "Clipboard", .name = "clipboard", .title = "Clipboard History", .value = S.onOff(st.clipboard), .icon = "edit-paste-symbolic", .color = .red, .action = .{ .toggle = .clipboard }, .keywords = "copy paste record" })) catch {};
-    out.append(a, S.row(a, .{ .section = "Clipboard", .name = "clipboard_keep", .title = "Clipboard Entries to Keep", .value = choiceLabel(ui, a, .clipboard_keep), .icon = "document-open-recent-symbolic", .color = .red, .action = choose(.clipboard_keep), .keywords = "history size limit" })) catch {};
-    out.append(a, S.row(a, .{ .section = "Apps", .name = "default_apps", .title = "Default Apps", .value = defaultAppsSummary(ui, a), .icon = "applications-system-symbolic", .color = .blue, .action = .{ .go = .default_apps }, .keywords = "open with file types associations mime" })) catch {};
-    out.append(a, S.row(a, .{ .section = "Apps", .name = "terminal", .title = "Terminal", .value = choiceLabel(ui, a, .terminal), .icon = "utilities-terminal-symbolic", .color = .blue, .action = choose(.terminal), .keywords = "console shell emulator" })) catch {};
-    out.append(a, S.row(a, .{ .section = "Apps", .name = "editor", .title = "Editor for Open at Line", .value = choiceLabel(ui, a, .editor), .icon = "accessories-text-editor-symbolic", .color = .blue, .action = choose(.editor), .keywords = "code vim nvim" })) catch {};
+    out.append(a, S.row(a, .{
+        .section = "Appearance",
+        .name = "theme",
+        .title = "Theme",
+        .value = themes.displayName(a, st.theme, ui.preferDark()),
+        .icon = "applications-graphics-symbolic",
+        .color = .purple,
+        .action = .{ .go = .themes },
+        .keywords = "color dark light appearance",
+    })) catch {};
+    out.append(a, S.row(a, .{
+        .section = "Appearance",
+        .name = "text_size",
+        .title = "Text Size",
+        .value = choiceLabel(ui, a, .text_size),
+        .icon = "preferences-desktop-font-symbolic",
+        .color = .purple,
+        .action = choose(.text_size),
+        .keywords = "font scale zoom bigger smaller",
+    })) catch {};
+    out.append(a, S.row(a, .{
+        .section = "Appearance",
+        .name = "opacity",
+        .title = "Window Opacity",
+        .value = choiceLabel(ui, a, .opacity),
+        .icon = "display-brightness-symbolic",
+        .color = .purple,
+        .action = choose(.opacity),
+        .keywords = "transparency translucent background",
+    })) catch {};
+    out.append(a, S.row(a, .{
+        .section = "Appearance",
+        .name = "position",
+        .title = "Window Position",
+        .value = choiceLabel(ui, a, .position),
+        .icon = "preferences-desktop-display-symbolic",
+        .color = .purple,
+        .action = choose(.position),
+        .keywords = "center top place",
+    })) catch {};
+    out.append(a, S.row(a, .{
+        .section = "Appearance",
+        .name = "icon_theme",
+        .title = "Icon Theme",
+        .value = choiceLabel(ui, a, .icon_theme),
+        .icon = "preferences-desktop-icons-symbolic",
+        .color = .purple,
+        .action = choose(.icon_theme),
+        .keywords = "icons pack papirus adwaita",
+    })) catch {};
+    out.append(a, S.row(a, .{
+        .section = "Layout",
+        .name = "width",
+        .title = "Window Width",
+        .value = choiceLabel(ui, a, .width),
+        .icon = "view-dual-symbolic",
+        .color = .green,
+        .action = choose(.width),
+        .keywords = "size wide narrow layout",
+    })) catch {};
+    out.append(a, S.row(a, .{
+        .section = "Layout",
+        .name = "height",
+        .title = "Window Height",
+        .value = choiceLabel(ui, a, .height),
+        .icon = "view-list-symbolic",
+        .color = .green,
+        .action = choose(.height),
+        .keywords = "size tall short rows results layout",
+    })) catch {};
+    out.append(a, S.row(a, .{
+        .section = "Layout",
+        .name = "density",
+        .title = "Density",
+        .value = choiceLabel(ui, a, .density),
+        .icon = "view-grid-symbolic",
+        .color = .green,
+        .action = choose(.density),
+        .keywords = "compact comfortable spacing icons rows layout",
+    })) catch {};
+    out.append(a, S.row(a, .{
+        .section = "Search",
+        .name = "files_in_root",
+        .title = "Show Files in Main Search",
+        .value = S.onOff(st.files_in_root),
+        .icon = "folder-saved-search-symbolic",
+        .color = .orange,
+        .action = .{ .toggle = .files_in_root },
+        .keywords = "results",
+    })) catch {};
+    out.append(a, S.row(a, .{
+        .section = "Search",
+        .name = "suggestions",
+        .title = "Show Suggestions",
+        .value = S.onOff(st.suggestions),
+        .icon = "starred-symbolic",
+        .color = .orange,
+        .action = .{ .toggle = .suggestions },
+        .keywords = "frecency recent most used",
+    })) catch {};
+    out.append(a, S.row(a, .{
+        .section = "Clipboard",
+        .name = "clipboard",
+        .title = "Clipboard History",
+        .value = S.onOff(st.clipboard),
+        .icon = "edit-paste-symbolic",
+        .color = .red,
+        .action = .{ .toggle = .clipboard },
+        .keywords = "copy paste record",
+    })) catch {};
+    out.append(a, S.row(a, .{
+        .section = "Clipboard",
+        .name = "clipboard_keep",
+        .title = "Clipboard Entries to Keep",
+        .value = choiceLabel(ui, a, .clipboard_keep),
+        .icon = "document-open-recent-symbolic",
+        .color = .red,
+        .action = choose(.clipboard_keep),
+        .keywords = "history size limit",
+    })) catch {};
+    out.append(a, S.row(a, .{
+        .section = "Apps",
+        .name = "default_apps",
+        .title = "Default Apps",
+        .value = defaultAppsSummary(ui, a),
+        .icon = "applications-system-symbolic",
+        .color = .blue,
+        .action = .{ .go = .default_apps },
+        .keywords = "open with file types associations mime",
+    })) catch {};
+    out.append(a, S.row(a, .{
+        .section = "Apps",
+        .name = "terminal",
+        .title = "Terminal",
+        .value = choiceLabel(ui, a, .terminal),
+        .icon = "utilities-terminal-symbolic",
+        .color = .blue,
+        .action = choose(.terminal),
+        .keywords = "console shell emulator",
+    })) catch {};
+    out.append(a, S.row(a, .{
+        .section = "Apps",
+        .name = "editor",
+        .title = "Editor for Open at Line",
+        .value = choiceLabel(ui, a, .editor),
+        .icon = "accessories-text-editor-symbolic",
+        .color = .blue,
+        .action = choose(.editor),
+        .keywords = "code vim nvim",
+    })) catch {};
     prefs_view.extensionRows(ui, a, &out);
-    var file_item = S.row(a, .{ .section = "Lumen", .name = "open_file", .title = "Open Settings File", .value = "", .icon = "document-edit-symbolic", .color = .gray, .action = .open_file, .keywords = "config edit text" });
+    var file_item = S.row(a, .{
+        .section = "Lumen",
+        .name = "open_file",
+        .title = "Open Settings File",
+        .value = "",
+        .icon = "document-edit-symbolic",
+        .color = .gray,
+        .action = .open_file,
+        .keywords = "config edit text",
+    });
     file_item.subtitle = labels.homeRelative(a, ui.settings_path);
     out.append(a, file_item) catch {};
-    var reset = S.row(a, .{ .section = "Lumen", .name = "reset", .title = "Reset All Settings", .value = "", .icon = "edit-undo-symbolic", .color = .gray, .action = .reset, .keywords = "defaults restore" });
+    var reset = S.row(a, .{
+        .section = "Lumen",
+        .name = "reset",
+        .title = "Reset All Settings",
+        .value = "",
+        .icon = "edit-undo-symbolic",
+        .color = .gray,
+        .action = .reset,
+        .keywords = "defaults restore",
+    });
     reset.confirm = true;
     out.append(a, reset) catch {};
     // What init.lua fixes cannot be changed here.
@@ -101,13 +262,42 @@ const Option = struct { value: [:0]const u8, label: [:0]const u8 };
 pub fn choiceOptions(ui: *Ui, a: std.mem.Allocator, ch: settings_mod.Choice) []const Option {
     _ = ui;
     return switch (ch) {
-        .text_size => &.{ .{ .value = "small", .label = "Small" }, .{ .value = "default", .label = "Default" }, .{ .value = "large", .label = "Large" } },
-        .position => &.{ .{ .value = "upper_third", .label = "Upper Third" }, .{ .value = "center", .label = "Center" } },
-        .width => &.{ .{ .value = "narrow", .label = "Narrow" }, .{ .value = "default", .label = "Default" }, .{ .value = "wide", .label = "Wide" } },
-        .height => &.{ .{ .value = "short", .label = "Short" }, .{ .value = "default", .label = "Default" }, .{ .value = "tall", .label = "Tall" } },
-        .density => &.{ .{ .value = "compact", .label = "Compact" }, .{ .value = "default", .label = "Default" }, .{ .value = "comfortable", .label = "Comfortable" } },
-        .opacity => &.{ .{ .value = "100", .label = "100% (Opaque)" }, .{ .value = "97", .label = "97%" }, .{ .value = "90", .label = "90%" }, .{ .value = "80", .label = "80%" } },
-        .clipboard_keep => &.{ .{ .value = "100", .label = "100 entries" }, .{ .value = "500", .label = "500 entries" }, .{ .value = "1000", .label = "1,000 entries" }, .{ .value = "5000", .label = "5,000 entries" } },
+        .text_size => &.{
+            .{ .value = "small", .label = "Small" },
+            .{ .value = "default", .label = "Default" },
+            .{ .value = "large", .label = "Large" },
+        },
+        .position => &.{ .{ .value = "upper_third", .label = "Upper Third" }, .{
+            .value = "center",
+            .label = "Center",
+        } },
+        .width => &.{
+            .{ .value = "narrow", .label = "Narrow" },
+            .{ .value = "default", .label = "Default" },
+            .{ .value = "wide", .label = "Wide" },
+        },
+        .height => &.{
+            .{ .value = "short", .label = "Short" },
+            .{ .value = "default", .label = "Default" },
+            .{ .value = "tall", .label = "Tall" },
+        },
+        .density => &.{
+            .{ .value = "compact", .label = "Compact" },
+            .{ .value = "default", .label = "Default" },
+            .{ .value = "comfortable", .label = "Comfortable" },
+        },
+        .opacity => &.{
+            .{ .value = "100", .label = "100% (Opaque)" },
+            .{ .value = "97", .label = "97%" },
+            .{ .value = "90", .label = "90%" },
+            .{ .value = "80", .label = "80%" },
+        },
+        .clipboard_keep => &.{
+            .{ .value = "100", .label = "100 entries" },
+            .{ .value = "500", .label = "500 entries" },
+            .{ .value = "1000", .label = "1,000 entries" },
+            .{ .value = "5000", .label = "5,000 entries" },
+        },
         .icon_theme => iconThemes(a),
         .terminal, .editor => blk: {
             var out: std.ArrayList(Option) = .empty;
@@ -118,8 +308,14 @@ pub fn choiceOptions(ui: *Ui, a: std.mem.Allocator, ch: settings_mod.Choice) []c
             for (list) |e| if (std.mem.eql(u8, e[0], auto_base)) {
                 auto_name = e[1];
             };
-            out.append(a, .{ .value = "", .label = a.printSentinel("Automatic ({s})", .{auto_name}, 0) catch "Automatic" }) catch {};
-            for (list) |e| if (proc.have(e[0])) out.append(a, .{ .value = e[0], .label = e[1] }) catch {};
+            out.append(a, .{
+                .value = "",
+                .label = a.printSentinel("Automatic ({s})", .{auto_name}, 0) catch "Automatic",
+            }) catch {};
+            for (list) |e| if (proc.have(e[0])) out.append(a, .{
+                .value = e[0],
+                .label = e[1],
+            }) catch {};
             break :blk out.items;
         },
     };
@@ -134,9 +330,15 @@ fn iconThemes(a: std.mem.Allocator) []const Option {
     var roots: std.ArrayList([]const u8) = .empty;
     const home = std.mem.span(c.g_get_home_dir());
     roots.append(a, a.print("{s}/.icons", .{home}) catch "") catch {};
-    roots.append(a, a.print("{s}/icons", .{std.mem.span(c.g_get_user_data_dir())}) catch "") catch {};
+    roots.append(
+        a,
+        a.print("{s}/icons", .{std.mem.span(c.g_get_user_data_dir())}) catch "",
+    ) catch {};
     var dirs = c.g_get_system_data_dirs();
-    while (dirs[0]) |d| : (dirs += 1) roots.append(a, a.print("{s}/icons", .{std.mem.span(d)}) catch "") catch {};
+    while (dirs[0]) |d| : (dirs += 1) roots.append(
+        a,
+        a.print("{s}/icons", .{std.mem.span(d)}) catch "",
+    ) catch {};
     for (roots.items) |root| {
         const rz = a.dupeSentinel(u8, root, 0) catch continue;
         const dir = c.g_dir_open(rz.ptr, 0, null) orelse continue;
@@ -147,7 +349,11 @@ fn iconThemes(a: std.mem.Allocator) []const Option {
             var dup = false;
             for (out.items) |o| dup = dup or std.mem.eql(u8, o.value, name);
             if (dup) continue;
-            const index_path = a.printSentinel("{s}/{s}/index.theme", .{ root, name }, 0) catch continue;
+            const index_path = a.printSentinel(
+                "{s}/{s}/index.theme",
+                .{ root, name },
+                0,
+            ) catch continue;
             var buf: [8192]u8 = undefined;
             const text = index.sys.readHead(index_path.ptr, &buf);
             if (std.mem.find(u8, text, "\nDirectories=") == null) continue;
@@ -203,7 +409,9 @@ pub fn setChoosing(ui: *Ui, next: Ui.Choosing) void {
         .setting => |ch| w.writeAll(chooseTitle(ch)) catch {},
         .kind => |k| w.print("Open {s} With", .{k.title()}) catch {},
         .file => |f| w.print("Open {s} With", .{std.Io.Dir.path.basename(f.path)}) catch {},
-        .pref => |i| if (ui.ext_registry) |reg| if (i < reg.prefs.len) w.writeAll(reg.prefs[i].title) catch {},
+        .pref => |i| if (ui.ext_registry) |reg| if (i < reg.prefs.len) w.writeAll(
+            reg.prefs[i].title,
+        ) catch {},
         .field => |i| if (form_view.field(ui, i)) |f| w.writeAll(f.title) catch {},
     }
     const n = labels.validUtf8Prefix(w.buffered()).len;
@@ -227,7 +435,14 @@ pub fn chooseCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
                 }) catch break;
             }
         },
-        .kind => |k| appOptions(ui, a, &out, k.sampleMime(), ui.settings.open_with.get(@tagName(k)), false),
+        .kind => |k| appOptions(
+            ui,
+            a,
+            &out,
+            k.sampleMime(),
+            ui.settings.open_with.get(@tagName(k)),
+            false,
+        ),
         .file => |f| appOptions(ui, a, &out, f.mime, null, true),
         .pref => |i| prefs_view.choiceCandidates(ui, a, &out, i),
         .field => |i| form_view.choiceCandidates(ui, a, &out, i),
@@ -238,11 +453,22 @@ pub fn chooseCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
 /// Apps for `mime`: those that declare it first, then every other app (any
 /// app can be told to open anything). `open_now`: rows open the file
 /// instead of saving a choice.
-pub fn appOptions(self: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item), mime: [:0]const u8, current: ?[]const u8, open_now: bool) void {
+pub fn appOptions(
+    self: *Ui,
+    a: std.mem.Allocator,
+    out: *std.ArrayList(Item),
+    mime: [:0]const u8,
+    current: ?[]const u8,
+    open_now: bool,
+) void {
     if (!open_now) {
         const def = c.g_app_info_get_default_for_type(mime, 0);
         defer if (def) |d| c.g_object_unref(d);
-        const name: [:0]const u8 = if (def) |d| (a.dupeSentinel(u8, std.mem.span(c.g_app_info_get_display_name(d) orelse ""), 0) catch "") else "none set";
+        const name: [:0]const u8 = if (def) |d| (a.dupeSentinel(
+            u8,
+            std.mem.span(c.g_app_info_get_display_name(d) orelse ""),
+            0,
+        ) catch "") else "none set";
         out.append(a, .{
             .key = "pick:",
             .title = "System Default",
@@ -258,7 +484,9 @@ pub fn appOptions(self: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item), mi
         var node: ?*c.GList = list;
         while (node) |n| : (node = n.next) {
             const info: *c.GAppInfo = @ptrCast(@alignCast(n.data));
-            const id = a.dupe(u8, std.mem.span(c.g_app_info_get_id(info) orelse continue)) catch continue;
+            const id = a.dupe(u8, std.mem.span(
+                c.g_app_info_get_id(info) orelse continue,
+            )) catch continue;
             declared.put(a, id, {}) catch {};
         }
     }
@@ -301,16 +529,26 @@ pub fn defaultAppsCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
     for (std.enums.values(Kind)) |k| {
         const chosen = ui.settings.open_with.get(@tagName(k));
         const accessory: [:0]const u8 = if (chosen) |id| appName(ui, a, id) else blk: {
-            const def = c.g_app_info_get_default_for_type(k.sampleMime(), 0) orelse break :blk "System Default";
+            const def = c.g_app_info_get_default_for_type(
+                k.sampleMime(),
+                0,
+            ) orelse break :blk "System Default";
             defer c.g_object_unref(def);
-            break :blk a.printSentinel("System: {s}", .{c.g_app_info_get_display_name(def) orelse ""}, 0) catch "";
+            break :blk a.printSentinel(
+                "System: {s}",
+                .{c.g_app_info_get_display_name(def) orelse ""},
+                0,
+            ) catch "";
         };
         out.append(a, .{
             .key = a.print("kind:{t}", .{k}) catch "",
             .section = "File Kinds",
             .title = k.title(),
             .accessory = accessory,
-            .icon = .{ .tile = .{ .name = k.icon(), .color = if (chosen != null) .blue else .gray } },
+            .icon = .{ .tile = .{
+                .name = k.icon(),
+                .color = if (chosen != null) .blue else .gray,
+            } },
             .keywords = @tagName(k),
             .action = .{ .setting = .{ .kind = k } },
         }) catch break;
@@ -349,9 +587,19 @@ pub fn themeCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
             out.append(a, themeItem(ui, a, t, if (want_dark) "Dark" else "Light")) catch break;
         }
     }
-    const style_section = a.printSentinel("{s} Themes", .{styleTitle(a, ui.settings.style)}, 0) catch "Style Themes";
-    for (themes.custom) |*t| if (t.from_style) out.append(a, themeItem(ui, a, t, style_section)) catch break;
-    for (themes.custom) |*t| if (!t.from_style) out.append(a, themeItem(ui, a, t, "Your Themes")) catch break;
+    const style_section = a.printSentinel(
+        "{s} Themes",
+        .{styleTitle(a, ui.settings.style)},
+        0,
+    ) catch "Style Themes";
+    for (themes.custom) |*t| if (t.from_style) out.append(
+        a,
+        themeItem(ui, a, t, style_section),
+    ) catch break;
+    for (themes.custom) |*t| if (!t.from_style) out.append(
+        a,
+        themeItem(ui, a, t, "Your Themes"),
+    ) catch break;
     return out.items;
 }
 
@@ -393,7 +641,14 @@ fn has(names: []const [:0]const u8, name: []const u8) bool {
     return false;
 }
 
-fn styleItem(a: std.mem.Allocator, id: []const u8, name: [:0]const u8, description: [:0]const u8, section: [:0]const u8, current: []const u8) Item {
+fn styleItem(
+    a: std.mem.Allocator,
+    id: []const u8,
+    name: [:0]const u8,
+    description: [:0]const u8,
+    section: [:0]const u8,
+    current: []const u8,
+) Item {
     return .{
         .key = a.print("style:{s}", .{id}) catch "",
         .section = section,
@@ -475,7 +730,10 @@ pub fn performSetting(ui: *Ui, s: item_mod.Setting, op: item_mod.Op) void {
                 ui.goBack();
             },
             .kind => |k| {
-                if (ui.settings.setOpenWith(@tagName(k), v)) ui.saveSettings() else |err| log.warn("default app for {t}: {t}", .{ k, err });
+                if (ui.settings.setOpenWith(@tagName(k), v)) ui.saveSettings() else |err| log.warn(
+                    "default app for {t}: {t}",
+                    .{ k, err },
+                );
                 ui.goBack();
             },
             .pref => |i| prefs_view.pick(ui, i, v),
@@ -506,9 +764,16 @@ pub fn performSetting(ui: *Ui, s: item_mod.Setting, op: item_mod.Op) void {
             if (op == .always_use) {
                 const name = std.Io.Dir.path.basename(f.path);
                 var ebuf: [16]u8 = undefined;
-                const key: []const u8 = if (core.file_kind.of(f.mime, name, false)) |k| @tagName(k) else core.file_kind.extKey(&ebuf, name);
+                const key: []const u8 = if (core.file_kind.of(
+                    f.mime,
+                    name,
+                    false,
+                )) |k| @tagName(k) else core.file_kind.extKey(&ebuf, name);
                 if (key.len > 0) {
-                    if (ui.settings.setOpenWith(key, id)) ui.saveSettings() else |err| log.warn("default app for {s}: {t}", .{ key, err });
+                    if (ui.settings.setOpenWith(key, id)) ui.saveSettings() else |err| log.warn(
+                        "default app for {s}: {t}",
+                        .{ key, err },
+                    );
                 }
             }
             if (!run.openWith(f.path, id)) return;
@@ -549,7 +814,11 @@ pub fn performSetting(ui: *Ui, s: item_mod.Setting, op: item_mod.Op) void {
 pub fn chooseAppFor(ui: *Ui, path: [:0]const u8) void {
     const guessed = c.g_content_type_guess(path, null, 0, null);
     defer if (guessed) |g| c.g_free(g);
-    const mime = ui.gpa.dupeSentinel(u8, if (guessed) |g| std.mem.span(g) else "application/octet-stream", 0) catch return;
+    const mime = ui.gpa.dupeSentinel(
+        u8,
+        if (guessed) |g| std.mem.span(g) else "application/octet-stream",
+        0,
+    ) catch return;
     const owned = ui.gpa.dupeSentinel(u8, path, 0) catch {
         ui.gpa.free(mime);
         return;

@@ -86,7 +86,15 @@ pub const Engine = struct {
     }
 
     /// Top `limit` hits for `query`, appended to `out` (cleared first).
-    pub fn search(e: *Engine, gpa: std.mem.Allocator, pool: *Pool, store: *const Store, query_in: []const u8, opts: Options, out: *std.ArrayList(Hit)) std.mem.Allocator.Error!void {
+    pub fn search(
+        e: *Engine,
+        gpa: std.mem.Allocator,
+        pool: *Pool,
+        store: *const Store,
+        query_in: []const u8,
+        opts: Options,
+        out: *std.ArrayList(Hit),
+    ) std.mem.Allocator.Error!void {
         const limit = opts.limit;
         out.clearRetainingCapacity();
         var packed_buf: [max_query]u8 = undefined;
@@ -114,7 +122,10 @@ pub const Engine = struct {
         // or the incremental case runs short of finalists (recall fell to
         // 52% with a fixed K in the Rust version).
         const n_chunks = @max(std.math.divCeil(usize, source_len, chunk_entries) catch 1, 1);
-        const per_chunk = @max(limit * per_chunk_mul, std.math.divCeil(usize, keep, n_chunks) catch keep);
+        const per_chunk = @max(
+            limit * per_chunk_mul,
+            std.math.divCeil(usize, keep, n_chunks) catch keep,
+        );
 
         const partials = try gpa.alloc(Partial, n_chunks);
         defer {
@@ -160,7 +171,11 @@ pub const Engine = struct {
         defer hits.deinit(gpa);
         try hits.resize(gpa, finalists.items.len);
         var fctx: FineCtx = .{ .store = store, .q = ql, .in = finalists.items, .out = hits.items };
-        pool.run(std.math.divCeil(usize, finalists.items.len, fine_block) catch 1, &fctx, FineCtx.block);
+        pool.run(
+            std.math.divCeil(usize, finalists.items.len, fine_block) catch 1,
+            &fctx,
+            FineCtx.block,
+        );
         std.mem.sort(Pair, hits.items, {}, lessThan);
 
         // Without this the thousands of "Cargo.toml" tie and their order is
@@ -175,7 +190,11 @@ pub const Engine = struct {
             while (n < hits.items.len and hits.items[n].score >= floor) n += 1;
             n = @min(n, limit * recency_mul);
             // Up to 960 path rebuilds and stats for the UI's 60: on the pool.
-            var rctx: RecencyCtx = .{ .store = store, .hits = hits.items[0..n], .now = sys.nowSeconds() };
+            var rctx: RecencyCtx = .{
+                .store = store,
+                .hits = hits.items[0..n],
+                .now = sys.nowSeconds(),
+            };
             pool.run(std.math.divCeil(usize, n, recency_block) catch 1, &rctx, RecencyCtx.block);
             std.mem.sort(Pair, hits.items[0..n], {}, lessThan);
         }
@@ -278,7 +297,10 @@ fn sift(ctx: *SiftCtx, ci: usize, lo: usize, hi: usize) !void {
             }
         }
         if (ctx.cache_cap > 0) {
-            if (p.cands.items.len < ctx.cache_cap) try p.cands.append(ctx.gpa, id) else p.overflow = true;
+            if (p.cands.items.len < ctx.cache_cap) try p.cands.append(
+                ctx.gpa,
+                id,
+            ) else p.overflow = true;
         }
     }
     if (p.top.items.len > k) {
@@ -347,7 +369,12 @@ pub fn cheapScoreMasked(name: []const u8, q: []const u8, mask: u64) ?i32 {
     if (mask & store_mod.mask_non_ascii != 0) return cheapFolded(name, q);
     // The same loop as before folding existed. A damaged mapped mask could
     // only score a non-ASCII name as plain bytes: never unsafe.
-    return cheapCore(.known_ascii, name, &.{}, q) catch unreachable; // NonAscii comes only from .ascii mode
+    return cheapCore(
+        .known_ascii,
+        name,
+        &.{},
+        q,
+    ) catch unreachable; // NonAscii comes only from .ascii mode
 }
 
 // Out of line: its 2 KB of buffers stay off the hot loop's stack frame.
@@ -355,7 +382,12 @@ noinline fn cheapFolded(name: []const u8, q: []const u8) ?i32 {
     var buf: [max_folded]u8 = undefined;
     var upper: [max_folded]bool = undefined;
     const n = fold.foldCase(&buf, &upper, name);
-    return cheapCore(.folded, buf[0..n], upper[0..n], q) catch unreachable; // NonAscii comes only from .ascii mode
+    return cheapCore(
+        .folded,
+        buf[0..n],
+        upper[0..n],
+        q,
+    ) catch unreachable; // NonAscii comes only from .ascii mode
 }
 
 /// Longest name folded for `cheapScore`; a longer non-ASCII name is scored
@@ -372,7 +404,12 @@ const CheapMode = enum {
     folded,
 };
 
-fn cheapCore(comptime mode: CheapMode, name: []const u8, upper: []const bool, q: []const u8) error{NonAscii}!?i32 {
+fn cheapCore(
+    comptime mode: CheapMode,
+    name: []const u8,
+    upper: []const bool,
+    q: []const u8,
+) error{NonAscii}!?i32 {
     const ascii = mode != .folded;
     var qi: usize = 0;
     var s: i32 = 0;
@@ -442,7 +479,10 @@ const FineCtx = struct {
 
     fn block(ctx: *FineCtx, b: usize) void {
         const lo = b * fine_block;
-        for (ctx.in[lo..@min(lo + fine_block, ctx.in.len)], ctx.out[lo..@min(lo + fine_block, ctx.in.len)]) |f, *h| {
+        for (ctx.in[lo..@min(
+            lo + fine_block,
+            ctx.in.len,
+        )], ctx.out[lo..@min(lo + fine_block, ctx.in.len)]) |f, *h| {
             const fs = fine.score(ctx.store.name(f.id), ctx.q) orelse 0;
             h.* = .{ .score = fs * 4 + f.score, .id = f.id };
         }
@@ -457,7 +497,10 @@ const RecencyCtx = struct {
     fn block(ctx: *RecencyCtx, b: usize) void {
         var buf: [4096]u8 = undefined;
         const lo = b * recency_block;
-        for (ctx.hits[lo..@min(lo + recency_block, ctx.hits.len)]) |*h| h.score += recencyBonus(ctx.store, h.id, ctx.now, &buf);
+        for (ctx.hits[lo..@min(
+            lo + recency_block,
+            ctx.hits.len,
+        )]) |*h| h.score += recencyBonus(ctx.store, h.id, ctx.now, &buf);
     }
 };
 
@@ -480,7 +523,13 @@ fn recencyBonus(store: *const Store, id: u32, now: i64, buf: *[4096]u8) i32 {
 
 /// Reference: scores every entry with the fine scorer, no cascade, no cuts.
 /// Defines the correct answer the cascade's recall is measured against.
-pub fn searchExhaustive(gpa: std.mem.Allocator, store: *const Store, query_in: []const u8, limit: usize, out: *std.ArrayList(Hit)) std.mem.Allocator.Error!void {
+pub fn searchExhaustive(
+    gpa: std.mem.Allocator,
+    store: *const Store,
+    query_in: []const u8,
+    limit: usize,
+    out: *std.ArrayList(Hit),
+) std.mem.Allocator.Error!void {
     out.clearRetainingCapacity();
     var packed_buf: [max_query]u8 = undefined;
     const query = packQuery(query_in, &packed_buf);
@@ -498,7 +547,10 @@ pub fn searchExhaustive(gpa: std.mem.Allocator, store: *const Store, query_in: [
         try all.append(gpa, .{ .score = fs * 4 + adjust(store, id, cheap), .id = id });
     }
     std.mem.sort(Pair, all.items, {}, lessThan);
-    for (all.items[0..@min(limit, all.items.len)]) |h| try out.append(gpa, .{ .id = h.id, .score = h.score });
+    for (all.items[0..@min(limit, all.items.len)]) |h| try out.append(gpa, .{
+        .id = h.id,
+        .score = h.score,
+    });
 }
 
 // ---------------------------------------------------------------- tests
@@ -509,7 +561,10 @@ test "selectTop keeps the best k" {
     var prng = std.Random.DefaultPrng.init(7);
     const r = prng.random();
     var items: [500]Pair = undefined;
-    for (&items, 0..) |*it, i| it.* = .{ .score = r.intRangeAtMost(i32, -50, 50), .id = @intCast(i) };
+    for (&items, 0..) |*it, i| it.* = .{
+        .score = r.intRangeAtMost(i32, -50, 50),
+        .id = @intCast(i),
+    };
     var sorted = items;
     std.mem.sort(Pair, &sorted, {}, lessThan);
     selectTop(&items, 37);
@@ -519,7 +574,14 @@ test "selectTop keeps the best k" {
 
 fn synthetic(gpa: std.mem.Allocator, n_dirs: usize) !Store {
     var b: store_mod.Builder = .empty;
-    const words = [_][]const u8{ "cargo", "config", "main", "readme", "notes", "src", "test", "build", "lib", "index", "photo", "draft", "Configuración", "español", "ÑANDÚ", "über", "AñoNuevo" };
+    const words = [_][]const u8{
+        "cargo", "config", "main", "readme", "notes", "src", "test", "build", "lib", "index", "photo", "draft",
+        "Configuración",
+        "español",
+        "ÑANDÚ",
+        "über",
+        "AñoNuevo",
+    };
     const exts = [_][]const u8{ ".toml", ".rs", ".md", ".zig", ".json", ".png", "" };
     var prng = std.Random.DefaultPrng.init(42);
     const r = prng.random();
@@ -529,13 +591,20 @@ fn synthetic(gpa: std.mem.Allocator, n_dirs: usize) !Store {
     defer dirs.deinit(gpa);
     for (0..n_dirs) |i| {
         var nb: [32]u8 = undefined;
-        const nm = try std.mem.print(&nb, "{s}{d}", .{ words[r.uintLessThan(usize, words.len)], i });
+        const nm = try std.mem.print(&nb, "{s}{d}", .{
+            words[r.uintLessThan(usize, words.len)],
+            i,
+        });
         try dirs.append(gpa, try b.push(gpa, nm, root, store_mod.flag_dir, 1));
     }
     for (dirs.items) |d| {
         for (0..40) |_| {
             var nb: [48]u8 = undefined;
-            const nm = try std.mem.print(&nb, "{s}_{s}{s}", .{ words[r.uintLessThan(usize, words.len)], words[r.uintLessThan(usize, words.len)], exts[r.uintLessThan(usize, exts.len)] });
+            const nm = try std.mem.print(&nb, "{s}_{s}{s}", .{
+                words[r.uintLessThan(usize, words.len)],
+                words[r.uintLessThan(usize, words.len)],
+                exts[r.uintLessThan(usize, exts.len)],
+            });
             _ = try b.push(gpa, nm, d, 0, 2);
         }
     }
@@ -556,9 +625,36 @@ test "cascade matches the exhaustive reference (recall 100%)" {
     defer want.deinit(gpa);
 
     // Typed letter by letter, so refinement is exercised too.
-    const queries = [_][]const u8{ "c", "ca", "car", "carg", "cargo", "cargo.t", "m", "mai", "main.rs", "rdm", "cfg", "photo_d", "zz", "photo draft", "cargo toml" } ++
+    const queries = [_][]const u8{
+        "c",
+        "ca",
+        "car",
+        "carg",
+        "cargo",
+        "cargo.t",
+        "m",
+        "mai",
+        "main.rs",
+        "rdm",
+        "cfg",
+        "photo_d",
+        "zz",
+        "photo draft",
+        "cargo toml",
+    } ++
         // Accents and case, both ways, typed letter by letter.
-        [_][]const u8{ "e", "es", "esp", "espa", "españ", "español", "espanol_", "configuracion", "CONFIGURACIÓN", "configuración.md", "nandu", "Ñandú", "uber", "an", "anonuevo", "ÜBER_ÑAN" };
+        [_][]const u8{
+            "e",        "es",            "esp",      "espa",
+            "españ",
+            "español",
+            "espanol_", "configuracion",
+            "CONFIGURACIÓN",
+            "configuración.md",
+            "nandu",
+            "Ñandú",
+            "uber",     "an",            "anonuevo",
+            "ÜBER_ÑAN",
+        };
     for (queries) |q| {
         try e.search(gpa, pool, &s, q, .{ .limit = 20, .recency = false }, &got);
         try searchExhaustive(gpa, &s, q, 20, &want);
@@ -586,13 +682,26 @@ fn topName(gpa: std.mem.Allocator, pool: *Pool, s: *const Store, q: []const u8) 
 
 test "accents and case fold both ways in name search" {
     const gpa = testing.allocator;
-    var s = try smallStore(gpa, &.{ "notes.md", "espanol.txt", "configuration.txt", "Configuración.md", "español-viejo.txt", "Ñandú.png", "config.toml", "3×4.md", "x.md" });
+    var s = try smallStore(gpa, &.{
+        "notes.md",    "espanol.txt", "configuration.txt",
+        "Configuración.md",
+        "español-viejo.txt",
+        "Ñandú.png",
+        "config.toml",
+        "3×4.md",
+        "x.md",
+    });
     defer s.deinit(gpa);
     const pool = try Pool.create(gpa, testing.io, 1);
     defer pool.destroy();
     try testing.expectEqualStrings("espanol.txt", try topName(gpa, pool, &s, "español"));
     try testing.expectEqualStrings("espanol.txt", try topName(gpa, pool, &s, "ESPANOL"));
-    try testing.expectEqualStrings("español-viejo.txt", try topName(gpa, pool, &s, "espanol viejo"));
+    try testing.expectEqualStrings("español-viejo.txt", try topName(
+        gpa,
+        pool,
+        &s,
+        "espanol viejo",
+    ));
     try testing.expectEqualStrings("Configuración.md", try topName(gpa, pool, &s, "configuracion"));
     try testing.expectEqualStrings("Configuración.md", try topName(gpa, pool, &s, "CONFIGURACIÓN"));
     try testing.expectEqualStrings("Ñandú.png", try topName(gpa, pool, &s, "nandu"));
@@ -609,34 +718,63 @@ test "accents and case fold both ways in name search" {
 }
 
 test "cheap score: an ASCII name scores the same down both paths" {
-    const names = [_][]const u8{ "Cargo.toml", "fileManager.rs", "README", "my_report.md", "a.b-c d/e" };
+    const names = [_][]const u8{
+        "Cargo.toml",
+        "fileManager.rs",
+        "README",
+        "my_report.md",
+        "a.b-c d/e",
+    };
     const qs = [_][]const u8{ "c", "cargo", "fm", "readme", "mr", "abcde", "zz" };
     for (names) |n| for (qs) |q| {
         var buf: [64]u8 = undefined;
         var up: [64]bool = undefined;
         const len = fold.foldCase(&buf, &up, n);
-        try testing.expectEqual(try cheapCore(.ascii, n, &.{}, q), try cheapCore(.folded, buf[0..len], up[0..len], q));
+        try testing.expectEqual(try cheapCore(.ascii, n, &.{}, q), try cheapCore(
+            .folded,
+            buf[0..len],
+            up[0..len],
+            q,
+        ));
         try testing.expectEqual(cheapScore(n, q), cheapScoreMasked(n, q, store_mod.charMask(n)));
     };
     // Same letters with accents: same score as the unaccented name.
     try testing.expectEqual(cheapScore("ArbolEpico.md", "ae"), cheapScore("ÁrbolÉpico.md", "ae"));
-    try testing.expectEqual(cheapScore("configuracion.md", "configuracion"), cheapScore("Configuración.md", "configuracion"));
+    try testing.expectEqual(cheapScore("configuracion.md", "configuracion"), cheapScore(
+        "Configuración.md",
+        "configuracion",
+    ));
     // A non-ASCII byte after the match still counts in the folded length.
     try testing.expectEqual(cheapScore("ab-ene", "ab"), cheapScore("ab-eñe", "ab"));
-    try testing.expectEqual(cheapScore("ab-eñe", "ab"), cheapScoreMasked("ab-eñe", "ab", store_mod.charMask("ab-eñe")));
+    try testing.expectEqual(cheapScore("ab-eñe", "ab"), cheapScoreMasked(
+        "ab-eñe",
+        "ab",
+        store_mod.charMask("ab-eñe"),
+    ));
 }
 
 test "a 100-character name is found and ranked first by its full name" {
     const gpa = testing.allocator;
     const long = "a_rather_long_file_name_that_someone_typed_in_full_to_find_it_again_quickly_2026_final_version_2.txt";
     try testing.expectEqual(@as(usize, 100), long.len);
-    var s = try smallStore(gpa, &.{ "notes.md", long ++ ".bak", "x" ++ long, long, "a_rather_long_file_name.txt" });
+    var s = try smallStore(gpa, &.{
+        "notes.md",
+        long ++ ".bak",
+        "x" ++ long,
+        long,
+        "a_rather_long_file_name.txt",
+    });
     defer s.deinit(gpa);
     const pool = try Pool.create(gpa, testing.io, 1);
     defer pool.destroy();
     try testing.expectEqualStrings(long, try topName(gpa, pool, &s, long));
     var upper: [long.len]u8 = undefined;
-    try testing.expectEqualStrings(long, try topName(gpa, pool, &s, std.ascii.upperString(&upper, long)));
+    try testing.expectEqualStrings(long, try topName(
+        gpa,
+        pool,
+        &s,
+        std.ascii.upperString(&upper, long),
+    ));
     // Longer than any file name: nothing, not a crash.
     try testing.expectEqualStrings("", try topName(gpa, pool, &s, long ++ long ++ long));
 }

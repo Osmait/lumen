@@ -21,14 +21,26 @@ pub const ListError = std.process.RunError || std.mem.Allocator.Error;
 
 /// Documents to index, sorted by path (stable doc ids between builds).
 /// Paths are owned by `arena`.
-pub fn list(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, root: []const u8, with_documents: bool) ListError![]content.DocIn {
+pub fn list(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    with_documents: bool,
+) ListError![]content.DocIn {
     var argv: std.ArrayList([]const u8) = .empty;
     // --no-ignore-parent: ignore files above the root are not about it (and
     // a checkout's .gitignore patterns like `build/` would hit any dir
     // with that name below).
     // --null: paths end in NUL, the one byte a path cannot contain (a file
     // name with a newline was split into two bogus paths and never indexed).
-    try argv.appendSlice(arena, &.{ "rg", "--files", "--null", "--no-messages", "--no-ignore-parent" });
+    try argv.appendSlice(arena, &.{
+        "rg",
+        "--files",
+        "--null",
+        "--no-messages",
+        "--no-ignore-parent",
+    });
     for (excludes) |g| try argv.appendSlice(arena, &.{ "-g", g });
     // Run inside the root and list ".": rg matches globs against the path it
     // prints, so with the root as argument a root below any excluded name
@@ -57,7 +69,12 @@ pub fn list(arena: std.mem.Allocator, gpa: std.mem.Allocator, io: std.Io, root: 
         if (doc_kind and !with_documents) continue;
         if (!doc_kind and binaryByName(p)) continue;
         const st = stat(z, doc_kind) orelse continue;
-        try docs.append(arena, .{ .path = try arena.dupe(u8, p), .mtime = st.mtime, .size = st.size, .source = if (doc_kind) .extracted else .plain });
+        try docs.append(arena, .{
+            .path = try arena.dupe(u8, p),
+            .mtime = st.mtime,
+            .size = st.size,
+            .source = if (doc_kind) .extracted else .plain,
+        });
     }
     std.mem.sort(content.DocIn, docs.items, {}, struct {
         fn lt(_: void, a: content.DocIn, b: content.DocIn) bool {
@@ -73,7 +90,13 @@ pub const Stat = struct { mtime: i64, size: u64 };
 /// more): not a regular file, or a size out of bounds.
 pub fn stat(path: [*:0]const u8, doc_kind: bool) ?Stat {
     var stx: linux.Statx = undefined;
-    const rc = linux.statx(linux.AT.FDCWD, path, 0, .{ .TYPE = true, .SIZE = true, .MTIME = true }, &stx);
+    const rc = linux.statx(
+        linux.AT.FDCWD,
+        path,
+        0,
+        .{ .TYPE = true, .SIZE = true, .MTIME = true },
+        &stx,
+    );
     if (linux.errno(rc) != .SUCCESS or stx.mode & linux.S.IFMT != linux.S.IFREG) return null;
     if (!doc_kind and (stx.size > content.max_text or stx.size < 3)) return null;
     if (doc_kind and stx.size > 64 << 20) return null;
@@ -89,7 +112,52 @@ pub fn documentKind(path: []const u8) bool {
 
 /// Obviously binary by extension: skips opening them at all.
 fn binaryByName(path: []const u8) bool {
-    const exts = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".mp4", ".mkv", ".mp3", ".ogg", ".wav", ".zip", ".gz", ".xz", ".zst", ".tar", ".so", ".o", ".a", ".wasm", ".ttf", ".otf", ".woff", ".woff2", ".blend", ".uasset", ".umap", ".exe", ".dll", ".class", ".jar", ".pyc", ".db", ".sqlite", ".bin", ".iso", ".avif", ".heic", ".psd", ".dds", ".ktx", ".glb", ".fbx", ".mov" };
+    const exts = [_][]const u8{
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".ico",
+        ".mp4",
+        ".mkv",
+        ".mp3",
+        ".ogg",
+        ".wav",
+        ".zip",
+        ".gz",
+        ".xz",
+        ".zst",
+        ".tar",
+        ".so",
+        ".o",
+        ".a",
+        ".wasm",
+        ".ttf",
+        ".otf",
+        ".woff",
+        ".woff2",
+        ".blend",
+        ".uasset",
+        ".umap",
+        ".exe",
+        ".dll",
+        ".class",
+        ".jar",
+        ".pyc",
+        ".db",
+        ".sqlite",
+        ".bin",
+        ".iso",
+        ".avif",
+        ".heic",
+        ".psd",
+        ".dds",
+        ".ktx",
+        ".glb",
+        ".fbx",
+        ".mov",
+    };
     for (exts) |e| if (std.ascii.endsWithIgnoreCase(path, e)) return true;
     return false;
 }
@@ -141,7 +209,13 @@ pub const TestTree = struct {
 
 /// `list` relative to the tree, or SkipZigTest without ripgrep.
 fn listRel(arena: std.mem.Allocator, t: *const TestTree, with_documents: bool) ![]content.DocIn {
-    return list(arena, testing.allocator, testing.io, t.abs, with_documents) catch |err| switch (err) {
+    return list(
+        arena,
+        testing.allocator,
+        testing.io,
+        t.abs,
+        with_documents,
+    ) catch |err| switch (err) {
         error.FileNotFound => error.SkipZigTest,
         else => err,
     };
@@ -209,7 +283,10 @@ test "list: what is indexed and what is excluded" {
     try t.write("proj/.gitignore", "ignored.txt\ngen/\n");
     // Sizes without writing the bytes: sparse files.
     var buf: [4096]u8 = undefined;
-    for ([_]struct { []const u8, i64 }{ .{ "big.log", content.max_text + 1 }, .{ "exactly_max.log", content.max_text } }) |e| {
+    for ([_]struct { []const u8, i64 }{ .{ "big.log", content.max_text + 1 }, .{
+        "exactly_max.log",
+        content.max_text,
+    } }) |e| {
         const rc = linux.open(try t.path(&buf, e[0]), .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
         try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
         const fd: i32 = @intCast(rc);
@@ -241,7 +318,10 @@ test "list: what is indexed and what is excluded" {
         try testing.expectEqual(info.mtime, d.mtime);
     }
     for (got) |d| {
-        if (std.mem.endsWith(u8, d.path, "/exactly_max.log")) try testing.expectEqual(@as(u64, content.max_text), d.size);
+        if (std.mem.endsWith(u8, d.path, "/exactly_max.log")) try testing.expectEqual(
+            @as(u64, content.max_text),
+            d.size,
+        );
     }
 
     // Without documents: the same minus the PDF and the docx.
@@ -260,7 +340,13 @@ test "list: a root below an excluded name still lists" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const sub = try arena_state.allocator().print("{s}/build/target/node_modules/me/", .{t.abs});
-    const got = list(arena_state.allocator(), testing.allocator, testing.io, sub, true) catch |err| switch (err) {
+    const got = list(
+        arena_state.allocator(),
+        testing.allocator,
+        testing.io,
+        sub,
+        true,
+    ) catch |err| switch (err) {
         error.FileNotFound => return error.SkipZigTest,
         else => return err,
     };
@@ -280,7 +366,13 @@ test "list: file names with newlines and invalid UTF-8 come back whole" {
     try t.write("bad-\xff\xfe.txt", "not utf-8 in the name");
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
-    const got = list(arena_state.allocator(), testing.allocator, testing.io, t.abs, true) catch |err| switch (err) {
+    const got = list(
+        arena_state.allocator(),
+        testing.allocator,
+        testing.io,
+        t.abs,
+        true,
+    ) catch |err| switch (err) {
         error.FileNotFound => return error.SkipZigTest,
         else => return err,
     };

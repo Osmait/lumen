@@ -122,9 +122,15 @@ pub fn pruneFrecency(db: *Db, now: i64) Error!void {
     var arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
     defer arena.deinit();
     while (try db.nextRow(stmt)) {
-        const count = std.math.cast(u32, c.sqlite3_column_int64(stmt, 1)) orelse std.math.maxInt(u32);
+        const count = std.math.cast(
+            u32,
+            c.sqlite3_column_int64(stmt, 1),
+        ) orelse std.math.maxInt(u32);
         if (frecency.value(count, c.sqlite3_column_int64(stmt, 2), now) >= 0.01) continue;
-        stale.append(arena.allocator(), arena.allocator().dupe(u8, columnText(stmt, 0)) catch continue) catch continue;
+        stale.append(
+            arena.allocator(),
+            arena.allocator().dupe(u8, columnText(stmt, 0)) catch continue,
+        ) catch continue;
     }
     for (stale.items) |key| {
         _ = c.sqlite3_reset(del);
@@ -134,14 +140,21 @@ pub fn pruneFrecency(db: *Db, now: i64) Error!void {
 }
 
 /// All usage, as key -> frecency value. Keys and the map live in `arena`.
-pub fn loadFrecency(db: *Db, arena: std.mem.Allocator, now: i64) (Error || std.mem.Allocator.Error)!std.StringHashMapUnmanaged(f64) {
+pub fn loadFrecency(
+    db: *Db,
+    arena: std.mem.Allocator,
+    now: i64,
+) (Error || std.mem.Allocator.Error)!std.StringHashMapUnmanaged(f64) {
     var map: std.StringHashMapUnmanaged(f64) = .empty;
     const stmt = try db.prepare("SELECT key, count, last_used FROM frecency");
     defer _ = c.sqlite3_finalize(stmt);
     while (try db.nextRow(stmt)) {
         const key = try arena.dupe(u8, columnText(stmt, 0));
         // A count beyond u32 (a foreign or damaged file) saturates.
-        const count = std.math.cast(u32, c.sqlite3_column_int64(stmt, 1)) orelse std.math.maxInt(u32);
+        const count = std.math.cast(
+            u32,
+            c.sqlite3_column_int64(stmt, 1),
+        ) orelse std.math.maxInt(u32);
         const last = c.sqlite3_column_int64(stmt, 2);
         try map.put(arena, key, frecency.value(count, last, now));
     }
@@ -187,11 +200,17 @@ pub const Clip = struct {
 };
 
 /// Most recent first; the slice and strings live in `arena`.
-pub fn recentClips(db: *Db, arena: std.mem.Allocator, limit: u32) (Error || std.mem.Allocator.Error)![]Clip {
+pub fn recentClips(
+    db: *Db,
+    arena: std.mem.Allocator,
+    limit: u32,
+) (Error || std.mem.Allocator.Error)![]Clip {
     var list: std.ArrayList(Clip) = .empty;
     // Times have one-second resolution; the id breaks ties in copy order
     // (two copies within a second came back oldest first).
-    const stmt = try db.prepare("SELECT id, content, created_at, last_copied FROM clipboard ORDER BY last_copied DESC, id DESC LIMIT ?1");
+    const stmt = try db.prepare(
+        "SELECT id, content, created_at, last_copied FROM clipboard ORDER BY last_copied DESC, id DESC LIMIT ?1",
+    );
     defer _ = c.sqlite3_finalize(stmt);
     _ = c.sqlite3_bind_int64(stmt, 1, limit);
     while (try db.nextRow(stmt)) {
@@ -313,7 +332,9 @@ test "frecency forgets what decayed to nothing, keeps the rest" {
 test "a failed write is an error, not silence" {
     var db = try Db.open(":memory:");
     defer db.close();
-    try db.exec("CREATE TRIGGER no_delete BEFORE DELETE ON clipboard BEGIN SELECT RAISE(ABORT, 'locked'); END;");
+    try db.exec(
+        "CREATE TRIGGER no_delete BEFORE DELETE ON clipboard BEGIN SELECT RAISE(ABORT, 'locked'); END;",
+    );
     try db.addClip("secret", 1, Db.max_entries);
     try std.testing.expectError(error.DbStep, db.deleteClip(1));
     try std.testing.expectError(error.DbExec, db.clearClips());

@@ -131,7 +131,10 @@ pub fn score(name_in: []const u8, q: []const u8) ?i32 {
             }
             m_cur[j] = ms;
             rb_cur[j] = rb;
-            const decayed = if (p_row > neg) p_row + (if (in_gap) @as(i32, gap_extension) else gap_start) else neg;
+            const decayed = if (p_row > neg) p_row + (if (in_gap) @as(
+                i32,
+                gap_extension,
+            ) else gap_start) else neg;
             if (ms >= decayed) {
                 p_row = ms;
                 in_gap = false;
@@ -165,7 +168,10 @@ test "finds the best placement, not the first" {
 }
 
 test "accents and case fold, bonuses follow the original letters" {
-    try std.testing.expectEqual(score("Configuracion.md", "configuracion"), score("Configuración.md", "configuracion"));
+    try std.testing.expectEqual(score("Configuracion.md", "configuracion"), score(
+        "Configuración.md",
+        "configuracion",
+    ));
     try std.testing.expect(score("español.txt", "espanol") != null);
     try std.testing.expect(score("espanol.txt", "espanol") != null);
     // "ÁrbolÉpico": É is a camelCase boundary, like "ArbolEpico".

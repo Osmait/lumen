@@ -87,13 +87,26 @@ pub const Pools = struct { search: *Pool, build: *Pool };
 
 pub const StartError = std.mem.Allocator.Error || std.Thread.SpawnError;
 
-pub fn start(gpa: std.mem.Allocator, io: Io, root: []const u8, cache_dir: []const u8, pools: Pools) StartError!*ContentService {
+pub fn start(
+    gpa: std.mem.Allocator,
+    io: Io,
+    root: []const u8,
+    cache_dir: []const u8,
+    pools: Pools,
+) StartError!*ContentService {
     return startWith(gpa, io, root, cache_dir, pools, .{});
 }
 
 /// Starts the background thread. Borrows the pools, which must outlive it.
 /// Thread-safe once started.
-pub fn startWith(gpa: std.mem.Allocator, io: Io, root: []const u8, cache_dir: []const u8, pools: Pools, opts: Options) StartError!*ContentService {
+pub fn startWith(
+    gpa: std.mem.Allocator,
+    io: Io,
+    root: []const u8,
+    cache_dir: []const u8,
+    pools: Pools,
+    opts: Options,
+) StartError!*ContentService {
     const s = try gpa.create(ContentService);
     errdefer gpa.destroy(s);
     const root_copy = try gpa.dupe(u8, root);
@@ -166,7 +179,9 @@ pub fn status(s: *ContentService) Status {
     defer s.lock.unlockShared(s.io);
     var extracted: usize = 0;
     if (s.index) |ix| {
-        for (ix.sources, 0..) |src, i| extracted += @intFromBool(src == @backingInt(content.Source.extracted) and !ix.removed(@intCast(i)));
+        for (ix.sources, 0..) |src, i| extracted += @intFromBool(
+            src == @backingInt(content.Source.extracted) and !ix.removed(@intCast(i)),
+        );
     }
     return .{
         .docs = if (s.index) |ix| ix.live() else 0,
@@ -199,13 +214,27 @@ pub const Hit = struct {
 
 /// Files whose text contains every word of `query` (3+ letters needed).
 /// Everything returned lives in `arena`.
-pub fn search(s: *ContentService, arena: std.mem.Allocator, query: []const u8, limit: usize, out: *std.ArrayList(Hit)) std.mem.Allocator.Error!void {
+pub fn search(
+    s: *ContentService,
+    arena: std.mem.Allocator,
+    query: []const u8,
+    limit: usize,
+    out: *std.ArrayList(Hit),
+) std.mem.Allocator.Error!void {
     out.clearRetainingCapacity();
     s.lock.lockSharedUncancelable(s.io);
     defer s.lock.unlockShared(s.io);
     const ix = if (s.index) |*i| i else return;
     var matches: std.ArrayList(content.Match) = .empty;
-    try content.search(ix, s.gpa, arena, s.search_pool, query, .{ .limit = limit, .text_path = pathOf, .text_ctx = s }, &matches);
+    try content.search(
+        ix,
+        s.gpa,
+        arena,
+        s.search_pool,
+        query,
+        .{ .limit = limit, .text_path = pathOf, .text_ctx = s },
+        &matches,
+    );
     for (matches.items) |m| try out.append(arena, .{
         .path = try arena.dupe(u8, ix.path(m.doc)),
         .line = m.line,
@@ -228,10 +257,22 @@ fn pathOf(ctx: *anyopaque, d: content.DocIn, buf: []u8) ?[:0]const u8 {
 /// null if it cannot be read. Reads no further than that: the preview runs
 /// on the UI thread, and a match near the top of a 4 MB extraction needs a
 /// few KB of it.
-pub fn readText(s: *ContentService, arena: std.mem.Allocator, path: []const u8, mtime: i64, extracted: bool, lines: u32) ?[]const u8 {
+pub fn readText(
+    s: *ContentService,
+    arena: std.mem.Allocator,
+    path: []const u8,
+    mtime: i64,
+    extracted: bool,
+    lines: u32,
+) ?[]const u8 {
     var pbuf: [4096]u8 = undefined;
     const p: [:0]const u8 = if (extracted)
-        s.textPath(&pbuf, .{ .path = path, .mtime = mtime, .size = 0, .source = .extracted }) orelse return null
+        s.textPath(&pbuf, .{
+            .path = path,
+            .mtime = mtime,
+            .size = 0,
+            .source = .extracted,
+        }) orelse return null
     else
         std.mem.printSentinel(&pbuf, "{s}", .{path}, 0) catch return null;
     const fd = sys.openRegular(p) catch return null;
@@ -251,7 +292,12 @@ pub fn readText(s: *ContentService, arena: std.mem.Allocator, path: []const u8, 
 }
 
 /// Text of a document: the file itself, or its cached extraction.
-fn textOf(ctx: *anyopaque, d: content.DocIn, buf: *std.ArrayList(u8), gpa: std.mem.Allocator) std.mem.Allocator.Error!bool {
+fn textOf(
+    ctx: *anyopaque,
+    d: content.DocIn,
+    buf: *std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+) std.mem.Allocator.Error!bool {
     const s: *ContentService = @ptrCast(@alignCast(ctx));
     if (d.source == .plain) return content.readPlain(gpa, d.path, buf);
     var pbuf: [4096]u8 = undefined;
@@ -270,7 +316,12 @@ fn textOf(ctx: *anyopaque, d: content.DocIn, buf: *std.ArrayList(u8), gpa: std.m
 }
 
 fn textPath(s: *ContentService, buf: []u8, d: content.DocIn) ?[:0]const u8 {
-    return std.mem.printSentinel(buf, "{s}/{x:0>16}-{d}.txt", .{ s.text_dir, std.hash.Wyhash.hash(0, d.path), d.mtime }, 0) catch null;
+    return std.mem.printSentinel(
+        buf,
+        "{s}/{x:0>16}-{d}.txt",
+        .{ s.text_dir, std.hash.Wyhash.hash(0, d.path), d.mtime },
+        0,
+    ) catch null;
 }
 
 /// Extracts what is missing from the text cache, on the background pool
@@ -300,7 +351,13 @@ fn extractMissing(s: *ContentService, docs: []const content.DocIn) void {
             const tp = svc.textPath(&tbuf, d) orelse return;
             const kind = extract.kindOf(d.path) orelse return;
             const src = std.mem.printSentinel(&zbuf, "{s}", .{d.path}, 0) catch return;
-            const text = extract.extractText(svc.gpa, svc.io, src, kind, max_extracted) catch |err| switch (err) {
+            const text = extract.extractText(
+                svc.gpa,
+                svc.io,
+                src,
+                kind,
+                max_extracted,
+            ) catch |err| switch (err) {
                 error.ToolFailed, error.NotRegular, error.Access, error.NotFound => "",
                 else => {
                     log.warn("extracting {s}: {t}, will retry", .{ d.path, err });
@@ -308,7 +365,10 @@ fn extractMissing(s: *ContentService, docs: []const content.DocIn) void {
                 },
             };
             defer if (text.len > 0) svc.gpa.free(text);
-            sys.writeFileAtomic(tp, text) catch |err| log.warn("caching text of {s}: {t}", .{ d.path, err });
+            sys.writeFileAtomic(tp, text) catch |err| log.warn(
+                "caching text of {s}: {t}",
+                .{ d.path, err },
+            );
             _ = svc.extractions.fetchAdd(1, .release);
         }
     };
@@ -322,11 +382,18 @@ const Diff = struct { gone: []u32, added: []content.DocIn };
 
 /// Called on the service thread, the only one that replaces the index, so
 /// it can read it without the lock.
-fn diff(s: *ContentService, arena: std.mem.Allocator, docs: []content.DocIn) std.mem.Allocator.Error!Diff {
+fn diff(
+    s: *ContentService,
+    arena: std.mem.Allocator,
+    docs: []content.DocIn,
+) std.mem.Allocator.Error!Diff {
     const ix = if (s.index) |*i| i else return .{ .gone = &.{}, .added = docs };
     var ids: std.StringHashMapUnmanaged(u32) = .empty;
     try ids.ensureTotalCapacity(arena, @intCast(ix.live()));
-    for (0..ix.n_docs) |i| if (!ix.removed(@intCast(i))) ids.putAssumeCapacity(ix.path(@intCast(i)), @intCast(i));
+    for (0..ix.n_docs) |i| if (!ix.removed(@intCast(i))) ids.putAssumeCapacity(
+        ix.path(@intCast(i)),
+        @intCast(i),
+    );
     const seen = try arena.alloc(bool, ix.n_docs);
     @memset(seen, false);
     var gone: std.ArrayList(u32) = .empty;
@@ -334,12 +401,17 @@ fn diff(s: *ContentService, arena: std.mem.Allocator, docs: []content.DocIn) std
     for (docs) |d| {
         if (ids.get(d.path)) |id| {
             seen[id] = true;
-            if (ix.mtimes[id] == d.mtime and ix.sizes[id] == d.size and ix.sources[id] == @backingInt(d.source)) continue;
+            if (ix.mtimes[id] == d.mtime and ix.sizes[id] == d.size and ix.sources[id] == @backingInt(
+                d.source,
+            )) continue;
             try gone.append(arena, id);
         }
         try added.append(arena, d);
     }
-    for (0..ix.n_docs) |i| if (!ix.removed(@intCast(i)) and !seen[i]) try gone.append(arena, @intCast(i));
+    for (0..ix.n_docs) |i| if (!ix.removed(@intCast(i)) and !seen[i]) try gone.append(
+        arena,
+        @intCast(i),
+    );
     return .{ .gone = gone.items, .added = added.items };
 }
 
@@ -375,7 +447,12 @@ fn indexedChanges(s: *ContentService, arena: std.mem.Allocator) std.mem.Allocato
         const now = content_list.stat(z, d.source == .extracted);
         if (now) |st| if (st.mtime == d.mtime and st.size == d.size) continue;
         try gone.append(arena, id);
-        if (now) |st| try added.append(arena, .{ .path = d.path, .mtime = st.mtime, .size = st.size, .source = d.source });
+        if (now) |st| try added.append(arena, .{
+            .path = d.path,
+            .mtime = st.mtime,
+            .size = st.size,
+            .source = d.source,
+        });
     }
     return .{ .gone = gone.items, .added = added.items };
 }
@@ -434,13 +511,31 @@ fn refresh(s: *ContentService) void {
     // An update is appended to the file the index is mapped from; rewritten
     // whole if that file is not what the index was mapped from.
     const appended: ?content.FileError!content.Index = if (!whole and s.index.?.mapped and !s.unsaved)
-        if (content.appendFile(s.gpa, s.build_pool, &s.index.?, d.gone, d.added, reader, s.cache_path, null)) |r| (if (r) |ix| ix else null) else |err| err
+        if (content.appendFile(
+            s.gpa,
+            s.build_pool,
+            &s.index.?,
+            d.gone,
+            d.added,
+            reader,
+            s.cache_path,
+            null,
+        )) |r| (if (r) |ix| ix else null) else |err| err
     else
         null;
     const written = appended orelse if (whole)
         content.buildFile(s.gpa, s.build_pool, docs.?, reader, s.cache_path, null)
     else
-        content.updateFile(s.gpa, s.build_pool, &s.index.?, d.gone, d.added, reader, s.cache_path, null);
+        content.updateFile(
+            s.gpa,
+            s.build_pool,
+            &s.index.?,
+            d.gone,
+            d.added,
+            reader,
+            s.cache_path,
+            null,
+        );
     const fresh = written catch |file_err| blk: {
         if (file_err == error.OutOfMemory) {
             log.warn("building the content index: out of memory", .{});
@@ -453,7 +548,15 @@ fn refresh(s: *ContentService) void {
         break :blk (if (whole)
             content.build(s.gpa, s.build_pool, docs.?, reader, null)
         else
-            content.update(s.gpa, s.build_pool, &s.index.?, d.gone, d.added, reader, null)) catch |err| {
+            content.update(
+                s.gpa,
+                s.build_pool,
+                &s.index.?,
+                d.gone,
+                d.added,
+                reader,
+                null,
+            )) catch |err| {
             log.warn("building the content index: {t}", .{err});
             return;
         };
@@ -494,7 +597,12 @@ fn dropStaleText(s: *ContentService, old: *const content.Index, gone: []const u3
     var pbuf: [4096]u8 = undefined;
     for (gone) |id| {
         if (old.sources[id] != @backingInt(content.Source.extracted)) continue;
-        const tp = s.textPath(&pbuf, .{ .path = old.path(id), .mtime = old.mtimes[id], .size = 0, .source = .extracted }) orelse continue;
+        const tp = s.textPath(&pbuf, .{
+            .path = old.path(id),
+            .mtime = old.mtimes[id],
+            .size = 0,
+            .source = .extracted,
+        }) orelse continue;
         _ = std.os.linux.unlink(tp);
     }
 }
@@ -511,7 +619,10 @@ fn run(s: *ContentService) void {
         // Until the next periodic check (pokes and `stop` wake it sooner):
         // it used to wake every 5 s to see whether 5 minutes had passed.
         const due = s.opts.refresh_every_ns -| (sys.monotonicNs() - s.last_check_ns.load(.acquire));
-        s.io.futexWaitTimeout(u32, &s.wake.raw, seen, .{ .duration = .{ .raw = .fromNanoseconds(@max(due, std.time.ns_per_s)), .clock = .awake } }) catch {};
+        s.io.futexWaitTimeout(u32, &s.wake.raw, seen, .{ .duration = .{
+            .raw = .fromNanoseconds(@max(due, std.time.ns_per_s)),
+            .clock = .awake,
+        } }) catch {};
         if (s.stop.load(.acquire)) return;
         const since = sys.monotonicNs() - s.last_check_ns.load(.acquire);
         const now_wake = s.wake.load(.acquire);
@@ -528,7 +639,9 @@ const linux = std.os.linux;
 const TestTree = content_list.TestTree;
 
 fn haveTool(name: []const u8) bool {
-    const r = std.process.run(testing.allocator, testing.io, .{ .argv = &.{ name, "--version" } }) catch return false;
+    const r = std.process.run(testing.allocator, testing.io, .{
+        .argv = &.{ name, "--version" },
+    }) catch return false;
     testing.allocator.free(r.stdout);
     testing.allocator.free(r.stderr);
     return true;
@@ -567,11 +680,22 @@ const Fixture = struct {
     fn start(f: *Fixture) !*ContentService {
         // Small trees: one edit is a large share, so updates are allowed
         // whatever the share (the compaction test sets its own).
-        return f.startWith(.{ .refresh_every_ns = std.math.maxInt(u64), .poke_min_ns = 0, .max_removed_percent = 100 });
+        return f.startWith(.{
+            .refresh_every_ns = std.math.maxInt(u64),
+            .poke_min_ns = 0,
+            .max_removed_percent = 100,
+        });
     }
 
     fn startWith(f: *Fixture, opts: Options) !*ContentService {
-        return ContentService.startWith(testing.allocator, testing.io, f.root.abs, f.cache.abs, .{ .search = f.search_pool, .build = f.build_pool }, opts);
+        return ContentService.startWith(
+            testing.allocator,
+            testing.io,
+            f.root.abs,
+            f.cache.abs,
+            .{ .search = f.search_pool, .build = f.build_pool },
+            opts,
+        );
     }
 
     fn find(f: *Fixture, s: *ContentService, query: []const u8) ![]Hit {
@@ -598,7 +722,9 @@ fn pokeAndWait(s: *ContentService) !void {
 /// Moves a file's mtime away from "now": the index compares whole seconds.
 fn setMtime(path: [:0]const u8, sec: i64) !void {
     const ts = [2]linux.timespec{ .{ .sec = sec, .nsec = 0 }, .{ .sec = sec, .nsec = 0 } };
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.utimensat(linux.AT.FDCWD, path, &ts, 0)));
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(
+        linux.utimensat(linux.AT.FDCWD, path, &ts, 0),
+    ));
 }
 
 /// Files in the text cache whose name starts with `prefix`.
@@ -634,7 +760,13 @@ test "content service: finds, follows edits and deletions, rebuilds only on chan
         try testing.expect(std.mem.endsWith(u8, hits[0].path, "/notes/alpha.txt"));
         try testing.expect(!hits[0].extracted);
         try testing.expectEqual(@as(u32, 1), hits[0].line);
-        const text = s.readText(f.arena_state.allocator(), hits[0].path, hits[0].mtime, false, std.math.maxInt(u32)).?;
+        const text = s.readText(
+            f.arena_state.allocator(),
+            hits[0].path,
+            hits[0].mtime,
+            false,
+            std.math.maxInt(u32),
+        ).?;
         try testing.expectEqualStrings("the quick zanzibar fox\n", text);
 
         // Nothing changed: listed again, not rebuilt.
@@ -712,7 +844,12 @@ test "content service: with the name index, checks without name changes only loo
     const names = try Service.start(testing.allocator, testing.io, f.root.abs, idx);
     defer names.shutdown();
     _ = try Service.waitNames(names, null);
-    const s = try f.startWith(.{ .refresh_every_ns = std.math.maxInt(u64), .poke_min_ns = 0, .max_removed_percent = 100, .names = names });
+    const s = try f.startWith(.{
+        .refresh_every_ns = std.math.maxInt(u64),
+        .poke_min_ns = 0,
+        .max_removed_percent = 100,
+        .names = names,
+    });
     defer s.shutdown();
     try waitChecks(s, 1);
     try testing.expectEqual(@as(u32, 1), s.status().listings);
@@ -747,7 +884,11 @@ test "content service: rebuilt whole once removed versions pile up" {
         var nbuf: [32]u8 = undefined;
         try f.root.write(try std.mem.print(&nbuf, "n{d}.txt", .{i}), "plain words\n");
     }
-    const s = try f.startWith(.{ .refresh_every_ns = std.math.maxInt(u64), .poke_min_ns = 0, .max_removed_percent = 20 });
+    const s = try f.startWith(.{
+        .refresh_every_ns = std.math.maxInt(u64),
+        .poke_min_ns = 0,
+        .max_removed_percent = 20,
+    });
     defer s.shutdown();
     try waitChecks(s, 1);
     var pbuf: [4096]u8 = undefined;
@@ -828,10 +969,22 @@ test "content service: Office documents are extracted once per version" {
         try testing.expectEqual(@as(usize, 1), hits.len);
         try testing.expectEqualStrings(report, hits[0].path);
         try testing.expect(hits[0].extracted);
-        const text = s.readText(f.arena_state.allocator(), hits[0].path, hits[0].mtime, true, std.math.maxInt(u32)).?;
+        const text = s.readText(
+            f.arena_state.allocator(),
+            hits[0].path,
+            hits[0].mtime,
+            true,
+            std.math.maxInt(u32),
+        ).?;
         try testing.expectEqualStrings("Minutes about the wombat project", text);
         // Asked as plain text, the zip is not the text.
-        if (s.readText(f.arena_state.allocator(), hits[0].path, hits[0].mtime, false, std.math.maxInt(u32))) |raw| {
+        if (s.readText(
+            f.arena_state.allocator(),
+            hits[0].path,
+            hits[0].mtime,
+            false,
+            std.math.maxInt(u32),
+        )) |raw| {
             try testing.expect(std.mem.find(u8, raw, "wombat") == null);
         }
 

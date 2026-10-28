@@ -49,7 +49,12 @@ pub const Layout = enum {
 /// Where a window of size `current` (w, h) goes for `layout`, with `gap`
 /// pixels kept around it.
 pub fn place(layout: Layout, area: Rect, current_w: i32, current_h: i32, gap: i32) Rect {
-    const a: Rect = .{ .x = area.x + gap, .y = area.y + gap, .w = area.w - 2 * gap, .h = area.h - 2 * gap };
+    const a: Rect = .{
+        .x = area.x + gap,
+        .y = area.y + gap,
+        .w = area.w - 2 * gap,
+        .h = area.h - 2 * gap,
+    };
     const half_w = @divTrunc(a.w - gap, 2);
     const half_h = @divTrunc(a.h - gap, 2);
     const third = @divTrunc(a.w - 2 * gap, 3);
@@ -63,7 +68,12 @@ pub fn place(layout: Layout, area: Rect, current_w: i32, current_h: i32, gap: i3
         .center => blk: {
             const w = @min(current_w, a.w);
             const h = @min(current_h, a.h);
-            break :blk .{ .x = a.x + @divTrunc(a.w - w, 2), .y = a.y + @divTrunc(a.h - h, 2), .w = w, .h = h };
+            break :blk .{
+                .x = a.x + @divTrunc(a.w - w, 2),
+                .y = a.y + @divTrunc(a.h - h, 2),
+                .w = w,
+                .h = h,
+            };
         },
         .first_third => .{ .x = a.x, .y = a.y, .w = third, .h = a.h },
         .center_third => .{ .x = a.x + third + gap, .y = a.y, .w = third, .h = a.h },
@@ -79,7 +89,15 @@ fn shrinkCentered(a: Rect, f: f64) Rect {
 
 test "usable area honours rotation and bars" {
     // The rotated 1600x900 monitor on this machine, bar on top.
-    const m: Monitor = .{ .x = 4307, .y = 0, .width = 1600, .height = 900, .scale = 1, .transform = 3, .reserved = .{ 0, 38, 0, 0 } };
+    const m: Monitor = .{
+        .x = 4307,
+        .y = 0,
+        .width = 1600,
+        .height = 900,
+        .scale = 1,
+        .transform = 3,
+        .reserved = .{ 0, 38, 0, 0 },
+    };
     const u = m.usable();
     try std.testing.expectEqual(Rect{ .x = 4307, .y = 38, .w = 900, .h = 1562 }, u);
 }

@@ -123,7 +123,11 @@ const Encoder = struct {
                     // Only string keys: converting a number key in place
                     // would break the traversal.
                     const key = lua.toSlice(L, -2) orelse
-                        lua.raise(L, "json.encode: object keys must be strings, got {s}", .{lua.typeName(L, -2)});
+                        lua.raise(
+                            L,
+                            "json.encode: object keys must be strings, got {s}",
+                            .{lua.typeName(L, -2)},
+                        );
                     if (!first) try w.writeByte(',');
                     first = false;
                     try std.json.Stringify.encodeJsonString(key, .{}, w);
@@ -213,5 +217,8 @@ test "json reports bad input instead of crashing" {
     try expectError("json.encode({[{}] = 1})", "keys must be strings");
     try expectError("local t = {} t.t = t json.encode(t)", "nested too deeply");
     try expectError("json.encode(0/0)", "cannot encode");
-    try expectError("json.decode(string.rep('[', 1000) .. string.rep(']', 1000))", "nested too deeply");
+    try expectError(
+        "json.decode(string.rep('[', 1000) .. string.rep(']', 1000))",
+        "nested too deeply",
+    );
 }

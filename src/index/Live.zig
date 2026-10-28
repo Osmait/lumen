@@ -96,7 +96,13 @@ limits: Limits = .{},
 /// Takes a store (mapped or fresh) with no watches armed yet: searchable
 /// right away, watches armed in batches by `armProgress`. Owns `base` once
 /// it returns; on error `base` is still the caller's.
-pub fn initUnarmed(gpa: std.mem.Allocator, base: Store, cfg: *const scan.Config, cache_path: ?[:0]const u8, scan_pool: *Pool) (std.mem.Allocator.Error || Watcher.CreateError)!Live {
+pub fn initUnarmed(
+    gpa: std.mem.Allocator,
+    base: Store,
+    cfg: *const scan.Config,
+    cache_path: ?[:0]const u8,
+    scan_pool: *Pool,
+) (std.mem.Allocator.Error || Watcher.CreateError)!Live {
     var b: Builder = .empty;
     var delta = try b.finish(gpa);
     errdefer delta.deinit(gpa);
@@ -181,7 +187,9 @@ pub fn apply(l: *Live, changes: []const Watcher.Change) std.mem.Allocator.Error!
             // re-pointed to (the rescanned destination), and tombstoning it
             // made a directory moved inside the tree vanish.
             if (!l.alive(id) or l.pathExists(id)) continue;
-            l.stats.removed += if (isDelta(id)) l.tombstoneDeltaTree(deltaIdx(id)) else l.tombstoneBaseTree(id);
+            l.stats.removed += if (isDelta(id)) l.tombstoneDeltaTree(
+                deltaIdx(id),
+            ) else l.tombstoneBaseTree(id);
             n += 1;
         },
         .overflow => unreachable, // returned above: an overflow resyncs instead
@@ -271,13 +279,22 @@ fn hiddenFlag(l: *const Live, parent: u32, name: []const u8) u8 {
 fn descends(l: *const Live, parent: []const u8, name: []const u8) bool {
     for (l.cfg.skip) |rule| {
         if (std.mem.findScalarLast(u8, rule, '/')) |slash| {
-            if (std.mem.eql(u8, rule[slash + 1 ..], name) and std.mem.endsWith(u8, parent, rule[0..slash])) return false;
+            if (std.mem.eql(
+                u8,
+                rule[slash + 1 ..],
+                name,
+            ) and std.mem.endsWith(u8, parent, rule[0..slash])) return false;
         } else if (std.mem.eql(u8, rule, name)) return false;
     }
     for (l.cfg.cachedir_probe) |probe| {
         if (!std.mem.eql(u8, probe, name)) continue;
         var buf: [4096]u8 = undefined;
-        const tag = std.mem.printSentinel(&buf, "{s}/{s}/CACHEDIR.TAG", .{ parent, name }, 0) catch return true;
+        const tag = std.mem.printSentinel(
+            &buf,
+            "{s}/{s}/CACHEDIR.TAG",
+            .{ parent, name },
+            0,
+        ) catch return true;
         if (sys.exists(tag)) return false;
     }
     return true;
@@ -353,7 +370,10 @@ fn add(l: *Live, parent: u32, name: []const u8, is_dir: bool) !bool {
     const hidden = l.hiddenFlag(parent, name);
     // A parent already in the delta is used as is; a base parent gets a
     // scaffolding root.
-    const root = if (isDelta(parent)) deltaIdx(parent) else try l.deltaRoot(parent_path, depth -| 1);
+    const root = if (isDelta(parent)) deltaIdx(parent) else try l.deltaRoot(
+        parent_path,
+        depth -| 1,
+    );
 
     if (is_dir and !l.descends(parent_path, name)) {
         // Skipped like the scan does: searchable, never opened.
@@ -363,7 +383,11 @@ fn add(l: *Live, parent: u32, name: []const u8, is_dir: bool) !bool {
         // inotify race: files may have appeared before the watch existed, so
         // a new directory is scanned whole.
         var fbuf: [4096]u8 = undefined;
-        const full = std.mem.print(&fbuf, "{s}{s}{s}", .{ parent_path, if (std.mem.endsWith(u8, parent_path, "/")) "" else "/", name }) catch return false;
+        const full = std.mem.print(&fbuf, "{s}{s}{s}", .{
+            parent_path,
+            if (std.mem.endsWith(u8, parent_path, "/")) "" else "/",
+            name,
+        }) catch return false;
         var sub_cfg = l.cfg.*;
         sub_cfg.roots = &.{full};
         var sub = try scan.scan(l.gpa, l.scan_pool, &sub_cfg, null, null);
@@ -389,7 +413,14 @@ fn add(l: *Live, parent: u32, name: []const u8, is_dir: bool) !bool {
 /// Copies a freshly scanned sub-index into the delta. Its root is relabelled
 /// with `basename` (scan names roots by absolute path, which here would be
 /// a result that does not exist after compaction).
-fn appendStore(l: *Live, sub: *const Store, parent: u32, basename: []const u8, base_depth: u16, hidden: u8) ![]u32 {
+fn appendStore(
+    l: *Live,
+    sub: *const Store,
+    parent: u32,
+    basename: []const u8,
+    base_depth: u16,
+    hidden: u8,
+) ![]u32 {
     const map = try l.gpa.alloc(u32, sub.len());
     const ps = sub.parents();
     const fl = sub.flags();
@@ -408,7 +439,13 @@ fn appendStore(l: *Live, sub: *const Store, parent: u32, basename: []const u8, b
 /// it rebuilds paths but never shows up (mask 0).
 fn deltaRoot(l: *Live, dir_path: []const u8, depth: u16) !u32 {
     if (l.delta_roots.get(dir_path)) |id| return id;
-    const id = try l.delta_b.pushStructural(l.gpa, dir_path, store_mod.no_parent, store_mod.flag_dir, depth);
+    const id = try l.delta_b.pushStructural(
+        l.gpa,
+        dir_path,
+        store_mod.no_parent,
+        store_mod.flag_dir,
+        depth,
+    );
     const key = try l.gpa.dupe(u8, dir_path);
     errdefer l.gpa.free(key);
     try l.delta_roots.put(l.gpa, key, id);
@@ -460,21 +497,40 @@ fn rebuildDelta(l: *Live) !void {
 
 /// Searches base and delta and merges by score. Paths are allocated in
 /// `arena`.
-pub fn search(l: *Live, arena: std.mem.Allocator, pool: *Pool, query: []const u8, opts: engine.Options, out: *std.ArrayList(Hit)) std.mem.Allocator.Error!void {
+pub fn search(
+    l: *Live,
+    arena: std.mem.Allocator,
+    pool: *Pool,
+    query: []const u8,
+    opts: engine.Options,
+    out: *std.ArrayList(Hit),
+) std.mem.Allocator.Error!void {
     const limit = opts.limit;
     out.clearRetainingCapacity();
     var hits: std.ArrayList(engine.Hit) = .empty;
     defer hits.deinit(l.gpa);
     var buf: [4096]u8 = undefined;
     try l.engine_base.search(l.gpa, pool, &l.base, query, opts, &hits);
-    for (hits.items) |h| try out.append(arena, .{ .path = try arena.dupe(u8, l.base.path(h.id, &buf)), .score = h.score, .is_dir = l.base.isDir(h.id) });
+    for (hits.items) |h| try out.append(arena, .{
+        .path = try arena.dupe(u8, l.base.path(h.id, &buf)),
+        .score = h.score,
+        .is_dir = l.base.isDir(h.id),
+    });
     if (l.delta.len() > 0) {
         try l.engine_delta.search(l.gpa, pool, &l.delta, query, opts, &hits);
-        for (hits.items) |h| try out.append(arena, .{ .path = try arena.dupe(u8, l.delta.path(h.id, &buf)), .score = h.score, .is_dir = l.delta.isDir(h.id) });
+        for (hits.items) |h| try out.append(arena, .{
+            .path = try arena.dupe(u8, l.delta.path(h.id, &buf)),
+            .score = h.score,
+            .is_dir = l.delta.isDir(h.id),
+        });
     }
     std.mem.sort(Hit, out.items, {}, struct {
         fn lt(_: void, a: Hit, b: Hit) bool {
-            return a.score > b.score or (a.score == b.score and std.mem.order(u8, a.path, b.path) == .lt);
+            return a.score > b.score or (a.score == b.score and std.mem.order(
+                u8,
+                a.path,
+                b.path,
+            ) == .lt);
         }
     }.lt);
     // Something can be in both (created during a rescan): keep the best.
@@ -532,7 +588,12 @@ pub fn needsCompaction(l: *const Live) bool {
 /// Builds the replacement index without touching the current one: the
 /// expensive part runs unlocked, alongside searches. Watching while scanning
 /// means nothing that changes meanwhile is lost.
-pub fn prepareCompaction(gpa: std.mem.Allocator, pool: *Pool, cfg: *const scan.Config, cache_path: ?[:0]const u8) (std.mem.Allocator.Error || Watcher.CreateError)!Replaced {
+pub fn prepareCompaction(
+    gpa: std.mem.Allocator,
+    pool: *Pool,
+    cfg: *const scan.Config,
+    cache_path: ?[:0]const u8,
+) (std.mem.Allocator.Error || Watcher.CreateError)!Replaced {
     const w = try Watcher.create(gpa);
     errdefer w.destroy(gpa);
     var base = try scan.scan(gpa, pool, cfg, w, null);
@@ -591,11 +652,18 @@ const Tree = struct {
         const gpa = testing.allocator;
         const t = try gpa.create(Tree);
         errdefer gpa.destroy(t);
-        t.* = .{ .tmp = testing.tmpDir(.{}), .pool = try Pool.create(gpa, testing.io, 2), .arena = .init(gpa) };
+        t.* = .{
+            .tmp = testing.tmpDir(.{}),
+            .pool = try Pool.create(gpa, testing.io, 2),
+            .arena = .init(gpa),
+        };
         var cwd_buf: [4096]u8 = undefined;
         const cwd = std.mem.sliceTo(cwd_buf[0..linux.getcwd(&cwd_buf, cwd_buf.len)], 0);
         var rel_buf: [4096]u8 = undefined;
-        t.dir = try std.mem.print(&t.dir_buf, "{s}/{s}", .{ cwd, try sys.tmpDirPath(&t.tmp, &rel_buf) });
+        t.dir = try std.mem.print(&t.dir_buf, "{s}/{s}", .{
+            cwd,
+            try sys.tmpDirPath(&t.tmp, &rel_buf),
+        });
         t.root = try std.mem.print(&t.root_buf, "{s}/root", .{t.dir});
         t.roots = .{t.root};
         t.cfg = .{ .roots = &t.roots };
@@ -618,7 +686,12 @@ const Tree = struct {
 
     /// Absolute path of `rel`, relative to the temp dir.
     fn abs(t: *Tree, rel: []const u8, buf: *[4096]u8) [:0]const u8 {
-        return std.mem.printSentinel(buf, "{s}/{s}", .{ t.dir, std.mem.trimEnd(u8, rel, "/") }, 0) catch unreachable;
+        return std.mem.printSentinel(
+            buf,
+            "{s}/{s}",
+            .{ t.dir, std.mem.trimEnd(u8, rel, "/") },
+            0,
+        ) catch unreachable;
     }
 
     fn mkAbs(t: *Tree, rel: []const u8) void {
@@ -626,7 +699,9 @@ const Tree = struct {
         if (std.mem.endsWith(u8, rel, "/")) {
             sys.mkdirP(t.abs(rel, &buf));
         } else {
-            if (std.mem.findScalarLast(u8, rel, '/')) |slash| sys.mkdirP(t.abs(rel[0..slash], &buf));
+            if (std.mem.findScalarLast(u8, rel, '/')) |slash| sys.mkdirP(
+                t.abs(rel[0..slash], &buf),
+            );
             sys.writeFile(t.abs(rel, &buf), "x") catch unreachable;
         }
     }
@@ -673,7 +748,10 @@ const Tree = struct {
         var buf: [4096]u8 = undefined;
         const want = try std.mem.print(&buf, "{s}/{s}", .{ t.root, rel });
         var n: usize = 0;
-        for (try t.searchOpts(query, .{ .limit = 50, .recency = false })) |h| n += @intFromBool(std.mem.eql(u8, h.path, want));
+        for (try t.searchOpts(query, .{
+            .limit = 50,
+            .recency = false,
+        })) |h| n += @intFromBool(std.mem.eql(u8, h.path, want));
         return n;
     }
 
@@ -689,7 +767,9 @@ const Tree = struct {
         const prefix = try std.mem.print(&buf, "{s}/{s}", .{ t.dir, rel });
         var n: usize = 0;
         for (try t.searchOpts(query, .{ .limit = 50, .recency = false })) |h| {
-            n += @intFromBool(std.mem.startsWith(u8, h.path, prefix) and !std.mem.eql(u8, h.path, t.root));
+            n += @intFromBool(
+                std.mem.startsWith(u8, h.path, prefix) and !std.mem.eql(u8, h.path, t.root),
+            );
         }
         return n;
     }
@@ -706,12 +786,20 @@ const Tree = struct {
     fn scoreOf(t: *Tree, query: []const u8, rel: []const u8) !?i32 {
         var buf: [4096]u8 = undefined;
         const want = try std.mem.print(&buf, "{s}/{s}", .{ t.root, rel });
-        for (try t.searchOpts(query, .{ .limit = 50, .recency = false })) |h| if (std.mem.eql(u8, h.path, want)) return h.score;
+        for (try t.searchOpts(query, .{
+            .limit = 50,
+            .recency = false,
+        })) |h| if (std.mem.eql(u8, h.path, want)) return h.score;
         return null;
     }
 };
 
-const sample_tree = [_][]const u8{ "src/main.rs", "Cargo.toml", "modulo/interno/hoja.rs", "modulo/raiz.rs" };
+const sample_tree = [_][]const u8{
+    "src/main.rs",
+    "Cargo.toml",
+    "modulo/interno/hoja.rs",
+    "modulo/raiz.rs",
+};
 
 test "live: moving a directory out of the tree leaves no ghost paths" {
     const t = try Tree.create(&sample_tree);
@@ -776,7 +864,11 @@ test "live: a MOVE_SELF read after the move was applied keeps the destination" {
     var want_buf: [4096]u8 = undefined;
     const want = try std.mem.print(&want_buf, "{s}/renombrado", .{t.root});
     while (it.next()) |id| {
-        if (isDelta(id.*) and std.mem.eql(u8, t.live.pathOf(id.*, &buf) orelse "", want)) dest = id.*;
+        if (isDelta(id.*) and std.mem.eql(
+            u8,
+            t.live.pathOf(id.*, &buf) orelse "",
+            want,
+        )) dest = id.*;
     }
     try testing.expect(dest != null);
     _ = try t.live.apply(&.{.{ .dir_gone = dest.? }});
@@ -874,10 +966,18 @@ test "live: an event for something already indexed adds no duplicate" {
     try testing.expectEqual(0, try t.sync());
     try testing.expectEqual(1, try t.count("durante", "durante.rs"));
     // An IN_MOVED_TO of something known, base or delta.
-    try testing.expectEqual(0, try t.live.apply(&.{.{ .created = .{ .parent = 0, .name = "Cargo.toml", .is_dir = false } }}));
+    try testing.expectEqual(0, try t.live.apply(&.{.{ .created = .{
+        .parent = 0,
+        .name = "Cargo.toml",
+        .is_dir = false,
+    } }}));
     t.mk("despues.rs");
     try testing.expectEqual(1, try t.sync());
-    try testing.expectEqual(0, try t.live.apply(&.{.{ .created = .{ .parent = 0, .name = "despues.rs", .is_dir = false } }}));
+    try testing.expectEqual(0, try t.live.apply(&.{.{ .created = .{
+        .parent = 0,
+        .name = "despues.rs",
+        .is_dir = false,
+    } }}));
     try testing.expectEqual(1, try t.count("despues", "despues.rs"));
     try testing.expectEqual(1, try t.count("cargo", "Cargo.toml"));
 }
@@ -904,7 +1004,10 @@ test "live: an overflow requests a rescan and does not do it" {
     try testing.expect(!t.live.pending_resync);
     const t0 = sys.monotonicNs();
     // Whatever else came with it is moot: a rescan follows.
-    _ = try t.live.apply(&.{ .{ .created = .{ .parent = 0, .name = "nunca.rs", .is_dir = false } }, .overflow });
+    _ = try t.live.apply(&.{
+        .{ .created = .{ .parent = 0, .name = "nunca.rs", .is_dir = false } },
+        .overflow,
+    });
     try testing.expect(sys.monotonicNs() - t0 < 50 * std.time.ns_per_ms);
     try testing.expect(t.live.pending_resync);
     try testing.expectEqual(1, t.live.stats.resyncs);
@@ -929,7 +1032,10 @@ test "live: adopt leaves a clean index that finds the same" {
 
     const arena = t.arena.allocator();
     var before: std.ArrayList([]const u8) = .empty;
-    for (try t.searchOpts("rs", .{ .limit = 50, .recency = false })) |h| try before.append(arena, h.path);
+    for (try t.searchOpts("rs", .{
+        .limit = 50,
+        .recency = false,
+    })) |h| try before.append(arena, h.path);
     try t.compact();
 
     try testing.expectEqual(0, t.live.delta.len());
@@ -1031,10 +1137,16 @@ test "live: recency on a file deleted but not yet applied" {
     // The event is still queued: the stale entry is stat'ed and must just
     // get no bonus.
     var any = false;
-    for (try t.searchOpts("main", .{ .limit = 50 })) |h| any = any or std.mem.endsWith(u8, h.path, "/src/main.rs");
+    for (try t.searchOpts("main", .{ .limit = 50 })) |h| any = any or std.mem.endsWith(
+        u8,
+        h.path,
+        "/src/main.rs",
+    );
     try testing.expect(any);
     _ = try t.sync();
-    for (try t.searchOpts("main", .{ .limit = 50 })) |h| try testing.expect(!std.mem.endsWith(u8, h.path, "/src/main.rs"));
+    for (try t.searchOpts("main", .{ .limit = 50 })) |h| try testing.expect(
+        !std.mem.endsWith(u8, h.path, "/src/main.rs"),
+    );
 }
 
 test "live: one path in base and delta comes out once" {

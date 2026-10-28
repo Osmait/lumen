@@ -30,7 +30,11 @@ pub fn extensionRows(ui: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item)) v
             .accessory = (if (n > 0)
                 a.printSentinel("{d} {s}", .{ n, if (n == 1) "setting" else "settings" }, 0)
             else
-                a.printSentinel("{d} {s}", .{ e.commands, if (e.commands == 1) "command" else "commands" }, 0)) catch "",
+                a.printSentinel(
+                    "{d} {s}",
+                    .{ e.commands, if (e.commands == 1) "command" else "commands" },
+                    0,
+                )) catch "",
             .icon = .{ .tile = .{ .name = "application-x-addon-symbolic", .color = .purple } },
             .keywords = "extension preferences update uninstall",
             .action = .{ .setting = .{ .ext_prefs = e.id } },
@@ -138,7 +142,11 @@ pub fn display(a: std.mem.Allocator, p: *const Host.Pref, value: []const u8) [:0
         .choice => for (p.choices) |ch| {
             if (std.mem.eql(u8, ch.value, value)) break ch.label;
         } else a.dupeSentinel(u8, value, 0) catch "",
-        .text => if (value.len == 0) "Not set" else a.dupeSentinel(u8, value[0..@min(value.len, 40)], 0) catch "",
+        .text => if (value.len == 0) "Not set" else a.dupeSentinel(
+            u8,
+            value[0..@min(value.len, 40)],
+            0,
+        ) catch "",
         .password => if (value.len == 0) "Not set" else "••••••••",
     };
 }
@@ -161,7 +169,12 @@ fn readStored(arena: std.mem.Allocator, file: [:0]const u8) Stored {
     if (len > prefs_bytes_max) return .unreadable;
     const text = contents.?[0..len];
     if (std.mem.trim(u8, text, " \t\r\n").len == 0) return .absent;
-    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{ .allocate = .alloc_always }) catch return .unreadable;
+    const v = std.json.parseFromSliceLeaky(
+        std.json.Value,
+        arena,
+        text,
+        .{ .allocate = .alloc_always },
+    ) catch return .unreadable;
     return if (v == .object) .{ .values = v.object } else .unreadable;
 }
 
@@ -262,7 +275,15 @@ pub fn inputCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
     const row = a.alloc(Item, 1) catch return &.{};
     row[0] = .{
         .key = "input:save",
-        .title = if (ui.input == .field) a.printSentinel("Set {s}", .{p.title}, 0) catch "Set" else a.printSentinel("Save {s}", .{p.title}, 0) catch "Save",
+        .title = if (ui.input == .field) a.printSentinel(
+            "Set {s}",
+            .{p.title},
+            0,
+        ) catch "Set" else a.printSentinel(
+            "Save {s}",
+            .{p.title},
+            0,
+        ) catch "Save",
         .subtitle = if (p.description.len > 0) p.description else "Type the value above",
         .icon = iconOf(p.kind),
         .action = .{ .setting = .save_input },
@@ -299,7 +320,11 @@ fn save(ui: *Ui, p: *const Host.Pref, value: std.json.Value) bool {
         ui.showFailure("Could not save the setting");
         return false;
     };
-    const json = std.json.Stringify.valueAlloc(a, std.json.Value{ .object = obj }, .{ .whitespace = .indent_2 }) catch {
+    const json = std.json.Stringify.valueAlloc(
+        a,
+        std.json.Value{ .object = obj },
+        .{ .whitespace = .indent_2 },
+    ) catch {
         ui.showFailure("Could not save the setting");
         return false;
     };

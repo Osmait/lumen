@@ -178,13 +178,19 @@ fn expectMarkup(md: []const u8, want: []const u8) !void {
 test "inline spans" {
     try expectMarkup("**bold** and *it* and _it_", "<b>bold</b> and <i>it</i> and <i>it</i>");
     try expectMarkup("run `zig build` now", "run <tt>zig build</tt> now");
-    try expectMarkup("see [docs](https://ziglang.org)", "see <a href=\"https://ziglang.org\">docs</a>");
+    try expectMarkup(
+        "see [docs](https://ziglang.org)",
+        "see <a href=\"https://ziglang.org\">docs</a>",
+    );
     try expectMarkup("**bold _and it_**", "<b>bold <i>and it</i></b>");
     try expectMarkup("`<b>` is & stays", "<tt>&lt;b&gt;</tt> is &amp; stays");
 }
 
 test "blocks" {
-    try expectMarkup("# Title\n## Sub\ntext", "<span size=\"x-large\" weight=\"bold\">Title</span>\n<span size=\"large\" weight=\"bold\">Sub</span>\ntext");
+    try expectMarkup(
+        "# Title\n## Sub\ntext",
+        "<span size=\"x-large\" weight=\"bold\">Title</span>\n<span size=\"large\" weight=\"bold\">Sub</span>\ntext",
+    );
     try expectMarkup("- one\n2. two", "  •  one\n  2.  two");
     try expectMarkup("> quoted", "<span fgalpha=\"70%\"><i>quoted</i></span>");
     try expectMarkup("```\nlet x = <1>;\n```\nafter", "<tt>let x = &lt;1&gt;;</tt>\nafter");

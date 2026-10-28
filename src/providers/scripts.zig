@@ -41,7 +41,10 @@ fn copy(a: std.mem.Allocator, it: Item) std.mem.Allocator.Error!Item {
     o.subtitle = try a.dupeSentinel(u8, it.subtitle, 0);
     o.keywords = try a.dupe(u8, it.keywords);
     if (it.icon == .emoji) o.icon = .{ .emoji = try a.dupeSentinel(u8, it.icon.emoji, 0) };
-    o.action = .{ .script = .{ .path = try a.dupeSentinel(u8, it.action.script.path, 0), .mode = it.action.script.mode } };
+    o.action = .{ .script = .{
+        .path = try a.dupeSentinel(u8, it.action.script.path, 0),
+        .mode = it.action.script.mode,
+    } };
     return o;
 }
 
@@ -82,7 +85,11 @@ fn scan(a: std.mem.Allocator) []Item {
         items.append(a, .{
             .key = a.print("script:{s}", .{name}) catch continue,
             .title = a.dupeSentinel(u8, meta.title, 0) catch continue,
-            .subtitle = a.dupeSentinel(u8, if (meta.package_name.len > 0) meta.package_name else "Script Command", 0) catch continue,
+            .subtitle = a.dupeSentinel(
+                u8,
+                if (meta.package_name.len > 0) meta.package_name else "Script Command",
+                0,
+            ) catch continue,
             .accessory = "Script",
             .keywords = a.dupe(u8, meta.description) catch "",
             .confirm = meta.needs_confirmation,

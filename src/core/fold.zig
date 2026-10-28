@@ -234,7 +234,20 @@ test "case of the original letter" {
 }
 
 test "symbols never fold to letters" {
-    for ([_][]const u8{ "×", "÷", "¿", "¡", "«", "»", "°", "ª", "µ", "€", "ж", "日本" }) |s| try expectFold(s, s);
+    for ([_][]const u8{
+        "×",
+        "÷",
+        "¿",
+        "¡",
+        "«",
+        "»",
+        "°",
+        "ª",
+        "µ",
+        "€",
+        "ж",
+        "日本",
+    }) |s| try expectFold(s, s);
     try expectFold("¿que?", "¿Qué?");
     try expectFold("3×4", "3×4");
 }
@@ -253,14 +266,30 @@ test "invalid and truncated UTF-8 passes through" {
 test "folding is idempotent and never lengthens" {
     var prng = std.Random.DefaultPrng.init(11);
     const r = prng.random();
-    const pieces = [_][]const u8{ "a", "Z", "é", "Ñ", "×", "\xC3", "\xA1", "\xC5", "ŉ", " ", "日", "ſ" };
+    const pieces = [_][]const u8{
+        "a",    "Z",
+        "é",
+        "Ñ",
+        "×",
+        "\xC3", "\xA1",
+        "\xC5",
+        "ŉ",
+        " ",
+        "日",
+        "ſ",
+    };
     var s: [64]u8 = undefined;
     var once: [64]u8 = undefined;
     var twice: [64]u8 = undefined;
     for (0..5000) |_| {
         var n: usize = 0;
         while (n < 50) {
-            const p = if (r.boolean()) pieces[r.uintLessThan(usize, pieces.len)] else &[_]u8{r.int(u8)};
+            const p = if (r.boolean()) pieces[
+                r.uintLessThan(
+                    usize,
+                    pieces.len,
+                )
+            ] else &[_]u8{r.int(u8)};
             @memcpy(s[n .. n + p.len], p);
             n += p.len;
         }

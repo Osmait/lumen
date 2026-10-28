@@ -30,19 +30,136 @@ pub const Theme = struct {
 pub const auto_id = "auto";
 
 pub const all = [_]Theme{
-    .{ .id = "lumen-dark", .name = "Lumen Dark", .dark = true, .bg = 0x1b1b1e, .surface = 0x28282c, .fg = 0xececee, .ink = 0xffffff, .accent = 0xff6363 },
-    .{ .id = "lumen-light", .name = "Lumen Light", .dark = false, .bg = 0xf5f7fb, .surface = 0xffffff, .fg = 0x10131a, .ink = 0x000000, .accent = 0x3a5bd9 },
-    .{ .id = "catppuccin-mocha", .name = "Catppuccin Mocha", .dark = true, .bg = 0x1e1e2e, .surface = 0x313244, .fg = 0xcdd6f4, .ink = 0xcdd6f4, .accent = 0xcba6f7 },
-    .{ .id = "catppuccin-latte", .name = "Catppuccin Latte", .dark = false, .bg = 0xeff1f5, .surface = 0xe6e9ef, .fg = 0x4c4f69, .ink = 0x11111b, .accent = 0x8839ef },
-    .{ .id = "dracula", .name = "Dracula", .dark = true, .bg = 0x282a36, .surface = 0x343746, .fg = 0xf8f8f2, .ink = 0xf8f8f2, .accent = 0xbd93f9 },
-    .{ .id = "nord", .name = "Nord", .dark = true, .bg = 0x2e3440, .surface = 0x3b4252, .fg = 0xeceff4, .ink = 0xd8dee9, .accent = 0x88c0d0 },
-    .{ .id = "gruvbox-dark", .name = "Gruvbox Dark", .dark = true, .bg = 0x282828, .surface = 0x3c3836, .fg = 0xebdbb2, .ink = 0xebdbb2, .accent = 0xfe8019 },
-    .{ .id = "gruvbox-light", .name = "Gruvbox Light", .dark = false, .bg = 0xfbf1c7, .surface = 0xf2e5bc, .fg = 0x3c3836, .ink = 0x1d2021, .accent = 0xaf3a03 },
-    .{ .id = "tokyo-night", .name = "Tokyo Night", .dark = true, .bg = 0x1a1b26, .surface = 0x24283b, .fg = 0xc0caf5, .ink = 0xc0caf5, .accent = 0x7aa2f7 },
-    .{ .id = "rose-pine", .name = "Rosé Pine", .dark = true, .bg = 0x191724, .surface = 0x1f1d2e, .fg = 0xe0def4, .ink = 0xe0def4, .accent = 0xebbcba },
-    .{ .id = "one-dark", .name = "One Dark", .dark = true, .bg = 0x282c34, .surface = 0x2f343f, .fg = 0xabb2bf, .ink = 0xdcdfe4, .accent = 0x61afef },
-    .{ .id = "solarized-dark", .name = "Solarized Dark", .dark = true, .bg = 0x002b36, .surface = 0x073642, .fg = 0x93a1a1, .ink = 0xfdf6e3, .accent = 0x268bd2 },
-    .{ .id = "solarized-light", .name = "Solarized Light", .dark = false, .bg = 0xfdf6e3, .surface = 0xeee8d5, .fg = 0x586e75, .ink = 0x002b36, .accent = 0x268bd2 },
+    .{
+        .id = "lumen-dark",
+        .name = "Lumen Dark",
+        .dark = true,
+        .bg = 0x1b1b1e,
+        .surface = 0x28282c,
+        .fg = 0xececee,
+        .ink = 0xffffff,
+        .accent = 0xff6363,
+    },
+    .{
+        .id = "lumen-light",
+        .name = "Lumen Light",
+        .dark = false,
+        .bg = 0xf5f7fb,
+        .surface = 0xffffff,
+        .fg = 0x10131a,
+        .ink = 0x000000,
+        .accent = 0x3a5bd9,
+    },
+    .{
+        .id = "catppuccin-mocha",
+        .name = "Catppuccin Mocha",
+        .dark = true,
+        .bg = 0x1e1e2e,
+        .surface = 0x313244,
+        .fg = 0xcdd6f4,
+        .ink = 0xcdd6f4,
+        .accent = 0xcba6f7,
+    },
+    .{
+        .id = "catppuccin-latte",
+        .name = "Catppuccin Latte",
+        .dark = false,
+        .bg = 0xeff1f5,
+        .surface = 0xe6e9ef,
+        .fg = 0x4c4f69,
+        .ink = 0x11111b,
+        .accent = 0x8839ef,
+    },
+    .{
+        .id = "dracula",
+        .name = "Dracula",
+        .dark = true,
+        .bg = 0x282a36,
+        .surface = 0x343746,
+        .fg = 0xf8f8f2,
+        .ink = 0xf8f8f2,
+        .accent = 0xbd93f9,
+    },
+    .{
+        .id = "nord",
+        .name = "Nord",
+        .dark = true,
+        .bg = 0x2e3440,
+        .surface = 0x3b4252,
+        .fg = 0xeceff4,
+        .ink = 0xd8dee9,
+        .accent = 0x88c0d0,
+    },
+    .{
+        .id = "gruvbox-dark",
+        .name = "Gruvbox Dark",
+        .dark = true,
+        .bg = 0x282828,
+        .surface = 0x3c3836,
+        .fg = 0xebdbb2,
+        .ink = 0xebdbb2,
+        .accent = 0xfe8019,
+    },
+    .{
+        .id = "gruvbox-light",
+        .name = "Gruvbox Light",
+        .dark = false,
+        .bg = 0xfbf1c7,
+        .surface = 0xf2e5bc,
+        .fg = 0x3c3836,
+        .ink = 0x1d2021,
+        .accent = 0xaf3a03,
+    },
+    .{
+        .id = "tokyo-night",
+        .name = "Tokyo Night",
+        .dark = true,
+        .bg = 0x1a1b26,
+        .surface = 0x24283b,
+        .fg = 0xc0caf5,
+        .ink = 0xc0caf5,
+        .accent = 0x7aa2f7,
+    },
+    .{
+        .id = "rose-pine",
+        .name = "Rosé Pine",
+        .dark = true,
+        .bg = 0x191724,
+        .surface = 0x1f1d2e,
+        .fg = 0xe0def4,
+        .ink = 0xe0def4,
+        .accent = 0xebbcba,
+    },
+    .{
+        .id = "one-dark",
+        .name = "One Dark",
+        .dark = true,
+        .bg = 0x282c34,
+        .surface = 0x2f343f,
+        .fg = 0xabb2bf,
+        .ink = 0xdcdfe4,
+        .accent = 0x61afef,
+    },
+    .{
+        .id = "solarized-dark",
+        .name = "Solarized Dark",
+        .dark = true,
+        .bg = 0x002b36,
+        .surface = 0x073642,
+        .fg = 0x93a1a1,
+        .ink = 0xfdf6e3,
+        .accent = 0x268bd2,
+    },
+    .{
+        .id = "solarized-light",
+        .name = "Solarized Light",
+        .dark = false,
+        .bg = 0xfdf6e3,
+        .surface = 0xeee8d5,
+        .fg = 0x586e75,
+        .ink = 0x002b36,
+        .accent = 0x268bd2,
+    },
 };
 
 /// Themes from init.lua (`lumen.theme`); set by the UI when the files
@@ -61,12 +178,20 @@ pub fn find(id: []const u8, prefer_dark: bool) *const Theme {
 /// The name shown for a theme setting value ("Auto (Lumen Dark)").
 pub fn displayName(a: std.mem.Allocator, id: []const u8, prefer_dark: bool) [:0]const u8 {
     if (std.mem.eql(u8, id, auto_id))
-        return a.printSentinel("Automatic ({s})", .{find(id, prefer_dark).name}, 0) catch "Automatic";
+        return a.printSentinel(
+            "Automatic ({s})",
+            .{find(id, prefer_dark).name},
+            0,
+        ) catch "Automatic";
     return find(id, prefer_dark).name;
 }
 
 /// The variables block `style.css` is painted with.
-pub fn css(w: *std.Io.Writer, t: *const Theme, s: *const settings.Settings) std.Io.Writer.Error!void {
+pub fn css(
+    w: *std.Io.Writer,
+    t: *const Theme,
+    s: *const settings.Settings,
+) std.Io.Writer.Error!void {
     const scale: f32 = switch (s.text_size) {
         .small => 0.9,
         .default => 1,
@@ -82,7 +207,13 @@ pub fn css(w: *std.Io.Writer, t: *const Theme, s: *const settings.Settings) std.
     try rgba(w, "accent-soft", t.accent, 0.35);
     try rgba(w, "on-accent", onAccent(t), 1);
     try rgba(w, "shadow", 0, if (t.dark) 0.45 else 0.18);
-    const sizes = [_]struct { []const u8, f32 }{ .{ "font", 14 }, .{ "font-query", 18 }, .{ "font-small", 13 }, .{ "font-tiny", 12 }, .{ "font-mono", 12.5 }, .{ "font-calc", 26 }, .{ "font-emoji", 17 } };
+    const sizes = [_]struct { []const u8, f32 }{ .{ "font", 14 }, .{
+        "font-query",
+        18,
+    }, .{ "font-small", 13 }, .{ "font-tiny", 12 }, .{
+        "font-mono",
+        12.5,
+    }, .{ "font-calc", 26 }, .{ "font-emoji", 17 } };
     for (sizes) |sz| try w.print("  --{s}: {d:.1}px;\n", .{ sz[0], sz[1] * scale });
     // Density: row height and icon size (the Density setting).
     const row_h: u8, const icon: u8 = switch (s.density) {
@@ -95,7 +226,13 @@ pub fn css(w: *std.Io.Writer, t: *const Theme, s: *const settings.Settings) std.
 }
 
 fn rgba(w: *std.Io.Writer, name: []const u8, color: u24, a: f32) !void {
-    try w.print("  --{s}: rgba({d}, {d}, {d}, {d:.2});\n", .{ name, color >> 16, (color >> 8) & 0xff, color & 0xff, a });
+    try w.print("  --{s}: rgba({d}, {d}, {d}, {d:.2});\n", .{
+        name,
+        color >> 16,
+        (color >> 8) & 0xff,
+        color & 0xff,
+        a,
+    });
 }
 
 /// Text on an accent fill (the selected row): near-black or white,
@@ -155,7 +292,9 @@ fn mix(top: u24, under: u24, a: f64) u24 {
 }
 
 test "ids are unique and lookups fall back" {
-    for (all, 0..) |x, i| for (all[i + 1 ..]) |y| try std.testing.expect(!std.mem.eql(u8, x.id, y.id));
+    for (all, 0..) |x, i| for (all[i + 1 ..]) |y| try std.testing.expect(
+        !std.mem.eql(u8, x.id, y.id),
+    );
     try std.testing.expectEqualStrings("nord", find("nord", true).id);
     try std.testing.expectEqualStrings("lumen-dark", find("no-such-theme", false).id);
     try std.testing.expectEqualStrings("lumen-dark", find(auto_id, true).id);
@@ -197,6 +336,8 @@ test "text size and opacity reach the CSS" {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     try css(&out.writer, find("nord", true), &s);
-    try std.testing.expect(std.mem.find(u8, out.written(), "--bg: rgba(46, 52, 64, 0.80);") != null);
+    try std.testing.expect(
+        std.mem.find(u8, out.written(), "--bg: rgba(46, 52, 64, 0.80);") != null,
+    );
     try std.testing.expect(std.mem.find(u8, out.written(), "--font: 16.1px;") != null);
 }

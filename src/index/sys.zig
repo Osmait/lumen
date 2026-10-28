@@ -15,7 +15,11 @@ fn check(rc: usize) Error!usize {
 }
 
 pub fn openDir(path: [*:0]const u8) Error!i32 {
-    const rc = try check(linux.open(path, .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true }, 0));
+    const rc = try check(linux.open(
+        path,
+        .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true },
+        0,
+    ));
     return @intCast(rc);
 }
 
@@ -43,7 +47,9 @@ pub const DirIter = struct {
             }
             const d: *align(1) linux.dirent64 = @ptrCast(&it.buf[it.pos]);
             it.pos += d.reclen;
-            const name_ptr: [*:0]const u8 = @ptrCast(&it.buf[it.pos - d.reclen + @offsetOf(linux.dirent64, "name")]);
+            const name_ptr: [*:0]const u8 = @ptrCast(
+                &it.buf[it.pos - d.reclen + @offsetOf(linux.dirent64, "name")],
+            );
             const name = std.mem.span(name_ptr);
             if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
             return .{ .name = name, .kind = d.type };
@@ -60,7 +66,13 @@ pub const Kind = struct {
 /// d_type is UNKNOWN on some filesystems: then a statx tells.
 pub fn kindOf(path: [*:0]const u8) u8 {
     var stx: linux.Statx = undefined;
-    const rc = linux.statx(linux.AT.FDCWD, path, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &stx);
+    const rc = linux.statx(
+        linux.AT.FDCWD,
+        path,
+        linux.AT.SYMLINK_NOFOLLOW,
+        .{ .TYPE = true },
+        &stx,
+    );
     if (linux.errno(rc) != .SUCCESS) return Kind.unknown;
     return switch (stx.mode & linux.S.IFMT) {
         linux.S.IFDIR => Kind.dir,
@@ -92,7 +104,13 @@ pub fn exists(path: [*:0]const u8) bool {
 /// Modification time in unix seconds, or null.
 pub fn mtime(path: [*:0]const u8) ?i64 {
     var stx: linux.Statx = undefined;
-    const rc = linux.statx(linux.AT.FDCWD, path, linux.AT.SYMLINK_NOFOLLOW, .{ .MTIME = true }, &stx);
+    const rc = linux.statx(
+        linux.AT.FDCWD,
+        path,
+        linux.AT.SYMLINK_NOFOLLOW,
+        .{ .MTIME = true },
+        &stx,
+    );
     if (linux.errno(rc) != .SUCCESS) return null;
     return stx.mtime.sec;
 }
@@ -101,9 +119,19 @@ pub const Info = struct { size: u64, mtime: i64, is_dir: bool };
 
 pub fn info(path: [*:0]const u8) ?Info {
     var stx: linux.Statx = undefined;
-    const rc = linux.statx(linux.AT.FDCWD, path, 0, .{ .TYPE = true, .SIZE = true, .MTIME = true }, &stx);
+    const rc = linux.statx(
+        linux.AT.FDCWD,
+        path,
+        0,
+        .{ .TYPE = true, .SIZE = true, .MTIME = true },
+        &stx,
+    );
     if (linux.errno(rc) != .SUCCESS) return null;
-    return .{ .size = stx.size, .mtime = stx.mtime.sec, .is_dir = stx.mode & linux.S.IFMT == linux.S.IFDIR };
+    return .{
+        .size = stx.size,
+        .mtime = stx.mtime.sec,
+        .is_dir = stx.mode & linux.S.IFMT == linux.S.IFDIR,
+    };
 }
 
 /// Opens a file for reading only if it is a regular file. The index can
@@ -112,7 +140,11 @@ pub fn info(path: [*:0]const u8) ?Info {
 /// (search verification runs while the UI waits). O_NONBLOCK makes the open
 /// return at once; then fstat decides.
 pub fn openRegular(path: [*:0]const u8) Error!i32 {
-    const fd: i32 = @intCast(try check(linux.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true, .NOCTTY = true }, 0)));
+    const fd: i32 = @intCast(try check(linux.open(
+        path,
+        .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true, .NOCTTY = true },
+        0,
+    )));
     var stx: linux.Statx = undefined;
     const rc = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stx);
     if (linux.errno(rc) != .SUCCESS or stx.mode & linux.S.IFMT != linux.S.IFREG) {
@@ -145,14 +177,20 @@ pub fn monotonicNs() u64 {
 }
 
 pub fn sleepUs(us: u64) void {
-    const ts: linux.timespec = .{ .sec = @intCast(us / std.time.us_per_s), .nsec = @intCast((us % std.time.us_per_s) * 1000) };
+    const ts: linux.timespec = .{ .sec = @intCast(us / std.time.us_per_s), .nsec = @intCast(
+        (us % std.time.us_per_s) * 1000,
+    ) };
     _ = linux.nanosleep(&ts, null);
 }
 
 /// Lumen's own files (indexes, extracted text) hold the names and text of
 /// the user's documents: owner-only, never world-readable.
 pub fn writeFile(path: [*:0]const u8, data: []const u8) Error!void {
-    const fd: i32 = @intCast(try check(linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600)));
+    const fd: i32 = @intCast(try check(linux.open(
+        path,
+        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true },
+        0o600,
+    )));
     defer close(fd);
     var off: usize = 0;
     while (off < data.len) {
@@ -173,7 +211,11 @@ pub fn writeFileAtomic(path: []const u8, data: []const u8) Error!void {
     const final = std.mem.printSentinel(&pbuf, "{s}", .{path}, 0) catch return error.NameTooLong;
     const tmp = std.mem.printSentinel(&tbuf, "{s}.tmp", .{path}, 0) catch return error.NameTooLong;
     {
-        const fd: i32 = @intCast(try check(linux.open(tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600)));
+        const fd: i32 = @intCast(try check(linux.open(
+            tmp,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true },
+            0o600,
+        )));
         defer close(fd);
         errdefer _ = linux.unlink(tmp);
         var off: usize = 0;
@@ -196,11 +238,25 @@ pub const AtomicFile = struct {
 
     pub fn create(path: []const u8) Error!AtomicFile {
         var f: AtomicFile = .{ .fd = -1 };
-        const final = std.mem.printSentinel(&f.final, "{s}", .{path}, 0) catch return error.NameTooLong;
-        const tmp = std.mem.printSentinel(&f.tmp, "{s}.tmp", .{path}, 0) catch return error.NameTooLong;
+        const final = std.mem.printSentinel(
+            &f.final,
+            "{s}",
+            .{path},
+            0,
+        ) catch return error.NameTooLong;
+        const tmp = std.mem.printSentinel(
+            &f.tmp,
+            "{s}.tmp",
+            .{path},
+            0,
+        ) catch return error.NameTooLong;
         f.final_len = final.len;
         f.tmp_len = tmp.len;
-        f.fd = @intCast(try check(linux.open(tmp, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600)));
+        f.fd = @intCast(try check(linux.open(
+            tmp,
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true },
+            0o600,
+        )));
         return f;
     }
 
@@ -211,7 +267,12 @@ pub const AtomicFile = struct {
 
     pub fn writeAt(f: *AtomicFile, data: []const u8, at: usize) Error!void {
         var off: usize = 0;
-        while (off < data.len) off += try check(linux.pwrite(f.fd, data[off..].ptr, data.len - off, @intCast(at + off)));
+        while (off < data.len) off += try check(linux.pwrite(
+            f.fd,
+            data[off..].ptr,
+            data.len - off,
+            @intCast(at + off),
+        ));
     }
 
     pub fn commit(f: *AtomicFile) Error!void {
@@ -240,7 +301,11 @@ pub const AppendFile = struct {
     /// Null when the file is not `expect_len` bytes long (someone else wrote
     /// it): the caller rewrites it whole instead.
     pub fn open(path: [*:0]const u8, expect_len: usize) Error!?AppendFile {
-        const fd: i32 = @intCast(try check(linux.open(path, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0)));
+        const fd: i32 = @intCast(try check(linux.open(
+            path,
+            .{ .ACCMODE = .WRONLY, .CLOEXEC = true },
+            0,
+        )));
         errdefer close(fd);
         const size = try check(linux.lseek(fd, 0, linux.SEEK.END));
         if (size != expect_len) {
@@ -257,7 +322,12 @@ pub const AppendFile = struct {
 
     pub fn writeAt(f: *AppendFile, data: []const u8, at: usize) Error!void {
         var off: usize = 0;
-        while (off < data.len) off += try check(linux.pwrite(f.fd, data[off..].ptr, data.len - off, @intCast(at + off)));
+        while (off < data.len) off += try check(linux.pwrite(
+            f.fd,
+            data[off..].ptr,
+            data.len - off,
+            @intCast(at + off),
+        ));
     }
 
     pub fn sync(f: *AppendFile) Error!void {
@@ -297,7 +367,14 @@ pub fn mapPrivate(path: [*:0]const u8) Error![]align(8) u8 {
     defer close(fd);
     const size = try check(linux.lseek(fd, 0, linux.SEEK.END));
     if (size == 0) return error.NotFound;
-    const addr = try check(linux.mmap(null, size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE }, fd, 0));
+    const addr = try check(linux.mmap(
+        null,
+        size,
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE },
+        fd,
+        0,
+    ));
     const p: [*]align(8) u8 = @ptrFromInt(addr);
     return p[0..size];
 }
@@ -366,7 +443,10 @@ test "atomic writes replace the file and leave no temporary behind" {
     try writeFileAtomic(p, "new");
     var rbuf: [16]u8 = undefined;
     var zbuf: [4096]u8 = undefined;
-    try std.testing.expectEqualStrings("new", readHead(try std.mem.printSentinel(&zbuf, "{s}", .{p}, 0), &rbuf));
+    try std.testing.expectEqualStrings("new", readHead(
+        try std.mem.printSentinel(&zbuf, "{s}", .{p}, 0),
+        &rbuf,
+    ));
     try std.testing.expect(!exists(try std.mem.printSentinel(&zbuf, "{s}.tmp", .{p}, 0)));
     // A directory that is not there: an error, and nothing left over.
     const bad = try std.mem.print(&pbuf, "{s}/missing/f.conf", .{dir});
@@ -392,9 +472,13 @@ test "Lumen's files and directories are owner-only" {
         }
     }.of;
     var zbuf: [4096]u8 = undefined;
-    try std.testing.expectEqual(@as(u32, 0o700), mode(try std.mem.printSentinel(&zbuf, "{s}", .{sub}, 0)));
+    try std.testing.expectEqual(@as(u32, 0o700), mode(
+        try std.mem.printSentinel(&zbuf, "{s}", .{sub}, 0),
+    ));
     try std.testing.expectEqual(@as(u32, 0o600), mode(f));
     _ = linux.chmod(try std.mem.printSentinel(&zbuf, "{s}", .{sub}, 0), 0o755);
     makePrivate(sub);
-    try std.testing.expectEqual(@as(u32, 0o700), mode(try std.mem.printSentinel(&zbuf, "{s}", .{sub}, 0)));
+    try std.testing.expectEqual(@as(u32, 0o700), mode(
+        try std.mem.printSentinel(&zbuf, "{s}", .{sub}, 0),
+    ));
 }

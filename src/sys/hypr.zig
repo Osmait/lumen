@@ -77,7 +77,11 @@ fn connect(which: []const u8, flags: u32) ?linux.fd_t {
     const sig = std.mem.span(c.g_getenv("HYPRLAND_INSTANCE_SIGNATURE") orelse return null);
     const rt = std.mem.span(c.g_getenv("XDG_RUNTIME_DIR") orelse return null);
     var addr: linux.sockaddr.un = .{ .path = @splat(0) };
-    _ = std.mem.print(addr.path[0 .. addr.path.len - 1], "{s}/hypr/{s}/{s}", .{ rt, sig, which }) catch return null;
+    _ = std.mem.print(
+        addr.path[0 .. addr.path.len - 1],
+        "{s}/hypr/{s}/{s}",
+        .{ rt, sig, which },
+    ) catch return null;
     const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC | flags, 0);
     if (linux.errno(rc) != .SUCCESS) return null;
     const fd: linux.fd_t = @intCast(rc);
@@ -96,7 +100,13 @@ fn dispatchOver(msg: []const u8) bool {
     const fd = connect(".socket.sock", 0) orelse return false;
     defer _ = linux.close(fd);
     const timeout: linux.timeval = .{ .sec = 1, .usec = 0 };
-    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO, @ptrCast(&timeout), @sizeOf(linux.timeval));
+    _ = linux.setsockopt(
+        fd,
+        linux.SOL.SOCKET,
+        linux.SO.RCVTIMEO,
+        @ptrCast(&timeout),
+        @sizeOf(linux.timeval),
+    );
     const n = linux.write(fd, msg.ptr, msg.len);
     if (linux.errno(n) != .SUCCESS or n == 0) return false;
     var answer: [256]u8 = undefined;
@@ -114,7 +124,13 @@ fn talk(arena: std.mem.Allocator, msg: []const u8) ?[]const u8 {
     defer _ = linux.close(fd);
     // A compositor that does not answer must not freeze the window.
     const timeout: linux.timeval = .{ .sec = 1, .usec = 0 };
-    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVTIMEO, @ptrCast(&timeout), @sizeOf(linux.timeval));
+    _ = linux.setsockopt(
+        fd,
+        linux.SOL.SOCKET,
+        linux.SO.RCVTIMEO,
+        @ptrCast(&timeout),
+        @sizeOf(linux.timeval),
+    );
     if (linux.errno(linux.write(fd, msg.ptr, msg.len)) != .SUCCESS) return null;
     var out: std.ArrayList(u8) = .empty;
     while (true) {
@@ -184,7 +200,10 @@ pub fn focusedName(all: []const MonitorJson) ?[]const u8 {
 
 /// The argument of `hyprctl --batch`: "dispatch a ; dispatch b". Caller owns
 /// it.
-pub fn batchString(gpa: std.mem.Allocator, commands: []const []const u8) std.mem.Allocator.Error![:0]u8 {
+pub fn batchString(
+    gpa: std.mem.Allocator,
+    commands: []const []const u8,
+) std.mem.Allocator.Error![:0]u8 {
     var cmd: std.ArrayList(u8) = .empty;
     errdefer cmd.deinit(gpa);
     for (commands, 0..) |command, i| {
@@ -207,7 +226,9 @@ pub fn batch(gpa: std.mem.Allocator, commands: []const []const u8) void {
     var w: std.Io.Writer = .fixed(queued_buf[queued_len..]);
     const ok = blk: {
         for (commands) |command| {
-            w.writeAll(if (queued_len + w.end == 0) "[[BATCH]]dispatch " else ";dispatch ") catch break :blk false;
+            w.writeAll(
+                if (queued_len + w.end == 0) "[[BATCH]]dispatch " else ";dispatch ",
+            ) catch break :blk false;
             w.writeAll(command) catch break :blk false;
         }
         break :blk true;
@@ -347,13 +368,27 @@ pub fn applyLayout(gpa: std.mem.Allocator, layout: geometry.Layout) void {
 /// need a floating window (and fullscreen windows ignore them), hence the
 /// first two. `fullscreen` only acts on the active window, which `win` is.
 /// The commands live in `arena`.
-pub fn layoutCommands(arena: std.mem.Allocator, win: Client, mon: geometry.Monitor, layout: geometry.Layout) std.mem.Allocator.Error![]const []const u8 {
+pub fn layoutCommands(
+    arena: std.mem.Allocator,
+    win: Client,
+    mon: geometry.Monitor,
+    layout: geometry.Layout,
+) std.mem.Allocator.Error![]const []const u8 {
     const r = geometry.place(layout, mon.usable(), win.size[0], win.size[1], 8);
     var cmds: std.ArrayList([]const u8) = .empty;
     if (win.fullscreen != 0) try cmds.append(arena, "fullscreen 0");
-    if (!win.floating) try cmds.append(arena, try arena.print("setfloating address:{s}", .{win.address}));
-    try cmds.append(arena, try arena.print("resizewindowpixel exact {d} {d},address:{s}", .{ r.w, r.h, win.address }));
-    try cmds.append(arena, try arena.print("movewindowpixel exact {d} {d},address:{s}", .{ r.x, r.y, win.address }));
+    if (!win.floating) try cmds.append(arena, try arena.print(
+        "setfloating address:{s}",
+        .{win.address},
+    ));
+    try cmds.append(arena, try arena.print(
+        "resizewindowpixel exact {d} {d},address:{s}",
+        .{ r.w, r.h, win.address },
+    ));
+    try cmds.append(arena, try arena.print(
+        "movewindowpixel exact {d} {d},address:{s}",
+        .{ r.x, r.y, win.address },
+    ));
     return cmds.items;
 }
 
@@ -376,7 +411,9 @@ test "clients: recorded output, extra fields ignored, ordered by focus" {
 test "monitors: rotation and scale give the usable area" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const mons = parse([]MonitorJson, arena.allocator(), @embedFile("testdata/hypr_monitors.json")).?;
+    const mons = parse([]MonitorJson, arena.allocator(), @embedFile(
+        "testdata/hypr_monitors.json",
+    )).?;
     try testing.expectEqualStrings("DP-1", focusedName(mons).?);
     // HDMI-A-1: 1600x900 rotated 270° -> 900x1600 logical, bar on top.
     const hdmi = findMonitor(mons, 0).?.usable();
@@ -397,7 +434,10 @@ test "layout commands: tiled window floats first, fullscreen leaves first" {
     const cmds = try layoutCommands(a, discord, findMonitor(mons, discord.monitor).?, .left_half);
     try testing.expectEqual(@as(usize, 3), cmds.len);
     try testing.expectEqualStrings("setfloating address:0x5600000000a0", cmds[0]);
-    try testing.expectEqualStrings("resizewindowpixel exact 756 810,address:0x5600000000a0", cmds[1]);
+    try testing.expectEqualStrings(
+        "resizewindowpixel exact 756 810,address:0x5600000000a0",
+        cmds[1],
+    );
     try testing.expectEqualStrings("movewindowpixel exact 2395 46,address:0x5600000000a0", cmds[2]);
 
     var full = all[1];
@@ -409,7 +449,10 @@ test "layout commands: tiled window floats first, fullscreen leaves first" {
 
     const joined = try batchString(testing.allocator, cmds[0..2]);
     defer testing.allocator.free(joined);
-    try testing.expectEqualStrings("dispatch setfloating address:0x5600000000a0 ; dispatch resizewindowpixel exact 756 810,address:0x5600000000a0", joined);
+    try testing.expectEqualStrings(
+        "dispatch setfloating address:0x5600000000a0 ; dispatch resizewindowpixel exact 756 810,address:0x5600000000a0",
+        joined,
+    );
 }
 
 test "garbage or a changed shape does not crash" {

@@ -70,12 +70,20 @@ pub fn count(w: *const Watcher) usize {
 /// descriptor and only the id it maps to changes. Failing is not fatal for
 /// the caller (the directory goes unwatched until the next rescan); hitting
 /// the kernel's limit is counted in `unwatched` and logged once.
-pub fn watch(w: *Watcher, gpa: std.mem.Allocator, path: [*:0]const u8, id: u32) error{ WatchLimit, Watch, OutOfMemory }!void {
+pub fn watch(
+    w: *Watcher,
+    gpa: std.mem.Allocator,
+    path: [*:0]const u8,
+    id: u32,
+) error{ WatchLimit, Watch, OutOfMemory }!void {
     const rc = linux.inotify_add_watch(w.fd, path, mask);
     switch (linux.errno(rc)) {
         .SUCCESS => {},
         .NOSPC => {
-            if (w.unwatched == 0) log.warn("inotify watch limit reached: raise fs.inotify.max_user_watches to watch every folder", .{});
+            if (w.unwatched == 0) log.warn(
+                "inotify watch limit reached: raise fs.inotify.max_user_watches to watch every folder",
+                .{},
+            );
             w.unwatched += 1;
             return error.WatchLimit;
         },
@@ -138,7 +146,11 @@ fn parse(w: *Watcher, arena: std.mem.Allocator, n: usize, out: *std.ArrayList(Ch
         if (name.len == 0) continue;
         const owned = try arena.dupe(u8, name);
         if (ev.mask & (linux.IN.CREATE | linux.IN.MOVED_TO) != 0) {
-            try out.append(arena, .{ .created = .{ .parent = id, .name = owned, .is_dir = ev.mask & linux.IN.ISDIR != 0 } });
+            try out.append(arena, .{ .created = .{
+                .parent = id,
+                .name = owned,
+                .is_dir = ev.mask & linux.IN.ISDIR != 0,
+            } });
         } else if (ev.mask & (linux.IN.DELETE | linux.IN.MOVED_FROM) != 0) {
             try out.append(arena, .{ .removed = .{ .parent = id, .name = owned } });
         }
@@ -174,7 +186,10 @@ test "watcher: events become changes attributed to the watched entry" {
     try sys.writeFile(try std.mem.printSentinel(&b1, "{s}/f", .{dir}, 0), "x");
     const d = try std.mem.printSentinel(&b2, "{s}/d", .{dir}, 0);
     _ = linux.mkdir(d, 0o755);
-    try sys.rename(try std.mem.printSentinel(&b1, "{s}/f", .{dir}, 0), try std.mem.printSentinel(&b2, "{s}/g", .{dir}, 0));
+    try sys.rename(
+        try std.mem.printSentinel(&b1, "{s}/f", .{dir}, 0),
+        try std.mem.printSentinel(&b2, "{s}/g", .{dir}, 0),
+    );
     _ = linux.unlink(try std.mem.printSentinel(&b1, "{s}/g", .{dir}, 0));
 
     var changes: std.ArrayList(Change) = .empty;
@@ -219,7 +234,11 @@ test "watcher: a flooded queue reports the overflow in one drain" {
     var dbuf: [4096]u8 = undefined;
     const dir = try tmpAbs(&tmp, &dbuf);
     var qbuf: [32]u8 = undefined;
-    const max_queued = std.fmt.parseInt(usize, std.mem.trim(u8, sys.readHead("/proc/sys/fs/inotify/max_queued_events", &qbuf), " \n"), 10) catch 16384;
+    const max_queued = std.fmt.parseInt(
+        usize,
+        std.mem.trim(u8, sys.readHead("/proc/sys/fs/inotify/max_queued_events", &qbuf), " \n"),
+        10,
+    ) catch 16384;
     if (max_queued > 200_000) return error.SkipZigTest;
 
     const w = try create(gpa);

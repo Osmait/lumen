@@ -61,7 +61,12 @@ pub fn nameFromUrl(buf: []u8, url: []const u8) []const u8 {
 }
 
 /// A failure: to the caller's stderr (exit 1), or on the selected row.
-fn fail(ui: *Ui, cmdline: ?*c.GApplicationCommandLine, comptime fmt: []const u8, args: anytype) void {
+fn fail(
+    ui: *Ui,
+    cmdline: ?*c.GApplicationCommandLine,
+    comptime fmt: []const u8,
+    args: anytype,
+) void {
     var buf: [1024]u8 = undefined;
     const msg = std.mem.printSentinel(&buf, fmt, args, 0) catch "failed";
     const cl = cmdline orelse return note(ui, msg);
@@ -81,16 +86,36 @@ fn note(ui: *Ui, msg: []const u8) void {
     ui.showFailure(ui.after_reload[0..n :0]);
 }
 
-pub fn install(ui: *Ui, cmdline: ?*c.GApplicationCommandLine, url: []const u8, as: ?[]const u8) void {
+pub fn install(
+    ui: *Ui,
+    cmdline: ?*c.GApplicationCommandLine,
+    url: []const u8,
+    as: ?[]const u8,
+) void {
     var nbuf: [64]u8 = undefined;
     const name = as orelse nameFromUrl(&nbuf, url);
-    if (!Host.validId(name)) return fail(ui, cmdline, "\"{s}\" cannot be an extension name (a-z, 0-9, - and _); pick one with --as NAME", .{name});
+    if (!Host.validId(name)) return fail(
+        ui,
+        cmdline,
+        "\"{s}\" cannot be an extension name (a-z, 0-9, - and _); pick one with --as NAME",
+        .{name},
+    );
     var dbuf: [4096]u8 = undefined;
     const dir = extDir(ui, &dbuf, name) orelse return fail(ui, cmdline, "path too long", .{});
-    if (index.sys.info(dir) != null) return fail(ui, cmdline, "{s} already exists: lumen --update {s}, or --as another name", .{ dir, name });
+    if (index.sys.info(dir) != null) return fail(
+        ui,
+        cmdline,
+        "{s} already exists: lumen --update {s}, or --as another name",
+        .{ dir, name },
+    );
     index.sys.mkdirP(dir[0 .. std.mem.findScalarLast(u8, dir, '/') orelse dir.len]);
     var ubuf: [2048]u8 = undefined;
-    const url_z = std.mem.printSentinel(&ubuf, "{s}", .{url}, 0) catch return fail(ui, cmdline, "URL too long", .{});
+    const url_z = std.mem.printSentinel(&ubuf, "{s}", .{url}, 0) catch return fail(
+        ui,
+        cmdline,
+        "URL too long",
+        .{},
+    );
     // "--": a URL starting with "-" is not an option.
     var argv = [_:null]?[*:0]const u8{ "git", "clone", "--depth", "1", "--", url_z.ptr, dir.ptr };
     start(ui, cmdline, .install, name, dir, &argv);
@@ -101,12 +126,22 @@ pub fn update(ui: *Ui, cmdline: ?*c.GApplicationCommandLine, name: ?[]const u8) 
     if (name) |n| {
         if (!Host.validId(n)) return fail(ui, cmdline, "no extension named \"{s}\"", .{n});
         const dir = extDir(ui, &dbuf, n) orelse return fail(ui, cmdline, "path too long", .{});
-        if (index.sys.info(dir) == null) return fail(ui, cmdline, "no extension named \"{s}\"", .{n});
+        if (index.sys.info(dir) == null) return fail(
+            ui,
+            cmdline,
+            "no extension named \"{s}\"",
+            .{n},
+        );
         var argv = [_:null]?[*:0]const u8{ "git", "-C", dir.ptr, "pull", "--ff-only" };
         return start(ui, cmdline, .update, n, dir, &argv);
     }
     // Every extension that is a git checkout.
-    const dir = std.mem.printSentinel(&dbuf, "{s}/extensions", .{ui.config_dir}, 0) catch return fail(ui, cmdline, "path too long", .{});
+    const dir = std.mem.printSentinel(
+        &dbuf,
+        "{s}/extensions",
+        .{ui.config_dir},
+        0,
+    ) catch return fail(ui, cmdline, "path too long", .{});
     var argv = [_:null]?[*:0]const u8{
         "sh",           "-c",
         \\cd "$1" || exit 1
@@ -127,14 +162,30 @@ pub fn uninstall(ui: *Ui, cmdline: ?*c.GApplicationCommandLine, name: []const u8
     if (!Host.validId(name)) return fail(ui, cmdline, "no extension named \"{s}\"", .{name});
     var dbuf: [4096]u8 = undefined;
     const dir = extDir(ui, &dbuf, name) orelse return fail(ui, cmdline, "path too long", .{});
-    if (index.sys.info(dir) == null) return fail(ui, cmdline, "no extension named \"{s}\"", .{name});
+    if (index.sys.info(dir) == null) return fail(
+        ui,
+        cmdline,
+        "no extension named \"{s}\"",
+        .{name},
+    );
     var argv = [_:null]?[*:0]const u8{ "rm", "-rf", "--", dir.ptr };
     start(ui, cmdline, .uninstall, name, dir, &argv);
 }
 
-fn start(ui: *Ui, cmdline: ?*c.GApplicationCommandLine, kind: Kind, name: []const u8, dir: []const u8, argv: [*:null]?[*:0]const u8) void {
+fn start(
+    ui: *Ui,
+    cmdline: ?*c.GApplicationCommandLine,
+    kind: Kind,
+    name: []const u8,
+    dir: []const u8,
+    argv: [*:null]?[*:0]const u8,
+) void {
     var err: ?*c.GError = null;
-    const sp = c.g_subprocess_newv(argv, c.G_SUBPROCESS_FLAGS_STDOUT_PIPE | c.G_SUBPROCESS_FLAGS_STDERR_MERGE, &err) orelse {
+    const sp = c.g_subprocess_newv(
+        argv,
+        c.G_SUBPROCESS_FLAGS_STDOUT_PIPE | c.G_SUBPROCESS_FLAGS_STDERR_MERGE,
+        &err,
+    ) orelse {
         const msg: []const u8 = if (err) |e| std.mem.span(e.message) else "cannot start";
         fail(ui, cmdline, "{s}: {s}", .{ std.mem.span(argv[0].?), msg });
         if (err) |e| c.g_error_free(e);
@@ -144,7 +195,12 @@ fn start(ui: *Ui, cmdline: ?*c.GApplicationCommandLine, kind: Kind, name: []cons
         c.g_object_unref(sp);
         return fail(ui, cmdline, "out of memory", .{});
     };
-    job.* = .{ .ui = ui, .cmdline = if (cmdline) |cl| @ptrCast(c.g_object_ref(cl)) else null, .sp = sp, .kind = kind };
+    job.* = .{
+        .ui = ui,
+        .cmdline = if (cmdline) |cl| @ptrCast(c.g_object_ref(cl)) else null,
+        .sp = sp,
+        .kind = kind,
+    };
     job.name_len = @min(name.len, job.name.len);
     @memcpy(job.name[0..job.name_len], name[0..job.name_len]);
     job.dir_len = @min(dir.len, job.dir.len - 1);
@@ -179,7 +235,10 @@ fn onDone(_: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) 
             // A failed clone can leave half a folder behind.
             removeTree(job.dirZ());
         }
-        return fail(ui, cmdline, "{s} failed:\n{s}", .{ @tagName(job.kind), std.mem.trim(u8, output, " \n") });
+        return fail(ui, cmdline, "{s} failed:\n{s}", .{
+            @tagName(job.kind),
+            std.mem.trim(u8, output, " \n"),
+        });
     }
     switch (job.kind) {
         .install => {
@@ -187,15 +246,32 @@ fn onDone(_: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) 
             const init = std.mem.printSentinel(&buf, "{s}/init.lua", .{job.dirZ()}, 0) catch "";
             if (index.sys.info(init) == null) {
                 removeTree(job.dirZ());
-                return fail(ui, cmdline, "{s} has no init.lua: it is not a Lumen extension", .{job.nameSlice()});
+                return fail(
+                    ui,
+                    cmdline,
+                    "{s} has no init.lua: it is not a Lumen extension",
+                    .{job.nameSlice()},
+                );
             }
-            print(ui, cmdline, "Installed {s} in {s}\nExtensions run as you: read its init.lua to know what it does.\n", .{ job.nameSlice(), job.dirZ() });
+            print(
+                ui,
+                cmdline,
+                "Installed {s} in {s}\nExtensions run as you: read its init.lua to know what it does.\n",
+                .{ job.nameSlice(), job.dirZ() },
+            );
         },
         .update => if (cmdline != null)
             print(ui, cmdline, "{s}", .{if (output.len > 0) output else "Up to date\n"})
         else
             // git's own lines are too long for a row: a summary.
-            note(ui, if (std.mem.find(u8, output, "Already up to date") != null or output.len == 0) "Already up to date" else "Updated"),
+            note(
+                ui,
+                if (std.mem.find(
+                    u8,
+                    output,
+                    "Already up to date",
+                ) != null or output.len == 0) "Already up to date" else "Updated",
+            ),
         .uninstall => print(ui, cmdline, "Removed {s}\n", .{job.nameSlice()}),
     }
     if (cmdline) |cl| c.g_application_command_line_set_exit_status(cl, 0);
@@ -205,7 +281,12 @@ fn onDone(_: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) 
 }
 
 /// Success: to the caller's stdout, or on the selected row.
-fn print(ui: *Ui, cmdline: ?*c.GApplicationCommandLine, comptime fmt: []const u8, args: anytype) void {
+fn print(
+    ui: *Ui,
+    cmdline: ?*c.GApplicationCommandLine,
+    comptime fmt: []const u8,
+    args: anytype,
+) void {
     var buf: [8192]u8 = undefined;
     const msg = std.mem.printSentinel(&buf, fmt, args, 0) catch return;
     const cl = cmdline orelse return note(ui, msg);
@@ -216,7 +297,18 @@ fn print(ui: *Ui, cmdline: ?*c.GApplicationCommandLine, comptime fmt: []const u8
 fn removeTree(dir: [:0]const u8) void {
     var argv = [_:null]?[*:0]const u8{ "rm", "-rf", "--", dir.ptr };
     var err: ?*c.GError = null;
-    if (c.g_spawn_sync(null, @ptrCast(&argv), null, c.G_SPAWN_SEARCH_PATH, null, null, null, null, null, &err) == 0) {
+    if (c.g_spawn_sync(
+        null,
+        @ptrCast(&argv),
+        null,
+        c.G_SPAWN_SEARCH_PATH,
+        null,
+        null,
+        null,
+        null,
+        null,
+        &err,
+    ) == 0) {
         if (err) |e| {
             log.warn("rm {s}: {s}", .{ dir, e.message });
             c.g_error_free(e);
@@ -226,9 +318,18 @@ fn removeTree(dir: [:0]const u8) void {
 
 test "extension names come from the repository" {
     var buf: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("weather", nameFromUrl(&buf, "https://github.com/me/lumen-weather.git"));
-    try std.testing.expectEqualStrings("github", nameFromUrl(&buf, "git@github.com:me/lumen-ext-github"));
-    try std.testing.expectEqualStrings("todo", nameFromUrl(&buf, "https://codeberg.org/x/todo-lumen/"));
+    try std.testing.expectEqualStrings("weather", nameFromUrl(
+        &buf,
+        "https://github.com/me/lumen-weather.git",
+    ));
+    try std.testing.expectEqualStrings("github", nameFromUrl(
+        &buf,
+        "git@github.com:me/lumen-ext-github",
+    ));
+    try std.testing.expectEqualStrings("todo", nameFromUrl(
+        &buf,
+        "https://codeberg.org/x/todo-lumen/",
+    ));
     try std.testing.expectEqualStrings("my-tool", nameFromUrl(&buf, "/home/me/src/My.Tool"));
     try std.testing.expectEqualStrings("lumen", nameFromUrl(&buf, "https://github.com/x/lumen"));
 }

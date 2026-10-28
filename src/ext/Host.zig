@@ -321,14 +321,27 @@ pub const StartError = std.mem.Allocator.Error || std.Thread.SpawnError;
 /// Starts the worker; call `reload` to load the files. `config_dir`
 /// ($XDG_CONFIG_HOME/lumen) and `data_dir` ($XDG_DATA_HOME/lumen) are
 /// copied.
-pub fn start(gpa: std.mem.Allocator, io: std.Io, config_dir: []const u8, data_dir: []const u8, cb: Callbacks) StartError!*Host {
+pub fn start(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    config_dir: []const u8,
+    data_dir: []const u8,
+    cb: Callbacks,
+) StartError!*Host {
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
     const dir = try gpa.dupeSentinel(u8, config_dir, 0);
     errdefer gpa.free(dir);
     const data = try gpa.dupeSentinel(u8, data_dir, 0);
     errdefer gpa.free(data);
-    h.* = .{ .gpa = gpa, .io = io, .config_dir = dir, .data_dir = data, .cb = cb, .warena = .init(gpa) };
+    h.* = .{
+        .gpa = gpa,
+        .io = io,
+        .config_dir = dir,
+        .data_dir = data,
+        .cb = cb,
+        .warena = .init(gpa),
+    };
     h.thread = try std.Thread.spawn(.{}, run, .{h});
     h.thread.setName(io, "lm-ext") catch {};
     return h;
@@ -385,7 +398,12 @@ pub fn list(h: *Host, registry: u32, command: u16, query: []const u8) u32 {
         h.lock.lockUncancelable(h.io);
         defer h.lock.unlock(h.io);
         @memcpy(h.list_query[0..q.len], q);
-        h.list_req = .{ .registry = registry, .command = command, .gen = h.next_gen, .query_len = q.len };
+        h.list_req = .{
+            .registry = registry,
+            .command = command,
+            .gen = h.next_gen,
+            .query_len = q.len,
+        };
     }
     h.wake();
     return h.next_gen;
@@ -403,7 +421,13 @@ fn dropSubmit(h: *Host, req: *SubmitReq) u32 {
 pub fn submit(h: *Host, registry: u32, command: u16, values: []const FormValue) u32 {
     h.next_gen +%= 1;
     const req = h.gpa.create(SubmitReq) catch return h.next_gen;
-    req.* = .{ .registry = registry, .command = command, .gen = h.next_gen, .values = &.{}, .arena = .init(h.gpa) };
+    req.* = .{
+        .registry = registry,
+        .command = command,
+        .gen = h.next_gen,
+        .values = &.{},
+        .arena = .init(h.gpa),
+    };
     const a = req.arena.allocator();
     const copy = a.alloc(FormValue, values.len) catch {
         req.arena.deinit();
@@ -451,12 +475,28 @@ pub fn root(h: *Host, registry: u32, query: []const u8) u32 {
 /// Runs a Lua action: action `action` of row `item` of the list with
 /// generation `list_gen` (the command's root rows when `root`), or the
 /// command's own `run` when `item` is null.
-pub fn act(h: *Host, registry: u32, command: u16, root_rows: bool, list_gen: u32, item: ?u32, action: u8) u32 {
+pub fn act(
+    h: *Host,
+    registry: u32,
+    command: u16,
+    root_rows: bool,
+    list_gen: u32,
+    item: ?u32,
+    action: u8,
+) u32 {
     h.next_gen +%= 1;
     {
         h.lock.lockUncancelable(h.io);
         defer h.lock.unlock(h.io);
-        h.act_req = .{ .registry = registry, .command = command, .root = root_rows, .list_gen = list_gen, .item = item, .action = action, .gen = h.next_gen };
+        h.act_req = .{
+            .registry = registry,
+            .command = command,
+            .root = root_rows,
+            .list_gen = list_gen,
+            .item = item,
+            .action = action,
+            .gen = h.next_gen,
+        };
     }
     h.wake();
     return h.next_gen;
@@ -637,12 +677,23 @@ fn loadFile(h: *Host, load: *Load, id: []const u8, dir: []const u8, path: [:0]co
 }
 
 /// Runs a file (`path`), or `source` (then `path` names it in errors).
-fn loadSource(h: *Host, load: *Load, id: []const u8, dir: []const u8, path: [:0]const u8, source: ?[:0]const u8) void {
+fn loadSource(
+    h: *Host,
+    load: *Load,
+    id: []const u8,
+    dir: []const u8,
+    path: [:0]const u8,
+    source: ?[:0]const u8,
+) void {
     const wa = h.warena.allocator();
     // Empty paths would put its storage at "/storage.json".
     const id_z = wa.dupeSentinel(u8, id, 0) catch return problem(load, id, "out of memory");
     const dir_z = wa.dupeSentinel(u8, dir, 0) catch return problem(load, id, "out of memory");
-    const data = wa.printSentinel("{s}/extensions/{s}", .{ h.data_dir, id }, 0) catch return problem(load, id, "out of memory");
+    const data = wa.printSentinel(
+        "{s}/extensions/{s}",
+        .{ h.data_dir, id },
+        0,
+    ) catch return problem(load, id, "out of memory");
     const e = h.gpa.create(Ext) catch return problem(load, id, "out of memory");
     e.* = .{ .host = h, .id = id_z, .dir = dir_z, .data = data };
     index.sys.mkdirP(e.data);
@@ -653,15 +704,34 @@ fn loadSource(h: *Host, load: *Load, id: []const u8, dir: []const u8, path: [:0]
     // What this file adds is dropped again if it fails half-way.
     const layout_before = load.layout;
     const had_layout = load.has_layout;
-    const marks = .{ load.commands.items.len, load.wcmds.items.len, load.themes.items.len, load.keymaps.items.len, load.settings.items.len, load.prefs.items.len, load.icons.items.len, load.style_settings.items.len };
+    const marks = .{
+        load.commands.items.len,
+        load.wcmds.items.len,
+        load.themes.items.len,
+        load.keymaps.items.len,
+        load.settings.items.len,
+        load.prefs.items.len,
+        load.icons.items.len,
+        load.style_settings.items.len,
+    };
     e.load = load;
     e.budget.deadline_ns = index.sys.monotonicNs() + load_budget_ns;
-    var ctx: LoadCtx = .{ .e = e, .load = load, .path = path, .source = source, .ext_index = @intCast(h.exts.items.len) };
+    var ctx: LoadCtx = .{
+        .e = e,
+        .load = load,
+        .path = path,
+        .source = source,
+        .ext_index = @intCast(h.exts.items.len),
+    };
     const err = lua.protect(e.L, load.a, LoadCtx, &ctx, LoadCtx.run);
     e.load = null;
     e.budget.deadline_ns = std.math.maxInt(u64);
     if (err == null) if (h.exts.append(h.gpa, e)) {
-        if (!std.mem.eql(u8, id, "config") and !std.mem.eql(u8, id, "style")) load.extensions.append(load.a, .{
+        if (!std.mem.eql(
+            u8,
+            id,
+            "config",
+        ) and !std.mem.eql(u8, id, "style")) load.extensions.append(load.a, .{
             .id = load.a.dupeSentinel(u8, id, 0) catch "",
             .title = if (ctx.title.len > 0) ctx.title else load.a.dupeSentinel(u8, id, 0) catch "",
             .commands = @intCast(load.commands.items.len - marks[0]),
@@ -705,7 +775,11 @@ const LoadCtx = struct {
         switch (lua.c.lua_type(L, -1)) {
             lua.c.LUA_TNIL => {},
             lua.c.LUA_TTABLE => parseExtension(L, ctx, lua.absIndex(L, -1)),
-            else => lua.raise(L, "init.lua must return lumen.extension{{...}} or nothing, not a {s}", .{lua.typeName(L, -1)}),
+            else => lua.raise(
+                L,
+                "init.lua must return lumen.extension{{...}} or nothing, not a {s}",
+                .{lua.typeName(L, -1)},
+            ),
         }
     }
 };
@@ -714,7 +788,10 @@ fn parseExtension(L: *lua.State, ctx: *LoadCtx, t: c_int) void {
     const a = ctx.load.a;
     const title = lua.fieldString(L, a, t, "title", "extension") orelse ctx.e.id;
     ctx.title = title;
-    var default_icon: item_mod.Icon = .{ .tile = .{ .name = "application-x-addon-symbolic", .color = .purple } };
+    var default_icon: item_mod.Icon = .{ .tile = .{
+        .name = "application-x-addon-symbolic",
+        .color = .purple,
+    } };
     _ = lua.getField(L, t, "icon");
     if (parseIcon(L, a, -1, "extension.icon")) |icon| default_icon = icon;
     lua.c.lua_settop(L, -2);
@@ -728,15 +805,31 @@ fn parseExtension(L: *lua.State, ctx: *LoadCtx, t: c_int) void {
             if (lua.c.lua_rawgeti(L, prefs, @intCast(i)) != lua.c.LUA_TTABLE)
                 lua.raise(L, "{s}: table expected, got {s}", .{ where, lua.typeName(L, -1) });
             const pref = parseField(L, ctx, lua.absIndex(L, -1), where, title);
-            for (ctx.load.prefs.items) |p| if (std.mem.eql(u8, p.ext, ctx.e.id) and std.mem.eql(u8, p.name, pref.name)) lua.raise(L, "two preferences named \"{s}\"", .{pref.name});
+            for (ctx.load.prefs.items) |p| if (std.mem.eql(u8, p.ext, ctx.e.id) and std.mem.eql(
+                u8,
+                p.name,
+                pref.name,
+            )) lua.raise(
+                L,
+                "two preferences named \"{s}\"",
+                .{pref.name},
+            );
             ctx.load.prefs.append(ctx.load.a, pref) catch lua.raise(L, "not enough memory", .{});
             lua.c.lua_settop(L, -2);
         }
-    } else if (lua.c.lua_type(L, -1) != lua.c.LUA_TNIL) lua.raise(L, "extension.preferences: a list expected, got {s}", .{lua.typeName(L, -1)});
+    } else if (lua.c.lua_type(L, -1) != lua.c.LUA_TNIL) lua.raise(
+        L,
+        "extension.preferences: a list expected, got {s}",
+        .{lua.typeName(L, -1)},
+    );
     lua.c.lua_settop(L, -2);
 
     if (lua.getField(L, t, "commands") != lua.c.LUA_TTABLE)
-        lua.raise(L, "extension.commands: a list of commands expected, got {s}", .{lua.typeName(L, -1)});
+        lua.raise(
+            L,
+            "extension.commands: a list of commands expected, got {s}",
+            .{lua.typeName(L, -1)},
+        );
     const cmds = lua.absIndex(L, -1);
     const n = lua.c.lua_rawlen(L, cmds);
     for (1..n + 1) |i| {
@@ -751,17 +844,39 @@ fn parseExtension(L: *lua.State, ctx: *LoadCtx, t: c_int) void {
 }
 
 /// A preference, or a form field: the same fields.
-fn parseField(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_title: [:0]const u8) Pref {
+fn parseField(
+    L: *lua.State,
+    ctx: *LoadCtx,
+    t: c_int,
+    where: []const u8,
+    ext_title: [:0]const u8,
+) Pref {
     const a = ctx.load.a;
-    const name = lua.fieldString(L, a, t, "name", where) orelse lua.raise(L, "{s}.name is missing", .{where});
-    if (!validId(name)) lua.raise(L, "{s}.name: use only a-z, 0-9, - and _ (got \"{s}\")", .{ where, name });
+    const name = lua.fieldString(L, a, t, "name", where) orelse lua.raise(
+        L,
+        "{s}.name is missing",
+        .{where},
+    );
+    if (!validId(name)) lua.raise(
+        L,
+        "{s}.name: use only a-z, 0-9, - and _ (got \"{s}\")",
+        .{ where, name },
+    );
     const kind_name = lua.fieldString(L, a, t, "type", where) orelse "text";
     const kind = std.meta.stringToEnum(PrefKind, kind_name) orelse
-        lua.raise(L, "{s}.type: toggle, choice, text or password (got \"{s}\")", .{ where, kind_name });
+        lua.raise(
+            L,
+            "{s}.type: toggle, choice, text or password (got \"{s}\")",
+            .{ where, kind_name },
+        );
     var pref: Pref = .{
         .ext = ctx.e.id,
         .ext_title = ext_title,
-        .file = a.printSentinel("{s}/preferences.json", .{ctx.e.data}, 0) catch lua.raise(L, "not enough memory", .{}),
+        .file = a.printSentinel(
+            "{s}/preferences.json",
+            .{ctx.e.data},
+            0,
+        ) catch lua.raise(L, "not enough memory", .{}),
         .name = name,
         .title = lua.fieldString(L, a, t, "title", where) orelse name,
         .description = lua.fieldString(L, a, t, "description", where) orelse "",
@@ -770,7 +885,11 @@ fn parseField(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_tit
         .required = lua.fieldBool(L, t, "required", false, where),
     };
     if (kind == .choice) {
-        if (lua.getField(L, t, "choices") != lua.c.LUA_TTABLE) lua.raise(L, "{s}.choices: a list expected for a choice", .{where});
+        if (lua.getField(L, t, "choices") != lua.c.LUA_TTABLE) lua.raise(
+            L,
+            "{s}.choices: a list expected for a choice",
+            .{where},
+        );
         const choice_list = lua.absIndex(L, -1);
         const n = lua.c.lua_rawlen(L, choice_list);
         if (n == 0) lua.raise(L, "{s}.choices is empty", .{where});
@@ -782,7 +901,11 @@ fn parseField(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_tit
                 const v = a.dupeSentinel(u8, s, 0) catch lua.raise(L, "not enough memory", .{});
                 ch.* = .{ .value = v, .label = v };
             } else if (lua.c.lua_type(L, -1) == lua.c.LUA_TTABLE) {
-                const v = lua.fieldString(L, a, -1, "value", where) orelse lua.raise(L, "{s}.choices[{d}].value is missing", .{ where, i });
+                const v = lua.fieldString(L, a, -1, "value", where) orelse lua.raise(
+                    L,
+                    "{s}.choices[{d}].value is missing",
+                    .{ where, i },
+                );
                 ch.* = .{ .value = v, .label = lua.fieldString(L, a, -1, "title", where) orelse v };
             } else lua.raise(L, "{s}.choices[{d}]: string or table expected", .{ where, i });
         }
@@ -797,29 +920,73 @@ fn parseField(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_tit
     return pref;
 }
 
-fn parseCommand(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_title: [:0]const u8, default_icon: item_mod.Icon) void {
+fn parseCommand(
+    L: *lua.State,
+    ctx: *LoadCtx,
+    t: c_int,
+    where: []const u8,
+    ext_title: [:0]const u8,
+    default_icon: item_mod.Icon,
+) void {
     const a = ctx.load.a;
-    const name = lua.fieldString(L, a, t, "name", where) orelse lua.raise(L, "{s}.name is missing", .{where});
-    if (!validId(name)) lua.raise(L, "{s}.name: use only a-z, 0-9, - and _ (got \"{s}\")", .{ where, name });
-    const title = lua.fieldString(L, a, t, "title", where) orelse lua.raise(L, "{s}.title is missing", .{where});
-    const id = a.printSentinel("{s}.{s}", .{ ctx.e.id, name }, 0) catch lua.raise(L, "not enough memory", .{});
-    for (ctx.load.commands.items) |cmd| if (std.mem.eql(u8, cmd.id, id)) lua.raise(L, "two commands named \"{s}\"", .{name});
+    const name = lua.fieldString(L, a, t, "name", where) orelse lua.raise(
+        L,
+        "{s}.name is missing",
+        .{where},
+    );
+    if (!validId(name)) lua.raise(
+        L,
+        "{s}.name: use only a-z, 0-9, - and _ (got \"{s}\")",
+        .{ where, name },
+    );
+    const title = lua.fieldString(L, a, t, "title", where) orelse lua.raise(
+        L,
+        "{s}.title is missing",
+        .{where},
+    );
+    const id = a.printSentinel(
+        "{s}.{s}",
+        .{ ctx.e.id, name },
+        0,
+    ) catch lua.raise(L, "not enough memory", .{});
+    for (ctx.load.commands.items) |cmd| if (std.mem.eql(u8, cmd.id, id)) lua.raise(
+        L,
+        "two commands named \"{s}\"",
+        .{name},
+    );
 
     const has_root = blk: {
         const ty = lua.getField(L, t, "root");
         defer lua.c.lua_settop(L, -2);
-        if (ty != lua.c.LUA_TNIL and ty != lua.c.LUA_TFUNCTION) lua.raise(L, "{s}.root: function expected, got {s}", .{ where, lua.typeName(L, -1) });
+        if (ty != lua.c.LUA_TNIL and ty != lua.c.LUA_TFUNCTION) lua.raise(
+            L,
+            "{s}.root: function expected, got {s}",
+            .{ where, lua.typeName(L, -1) },
+        );
         break :blk ty == lua.c.LUA_TFUNCTION;
     };
     var mode: ?Mode = null;
-    const kinds = [_]struct { [:0]const u8, Mode, bool }{ .{ "items", .list, true }, .{ "search", .search, false }, .{ "run", .run, false }, .{ "submit", .form, false } };
+    const kinds = [_]struct { [:0]const u8, Mode, bool }{ .{ "items", .list, true }, .{
+        "search",
+        .search,
+        false,
+    }, .{ "run", .run, false }, .{ "submit", .form, false } };
     for (kinds) |k| {
         const ty = lua.getField(L, t, k[0]);
         defer lua.c.lua_settop(L, -2);
         if (ty == lua.c.LUA_TNIL) continue;
         const ok = ty == lua.c.LUA_TFUNCTION or (k[2] and ty == lua.c.LUA_TTABLE);
-        if (!ok) lua.raise(L, "{s}.{s}: {s} expected, got {s}", .{ where, k[0], if (k[2]) "function or table" else "function", lua.typeName(L, -1) });
-        if (mode != null) lua.raise(L, "{s}: give it one of items, search or run, not several", .{where});
+        if (!ok) lua.raise(L, "{s}.{s}: {s} expected, got {s}", .{
+            where,
+            k[0],
+            if (k[2]) "function or table" else "function",
+            lua.typeName(L, -1),
+        });
+        if (mode != null) lua.raise(
+            L,
+            "{s}: give it one of items, search or run, not several",
+            .{where},
+        );
         mode = k[1];
     }
 
@@ -830,7 +997,11 @@ fn parseCommand(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_t
 
     var fields: []const Pref = &.{};
     if (mode == .form) {
-        if (lua.getField(L, t, "fields") != lua.c.LUA_TTABLE) lua.raise(L, "{s}.fields: a list of fields expected for a form", .{where});
+        if (lua.getField(L, t, "fields") != lua.c.LUA_TTABLE) lua.raise(
+            L,
+            "{s}.fields: a list of fields expected for a form",
+            .{where},
+        );
         const list_idx = lua.absIndex(L, -1);
         const n = lua.c.lua_rawlen(L, list_idx);
         if (n == 0 or n > 20) lua.raise(L, "{s}.fields: 1 to 20 fields", .{where});
@@ -838,10 +1009,18 @@ fn parseCommand(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_t
         for (out, 1..) |*f, i| {
             var wbuf: [48]u8 = undefined;
             const fwhere = std.mem.print(&wbuf, "{s}.fields[{d}]", .{ where, i }) catch where;
-            if (lua.c.lua_rawgeti(L, list_idx, @intCast(i)) != lua.c.LUA_TTABLE) lua.raise(L, "{s}: table expected", .{fwhere});
+            if (lua.c.lua_rawgeti(L, list_idx, @intCast(i)) != lua.c.LUA_TTABLE) lua.raise(
+                L,
+                "{s}: table expected",
+                .{fwhere},
+            );
             f.* = parseField(L, ctx, lua.absIndex(L, -1), fwhere, ext_title);
             lua.c.lua_settop(L, -2);
-            for (out[0 .. i - 1]) |prev| if (std.mem.eql(u8, prev.name, f.name)) lua.raise(L, "{s}: two fields named \"{s}\"", .{ where, f.name });
+            for (out[0 .. i - 1]) |prev| if (std.mem.eql(u8, prev.name, f.name)) lua.raise(
+                L,
+                "{s}: two fields named \"{s}\"",
+                .{ where, f.name },
+            );
         }
         lua.c.lua_settop(L, -2);
         fields = out;
@@ -858,7 +1037,11 @@ fn parseCommand(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_t
         .icon = icon,
         .keywords = keywords(L, a, t, where),
         .placeholder = lua.fieldString(L, a, t, "placeholder", where) orelse "",
-        .mode = mode orelse if (has_root) .provider else lua.raise(L, "{s}: give it items, search or run", .{where}),
+        .mode = mode orelse if (has_root) .provider else lua.raise(
+            L,
+            "{s}: give it items, search or run",
+            .{where},
+        ),
         .detail = lua.fieldBool(L, t, "detail", false, where),
         .root = has_root,
         .fields = fields,
@@ -873,7 +1056,12 @@ fn parseCommand(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8, ext_t
     if (ctx.load.commands.items.len >= std.math.maxInt(u16)) lua.raise(L, "too many commands", .{});
     lua.c.lua_pushvalue(L, t);
     const r = lua.ref(L);
-    ctx.load.wcmds.append(a, .{ .ext = ctx.ext_index, .ref = r, .mode = cmd.mode, .root = has_root }) catch lua.raise(L, "not enough memory", .{});
+    ctx.load.wcmds.append(a, .{
+        .ext = ctx.ext_index,
+        .ref = r,
+        .mode = cmd.mode,
+        .root = has_root,
+    }) catch lua.raise(L, "not enough memory", .{});
     ctx.load.commands.append(a, cmd) catch lua.raise(L, "not enough memory", .{});
 }
 
@@ -882,26 +1070,47 @@ fn keywords(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8) []
     defer lua.c.lua_settop(L, -2);
     switch (lua.getField(L, t, "keywords")) {
         lua.c.LUA_TNIL => return "",
-        lua.c.LUA_TSTRING => return a.dupe(u8, lua.toSlice(L, -1).?) catch lua.raise(L, "not enough memory", .{}),
+        lua.c.LUA_TSTRING => return a.dupe(u8, lua.toSlice(L, -1).?) catch lua.raise(
+            L,
+            "not enough memory",
+            .{},
+        ),
         lua.c.LUA_TTABLE => {
             var out: std.ArrayList(u8) = .empty;
             const n = lua.c.lua_rawlen(L, -1);
             for (1..n + 1) |i| {
                 _ = lua.c.lua_rawgeti(L, -1, @intCast(i));
                 defer lua.c.lua_settop(L, -2);
-                const s = lua.toSlice(L, -1) orelse lua.raise(L, "{s}.keywords[{d}]: string expected", .{ where, i });
-                if (out.items.len > 0) out.append(a, ' ') catch lua.raise(L, "not enough memory", .{});
+                const s = lua.toSlice(L, -1) orelse lua.raise(
+                    L,
+                    "{s}.keywords[{d}]: string expected",
+                    .{ where, i },
+                );
+                if (out.items.len > 0) out.append(a, ' ') catch lua.raise(
+                    L,
+                    "not enough memory",
+                    .{},
+                );
                 out.appendSlice(a, s) catch lua.raise(L, "not enough memory", .{});
             }
             return out.items;
         },
-        else => lua.raise(L, "{s}.keywords: string or list expected, got {s}", .{ where, lua.typeName(L, -1) }),
+        else => lua.raise(
+            L,
+            "{s}.keywords: string or list expected, got {s}",
+            .{ where, lua.typeName(L, -1) },
+        ),
     }
 }
 
 /// An icon: an emoji ("🐙"), an icon name ("folder-symbolic") on a grey
 /// tile, or `{ name = ..., color = "blue" }`. Null for nil.
-pub fn parseIcon(L: *lua.State, a: std.mem.Allocator, idx: c_int, where: []const u8) ?item_mod.Icon {
+pub fn parseIcon(
+    L: *lua.State,
+    a: std.mem.Allocator,
+    idx: c_int,
+    where: []const u8,
+) ?item_mod.Icon {
     const t = lua.absIndex(L, idx);
     switch (lua.c.lua_type(L, t)) {
         lua.c.LUA_TNIL => return null,
@@ -916,20 +1125,35 @@ pub fn parseIcon(L: *lua.State, a: std.mem.Allocator, idx: c_int, where: []const
             return .byName(copy);
         },
         lua.c.LUA_TTABLE => {
-            const name = lua.fieldString(L, a, t, "name", where) orelse lua.raise(L, "{s}.icon.name is missing", .{where});
+            const name = lua.fieldString(L, a, t, "name", where) orelse lua.raise(
+                L,
+                "{s}.icon.name is missing",
+                .{where},
+            );
             const color_name = lua.fieldString(L, a, t, "color", where) orelse "gray";
             const color = std.meta.stringToEnum(item_mod.Color, color_name) orelse
-                lua.raise(L, "{s}.icon.color: one of red, orange, yellow, green, blue, purple, pink, gray (got \"{s}\")", .{ where, color_name });
+                lua.raise(
+                    L,
+                    "{s}.icon.color: one of red, orange, yellow, green, blue, purple, pink, gray (got \"{s}\")",
+                    .{ where, color_name },
+                );
             return .{ .tile = .{ .name = name, .color = color } };
         },
-        else => lua.raise(L, "{s}.icon: string or table expected, got {s}", .{ where, lua.typeName(L, t) }),
+        else => lua.raise(
+            L,
+            "{s}.icon: string or table expected, got {s}",
+            .{ where, lua.typeName(L, t) },
+        ),
     }
 }
 
 // ----------------------------------------------------------------- list
 
 fn doList(h: *Host, req: ListReq, query: []const u8) void {
-    const res = h.gpa.create(ListResult) catch return log.warn("list: out of memory, no answer", .{});
+    const res = h.gpa.create(ListResult) catch return log.warn(
+        "list: out of memory, no answer",
+        .{},
+    );
     res.* = .{ .gen = req.gen, .command = req.command, .query = "", .arena = .init(h.gpa) };
     const a = res.arena.allocator();
     res.query = a.dupe(u8, query) catch "";
@@ -957,7 +1181,11 @@ const ListCtx = struct {
         _ = lua.pushRef(L, ctx.wc.ref);
         const spec = lua.absIndex(L, -1);
         switch (ctx.wc.mode) {
-            .list => if (lua.getField(L, spec, "items") == lua.c.LUA_TFUNCTION) lua.c.lua_callk(L, 0, 1, 0, null),
+            .list => if (lua.getField(
+                L,
+                spec,
+                "items",
+            ) == lua.c.LUA_TFUNCTION) lua.c.lua_callk(L, 0, 1, 0, null),
             .search => {
                 _ = lua.getField(L, spec, "search");
                 lua.pushString(L, ctx.query);
@@ -972,7 +1200,14 @@ const ListCtx = struct {
             else => lua.raise(L, "items: a list expected, got {s}", .{lua.typeName(L, list_idx)}),
         }
         keep(L, &ctx.wc.list, list_idx, ctx.req.gen);
-        ctx.res.items = parseItems(L, ctx.res.arena.allocator(), list_idx, .{ .gen = ctx.req.gen, .command = ctx.req.command }, ctx.e.id, max_items);
+        ctx.res.items = parseItems(
+            L,
+            ctx.res.arena.allocator(),
+            list_idx,
+            .{ .gen = ctx.req.gen, .command = ctx.req.command },
+            ctx.e.id,
+            max_items,
+        );
     }
 };
 
@@ -990,7 +1225,14 @@ fn keep(L: *lua.State, k: *Kept, idx: c_int, gen: u32) void {
 /// Where rows came from, for their actions.
 const Origin = struct { gen: u32, command: u16, root: bool = false };
 
-fn parseItems(L: *lua.State, a: std.mem.Allocator, list_idx: c_int, origin: Origin, ext_id: []const u8, limit: usize) []Item {
+fn parseItems(
+    L: *lua.State,
+    a: std.mem.Allocator,
+    list_idx: c_int,
+    origin: Origin,
+    ext_id: []const u8,
+    limit: usize,
+) []Item {
     const n = @min(lua.c.lua_rawlen(L, list_idx), limit);
     const items = a.alloc(Item, n) catch lua.raise(L, "not enough memory", .{});
     for (items, 1..) |*it, i| {
@@ -1003,14 +1245,32 @@ fn parseItems(L: *lua.State, a: std.mem.Allocator, list_idx: c_int, origin: Orig
     return items;
 }
 
-fn parseItem(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8, origin: Origin, pos: u32, ext_id: []const u8) Item {
+fn parseItem(
+    L: *lua.State,
+    a: std.mem.Allocator,
+    t: c_int,
+    where: []const u8,
+    origin: Origin,
+    pos: u32,
+    ext_id: []const u8,
+) Item {
     // A plain string is a row with that title.
     if (lua.toSlice(L, t)) |s| {
         const title = a.dupeSentinel(u8, s, 0) catch lua.raise(L, "not enough memory", .{});
-        return .{ .key = key(L, a, ext_id, title), .title = title, .action = .{ .ext_item = defaultActions(a, L, origin, pos, title) } };
+        return .{ .key = key(L, a, ext_id, title), .title = title, .action = .{
+            .ext_item = defaultActions(a, L, origin, pos, title),
+        } };
     }
-    if (lua.c.lua_type(L, t) != lua.c.LUA_TTABLE) lua.raise(L, "{s}: table or string expected, got {s}", .{ where, lua.typeName(L, t) });
-    const title = lua.fieldString(L, a, t, "title", where) orelse lua.raise(L, "{s}.title is missing", .{where});
+    if (lua.c.lua_type(L, t) != lua.c.LUA_TTABLE) lua.raise(
+        L,
+        "{s}: table or string expected, got {s}",
+        .{ where, lua.typeName(L, t) },
+    );
+    const title = lua.fieldString(L, a, t, "title", where) orelse lua.raise(
+        L,
+        "{s}.title is missing",
+        .{where},
+    );
     var it: Item = .{
         .key = key(L, a, ext_id, lua.fieldString(L, a, t, "id", where) orelse title),
         .title = title,
@@ -1040,7 +1300,11 @@ fn parseItem(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8, o
         return it;
     }
     const acts_idx = lua.absIndex(L, -1);
-    if (lua.c.lua_type(L, acts_idx) != lua.c.LUA_TTABLE) lua.raise(L, "{s}.actions: a list expected, got {s}", .{ where, lua.typeName(L, acts_idx) });
+    if (lua.c.lua_type(L, acts_idx) != lua.c.LUA_TTABLE) lua.raise(
+        L,
+        "{s}.actions: a list expected, got {s}",
+        .{ where, lua.typeName(L, acts_idx) },
+    );
     const n = @min(lua.c.lua_rawlen(L, acts_idx), max_actions);
     if (n == 0) lua.raise(L, "{s}.actions is empty", .{where});
     const actions = a.alloc(item_mod.ExtAction, n) catch lua.raise(L, "not enough memory", .{});
@@ -1051,24 +1315,44 @@ fn parseItem(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8, o
         _ = lua.c.lua_rawgeti(L, acts_idx, @intCast(j + 1));
         defer lua.c.lua_settop(L, -2);
         const at = lua.absIndex(L, -1);
-        if (lua.c.lua_type(L, at) != lua.c.LUA_TTABLE) lua.raise(L, "{s}: table expected, got {s}", .{ awhere, lua.typeName(L, at) });
+        if (lua.c.lua_type(L, at) != lua.c.LUA_TTABLE) lua.raise(
+            L,
+            "{s}: table expected, got {s}",
+            .{ awhere, lua.typeName(L, at) },
+        );
         const parsed = parseAction(L, a, at, awhere);
         act_out.* = parsed.action;
         entry.* = .{ .label = parsed.label, .keys = keysFor(j), .op = .ext, .index = @intCast(j) };
     }
     lua.c.lua_settop(L, -2);
-    it.action = .{ .ext_item = .{ .command = origin.command, .root = origin.root, .gen = origin.gen, .index = pos, .actions = actions, .entries = entries } };
+    it.action = .{ .ext_item = .{
+        .command = origin.command,
+        .root = origin.root,
+        .gen = origin.gen,
+        .index = pos,
+        .actions = actions,
+        .entries = entries,
+    } };
     return it;
 }
 
 /// `metadata = { { "Label", "value" }, { label = "Size", value = 42 } }`:
 /// up to 4 pairs for the detail pane.
-fn metadata(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8) []const item_mod.Meta {
+fn metadata(
+    L: *lua.State,
+    a: std.mem.Allocator,
+    t: c_int,
+    where: []const u8,
+) []const item_mod.Meta {
     defer lua.c.lua_settop(L, -2);
     switch (lua.getField(L, t, "metadata")) {
         lua.c.LUA_TNIL => return &.{},
         lua.c.LUA_TTABLE => {},
-        else => lua.raise(L, "{s}.metadata: a list expected, got {s}", .{ where, lua.typeName(L, -1) }),
+        else => lua.raise(
+            L,
+            "{s}.metadata: a list expected, got {s}",
+            .{ where, lua.typeName(L, -1) },
+        ),
     }
     const pairs = lua.absIndex(L, -1);
     const n = @min(lua.c.lua_rawlen(L, pairs), max_meta);
@@ -1076,12 +1360,28 @@ fn metadata(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8) []
     for (out, 1..) |*m, i| {
         var wbuf: [48]u8 = undefined;
         const mwhere = std.mem.print(&wbuf, "{s}.metadata[{d}]", .{ where, i }) catch where;
-        if (lua.c.lua_rawgeti(L, pairs, @intCast(i)) != lua.c.LUA_TTABLE) lua.raise(L, "{s}: table expected", .{mwhere});
+        if (lua.c.lua_rawgeti(L, pairs, @intCast(i)) != lua.c.LUA_TTABLE) lua.raise(
+            L,
+            "{s}: table expected",
+            .{mwhere},
+        );
         defer lua.c.lua_settop(L, -2);
         const pair = lua.absIndex(L, -1);
         m.* = .{
-            .label = lua.fieldString(L, a, pair, "label", mwhere) orelse pairPart(L, a, pair, 1, mwhere),
-            .value = lua.fieldString(L, a, pair, "value", mwhere) orelse pairPart(L, a, pair, 2, mwhere),
+            .label = lua.fieldString(
+                L,
+                a,
+                pair,
+                "label",
+                mwhere,
+            ) orelse pairPart(L, a, pair, 1, mwhere),
+            .value = lua.fieldString(
+                L,
+                a,
+                pair,
+                "value",
+                mwhere,
+            ) orelse pairPart(L, a, pair, 2, mwhere),
         };
     }
     return out;
@@ -1090,13 +1390,23 @@ fn metadata(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8) []
 const max_meta = 4;
 
 /// `pair[i]` as text (numbers too).
-fn pairPart(L: *lua.State, a: std.mem.Allocator, pair: c_int, i: c_int, where: []const u8) [:0]const u8 {
+fn pairPart(
+    L: *lua.State,
+    a: std.mem.Allocator,
+    pair: c_int,
+    i: c_int,
+    where: []const u8,
+) [:0]const u8 {
     defer lua.c.lua_settop(L, -2);
     return switch (lua.c.lua_rawgeti(L, pair, i)) {
         lua.c.LUA_TSTRING, lua.c.LUA_TNUMBER => blk: {
             var len: usize = 0;
             const p = lua.c.lua_tolstring(L, -1, &len);
-            break :blk a.dupeSentinel(u8, p[0..len], 0) catch lua.raise(L, "not enough memory", .{});
+            break :blk a.dupeSentinel(u8, p[0..len], 0) catch lua.raise(
+                L,
+                "not enough memory",
+                .{},
+            );
         },
         else => lua.raise(L, "{s}: {{ label, value }} expected", .{where}),
     };
@@ -1116,10 +1426,30 @@ fn keysFor(j: usize) [:0]const u8 {
 }
 
 /// A row without actions copies its title.
-fn defaultActions(a: std.mem.Allocator, L: *lua.State, origin: Origin, pos: u32, title: [:0]const u8) item_mod.ExtItem {
-    const actions = a.dupe(item_mod.ExtAction, &.{.{ .copy = title }}) catch lua.raise(L, "not enough memory", .{});
-    const entries = a.dupe(item_mod.Entry, &.{.{ .label = "Copy to Clipboard", .keys = "↵", .op = .ext }}) catch lua.raise(L, "not enough memory", .{});
-    return .{ .command = origin.command, .root = origin.root, .gen = origin.gen, .index = pos, .actions = actions, .entries = entries };
+fn defaultActions(
+    a: std.mem.Allocator,
+    L: *lua.State,
+    origin: Origin,
+    pos: u32,
+    title: [:0]const u8,
+) item_mod.ExtItem {
+    const actions = a.dupe(
+        item_mod.ExtAction,
+        &.{.{ .copy = title }},
+    ) catch lua.raise(L, "not enough memory", .{});
+    const entries = a.dupe(item_mod.Entry, &.{.{
+        .label = "Copy to Clipboard",
+        .keys = "↵",
+        .op = .ext,
+    }}) catch lua.raise(L, "not enough memory", .{});
+    return .{
+        .command = origin.command,
+        .root = origin.root,
+        .gen = origin.gen,
+        .index = pos,
+        .actions = actions,
+        .entries = entries,
+    };
 }
 
 const ParsedAction = struct { action: item_mod.ExtAction, label: [:0]const u8 };
@@ -1130,23 +1460,39 @@ fn parseAction(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8)
         const ty = lua.getField(L, t, "run");
         defer lua.c.lua_settop(L, -2);
         if (ty == lua.c.LUA_TFUNCTION) return .{ .action = .lua, .label = title orelse "Run" };
-        if (ty != lua.c.LUA_TNIL) lua.raise(L, "{s}.run: function expected, got {s}", .{ where, lua.typeName(L, -1) });
+        if (ty != lua.c.LUA_TNIL) lua.raise(
+            L,
+            "{s}.run: function expected, got {s}",
+            .{ where, lua.typeName(L, -1) },
+        );
     }
     const kind = lua.fieldString(L, a, t, "kind", where) orelse
         lua.raise(L, "{s}: give it a run function, or make it with lumen.action.*", .{where});
     if (std.mem.eql(u8, kind, "open")) {
-        const target = lua.fieldString(L, a, t, "target", where) orelse lua.raise(L, "{s}.target is missing", .{where});
+        const target = lua.fieldString(L, a, t, "target", where) orelse lua.raise(
+            L,
+            "{s}.target is missing",
+            .{where},
+        );
         return .{ .action = .{ .open = target }, .label = title orelse "Open" };
     }
     if (std.mem.eql(u8, kind, "copy") or std.mem.eql(u8, kind, "paste")) {
-        const text = lua.fieldString(L, a, t, "text", where) orelse lua.raise(L, "{s}.text is missing", .{where});
+        const text = lua.fieldString(L, a, t, "text", where) orelse lua.raise(
+            L,
+            "{s}.text is missing",
+            .{where},
+        );
         return if (kind[0] == 'c')
             .{ .action = .{ .copy = text }, .label = title orelse "Copy to Clipboard" }
         else
             .{ .action = .{ .paste = text }, .label = title orelse "Paste to Active App" };
     }
     if (std.mem.eql(u8, kind, "exec")) {
-        if (lua.getField(L, t, "argv") != lua.c.LUA_TTABLE) lua.raise(L, "{s}.argv: a list of strings expected", .{where});
+        if (lua.getField(L, t, "argv") != lua.c.LUA_TTABLE) lua.raise(
+            L,
+            "{s}.argv: a list of strings expected",
+            .{where},
+        );
         defer lua.c.lua_settop(L, -2);
         const n = lua.c.lua_rawlen(L, -1);
         if (n == 0 or n > 32) lua.raise(L, "{s}.argv: 1 to 32 strings expected", .{where});
@@ -1154,7 +1500,11 @@ fn parseAction(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8)
         for (argv, 1..) |*arg, i| {
             _ = lua.c.lua_rawgeti(L, -1, @intCast(i));
             defer lua.c.lua_settop(L, -2);
-            const s = lua.toSlice(L, -1) orelse lua.raise(L, "{s}.argv[{d}]: string expected", .{ where, i });
+            const s = lua.toSlice(L, -1) orelse lua.raise(
+                L,
+                "{s}.argv[{d}]: string expected",
+                .{ where, i },
+            );
             arg.* = a.dupeSentinel(u8, s, 0) catch lua.raise(L, "not enough memory", .{});
         }
         return .{ .action = .{ .exec = argv }, .label = title orelse "Run" };
@@ -1165,7 +1515,10 @@ fn parseAction(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8)
 // ----------------------------------------------------------------- root
 
 fn doRoot(h: *Host, req: RootReq, query: []const u8) void {
-    const res = h.gpa.create(RootResult) catch return log.warn("root: out of memory, no answer", .{});
+    const res = h.gpa.create(RootResult) catch return log.warn(
+        "root: out of memory, no answer",
+        .{},
+    );
     res.* = .{ .gen = req.gen, .query = "", .arena = .init(h.gpa) };
     const a = res.arena.allocator();
     res.query = a.dupe(u8, query) catch "";
@@ -1179,13 +1532,23 @@ fn doRoot(h: *Host, req: RootReq, query: []const u8) void {
         const e = h.exts.items[wc.ext];
         e.budget.deadline_ns = index.sys.monotonicNs() + root_budget_ns;
         defer e.budget.deadline_ns = std.math.maxInt(u64);
-        var ctx: RootCtx = .{ .e = e, .wc = wc, .command = @intCast(i), .gen = req.gen, .query = query, .a = a };
+        var ctx: RootCtx = .{
+            .e = e,
+            .wc = wc,
+            .command = @intCast(i),
+            .gen = req.gen,
+            .query = query,
+            .a = a,
+        };
         if (lua.protect(e.L, a, RootCtx, &ctx, RootCtx.run)) |err| {
             // One provider failing must not hide the others' rows.
             log.warn("{s}: root search: {s}", .{ e.id, err });
             continue;
         }
-        if (ctx.items.len > 0) sections.append(a, .{ .command = @intCast(i), .items = ctx.items }) catch break;
+        if (ctx.items.len > 0) sections.append(a, .{
+            .command = @intCast(i),
+            .items = ctx.items,
+        }) catch break;
     }
     res.sections = sections.items;
 }
@@ -1217,7 +1580,14 @@ const RootCtx = struct {
             else => lua.raise(L, "root: a list expected, got {s}", .{lua.typeName(L, list_idx)}),
         }
         keep(L, &ctx.wc.root_rows, list_idx, ctx.gen);
-        ctx.items = parseItems(L, ctx.a, list_idx, .{ .gen = ctx.gen, .command = ctx.command, .root = true }, ctx.e.id, max_root_items);
+        ctx.items = parseItems(
+            L,
+            ctx.a,
+            list_idx,
+            .{ .gen = ctx.gen, .command = ctx.command, .root = true },
+            ctx.e.id,
+            max_root_items,
+        );
     }
 };
 
@@ -1228,7 +1598,10 @@ fn doSubmit(h: *Host, req: *SubmitReq) void {
         req.arena.deinit();
         h.gpa.destroy(req);
     }
-    const res = h.gpa.create(ActResult) catch return log.warn("action: out of memory, no answer", .{});
+    const res = h.gpa.create(ActResult) catch return log.warn(
+        "action: out of memory, no answer",
+        .{},
+    );
     res.* = .{ .gen = req.gen, .arena = .init(h.gpa) };
     defer h.deliver(.{ .act = res });
     if (req.registry != h.registry_gen or req.command >= h.wcmds.len) {
@@ -1250,10 +1623,16 @@ const SubmitCtx = struct {
 
     fn run(L: *lua.State, ctx: *SubmitCtx) void {
         _ = lua.pushRef(L, ctx.wc.ref);
-        if (lua.getField(L, -1, "submit") != lua.c.LUA_TFUNCTION) lua.raise(L, "this command has no submit function", .{});
+        if (lua.getField(L, -1, "submit") != lua.c.LUA_TFUNCTION) lua.raise(
+            L,
+            "this command has no submit function",
+            .{},
+        );
         lua.c.lua_createtable(L, 0, @intCast(ctx.req.values.len));
         for (ctx.req.values) |v| {
-            if (v.toggle) lua.c.lua_pushboolean(L, @intFromBool(std.mem.eql(u8, v.value, "true"))) else lua.pushString(L, v.value);
+            if (v.toggle) lua.c.lua_pushboolean(L, @intFromBool(
+                std.mem.eql(u8, v.value, "true"),
+            )) else lua.pushString(L, v.value);
             lua.pushString(L, v.name);
             lua.c.lua_rotate(L, -2, 1);
             lua.c.lua_rawset(L, -3);
@@ -1268,15 +1647,26 @@ fn outcomeOf(L: *lua.State) Outcome {
     return switch (lua.c.lua_type(L, -1)) {
         lua.c.LUA_TNIL => .close,
         lua.c.LUA_TSTRING => std.meta.stringToEnum(Outcome, lua.toSlice(L, -1).?) orelse
-            lua.raise(L, "run must return nothing, \"close\", \"stay\" or \"refresh\" (got \"{s}\")", .{lua.toSlice(L, -1).?}),
-        else => lua.raise(L, "run must return nothing, \"close\", \"stay\" or \"refresh\", not a {s}", .{lua.typeName(L, -1)}),
+            lua.raise(
+                L,
+                "run must return nothing, \"close\", \"stay\" or \"refresh\" (got \"{s}\")",
+                .{lua.toSlice(L, -1).?},
+            ),
+        else => lua.raise(
+            L,
+            "run must return nothing, \"close\", \"stay\" or \"refresh\", not a {s}",
+            .{lua.typeName(L, -1)},
+        ),
     };
 }
 
 // ------------------------------------------------------------------ act
 
 fn doAct(h: *Host, req: ActReq) void {
-    const res = h.gpa.create(ActResult) catch return log.warn("action: out of memory, no answer", .{});
+    const res = h.gpa.create(ActResult) catch return log.warn(
+        "action: out of memory, no answer",
+        .{},
+    );
     res.* = .{ .gen = req.gen, .arena = .init(h.gpa) };
     defer h.deliver(.{ .act = res });
     if (req.registry != h.registry_gen or req.command >= h.wcmds.len) {
@@ -1304,20 +1694,36 @@ const ActCtx = struct {
             if (k.ref == c_noref or k.gen != req.list_gen)
                 lua.raise(L, "the list changed meanwhile; try again", .{});
             _ = lua.pushRef(L, k.ref);
-            if (lua.c.lua_rawgeti(L, -1, @intCast(item + 1)) != lua.c.LUA_TTABLE) lua.raise(L, "that row has no actions", .{});
+            if (lua.c.lua_rawgeti(L, -1, @intCast(item + 1)) != lua.c.LUA_TTABLE) lua.raise(
+                L,
+                "that row has no actions",
+                .{},
+            );
             const row = lua.absIndex(L, -1);
             // The row is a live table the extension may have changed since:
             // rawgeti on a non-table reads garbage (no API checks in
             // distribution builds of Lua).
-            if (lua.getField(L, row, "actions") != lua.c.LUA_TTABLE) lua.raise(L, "that row has no actions", .{});
+            if (lua.getField(L, row, "actions") != lua.c.LUA_TTABLE) lua.raise(
+                L,
+                "that row has no actions",
+                .{},
+            );
             _ = lua.c.lua_rawgeti(L, -1, @as(c_int, req.action) + 1);
-            if (lua.c.lua_type(L, -1) != lua.c.LUA_TTABLE or lua.getField(L, -1, "run") != lua.c.LUA_TFUNCTION)
+            if (lua.c.lua_type(L, -1) != lua.c.LUA_TTABLE or lua.getField(
+                L,
+                -1,
+                "run",
+            ) != lua.c.LUA_TFUNCTION)
                 lua.raise(L, "that action is not a Lua function", .{});
             lua.c.lua_pushvalue(L, row);
             lua.c.lua_callk(L, 1, 1, 0, null);
         } else {
             _ = lua.pushRef(L, ctx.wc.ref);
-            if (lua.getField(L, -1, "run") != lua.c.LUA_TFUNCTION) lua.raise(L, "this command has no run function", .{});
+            if (lua.getField(L, -1, "run") != lua.c.LUA_TFUNCTION) lua.raise(
+                L,
+                "this command has no run function",
+                .{},
+            );
             lua.c.lua_callk(L, 0, 1, 0, null);
         }
         ctx.res.outcome = outcomeOf(L);
@@ -1364,10 +1770,20 @@ fn onIdle(data: ?*anyopaque) callconv(.c) c.gboolean {
 pub fn stamp(config_dir: []const u8, style: []const u8) u64 {
     var hasher: std.hash.Wyhash = .init(0);
     var buf: [4096]u8 = undefined;
-    if (std.mem.printSentinel(&buf, "{s}/init.lua", .{config_dir}, 0)) |p| hashFile(&hasher, p) else |_| {}
+    if (std.mem.printSentinel(
+        &buf,
+        "{s}/init.lua",
+        .{config_dir},
+        0,
+    )) |p| hashFile(&hasher, p) else |_| {}
     hashFolders(&hasher, config_dir, "extensions");
     hasher.update(style);
-    if (style.len > 0) if (std.mem.printSentinel(&buf, "{s}/styles/{s}", .{ config_dir, style }, 0)) |dir| hashLua(&hasher, dir) else |_| {};
+    if (style.len > 0) if (std.mem.printSentinel(
+        &buf,
+        "{s}/styles/{s}",
+        .{ config_dir, style },
+        0,
+    )) |dir| hashLua(&hasher, dir) else |_| {};
     return hasher.final();
 }
 
@@ -1393,7 +1809,12 @@ fn hashFolders(hasher: *std.hash.Wyhash, config_dir: []const u8, kind: []const u
     defer c.g_dir_close(d);
     while (c.g_dir_read_name(d)) |n| {
         var sub_buf: [4096]u8 = undefined;
-        const sub = std.mem.printSentinel(&sub_buf, "{s}/{s}", .{ top, std.mem.span(n) }, 0) catch continue;
+        const sub = std.mem.printSentinel(
+            &sub_buf,
+            "{s}/{s}",
+            .{ top, std.mem.span(n) },
+            0,
+        ) catch continue;
         hashLua(hasher, sub);
     }
 }
@@ -1402,7 +1823,13 @@ fn hashFile(hasher: *std.hash.Wyhash, path: [:0]const u8) void {
     const linux = std.os.linux;
     var st: linux.Statx = undefined;
     hasher.update(path);
-    if (linux.errno(linux.statx(linux.AT.FDCWD, path, 0, .{ .SIZE = true, .MTIME = true, .INO = true }, &st)) != .SUCCESS) return;
+    if (linux.errno(linux.statx(
+        linux.AT.FDCWD,
+        path,
+        0,
+        .{ .SIZE = true, .MTIME = true, .INO = true },
+        &st,
+    )) != .SUCCESS) return;
     hasher.update(std.mem.asBytes(&st.mtime.sec));
     hasher.update(std.mem.asBytes(&st.mtime.nsec));
     hasher.update(std.mem.asBytes(&st.size));
@@ -1452,7 +1879,11 @@ const Probe = struct {
         while (@field(p, field) == null) {
             if (index.sys.monotonicNs() > until) return error.Timeout;
             // Nothing ready: a 1 ms nap (poll with no descriptors).
-            if (c.g_main_context_iteration(null, 0) == 0) _ = std.os.linux.poll(&[0]std.os.linux.pollfd{}, 0, 1);
+            if (c.g_main_context_iteration(null, 0) == 0) _ = std.os.linux.poll(
+                &[0]std.os.linux.pollfd{},
+                0,
+                1,
+            );
         }
     }
     fn take(p: *Probe, comptime field: []const u8) !@TypeOf(@field(p, field).?) {
@@ -1473,7 +1904,13 @@ fn writeTestFile(dir: []const u8, name: []const u8, data: []const u8) !void {
 fn testHost(probe: *Probe, dir: []const u8) !*Host {
     var buf: [4096]u8 = undefined;
     const data = try std.mem.print(&buf, "{s}/data", .{dir});
-    return start(testing.allocator, testing.io, dir, data, .{ .ctx = probe, .registry = &Probe.onRegistry, .list = &Probe.onList, .act = &Probe.onAct, .root = &Probe.onRoot });
+    return start(testing.allocator, testing.io, dir, data, .{
+        .ctx = probe,
+        .registry = &Probe.onRegistry,
+        .list = &Probe.onList,
+        .act = &Probe.onAct,
+        .root = &Probe.onRoot,
+    });
 }
 
 test "extensions load, list, search and run actions" {
@@ -1514,7 +1951,11 @@ test "extensions load, list, search and run actions" {
         \\}
     );
     try writeTestFile(dir, "extensions/demo/util.lua", "return {}");
-    try writeTestFile(dir, "extensions/broken/init.lua", "return lumen.extension { commands = { { name = 'x' } } }");
+    try writeTestFile(
+        dir,
+        "extensions/broken/init.lua",
+        "return lumen.extension { commands = { { name = 'x' } } }",
+    );
 
     var probe: Probe = .{};
     defer probe.deinit();
@@ -1543,10 +1984,16 @@ test "extensions load, list, search and run actions" {
     // Several lumen.layout calls add up.
     try testing.expect(reg.has_layout);
     try testing.expectEqual(@as(?u16, 820), reg.layout.width);
-    try testing.expect(reg.layout.footer and reg.layout.panels == .single and reg.layout.rows == .inline_);
+    try testing.expect(
+        reg.layout.footer and reg.layout.panels == .single and reg.layout.rows == .inline_,
+    );
     try testing.expect(!reg.layout.show.icons and reg.layout.show.subtitles);
     for (reg.settings) |o| {
-        const want: []const u8 = if (std.mem.eql(u8, o.key, "width")) "wide" else if (std.mem.eql(u8, o.key, "suggestions")) "false" else "90";
+        const want: []const u8 = if (std.mem.eql(u8, o.key, "width")) "wide" else if (std.mem.eql(
+            u8,
+            o.key,
+            "suggestions",
+        )) "false" else "90";
         try testing.expectEqualStrings(want, o.value);
     }
     // The broken one is reported, the others load.
@@ -1562,7 +2009,10 @@ test "extensions load, list, search and run actions" {
     try testing.expect(fruits.err == null);
     try testing.expectEqual(@as(usize, 2), fruits.items.len);
     try testing.expectEqualStrings("Apple", fruits.items[0].title);
-    try testing.expectEqualStrings("Copy to Clipboard", fruits.items[0].action.ext_item.entries[0].label);
+    try testing.expectEqualStrings(
+        "Copy to Clipboard",
+        fruits.items[0].action.ext_item.entries[0].label,
+    );
     const banana = fruits.items[1];
     try testing.expectEqualStrings("yellow", banana.subtitle);
     try testing.expectEqualStrings("Long", banana.section);
@@ -1671,7 +2121,23 @@ test "errors in extensions come back as messages" {
     try testing.expectEqual(@as(usize, 5), reg.problems.len);
     try testing.expect(!reg.has_layout);
     for (reg.problems) |p| {
-        const want: []const u8 = if (std.mem.eql(u8, p.ext, "Bad Name")) "folder names" else if (std.mem.eql(u8, p.ext, "keys")) "needs ctrl" else if (std.mem.eql(u8, p.ext, "sets")) "no setting named \"widht\"" else if (std.mem.eql(u8, p.ext, "lay")) "bad value for panels" else "unexpected symbol near <eof>";
+        const want: []const u8 = if (std.mem.eql(
+            u8,
+            p.ext,
+            "Bad Name",
+        )) "folder names" else if (std.mem.eql(
+            u8,
+            p.ext,
+            "keys",
+        )) "needs ctrl" else if (std.mem.eql(
+            u8,
+            p.ext,
+            "sets",
+        )) "no setting named \"widht\"" else if (std.mem.eql(
+            u8,
+            p.ext,
+            "lay",
+        )) "bad value for panels" else "unexpected symbol near <eof>";
         if (std.mem.find(u8, p.message, want) == null) {
             std.debug.print("{s}: {s}\n", .{ p.ext, p.message });
             return error.TestUnexpectedResult;
@@ -1733,7 +2199,11 @@ test "preferences read Settings' file over their defaults; storage persists" {
     try testing.expectEqualStrings("false", reg.prefs[1].default);
     try testing.expectEqualStrings("s", reg.prefs[2].default);
     try testing.expectEqualStrings("Medium", reg.prefs[2].choices[1].label);
-    try testing.expect(std.mem.endsWith(u8, reg.prefs[0].file, "data/extensions/kv/preferences.json"));
+    try testing.expect(std.mem.endsWith(
+        u8,
+        reg.prefs[0].file,
+        "data/extensions/kv/preferences.json",
+    ));
 
     _ = h.list(reg.gen, 0, "");
     const before = try probe.take("res");

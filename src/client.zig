@@ -13,7 +13,15 @@ const linux = std.os.linux;
 const ipc = @import("ipc.zig");
 
 /// Flags passed on as they are, and those taking a value.
-const plain = [_][]const u8{ "--toggle", "--show", "--hide", "--quit", "--reload", "--stats", "--dump" };
+const plain = [_][]const u8{
+    "--toggle",
+    "--show",
+    "--hide",
+    "--quit",
+    "--reload",
+    "--stats",
+    "--dump",
+};
 const valued = [_][]const u8{ "--key", "--text", "--view", "--query", "--command" };
 
 var request: [ipc.max_request_bytes]u8 = undefined;
@@ -24,7 +32,10 @@ pub fn main(init: std.process.Init.Minimal) void {
     const envp: [*:null]const ?[*:0]const u8 = init.environ.block.slice.ptr;
     const args = argv[1..];
     if (std.process.Environ.getPosix(init.environ, "XDG_RUNTIME_DIR")) |rt| {
-        const app_id = std.process.Environ.getPosix(init.environ, "LUMEN_APP_ID") orelse ipc.default_app_id;
+        const app_id = std.process.Environ.getPosix(
+            init.environ,
+            "LUMEN_APP_ID",
+        ) orelse ipc.default_app_id;
         if (clipStore(args)) {
             // wl-clipboard says when a copy is a password manager's or a clear.
             if (std.process.Environ.getPosix(init.environ, "CLIPBOARD_STATE")) |state|
@@ -56,7 +67,12 @@ fn passable(args: []const [*:0]const u8) bool {
 }
 
 /// The daemon's exit status, or null when there is no daemon to ask.
-fn ask(runtime_dir: []const u8, app_id: []const u8, args: []const [*:0]const u8, with_stdin: bool) ?u8 {
+fn ask(
+    runtime_dir: []const u8,
+    app_id: []const u8,
+    args: []const [*:0]const u8,
+    with_stdin: bool,
+) ?u8 {
     var path_buf: [256]u8 = undefined;
     const path = ipc.socketPath(&path_buf, runtime_dir, app_id) orelse return null;
     var spans: [ipc.max_args][]const u8 = undefined;

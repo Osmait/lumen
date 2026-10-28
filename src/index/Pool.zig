@@ -54,7 +54,10 @@ pub fn create(gpa: std.mem.Allocator, io: Io, workers: usize) CreateError!*Pool 
 pub fn nameThreads(pool: *Pool, prefix: []const u8) void {
     for (pool.threads, 0..) |t, i| {
         var buf: [16]u8 = undefined;
-        const name = std.mem.print(&buf, "{s}-{d}", .{ prefix[0..@min(prefix.len, 10)], i }) catch continue;
+        const name = std.mem.print(&buf, "{s}-{d}", .{
+            prefix[0..@min(prefix.len, 10)],
+            i,
+        }) catch continue;
         t.setName(pool.io, name) catch {};
     }
 }

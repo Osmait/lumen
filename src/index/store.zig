@@ -101,7 +101,18 @@ const Layout = struct {
         const name_len = depth + n * 2;
         const flags = name_len + n * 2;
         const names = align8(flags + n);
-        return .{ .n = n, .names_len = names_len, .masks = masks, .name_off = name_off, .parent = parent, .depth = depth, .name_len = name_len, .flags = flags, .names = names, .total = names + names_len };
+        return .{
+            .n = n,
+            .names_len = names_len,
+            .masks = masks,
+            .name_off = name_off,
+            .parent = parent,
+            .depth = depth,
+            .name_len = name_len,
+            .flags = flags,
+            .names = names,
+            .total = names + names_len,
+        };
     }
 };
 
@@ -346,7 +357,15 @@ pub const Builder = struct {
     depth: std.ArrayList(u16) = .empty,
 
     pub fn deinit(b: *Builder, gpa: std.mem.Allocator) void {
-        inline for (.{ "names", "name_off", "name_len", "parent", "flags", "masks", "depth" }) |f| @field(b, f).deinit(gpa);
+        inline for (.{
+            "names",
+            "name_off",
+            "name_len",
+            "parent",
+            "flags",
+            "masks",
+            "depth",
+        }) |f| @field(b, f).deinit(gpa);
         b.* = .empty; // reusable: `finish` leaves an empty builder
     }
 
@@ -354,7 +373,14 @@ pub const Builder = struct {
         return @intCast(b.name_off.items.len);
     }
 
-    pub fn push(b: *Builder, gpa: std.mem.Allocator, n: []const u8, parent: u32, fl: u8, depth: u16) std.mem.Allocator.Error!u32 {
+    pub fn push(
+        b: *Builder,
+        gpa: std.mem.Allocator,
+        n: []const u8,
+        parent: u32,
+        fl: u8,
+        depth: u16,
+    ) std.mem.Allocator.Error!u32 {
         const id = b.len();
         const short = n[0..@min(n.len, std.math.maxInt(u16))];
         try b.name_off.append(gpa, @intCast(b.names.items.len));
@@ -369,7 +395,14 @@ pub const Builder = struct {
 
     /// Scaffolding: rebuilds paths but never shows up (mask 0, like a
     /// tombstone; `path()` does not look at masks).
-    pub fn pushStructural(b: *Builder, gpa: std.mem.Allocator, n: []const u8, parent: u32, fl: u8, depth: u16) std.mem.Allocator.Error!u32 {
+    pub fn pushStructural(
+        b: *Builder,
+        gpa: std.mem.Allocator,
+        n: []const u8,
+        parent: u32,
+        fl: u8,
+        depth: u16,
+    ) std.mem.Allocator.Error!u32 {
         const id = try b.push(gpa, n, parent, fl, depth);
         b.masks.items[id] = 0;
         return id;
@@ -520,7 +553,10 @@ test "corrupt indexes are rejected, not trusted" {
     const lay = (try Store.parse(good, false)).lay;
 
     // Truncated anywhere (a save interrupted by a full disk), or empty.
-    for (0..good.len) |cut| try testing.expectError(error.BadIndex, Store.parse(good[0..cut], false));
+    for (0..good.len) |cut| try testing.expectError(
+        error.BadIndex,
+        Store.parse(good[0..cut], false),
+    );
 
     // Wrong magic (another version).
     @memcpy(bad, good);
@@ -649,7 +685,10 @@ fn fuzzBuilt(_: void, smith: *testing.Smith) anyerror!void {
     const m = try Store.parse(s.buf, false);
     var p1: [4096]u8 = undefined;
     var p2: [4096]u8 = undefined;
-    for (0..s.len()) |i| try testing.expectEqualStrings(s.path(@intCast(i), &p1), m.path(@intCast(i), &p2));
+    for (0..s.len()) |i| try testing.expectEqualStrings(
+        s.path(@intCast(i), &p1),
+        m.path(@intCast(i), &p2),
+    );
     exercise(&m);
 }
 

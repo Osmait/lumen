@@ -20,7 +20,9 @@ const log = std.log.scoped(.ext);
 /// window exists.
 pub fn start(ui: *Ui) void {
     var buf: [4096]u8 = undefined;
-    const data_dir = std.mem.print(&buf, "{s}/lumen", .{std.mem.span(c.g_get_user_data_dir())}) catch return;
+    const data_dir = std.mem.print(&buf, "{s}/lumen", .{
+        std.mem.span(c.g_get_user_data_dir()),
+    }) catch return;
     ui.ext_host = Host.start(ui.gpa, ui.io, ui.config_dir, data_dir, .{
         .ctx = ui,
         .registry = &onRegistry,
@@ -142,7 +144,11 @@ fn onRoot(res: *Host.RootResult, ctx: ?*anyopaque) void {
     ui.ext_root = res;
     ui.ext_root_pending = false;
     // Answers for a query typed over meanwhile change nothing on screen.
-    if (ui.view == .root and res.sections.len > 0 and std.mem.eql(u8, res.query, std.mem.trim(u8, ui.query(), " "))) {
+    if (ui.view == .root and res.sections.len > 0 and std.mem.eql(
+        u8,
+        res.query,
+        std.mem.trim(u8, ui.query(), " "),
+    )) {
         if (ui.selectedItem()) |it| ui.setReselect("{s}", .{it.key});
         ui.refresh();
     }
@@ -165,7 +171,11 @@ pub fn addRootSections(ui: *Ui, q: []const u8) void {
         }
         return;
     };
-    const asked = ui.ext_root_pending and std.mem.eql(u8, ui.ext_root_asked[0..ui.ext_root_asked_len], q);
+    const asked = ui.ext_root_pending and std.mem.eql(
+        u8,
+        ui.ext_root_asked[0..ui.ext_root_asked_len],
+        q,
+    );
     if (asked) return;
     const n = @min(q.len, ui.ext_root_asked.len);
     @memcpy(ui.ext_root_asked[0..n], q[0..n]);
@@ -251,7 +261,11 @@ pub fn rootItems(ui: *Ui, a: std.mem.Allocator) []const Item {
     }
     for (reg.problems) |p| {
         out.append(a, .{
-            .title = a.printSentinel("Extension \"{s}\" failed to load", .{p.ext}, 0) catch continue,
+            .title = a.printSentinel(
+                "Extension \"{s}\" failed to load",
+                .{p.ext},
+                0,
+            ) catch continue,
             .subtitle = firstLine(a, p.message),
             .accessory = "Error",
             .icon = .{ .tile = .{ .name = "dialog-warning-symbolic", .color = .red } },
@@ -294,7 +308,11 @@ pub fn waitingForSearch(ui: *Ui, q: []const u8) bool {
 pub fn prepare(ui: *Ui, q: []const u8) bool {
     const cmd = command(ui) orelse return true;
     if (cmd.mode != .search) return true;
-    const answered = if (ui.ext_result) |r| r.command == ui.ext_cmd and std.mem.eql(u8, r.query, q) else false;
+    const answered = if (ui.ext_result) |r| r.command == ui.ext_cmd and std.mem.eql(
+        u8,
+        r.query,
+        q,
+    ) else false;
     const asked = ui.ext_pending and std.mem.eql(u8, ui.ext_asked[0..ui.ext_asked_len], q);
     if (!answered and !asked) ask(ui, q);
     return false;
@@ -324,7 +342,12 @@ pub fn placeholder(ui: *Ui, buf: []u8) [*:0]const u8 {
     if (cmd.placeholder.len > 0) return cmd.placeholder;
     // "Search Emoji" reads "Search Emoji...", not "Search Search Emoji...".
     const verb = if (std.mem.startsWith(u8, cmd.title, "Search ")) "" else "Search ";
-    const text = std.mem.printSentinel(buf, "{s}{s}...", .{ verb, cmd.title }, 0) catch return "Search...";
+    const text = std.mem.printSentinel(
+        buf,
+        "{s}{s}...",
+        .{ verb, cmd.title },
+        0,
+    ) catch return "Search...";
     return text.ptr;
 }
 
@@ -377,10 +400,16 @@ pub fn perform(ui: *Ui, index_: u8) void {
 /// files, Default Apps included.
 fn open(ui: *Ui, target: [:0]const u8) void {
     if (std.mem.find(u8, target, "://") != null or std.mem.startsWith(u8, target, "mailto:")) {
-        const lctx = c.gdk_display_get_app_launch_context(c.gdk_display_get_default() orelse return);
+        const lctx = c.gdk_display_get_app_launch_context(
+            c.gdk_display_get_default() orelse return,
+        );
         defer c.g_object_unref(lctx);
         var err: ?*c.GError = null;
-        if (c.g_app_info_launch_default_for_uri(target.ptr, @ptrCast(lctx), &err) == 0) if (err) |e| {
+        if (c.g_app_info_launch_default_for_uri(
+            target.ptr,
+            @ptrCast(lctx),
+            &err,
+        ) == 0) if (err) |e| {
             log.warn("open {s}: {s}", .{ target, e.message });
             c.g_error_free(e);
         };
@@ -388,7 +417,12 @@ fn open(ui: *Ui, target: [:0]const u8) void {
     }
     var buf: [4096]u8 = undefined;
     const path = if (std.mem.startsWith(u8, target, "~/"))
-        std.mem.printSentinel(&buf, "{s}/{s}", .{ std.mem.span(c.g_get_home_dir()), target[2..] }, 0) catch return
+        std.mem.printSentinel(
+            &buf,
+            "{s}/{s}",
+            .{ std.mem.span(c.g_get_home_dir()), target[2..] },
+            0,
+        ) catch return
     else
         target;
     const info = index.sys.info(path) orelse {
@@ -407,7 +441,10 @@ pub fn keymap(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) bool {
     const key = c.gdk_keyval_to_lower(keyval);
     for (reg.keymaps) |k| {
         if (k.keyval != key or k.mods != state & mask) continue;
-        if (!openTarget(ui, k.target, null)) log.warn("keymap {s} ({s}): no command or view \"{s}\"", .{ k.keys, k.ext, k.target });
+        if (!openTarget(ui, k.target, null)) log.warn(
+            "keymap {s} ({s}): no command or view \"{s}\"",
+            .{ k.keys, k.ext, k.target },
+        );
         return true;
     }
     return false;

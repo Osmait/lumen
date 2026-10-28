@@ -121,10 +121,22 @@ const Unit = struct {
 
 const units = [_]Unit{
     // length, base metre
-    .{ .names = &.{ "mm", "millimeter", "millimeters", "millimetre" }, .dim = .length, .factor = 0.001 },
-    .{ .names = &.{ "cm", "centimeter", "centimeters", "centimetre" }, .dim = .length, .factor = 0.01 },
+    .{
+        .names = &.{ "mm", "millimeter", "millimeters", "millimetre" },
+        .dim = .length,
+        .factor = 0.001,
+    },
+    .{
+        .names = &.{ "cm", "centimeter", "centimeters", "centimetre" },
+        .dim = .length,
+        .factor = 0.01,
+    },
     .{ .names = &.{ "m", "meter", "meters", "metre", "metres" }, .dim = .length, .factor = 1 },
-    .{ .names = &.{ "km", "kilometer", "kilometers", "kilometre" }, .dim = .length, .factor = 1000 },
+    .{
+        .names = &.{ "km", "kilometer", "kilometers", "kilometre" },
+        .dim = .length,
+        .factor = 1000,
+    },
     .{ .names = &.{ "in", "inch", "inches" }, .dim = .length, .factor = 0.0254 },
     .{ .names = &.{ "ft", "foot", "feet" }, .dim = .length, .factor = 0.3048 },
     .{ .names = &.{ "yd", "yard", "yards" }, .dim = .length, .factor = 0.9144 },
@@ -148,14 +160,31 @@ const units = [_]Unit{
     .{ .names = &.{ "b", "byte", "bytes" }, .dim = .data, .factor = 1 },
     .{ .names = &.{ "kb", "kib", "kilobyte", "kilobytes" }, .dim = .data, .factor = 1024 },
     .{ .names = &.{ "mb", "mib", "megabyte", "megabytes" }, .dim = .data, .factor = 1024 * 1024 },
-    .{ .names = &.{ "gb", "gib", "gigabyte", "gigabytes" }, .dim = .data, .factor = 1024 * 1024 * 1024 },
-    .{ .names = &.{ "tb", "tib", "terabyte", "terabytes" }, .dim = .data, .factor = 1024 * 1024 * 1024 * 1024 },
+    .{
+        .names = &.{ "gb", "gib", "gigabyte", "gigabytes" },
+        .dim = .data,
+        .factor = 1024 * 1024 * 1024,
+    },
+    .{
+        .names = &.{ "tb", "tib", "terabyte", "terabytes" },
+        .dim = .data,
+        .factor = 1024 * 1024 * 1024 * 1024,
+    },
     // temperature, base kelvin
     .{ .names = &.{ "c", "celsius", "°c" }, .dim = .temperature, .factor = 1, .offset = 273.15 },
-    .{ .names = &.{ "f", "fahrenheit", "°f" }, .dim = .temperature, .factor = 5.0 / 9.0, .offset = 273.15 - 32.0 * 5.0 / 9.0 },
+    .{
+        .names = &.{ "f", "fahrenheit", "°f" },
+        .dim = .temperature,
+        .factor = 5.0 / 9.0,
+        .offset = 273.15 - 32.0 * 5.0 / 9.0,
+    },
     .{ .names = &.{ "k", "kelvin" }, .dim = .temperature, .factor = 1 },
     // volume, base litre
-    .{ .names = &.{ "ml", "milliliter", "milliliters", "millilitre" }, .dim = .volume, .factor = 0.001 },
+    .{
+        .names = &.{ "ml", "milliliter", "milliliters", "millilitre" },
+        .dim = .volume,
+        .factor = 0.001,
+    },
     .{ .names = &.{ "l", "liter", "liters", "litre", "litres" }, .dim = .volume, .factor = 1 },
     .{ .names = &.{ "gal", "gallon", "gallons" }, .dim = .volume, .factor = 3.785411784 },
     .{ .names = &.{ "cup", "cups" }, .dim = .volume, .factor = 0.2365882365 },
@@ -192,7 +221,9 @@ fn splitConversion(text: []const u8) ?Result {
         // The source unit is the trailing word of the left side; it may be
         // glued to the number ("10km").
         var split = left.len;
-        while (split > 0 and !std.ascii.isDigit(left[split - 1]) and left[split - 1] != ' ' and left[split - 1] != ')') split -= 1;
+        while (split > 0 and !std.ascii.isDigit(
+            left[split - 1],
+        ) and left[split - 1] != ' ' and left[split - 1] != ')') split -= 1;
         const source_name = std.mem.trim(u8, left[split..], " ");
         const source = findUnit(source_name) orelse continue;
         if (source.dim != target.dim) continue;
@@ -378,7 +409,9 @@ const Parser = struct {
             const ch = p.src[p.pos];
             if (std.ascii.isDigit(ch) or ch == '.' or ch == '_') continue;
             // Thousands separator only when followed by exactly three digits.
-            if (ch == ',' and p.pos + 3 < p.src.len + 1 and isThreeDigits(p.src[p.pos + 1 ..])) continue;
+            if (ch == ',' and p.pos + 3 < p.src.len + 1 and isThreeDigits(
+                p.src[p.pos + 1 ..],
+            )) continue;
             if ((ch == 'e' or ch == 'E') and p.pos + 1 < p.src.len and
                 (std.ascii.isDigit(p.src[p.pos + 1]) or p.src[p.pos + 1] == '-'))
             {
@@ -586,8 +619,14 @@ test "hostile input: deep nesting, overflowing conversions, huge values" {
     try std.testing.expectEqualStrings("0", formatDisplay(&buf, -0.0));
     try std.testing.expectEqualStrings("0", formatPlain(&buf, -0.0));
     // At most 4 decimals even where binary noise shows at the 5th.
-    try std.testing.expectEqualStrings("123,456,789,012.3456", formatDisplay(&buf, 123456789012.3456));
-    try std.testing.expectEqualStrings("-999,999,999,999,999.9", formatDisplay(&buf, -999999999999999.9));
+    try std.testing.expectEqualStrings(
+        "123,456,789,012.3456",
+        formatDisplay(&buf, 123456789012.3456),
+    );
+    try std.testing.expectEqualStrings(
+        "-999,999,999,999,999.9",
+        formatDisplay(&buf, -999999999999999.9),
+    );
     try std.testing.expectEqualStrings("0.00005", formatDisplay(&buf, 0.00005));
     // A buffer too small gets a truncated result, never an overflow.
     var tiny: [4]u8 = undefined;
@@ -600,7 +639,13 @@ fn fuzzEvaluate(_: void, smith: *std.testing.Smith) anyerror!void {
         .rangeAtMost(u8, '0', '9', 8), .value(u8, '+', 4), .value(u8, '-', 4), .value(u8, '*', 4),
         .value(u8, '/', 4),            .value(u8, '^', 4), .value(u8, '(', 4), .value(u8, ')', 4),
         .value(u8, '!', 3),            .value(u8, '%', 3), .value(u8, '.', 3), .value(u8, ',', 3),
-        .value(u8, ' ', 4),            .value(u8, 'e', 3), .value(u8, 'x', 2), .rangeAtMost(u8, 'a', 'z', 1),
+        .value(u8, ' ', 4),            .value(u8, 'e', 3), .value(u8, 'x', 2),
+        .rangeAtMost(
+            u8,
+            'a',
+            'z',
+            1,
+        ),
         .rangeAtMost(u8, 0, 255, 1),
     };
     var in: [200]u8 = undefined;
@@ -621,10 +666,19 @@ test "fuzz: evaluate never crashes and only returns finite values" {
         }
     };
     try std.testing.fuzz({}, fuzzEvaluate, .{ .corpus = &.{
-        comptime P.lp("2 + 3 * 4"),           comptime P.lp("(1 + 2)^3"),       comptime P.lp("sqrt(16) + 2!"),
-        comptime P.lp("20% of 80"),           comptime P.lp("0xff + 0b101"),    comptime P.lp("10 km to mi"),
-        comptime P.lp("100 f in c"),          comptime P.lp("1,000.5e3 mod 7"), comptime P.lp("2pi - ln(e)"),
-        comptime P.lp("1e308 * 10 kg to lb"),
+        comptime P.lp("2 + 3 * 4"),   comptime P.lp("(1 + 2)^3"),
+        comptime P.lp(
+            "sqrt(16) + 2!",
+        ),
+        comptime P.lp("20% of 80"),
+        comptime P.lp(
+            "0xff + 0b101",
+        ),
+        comptime P.lp("10 km to mi"), comptime P.lp("100 f in c"),
+        comptime P.lp(
+            "1,000.5e3 mod 7",
+        ),
+        comptime P.lp("2pi - ln(e)"), comptime P.lp("1e308 * 10 kg to lb"),
     } });
 }
 
@@ -633,7 +687,9 @@ fn fuzzFormat(_: void, smith: *std.testing.Smith) anyerror!void {
         0 => smith.value(f64), // any bit pattern: nan, inf, subnormals, -0
         1 => @floatFromInt(smith.value(i64)),
         2 => @as(f64, @floatFromInt(smith.value(i32))) / 10000.0,
-        else => std.math.pow(f64, 10, @floatFromInt(smith.valueRangeAtMost(i16, -330, 330))) * if (smith.value(bool)) @as(f64, -1) else 1,
+        else => std.math.pow(f64, 10, @floatFromInt(
+            smith.valueRangeAtMost(i16, -330, 330),
+        )) * if (smith.value(bool)) @as(f64, -1) else 1,
     };
     // Every buffer size, down to none: never a write past the end.
     var big: [64]u8 = undefined;
@@ -646,7 +702,9 @@ fn fuzzFormat(_: void, smith: *std.testing.Smith) anyerror!void {
     const full = formatDisplay(&b32, v);
     var raw: [64]u8 = undefined;
     const plain = formatPlain(&raw, v);
-    try std.testing.expect(full.len < b32.len and plain.len < raw.len and !std.mem.eql(u8, plain, "?"));
+    try std.testing.expect(
+        full.len < b32.len and plain.len < raw.len and !std.mem.eql(u8, plain, "?"),
+    );
     // What is copied reads back as the value.
     if (std.math.isFinite(v)) {
         const back = try std.fmt.parseFloat(f64, plain);

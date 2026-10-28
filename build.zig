@@ -20,7 +20,11 @@ pub fn build(b: *std.Build) void {
     // measured). The index validates what it maps from disk on open, and its
     // decoders never read past their input, so a ReleaseSafe build compiles
     // these two modules ReleaseFast; the rest keeps its checks.
-    const safe_index = b.option(bool, "safe-index", "Keep safety checks in the core and index modules in ReleaseSafe") orelse false;
+    const safe_index = b.option(
+        bool,
+        "safe-index",
+        "Keep safety checks in the core and index modules in ReleaseSafe",
+    ) orelse false;
     const hot = if (optimize == .safe and !safe_index) .fast else optimize;
 
     const core = b.createModule(.{
@@ -46,7 +50,11 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    for ([_][]const u8{ "gtk4", "gtk4-layer-shell-0", "gio-unix-2.0" }) |lib| c_mod.linkSystemLibrary(lib, .{});
+    for ([_][]const u8{
+        "gtk4",
+        "gtk4-layer-shell-0",
+        "gio-unix-2.0",
+    }) |lib| c_mod.linkSystemLibrary(lib, .{});
 
     const sqlite = b.addTranslateC(.{
         .root_source_file = b.path("src/sqlite.h"),
@@ -57,7 +65,11 @@ pub fn build(b: *std.Build) void {
 
     // Lua 5.4's pkg-config name differs between distributions: lua5.4 on
     // Arch and Debian, lua on Fedora.
-    const lua_pkg = b.option([]const u8, "lua-pkg", "pkg-config name of Lua 5.4 (default lua5.4)") orelse "lua5.4";
+    const lua_pkg = b.option(
+        []const u8,
+        "lua-pkg",
+        "pkg-config name of Lua 5.4 (default lua5.4)",
+    ) orelse "lua5.4";
     const lua = b.addTranslateC(.{
         .root_source_file = b.path("src/lua.h"),
         .target = target,
@@ -77,7 +89,11 @@ pub fn build(b: *std.Build) void {
     mod.addImport("sqlite", sqlite.createModule());
     mod.addImport("lua", lua.createModule());
     // The styles in examples/styles, built in (Change Theme > Styles).
-    mod.addImport("styles", b.createModule(.{ .root_source_file = b.path("examples/styles/styles.zig"), .target = target, .optimize = optimize }));
+    mod.addImport("styles", b.createModule(.{
+        .root_source_file = b.path("examples/styles/styles.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
 
     const exe = b.addExecutable(.{ .name = "lumen-gtk", .root_module = mod });
     b.installArtifact(exe);
@@ -91,7 +107,11 @@ pub fn build(b: *std.Build) void {
         .single_threaded = true,
         .strip = optimize != .debug,
     });
-    b.installArtifact(b.addExecutable(.{ .name = "lumen", .root_module = client, .linkage = .static }));
+    b.installArtifact(b.addExecutable(.{
+        .name = "lumen",
+        .root_module = client,
+        .linkage = .static,
+    }));
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
@@ -127,9 +147,15 @@ pub fn build(b: *std.Build) void {
         .optimize = .fast,
     }));
     perf_mod.addImport("index", perf_index);
-    const perf_run = b.addRunArtifact(b.addExecutable(.{ .name = "lumen-perf", .root_module = perf_mod }));
+    const perf_run = b.addRunArtifact(b.addExecutable(.{
+        .name = "lumen-perf",
+        .root_module = perf_mod,
+    }));
     perf_run.has_side_effects = true;
-    b.step("perf", "Performance regression checks (PERF_SCALE=2 to relax)").dependOn(&perf_run.step);
+    b.step(
+        "perf",
+        "Performance regression checks (PERF_SCALE=2 to relax)",
+    ).dependOn(&perf_run.step);
 
     // End-to-end: an isolated instance driven through --dump/--key. Needs a
     // Wayland session; the window shows for a few seconds.

@@ -15,7 +15,12 @@ pub fn makeBackdrop(ui: *Ui) *c.GtkWidget {
     c.gtk_layer_set_layer(w, c.GTK_LAYER_SHELL_LAYER_OVERLAY);
     c.gtk_layer_set_keyboard_mode(w, c.GTK_LAYER_SHELL_KEYBOARD_MODE_NONE);
     c.gtk_layer_set_namespace(w, "lumen-backdrop");
-    const edges = [_]c_int{ c.GTK_LAYER_SHELL_EDGE_LEFT, c.GTK_LAYER_SHELL_EDGE_RIGHT, c.GTK_LAYER_SHELL_EDGE_TOP, c.GTK_LAYER_SHELL_EDGE_BOTTOM };
+    const edges = [_]c_int{
+        c.GTK_LAYER_SHELL_EDGE_LEFT,
+        c.GTK_LAYER_SHELL_EDGE_RIGHT,
+        c.GTK_LAYER_SHELL_EDGE_TOP,
+        c.GTK_LAYER_SHELL_EDGE_BOTTOM,
+    };
     for (edges) |edge| c.gtk_layer_set_anchor(w, edge, 1);
     // Over the bars too: a click on them closes Lumen as well.
     c.gtk_layer_set_exclusive_zone(w, -1);
@@ -73,7 +78,13 @@ pub fn isOn(ui: *Ui, w: *c.GtkWidget, x: f64, y: f64) bool {
     return x >= b.origin.x and x < b.origin.x + b.size.width and y >= b.origin.y and y < b.origin.y + b.size.height;
 }
 
-pub fn onWindowPressed(_: *c.GtkEventController, _: c_int, x: f64, y: f64, data: ?*anyopaque) callconv(.c) void {
+pub fn onWindowPressed(
+    _: *c.GtkEventController,
+    _: c_int,
+    x: f64,
+    y: f64,
+    data: ?*anyopaque,
+) callconv(.c) void {
     const self: *Ui = @ptrCast(@alignCast(data));
     const on_pieces = isOn(self, self.search_bar, x, y) or isOn(self, self.results, x, y);
     if (self.panel_open) {
@@ -84,7 +95,13 @@ pub fn onWindowPressed(_: *c.GtkEventController, _: c_int, x: f64, y: f64, data:
     if (!on_pieces) self.hide();
 }
 
-pub fn onBackdropPressed(_: *c.GtkEventController, _: c_int, _: f64, _: f64, data: ?*anyopaque) callconv(.c) void {
+pub fn onBackdropPressed(
+    _: *c.GtkEventController,
+    _: c_int,
+    _: f64,
+    _: f64,
+    data: ?*anyopaque,
+) callconv(.c) void {
     const self: *Ui = @ptrCast(@alignCast(data));
     self.hide();
 }

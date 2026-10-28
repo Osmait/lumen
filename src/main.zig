@@ -87,10 +87,17 @@ pub fn main(init: std.process.Init) !void {
     Ui.connect(app, "shutdown", &onShutdown, null);
 
     if (client_only) {
-        if (c.g_application_register(@ptrCast(app), null, null) == 0 or c.g_application_get_is_remote(@ptrCast(app)) == 0)
+        if (c.g_application_register(
+            @ptrCast(app),
+            null,
+            null,
+        ) == 0 or c.g_application_get_is_remote(@ptrCast(app)) == 0)
             std.process.fatal("lumen is not running", .{});
     }
-    const argc = std.math.cast(c_int, argv.items.len) orelse std.process.fatal("too many arguments", .{});
+    const argc = std.math.cast(c_int, argv.items.len) orelse std.process.fatal(
+        "too many arguments",
+        .{},
+    );
     const status = c.g_application_run(@ptrCast(app), argc, @ptrCast(argv.items.ptr));
     std.process.exit(std.math.cast(u8, status) orelse 1);
 }
@@ -141,17 +148,29 @@ const Out = struct {
     payload: ?[]const u8 = null,
 
     fn print(o: *const Out, text: [:0]const u8) void {
-        if (o.cmdline) |cl| c.g_application_command_line_print(cl, "%s", text.ptr) else if (o.out) |w| w.writeAll(text) catch {};
+        if (o.cmdline) |cl| c.g_application_command_line_print(
+            cl,
+            "%s",
+            text.ptr,
+        ) else if (o.out) |w| w.writeAll(text) catch {};
     }
 
     fn printErr(o: *const Out, text: [:0]const u8) void {
-        if (o.cmdline) |cl| c.g_application_command_line_printerr(cl, "%s", text.ptr) else if (o.err) |w| w.writeAll(text) catch {};
+        if (o.cmdline) |cl| c.g_application_command_line_printerr(
+            cl,
+            "%s",
+            text.ptr,
+        ) else if (o.err) |w| w.writeAll(text) catch {};
     }
 };
 
 /// Every invocation through GApplication (the first one, and those `lumen`
 /// hands to lumen-gtk) lands here.
-fn onCommandLine(app: *c.GApplication, cmdline: *c.GApplicationCommandLine, _: ?*anyopaque) callconv(.c) c_int {
+fn onCommandLine(
+    app: *c.GApplication,
+    cmdline: *c.GApplicationCommandLine,
+    _: ?*anyopaque,
+) callconv(.c) c_int {
     var argc: c_int = 0;
     const argv = c.g_application_command_line_get_arguments(cmdline, &argc);
     defer c.g_strfreev(argv);
@@ -166,7 +185,12 @@ fn onCommandLine(app: *c.GApplication, cmdline: *c.GApplicationCommandLine, _: ?
 }
 
 /// Every invocation through the socket.
-fn onSocket(args: []const [:0]const u8, payload: []const u8, out: *std.Io.Writer, err: *std.Io.Writer) u8 {
+fn onSocket(
+    args: []const [:0]const u8,
+    payload: []const u8,
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+) u8 {
     const status = run(the_app, args, &.{ .out = out, .err = err, .payload = payload });
     return std.math.cast(u8, status) orelse 1;
 }
@@ -283,7 +307,14 @@ fn run(app: *c.GApplication, args: []const [:0]const u8, out: *const Out) c_int 
     if (command) |id| {
         if (Ui.ext_view.openTarget(&ui, id, query)) return 0;
         var buf: [256]u8 = undefined;
-        out.printErr(std.mem.printSentinel(&buf, "lumen: no command \"{s}\"\n", .{id[0..@min(id.len, 200)]}, 0) catch "lumen: no such command\n");
+        out.printErr(
+            std.mem.printSentinel(
+                &buf,
+                "lumen: no command \"{s}\"\n",
+                .{id[0..@min(id.len, 200)]},
+                0,
+            ) catch "lumen: no such command\n",
+        );
         return 1;
     }
     // A view or a query always means "show me this".
@@ -298,7 +329,19 @@ fn run(app: *c.GApplication, args: []const [:0]const u8, out: *const Out) c_int 
 }
 
 fn clientOnly(flag: []const u8) bool {
-    const flags = [_][]const u8{ "--dump", "--key", "--text", "--stats", "--hide", "--quit", "--reload", "--dmenu", "--install", "--update", "--uninstall" };
+    const flags = [_][]const u8{
+        "--dump",
+        "--key",
+        "--text",
+        "--stats",
+        "--hide",
+        "--quit",
+        "--reload",
+        "--dmenu",
+        "--install",
+        "--update",
+        "--uninstall",
+    };
     for (flags) |f| if (std.mem.eql(u8, flag, f)) return true;
     return false;
 }
@@ -341,21 +384,39 @@ fn onShutdown(_: *c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
 fn startFileIndex() void {
     const home = std.mem.span(c.g_get_home_dir());
     var buf: [4096]u8 = undefined;
-    const cache = std.mem.print(&buf, "{s}/lumen/files.idx", .{std.mem.span(c.g_get_user_cache_dir())}) catch return;
+    const cache = std.mem.print(&buf, "{s}/lumen/files.idx", .{
+        std.mem.span(c.g_get_user_cache_dir()),
+    }) catch return;
     ui.files = index.Service.start(ui.gpa, ui.io, home, cache) catch |err| {
         log.warn("file index: {t}", .{err});
         return;
     };
     // The content index shares the file index's thread pools.
     const files = ui.files.?;
-    const cache_dir = std.mem.print(&buf, "{s}/lumen", .{std.mem.span(c.g_get_user_cache_dir())}) catch return;
+    const cache_dir = std.mem.print(&buf, "{s}/lumen", .{
+        std.mem.span(c.g_get_user_cache_dir()),
+    }) catch return;
     // The name index tells it when listing every file again is needed.
-    ui.contents = index.ContentService.startWith(ui.gpa, ui.io, home, cache_dir, .{ .search = files.search_pool, .build = files.scan_pool }, .{ .names = files }) catch |err| {
+    ui.contents = index.ContentService.startWith(
+        ui.gpa,
+        ui.io,
+        home,
+        cache_dir,
+        .{ .search = files.search_pool, .build = files.scan_pool },
+        .{ .names = files },
+    ) catch |err| {
         log.warn("content index: {t}", .{err});
         return;
     };
     // Without it, content queries run on the UI thread (still correct).
-    ui.content_search = Ui.ContentSearch.start(ui.gpa, ui.io, ui.contents.?, 50, &Ui.onContentResult, &ui) catch |err| blk: {
+    ui.content_search = Ui.ContentSearch.start(
+        ui.gpa,
+        ui.io,
+        ui.contents.?,
+        50,
+        &Ui.onContentResult,
+        &ui,
+    ) catch |err| blk: {
         log.warn("content search worker: {t}", .{err});
         break :blk null;
     };
@@ -377,13 +438,34 @@ fn startClipboardWatcher() void {
     defer c.g_free(self_exe);
     // `lumen` beside us hands each copy over without loading GTK.
     var buf: [4096]u8 = undefined;
-    const client = if (std.mem.printSentinel(&buf, "{s}/lumen", .{std.Io.Dir.path.dirname(std.mem.span(self_exe)) orelse "/"}, 0)) |p|
+    const client = if (std.mem.printSentinel(
+        &buf,
+        "{s}/lumen",
+        .{std.Io.Dir.path.dirname(std.mem.span(self_exe)) orelse "/"},
+        0,
+    )) |p|
         (if (std.os.linux.access(p.ptr, std.os.linux.X_OK) == 0) p.ptr else self_exe)
     else |_|
         self_exe;
-    var argv = [_:null]?[*:0]const u8{ "wl-paste", "--type", "text", "--watch", client, "--clip-store" };
+    var argv = [_:null]?[*:0]const u8{
+        "wl-paste",
+        "--type",
+        "text",
+        "--watch",
+        client,
+        "--clip-store",
+    };
     var err: ?*c.GError = null;
-    if (c.g_spawn_async(null, @ptrCast(&argv), null, c.G_SPAWN_SEARCH_PATH | c.G_SPAWN_DO_NOT_REAP_CHILD, &dieWithParent, null, &watcher_pid, &err) == 0) {
+    if (c.g_spawn_async(
+        null,
+        @ptrCast(&argv),
+        null,
+        c.G_SPAWN_SEARCH_PATH | c.G_SPAWN_DO_NOT_REAP_CHILD,
+        &dieWithParent,
+        null,
+        &watcher_pid,
+        &err,
+    ) == 0) {
         if (err) |e| {
             log.warn("clipboard watcher: {s}", .{e.message});
             c.g_error_free(e);
@@ -408,7 +490,10 @@ fn onWatcherExit(pid: c.GPid, status: c_int, _: ?*anyopaque) callconv(.c) void {
     // Stopped on purpose: shutting down, or history turned off.
     if (shutting_down or !ui.settings.clipboard) return;
     if (stats.now() - watcher_started_ns > 60 * std.time.ns_per_s) watcher_backoff_ms = 1000;
-    log.warn("clipboard watcher exited ({d}); restarting in {d} ms", .{ status, watcher_backoff_ms });
+    log.warn(
+        "clipboard watcher exited ({d}); restarting in {d} ms",
+        .{ status, watcher_backoff_ms },
+    );
     _ = c.g_timeout_add(watcher_backoff_ms, &restartWatcher, null);
     watcher_backoff_ms = @min(watcher_backoff_ms * 2, 60_000);
 }
@@ -448,7 +533,11 @@ fn dieWithParent(_: ?*anyopaque) callconv(.c) void {
 fn storeClip(content: []const u8) void {
     if (!ui_ready or !ui.settings.clipboard) return;
     if (!std.unicode.utf8ValidateSlice(content)) return;
-    ui.db.addClip(content, @divTrunc(c.g_get_real_time(), std.time.us_per_s), ui.settings.clipboard_keep) catch |err|
+    ui.db.addClip(
+        content,
+        @divTrunc(c.g_get_real_time(), std.time.us_per_s),
+        ui.settings.clipboard_keep,
+    ) catch |err|
         log.warn("clipboard: {t}", .{err});
 }
 
@@ -462,7 +551,10 @@ fn clipStore(init: std.process.Init) !void {
     var buf: [16 * 1024]u8 = undefined;
     var stdin = std.Io.File.stdin().reader(init.io, &buf);
     // Larger copies are not kept (images, huge selections).
-    const content = stdin.interface.allocRemaining(init.gpa, .limited(Db.max_bytes)) catch |err| switch (err) {
+    const content = stdin.interface.allocRemaining(
+        init.gpa,
+        .limited(Db.max_bytes),
+    ) catch |err| switch (err) {
         error.StreamTooLong => return,
         error.ReadFailed => return stdin.err.?,
         else => |e| return e,
@@ -472,7 +564,12 @@ fn clipStore(init: std.process.Init) !void {
 
     // History off in Settings (a copy can race the watcher being stopped).
     var cbuf: [4096]u8 = undefined;
-    const conf = try std.mem.printSentinel(&cbuf, "{s}/lumen/settings.conf", .{std.mem.span(c.g_get_user_config_dir())}, 0);
+    const conf = try std.mem.printSentinel(
+        &cbuf,
+        "{s}/lumen/settings.conf",
+        .{std.mem.span(c.g_get_user_config_dir())},
+        0,
+    );
     var settings = Settings.load(init.gpa, conf);
     defer settings.deinit();
     if (!settings.clipboard) return;
@@ -481,7 +578,11 @@ fn clipStore(init: std.process.Init) !void {
     defer c.g_free(path);
     var db = try Db.open(std.mem.span(path));
     defer db.close();
-    try db.addClip(content, @divTrunc(c.g_get_real_time(), std.time.us_per_s), settings.clipboard_keep);
+    try db.addClip(
+        content,
+        @divTrunc(c.g_get_real_time(), std.time.us_per_s),
+        settings.clipboard_keep,
+    );
 }
 
 test {

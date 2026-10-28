@@ -32,13 +32,41 @@ pub const keep_choices = [_]u32{ 100, 500, 1000, 5000 };
 /// Terminal emulators and editors offered when installed (first word is the
 /// command, the rest its display name).
 pub const terminals = [_][2][:0]const u8{
-    .{ "ghostty", "Ghostty" }, .{ "kitty", "Kitty" },     .{ "alacritty", "Alacritty" },           .{ "foot", "Foot" },
-    .{ "wezterm", "WezTerm" }, .{ "konsole", "Konsole" }, .{ "gnome-terminal", "GNOME Terminal" }, .{ "xterm", "XTerm" },
+    .{ "ghostty", "Ghostty" }, .{ "kitty", "Kitty" },
+    .{
+        "alacritty",
+        "Alacritty",
+    },
+    .{ "foot", "Foot" },       .{ "wezterm", "WezTerm" },
+    .{ "konsole", "Konsole" },
+    .{
+        "gnome-terminal",
+        "GNOME Terminal",
+    },
+    .{ "xterm", "XTerm" },
 };
 pub const editors = [_][2][:0]const u8{
-    .{ "nvim", "Neovim" },                         .{ "vim", "Vim" },           .{ "hx", "Helix" },     .{ "nano", "nano" },
-    .{ "micro", "micro" },                         .{ "emacs", "Emacs" },       .{ "code", "VS Code" }, .{ "codium", "VSCodium" },
-    .{ "zed", "Zed" },                             .{ "subl", "Sublime Text" }, .{ "kate", "Kate" },    .{ "gedit", "gedit" },
+    .{
+        "nvim",
+        "Neovim",
+    },
+    .{ "vim", "Vim" },
+    .{ "hx", "Helix" },
+    .{ "nano", "nano" },
+    .{ "micro", "micro" },
+    .{ "emacs", "Emacs" },
+    .{ "code", "VS Code" },
+    .{
+        "codium",
+        "VSCodium",
+    },
+    .{ "zed", "Zed" },
+    .{
+        "subl",
+        "Sublime Text",
+    },
+    .{ "kate", "Kate" },
+    .{ "gedit", "gedit" },
     .{ "gnome-text-editor", "GNOME Text Editor" },
 };
 
@@ -177,7 +205,11 @@ pub const Settings = struct {
             .height => s.height = std.meta.stringToEnum(Height, value) orelse return false,
             .density => s.density = std.meta.stringToEnum(Density, value) orelse return false,
             .opacity => {
-                const v = std.fmt.parseInt(u8, std.mem.trimEnd(u8, value, "%"), 10) catch return false;
+                const v = std.fmt.parseInt(
+                    u8,
+                    std.mem.trimEnd(u8, value, "%"),
+                    10,
+                ) catch return false;
                 if (v < 50 or v > 100) return false;
                 s.opacity = v;
             },
@@ -254,7 +286,12 @@ pub const Settings = struct {
 
     /// Writes `s`, except the keys in `kept`, which keep their values from
     /// `file` (keys init.lua sets stay out of the file).
-    pub fn writeKeeping(s: *const Settings, w: *std.Io.Writer, file: *const Settings, kept: []const []const u8) std.Io.Writer.Error!void {
+    pub fn writeKeeping(
+        s: *const Settings,
+        w: *std.Io.Writer,
+        file: *const Settings,
+        kept: []const []const u8,
+    ) std.Io.Writer.Error!void {
         const P = struct {
             s: *const Settings,
             file: *const Settings,
@@ -300,10 +337,24 @@ pub const Settings = struct {
             \\editor = {s}
             \\
         , .{
-            p.of("style").style,                   p.of("theme").theme,                 p.of("text_size").text_size,     p.of("opacity").opacity,
-            p.of("position").position,             p.of("width").width,                 p.of("height").height,           p.of("density").density,
-            p.of("icon_theme").icon_theme,         p.of("files_in_root").files_in_root, p.of("suggestions").suggestions, p.of("clipboard").clipboard,
-            p.of("clipboard_keep").clipboard_keep, p.of("terminal").terminal,           p.of("editor").editor,
+            p.of("style").style,             p.of("theme").theme,
+            p.of(
+                "text_size",
+            ).text_size,
+            p.of("opacity").opacity,
+            p.of(
+                "position",
+            ).position,
+            p.of("width").width,             p.of("height").height,
+            p.of("density").density,         p.of("icon_theme").icon_theme,
+            p.of(
+                "files_in_root",
+            ).files_in_root,
+            p.of("suggestions").suggestions, p.of("clipboard").clipboard,
+            p.of(
+                "clipboard_keep",
+            ).clipboard_keep,
+            p.of("terminal").terminal,       p.of("editor").editor,
         });
         if (s.unknown.items.len > 0) {
             try w.writeAll("\n# Not known to this version of Lumen\n");
@@ -336,7 +387,12 @@ pub const Settings = struct {
     /// Writes `path` atomically (temporary file, fsync, rename): a crash or a
     /// full disk never leaves half a file. Owner-only, like Lumen's other
     /// files. The keys in `kept` keep the values the file has now.
-    pub fn save(s: *const Settings, gpa: std.mem.Allocator, path: [:0]const u8, kept: []const []const u8) SaveError!void {
+    pub fn save(
+        s: *const Settings,
+        gpa: std.mem.Allocator,
+        path: [:0]const u8,
+        kept: []const []const u8,
+    ) SaveError!void {
         if (s.incomplete) return error.Incomplete;
         if (std.mem.findScalarLast(u8, path, '/')) |slash| sys.mkdirP(path[0..slash]);
         var file = if (kept.len > 0) load(gpa, path.ptr) else Settings.init(gpa);
@@ -352,7 +408,10 @@ pub const Settings = struct {
     /// Whether `key = value` would be taken (`lumen.set` reports both
     /// mistakes instead of ignoring them like a hand-edited file).
     pub fn check(key: []const u8, value: []const u8) Check {
-        if (std.meta.stringToEnum(Toggle, key) != null) return if (parseBool(value) != null) .ok else .bad_value;
+        if (std.meta.stringToEnum(
+            Toggle,
+            key,
+        ) != null) return if (parseBool(value) != null) .ok else .bad_value;
         if (std.meta.stringToEnum(Choice, key)) |ch| {
             var buf: [1024]u8 = undefined;
             var fba: std.heap.FixedBufferAllocator = .init(&buf);
@@ -360,7 +419,11 @@ pub const Settings = struct {
             return if (probe.setChoice(ch, value)) .ok else .bad_value;
         }
         if (std.mem.eql(u8, key, "theme")) return if (isToken(value)) .ok else .bad_value;
-        if (std.mem.eql(u8, key, "style")) return if (value.len == 0 or isToken(value)) .ok else .bad_value;
+        if (std.mem.eql(
+            u8,
+            key,
+            "style",
+        )) return if (value.len == 0 or isToken(value)) .ok else .bad_value;
         return .unknown_key;
     }
 };
@@ -379,7 +442,13 @@ pub const Stamp = struct {
     pub fn of(path: [*:0]const u8) Stamp {
         const linux = std.os.linux;
         var st: linux.Statx = undefined;
-        const rc = linux.statx(linux.AT.FDCWD, path, 0, .{ .SIZE = true, .MTIME = true, .INO = true }, &st);
+        const rc = linux.statx(
+            linux.AT.FDCWD,
+            path,
+            0,
+            .{ .SIZE = true, .MTIME = true, .INO = true },
+            &st,
+        );
         if (linux.errno(rc) != .SUCCESS) return .{};
         return .{ .sec = st.mtime.sec, .nsec = st.mtime.nsec, .size = st.size, .ino = st.ino };
     }

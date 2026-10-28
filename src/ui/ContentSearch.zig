@@ -62,10 +62,24 @@ query_t0: u64 = 0,
 pub const StartError = std.mem.Allocator.Error || std.Thread.SpawnError;
 
 /// Starts the worker. `service` must outlive it.
-pub fn start(gpa: std.mem.Allocator, io: std.Io, service: *index.ContentService, limit: usize, on_result: Callback, ctx: ?*anyopaque) StartError!*ContentSearch {
+pub fn start(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    service: *index.ContentService,
+    limit: usize,
+    on_result: Callback,
+    ctx: ?*anyopaque,
+) StartError!*ContentSearch {
     const cs = try gpa.create(ContentSearch);
     errdefer gpa.destroy(cs);
-    cs.* = .{ .gpa = gpa, .io = io, .service = service, .limit = limit, .on_result = on_result, .ctx = ctx };
+    cs.* = .{
+        .gpa = gpa,
+        .io = io,
+        .service = service,
+        .limit = limit,
+        .on_result = on_result,
+        .ctx = ctx,
+    };
     cs.thread = try std.Thread.spawn(.{}, run, .{cs});
     cs.thread.setName(io, "lm-csearch") catch {};
     return cs;
@@ -113,7 +127,14 @@ fn run(cs: *ContentSearch) void {
             log.warn("content search: out of memory", .{});
             continue;
         };
-        r.* = .{ .gen = 0, .t0 = 0, .search_ns = 0, .query = "", .hits = &.{}, .arena = .init(cs.gpa) };
+        r.* = .{
+            .gen = 0,
+            .t0 = 0,
+            .search_ns = 0,
+            .query = "",
+            .hits = &.{},
+            .arena = .init(cs.gpa),
+        };
         const a = r.arena.allocator();
         {
             cs.lock.lockUncancelable(cs.io);

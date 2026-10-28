@@ -31,7 +31,12 @@ pub const Error = std.process.SpawnError || std.mem.Allocator.Error || error{Sys
 
 /// Runs `argv` (PATH searched, environment inherited) to completion or to
 /// the deadline. The child is always reaped and its pipes closed.
-pub fn run(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, opts: Options) Error!Result {
+pub fn run(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    opts: Options,
+) Error!Result {
     var child = try std.process.spawn(io, .{
         .argv = argv,
         .stdin = if (opts.stdin.len > 0) .pipe else .ignore,
@@ -55,7 +60,11 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, opts: O
     if (child.stdin) |f| {
         stdin_fd = f.handle;
         const nonblock: u32 = @bitCast(linux.O{ .NONBLOCK = true });
-        _ = linux.fcntl(stdin_fd, linux.F.SETFL, linux.fcntl(stdin_fd, linux.F.GETFL, 0) | nonblock);
+        _ = linux.fcntl(
+            stdin_fd,
+            linux.F.SETFL,
+            linux.fcntl(stdin_fd, linux.F.GETFL, 0) | nonblock,
+        );
     }
     var written: usize = 0;
     var out_open = true;
@@ -81,7 +90,10 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8, opts: O
             fds[n] = .{ .fd = stdin_fd, .events = linux.POLL.OUT, .revents = 0 };
             n += 1;
         }
-        const left_ms: i32 = @intCast(@min((opts.deadline_ns - now) / std.time.ns_per_ms + 1, std.math.maxInt(i32)));
+        const left_ms: i32 = @intCast(@min(
+            (opts.deadline_ns - now) / std.time.ns_per_ms + 1,
+            std.math.maxInt(i32),
+        ));
         const rc = linux.poll(&fds, n, left_ms);
         switch (linux.errno(rc)) {
             .SUCCESS => {},
@@ -148,7 +160,12 @@ fn deadline(ms: u64) u64 {
 }
 
 test "output, exit code and stdin" {
-    var r = try run(testing.allocator, testing.io, &.{ "sh", "-c", "echo out; echo err >&2; exit 3" }, .{ .deadline_ns = deadline(5000) });
+    var r = try run(
+        testing.allocator,
+        testing.io,
+        &.{ "sh", "-c", "echo out; echo err >&2; exit 3" },
+        .{ .deadline_ns = deadline(5000) },
+    );
     defer r.deinit(testing.allocator);
     try testing.expectEqualStrings("out\n", r.stdout);
     try testing.expectEqualStrings("err\n", r.stderr);
@@ -158,14 +175,19 @@ test "output, exit code and stdin" {
     const big = try testing.allocator.alloc(u8, 300_000);
     defer testing.allocator.free(big);
     @memset(big, 'x');
-    var w = try run(testing.allocator, testing.io, &.{ "wc", "-c" }, .{ .stdin = big, .deadline_ns = deadline(5000) });
+    var w = try run(testing.allocator, testing.io, &.{ "wc", "-c" }, .{
+        .stdin = big,
+        .deadline_ns = deadline(5000),
+    });
     defer w.deinit(testing.allocator);
     try testing.expectEqualStrings("300000", std.mem.trim(u8, w.stdout, " \n"));
 }
 
 test "a program past its deadline is killed" {
     const t0 = index.sys.monotonicNs();
-    var r = try run(testing.allocator, testing.io, &.{ "sleep", "30" }, .{ .deadline_ns = deadline(100) });
+    var r = try run(testing.allocator, testing.io, &.{ "sleep", "30" }, .{
+        .deadline_ns = deadline(100),
+    });
     defer r.deinit(testing.allocator);
     try testing.expect(r.timed_out);
     try testing.expectEqual(@as(?u8, null), r.code);
@@ -173,11 +195,18 @@ test "a program past its deadline is killed" {
 }
 
 test "a program that closes its output but keeps running still times out" {
-    var r = try run(testing.allocator, testing.io, &.{ "sh", "-c", "exec >&- 2>&-; sleep 30" }, .{ .deadline_ns = deadline(150) });
+    var r = try run(testing.allocator, testing.io, &.{ "sh", "-c", "exec >&- 2>&-; sleep 30" }, .{
+        .deadline_ns = deadline(150),
+    });
     defer r.deinit(testing.allocator);
     try testing.expect(r.timed_out);
 }
 
 test "a missing program is an error, not a crash" {
-    try testing.expectError(error.FileNotFound, run(testing.allocator, testing.io, &.{"lumen-no-such-program-xyz"}, .{ .deadline_ns = deadline(1000) }));
+    try testing.expectError(error.FileNotFound, run(
+        testing.allocator,
+        testing.io,
+        &.{"lumen-no-such-program-xyz"},
+        .{ .deadline_ns = deadline(1000) },
+    ));
 }

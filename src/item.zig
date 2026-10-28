@@ -12,7 +12,10 @@ pub const Icon = union(enum) {
     /// full colour. `name` must outlive the icon.
     pub fn byName(name: [:0]const u8) Icon {
         if (name.len > 0 and name[0] == '/') return .{ .file = name };
-        return if (std.mem.endsWith(u8, name, "-symbolic")) .{ .tile = .{ .name = name, .color = .gray } } else .{ .named = name };
+        return if (std.mem.endsWith(u8, name, "-symbolic")) .{ .tile = .{
+            .name = name,
+            .color = .gray,
+        } } else .{ .named = name };
     }
 
     none,
