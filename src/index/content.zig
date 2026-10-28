@@ -87,6 +87,48 @@ const SegEntry = extern struct {
     post_len: u64,
 };
 
+/// The doc table of an index file, checked: every path inside the file,
+/// every source a known kind, no unknown flag.
+const ParsedDocs = struct {
+    mt: []const i64,
+    sz: []const u64,
+    po: []const u32,
+    pl: []const u16,
+    src: []const u8,
+    fl: []u8,
+    /// Bytes of all paths, and documents marked removed.
+    all_paths: usize,
+    n_removed: usize,
+
+    fn parse(buf: []align(8) u8, docs_off: usize, n: usize) error{BadIndex}!ParsedDocs {
+        var o = docs_off;
+        var t: ParsedDocs = undefined;
+        t.mt = sliceAt(i64, buf, o, n);
+        o += n * 8;
+        t.sz = sliceAt(u64, buf, o, n);
+        o += n * 8;
+        t.po = sliceAt(u32, buf, o, n);
+        o += n * 4;
+        t.pl = sliceAt(u16, buf, o, n);
+        o += n * 2;
+        t.src = buf[o..][0..n];
+        o += n;
+        t.fl = buf[o..][0..n];
+        t.all_paths = 0;
+        for (t.po, t.pl) |off, l| {
+            if (@as(u64, off) + l > buf.len) return error.BadIndex;
+            t.all_paths += l;
+        }
+        for (t.src) |k| if (std.enums.fromInt(Source, k) == null) return error.BadIndex;
+        t.n_removed = 0;
+        for (t.fl) |f| {
+            if (f & ~flag_removed != 0) return error.BadIndex;
+            t.n_removed += f & flag_removed;
+        }
+        return t;
+    }
+};
+
 pub const Index = struct {
     buf: []align(8) u8,
     mapped: bool,
@@ -168,38 +210,13 @@ pub const Index = struct {
         if (docs_off < header_len) return error.BadIndex;
         const paths_off = docs_off + n * doc_bytes;
         if (paths_len64 > buf.len - paths_off) return error.BadIndex;
-        const paths_len: usize = @intCast(paths_len64);
         const dir_off = try region(buf.len, dir_off64, n_segs64, @sizeOf(SegEntry), 8);
         const n_segs: usize = @intCast(n_segs64);
 
-        var o = docs_off;
-        const mt = sliceAt(i64, buf, o, n);
-        o += n * 8;
-        const sz = sliceAt(u64, buf, o, n);
-        o += n * 8;
-        const po = sliceAt(u32, buf, o, n);
-        o += n * 4;
-        const pl = sliceAt(u16, buf, o, n);
-        o += n * 2;
-        const src = buf[o..][0..n];
-        o += n;
-        const fl = buf[o..][0..n];
-        o += n;
-        o += paths_len;
-        var all_paths: usize = 0;
-        for (po, pl) |off, l| {
-            if (@as(u64, off) + l > buf.len) return error.BadIndex;
-            all_paths += l;
-        }
-        for (src) |k| if (std.enums.fromInt(Source, k) == null) return error.BadIndex;
-        var n_removed: usize = 0;
-        for (fl) |f| {
-            if (f & ~flag_removed != 0) return error.BadIndex;
-            n_removed += f & flag_removed;
-        }
+        const t = try ParsedDocs.parse(buf, docs_off, n);
 
         const segs = sliceAt(SegEntry, buf, dir_off, n_segs);
-        var used = header_len + n * doc_bytes + all_paths + n_segs * @sizeOf(SegEntry);
+        var used = header_len + n * doc_bytes + t.all_paths + n_segs * @sizeOf(SegEntry);
         for (segs) |seg| {
             try checkSegment(buf, seg);
             used += @as(usize, @intCast(seg.n_keys)) * 8 + 4 + @as(usize, @intCast(seg.post_len));
@@ -210,15 +227,15 @@ pub const Index = struct {
             .mapped = mapped,
             .n_docs = n,
             .n_segs = n_segs,
-            .mtimes = mt,
-            .sizes = sz,
-            .path_off = po,
-            .path_len = pl,
-            .sources = src,
-            .flags = fl,
+            .mtimes = t.mt,
+            .sizes = t.sz,
+            .path_off = t.po,
+            .path_len = t.pl,
+            .sources = t.src,
+            .flags = t.fl,
             .file = buf,
             .segs = segs,
-            .n_removed = n_removed,
+            .n_removed = t.n_removed,
             .live_bytes = used,
         };
     }

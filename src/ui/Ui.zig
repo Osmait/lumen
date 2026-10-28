@@ -1461,30 +1461,31 @@ fn fillSectioned(self: *Ui, a: std.mem.Allocator, q: []const u8) void {
     for (hits.items) |it| self.addItem(it);
 }
 
-fn fillRoot(self: *Ui, a: std.mem.Allocator, q: []const u8) void {
-    if (q.len == 0) {
-        // Suggestions: what was used most, then every command.
-        var used: std.ArrayList(Item) = .empty;
-        for (self.base) |it| {
-            const v = self.frec.get(it.key) orelse continue;
-            var copy = it;
-            copy.score = std.math.lossyCast(i32, v * 1000);
-            used.append(a, copy) catch break;
-        }
-        sortByScore(used.items);
-        if (used.items.len > 0 and self.settings.suggestions) {
-            self.addSection("Suggestions");
-            for (used.items[0..@min(used.items.len, 6)]) |it| self.addItem(it);
-        }
-        self.addSection("Commands");
-        for (self.base) |it| {
-            switch (it.action) {
-                .view, .script, .ext_command, .ext_problem => self.addItem(it),
-                else => {},
-            }
-        }
-        return;
+/// Nothing typed: what was used most, then every command.
+fn fillSuggestions(self: *Ui, a: std.mem.Allocator) void {
+    var used: std.ArrayList(Item) = .empty;
+    for (self.base) |it| {
+        const v = self.frec.get(it.key) orelse continue;
+        var copy = it;
+        copy.score = std.math.lossyCast(i32, v * 1000);
+        used.append(a, copy) catch break;
     }
+    sortByScore(used.items);
+    if (used.items.len > 0 and self.settings.suggestions) {
+        self.addSection("Suggestions");
+        for (used.items[0..@min(used.items.len, 6)]) |it| self.addItem(it);
+    }
+    self.addSection("Commands");
+    for (self.base) |it| {
+        switch (it.action) {
+            .view, .script, .ext_command, .ext_problem => self.addItem(it),
+            else => {},
+        }
+    }
+}
+
+fn fillRoot(self: *Ui, a: std.mem.Allocator, q: []const u8) void {
+    if (q.len == 0) return self.fillSuggestions(a);
 
     if (core.calc.evaluate(q)) |r| {
         self.addSection("Calculator");

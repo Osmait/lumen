@@ -266,6 +266,24 @@ pub const Load = struct {
     layout: layout_mod.Layout = .{},
     has_layout: bool = false,
     problems: std.ArrayList(Problem) = .empty,
+
+    /// What a file adds, dropped again if it fails half-way (its problem
+    /// and its extension entry are added after it ran).
+    const undone = .{ "commands", "wcmds", "themes", "keymaps", "settings", "prefs", "icons", "style_settings" };
+
+    const Mark = struct { lens: [undone.len]usize, layout: layout_mod.Layout, has_layout: bool };
+
+    fn mark(load: *const Load) Mark {
+        var m: Mark = .{ .lens = undefined, .layout = load.layout, .has_layout = load.has_layout };
+        inline for (undone, 0..) |field, i| m.lens[i] = @field(load, field).items.len;
+        return m;
+    }
+
+    fn rollback(load: *Load, m: Mark) void {
+        inline for (undone, 0..) |field, i| @field(load, field).shrinkRetainingCapacity(m.lens[i]);
+        load.layout = m.layout;
+        load.has_layout = m.has_layout;
+    }
 };
 
 /// Where the worker finds a command: its state and its spec table, and the
@@ -712,19 +730,7 @@ fn loadSource(
         h.gpa.destroy(e);
         return problem(load, id, "out of memory");
     };
-    // What this file adds is dropped again if it fails half-way.
-    const layout_before = load.layout;
-    const had_layout = load.has_layout;
-    const marks = .{
-        load.commands.items.len,
-        load.wcmds.items.len,
-        load.themes.items.len,
-        load.keymaps.items.len,
-        load.settings.items.len,
-        load.prefs.items.len,
-        load.icons.items.len,
-        load.style_settings.items.len,
-    };
+    const before = load.mark();
     e.load = load;
     var ctx: LoadCtx = .{
         .e = e,
@@ -743,20 +749,11 @@ fn loadSource(
         ) and !std.mem.eql(u8, id, "style")) load.extensions.append(load.a, .{
             .id = load.a.dupeSentinel(u8, id, 0) catch "",
             .title = if (ctx.title.len > 0) ctx.title else load.a.dupeSentinel(u8, id, 0) catch "",
-            .commands = @intCast(load.commands.items.len - marks[0]),
+            .commands = @intCast(load.commands.items.len - before.lens[0]),
         }) catch {};
         return;
     } else |_| {};
-    load.commands.shrinkRetainingCapacity(marks[0]);
-    load.wcmds.shrinkRetainingCapacity(marks[1]);
-    load.themes.shrinkRetainingCapacity(marks[2]);
-    load.keymaps.shrinkRetainingCapacity(marks[3]);
-    load.settings.shrinkRetainingCapacity(marks[4]);
-    load.prefs.shrinkRetainingCapacity(marks[5]);
-    load.icons.shrinkRetainingCapacity(marks[6]);
-    load.style_settings.shrinkRetainingCapacity(marks[7]);
-    load.layout = layout_before;
-    load.has_layout = had_layout;
+    load.rollback(before);
     problem(load, id, err orelse "out of memory");
     lua.c.lua_close(e.L);
     h.gpa.destroy(e);
@@ -849,6 +846,39 @@ fn parseExtension(L: *lua.State, ctx: *LoadCtx, t: c_int) void {
 }
 
 /// A preference, or a form field: the same fields.
+/// A command's or a field's `name`: present, and a-z, 0-9, - and _ only.
+fn fieldName(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8) [:0]const u8 {
+    const name = lua.fieldString(L, a, t, "name", where) orelse
+        lua.raise(L, "{s}.name is missing", .{where});
+    if (!validId(name))
+        lua.raise(L, "{s}.name: use only a-z, 0-9, - and _ (got \"{s}\")", .{ where, name });
+    return name;
+}
+
+/// A choice's `choices`: strings, or tables with a value and a title.
+fn prefChoices(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8) []const PrefChoice {
+    if (lua.getField(L, t, "choices") != lua.c.LUA_TTABLE)
+        lua.raise(L, "{s}.choices: a list expected for a choice", .{where});
+    defer lua.c.lua_settop(L, -2);
+    const choice_list = lua.absIndex(L, -1);
+    const n = lua.c.lua_rawlen(L, choice_list);
+    if (n == 0) lua.raise(L, "{s}.choices is empty", .{where});
+    const choices = a.alloc(PrefChoice, n) catch lua.oom(L);
+    for (choices, 1..) |*ch, i| {
+        _ = lua.c.lua_rawgeti(L, choice_list, @intCast(i));
+        defer lua.c.lua_settop(L, -2);
+        if (lua.toSlice(L, -1)) |s| {
+            const v = a.dupeSentinel(u8, s, 0) catch lua.oom(L);
+            ch.* = .{ .value = v, .label = v };
+        } else if (lua.c.lua_type(L, -1) == lua.c.LUA_TTABLE) {
+            const v = lua.fieldString(L, a, -1, "value", where) orelse
+                lua.raise(L, "{s}.choices[{d}].value is missing", .{ where, i });
+            ch.* = .{ .value = v, .label = lua.fieldString(L, a, -1, "title", where) orelse v };
+        } else lua.raise(L, "{s}.choices[{d}]: string or table expected", .{ where, i });
+    }
+    return choices;
+}
+
 fn parseField(
     L: *lua.State,
     ctx: *LoadCtx,
@@ -857,16 +887,7 @@ fn parseField(
     ext_title: [:0]const u8,
 ) Pref {
     const a = ctx.load.a;
-    const name = lua.fieldString(L, a, t, "name", where) orelse lua.raise(
-        L,
-        "{s}.name is missing",
-        .{where},
-    );
-    if (!validId(name)) lua.raise(
-        L,
-        "{s}.name: use only a-z, 0-9, - and _ (got \"{s}\")",
-        .{ where, name },
-    );
+    const name = fieldName(L, a, t, where);
     const kind_name = lua.fieldString(L, a, t, "type", where) orelse "text";
     const kind = std.meta.stringToEnum(PrefKind, kind_name) orelse
         lua.raise(
@@ -889,34 +910,7 @@ fn parseField(
         .default = "",
         .required = lua.fieldBool(L, t, "required", false, where),
     };
-    if (kind == .choice) {
-        if (lua.getField(L, t, "choices") != lua.c.LUA_TTABLE) lua.raise(
-            L,
-            "{s}.choices: a list expected for a choice",
-            .{where},
-        );
-        const choice_list = lua.absIndex(L, -1);
-        const n = lua.c.lua_rawlen(L, choice_list);
-        if (n == 0) lua.raise(L, "{s}.choices is empty", .{where});
-        const choices = a.alloc(PrefChoice, n) catch lua.oom(L);
-        for (choices, 1..) |*ch, i| {
-            _ = lua.c.lua_rawgeti(L, choice_list, @intCast(i));
-            defer lua.c.lua_settop(L, -2);
-            if (lua.toSlice(L, -1)) |s| {
-                const v = a.dupeSentinel(u8, s, 0) catch lua.oom(L);
-                ch.* = .{ .value = v, .label = v };
-            } else if (lua.c.lua_type(L, -1) == lua.c.LUA_TTABLE) {
-                const v = lua.fieldString(L, a, -1, "value", where) orelse lua.raise(
-                    L,
-                    "{s}.choices[{d}].value is missing",
-                    .{ where, i },
-                );
-                ch.* = .{ .value = v, .label = lua.fieldString(L, a, -1, "title", where) orelse v };
-            } else lua.raise(L, "{s}.choices[{d}]: string or table expected", .{ where, i });
-        }
-        lua.c.lua_settop(L, -2);
-        pref.choices = choices;
-    }
+    if (kind == .choice) pref.choices = prefChoices(L, a, t, where);
     pref.default = switch (kind) {
         .toggle => if (lua.fieldBool(L, t, "default", false, where)) "true" else "false",
         .choice => lua.fieldString(L, a, t, "default", where) orelse pref.choices[0].value,
@@ -1000,10 +994,7 @@ fn formFields(
 /// "<extension>.<name>" from the command's `name`, checked and unique.
 fn commandId(L: *lua.State, ctx: *LoadCtx, t: c_int, where: []const u8) [:0]const u8 {
     const a = ctx.load.a;
-    const name = lua.fieldString(L, a, t, "name", where) orelse
-        lua.raise(L, "{s}.name is missing", .{where});
-    if (!validId(name))
-        lua.raise(L, "{s}.name: use only a-z, 0-9, - and _ (got \"{s}\")", .{ where, name });
+    const name = fieldName(L, a, t, where);
     const id = a.printSentinel("{s}.{s}", .{ ctx.e.id, name }, 0) catch lua.oom(L);
     for (ctx.load.commands.items) |cmd| {
         if (std.mem.eql(u8, cmd.id, id)) lua.raise(L, "two commands named \"{s}\"", .{name});
