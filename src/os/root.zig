@@ -418,6 +418,10 @@ pub fn makePrivate(path: []const u8) void {
     _ = linux.chmod(z, 0o700);
 }
 
+pub fn unmap(buf: []align(8) u8) void {
+    _ = linux.munmap(buf.ptr, buf.len);
+}
+
 /// Private, writable (copy-on-write) mapping of a whole file.
 pub fn mapPrivate(path: [*:0]const u8) Error![]align(8) u8 {
     const fd = try openRegular(path);
@@ -436,7 +440,6 @@ pub fn mapPrivate(path: [*:0]const u8) Error![]align(8) u8 {
     return p[0..size];
 }
 
-/// Absolute-enough path of a testing tmp dir (tests run from the build root).
 /// A testing tmp dir with its absolute path (tests run from the build
 /// root; what they test often takes absolute paths), and files in it.
 pub const TestDir = struct {
@@ -485,6 +488,7 @@ pub fn tmpDirAbs(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
     return std.mem.print(buf, "{s}/{s}", .{ cwd, try tmpDirPath(tmp, &rel_buf) });
 }
 
+/// Path of a testing tmp dir relative to the build root (where tests run).
 pub fn tmpDirPath(tmp: *std.testing.TmpDir, buf: []u8) std.mem.PrintError![]const u8 {
     return std.mem.print(buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 }

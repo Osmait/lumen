@@ -144,7 +144,7 @@ pub const Engine = struct {
             .cache_cap = if (cacheable) cache_max else 0,
             .partials = partials,
         };
-        pool.run(n_chunks, &ctx, siftChunk);
+        pool.runBlocks(source_len, chunk_entries, &ctx, siftChunk);
 
         // Merge the per-chunk tops and keep the finalists.
         var finalists: std.ArrayList(Pair) = .empty;
@@ -171,11 +171,7 @@ pub const Engine = struct {
         defer hits.deinit(gpa);
         try hits.resize(gpa, finalists.items.len);
         var fctx: FineCtx = .{ .store = store, .q = ql, .in = finalists.items, .out = hits.items };
-        pool.run(
-            std.math.divCeil(usize, finalists.items.len, fine_block) catch 1,
-            &fctx,
-            FineCtx.block,
-        );
+        pool.runBlocks(finalists.items.len, fine_block, &fctx, FineCtx.block);
         std.mem.sort(Pair, hits.items, {}, lessThan);
 
         // Without this the thousands of "Cargo.toml" tie and their order is
@@ -195,7 +191,7 @@ pub const Engine = struct {
                 .hits = hits.items[0..n],
                 .now = sys.nowSeconds(),
             };
-            pool.run(std.math.divCeil(usize, n, recency_block) catch 1, &rctx, RecencyCtx.block);
+            pool.runBlocks(n, recency_block, &rctx, RecencyCtx.block);
             std.mem.sort(Pair, hits.items[0..n], {}, lessThan);
         }
 
@@ -256,9 +252,8 @@ const SiftCtx = struct {
     partials: []Partial,
 };
 
-fn siftChunk(ctx: *SiftCtx, ci: usize) void {
-    const lo = ci * chunk_entries;
-    const hi = @min(lo + chunk_entries, ctx.source_len);
+fn siftChunk(ctx: *SiftCtx, lo: usize, hi: usize) void {
+    const ci = lo / chunk_entries;
     // Out of memory: the chunk's candidates are incomplete, so they must not
     // be refined on the next keystroke as if they were all of them.
     sift(ctx, ci, lo, hi) catch {
@@ -477,12 +472,8 @@ const FineCtx = struct {
     in: []const Pair,
     out: []Pair,
 
-    fn block(ctx: *FineCtx, b: usize) void {
-        const lo = b * fine_block;
-        for (ctx.in[lo..@min(
-            lo + fine_block,
-            ctx.in.len,
-        )], ctx.out[lo..@min(lo + fine_block, ctx.in.len)]) |f, *h| {
+    fn block(ctx: *FineCtx, lo: usize, hi: usize) void {
+        for (ctx.in[lo..hi], ctx.out[lo..hi]) |f, *h| {
             const fs = fine.score(ctx.store.name(f.id), ctx.q) orelse 0;
             h.* = .{ .score = fs * 4 + f.score, .id = f.id };
         }
@@ -494,13 +485,9 @@ const RecencyCtx = struct {
     hits: []Pair,
     now: i64,
 
-    fn block(ctx: *RecencyCtx, b: usize) void {
+    fn block(ctx: *RecencyCtx, lo: usize, hi: usize) void {
         var buf: [4096]u8 = undefined;
-        const lo = b * recency_block;
-        for (ctx.hits[lo..@min(
-            lo + recency_block,
-            ctx.hits.len,
-        )]) |*h| h.score += recencyBonus(ctx.store, h.id, ctx.now, &buf);
+        for (ctx.hits[lo..hi]) |*h| h.score += recencyBonus(ctx.store, h.id, ctx.now, &buf);
     }
 };
 

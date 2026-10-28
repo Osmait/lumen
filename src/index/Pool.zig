@@ -91,6 +91,27 @@ fn stop(pool: *Pool, started: []std.Thread) void {
     for (started) |t| t.join();
 }
 
+/// `run` over `len` items in blocks of `block`: `f(ctx, lo, hi)` for each.
+pub fn runBlocks(
+    pool: *Pool,
+    len: usize,
+    comptime block: usize,
+    ctx: anytype,
+    comptime f: fn (@TypeOf(ctx), usize, usize) void,
+) void {
+    const Blocks = struct {
+        ctx: @TypeOf(ctx),
+        len: usize,
+
+        fn one(b: *const @This(), i: usize) void {
+            const lo = i * block;
+            f(b.ctx, lo, @min(lo + block, b.len));
+        }
+    };
+    const b: Blocks = .{ .ctx = ctx, .len = len };
+    pool.run((len + block - 1) / block, &b, Blocks.one);
+}
+
 /// Calls `f(ctx, i)` for every `i < n` and returns when all calls are done.
 /// Callers on other threads wait their turn.
 pub fn run(pool: *Pool, n: usize, ctx: anytype, comptime f: fn (@TypeOf(ctx), usize) void) void {

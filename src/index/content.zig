@@ -26,6 +26,9 @@ const std = @import("std");
 const linux = std.os.linux;
 const Pool = @import("Pool.zig");
 const sys = @import("os");
+const format = @import("format.zig");
+const align8 = format.align8;
+const corpusEntry = format.corpusEntry;
 const fold = @import("core").fold;
 const utf8 = @import("core").utf8;
 
@@ -76,10 +79,6 @@ const Trigrams = struct {
     }
 };
 
-fn align8(x: usize) usize {
-    return (x + 7) & ~@as(usize, 7);
-}
-
 const SegEntry = extern struct {
     n_keys: u64,
     keys_off: u64,
@@ -109,7 +108,7 @@ pub const Index = struct {
     live_bytes: usize,
 
     pub fn deinit(ix: *Index, gpa: std.mem.Allocator) void {
-        if (ix.mapped) _ = linux.munmap(ix.buf.ptr, ix.buf.len) else gpa.free(ix.buf);
+        format.release(ix.buf, ix.mapped, gpa);
         ix.* = undefined;
     }
 
@@ -231,7 +230,7 @@ pub const Index = struct {
 
     pub fn open(path_z: [:0]const u8) (sys.Error || error{BadIndex})!Index {
         const buf = try sys.mapPrivate(path_z);
-        errdefer _ = linux.munmap(buf.ptr, buf.len);
+        errdefer sys.unmap(buf);
         return parse(buf, true);
     }
 
@@ -660,6 +659,38 @@ const small_postings = 1 << 20;
 /// How many small segments at the end make a merge.
 const merge_small = 4;
 
+/// The old index's documents then `added` (ids are positions), and their
+/// flags with `gone` marked removed.
+const Merged = struct {
+    docs: []DocIn,
+    flags: []u8,
+
+    fn deinit(m: Merged, gpa: std.mem.Allocator) void {
+        gpa.free(m.docs);
+        gpa.free(m.flags);
+    }
+};
+
+fn mergeDocs(
+    gpa: std.mem.Allocator,
+    old: *const Index,
+    gone: []const u32,
+    added: []const DocIn,
+) std.mem.Allocator.Error!Merged {
+    const n = old.n_docs + added.len;
+    // Doc ids are u32.
+    if (n > std.math.maxInt(u32)) return error.OutOfMemory;
+    const docs = try gpa.alloc(DocIn, n);
+    errdefer gpa.free(docs);
+    for (docs[0..old.n_docs], 0..) |*d, i| d.* = old.docIn(@intCast(i));
+    @memcpy(docs[old.n_docs..], added);
+    const flags = try gpa.alloc(u8, n);
+    @memcpy(flags[0..old.n_docs], old.flags);
+    @memset(flags[old.n_docs..], 0);
+    for (gone) |id| flags[id] |= flag_removed;
+    return .{ .docs = docs, .flags = flags };
+}
+
 fn appendInto(
     sink: *Sink,
     pool: *Pool,
@@ -672,17 +703,10 @@ fn appendInto(
     const gpa = sink.gpa;
     const t0 = sys.monotonicNs();
     var st: BuildStats = .{};
-    const n = old.n_docs + added.len;
-    if (n > std.math.maxInt(u32)) return error.OutOfMemory;
-    const docs = try gpa.alloc(DocIn, n);
-    defer gpa.free(docs);
-    for (docs[0..old.n_docs], 0..) |*d, i| d.* = old.docIn(@intCast(i));
-    @memcpy(docs[old.n_docs..], added);
-    const flags = try gpa.alloc(u8, n);
-    defer gpa.free(flags);
-    @memcpy(flags[0..old.n_docs], old.flags);
-    @memset(flags[old.n_docs..], 0);
-    for (gone) |id| flags[id] |= flag_removed;
+    const m = try mergeDocs(gpa, old, gone, added);
+    defer m.deinit(gpa);
+    const docs = m.docs;
+    const flags = m.flags;
 
     var keep = old.segs.len;
     while (keep > 0 and old.segs[keep - 1].post_len < small_postings) keep -= 1;
@@ -843,17 +867,10 @@ fn updateInto(
     const gpa = sink.gpa;
     const t0 = sys.monotonicNs();
     var st: BuildStats = .{};
-    const n = old.n_docs + added.len;
-    if (n > std.math.maxInt(u32)) return error.OutOfMemory;
-    const docs = try gpa.alloc(DocIn, n);
-    defer gpa.free(docs);
-    for (docs[0..old.n_docs], 0..) |*d, i| d.* = old.docIn(@intCast(i));
-    @memcpy(docs[old.n_docs..], added);
-    const flags = try gpa.alloc(u8, n);
-    defer gpa.free(flags);
-    @memcpy(flags[0..old.n_docs], old.flags);
-    @memset(flags[old.n_docs..], 0);
-    for (gone) |id| flags[id] |= flag_removed;
+    const m = try mergeDocs(gpa, old, gone, added);
+    defer m.deinit(gpa);
+    const docs = m.docs;
+    const flags = m.flags;
 
     var dir: std.ArrayList(SegEntry) = .empty;
     defer dir.deinit(gpa);
@@ -1781,9 +1798,7 @@ fn verifyTask(ctx: *VerifyCtx, t: usize) void {
         // 24-thread process. Extracted texts run to megabytes and usually
         // match early, so those are mapped and only touched where scanned.
         var mapped: ?[]align(8) u8 = null;
-        defer if (mapped) |m| {
-            _ = linux.munmap(m.ptr, m.len);
-        };
+        defer if (mapped) |m| sys.unmap(m);
         const text: []const u8 = if (d.source == .plain) blk: {
             // Out of memory: this candidate is left out of the results.
             if (!(readPlain(ctx.gpa, p, &buf) catch false)) continue;
@@ -2444,14 +2459,6 @@ test "random byte flips in a content index never crash" {
         } else |_| {}
     }
     try testing.expect(accepted > 0);
-}
-
-/// Smith input for a fuzz test that starts with one `slice()`.
-fn corpusEntry(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
-    const e = try gpa.alloc(u8, 4 + bytes.len);
-    std.mem.writeInt(u32, e[0..4], @intCast(bytes.len), .little);
-    @memcpy(e[4..], bytes);
-    return e;
 }
 
 fn fuzzParseBytes(_: void, smith: *testing.Smith) anyerror!void {

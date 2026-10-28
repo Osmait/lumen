@@ -14,7 +14,7 @@ const log = std.log.scoped(.db);
 handle: *c.sqlite3,
 
 /// Each failure is also logged with SQLite's message.
-pub const Error = error{ DbOpen, DbExec, DbPrepare, DbStep };
+pub const Error = error{ DbOpen, DbExec, DbPrepare, DbBind, DbStep };
 
 pub fn open(path: [:0]const u8) Error!Db {
     var h: ?*c.sqlite3 = null;
@@ -70,6 +70,30 @@ fn prepare(db: *Db, sql: [:0]const u8) Error!*c.sqlite3_stmt {
     return stmt.?;
 }
 
+/// Binds `args` to ?1, ?2... in order: integers as int64, byte slices as
+/// text. A bind that fails would run the statement with NULL instead.
+fn bind(db: *Db, stmt: *c.sqlite3_stmt, args: anytype) Error!void {
+    inline for (args, 0..) |v, i| {
+        const at: c_int = i + 1;
+        const rc = switch (@typeInfo(@TypeOf(v))) {
+            .int, .comptime_int => c.sqlite3_bind_int64(stmt, at, v),
+            else => bindText(stmt, at, v),
+        };
+        if (rc != c.SQLITE_OK) {
+            log.warn("bind ?{d}: {s}", .{ at, c.sqlite3_errmsg(db.handle) });
+            return error.DbBind;
+        }
+    }
+}
+
+/// Prepares `sql`, binds `args` and runs it (no rows).
+fn execArgs(db: *Db, sql: [:0]const u8, args: anytype) Error!void {
+    const stmt = try db.prepare(sql);
+    defer _ = c.sqlite3_finalize(stmt);
+    try db.bind(stmt, args);
+    try db.run(stmt);
+}
+
 /// Runs a statement that returns no rows.
 fn run(db: *Db, stmt: *c.sqlite3_stmt) Error!void {
     const rc = c.sqlite3_step(stmt);
@@ -94,21 +118,14 @@ fn stepFailed(db: *Db, rc: c_int) Error {
 // ---------------------------------------------------------------- frecency
 
 pub fn recordUse(db: *Db, key: []const u8, now: i64) Error!void {
-    const stmt = try db.prepare(
+    try db.execArgs(
         \\INSERT INTO frecency (key, count, last_used) VALUES (?1, 1, ?2)
         \\ON CONFLICT(key) DO UPDATE SET count = count + 1, last_used = ?2
-    );
-    defer _ = c.sqlite3_finalize(stmt);
-    bindText(stmt, 1, key);
-    _ = c.sqlite3_bind_int64(stmt, 2, now);
-    try db.run(stmt);
+    , .{ key, now });
 }
 
 pub fn forget(db: *Db, key: []const u8) Error!void {
-    const stmt = try db.prepare("DELETE FROM frecency WHERE key = ?1");
-    defer _ = c.sqlite3_finalize(stmt);
-    bindText(stmt, 1, key);
-    try db.run(stmt);
+    try db.execArgs("DELETE FROM frecency WHERE key = ?1", .{key});
 }
 
 /// Forgets what decayed below any effect on the ranking: every file opened
@@ -134,7 +151,7 @@ pub fn pruneFrecency(db: *Db, now: i64) Error!void {
     }
     for (stale.items) |key| {
         _ = c.sqlite3_reset(del);
-        bindText(del, 1, key);
+        try db.bind(del, .{key});
         try db.run(del);
     }
 }
@@ -172,24 +189,16 @@ pub fn addClip(db: *Db, content: []const u8, now: i64, keep: u32) Error!void {
     if (content.len == 0 or content.len > max_bytes) return;
     if (std.mem.trim(u8, content, " \t\r\n").len == 0) return;
     const hash: i64 = @bitCast(std.hash.Wyhash.hash(0, content));
-    const stmt = try db.prepare(
+    try db.execArgs(
         \\INSERT INTO clipboard (hash, content, created_at, last_copied) VALUES (?1, ?2, ?3, ?3)
         \\ON CONFLICT(hash) DO UPDATE SET last_copied = ?3
-    );
-    defer _ = c.sqlite3_finalize(stmt);
-    _ = c.sqlite3_bind_int64(stmt, 1, hash);
-    bindText(stmt, 2, content);
-    _ = c.sqlite3_bind_int64(stmt, 3, now);
-    try db.run(stmt);
+    , .{ hash, content, now });
     // What is past the newest `keep`, found through the index (scanned
     // backwards: newest first, ties by id); NOT IN read the whole table.
-    const trim = try db.prepare(
+    try db.execArgs(
         \\DELETE FROM clipboard WHERE id IN
         \\  (SELECT id FROM clipboard ORDER BY last_copied DESC, id DESC LIMIT -1 OFFSET ?1)
-    );
-    defer _ = c.sqlite3_finalize(trim);
-    _ = c.sqlite3_bind_int64(trim, 1, @max(keep, 1));
-    try db.run(trim);
+    , .{@max(keep, 1)});
 }
 
 pub const Clip = struct {
@@ -212,7 +221,7 @@ pub fn recentClips(
         "SELECT id, content, created_at, last_copied FROM clipboard ORDER BY last_copied DESC, id DESC LIMIT ?1",
     );
     defer _ = c.sqlite3_finalize(stmt);
-    _ = c.sqlite3_bind_int64(stmt, 1, limit);
+    try db.bind(stmt, .{limit});
     while (try db.nextRow(stmt)) {
         try list.append(arena, .{
             .id = c.sqlite3_column_int64(stmt, 0),
@@ -225,28 +234,21 @@ pub fn recentClips(
 }
 
 pub fn touchClip(db: *Db, id: i64, now: i64) Error!void {
-    const stmt = try db.prepare("UPDATE clipboard SET last_copied = ?2 WHERE id = ?1");
-    defer _ = c.sqlite3_finalize(stmt);
-    _ = c.sqlite3_bind_int64(stmt, 1, id);
-    _ = c.sqlite3_bind_int64(stmt, 2, now);
-    try db.run(stmt);
+    try db.execArgs("UPDATE clipboard SET last_copied = ?2 WHERE id = ?1", .{ id, now });
 }
 
 pub fn deleteClip(db: *Db, id: i64) Error!void {
-    const stmt = try db.prepare("DELETE FROM clipboard WHERE id = ?1");
-    defer _ = c.sqlite3_finalize(stmt);
-    _ = c.sqlite3_bind_int64(stmt, 1, id);
-    try db.run(stmt);
+    try db.execArgs("DELETE FROM clipboard WHERE id = ?1", .{id});
 }
 
 pub fn clearClips(db: *Db) Error!void {
     try db.exec("DELETE FROM clipboard");
 }
 
-fn bindText(stmt: *c.sqlite3_stmt, idx: c_int, text: []const u8) void {
+fn bindText(stmt: *c.sqlite3_stmt, idx: c_int, text: []const u8) c_int {
     // SQLITE_TRANSIENT: sqlite copies the bytes.
     const transient: c.sqlite3_destructor_type = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
-    _ = c.sqlite3_bind_text64(stmt, idx, text.ptr, text.len, transient, c.SQLITE_UTF8);
+    return c.sqlite3_bind_text64(stmt, idx, text.ptr, text.len, transient, c.SQLITE_UTF8);
 }
 
 fn columnText(stmt: *c.sqlite3_stmt, col: c_int) []const u8 {

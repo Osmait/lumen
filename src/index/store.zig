@@ -11,6 +11,9 @@
 const std = @import("std");
 const linux = std.os.linux;
 const sys = @import("os");
+const format = @import("format.zig");
+const align8 = format.align8;
+const corpusEntry = format.corpusEntry;
 const fold = @import("core").fold;
 
 pub const no_parent: u32 = std.math.maxInt(u32);
@@ -75,10 +78,6 @@ fn foldedMask(s: []const u8) u64 {
     return m;
 }
 
-fn align8(x: usize) usize {
-    return (x + 7) & ~@as(usize, 7);
-}
-
 /// Offset of each array inside the buffer. Computed the same way when
 /// building and when mapping, which is what makes both formats one.
 const Layout = struct {
@@ -123,9 +122,7 @@ pub const Store = struct {
     lay: Layout,
 
     pub fn deinit(s: *Store, gpa: std.mem.Allocator) void {
-        if (s.mapped) {
-            _ = linux.munmap(s.buf.ptr, s.buf.len);
-        } else gpa.free(s.buf);
+        format.release(s.buf, s.mapped, gpa);
         s.* = undefined;
     }
 
@@ -270,7 +267,7 @@ pub const Store = struct {
     /// tombstones never reach the file.
     pub fn open(path_z: [:0]const u8) (sys.Error || error{BadIndex})!Store {
         const buf = try sys.mapPrivate(path_z);
-        errdefer _ = linux.munmap(buf.ptr, buf.len);
+        errdefer sys.unmap(buf);
         return parse(buf, true);
     }
 
@@ -633,14 +630,6 @@ test "random byte flips never crash" {
     }
     // Flips in masks, depths, flags and names are harmless: many pass.
     try testing.expect(accepted > 0);
-}
-
-/// Smith input for a fuzz test that starts with one `slice()`.
-fn corpusEntry(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
-    const e = try gpa.alloc(u8, 4 + bytes.len);
-    std.mem.writeInt(u32, e[0..4], @intCast(bytes.len), .little);
-    @memcpy(e[4..], bytes);
-    return e;
 }
 
 fn fuzzParse(_: void, smith: *testing.Smith) anyerror!void {

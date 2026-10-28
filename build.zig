@@ -32,27 +32,10 @@ pub fn build(b: *std.Build) void {
     ) orelse false;
     const hot = if (optimize == .safe and !safe_index) .fast else optimize;
 
-    const core = b.createModule(.{
-        .root_source_file = b.path("src/core/root.zig"),
-        .target = target,
-        .optimize = hot,
-    });
-
-    const os = b.createModule(.{
-        .root_source_file = b.path("src/os/root.zig"),
-        .target = target,
-        .optimize = hot,
-    });
-
-    const index = b.createModule(.{
-        .root_source_file = b.path("src/index/root.zig"),
-        .target = target,
-        .optimize = hot,
-        .link_libc = true,
-    });
-    // Accent and case folding (core.fold) is shared by every search.
-    index.addImport("core", core);
-    index.addImport("os", os);
+    const base = baseModules(b, target, hot);
+    const core = base.core;
+    const os = base.os;
+    const index = base.index;
 
     // GTK & co. are declared by hand in src/c.zig: Zig 0.16's translate-c
     // could not parse GLib's headers (0.17's can, so this could move).
@@ -163,25 +146,9 @@ pub fn build(b: *std.Build) void {
         .optimize = .fast,
         .link_libc = true,
     });
-    const perf_index = b.createModule(.{
-        .root_source_file = b.path("src/index/root.zig"),
-        .target = target,
-        .optimize = .fast,
-        .link_libc = true,
-    });
-    perf_index.addImport("core", b.createModule(.{
-        .root_source_file = b.path("src/core/root.zig"),
-        .target = target,
-        .optimize = .fast,
-    }));
-    const perf_os = b.createModule(.{
-        .root_source_file = b.path("src/os/root.zig"),
-        .target = target,
-        .optimize = .fast,
-    });
-    perf_index.addImport("os", perf_os);
-    perf_mod.addImport("index", perf_index);
-    perf_mod.addImport("os", perf_os);
+    const perf_base = baseModules(b, target, .fast);
+    perf_mod.addImport("index", perf_base.index);
+    perf_mod.addImport("os", perf_base.os);
     const perf_run = b.addRunArtifact(b.addExecutable(.{
         .name = "lumen-perf",
         .root_module = perf_mod,
@@ -205,4 +172,33 @@ pub fn build(b: *std.Build) void {
     for ([_]*std.Build.Module{ core, os, index, luart, mod, client }) |m| {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     }
+}
+
+/// core, os and index, compiled in `optimize` (the program's, or always
+/// optimized for the performance checks).
+fn baseModules(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) struct { core: *std.Build.Module, os: *std.Build.Module, index: *std.Build.Module } {
+    const core = b.createModule(.{
+        .root_source_file = b.path("src/core/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const os = b.createModule(.{
+        .root_source_file = b.path("src/os/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const index = b.createModule(.{
+        .root_source_file = b.path("src/index/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    // Accent and case folding (core.fold) is shared by every search.
+    index.addImport("core", core);
+    index.addImport("os", os);
+    return .{ .core = core, .os = os, .index = index };
 }
