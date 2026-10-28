@@ -17,6 +17,12 @@ set -uo pipefail
 BIN=$(realpath "${1:-zig-out/bin/lumen}")
 [[ -x "$BIN" ]] || { echo "no lumen binary at $BIN" >&2; exit 2; }
 [[ -n "${WAYLAND_DISPLAY:-}" ]] || { echo "e2e: no Wayland session, skipping"; exit 0; }
+# A window cannot draw on a monitor that is off: GTK waits for a frame that
+# never comes, and so would every --dump after it.
+if command -v hyprctl >/dev/null && hyprctl -j monitors 2>/dev/null | grep -q '"dpmsStatus": *false'; then
+    echo "e2e: a monitor is off (DPMS); turn it on (hyprctl dispatch dpms on) and run again" >&2
+    exit 2
+fi
 
 T=$(mktemp -d "${TMPDIR:-/tmp}/lumen-e2e.XXXXXX")
 H=$T/home
