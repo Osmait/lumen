@@ -3,7 +3,7 @@
 const std = @import("std");
 const c = @import("c");
 const script_meta = @import("core").script_meta;
-const index = @import("index");
+const os = @import("os");
 const Item = @import("../item.zig").Item;
 
 /// ~/.config/lumen/scripts, in `a`; null only when out of memory.
@@ -59,7 +59,7 @@ fn stamp(a: std.mem.Allocator) u64 {
         const name = std.mem.span(name_c);
         hasher.update(name);
         const full = std.mem.printSentinel(&buf, "{s}/{s}", .{ path, name }, 0) catch continue;
-        if (index.sys.info(full)) |i| hasher.update(std.mem.asBytes(&.{ i.mtime, i.size }));
+        if (os.info(full)) |i| hasher.update(std.mem.asBytes(&.{ i.mtime, i.size }));
     }
     return hasher.final();
 }
@@ -78,7 +78,7 @@ fn scan(a: std.mem.Allocator) []Item {
 
         // The header is all that is read of it.
         var head_buf: [4096]u8 = undefined;
-        const head = index.sys.readHead(full.ptr, &head_buf);
+        const head = os.readHead(full.ptr, &head_buf);
         const meta = script_meta.parse(head) orelse continue;
 
         const emoji = meta.icon.len > 0 and meta.icon.len <= 8 and meta.icon[0] >= 0x80;

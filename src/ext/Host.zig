@@ -15,7 +15,7 @@ const std = @import("std");
 const c = @import("c");
 const lua = @import("lua.zig");
 const api = @import("api.zig");
-const index = @import("index");
+const os = @import("os");
 const core = @import("core");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
@@ -582,7 +582,7 @@ fn doReload(h: *Host) void {
     };
     if (style.len > 0) h.loadStyle(&load, style);
     if (wa.printSentinel("{s}/init.lua", .{h.config_dir}, 0)) |path| {
-        if (index.sys.info(path) != null) h.loadFile(&load, "config", h.config_dir, path);
+        if (os.info(path) != null) h.loadFile(&load, "config", h.config_dir, path);
     } else |_| problem(&load, "config", "out of memory");
     for (h.extensionDirs(wa)) |id| {
         const dir = wa.printSentinel("{s}/extensions/{s}", .{ h.config_dir, id }, 0) catch {
@@ -597,7 +597,7 @@ fn doReload(h: *Host) void {
             problem(&load, id, "extension folder names may use only a-z, 0-9, - and _");
             continue;
         }
-        if (index.sys.info(path) == null) {
+        if (os.info(path) == null) {
             problem(&load, id, "no init.lua in the extension's folder");
             continue;
         }
@@ -627,23 +627,11 @@ fn doReload(h: *Host) void {
 /// Names of the folders under extensions/, sorted, in `a`.
 fn extensionDirs(h: *Host, a: std.mem.Allocator) []const [:0]const u8 {
     const path = a.printSentinel("{s}/extensions", .{h.config_dir}, 0) catch return &.{};
-    const d = c.g_dir_open(path.ptr, 0, null) orelse return &.{};
-    defer c.g_dir_close(d);
-    var names: std.ArrayList([:0]const u8) = .empty;
-    while (c.g_dir_read_name(d)) |n| {
-        const name = std.mem.span(n);
-        if (name.len == 0 or name[0] == '.') continue;
-        const full = a.printSentinel("{s}/{s}", .{ path, name }, 0) catch continue;
-        const info = index.sys.info(full) orelse continue;
-        if (!info.is_dir) continue;
-        names.append(a, a.dupeSentinel(u8, name, 0) catch continue) catch continue;
-    }
-    std.mem.sort([:0]const u8, names.items, {}, struct {
-        fn lt(_: void, x: [:0]const u8, y: [:0]const u8) bool {
-            return std.mem.order(u8, x, y) == .lt;
-        }
-    }.lt);
-    return names.items;
+    return os.subdirs(a, path, anyName);
+}
+
+fn anyName(_: []const u8) bool {
+    return true;
 }
 
 pub fn validId(id: []const u8) bool {
@@ -665,9 +653,9 @@ fn loadStyle(h: *Host, load: *Load, name: []const u8) void {
     const wa = h.warena.allocator();
     const dir = wa.printSentinel("{s}/styles/{s}", .{ h.config_dir, name }, 0) catch return;
     const path = wa.printSentinel("{s}/init.lua", .{dir}, 0) catch return;
-    if (index.sys.info(path) != null) return h.loadSource(load, "style", dir, path, null);
+    if (os.info(path) != null) return h.loadSource(load, "style", dir, path, null);
     // A style folder may hold only a style.css.
-    if (index.sys.info(dir) != null) return;
+    if (os.info(dir) != null) return;
     if (styles.find(name)) |s| return h.loadSource(load, "style", h.config_dir, "=style", s.lua);
     problem(load, "style", "no such style");
 }
@@ -696,7 +684,7 @@ fn loadSource(
     ) catch return problem(load, id, "out of memory");
     const e = h.gpa.create(Ext) catch return problem(load, id, "out of memory");
     e.* = .{ .host = h, .id = id_z, .dir = dir_z, .data = data };
-    index.sys.mkdirP(e.data);
+    os.mkdirP(e.data);
     e.L = lua.newState(&e.budget) orelse {
         h.gpa.destroy(e);
         return problem(load, id, "out of memory");
@@ -715,7 +703,7 @@ fn loadSource(
         load.style_settings.items.len,
     };
     e.load = load;
-    e.budget.deadline_ns = index.sys.monotonicNs() + load_budget_ns;
+    e.budget.deadline_ns = os.monotonicNs() + load_budget_ns;
     var ctx: LoadCtx = .{
         .e = e,
         .load = load,
@@ -1164,7 +1152,7 @@ fn doList(h: *Host, req: ListReq, query: []const u8) void {
     }
     const wc = &h.wcmds[req.command];
     const e = h.exts.items[wc.ext];
-    e.budget.deadline_ns = index.sys.monotonicNs() + list_budget_ns;
+    e.budget.deadline_ns = os.monotonicNs() + list_budget_ns;
     defer e.budget.deadline_ns = std.math.maxInt(u64);
     var ctx: ListCtx = .{ .e = e, .wc = wc, .req = req, .res = res, .query = query };
     res.err = lua.protect(e.L, a, ListCtx, &ctx, ListCtx.run);
@@ -1530,7 +1518,7 @@ fn doRoot(h: *Host, req: RootReq, query: []const u8) void {
         // A newer query came in: this one is already stale.
         if (h.rootSuperseded()) break;
         const e = h.exts.items[wc.ext];
-        e.budget.deadline_ns = index.sys.monotonicNs() + root_budget_ns;
+        e.budget.deadline_ns = os.monotonicNs() + root_budget_ns;
         defer e.budget.deadline_ns = std.math.maxInt(u64);
         var ctx: RootCtx = .{
             .e = e,
@@ -1610,7 +1598,7 @@ fn doSubmit(h: *Host, req: *SubmitReq) void {
     }
     const wc = &h.wcmds[req.command];
     const e = h.exts.items[wc.ext];
-    e.budget.deadline_ns = index.sys.monotonicNs() + act_budget_ns;
+    e.budget.deadline_ns = os.monotonicNs() + act_budget_ns;
     defer e.budget.deadline_ns = std.math.maxInt(u64);
     var ctx: SubmitCtx = .{ .wc = wc, .req = req, .res = res };
     res.err = lua.protect(e.L, res.arena.allocator(), SubmitCtx, &ctx, SubmitCtx.run);
@@ -1675,7 +1663,7 @@ fn doAct(h: *Host, req: ActReq) void {
     }
     const wc = &h.wcmds[req.command];
     const e = h.exts.items[wc.ext];
-    e.budget.deadline_ns = index.sys.monotonicNs() + act_budget_ns;
+    e.budget.deadline_ns = os.monotonicNs() + act_budget_ns;
     defer e.budget.deadline_ns = std.math.maxInt(u64);
     var ctx: ActCtx = .{ .e = e, .wc = wc, .req = req, .res = res };
     res.err = lua.protect(e.L, res.arena.allocator(), ActCtx, &ctx, ActCtx.run);
@@ -1820,20 +1808,10 @@ fn hashFolders(hasher: *std.hash.Wyhash, config_dir: []const u8, kind: []const u
 }
 
 fn hashFile(hasher: *std.hash.Wyhash, path: [:0]const u8) void {
-    const linux = std.os.linux;
-    var st: linux.Statx = undefined;
     hasher.update(path);
-    if (linux.errno(linux.statx(
-        linux.AT.FDCWD,
-        path,
-        0,
-        .{ .SIZE = true, .MTIME = true, .INO = true },
-        &st,
-    )) != .SUCCESS) return;
-    hasher.update(std.mem.asBytes(&st.mtime.sec));
-    hasher.update(std.mem.asBytes(&st.mtime.nsec));
-    hasher.update(std.mem.asBytes(&st.size));
-    hasher.update(std.mem.asBytes(&st.ino));
+    const st = os.Stamp.of(path.ptr);
+    hasher.update(std.mem.asBytes(&.{ st.sec, st.size, st.ino }));
+    hasher.update(std.mem.asBytes(&st.nsec));
 }
 
 // ---------------------------------------------------------------- tests
@@ -1875,9 +1853,9 @@ const Probe = struct {
     }
     /// Pumps the main loop until `field` is set (up to 10 s).
     fn wait(p: *Probe, comptime field: []const u8) !void {
-        const until = index.sys.monotonicNs() + 10 * std.time.ns_per_s;
+        const until = os.monotonicNs() + 10 * std.time.ns_per_s;
         while (@field(p, field) == null) {
-            if (index.sys.monotonicNs() > until) return error.Timeout;
+            if (os.monotonicNs() > until) return error.Timeout;
             // Nothing ready: a 1 ms nap (poll with no descriptors).
             if (c.g_main_context_iteration(null, 0) == 0) _ = std.os.linux.poll(
                 &[0]std.os.linux.pollfd{},
@@ -1897,8 +1875,8 @@ const Probe = struct {
 fn writeTestFile(dir: []const u8, name: []const u8, data: []const u8) !void {
     var buf: [4096]u8 = undefined;
     const p = try std.mem.printSentinel(&buf, "{s}/{s}", .{ dir, name }, 0);
-    if (std.mem.findScalarLast(u8, p, '/')) |s| index.sys.mkdirP(p[0..s]);
-    try index.sys.writeFile(p, data);
+    if (std.mem.findScalarLast(u8, p, '/')) |s| os.mkdirP(p[0..s]);
+    try os.writeFile(p, data);
 }
 
 fn testHost(probe: *Probe, dir: []const u8) !*Host {
@@ -1917,7 +1895,7 @@ test "extensions load, list, search and run actions" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var dbuf: [4096]u8 = undefined;
-    const dir = try index.sys.tmpDirPath(&tmp, &dbuf);
+    const dir = try os.tmpDirPath(&tmp, &dbuf);
     try writeTestFile(dir, "init.lua",
         \\lumen.theme { id = "mine", name = "Mine", bg = "#101010", fg = "#f0f0f0", accent = "#ff8800" }
         \\lumen.keymap("ctrl+g", "demo.fruits")
@@ -2095,7 +2073,7 @@ test "errors in extensions come back as messages" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var dbuf: [4096]u8 = undefined;
-    const dir = try index.sys.tmpDirPath(&tmp, &dbuf);
+    const dir = try os.tmpDirPath(&tmp, &dbuf);
     try writeTestFile(dir, "extensions/bad/init.lua",
         \\return lumen.extension { commands = {
         \\  { name = "boom", title = "Boom", items = function() error("kaboom") end },
@@ -2164,7 +2142,7 @@ test "preferences read Settings' file over their defaults; storage persists" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var dbuf: [4096]u8 = undefined;
-    const dir = try index.sys.tmpDirPath(&tmp, &dbuf);
+    const dir = try os.tmpDirPath(&tmp, &dbuf);
     try writeTestFile(dir, "extensions/kv/init.lua",
         \\return lumen.extension {
         \\  preferences = {

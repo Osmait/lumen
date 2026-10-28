@@ -165,7 +165,7 @@ fn binaryByName(path: []const u8) bool {
 // ---------------------------------------------------------------- tests
 
 const testing = std.testing;
-const sys = @import("sys.zig");
+const sys = @import("os");
 
 /// A testing tmp dir with its absolute path (`list` takes an absolute root;
 /// tests run from the build root).

@@ -10,7 +10,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
-const sys = @import("sys.zig");
+const sys = @import("os");
 const fold = @import("core").fold;
 
 pub const no_parent: u32 = std.math.maxInt(u32);

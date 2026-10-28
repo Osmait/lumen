@@ -8,7 +8,7 @@ const c = @import("c");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
 const Host = @import("../ext/Host.zig");
-const index = @import("index");
+const os = @import("os");
 const Ui = @import("Ui.zig");
 const settings_view = @import("settings_view.zig");
 const form_view = @import("form_view.zig");
@@ -107,7 +107,7 @@ fn manageRows(ui: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item)) void {
         .icon = .{ .tile = .{ .name = "folder-open-symbolic", .color = .blue } },
         .action = .{ .setting = .{ .ext_open = dir } },
     }) catch return;
-    if (index.sys.info(git) != null) out.append(a, .{
+    if (os.info(git) != null) out.append(a, .{
         .key = "manage:update",
         .section = "Manage",
         .title = "Update",
@@ -161,7 +161,7 @@ const Stored = union(enum) { absent, unreadable, values: std.json.ObjectMap };
 const prefs_bytes_max = 1 << 20;
 
 fn readStored(arena: std.mem.Allocator, file: [:0]const u8) Stored {
-    if (index.sys.info(file.ptr) == null) return .absent;
+    if (os.info(file.ptr) == null) return .absent;
     var contents: ?[*:0]u8 = null;
     var len: usize = 0;
     if (c.g_file_get_contents(file.ptr, &contents, &len, null) == 0) return .unreadable;
@@ -328,8 +328,8 @@ fn save(ui: *Ui, p: *const Host.Pref, value: std.json.Value) bool {
         ui.showFailure("Could not save the setting");
         return false;
     };
-    if (std.mem.findScalarLast(u8, p.file, '/')) |s| index.sys.mkdirP(p.file[0..s]);
-    index.sys.writeFileAtomic(p.file, json) catch |err| {
+    if (std.mem.findScalarLast(u8, p.file, '/')) |s| os.mkdirP(p.file[0..s]);
+    os.writeFileAtomic(p.file, json) catch |err| {
         log.warn("{s}: {t}", .{ p.file, err });
         ui.showFailure("Could not save the setting");
         return false;

@@ -25,7 +25,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const Pool = @import("Pool.zig");
-const sys = @import("sys.zig");
+const sys = @import("os");
 const fold = @import("core").fold;
 
 /// 02: trigrams of folded text (accents and case, `core.fold`).

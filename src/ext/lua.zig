@@ -17,7 +17,7 @@
 
 const std = @import("std");
 pub const c = @import("lua");
-const index = @import("index");
+const os = @import("os");
 
 comptime {
     if (c.LUA_VERSION_NUM != 504) @compileError("Lumen needs Lua 5.4");
@@ -84,7 +84,7 @@ fn alloc(ud: ?*anyopaque, ptr: ?*anyopaque, osize: usize, nsize: usize) callconv
 }
 
 fn hook(L: ?*State, _: ?*c.lua_Debug) callconv(.c) void {
-    if (index.sys.monotonicNs() > budgetOf(L.?).deadline_ns) _ = c.luaL_error(L, "timed out");
+    if (os.monotonicNs() > budgetOf(L.?).deadline_ns) _ = c.luaL_error(L, "timed out");
 }
 
 /// Only reached by a Lua error outside every protected call: a bug here.
@@ -378,11 +378,11 @@ test "a runaway loop stops at its deadline" {
     defer c.lua_close(L);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    budget.deadline_ns = index.sys.monotonicNs() + 50 * std.time.ns_per_ms;
-    const t0 = index.sys.monotonicNs();
+    budget.deadline_ns = os.monotonicNs() + 50 * std.time.ns_per_ms;
+    const t0 = os.monotonicNs();
     const msg = runCode(L, arena.allocator(), "while true do end").?;
     try testing.expect(std.mem.find(u8, msg, "timed out") != null);
-    try testing.expect(index.sys.monotonicNs() - t0 < 2 * std.time.ns_per_s);
+    try testing.expect(os.monotonicNs() - t0 < 2 * std.time.ns_per_s);
 }
 
 test "memory is capped per state" {

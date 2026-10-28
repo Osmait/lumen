@@ -7,6 +7,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const c = @import("c");
+const os = @import("os");
 const proc = @import("proc.zig");
 const geometry = @import("core").geometry;
 
@@ -73,71 +74,46 @@ fn request(arena: std.mem.Allocator, what: []const u8) ?[]const u8 {
 
 /// Connects to one of Hyprland's sockets (".socket.sock" for requests,
 /// ".socket2.sock" for events); null without Hyprland.
-fn connect(which: []const u8, flags: u32) ?linux.fd_t {
+fn connect(which: []const u8, opts: os.unix.ConnectOptions) ?linux.fd_t {
     const sig = std.mem.span(c.g_getenv("HYPRLAND_INSTANCE_SIGNATURE") orelse return null);
     const rt = std.mem.span(c.g_getenv("XDG_RUNTIME_DIR") orelse return null);
-    var addr: linux.sockaddr.un = .{ .path = @splat(0) };
-    _ = std.mem.print(
-        addr.path[0 .. addr.path.len - 1],
-        "{s}/hypr/{s}/{s}",
-        .{ rt, sig, which },
-    ) catch return null;
-    const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC | flags, 0);
-    if (linux.errno(rc) != .SUCCESS) return null;
-    const fd: linux.fd_t = @intCast(rc);
-    if (linux.errno(linux.connect(fd, &addr, @sizeOf(linux.sockaddr.un))) != .SUCCESS) {
-        _ = linux.close(fd);
-        return null;
-    }
-    return fd;
+    var path_buf: [108]u8 = undefined;
+    const path = std.mem.print(&path_buf, "{s}/hypr/{s}/{s}", .{ rt, sig, which }) catch return null;
+    return os.unix.connect(path, opts);
 }
+
+/// A compositor that does not answer must not freeze the window.
+const answer_ns = std.time.ns_per_s;
 
 /// Sends dispatches and waits until Hyprland has run them. False only when
 /// nothing was sent (no socket), so hyprctl may try instead: once sent, a
 /// dispatch must never go twice (a toggle would undo itself). What Hyprland
 /// answers ("ok" per dispatch) does not matter.
 fn dispatchOver(msg: []const u8) bool {
-    const fd = connect(".socket.sock", 0) orelse return false;
+    const fd = connect(".socket.sock", .{}) orelse return false;
     defer _ = linux.close(fd);
-    const timeout: linux.timeval = .{ .sec = 1, .usec = 0 };
-    _ = linux.setsockopt(
-        fd,
-        linux.SOL.SOCKET,
-        linux.SO.RCVTIMEO,
-        @ptrCast(&timeout),
-        @sizeOf(linux.timeval),
-    );
     const n = linux.write(fd, msg.ptr, msg.len);
-    if (linux.errno(n) != .SUCCESS or n == 0) return false;
+    if (os.unix.failed(n) != null or n == 0) return false;
+    // Partly sent: the rest goes too, never again from the start.
+    if (n < msg.len) _ = os.unix.writeAll(fd, msg[n..]);
+    const deadline_ns = os.monotonicNs() + answer_ns;
     var answer: [256]u8 = undefined;
-    while (true) {
-        const r = linux.read(fd, &answer, answer.len);
-        if (linux.errno(r) == .INTR) continue;
-        if (linux.errno(r) != .SUCCESS or r == 0) break;
-    }
+    while (os.unix.readSome(fd, &answer, deadline_ns)) |got| {
+        if (got == 0) break;
+    } else |_| {}
     return true;
 }
 
 /// Sends `msg` to the request socket and reads the whole answer.
 fn talk(arena: std.mem.Allocator, msg: []const u8) ?[]const u8 {
-    const fd = connect(".socket.sock", 0) orelse return null;
+    const fd = connect(".socket.sock", .{}) orelse return null;
     defer _ = linux.close(fd);
-    // A compositor that does not answer must not freeze the window.
-    const timeout: linux.timeval = .{ .sec = 1, .usec = 0 };
-    _ = linux.setsockopt(
-        fd,
-        linux.SOL.SOCKET,
-        linux.SO.RCVTIMEO,
-        @ptrCast(&timeout),
-        @sizeOf(linux.timeval),
-    );
-    if (linux.errno(linux.write(fd, msg.ptr, msg.len)) != .SUCCESS) return null;
+    if (!os.unix.writeAll(fd, msg)) return null;
+    const deadline_ns = os.monotonicNs() + answer_ns;
     var out: std.ArrayList(u8) = .empty;
     while (true) {
         out.ensureUnusedCapacity(arena, 16 * 1024) catch return null;
-        const n = linux.read(fd, out.unusedCapacitySlice().ptr, out.unusedCapacitySlice().len);
-        if (linux.errno(n) == .INTR) continue;
-        if (linux.errno(n) != .SUCCESS) return null;
+        const n = os.unix.readSome(fd, out.unusedCapacitySlice(), deadline_ns) catch return null;
         if (n == 0) break;
         out.items.len += n;
     }
@@ -283,7 +259,7 @@ pub fn afterFocusChange(cb: *const fn () void, fallback_ms: c_uint) void {
     n_focus_cbs += 1;
     if (events_timer != 0) return; // already waiting: one event serves all
     events_len = 0;
-    if (connect(".socket2.sock", linux.SOCK.NONBLOCK)) |fd| {
+    if (connect(".socket2.sock", .{ .nonblock = true })) |fd| {
         events_fd = fd;
         events_watch = c.g_unix_fd_add(fd, c.G_IO_IN, &onEvents, null);
     }

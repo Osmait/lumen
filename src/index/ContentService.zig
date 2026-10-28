@@ -20,7 +20,7 @@ const content_list = @import("content_list.zig");
 const extract = @import("extract.zig");
 const Pool = @import("Pool.zig");
 const Service = @import("Service.zig");
-const sys = @import("sys.zig");
+const sys = @import("os");
 
 const log = std.log.scoped(.content);
 
@@ -484,7 +484,7 @@ fn refresh(s: *ContentService) void {
 
     s.building.store(true, .release);
     defer s.building.store(false, .release);
-    defer sys.trimHeap();
+    defer @import("root.zig").trimHeap();
     // Whole when there is nothing to update, or when what updates leave
     // behind (removed versions, small segments) has piled up.
     const whole = if (s.index) |*ix| blk: {

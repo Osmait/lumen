@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const index = @import("index");
-const sys = index.sys;
+const sys = @import("os");
 const store_mod = index.store;
 const content = index.content;
 

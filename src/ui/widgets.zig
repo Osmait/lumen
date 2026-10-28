@@ -8,7 +8,7 @@ const Item = item_mod.Item;
 const logos = @import("logos.zig");
 const themes = @import("themes.zig");
 const labels = @import("labels.zig");
-const index = @import("index");
+const os = @import("os");
 
 /// A small picture of a theme: its background, two lines of text and an
 /// accent dot. Made once per set of colours and kept (themes from init.lua
@@ -88,7 +88,7 @@ fn fileTexture(path: [:0]const u8, size: c_int) ?*c.GdkTexture {
     h.update(path);
     const k = h.final();
     for (Cache.keys[0..Cache.len], Cache.textures[0..Cache.len]) |ck, t| if (ck == k) return t;
-    if (!index.sys.isRegular(path.ptr)) return null;
+    if (!os.isRegular(path.ptr)) return null;
     const pb = c.gdk_pixbuf_new_from_file_at_scale(
         path.ptr,
         size * 2,
@@ -154,7 +154,7 @@ pub fn gridCell(it: Item, w: c_int) *c.GtkWidget {
     const pic_h = @divTrunc(w * 5, 8);
     var picture: ?*c.GtkWidget = null;
     // Only regular files: decoding blocks, and a FIFO would never answer.
-    if (it.image.len > 0 and index.sys.isRegular(it.image.ptr)) {
+    if (it.image.len > 0 and os.isRegular(it.image.ptr)) {
         if (c.gdk_pixbuf_new_from_file_at_scale(it.image.ptr, w, pic_h, 1, null)) |pb| {
             defer c.g_object_unref(pb);
             const tex = c.gdk_texture_new_for_pixbuf(pb);

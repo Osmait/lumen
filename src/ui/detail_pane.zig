@@ -5,6 +5,7 @@ const c = @import("c");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
 const index = @import("index");
+const os = @import("os");
 const stats = @import("../stats.zig");
 const Ui = @import("Ui.zig");
 const widgets = @import("widgets.zig");
@@ -70,7 +71,7 @@ pub fn showContentDetail(ui: *Ui, it: *const Item) void {
     const a = arena.allocator();
     c.gtk_widget_set_visible(ui.detail_picture, 0);
 
-    const info = index.sys.info(f.path);
+    const info = os.info(f.path);
     const service = ui.contents orelse return;
     const text = service.readText(
         a,
@@ -188,15 +189,15 @@ pub fn showFileDetail(ui: *Ui, it: *const Item) void {
         u8,
         std.mem.span(ct),
         "image/",
-    )) and index.sys.isRegular(f.path);
-    const info = index.sys.info(f.path);
+    )) and os.isRegular(f.path);
+    const info = os.info(f.path);
     c.gtk_widget_set_visible(ui.detail_picture, @intFromBool(image));
     if (image) showImage(ui, f.path, if (info) |i| i.mtime else 0) else forgetImage(ui);
 
     // Text preview: the head of anything that is valid UTF-8.
     var text: []const u8 = "";
     if (!image and !f.is_dir) {
-        const head = index.sys.readHead(f.path, a.alloc(u8, 4096) catch return);
+        const head = os.readHead(f.path, a.alloc(u8, 4096) catch return);
         const valid = labels.validUtf8Prefix(head);
         if (valid.len + 4 >= head.len and std.mem.findScalar(
             u8,

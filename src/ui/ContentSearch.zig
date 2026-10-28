@@ -10,6 +10,7 @@
 const std = @import("std");
 const c = @import("c");
 const index = @import("index");
+const os = @import("os");
 
 const ContentSearch = @This();
 
@@ -148,12 +149,12 @@ fn run(cs: *ContentSearch) void {
             };
         }
 
-        const t = index.sys.monotonicNs();
+        const t = os.monotonicNs();
         var hits: std.ArrayList(index.ContentService.Hit) = .empty;
         if (r.err == null) cs.service.search(a, r.query, cs.limit, &hits) catch |err| {
             r.err = err;
         };
-        r.search_ns = index.sys.monotonicNs() - t;
+        r.search_ns = os.monotonicNs() - t;
         r.hits = hits.items;
         // A newer query arrived meanwhile: this answer is already stale.
         if (cs.gen.load(.acquire) != seen) {

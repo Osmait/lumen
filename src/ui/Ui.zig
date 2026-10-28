@@ -18,6 +18,7 @@ const commands = @import("../providers/commands.zig");
 const scripts = @import("../providers/scripts.zig");
 const run = @import("../actions.zig");
 const index = @import("index");
+const os = @import("os");
 const styles = @import("styles");
 const stats = @import("../stats.zig");
 pub const ContentSearch = @import("ContentSearch.zig");
@@ -770,7 +771,7 @@ fn appendStyleCss(self: *Ui, w: *std.Io.Writer) std.Io.Writer.Error!void {
         .{ self.config_dir, name },
         0,
     ) catch return;
-    if (index.sys.info(dir) == null) {
+    if (os.info(dir) == null) {
         const s = styles.find(name) orelse return;
         try w.print("\n/* style {s} */\n", .{name});
         return w.writeAll(s.css);

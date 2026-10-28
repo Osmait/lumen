@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const core = @import("core");
-const sys = @import("index").sys;
+const sys = @import("os");
 const Kind = core.file_kind.Kind;
 
 pub const default_theme = "lumen-dark";
@@ -428,35 +428,7 @@ pub const Settings = struct {
     }
 };
 
-/// A file's identity for "did it change?": modification time to the
-/// nanosecond, size and inode (editors that save by renaming a new file).
-pub const Stamp = struct {
-    /// What no file has: the first look always counts as a change.
-    pub const none: Stamp = .{};
-
-    sec: i64 = -1,
-    nsec: u32 = 0,
-    size: u64 = 0,
-    ino: u64 = 0,
-
-    pub fn of(path: [*:0]const u8) Stamp {
-        const linux = std.os.linux;
-        var st: linux.Statx = undefined;
-        const rc = linux.statx(
-            linux.AT.FDCWD,
-            path,
-            0,
-            .{ .SIZE = true, .MTIME = true, .INO = true },
-            &st,
-        );
-        if (linux.errno(rc) != .SUCCESS) return .{};
-        return .{ .sec = st.mtime.sec, .nsec = st.mtime.nsec, .size = st.size, .ino = st.ino };
-    }
-
-    pub fn eql(a: Stamp, b: Stamp) bool {
-        return a.sec == b.sec and a.nsec == b.nsec and a.size == b.size and a.ino == b.ino;
-    }
-};
+pub const Stamp = sys.Stamp;
 
 fn parseBool(v: []const u8) ?bool {
     const yes = [_][]const u8{ "true", "on", "yes", "1" };

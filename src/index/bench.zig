@@ -8,7 +8,7 @@
 
 const std = @import("std");
 const index = @import("index");
-const sys = index.sys;
+const sys = @import("os");
 const Store = index.store.Store;
 
 pub fn main(init: std.process.Init) !void {

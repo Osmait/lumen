@@ -18,7 +18,7 @@ const engine = @import("search.zig");
 const Pool = @import("Pool.zig");
 const Watcher = @import("Watcher.zig");
 const Live = @import("Live.zig");
-const sys = @import("sys.zig");
+const sys = @import("os");
 
 const Service = @This();
 
@@ -206,7 +206,7 @@ fn rescan(s: *Service) void {
     defer {
         s.last_rescan_ns.store(sys.monotonicNs() - t0, .monotonic);
         _ = s.rescans.fetchAdd(1, .monotonic);
-        sys.trimHeap();
+        @import("root.zig").trimHeap();
     }
     const fresh = Live.prepareCompaction(s.gpa, s.scan_pool, &s.cfg, s.cache_path) catch |err| {
         log.warn("rescan: {t}", .{err});

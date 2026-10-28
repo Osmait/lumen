@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
-const sys = @import("sys.zig");
+const sys = @import("os");
 
 pub const Kind = enum { pdf, docx, xlsx, pptx, odt, ods, odp };
 
@@ -33,7 +33,7 @@ pub fn kindOf(path: []const u8) ?Kind {
     return std.meta.stringToEnum(Kind, std.ascii.lowerString(&buf, ext));
 }
 
-pub const ExtractError = Error || std.mem.Allocator.Error || std.process.SpawnError || std.process.Child.WaitError;
+pub const ExtractError = Error || std.mem.Allocator.Error || sys.child.Error;
 
 /// Extracted UTF-8 text of the document at `path` (absolute), owned by
 /// `gpa`, at most `max_bytes` long (truncated, never failing for size).
@@ -98,8 +98,7 @@ pub const Error = sys.Error || error{ ToolMissing, ToolFailed, Timeout };
 
 /// Runs `argv` with `input` as stdin and returns at most `cap` bytes of its
 /// stdout. Reaching the cap or the timeout kills the tool and keeps what was
-/// read; otherwise its exit code must be in `ok_codes`. The child is always
-/// reaped and the pipe closed (`Child.kill` is a no-op after `wait`).
+/// read; otherwise its exit code must be in `ok_codes`.
 fn runTool(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -108,64 +107,27 @@ fn runTool(
     cap: usize,
     ok_codes: []const u8,
     limit_ms: u64,
-) ![]u8 {
-    var env = std.process.Environ.Map.init(gpa);
-    defer env.deinit();
-    var child = std.process.spawn(io, .{
-        .argv = argv,
-        .environ_map = &env,
-        .stdin = .{ .file = .{ .handle = input, .flags = .{ .nonblocking = false } } },
-        .stdout = .pipe,
+) ExtractError![]u8 {
+    const r = sys.child.run(gpa, io, argv, .{
+        .stdin = .{ .fd = input },
         .stderr = .ignore,
+        .environ = .empty,
+        .max_output_bytes = cap,
+        .at_cap = .kill,
+        .deadline_ns = sys.monotonicNs() + limit_ms * std.time.ns_per_ms,
     }) catch |err| return switch (err) {
         error.FileNotFound => error.ToolMissing,
-        else => err,
+        else => |e| e,
     };
-    defer child.kill(io);
-    const out_fd = child.stdout.?.handle;
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    const deadline = sys.monotonicNs() + limit_ms * std.time.ns_per_ms;
-    const finished = while (out.items.len < cap) {
-        const now = sys.monotonicNs();
-        if (now >= deadline) break false;
-        const left_ms: i32 = @intCast(@min(
-            (deadline - now) / std.time.ns_per_ms + 1,
-            std.math.maxInt(i32),
-        ));
-        // EOF shows up as POLLHUP, then read returns 0.
-        if (!sys.waitReadable(out_fd, left_ms)) continue;
-        try out.ensureUnusedCapacity(gpa, @min(64 * 1024, cap - out.items.len));
-        const room = out.unusedCapacitySlice();
-        const n = linux.read(out_fd, room.ptr, @min(room.len, cap - out.items.len));
-        switch (linux.errno(n)) {
-            .SUCCESS => if (n == 0) break true else {
-                out.items.len += n;
-            },
-            .INTR, .AGAIN => {},
-            else => return error.Syscall,
-        }
-    } else false;
-
-    // Its output is closed, but it may live on: no waiting past the deadline
-    // for its exit either.
-    if (!finished or !sys.waitExit(child.id.?, deadline)) {
-        // Cap or timeout: stop it now, even if it ignores SIGTERM.
-        _ = linux.kill(child.id.?, .KILL);
-        child.kill(io);
-        if (out.items.len == 0) return error.Timeout;
-        return out.toOwnedSlice(gpa);
+    gpa.free(r.stderr);
+    errdefer gpa.free(r.stdout);
+    if (r.timed_out or r.capped) {
+        if (r.stdout.len == 0) return error.Timeout;
+        return r.stdout;
     }
-    switch (try child.wait(io)) {
-        .exited => |code| if (std.mem.findScalar(
-            u8,
-            ok_codes,
-            code,
-        ) == null) return error.ToolFailed,
-        else => return error.ToolFailed,
-    }
-    return out.toOwnedSlice(gpa);
+    const code = r.code orelse return error.ToolFailed;
+    if (std.mem.findScalar(u8, ok_codes, code) == null) return error.ToolFailed;
+    return r.stdout;
 }
 
 /// `s` cut to at most `max` bytes at a UTF-8 boundary, reallocated to fit.

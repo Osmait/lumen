@@ -8,7 +8,7 @@
 const std = @import("std");
 const c = @import("c");
 const Host = @import("../ext/Host.zig");
-const index = @import("index");
+const os = @import("os");
 const Ui = @import("Ui.zig");
 const ext_view = @import("ext_view.zig");
 
@@ -102,13 +102,13 @@ pub fn install(
     );
     var dbuf: [4096]u8 = undefined;
     const dir = extDir(ui, &dbuf, name) orelse return fail(ui, cmdline, "path too long", .{});
-    if (index.sys.info(dir) != null) return fail(
+    if (os.info(dir) != null) return fail(
         ui,
         cmdline,
         "{s} already exists: lumen --update {s}, or --as another name",
         .{ dir, name },
     );
-    index.sys.mkdirP(dir[0 .. std.mem.findScalarLast(u8, dir, '/') orelse dir.len]);
+    os.mkdirP(dir[0 .. std.mem.findScalarLast(u8, dir, '/') orelse dir.len]);
     var ubuf: [2048]u8 = undefined;
     const url_z = std.mem.printSentinel(&ubuf, "{s}", .{url}, 0) catch return fail(
         ui,
@@ -126,7 +126,7 @@ pub fn update(ui: *Ui, cmdline: ?*c.GApplicationCommandLine, name: ?[]const u8) 
     if (name) |n| {
         if (!Host.validId(n)) return fail(ui, cmdline, "no extension named \"{s}\"", .{n});
         const dir = extDir(ui, &dbuf, n) orelse return fail(ui, cmdline, "path too long", .{});
-        if (index.sys.info(dir) == null) return fail(
+        if (os.info(dir) == null) return fail(
             ui,
             cmdline,
             "no extension named \"{s}\"",
@@ -162,7 +162,7 @@ pub fn uninstall(ui: *Ui, cmdline: ?*c.GApplicationCommandLine, name: []const u8
     if (!Host.validId(name)) return fail(ui, cmdline, "no extension named \"{s}\"", .{name});
     var dbuf: [4096]u8 = undefined;
     const dir = extDir(ui, &dbuf, name) orelse return fail(ui, cmdline, "path too long", .{});
-    if (index.sys.info(dir) == null) return fail(
+    if (os.info(dir) == null) return fail(
         ui,
         cmdline,
         "no extension named \"{s}\"",
@@ -244,7 +244,7 @@ fn onDone(_: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) 
         .install => {
             var buf: [4200]u8 = undefined;
             const init = std.mem.printSentinel(&buf, "{s}/init.lua", .{job.dirZ()}, 0) catch "";
-            if (index.sys.info(init) == null) {
+            if (os.info(init) == null) {
                 removeTree(job.dirZ());
                 return fail(
                     ui,

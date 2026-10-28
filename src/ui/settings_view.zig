@@ -10,6 +10,7 @@ const proc = @import("../sys/proc.zig");
 const Apps = @import("../providers/Apps.zig");
 const run = @import("../actions.zig");
 const index = @import("index");
+const os = @import("os");
 const styles = @import("styles");
 const settings_mod = @import("../settings.zig");
 const ext_view = @import("ext_view.zig");
@@ -355,7 +356,7 @@ fn iconThemes(a: std.mem.Allocator) []const Option {
                 0,
             ) catch continue;
             var buf: [8192]u8 = undefined;
-            const text = index.sys.readHead(index_path.ptr, &buf);
+            const text = os.readHead(index_path.ptr, &buf);
             if (std.mem.find(u8, text, "\nDirectories=") == null) continue;
             var label: []const u8 = name;
             if (std.mem.find(u8, text, "\nName=")) |at| {
@@ -663,23 +664,7 @@ fn styleItem(
 /// The folders in ~/.config/lumen/styles, sorted.
 fn customStyles(ui: *Ui, a: std.mem.Allocator) []const [:0]const u8 {
     const path = a.printSentinel("{s}/styles", .{ui.config_dir}, 0) catch return &.{};
-    const d = c.g_dir_open(path.ptr, 0, null) orelse return &.{};
-    defer c.g_dir_close(d);
-    var names: std.ArrayList([:0]const u8) = .empty;
-    while (c.g_dir_read_name(d)) |n| {
-        const name = std.mem.span(n);
-        if (name.len == 0 or name[0] == '.' or !settings_mod.isToken(name)) continue;
-        const full = a.printSentinel("{s}/{s}", .{ path, name }, 0) catch continue;
-        const info = index.sys.info(full) orelse continue;
-        if (!info.is_dir) continue;
-        names.append(a, a.dupeSentinel(u8, name, 0) catch continue) catch continue;
-    }
-    std.mem.sort([:0]const u8, names.items, {}, struct {
-        fn lt(_: void, x: [:0]const u8, y: [:0]const u8) bool {
-            return std.mem.order(u8, x, y) == .lt;
-        }
-    }.lt);
-    return names.items;
+    return os.subdirs(a, path, settings_mod.isToken);
 }
 
 fn themeItem(ui: *Ui, a: std.mem.Allocator, t: *const themes.Theme, section: [:0]const u8) Item {
@@ -781,7 +766,7 @@ pub fn performSetting(ui: *Ui, s: item_mod.Setting, op: item_mod.Op) void {
         },
         .open_file => {
             // Write the defaults first: an empty editor helps nobody.
-            if (index.sys.info(ui.settings_path.ptr) == null) ui.saveSettings();
+            if (os.info(ui.settings_path.ptr) == null) ui.saveSettings();
             run.openFile(ui.actionCtx(), ui.settings_path, false);
             ui.hide();
         },

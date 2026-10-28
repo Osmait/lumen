@@ -17,7 +17,7 @@ const Store = store_mod.Store;
 const Builder = store_mod.Builder;
 const Pool = @import("Pool.zig");
 const Watcher = @import("Watcher.zig");
-const sys = @import("sys.zig");
+const sys = @import("os");
 
 pub const Config = struct {
     roots: []const []const u8,

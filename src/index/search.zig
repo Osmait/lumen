@@ -18,7 +18,7 @@ const store_mod = @import("store.zig");
 const Store = store_mod.Store;
 const Pool = @import("Pool.zig");
 const fine = @import("fine.zig");
-const sys = @import("sys.zig");
+const sys = @import("os");
 const fold = @import("core").fold;
 
 /// Candidates one pool task scores.

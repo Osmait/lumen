@@ -11,6 +11,9 @@
 const std = @import("std");
 const linux = std.os.linux;
 const ipc = @import("ipc.zig");
+const unix = @import("os").unix;
+const failed = unix.failed;
+const writeAll = unix.writeAll;
 
 /// Flags passed on as they are, and those taking a value.
 const plain = [_][]const u8{
@@ -81,42 +84,18 @@ fn ask(
     const head = ipc.encode(&request, spans[0..args.len]) orelse return null;
     var len = head.len;
 
-    const rc = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
-    if (failed(rc) != null) return null;
-    const fd: linux.fd_t = @intCast(rc);
-    var addr: linux.sockaddr.un = .{ .path = @splat(0) };
-    @memcpy(addr.path[0..path.len], path);
-    if (failed(linux.connect(fd, &addr, @sizeOf(linux.sockaddr.un))) != null) {
-        _ = linux.close(fd);
-        return null;
-    }
+    const fd = unix.connect(path, .{}) orelse return null;
     // From here on there is no going back to lumen-gtk: stdin is read, and
     // the daemon may have acted.
     if (with_stdin) {
+        len += unix.readAll(0, request[len..], unix.no_deadline) catch linux.exit_group(1);
         // A copy too large to keep is dropped here, as lumen-gtk would.
-        while (true) {
-            if (len == request.len) linux.exit_group(0);
-            const n = linux.read(0, request[len..].ptr, request.len - len);
-            if (failed(n)) |e| {
-                if (e == .INTR) continue;
-                linux.exit_group(1);
-            }
-            if (n == 0) break;
-            len += n;
-        }
+        if (len == request.len) linux.exit_group(0);
     }
     if (!writeAll(fd, request[0..len])) return fail("lumen: the daemon closed the connection\n");
     _ = linux.shutdown(fd, linux.SHUT.WR);
-    var got: usize = 0;
-    while (got < answer.len) {
-        const n = linux.read(fd, answer[got..].ptr, answer.len - got);
-        if (failed(n)) |e| {
-            if (e == .INTR) continue;
-            break;
-        }
-        if (n == 0) break;
-        got += n;
-    }
+    // The daemon answers when it is done, however long that takes.
+    const got = unix.readAll(fd, &answer, unix.no_deadline) catch 0;
     _ = linux.close(fd);
     if (got < 5) return fail("lumen: no answer from the daemon\n");
     const out_len = std.mem.readInt(u32, answer[1..5], .little);
@@ -155,24 +134,6 @@ fn runFull(argv: []const [*:0]const u8, envp: [*:null]const ?[*:0]const u8) nore
 fn fail(msg: []const u8) u8 {
     _ = writeAll(2, msg);
     return 1;
-}
-
-fn writeAll(fd: linux.fd_t, bytes: []const u8) bool {
-    var at: usize = 0;
-    while (at < bytes.len) {
-        const n = linux.write(fd, bytes[at..].ptr, bytes.len - at);
-        if (failed(n)) |e| {
-            if (e == .INTR) continue;
-            return false;
-        }
-        at += n;
-    }
-    return true;
-}
-
-fn failed(rc: usize) ?linux.E {
-    const e = linux.errno(rc);
-    return if (e == .SUCCESS) null else e;
 }
 
 test "what goes over the socket" {

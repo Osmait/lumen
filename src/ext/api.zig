@@ -6,10 +6,10 @@ const lua = @import("lua.zig");
 const c = lua.c;
 const Host = @import("Host.zig");
 const json = @import("json.zig");
-const exec = @import("exec.zig");
 const proc = @import("../sys/proc.zig");
 const themes = @import("../ui/themes.zig");
-const index = @import("index");
+const os = @import("os");
+const exec = os.child;
 const gtk = @import("c");
 const Settings = @import("../settings.zig").Settings;
 const layout_mod = @import("../layout.zig");
@@ -223,9 +223,9 @@ fn execFn(L: *lua.State) lua.Error!c_int {
 
     const e = extOf(L);
     // Never past the deadline of the call that runs it.
-    const deadline = @min(e.budget.deadline_ns, index.sys.monotonicNs() +| timeout_ns);
+    const deadline = @min(e.budget.deadline_ns, os.monotonicNs() +| timeout_ns);
     var r = exec.run(e.gpa(), e.io(), argv[0..n], .{
-        .stdin = stdin,
+        .stdin = .{ .bytes = stdin },
         .deadline_ns = deadline,
     }) catch |err| {
         c.lua_pushnil(L);

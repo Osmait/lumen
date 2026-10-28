@@ -9,6 +9,7 @@
 const std = @import("std");
 const c = @import("c");
 const index = @import("index");
+const os = @import("os");
 const View = @import("item.zig").View;
 
 /// The last `cap` samples, in nanoseconds.
@@ -65,7 +66,7 @@ pub var startup_ns: u64 = 0;
 pub var pending: ?struct { t0: u64, view: View, search: u64, rows: u64, is_show: bool } = null;
 
 pub fn now() u64 {
-    return index.sys.monotonicNs();
+    return os.monotonicNs();
 }
 
 /// Called after every painted frame.
@@ -127,7 +128,7 @@ pub fn report(
     });
 
     var status_buf: [4096]u8 = undefined;
-    const status = index.sys.readHead("/proc/self/status", &status_buf);
+    const status = os.readHead("/proc/self/status", &status_buf);
     const mi = mallinfo2();
     try w.print("Memory\n", .{});
     try w.print("  RSS {d:.1} MB (anon {d:.1}, files {d:.1}, shmem {d:.1})   peak {d:.1} MB   threads {s}\n", .{

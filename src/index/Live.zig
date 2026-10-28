@@ -21,7 +21,7 @@ const scan = @import("scan.zig");
 const engine = @import("search.zig");
 const Pool = @import("Pool.zig");
 const Watcher = @import("Watcher.zig");
-const sys = @import("sys.zig");
+const sys = @import("os");
 
 const log = std.log.scoped(.files);
 

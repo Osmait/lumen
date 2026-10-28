@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
-const sys = @import("sys.zig");
+const sys = @import("os");
 
 const Watcher = @This();
 

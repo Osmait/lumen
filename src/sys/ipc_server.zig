@@ -7,6 +7,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const c = @import("c");
 const ipc = @import("../ipc.zig");
+const os = @import("os");
 
 const log = std.log.scoped(.ipc);
 
@@ -87,26 +88,16 @@ fn serve(conn: linux.fd_t) void {
     )) != .SUCCESS or
         cred.uid != linux.getuid()) return;
     // The client writes everything at once; a stuck one cannot hold the
-    // main loop for long.
-    const timeout: linux.timeval = .{ .sec = 0, .usec = 500_000 };
-    _ = linux.setsockopt(
-        conn,
-        linux.SOL.SOCKET,
-        linux.SO.RCVTIMEO,
-        @ptrCast(&timeout),
-        @sizeOf(linux.timeval),
-    );
-    // Large enough for a copy; mmap'd (Lumen's malloc threshold), so only
-    // what is read is touched, and it goes back to the system after.
+    // main loop for long. Large enough for a copy; mmap'd (Lumen's malloc
+    // threshold), so only what is read is touched, and it goes back to the
+    // system after.
+    const deadline_ns = os.monotonicNs() + 500 * std.time.ns_per_ms;
     const buf = gpa.alloc(u8, ipc.max_request_bytes) catch return;
     defer gpa.free(buf);
-    var got: usize = 0;
-    while (got < buf.len) {
-        const n = linux.read(conn, buf[got..].ptr, buf.len - got);
-        if (linux.errno(n) == .INTR) continue;
-        if (linux.errno(n) != .SUCCESS or n == 0) break;
-        got += n;
-    }
+    const got = os.unix.readAll(conn, buf, deadline_ns) catch |err| {
+        log.warn("dropped a request: {t}", .{err});
+        return;
+    };
     const req = ipc.parse(buf[0..got]) orelse return;
 
     var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -120,16 +111,7 @@ fn serve(conn: linux.fd_t) void {
     var head: [5]u8 = undefined;
     head[0] = status;
     std.mem.writeInt(u32, head[1..5], @intCast(out.written().len), .little);
-    _ = writeAll(conn, &head) and writeAll(conn, out.written()) and writeAll(conn, err.written());
-}
-
-fn writeAll(fd: linux.fd_t, bytes: []const u8) bool {
-    var at: usize = 0;
-    while (at < bytes.len) {
-        const n = linux.write(fd, bytes[at..].ptr, bytes.len - at);
-        if (linux.errno(n) == .INTR) continue;
-        if (linux.errno(n) != .SUCCESS) return false;
-        at += n;
-    }
-    return true;
+    _ = os.unix.writeAll(conn, &head) and
+        os.unix.writeAll(conn, out.written()) and
+        os.unix.writeAll(conn, err.written());
 }

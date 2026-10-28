@@ -1,7 +1,12 @@
-//! The few Linux calls the index makes, straight through `std.os.linux`.
+//! The Linux calls Lumen makes itself, straight through `std.os.linux`:
+//! files, time, sockets, waiting on descriptors. No libc, so the static
+//! `lumen` client uses it too.
 
 const std = @import("std");
 const linux = std.os.linux;
+
+pub const unix = @import("unix.zig");
+pub const child = @import("child.zig");
 
 pub const Error = error{ Syscall, NotFound, Access, NotRegular, NameTooLong };
 
@@ -57,6 +62,62 @@ pub const DirIter = struct {
     }
 };
 
+/// Names of the folders directly in `path` (links to folders count), that
+/// `keep` accepts, sorted, in `a`. Hidden ones are skipped. Empty when the
+/// folder cannot be read; out of memory, the ones found so far.
+pub fn subdirs(a: std.mem.Allocator, path: [:0]const u8, keep: *const fn ([]const u8) bool) []const [:0]const u8 {
+    const fd = openDir(path) catch return &.{};
+    defer close(fd);
+    var it: DirIter = .{ .fd = fd };
+    var names: std.ArrayList([:0]const u8) = .empty;
+    while (it.next() catch null) |e| {
+        if (e.name[0] == '.' or !keep(e.name)) continue;
+        if (e.kind != Kind.dir) {
+            if (e.kind != Kind.symlink and e.kind != Kind.unknown) continue;
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const full = std.mem.printSentinel(&buf, "{s}/{s}", .{ path, e.name }, 0) catch continue;
+            const i = info(full) orelse continue;
+            if (!i.is_dir) continue;
+        }
+        names.append(a, a.dupeSentinel(u8, e.name, 0) catch break) catch break;
+    }
+    std.mem.sort([:0]const u8, names.items, {}, struct {
+        fn lt(_: void, x: [:0]const u8, y: [:0]const u8) bool {
+            return std.mem.order(u8, x, y) == .lt;
+        }
+    }.lt);
+    return names.items;
+}
+
+/// A file's identity for "did it change?": modification time to the
+/// nanosecond, size and inode (editors that save by renaming a new file).
+pub const Stamp = struct {
+    /// What no file has: the first look always counts as a change.
+    pub const none: Stamp = .{};
+
+    sec: i64 = -1,
+    nsec: u32 = 0,
+    size: u64 = 0,
+    ino: u64 = 0,
+
+    pub fn of(path: [*:0]const u8) Stamp {
+        var st: linux.Statx = undefined;
+        const rc = linux.statx(
+            linux.AT.FDCWD,
+            path,
+            0,
+            .{ .SIZE = true, .MTIME = true, .INO = true },
+            &st,
+        );
+        if (linux.errno(rc) != .SUCCESS) return .{};
+        return .{ .sec = st.mtime.sec, .nsec = st.mtime.nsec, .size = st.size, .ino = st.ino };
+    }
+
+    pub fn eql(a: Stamp, b: Stamp) bool {
+        return a.sec == b.sec and a.nsec == b.nsec and a.size == b.size and a.ino == b.ino;
+    }
+};
+
 pub const Kind = struct {
     pub const dir = linux.DT.DIR;
     pub const symlink = linux.DT.LNK;
@@ -79,15 +140,6 @@ pub fn kindOf(path: [*:0]const u8) u8 {
         linux.S.IFLNK => Kind.symlink,
         else => linux.DT.REG,
     };
-}
-
-extern fn malloc_trim(pad: usize) c_int;
-
-/// Hands freed heap back to the kernel. glibc keeps freed blocks for reuse;
-/// after a rebuild (hundreds of MB of temporary pairs) that is memory the
-/// daemon would otherwise sit on until it exits.
-pub fn trimHeap() void {
-    _ = malloc_trim(0);
 }
 
 /// True for a regular file (not a FIFO, device, socket or directory).
@@ -415,6 +467,28 @@ pub fn waitReadable(fd: i32, timeout_ms: i32) bool {
     return linux.errno(rc) == .SUCCESS and rc > 0;
 }
 
+test "subdirs: folders and links to them, sorted, filtered" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [256]u8 = undefined;
+    const root = try tmpDirPath(&tmp, &buf);
+    var pbuf: [512]u8 = undefined;
+    for ([_][]const u8{ "b", "a", ".hidden", "skip" }) |d| mkdirP(try std.mem.print(&pbuf, "{s}/{s}", .{ root, d }));
+    try writeFile(try std.mem.printSentinel(&pbuf, "{s}/file", .{root}, 0), "x");
+    var lbuf: [512]u8 = undefined;
+    _ = linux.symlink("a", try std.mem.printSentinel(&lbuf, "{s}/c", .{root}, 0));
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const root_z = try arena.allocator().dupeSentinel(u8, root, 0);
+    const names = subdirs(arena.allocator(), root_z, struct {
+        fn keep(n: []const u8) bool {
+            return !std.mem.eql(u8, n, "skip");
+        }
+    }.keep);
+    try std.testing.expectEqual(@as(usize, 3), names.len);
+    for ([_][]const u8{ "a", "b", "c" }, names) |want, got| try std.testing.expectEqualStrings(want, got);
+}
+
 test "special files are refused without blocking" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -481,4 +555,8 @@ test "Lumen's files and directories are owner-only" {
     try std.testing.expectEqual(@as(u32, 0o700), mode(
         try std.mem.printSentinel(&zbuf, "{s}", .{sub}, 0),
     ));
+}
+
+test {
+    std.testing.refAllDecls(@This());
 }

@@ -9,7 +9,7 @@ const Host = @import("../ext/Host.zig");
 const api = @import("../ext/api.zig");
 const run = @import("../actions.zig");
 const proc = @import("../sys/proc.zig");
-const index = @import("index");
+const os = @import("os");
 const themes = @import("themes.zig");
 const Ui = @import("Ui.zig");
 const form_view = @import("form_view.zig");
@@ -425,7 +425,7 @@ fn open(ui: *Ui, target: [:0]const u8) void {
         ) catch return
     else
         target;
-    const info = index.sys.info(path) orelse {
+    const info = os.info(path) orelse {
         log.warn("open {s}: no such file", .{path});
         return;
     };

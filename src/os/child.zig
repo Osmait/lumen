@@ -1,25 +1,43 @@
-//! `lumen.exec`: run a program, feed it stdin, collect its output, never
-//! wait past a deadline. Runs on the extension thread.
+//! Run a program, feed it stdin, collect its output, never wait past a
+//! deadline: `lumen.exec` for extensions, and the tools text extraction
+//! runs (pdftotext, unzip).
 
 const std = @import("std");
 const linux = std.os.linux;
-const index = @import("index");
+const os = @import("root.zig");
+
+pub const Stdin = union(enum) {
+    /// Written while the output is read, so a program that answers before
+    /// reading all its input cannot deadlock it. Empty: no stdin.
+    bytes: []const u8,
+    /// An open descriptor the program reads itself (it stays the caller's).
+    fd: i32,
+};
 
 pub const Options = struct {
-    stdin: []const u8 = "",
+    stdin: Stdin = .{ .bytes = "" },
+    stderr: enum { collect, ignore } = .collect,
     /// Monotonic ns: past it the program is killed.
     deadline_ns: u64,
-    /// Output beyond this (per stream) is dropped; the program keeps running.
-    max_output: usize = 16 << 20,
+    /// Output kept per stream. Past it the rest is dropped while the
+    /// program runs on (`drop`), or the program is killed (`kill`: a
+    /// tool whose output only grows).
+    max_output_bytes: usize = 16 << 20,
+    at_cap: enum { drop, kill } = .drop,
+    /// Lumen's environment, or none (what a tool prints must not depend
+    /// on the user's locale or settings).
+    environ: enum { inherit, empty } = .inherit,
 };
 
 /// Owned by the caller: free with `deinit`.
 pub const Result = struct {
     stdout: []u8,
     stderr: []u8,
-    /// Exit code; null when killed by a signal or the deadline.
+    /// Exit code; null when killed by a signal, the deadline or the cap.
     code: ?u8,
     timed_out: bool,
+    /// Killed at `max_output_bytes` (`at_cap = .kill`).
+    capped: bool = false,
 
     pub fn deinit(r: *Result, gpa: std.mem.Allocator) void {
         gpa.free(r.stdout);
@@ -37,11 +55,21 @@ pub fn run(
     argv: []const []const u8,
     opts: Options,
 ) Error!Result {
+    var empty_env = std.process.Environ.Map.init(gpa);
+    defer empty_env.deinit();
+    const stdin_bytes = switch (opts.stdin) {
+        .bytes => |b| b,
+        .fd => "",
+    };
     var child = try std.process.spawn(io, .{
         .argv = argv,
-        .stdin = if (opts.stdin.len > 0) .pipe else .ignore,
+        .environ_map = if (opts.environ == .empty) &empty_env else null,
+        .stdin = switch (opts.stdin) {
+            .bytes => |b| if (b.len > 0) .pipe else .ignore,
+            .fd => |fd| .{ .file = .{ .handle = fd, .flags = .{ .nonblocking = false } } },
+        },
         .stdout = .pipe,
-        .stderr = .pipe,
+        .stderr = if (opts.stderr == .collect) .pipe else .ignore,
     });
     // `kill` sends SIGTERM and waits: after a SIGKILL it only reaps.
     defer if (child.id) |pid| {
@@ -68,10 +96,11 @@ pub fn run(
     }
     var written: usize = 0;
     var out_open = true;
-    var err_open = true;
+    var err_open = opts.stderr == .collect;
     var timed_out = false;
-    while (out_open or err_open) {
-        const now = index.sys.monotonicNs();
+    var capped = false;
+    poll: while (out_open or err_open) {
+        const now = os.monotonicNs();
         if (now >= opts.deadline_ns) {
             timed_out = true;
             break;
@@ -103,15 +132,15 @@ pub fn run(
         for (fds[0..n]) |p| {
             if (p.revents == 0) continue;
             if (p.fd == stdin_fd) {
-                const rest = opts.stdin[written..];
+                const rest = stdin_bytes[written..];
                 const w = linux.write(stdin_fd, rest.ptr, rest.len);
                 switch (linux.errno(w)) {
                     .SUCCESS => written += w,
                     .AGAIN, .INTR => {},
                     // The program closed its stdin: it does not want the rest.
-                    else => written = opts.stdin.len,
+                    else => written = stdin_bytes.len,
                 }
-                if (written == opts.stdin.len) {
+                if (written == stdin_bytes.len) {
                     child.stdin.?.close(io);
                     child.stdin = null;
                     stdin_fd = -1;
@@ -126,8 +155,12 @@ pub fn run(
                 .SUCCESS => if (r == 0) {
                     if (is_out) out_open = false else err_open = false;
                 } else {
-                    const keep = @min(r, opts.max_output -| list.items.len);
+                    const keep = @min(r, opts.max_output_bytes -| list.items.len);
                     try list.appendSlice(gpa, buf[0..keep]);
+                    if (opts.at_cap == .kill and list.items.len == opts.max_output_bytes) {
+                        capped = true;
+                        break :poll;
+                    }
                 },
                 .AGAIN, .INTR => {},
                 else => return error.Syscall,
@@ -137,9 +170,9 @@ pub fn run(
 
     // Both outputs closed, but the program may live on (it closed them, or
     // a background child holds them): wait for its exit up to the deadline.
-    if (!timed_out and !index.sys.waitExit(child.id.?, opts.deadline_ns)) timed_out = true;
+    if (!timed_out and !capped and !os.waitExit(child.id.?, opts.deadline_ns)) timed_out = true;
     var code: ?u8 = null;
-    if (!timed_out) {
+    if (!timed_out and !capped) {
         if (child.wait(io)) |term| switch (term) {
             .exited => |x| code = x,
             else => {},
@@ -150,13 +183,14 @@ pub fn run(
         .stderr = try err.toOwnedSlice(gpa),
         .code = code,
         .timed_out = timed_out,
+        .capped = capped,
     };
 }
 
 const testing = std.testing;
 
 fn deadline(ms: u64) u64 {
-    return index.sys.monotonicNs() + ms * std.time.ns_per_ms;
+    return os.monotonicNs() + ms * std.time.ns_per_ms;
 }
 
 test "output, exit code and stdin" {
@@ -176,7 +210,7 @@ test "output, exit code and stdin" {
     defer testing.allocator.free(big);
     @memset(big, 'x');
     var w = try run(testing.allocator, testing.io, &.{ "wc", "-c" }, .{
-        .stdin = big,
+        .stdin = .{ .bytes = big },
         .deadline_ns = deadline(5000),
     });
     defer w.deinit(testing.allocator);
@@ -184,14 +218,14 @@ test "output, exit code and stdin" {
 }
 
 test "a program past its deadline is killed" {
-    const t0 = index.sys.monotonicNs();
+    const t0 = os.monotonicNs();
     var r = try run(testing.allocator, testing.io, &.{ "sleep", "30" }, .{
         .deadline_ns = deadline(100),
     });
     defer r.deinit(testing.allocator);
     try testing.expect(r.timed_out);
     try testing.expectEqual(@as(?u8, null), r.code);
-    try testing.expect(index.sys.monotonicNs() - t0 < 2 * std.time.ns_per_s);
+    try testing.expect(os.monotonicNs() - t0 < 2 * std.time.ns_per_s);
 }
 
 test "a program that closes its output but keeps running still times out" {
