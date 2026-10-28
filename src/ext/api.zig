@@ -37,20 +37,16 @@ pub fn install(L: *lua.State, e: *Host.Ext) void {
     c.lua_settop(L, -2);
 
     c.lua_createtable(L, 0, 16);
-    const funcs = [_]struct { [:0]const u8, c.lua_CFunction }{
-        .{ "exec", lua.wrap(execFn) },
-        .{ "notify", lua.wrap(notify) },
-        .{ "log", lua.wrap(logFn) },
-        .{ "theme", lua.wrap(theme) },
-        .{ "keymap", lua.wrap(keymap) },
-        .{ "set", lua.wrap(set) },
-        .{ "layout", lua.wrap(layout) },
-        .{ "icons", lua.wrap(icons) },
-    };
-    for (funcs) |f| {
-        c.lua_pushcclosure(L, f[1], 0);
-        c.lua_setfield(L, -2, f[0].ptr);
-    }
+    lua.setFuncs(L, &.{
+        .{ "exec", execFn },
+        .{ "notify", notify },
+        .{ "log", logFn },
+        .{ "theme", theme },
+        .{ "keymap", keymap },
+        .{ "set", set },
+        .{ "layout", layout },
+        .{ "icons", icons },
+    });
     _ = c.lua_pushstring(L, e.data.ptr);
     c.lua_setfield(L, -2, "data_dir");
     _ = c.lua_pushstring(L, e.dir.ptr);
@@ -59,23 +55,16 @@ pub fn install(L: *lua.State, e: *Host.Ext) void {
     c.lua_setfield(L, -2, "id");
 
     c.lua_createtable(L, 0, 4);
-    const kinds = [_]struct { [:0]const u8, c.lua_CFunction }{
-        .{ "open", lua.wrap(actionOpen) },
-        .{ "copy", lua.wrap(actionCopy) },
-        .{ "paste", lua.wrap(actionPaste) },
-        .{ "exec", lua.wrap(actionExec) },
-    };
-    for (kinds) |k| {
-        c.lua_pushcclosure(L, k[1], 0);
-        c.lua_setfield(L, -2, k[0].ptr);
-    }
+    lua.setFuncs(L, &.{
+        .{ "open", actionOpen },
+        .{ "copy", actionCopy },
+        .{ "paste", actionPaste },
+        .{ "exec", actionExec },
+    });
     c.lua_setfield(L, -2, "action");
 
     c.lua_createtable(L, 0, 2);
-    c.lua_pushcclosure(L, lua.wrap(jsonDecode), 0);
-    c.lua_setfield(L, -2, "decode");
-    c.lua_pushcclosure(L, lua.wrap(jsonEncode), 0);
-    c.lua_setfield(L, -2, "encode");
+    lua.setFuncs(L, &.{ .{ "decode", jsonDecode }, .{ "encode", jsonEncode } });
     c.lua_setfield(L, -2, "json");
 
     _ = c.lua_getglobal(L, "package");
@@ -331,7 +320,7 @@ fn theme(L: *lua.State) lua.Error!c_int {
         .accent = try color(L, a, "accent", null),
         .from_style = std.mem.eql(u8, e.id, "style"),
     };
-    load.themes.append(a, t) catch return lua.fail(L, "not enough memory", .{});
+    load.themes.append(a, t) catch return lua.failOom(L);
     return 0;
 }
 
@@ -378,10 +367,10 @@ fn keymap(L: *lua.State) lua.Error!c_int {
     load.keymaps.append(a, .{
         .keyval = parsed.keyval,
         .mods = parsed.mods,
-        .keys = a.dupeSentinel(u8, keys, 0) catch return lua.fail(L, "not enough memory", .{}),
-        .target = a.dupeSentinel(u8, target, 0) catch return lua.fail(L, "not enough memory", .{}),
-        .ext = a.dupeSentinel(u8, e.id, 0) catch return lua.fail(L, "not enough memory", .{}),
-    }) catch return lua.fail(L, "not enough memory", .{});
+        .keys = a.dupeSentinel(u8, keys, 0) catch return lua.failOom(L),
+        .target = a.dupeSentinel(u8, target, 0) catch return lua.failOom(L),
+        .ext = a.dupeSentinel(u8, e.id, 0) catch return lua.failOom(L),
+    }) catch return lua.failOom(L);
     return 0;
 }
 
@@ -457,13 +446,9 @@ fn set(L: *lua.State) lua.Error!c_int {
         // A style's settings are defaults for when it is chosen; init.lua's fix them.
         const list = if (std.mem.eql(u8, e.id, "style")) &load.style_settings else &load.settings;
         list.append(a, .{
-            .key = a.dupeSentinel(u8, key, 0) catch return lua.fail(L, "not enough memory", .{}),
-            .value = a.dupeSentinel(u8, value, 0) catch return lua.fail(
-                L,
-                "not enough memory",
-                .{},
-            ),
-        }) catch return lua.fail(L, "not enough memory", .{});
+            .key = a.dupeSentinel(u8, key, 0) catch return lua.failOom(L),
+            .value = a.dupeSentinel(u8, value, 0) catch return lua.failOom(L),
+        }) catch return lua.failOom(L);
         c.lua_settop(L, -2);
     }
     return 0;
@@ -531,7 +516,7 @@ fn layout(L: *lua.State) lua.Error!c_int {
                 u8,
                 p[0..@min(p.len, 64)],
                 0,
-            ) catch return lua.fail(L, "not enough memory", .{});
+            ) catch return lua.failOom(L);
             if (key[1] == 'r') l.prompt = text else l.placeholder = text;
         } else if (std.mem.eql(u8, key, "show")) {
             if (c.lua_type(L, -1) != c.LUA_TTABLE) return lua.fail(
@@ -623,10 +608,10 @@ fn icons(L: *lua.State) lua.Error!c_int {
         else
             a.dupeSentinel(u8, key, 0);
         load.icons.append(a, .{
-            .key = full catch return lua.fail(L, "not enough memory", .{}),
+            .key = full catch return lua.failOom(L),
             .icon = icon,
         }) catch
-            return lua.fail(L, "not enough memory", .{});
+            return lua.failOom(L);
         c.lua_settop(L, -2);
     }
     return 0;

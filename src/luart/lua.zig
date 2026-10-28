@@ -212,6 +212,35 @@ pub fn raise(L: *State, comptime fmt: []const u8, args: anytype) noreturn {
     unreachable;
 }
 
+pub const Fn = struct { [:0]const u8, (fn (*State) Error!c_int) };
+
+/// Sets each function, wrapped (`wrap`), as a field of the table on top.
+pub fn setFuncs(L: *State, comptime fns: []const Fn) void {
+    inline for (fns) |f| {
+        c.lua_pushcclosure(L, wrap(f[1]), 0);
+        c.lua_setfield(L, -2, f[0].ptr);
+    }
+}
+
+/// Pushes element `i` (1-based) of the list at `list` and returns its
+/// absolute index; raises unless it is a table (`where` names it).
+pub fn tableAt(L: *State, list: c_int, i: usize, where: []const u8) c_int {
+    if (c.lua_rawgeti(L, list, @intCast(i)) != c.LUA_TTABLE)
+        raise(L, "{s}: table expected, got {s}", .{ where, typeName(L, -1) });
+    return c.lua_gettop(L);
+}
+
+/// Raises Lua's own "not enough memory", for a Zig allocation that failed
+/// inside a protected call.
+pub fn oom(L: *State) noreturn {
+    raise(L, "not enough memory", .{});
+}
+
+/// `oom` for a function Lua calls: pushes the message, for `wrap` to raise.
+pub fn failOom(L: *State) Error {
+    return fail(L, "not enough memory", .{});
+}
+
 pub fn typeName(L: *State, idx: c_int) []const u8 {
     return std.mem.span(c.lua_typename(L, c.lua_type(L, idx)));
 }

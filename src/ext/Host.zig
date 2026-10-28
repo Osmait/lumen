@@ -232,6 +232,21 @@ pub const Ext = struct {
     pub fn io(e: *Ext) std.Io {
         return e.host.io;
     }
+
+    /// Runs `handler` in this state, protected, with `budget_ns` to finish
+    /// (the instruction hook stops it past that). Its error, or null.
+    fn run(
+        e: *Ext,
+        a: std.mem.Allocator,
+        budget_ns: u64,
+        comptime T: type,
+        ctx: *T,
+        comptime handler: fn (*lua.State, *T) void,
+    ) ?[:0]const u8 {
+        e.budget.deadline_ns = os.monotonicNs() + budget_ns;
+        defer e.budget.deadline_ns = std.math.maxInt(u64);
+        return lua.protect(e.L, a, T, ctx, handler);
+    }
 };
 
 const c_noref = lua.c.LUA_NOREF;
@@ -703,7 +718,6 @@ fn loadSource(
         load.style_settings.items.len,
     };
     e.load = load;
-    e.budget.deadline_ns = os.monotonicNs() + load_budget_ns;
     var ctx: LoadCtx = .{
         .e = e,
         .load = load,
@@ -711,9 +725,8 @@ fn loadSource(
         .source = source,
         .ext_index = @intCast(h.exts.items.len),
     };
-    const err = lua.protect(e.L, load.a, LoadCtx, &ctx, LoadCtx.run);
+    const err = e.run(load.a, load_budget_ns, LoadCtx, &ctx, LoadCtx.run);
     e.load = null;
-    e.budget.deadline_ns = std.math.maxInt(u64);
     if (err == null) if (h.exts.append(h.gpa, e)) {
         if (!std.mem.eql(
             u8,
@@ -790,9 +803,7 @@ fn parseExtension(L: *lua.State, ctx: *LoadCtx, t: c_int) void {
         for (1..n + 1) |i| {
             var where_buf: [32]u8 = undefined;
             const where = std.mem.print(&where_buf, "preferences[{d}]", .{i}) catch "preferences";
-            if (lua.c.lua_rawgeti(L, prefs, @intCast(i)) != lua.c.LUA_TTABLE)
-                lua.raise(L, "{s}: table expected, got {s}", .{ where, lua.typeName(L, -1) });
-            const pref = parseField(L, ctx, lua.absIndex(L, -1), where, title);
+            const pref = parseField(L, ctx, lua.tableAt(L, prefs, i, where), where, title);
             for (ctx.load.prefs.items) |p| if (std.mem.eql(u8, p.ext, ctx.e.id) and std.mem.eql(
                 u8,
                 p.name,
@@ -802,7 +813,7 @@ fn parseExtension(L: *lua.State, ctx: *LoadCtx, t: c_int) void {
                 "two preferences named \"{s}\"",
                 .{pref.name},
             );
-            ctx.load.prefs.append(ctx.load.a, pref) catch lua.raise(L, "not enough memory", .{});
+            ctx.load.prefs.append(ctx.load.a, pref) catch lua.oom(L);
             lua.c.lua_settop(L, -2);
         }
     } else if (lua.c.lua_type(L, -1) != lua.c.LUA_TNIL) lua.raise(
@@ -823,9 +834,7 @@ fn parseExtension(L: *lua.State, ctx: *LoadCtx, t: c_int) void {
     for (1..n + 1) |i| {
         var where_buf: [32]u8 = undefined;
         const where = std.mem.print(&where_buf, "commands[{d}]", .{i}) catch "commands";
-        if (lua.c.lua_rawgeti(L, cmds, @intCast(i)) != lua.c.LUA_TTABLE)
-            lua.raise(L, "{s}: table expected, got {s}", .{ where, lua.typeName(L, -1) });
-        parseCommand(L, ctx, lua.absIndex(L, -1), where, title, default_icon);
+        parseCommand(L, ctx, lua.tableAt(L, cmds, i, where), where, title, default_icon);
         lua.c.lua_settop(L, -2);
     }
     lua.c.lua_settop(L, -2);
@@ -864,7 +873,7 @@ fn parseField(
             "{s}/preferences.json",
             .{ctx.e.data},
             0,
-        ) catch lua.raise(L, "not enough memory", .{}),
+        ) catch lua.oom(L),
         .name = name,
         .title = lua.fieldString(L, a, t, "title", where) orelse name,
         .description = lua.fieldString(L, a, t, "description", where) orelse "",
@@ -881,12 +890,12 @@ fn parseField(
         const choice_list = lua.absIndex(L, -1);
         const n = lua.c.lua_rawlen(L, choice_list);
         if (n == 0) lua.raise(L, "{s}.choices is empty", .{where});
-        const choices = a.alloc(PrefChoice, n) catch lua.raise(L, "not enough memory", .{});
+        const choices = a.alloc(PrefChoice, n) catch lua.oom(L);
         for (choices, 1..) |*ch, i| {
             _ = lua.c.lua_rawgeti(L, choice_list, @intCast(i));
             defer lua.c.lua_settop(L, -2);
             if (lua.toSlice(L, -1)) |s| {
-                const v = a.dupeSentinel(u8, s, 0) catch lua.raise(L, "not enough memory", .{});
+                const v = a.dupeSentinel(u8, s, 0) catch lua.oom(L);
                 ch.* = .{ .value = v, .label = v };
             } else if (lua.c.lua_type(L, -1) == lua.c.LUA_TTABLE) {
                 const v = lua.fieldString(L, a, -1, "value", where) orelse lua.raise(
@@ -936,7 +945,7 @@ fn parseCommand(
         "{s}.{s}",
         .{ ctx.e.id, name },
         0,
-    ) catch lua.raise(L, "not enough memory", .{});
+    ) catch lua.oom(L);
     for (ctx.load.commands.items) |cmd| if (std.mem.eql(u8, cmd.id, id)) lua.raise(
         L,
         "two commands named \"{s}\"",
@@ -993,16 +1002,11 @@ fn parseCommand(
         const list_idx = lua.absIndex(L, -1);
         const n = lua.c.lua_rawlen(L, list_idx);
         if (n == 0 or n > 20) lua.raise(L, "{s}.fields: 1 to 20 fields", .{where});
-        const out = a.alloc(Pref, n) catch lua.raise(L, "not enough memory", .{});
+        const out = a.alloc(Pref, n) catch lua.oom(L);
         for (out, 1..) |*f, i| {
             var wbuf: [48]u8 = undefined;
             const fwhere = std.mem.print(&wbuf, "{s}.fields[{d}]", .{ where, i }) catch where;
-            if (lua.c.lua_rawgeti(L, list_idx, @intCast(i)) != lua.c.LUA_TTABLE) lua.raise(
-                L,
-                "{s}: table expected",
-                .{fwhere},
-            );
-            f.* = parseField(L, ctx, lua.absIndex(L, -1), fwhere, ext_title);
+            f.* = parseField(L, ctx, lua.tableAt(L, list_idx, i, fwhere), fwhere, ext_title);
             lua.c.lua_settop(L, -2);
             for (out[0 .. i - 1]) |prev| if (std.mem.eql(u8, prev.name, f.name)) lua.raise(
                 L,
@@ -1049,8 +1053,8 @@ fn parseCommand(
         .ref = r,
         .mode = cmd.mode,
         .root = has_root,
-    }) catch lua.raise(L, "not enough memory", .{});
-    ctx.load.commands.append(a, cmd) catch lua.raise(L, "not enough memory", .{});
+    }) catch lua.oom(L);
+    ctx.load.commands.append(a, cmd) catch lua.oom(L);
 }
 
 /// `keywords`: a string, or a list of strings joined with spaces.
@@ -1058,11 +1062,7 @@ fn keywords(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8) []
     defer lua.c.lua_settop(L, -2);
     switch (lua.getField(L, t, "keywords")) {
         lua.c.LUA_TNIL => return "",
-        lua.c.LUA_TSTRING => return a.dupe(u8, lua.toSlice(L, -1).?) catch lua.raise(
-            L,
-            "not enough memory",
-            .{},
-        ),
+        lua.c.LUA_TSTRING => return a.dupe(u8, lua.toSlice(L, -1).?) catch lua.oom(L),
         lua.c.LUA_TTABLE => {
             var out: std.ArrayList(u8) = .empty;
             const n = lua.c.lua_rawlen(L, -1);
@@ -1074,12 +1074,8 @@ fn keywords(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8) []
                     "{s}.keywords[{d}]: string expected",
                     .{ where, i },
                 );
-                if (out.items.len > 0) out.append(a, ' ') catch lua.raise(
-                    L,
-                    "not enough memory",
-                    .{},
-                );
-                out.appendSlice(a, s) catch lua.raise(L, "not enough memory", .{});
+                if (out.items.len > 0) out.append(a, ' ') catch lua.oom(L);
+                out.appendSlice(a, s) catch lua.oom(L);
             }
             return out.items;
         },
@@ -1108,7 +1104,7 @@ pub fn parseIcon(
             const copy = (if (std.mem.startsWith(u8, s, "~/"))
                 a.printSentinel("{s}/{s}", .{ std.mem.span(c.g_get_home_dir()), s[2..] }, 0)
             else
-                a.dupeSentinel(u8, s, 0)) catch lua.raise(L, "not enough memory", .{});
+                a.dupeSentinel(u8, s, 0)) catch lua.oom(L);
             if (s.len > 0 and s.len <= 32 and s[0] >= 0x80) return .{ .emoji = copy };
             return .byName(copy);
         },
@@ -1137,6 +1133,16 @@ pub fn parseIcon(
 
 // ----------------------------------------------------------------- list
 
+/// What a request for a command of the registry before a reload gets.
+const reloaded = "Extensions were reloaded";
+
+/// The command a request names; null when the extensions were reloaded
+/// since (the request is for a registry that is gone).
+fn requested(h: *Host, registry: u32, command: u16) ?*WorkerCommand {
+    if (registry != h.registry_gen or command >= h.wcmds.len) return null;
+    return &h.wcmds[command];
+}
+
 fn doList(h: *Host, req: ListReq, query: []const u8) void {
     const res = h.gpa.create(ListResult) catch return log.warn(
         "list: out of memory, no answer",
@@ -1146,16 +1152,13 @@ fn doList(h: *Host, req: ListReq, query: []const u8) void {
     const a = res.arena.allocator();
     res.query = a.dupe(u8, query) catch "";
     defer h.deliver(.{ .list = res });
-    if (req.registry != h.registry_gen or req.command >= h.wcmds.len) {
-        res.err = "Extensions were reloaded";
+    const wc = h.requested(req.registry, req.command) orelse {
+        res.err = reloaded;
         return;
-    }
-    const wc = &h.wcmds[req.command];
+    };
     const e = h.exts.items[wc.ext];
-    e.budget.deadline_ns = os.monotonicNs() + list_budget_ns;
-    defer e.budget.deadline_ns = std.math.maxInt(u64);
     var ctx: ListCtx = .{ .e = e, .wc = wc, .req = req, .res = res, .query = query };
-    res.err = lua.protect(e.L, a, ListCtx, &ctx, ListCtx.run);
+    res.err = e.run(a, list_budget_ns, ListCtx, &ctx, ListCtx.run);
 }
 
 const ListCtx = struct {
@@ -1222,7 +1225,7 @@ fn parseItems(
     limit: usize,
 ) []Item {
     const n = @min(lua.c.lua_rawlen(L, list_idx), limit);
-    const items = a.alloc(Item, n) catch lua.raise(L, "not enough memory", .{});
+    const items = a.alloc(Item, n) catch lua.oom(L);
     for (items, 1..) |*it, i| {
         var where_buf: [24]u8 = undefined;
         const where = std.mem.print(&where_buf, "items[{d}]", .{i}) catch "items";
@@ -1244,7 +1247,7 @@ fn parseItem(
 ) Item {
     // A plain string is a row with that title.
     if (lua.toSlice(L, t)) |s| {
-        const title = a.dupeSentinel(u8, s, 0) catch lua.raise(L, "not enough memory", .{});
+        const title = a.dupeSentinel(u8, s, 0) catch lua.oom(L);
         return .{ .key = key(L, a, ext_id, title), .title = title, .action = .{
             .ext_item = defaultActions(a, L, origin, pos, title),
         } };
@@ -1275,7 +1278,7 @@ fn parseItem(
     lua.c.lua_settop(L, -2);
     if (lua.fieldString(L, a, t, "markdown", where)) |md| {
         var out: std.Io.Writer.Allocating = .init(a);
-        core.markdown.toMarkup(&out.writer, md) catch lua.raise(L, "not enough memory", .{});
+        core.markdown.toMarkup(&out.writer, md) catch lua.oom(L);
         it.detail = out.written();
         it.markup = true;
     }
@@ -1295,19 +1298,13 @@ fn parseItem(
     );
     const n = @min(lua.c.lua_rawlen(L, acts_idx), max_actions);
     if (n == 0) lua.raise(L, "{s}.actions is empty", .{where});
-    const actions = a.alloc(item_mod.ExtAction, n) catch lua.raise(L, "not enough memory", .{});
-    const entries = a.alloc(item_mod.Entry, n) catch lua.raise(L, "not enough memory", .{});
+    const actions = a.alloc(item_mod.ExtAction, n) catch lua.oom(L);
+    const entries = a.alloc(item_mod.Entry, n) catch lua.oom(L);
     for (actions, entries, 0..) |*act_out, *entry, j| {
         var wbuf: [48]u8 = undefined;
         const awhere = std.mem.print(&wbuf, "{s}.actions[{d}]", .{ where, j + 1 }) catch where;
-        _ = lua.c.lua_rawgeti(L, acts_idx, @intCast(j + 1));
+        const at = lua.tableAt(L, acts_idx, j + 1, awhere);
         defer lua.c.lua_settop(L, -2);
-        const at = lua.absIndex(L, -1);
-        if (lua.c.lua_type(L, at) != lua.c.LUA_TTABLE) lua.raise(
-            L,
-            "{s}: table expected, got {s}",
-            .{ awhere, lua.typeName(L, at) },
-        );
         const parsed = parseAction(L, a, at, awhere);
         act_out.* = parsed.action;
         entry.* = .{ .label = parsed.label, .keys = keysFor(j), .op = .ext, .index = @intCast(j) };
@@ -1344,17 +1341,12 @@ fn metadata(
     }
     const pairs = lua.absIndex(L, -1);
     const n = @min(lua.c.lua_rawlen(L, pairs), max_meta);
-    const out = a.alloc(item_mod.Meta, n) catch lua.raise(L, "not enough memory", .{});
+    const out = a.alloc(item_mod.Meta, n) catch lua.oom(L);
     for (out, 1..) |*m, i| {
         var wbuf: [48]u8 = undefined;
         const mwhere = std.mem.print(&wbuf, "{s}.metadata[{d}]", .{ where, i }) catch where;
-        if (lua.c.lua_rawgeti(L, pairs, @intCast(i)) != lua.c.LUA_TTABLE) lua.raise(
-            L,
-            "{s}: table expected",
-            .{mwhere},
-        );
+        const pair = lua.tableAt(L, pairs, i, mwhere);
         defer lua.c.lua_settop(L, -2);
-        const pair = lua.absIndex(L, -1);
         m.* = .{
             .label = lua.fieldString(
                 L,
@@ -1390,11 +1382,7 @@ fn pairPart(
         lua.c.LUA_TSTRING, lua.c.LUA_TNUMBER => blk: {
             var len: usize = 0;
             const p = lua.c.lua_tolstring(L, -1, &len);
-            break :blk a.dupeSentinel(u8, p[0..len], 0) catch lua.raise(
-                L,
-                "not enough memory",
-                .{},
-            );
+            break :blk a.dupeSentinel(u8, p[0..len], 0) catch lua.oom(L);
         },
         else => lua.raise(L, "{s}: {{ label, value }} expected", .{where}),
     };
@@ -1402,7 +1390,7 @@ fn pairPart(
 
 /// Raises when out of memory: an empty key would merge rows' rankings.
 fn key(L: *lua.State, a: std.mem.Allocator, ext_id: []const u8, id: []const u8) []const u8 {
-    return a.print("x:{s}:{s}", .{ ext_id, id }) catch lua.raise(L, "not enough memory", .{});
+    return a.print("x:{s}:{s}", .{ ext_id, id }) catch lua.oom(L);
 }
 
 fn keysFor(j: usize) [:0]const u8 {
@@ -1424,12 +1412,12 @@ fn defaultActions(
     const actions = a.dupe(
         item_mod.ExtAction,
         &.{.{ .copy = title }},
-    ) catch lua.raise(L, "not enough memory", .{});
+    ) catch lua.oom(L);
     const entries = a.dupe(item_mod.Entry, &.{.{
         .label = "Copy to Clipboard",
         .keys = "↵",
         .op = .ext,
-    }}) catch lua.raise(L, "not enough memory", .{});
+    }}) catch lua.oom(L);
     return .{
         .command = origin.command,
         .root = origin.root,
@@ -1484,7 +1472,7 @@ fn parseAction(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8)
         defer lua.c.lua_settop(L, -2);
         const n = lua.c.lua_rawlen(L, -1);
         if (n == 0 or n > 32) lua.raise(L, "{s}.argv: 1 to 32 strings expected", .{where});
-        const argv = a.alloc([:0]const u8, n) catch lua.raise(L, "not enough memory", .{});
+        const argv = a.alloc([:0]const u8, n) catch lua.oom(L);
         for (argv, 1..) |*arg, i| {
             _ = lua.c.lua_rawgeti(L, -1, @intCast(i));
             defer lua.c.lua_settop(L, -2);
@@ -1493,7 +1481,7 @@ fn parseAction(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8)
                 "{s}.argv[{d}]: string expected",
                 .{ where, i },
             );
-            arg.* = a.dupeSentinel(u8, s, 0) catch lua.raise(L, "not enough memory", .{});
+            arg.* = a.dupeSentinel(u8, s, 0) catch lua.oom(L);
         }
         return .{ .action = .{ .exec = argv }, .label = title orelse "Run" };
     }
@@ -1518,8 +1506,6 @@ fn doRoot(h: *Host, req: RootReq, query: []const u8) void {
         // A newer query came in: this one is already stale.
         if (h.rootSuperseded()) break;
         const e = h.exts.items[wc.ext];
-        e.budget.deadline_ns = os.monotonicNs() + root_budget_ns;
-        defer e.budget.deadline_ns = std.math.maxInt(u64);
         var ctx: RootCtx = .{
             .e = e,
             .wc = wc,
@@ -1528,7 +1514,7 @@ fn doRoot(h: *Host, req: RootReq, query: []const u8) void {
             .query = query,
             .a = a,
         };
-        if (lua.protect(e.L, a, RootCtx, &ctx, RootCtx.run)) |err| {
+        if (e.run(a, root_budget_ns, RootCtx, &ctx, RootCtx.run)) |err| {
             // One provider failing must not hide the others' rows.
             log.warn("{s}: root search: {s}", .{ e.id, err });
             continue;
@@ -1592,16 +1578,13 @@ fn doSubmit(h: *Host, req: *SubmitReq) void {
     );
     res.* = .{ .gen = req.gen, .arena = .init(h.gpa) };
     defer h.deliver(.{ .act = res });
-    if (req.registry != h.registry_gen or req.command >= h.wcmds.len) {
-        res.err = "Extensions were reloaded";
+    const wc = h.requested(req.registry, req.command) orelse {
+        res.err = reloaded;
         return;
-    }
-    const wc = &h.wcmds[req.command];
+    };
     const e = h.exts.items[wc.ext];
-    e.budget.deadline_ns = os.monotonicNs() + act_budget_ns;
-    defer e.budget.deadline_ns = std.math.maxInt(u64);
     var ctx: SubmitCtx = .{ .wc = wc, .req = req, .res = res };
-    res.err = lua.protect(e.L, res.arena.allocator(), SubmitCtx, &ctx, SubmitCtx.run);
+    res.err = e.run(res.arena.allocator(), act_budget_ns, SubmitCtx, &ctx, SubmitCtx.run);
 }
 
 const SubmitCtx = struct {
@@ -1657,16 +1640,13 @@ fn doAct(h: *Host, req: ActReq) void {
     );
     res.* = .{ .gen = req.gen, .arena = .init(h.gpa) };
     defer h.deliver(.{ .act = res });
-    if (req.registry != h.registry_gen or req.command >= h.wcmds.len) {
-        res.err = "Extensions were reloaded";
+    const wc = h.requested(req.registry, req.command) orelse {
+        res.err = reloaded;
         return;
-    }
-    const wc = &h.wcmds[req.command];
+    };
     const e = h.exts.items[wc.ext];
-    e.budget.deadline_ns = os.monotonicNs() + act_budget_ns;
-    defer e.budget.deadline_ns = std.math.maxInt(u64);
     var ctx: ActCtx = .{ .e = e, .wc = wc, .req = req, .res = res };
-    res.err = lua.protect(e.L, res.arena.allocator(), ActCtx, &ctx, ActCtx.run);
+    res.err = e.run(res.arena.allocator(), act_budget_ns, ActCtx, &ctx, ActCtx.run);
 }
 
 const ActCtx = struct {
