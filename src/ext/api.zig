@@ -2,10 +2,10 @@
 //! EXTENSIONS.md documents it; keep the two in step.
 
 const std = @import("std");
-const lua = @import("lua.zig");
+const lua = @import("luart").lua;
 const c = lua.c;
 const Host = @import("Host.zig");
-const json = @import("json.zig");
+const json = @import("luart").json;
 const proc = @import("../sys/proc.zig");
 const themes = @import("../ui/themes.zig");
 const os = @import("os");

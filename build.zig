@@ -7,9 +7,11 @@
 //!          -> core, os
 //!   c      hand-written GLib/GIO/GTK4/gtk4-layer-shell bindings
 //!   sqlite SQLite through translate-c
-//!   lua    Lua 5.4 through translate-c (extensions and init.lua)
+//!   lua    Lua 5.4 through translate-c
+//!   luart  Lua for extensions: the C API with longjmp-safe rules, JSON
+//!          -> lua, os
 //!   main   the daemon: providers, actions, extensions and the window
-//!          -> core, os, index, c, sqlite, lua (the lumen-gtk executable)
+//!          -> core, os, index, c, sqlite, luart (the lumen-gtk executable)
 //!   client `lumen`, what the shortcut runs: passes its arguments to the
 //!          daemon over a socket, or runs lumen-gtk (no GTK, no libc)
 
@@ -98,7 +100,15 @@ pub fn build(b: *std.Build) void {
     mod.addImport("index", index);
     mod.addImport("c", c_mod);
     mod.addImport("sqlite", sqlite.createModule());
-    mod.addImport("lua", lua.createModule());
+    const luart = b.createModule(.{
+        .root_source_file = b.path("src/luart/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    luart.addImport("lua", lua.createModule());
+    luart.addImport("os", os);
+    mod.addImport("luart", luart);
     // The styles in examples/styles, built in (Change Theme > Styles).
     mod.addImport("styles", b.createModule(.{
         .root_source_file = b.path("examples/styles/styles.zig"),
@@ -192,7 +202,7 @@ pub fn build(b: *std.Build) void {
     b.step("e2e", "End-to-end tests against an isolated instance").dependOn(&e2e_run.step);
 
     const test_step = b.step("test", "Run unit tests");
-    for ([_]*std.Build.Module{ core, os, index, mod, client }) |m| {
+    for ([_]*std.Build.Module{ core, os, index, luart, mod, client }) |m| {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     }
 }

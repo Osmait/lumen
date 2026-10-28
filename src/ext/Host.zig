@@ -13,7 +13,7 @@
 
 const std = @import("std");
 const c = @import("c");
-const lua = @import("lua.zig");
+const lua = @import("luart").lua;
 const api = @import("api.zig");
 const os = @import("os");
 const core = @import("core");

@@ -24,17 +24,24 @@ daemon's open database.
 src/main.zig      entry point: GApplication, command line, clipboard watcher
 src/client.zig    `lumen`: arguments to the daemon over a socket, else lumen-gtk
 src/ipc.zig       the socket's path and messages (shared by both)
+src/cli.zig       the command-line flags: what the client passes on, what
+                  needs a daemon, the usage text (shared by both)
 src/core/         pure logic, unit tested: fuzzy matching, accent folding,
-                  calculator and units, frecency, window geometry, script headers
-src/index/        file index (std + Linux syscalls only): store, scan, search,
-                  live updates, service; content index: content, content_list,
-                  extract, ContentService
+                  calculator and units, frecency, window geometry, script
+                  headers, UTF-8 cuts
+src/os/           the Linux calls Lumen makes itself (std only, no libc, so
+                  the client uses it too): files, sockets with deadlines
+                  (unix.zig), programs run to a deadline (child.zig)
+src/index/        file index (std + os): store, scan, search, live updates,
+                  service; content index: content, content_list, extract,
+                  ContentService
 src/sys/          SQLite store (Db.zig), process spawning (GLib), hyprctl,
                   the daemon's end of the socket (ipc_server.zig)
 src/providers/    apps (GIO), built-in commands, script commands
-src/ext/          Lua extensions: lua.zig (the C API and its rules), Host.zig
-                  (the worker thread and the registry), api.zig (the `lumen`
-                  module), exec.zig, json.zig
+src/luart/        Lua 5.4 as a library: lua.zig (the C API and its rules),
+                  json.zig (both ways)
+src/ext/          Lua extensions: Host.zig (the worker thread and the
+                  registry), api.zig (the `lumen` module)
 src/ui/           the window: Ui.zig (state and flow), widgets, labels,
                   settings_view, file_results, detail_pane, backdrop, keyboard,
                   ext_view (extensions in the window), prefs_view (their
@@ -166,7 +173,7 @@ directory (2.8 s cold) and every core.
   posting lists. Building dedups each file's trigrams with a 16M-bit map and
   radix-sorts (trigram, doc) pairs, closing a segment every 4 M pairs so
   memory stays bounded, and writes the file as segments close
-  (`sys.AtomicFile`: a temporary file, the header patched in last, fsync,
+  (`os.AtomicFile`: a temporary file, the header patched in last, fsync,
   rename), so the finished index is never whole in the heap; an update
   copies the old segments from their mapping straight to the file. On 49 k
   documents the build peaked at 585 MB with 16 M-pair segments, built in

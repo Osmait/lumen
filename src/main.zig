@@ -597,8 +597,6 @@ test {
 test {
     _ = @import("ui/logos.zig");
     _ = @import("cli.zig");
-    _ = @import("ext/lua.zig");
-    _ = @import("ext/json.zig");
     _ = @import("ext/api.zig");
     _ = @import("ext/Host.zig");
     _ = @import("ui/ext_view.zig");
