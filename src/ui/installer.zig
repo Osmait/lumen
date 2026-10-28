@@ -9,6 +9,7 @@ const std = @import("std");
 const c = @import("c");
 const Host = @import("../ext/Host.zig");
 const os = @import("os");
+const core = @import("core");
 const Ui = @import("Ui.zig");
 const ext_view = @import("ext_view.zig");
 
@@ -22,16 +23,15 @@ const Job = struct {
     cmdline: ?*c.GApplicationCommandLine,
     sp: *c.GSubprocess,
     kind: Kind,
-    name: [64]u8 = undefined,
-    name_len: usize = 0,
-    dir: [4096]u8 = undefined,
-    dir_len: usize = 0,
+    name: core.FixedStr(64) = .{},
+    /// What removeTree deletes on failure: whole, never cut (see `start`).
+    dir: core.FixedStr(4096) = .{},
 
     fn nameSlice(j: *const Job) []const u8 {
-        return j.name[0..j.name_len];
+        return j.name.slice();
     }
     fn dirZ(j: *Job) [:0]const u8 {
-        return j.dir[0..j.dir_len :0];
+        return j.dir.slice();
     }
 };
 
@@ -78,12 +78,9 @@ fn fail(
 /// now and again once the extensions have reloaded.
 fn note(ui: *Ui, msg: []const u8) void {
     const line = std.mem.trim(u8, msg[0 .. std.mem.findScalar(u8, msg, '\n') orelse msg.len], " ");
-    const n = @min(line.len, ui.after_reload.len);
-    @memcpy(ui.after_reload[0..n], line[0..n]);
-    ui.after_reload[n] = 0;
-    ui.after_reload_len = n;
+    ui.after_reload.set(line);
     ui.after_reload_pending = true;
-    ui.showFailure(ui.after_reload[0..n :0]);
+    ui.showFailure(ui.after_reload.slice());
 }
 
 pub fn install(
@@ -201,11 +198,10 @@ fn start(
         .sp = sp,
         .kind = kind,
     };
-    job.name_len = @min(name.len, job.name.len);
-    @memcpy(job.name[0..job.name_len], name[0..job.name_len]);
-    job.dir_len = @min(dir.len, job.dir.len - 1);
-    @memcpy(job.dir[0..job.dir_len], dir[0..job.dir_len]);
-    job.dir[job.dir_len] = 0;
+    job.name.set(name);
+    // extDir builds it in a buffer of this size: it always fits.
+    std.debug.assert(dir.len <= @TypeOf(job.dir).capacity);
+    job.dir.set(dir);
     c.g_subprocess_communicate_utf8_async(sp, null, null, &onDone, job);
 }
 

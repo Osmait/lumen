@@ -123,7 +123,7 @@ fn onRegistry(reg: *Host.Registry, ctx: ?*anyopaque) void {
     // What an update or removal from Settings said, over the rebuilt rows.
     if (ui.after_reload_pending) {
         ui.after_reload_pending = false;
-        ui.showFailure(ui.after_reload[0..ui.after_reload_len :0]);
+        ui.showFailure(ui.after_reload.slice());
     }
 }
 
@@ -171,15 +171,9 @@ pub fn addRootSections(ui: *Ui, q: []const u8) void {
         }
         return;
     };
-    const asked = ui.ext_root_pending and std.mem.eql(
-        u8,
-        ui.ext_root_asked[0..ui.ext_root_asked_len],
-        q,
-    );
+    const asked = ui.ext_root_pending and ui.ext_root_asked.eql(q);
     if (asked) return;
-    const n = @min(q.len, ui.ext_root_asked.len);
-    @memcpy(ui.ext_root_asked[0..n], q[0..n]);
-    ui.ext_root_asked_len = n;
+    ui.ext_root_asked.set(q);
     ui.ext_root_gen = h.root(reg.gen, q);
     ui.ext_root_pending = true;
 }
@@ -313,7 +307,7 @@ pub fn prepare(ui: *Ui, q: []const u8) bool {
         r.query,
         q,
     ) else false;
-    const asked = ui.ext_pending and std.mem.eql(u8, ui.ext_asked[0..ui.ext_asked_len], q);
+    const asked = ui.ext_pending and ui.ext_asked.eql(q);
     if (!answered and !asked) ask(ui, q);
     return false;
 }
@@ -321,9 +315,7 @@ pub fn prepare(ui: *Ui, q: []const u8) bool {
 fn ask(ui: *Ui, q: []const u8) void {
     const h = ui.ext_host orelse return;
     const reg = ui.ext_registry orelse return;
-    const n = @min(q.len, ui.ext_asked.len);
-    @memcpy(ui.ext_asked[0..n], q[0..n]);
-    ui.ext_asked_len = n;
+    ui.ext_asked.set(q);
     ui.ext_gen = h.list(reg.gen, ui.ext_cmd, q);
     ui.ext_pending = true;
 }

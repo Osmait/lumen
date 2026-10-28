@@ -296,6 +296,14 @@ query clipboard "42"
 expect "clipboard filter" '> e2e clipboard entry 42'
 expect "clipboard detail" 'Characters = 22'
 expect "a filtered entry keeps its copy time" 'Copied = Today'
+# The keys the action panel shows for an action are the ones that run it.
+printf 'e2e entry to delete' | CLIPBOARD_STATE=data L --clip-store
+query clipboard "to delete"
+expect "entry to delete listed" '> e2e entry to delete'
+L --key ctrl+x; sleep 0.3
+query clipboard ""
+expect_not "Ctrl X deletes the entry, as its action says" 'e2e entry to delete'
+expect "other entries stay" 'e2e clipboard entry 42'
 
 echo "windows"
 L --view windows; sleep 0.2

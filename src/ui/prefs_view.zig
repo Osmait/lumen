@@ -56,15 +56,13 @@ pub fn extensionRows(ui: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item)) v
 
 /// Opens the preferences of extension `id`.
 pub fn open(ui: *Ui, id: []const u8) void {
-    const n = @min(id.len, ui.prefs_ext.len);
-    @memcpy(ui.prefs_ext[0..n], id[0..n]);
-    ui.prefs_ext_len = n;
-    ui.reselect_len = 0;
+    ui.prefs_ext.set(id);
+    ui.reselect.clear();
     ui.navigate(.prefs);
 }
 
 fn extId(ui: *Ui) []const u8 {
-    return ui.prefs_ext[0..ui.prefs_ext_len];
+    return ui.prefs_ext.slice();
 }
 
 pub fn title(ui: *Ui) [*:0]const u8 {

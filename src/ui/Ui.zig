@@ -224,19 +224,16 @@ ext_shown: ?*ExtHost.ListResult = null,
 ext_gen: u32 = 0,
 ext_pending: bool = false,
 /// The query of the last list asked for.
-ext_asked: [256]u8 = undefined,
-ext_asked_len: usize = 0,
+ext_asked: core.FixedStr(256) = .{},
 /// Extension rows for the root search, and the query last asked for.
 ext_root: ?*ExtHost.RootResult = null,
 ext_root_gen: u32 = 0,
 ext_root_pending: bool = false,
-ext_root_asked: [256]u8 = undefined,
-ext_root_asked_len: usize = 0,
+ext_root_asked: core.FixedStr(256) = .{},
 /// The Lua action running (0: none); its answer decides what happens.
 ext_act_gen: u32 = 0,
 /// The extension whose preferences the prefs view lists.
-prefs_ext: [64]u8 = undefined,
-prefs_ext_len: usize = 0,
+prefs_ext: core.FixedStr(64) = .{},
 /// What the input view edits: a preference (index in the registry) or a
 /// field of the open form.
 input: Edited = .{ .pref = 0 },
@@ -247,8 +244,7 @@ form_values: std.ArrayList([:0]u8) = .empty,
 icon_arena: ?std.heap.ArenaAllocator = null,
 /// A message for the selected row once the extensions have reloaded (the
 /// reload rebuilds the rows, and would wipe it).
-after_reload: [160:0]u8 = @splat(0),
-after_reload_len: usize = 0,
+after_reload: core.FixedStr(160) = .{},
 /// `after_reload` waits for the next reload (the row may still point at
 /// the text after that: it is never cleared, only replaced).
 after_reload_pending: bool = false,
@@ -264,11 +260,10 @@ choosing: Choosing = .none,
 choose_title: [96:0]u8 = @splat(0),
 /// Views to go back to (Escape, Backspace, the back arrow), each with the
 /// row that was selected there.
-nav: [8]struct { view: View, key: [80]u8, key_len: usize } = undefined,
+nav: [8]struct { view: View, key: core.FixedStr(80) } = undefined,
 nav_len: usize = 0,
 /// Row to select once the view is built (by its item key).
-reselect: [80]u8 = undefined,
-reselect_len: usize = 0,
+reselect: core.FixedStr(80) = .{},
 
 /// A value being edited: an extension's preference or a field of the open
 /// form (indexes in the registry and the form).
@@ -884,8 +879,7 @@ pub fn keepSelection(self: *Ui) void {
 }
 
 pub fn setReselect(self: *Ui, comptime fmt: []const u8, args: anytype) void {
-    const k = std.mem.print(&self.reselect, fmt, args) catch "";
-    self.reselect_len = k.len;
+    self.reselect.print(fmt, args);
 }
 
 pub fn actionCtx(self: *Ui) run.Ctx {
@@ -1036,8 +1030,8 @@ pub fn navigate(self: *Ui, view: View) void {
         const e = &self.nav[self.nav_len];
         e.view = self.view;
         const key = if (self.selectedItem()) |it| it.key else "";
-        e.key_len = @min(key.len, e.key.len);
-        @memcpy(e.key[0..e.key_len], key[0..e.key_len]);
+        e.key = .{};
+        e.key.set(key);
         self.nav_len += 1;
     }
     self.setView(view);
@@ -1048,8 +1042,7 @@ pub fn goBack(self: *Ui) void {
     if (self.nav_len == 0) return self.setView(.root);
     self.nav_len -= 1;
     const e = &self.nav[self.nav_len];
-    @memcpy(self.reselect[0..e.key_len], e.key[0..e.key_len]);
-    self.reselect_len = e.key_len;
+    self.reselect = e.key;
     self.setView(e.view);
 }
 
@@ -1087,7 +1080,7 @@ pub fn setView(self: *Ui, view: View) void {
     // Somewhere else now: the dmenu caller gets no answer.
     if (self.view == .dmenu and view != .dmenu) dmenu.finish(self, null);
     // Change Theme starts on the theme in use.
-    if (view == .themes and self.reselect_len == 0) self.setReselect(
+    if (view == .themes and self.reselect.len == 0) self.setReselect(
         "theme:{s}",
         .{self.settings.theme},
     );
@@ -1396,11 +1389,13 @@ fn selectAfterRefresh(self: *Ui) void {
     c.gtk_adjustment_set_value(adj, 0);
     var first = self.nextSelectable(null, 1);
     const top = first;
-    if (self.reselect_len > 0) {
+    if (self.reselect.len > 0) {
         // The row to select back may be any of them.
         self.ensureRows();
-        const want = self.reselect[0..self.reselect_len];
-        self.reselect_len = 0;
+        // A copy: clearing writes into the buffer `slice` points at.
+        const pending = self.reselect;
+        self.reselect.clear();
+        const want = pending.slice();
         for (self.rows.items, 0..) |row, i| {
             const ii = row.item orelse continue;
             if (std.mem.eql(u8, self.items.items[ii].key, want)) {

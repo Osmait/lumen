@@ -10,6 +10,7 @@
 const std = @import("std");
 const c = @import("c");
 const index = @import("index");
+const core = @import("core");
 const os = @import("os");
 
 const ContentSearch = @This();
@@ -21,7 +22,7 @@ const log = std.log.scoped(.content_search);
 pub const max_query = 1024;
 
 pub fn clip(query: []const u8) []const u8 {
-    return query[0..@min(query.len, max_query)];
+    return query[0..core.utf8.floorBoundary(query, max_query)];
 }
 
 /// Owned by the receiver of `Callback`, which frees it with `destroy`.
@@ -56,8 +57,7 @@ lock: std.Io.Mutex = .init,
 /// Bumped by every `submit`; the worker sleeps on it.
 gen: std.atomic.Value(u32) = .init(0),
 stop: std.atomic.Value(bool) = .init(false),
-query_buf: [max_query]u8 = undefined,
-query_len: usize = 0,
+query: core.FixedStr(max_query) = .{},
 query_t0: u64 = 0,
 
 pub const StartError = std.mem.Allocator.Error || std.Thread.SpawnError;
@@ -104,8 +104,7 @@ pub fn submit(cs: *ContentSearch, query: []const u8, t0: u64) u32 {
     const g = blk: {
         cs.lock.lockUncancelable(cs.io);
         defer cs.lock.unlock(cs.io);
-        @memcpy(cs.query_buf[0..q.len], q);
-        cs.query_len = q.len;
+        cs.query.set(q);
         cs.query_t0 = t0;
         break :blk cs.gen.fetchAdd(1, .release) + 1;
     };
@@ -143,7 +142,7 @@ fn run(cs: *ContentSearch) void {
             seen = cs.gen.load(.acquire);
             r.gen = seen;
             r.t0 = cs.query_t0;
-            r.query = a.dupe(u8, cs.query_buf[0..cs.query_len]) catch |err| blk: {
+            r.query = a.dupe(u8, cs.query.slice()) catch |err| blk: {
                 r.err = err;
                 break :blk "";
             };

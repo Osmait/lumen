@@ -1,5 +1,6 @@
 //! The keyboard: navigation, actions, the action panel.
 
+const std = @import("std");
 const c = @import("c");
 const item_mod = @import("../item.zig");
 const Ui = @import("Ui.zig");
@@ -99,30 +100,18 @@ fn move(ui: *Ui, keyval: c_uint, down: bool, up: bool) bool {
     return false;
 }
 
-/// Shortcuts on the selected row (delete, copy path, copy file, open with).
-/// True when the key was one of them.
+/// Ctrl+letter (and Ctrl+Shift+letter) on the selected row: the action
+/// whose keys say that chord in the action panel ("Ctrl X", "Ctrl Shift C"),
+/// so what the panel shows is what the keys do. True when one ran.
 fn itemShortcut(ui: *Ui, keyval: c_uint, ctrl: bool, shift: bool) bool {
-    if (!ctrl) return false;
-    const Shortcut = enum { delete, copy_path, copy_file, open_with };
-    const shortcut: Shortcut = if (keyval == c.GDK_KEY_x or keyval == c.GDK_KEY_X)
-        .delete
-    else if (shift and (keyval == c.GDK_KEY_c or keyval == c.GDK_KEY_C))
-        .copy_path
-    else if (shift and (keyval == c.GDK_KEY_f or keyval == c.GDK_KEY_F))
-        .copy_file
-    else if (keyval == c.GDK_KEY_o or keyval == c.GDK_KEY_O)
-        .open_with
-    else
-        return false;
-    const it = ui.selectedItem() orelse return true;
-    switch (shortcut) {
-        .delete => {
-            if (it.action == .clip) ui.perform(if (shift) .clip_clear else .clip_delete);
-            if (it.action == .file) ui.perform(.trash);
-        },
-        .copy_path => if (it.action == .app or it.action == .file) ui.perform(.copy_path),
-        .copy_file => if (it.action == .file) ui.perform(.copy_file),
-        .open_with => if (it.action == .file) ui.perform(.open_with),
-    }
-    return true;
+    if (!ctrl or keyval > 0x7f or !std.ascii.isAlphabetic(@intCast(keyval))) return false;
+    const letter = std.ascii.toUpper(@intCast(keyval));
+    var buf: [16]u8 = undefined;
+    const chord = std.mem.print(&buf, "Ctrl {s}{c}", .{ if (shift) "Shift " else "", letter }) catch return false;
+    const it = ui.selectedItem() orelse return false;
+    for (item_mod.actionsFor(it)) |e| if (std.mem.eql(u8, e.keys, chord)) {
+        ui.performEntry(e);
+        return true;
+    };
+    return false;
 }

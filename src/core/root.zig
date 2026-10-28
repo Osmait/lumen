@@ -10,6 +10,7 @@ pub const file_badge = @import("file_badge.zig");
 pub const file_kind = @import("file_kind.zig");
 pub const markdown = @import("markdown.zig");
 pub const utf8 = @import("utf8.zig");
+pub const FixedStr = @import("fixed_str.zig").FixedStr;
 
 test {
     @import("std").testing.refAllDecls(@This());

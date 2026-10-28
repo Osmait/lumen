@@ -631,7 +631,7 @@ pub fn performSetting(ui: *Ui, s: item_mod.Setting, op: item_mod.Op) void {
         },
         .pick => |v| pick(ui, v),
         .go => |v| {
-            ui.reselect_len = 0;
+            ui.reselect.clear();
             ui.navigate(v);
         },
         .theme => |id| {
@@ -694,6 +694,6 @@ pub fn chooseAppFor(ui: *Ui, path: [:0]const u8) void {
         return;
     };
     setChoosing(ui, .{ .file = .{ .path = owned, .mime = mime } });
-    ui.reselect_len = 0;
+    ui.reselect.clear();
     ui.navigate(.choose);
 }

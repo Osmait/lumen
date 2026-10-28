@@ -319,8 +319,7 @@ list_query: [max_query]u8 = undefined,
 act_req: ?ActReq = null,
 root_req: ?RootReq = null,
 /// The style to load before init.lua (under `lock`); empty is none.
-style: [64]u8 = undefined,
-style_len: usize = 0,
+style: core.FixedStr(64) = .{},
 submit_req: ?*SubmitReq = null,
 root_query: [max_query]u8 = undefined,
 
@@ -386,10 +385,10 @@ pub fn shutdown(h: *Host) void {
 pub fn setStyle(h: *Host, name: []const u8) bool {
     h.lock.lockUncancelable(h.io);
     defer h.lock.unlock(h.io);
-    const n = @min(name.len, h.style.len);
-    if (std.mem.eql(u8, h.style[0..h.style_len], name[0..n])) return false;
-    @memcpy(h.style[0..n], name[0..n]);
-    h.style_len = n;
+    var next: core.FixedStr(64) = .{};
+    next.set(name);
+    if (h.style.eql(next.slice())) return false;
+    h.style = next;
     return true;
 }
 
@@ -590,7 +589,7 @@ fn doReload(h: *Host) void {
     const style = blk: {
         h.lock.lockUncancelable(h.io);
         defer h.lock.unlock(h.io);
-        break :blk wa.dupe(u8, h.style[0..h.style_len]) catch {
+        break :blk wa.dupe(u8, h.style.slice()) catch {
             problem(&load, "style", "out of memory");
             break :blk "";
         };

@@ -94,16 +94,12 @@ pub fn showContentDetail(ui: *Ui, it: *const Item) void {
 
     const ctype = c.g_content_type_guess(f.path, null, 0, null);
     defer if (ctype) |t| c.g_free(t);
-    c.gtk_label_set_text(
-        @ptrCast(ui.meta_values[0]),
-        labels.kindLabel(a, f.path, false, ctype).ptr,
-    );
-    c.gtk_label_set_text(@ptrCast(ui.meta_values[1]), it.fact.ptr);
-    c.gtk_label_set_text(
-        @ptrCast(ui.meta_values[2]),
-        if (info) |i| labels.formatWhen(a, i.mtime).ptr else "—",
-    );
-    c.gtk_label_set_text(@ptrCast(ui.meta_values[3]), it.where.ptr);
+    setMeta(ui, .{
+        labels.kindLabel(a, f.path, false, ctype),
+        it.fact,
+        if (info) |i| labels.formatWhen(a, i.mtime) else "—",
+        it.where,
+    });
 }
 
 /// The image the preview shows or is loading. Decoding happened on the UI
@@ -211,21 +207,12 @@ pub fn showFileDetail(ui: *Ui, it: *const Item) void {
     }
     c.gtk_label_set_text(@ptrCast(ui.detail_text), (a.dupeSentinel(u8, text, 0) catch return).ptr);
 
-    c.gtk_label_set_text(
-        @ptrCast(ui.meta_values[0]),
-        labels.kindLabel(a, f.path, f.is_dir, ct).ptr,
-    );
-    if (info) |inf| {
-        c.gtk_label_set_text(
-            @ptrCast(ui.meta_values[1]),
-            if (f.is_dir) "—" else labels.formatSize(a, inf.size).ptr,
-        );
-        c.gtk_label_set_text(@ptrCast(ui.meta_values[2]), labels.formatWhen(a, inf.mtime).ptr);
-    } else {
-        c.gtk_label_set_text(@ptrCast(ui.meta_values[1]), "—");
-        c.gtk_label_set_text(@ptrCast(ui.meta_values[2]), "—");
-    }
-    c.gtk_label_set_text(@ptrCast(ui.meta_values[3]), it.subtitle.ptr);
+    setMeta(ui, .{
+        labels.kindLabel(a, f.path, f.is_dir, ct),
+        if (info) |inf| (if (f.is_dir) "—" else labels.formatSize(a, inf.size)) else "—",
+        if (info) |inf| labels.formatWhen(a, inf.mtime) else "—",
+        it.subtitle,
+    });
 }
 
 /// Lines of a file preview. The pane shows ~14; GTK wraps and measures all
@@ -262,6 +249,12 @@ fn showExtDetail(ui: *Ui, it: ?*const Item) void {
     }
 }
 
+/// The four values beside the keys the view set (Kind, Size, Modified,
+/// Where for files; Content type, Characters, Words, Copied for copies).
+fn setMeta(ui: *Ui, values: [4][:0]const u8) void {
+    for (ui.meta_values, values) |w, v| c.gtk_label_set_text(@ptrCast(w), v.ptr);
+}
+
 pub fn showDetail(ui: *Ui, it: ?*const Item) void {
     if (ui.view == .files or ui.view == .contents) {
         if (it) |i| if (i.action == .file) {
@@ -269,14 +262,14 @@ pub fn showDetail(ui: *Ui, it: ?*const Item) void {
         };
         c.gtk_widget_set_visible(ui.detail_picture, 0);
         c.gtk_label_set_text(@ptrCast(ui.detail_text), "");
-        for (ui.meta_values) |v| c.gtk_label_set_text(@ptrCast(v), "");
+        setMeta(ui, @splat(""));
         return;
     }
     if (ui.view == .ext) return showExtDetail(ui, it);
     if (ui.view != .clipboard) return;
     const i = it orelse {
         c.gtk_label_set_text(@ptrCast(ui.detail_text), "");
-        for (ui.meta_values) |v| c.gtk_label_set_text(@ptrCast(v), "");
+        setMeta(ui, @splat(""));
         return;
     };
     var arena: std.heap.ArenaAllocator = .init(ui.gpa);
@@ -287,18 +280,14 @@ pub fn showDetail(ui: *Ui, it: ?*const Item) void {
         @ptrCast(ui.detail_text),
         (a.dupeSentinel(u8, core.utf8.validPrefix(text), 0) catch return).ptr,
     );
-    c.gtk_label_set_text(@ptrCast(ui.meta_values[0]), "Text");
     const chars = std.unicode.utf8CountCodepoints(i.detail) catch i.detail.len;
     var words: usize = 0;
     var tok = std.mem.tokenizeAny(u8, i.detail, " \t\r\n");
     while (tok.next()) |_| words += 1;
-    c.gtk_label_set_text(
-        @ptrCast(ui.meta_values[1]),
-        (a.printSentinel("{d}", .{chars}, 0) catch return).ptr,
-    );
-    c.gtk_label_set_text(
-        @ptrCast(ui.meta_values[2]),
-        (a.printSentinel("{d}", .{words}, 0) catch return).ptr,
-    );
-    c.gtk_label_set_text(@ptrCast(ui.meta_values[3]), labels.formatWhen(a, i.time_s).ptr);
+    setMeta(ui, .{
+        "Text",
+        a.printSentinel("{d}", .{chars}, 0) catch "",
+        a.printSentinel("{d}", .{words}, 0) catch "",
+        labels.formatWhen(a, i.time_s),
+    });
 }
