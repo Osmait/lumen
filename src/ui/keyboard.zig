@@ -13,54 +13,14 @@ pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
     const enter = keyval == c.GDK_KEY_Return or keyval == c.GDK_KEY_KP_Enter;
 
     if (ui.panel_open) {
-        if (keyval == c.GDK_KEY_Escape or (ctrl and keyval == c.GDK_KEY_k and !up)) {
-            ui.closePanel();
-        } else if (down) {
-            ui.selectPanel(@min(ui.panel_selected + 1, ui.panel_entries.len - 1));
-        } else if (up) {
-            ui.selectPanel(ui.panel_selected -| 1);
-        } else if (enter) {
-            ui.performEntry(ui.panel_entries[ui.panel_selected]);
-        }
+        panelKey(ui, keyval, ctrl, down, up, enter);
         return 1;
     }
-
     if (keyval == c.GDK_KEY_Escape) {
-        // A dmenu caller is waiting: Esc answers "nothing" and hides.
-        if (ui.view == .dmenu and ui.query().len == 0) {
-            ui.hide();
-        } else if (ui.view == .input) {
-            // The text is the value being edited: Esc leaves it unsaved.
-            ui.goBack();
-        } else if (ui.query().len > 0) {
-            c.gtk_editable_set_text(@ptrCast(ui.entry), "");
-        } else if (ui.view != .root) ui.goBack() else ui.hide();
+        escape(ui);
         return 1;
     }
-    // A grid moves in two directions: a line is `grid_columns` cells.
-    if (ui.grid_mode and ui.rows.items.len > 0 and (down or up or keyval == c.GDK_KEY_Left or keyval == c.GDK_KEY_Right)) {
-        const n: i64 = @intCast(ui.rows.items.len);
-        const cur: i64 = if (ui.selected) |s| @intCast(s) else 0;
-        const step: i64 = if (down) ui.grid_columns else if (up) -ui.grid_columns else if (keyval == c.GDK_KEY_Right) 1 else -1;
-        const next = cur + step;
-        if (next >= 0 and next < n) ui.select(@intCast(next));
-        return 1;
-    }
-    if (down) {
-        ui.select(ui.nextSelectable(ui.selected, 1));
-        return 1;
-    }
-    if (up) {
-        ui.select(ui.nextSelectable(ui.selected, -1));
-        return 1;
-    }
-    if (keyval == c.GDK_KEY_Page_Down or keyval == c.GDK_KEY_Page_Up) {
-        const dir: i32 = if (keyval == c.GDK_KEY_Page_Down) 1 else -1;
-        var target = ui.selected;
-        for (0..8) |_| target = ui.nextSelectable(target, dir);
-        ui.select(target);
-        return 1;
-    }
+    if (move(ui, keyval, down, up)) return 1;
     if (ctrl and keyval == c.GDK_KEY_k) {
         ui.openPanel();
         return 1;
@@ -77,32 +37,92 @@ pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
         if (ctrl and actions.len > 1) ui.performEntry(actions[1]) else ui.performEntry(actions[0]);
         return 1;
     }
-    if (ctrl and (keyval == c.GDK_KEY_x or keyval == c.GDK_KEY_X)) {
-        const it = ui.selectedItem() orelse return 1;
-        if (it.action == .clip) ui.perform(if (shift) .clip_clear else .clip_delete);
-        if (it.action == .file) ui.perform(.trash);
-        return 1;
-    }
-    if (ctrl and shift and (keyval == c.GDK_KEY_c or keyval == c.GDK_KEY_C)) {
-        const it = ui.selectedItem() orelse return 1;
-        if (it.action == .app or it.action == .file) ui.perform(.copy_path);
-        return 1;
-    }
-    if (ctrl and shift and (keyval == c.GDK_KEY_f or keyval == c.GDK_KEY_F)) {
-        const it = ui.selectedItem() orelse return 1;
-        if (it.action == .file) ui.perform(.copy_file);
-        return 1;
-    }
+    if (itemShortcut(ui, keyval, ctrl, shift)) return 1;
     if (keyval == c.GDK_KEY_BackSpace and ui.query().len == 0 and ui.view != .root) {
         ui.goBack();
-        return 1;
-    }
-    if (ctrl and (keyval == c.GDK_KEY_o or keyval == c.GDK_KEY_O)) {
-        const it = ui.selectedItem() orelse return 1;
-        if (it.action == .file) ui.perform(.open_with);
         return 1;
     }
     // Keymaps from init.lua and extensions.
     if (Ui.ext_view.keymap(ui, keyval, state)) return 1;
     return 0;
+}
+
+/// Keys while the action panel is open: they all go to it.
+fn panelKey(ui: *Ui, keyval: c_uint, ctrl: bool, down: bool, up: bool, enter: bool) void {
+    if (keyval == c.GDK_KEY_Escape or (ctrl and keyval == c.GDK_KEY_k and !up)) {
+        ui.closePanel();
+    } else if (down) {
+        ui.selectPanel(@min(ui.panel_selected + 1, ui.panel_entries.len - 1));
+    } else if (up) {
+        ui.selectPanel(ui.panel_selected -| 1);
+    } else if (enter) {
+        ui.performEntry(ui.panel_entries[ui.panel_selected]);
+    }
+}
+
+/// Esc: clears what is typed, then goes back a view, then hides.
+fn escape(ui: *Ui) void {
+    // A dmenu caller is waiting: Esc answers "nothing" and hides.
+    if (ui.view == .dmenu and ui.query().len == 0) {
+        ui.hide();
+    } else if (ui.view == .input) {
+        // The text is the value being edited: Esc leaves it unsaved.
+        ui.goBack();
+    } else if (ui.query().len > 0) {
+        c.gtk_editable_set_text(@ptrCast(ui.entry), "");
+    } else if (ui.view != .root) ui.goBack() else ui.hide();
+}
+
+/// Moving the selection: by row, by page, or across the grid. True when
+/// the key was one of those.
+fn move(ui: *Ui, keyval: c_uint, down: bool, up: bool) bool {
+    // A grid moves in two directions: a line is `grid_columns` cells.
+    if (ui.grid_mode and ui.rows.items.len > 0 and (down or up or keyval == c.GDK_KEY_Left or keyval == c.GDK_KEY_Right)) {
+        const n: i64 = @intCast(ui.rows.items.len);
+        const cur: i64 = if (ui.selected) |s| @intCast(s) else 0;
+        const step: i64 = if (down) ui.grid_columns else if (up) -ui.grid_columns else if (keyval == c.GDK_KEY_Right) 1 else -1;
+        const next = cur + step;
+        if (next >= 0 and next < n) ui.select(@intCast(next));
+        return true;
+    }
+    if (down or up) {
+        ui.select(ui.nextSelectable(ui.selected, if (down) 1 else -1));
+        return true;
+    }
+    if (keyval == c.GDK_KEY_Page_Down or keyval == c.GDK_KEY_Page_Up) {
+        const dir: i32 = if (keyval == c.GDK_KEY_Page_Down) 1 else -1;
+        var target = ui.selected;
+        for (0..8) |_| target = ui.nextSelectable(target, dir);
+        ui.select(target);
+        return true;
+    }
+    return false;
+}
+
+/// Shortcuts on the selected row (delete, copy path, copy file, open with).
+/// True when the key was one of them.
+fn itemShortcut(ui: *Ui, keyval: c_uint, ctrl: bool, shift: bool) bool {
+    if (!ctrl) return false;
+    const Shortcut = enum { delete, copy_path, copy_file, open_with };
+    const shortcut: Shortcut = if (keyval == c.GDK_KEY_x or keyval == c.GDK_KEY_X)
+        .delete
+    else if (shift and (keyval == c.GDK_KEY_c or keyval == c.GDK_KEY_C))
+        .copy_path
+    else if (shift and (keyval == c.GDK_KEY_f or keyval == c.GDK_KEY_F))
+        .copy_file
+    else if (keyval == c.GDK_KEY_o or keyval == c.GDK_KEY_O)
+        .open_with
+    else
+        return false;
+    const it = ui.selectedItem() orelse return true;
+    switch (shortcut) {
+        .delete => {
+            if (it.action == .clip) ui.perform(if (shift) .clip_clear else .clip_delete);
+            if (it.action == .file) ui.perform(.trash);
+        },
+        .copy_path => if (it.action == .app or it.action == .file) ui.perform(.copy_path),
+        .copy_file => if (it.action == .file) ui.perform(.copy_file),
+        .open_with => if (it.action == .file) ui.perform(.open_with),
+    }
+    return true;
 }

@@ -341,6 +341,38 @@ pub fn build(self: *Ui) void {
     self.watchColorScheme();
     self.reloadSettings();
 
+    const overlay = self.buildWindow();
+    // Two pieces on a transparent surface: the search bar and, below it, the
+    // results, as tall as their rows (the rest of the surface stays clear).
+    const column = widgets.vbox(10);
+    self.column = column;
+    c.gtk_widget_add_css_class(column, "shell");
+    c.gtk_widget_set_size_request(column, self.panelW(), self.panelH());
+    c.gtk_overlay_set_child(@ptrCast(overlay), column);
+
+    self.buildSearchBar(column);
+    self.buildResults(column);
+    self.buildFooter(column);
+    self.buildPanel(overlay);
+    const win = self.window;
+    const keys = c.gtk_event_controller_key_new();
+    c.gtk_event_controller_set_propagation_phase(keys, c.GTK_PHASE_CAPTURE);
+    widgets.connect(keys, "key-pressed", &onKey, self);
+    c.gtk_widget_add_controller(win, keys);
+
+    // A click on the clear part of the surface hides the window, like one on
+    // the backdrop. Capture phase: it sees every press, and claims none.
+    const click = c.gtk_gesture_click_new();
+    c.gtk_event_controller_set_propagation_phase(click, c.GTK_PHASE_CAPTURE);
+    widgets.connect(click, "pressed", &backdrop.onWindowPressed, self);
+    c.gtk_widget_add_controller(win, click);
+    self.built = true;
+    self.scanIconDir();
+    self.applyStructure();
+}
+
+/// The layer-shell window and the overlay everything goes in.
+fn buildWindow(self: *Ui) *c.GtkWidget {
     const win = c.gtk_application_window_new(self.app);
     self.window = win;
     c.gtk_widget_add_css_class(win, "lumen");
@@ -367,16 +399,11 @@ pub fn build(self: *Ui) void {
 
     const overlay = c.gtk_overlay_new();
     c.gtk_window_set_child(w, overlay);
+    return overlay;
+}
 
-    // Two pieces on a transparent surface: the search bar and, below it, the
-    // results, as tall as their rows (the rest of the surface stays clear).
-    const column = widgets.vbox(10);
-    self.column = column;
-    c.gtk_widget_add_css_class(column, "shell");
-    c.gtk_widget_set_size_request(column, self.panelW(), self.panelH());
-    c.gtk_overlay_set_child(@ptrCast(overlay), column);
-
-    // search bar
+/// The back arrow, magnifier, prompt, scope, entry and Ctrl K chip.
+fn buildSearchBar(self: *Ui, column: *c.GtkWidget) void {
     const search = widgets.hbox(0);
     c.gtk_widget_add_css_class(search, "search");
     self.search_bar = search;
@@ -418,8 +445,10 @@ pub fn build(self: *Ui) void {
     c.gtk_widget_set_visible(self.spacer, 0);
     c.gtk_box_append(@ptrCast(column), self.spacer);
     c.gtk_box_append(@ptrCast(column), search);
+}
 
-    // results + detail
+/// The list and the grid in their scroller, beside the detail pane.
+fn buildResults(self: *Ui, column: *c.GtkWidget) void {
     const body = widgets.hbox(0);
     c.gtk_widget_add_css_class(body, "results-island");
     self.results = body;
@@ -458,8 +487,10 @@ pub fn build(self: *Ui) void {
     detail_pane.buildDetail(self);
     c.gtk_box_append(@ptrCast(body), self.detail);
     c.gtk_box_append(@ptrCast(column), body);
+}
 
-    // footer (lumen.layout { footer = true })
+/// The footer (lumen.layout { footer = true }): title, action, keys.
+fn buildFooter(self: *Ui, column: *c.GtkWidget) void {
     self.footer = widgets.hbox(8);
     c.gtk_widget_add_css_class(self.footer, "footer");
     c.gtk_widget_set_size_request(self.footer, -1, footer_h);
@@ -482,8 +513,10 @@ pub fn build(self: *Ui) void {
     c.gtk_box_append(@ptrCast(self.footer), fk);
     c.gtk_widget_set_visible(self.footer, 0);
     c.gtk_box_append(@ptrCast(column), self.footer);
+}
 
-    // action panel, floating over the top right corner of the results
+/// The action panel, floating over the top right corner of the results.
+fn buildPanel(self: *Ui, overlay: *c.GtkWidget) void {
     self.panel = widgets.vbox(0);
     c.gtk_widget_add_css_class(self.panel, "actions");
     c.gtk_widget_set_halign(self.panel, c.GTK_ALIGN_END);
@@ -495,21 +528,6 @@ pub fn build(self: *Ui) void {
     c.gtk_box_append(@ptrCast(self.panel), self.panel_list);
     c.gtk_widget_set_visible(self.panel, 0);
     c.gtk_overlay_add_overlay(@ptrCast(overlay), self.panel);
-
-    const keys = c.gtk_event_controller_key_new();
-    c.gtk_event_controller_set_propagation_phase(keys, c.GTK_PHASE_CAPTURE);
-    widgets.connect(keys, "key-pressed", &onKey, self);
-    c.gtk_widget_add_controller(win, keys);
-
-    // A click on the clear part of the surface hides the window, like one on
-    // the backdrop. Capture phase: it sees every press, and claims none.
-    const click = c.gtk_gesture_click_new();
-    c.gtk_event_controller_set_propagation_phase(click, c.GTK_PHASE_CAPTURE);
-    widgets.connect(click, "pressed", &backdrop.onWindowPressed, self);
-    c.gtk_widget_add_controller(win, click);
-    self.built = true;
-    self.scanIconDir();
-    self.applyStructure();
 }
 
 /// ~/.config/lumen/icons/<name>.svg|png replaces the icon <name> everywhere
@@ -1086,6 +1104,29 @@ pub fn setView(self: *Ui, view: View) void {
     ));
     self.base = self.loadBase(self.data_arena.allocator());
 
+    self.layoutFor(view);
+    var placeholder_buf: [128]u8 = undefined;
+    c.gtk_text_set_placeholder_text(@ptrCast(self.entry), self.placeholderFor(view, &placeholder_buf));
+    c.gtk_label_set_text(@ptrCast(self.scope), self.viewTitle());
+    c.gtk_widget_set_visible(self.scope, @intFromBool(
+        view != .root and self.layout.show.scope and self.layout.searchbar.has(.scope),
+    ));
+    c.gtk_label_set_text(@ptrCast(self.footer_title), self.viewTitle());
+
+    // Setting the text triggers `changed`, which refreshes.
+    if (c.gtk_editable_get_text(
+        @ptrCast(self.entry),
+    )[0] == 0) self.refresh() else c.gtk_editable_set_text(
+        @ptrCast(self.entry),
+        "",
+    );
+    // The rows are this base's now: nothing points into replaced app lists.
+    self.apps.dropStale();
+}
+
+/// The window's parts for `view`: the detail pane and what it shows, the
+/// grid, the back arrow and the magnifier, the list's size.
+fn layoutFor(self: *Ui, view: View) void {
     const has_detail = view == .clipboard or view == .files or view == .contents or
         (view == .ext and if (ext_view.command(self)) |cmd| cmd.detail else false);
     self.grid_mode = view == .ext and if (ext_view.command(self)) |cmd| cmd.grid else false;
@@ -1134,17 +1175,20 @@ pub fn setView(self: *Ui, view: View) void {
         if (wrap) c.PANGO_ELLIPSIZE_NONE else c.PANGO_ELLIPSIZE_END,
     );
     c.gtk_widget_set_visible(self.detail_picture, 0);
-    var placeholder_buf: [128]u8 = undefined;
+}
+
+/// The search bar's text while empty, for `view` (`buf` may hold it).
+fn placeholderFor(self: *Ui, view: View, buf: *[128]u8) [*:0]const u8 {
     // lumen.layout's placeholder: "Go…" at the root, "<view>…" elsewhere.
     const custom: ?[*:0]const u8 = if (self.layout.placeholder.len == 0) null else if (view == .root)
         self.layout.placeholder.ptr
     else if (std.mem.printSentinel(
-        &placeholder_buf,
+        buf,
         "{s}…",
         .{std.mem.span(self.viewTitle())},
         0,
     )) |t| t.ptr else |_| "…";
-    c.gtk_text_set_placeholder_text(@ptrCast(self.entry), custom orelse switch (view) {
+    return custom orelse switch (view) {
         .root => "Search for apps and commands...",
         .clipboard => "Type to filter entries...",
         .windows => "Search windows...",
@@ -1154,27 +1198,12 @@ pub fn setView(self: *Ui, view: View) void {
         .themes => "Search themes...",
         .default_apps => "Search file kinds...",
         .choose => if (self.choosing == .setting) "Filter values..." else "Search apps...",
-        .ext => ext_view.placeholder(self, &placeholder_buf),
+        .ext => ext_view.placeholder(self, buf),
         .dmenu => "Filter...",
         .prefs => "Search preferences...",
         .input => prefs_view.inputTitle(self),
         .form => "Search fields...",
-    });
-    c.gtk_label_set_text(@ptrCast(self.scope), self.viewTitle());
-    c.gtk_widget_set_visible(self.scope, @intFromBool(
-        view != .root and self.layout.show.scope and bar.has(.scope),
-    ));
-    c.gtk_label_set_text(@ptrCast(self.footer_title), self.viewTitle());
-
-    // Setting the text triggers `changed`, which refreshes.
-    if (c.gtk_editable_get_text(
-        @ptrCast(self.entry),
-    )[0] == 0) self.refresh() else c.gtk_editable_set_text(
-        @ptrCast(self.entry),
-        "",
-    );
-    // The rows are this base's now: nothing points into replaced app lists.
-    self.apps.dropStale();
+    };
 }
 
 fn rootCandidates(self: *Ui, a: std.mem.Allocator) []Item {

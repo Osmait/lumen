@@ -687,6 +687,50 @@ pub fn swatchOf(t: *const themes.Theme) item_mod.Icon {
 }
 
 /// Applies what a settings row does.
+/// A value picked in the choose view, for what it was opened for.
+fn pick(ui: *Ui, v: [:0]const u8) void {
+    switch (ui.choosing) {
+        .setting => |ch| {
+            _ = ui.settings.setChoice(ch, v);
+            ui.saveSettings();
+            ui.goBack();
+        },
+        .kind => |k| {
+            if (ui.settings.setOpenWith(@tagName(k), v)) ui.saveSettings() else |err| log.warn(
+                "default app for {t}: {t}",
+                .{ k, err },
+            );
+            ui.goBack();
+        },
+        .pref => |i| prefs_view.pick(ui, i, v),
+        .field => |i| form_view.pick(ui, i, v),
+        .none, .file => {},
+    }
+}
+
+/// Opens the file being chosen for with app `id`; with `always`, that app
+/// becomes the default for its kind (or its extension).
+fn openWith(ui: *Ui, id: [:0]const u8, always: bool) void {
+    if (ui.choosing != .file) return;
+    const f = ui.choosing.file;
+    if (always) {
+        const name = std.Io.Dir.path.basename(f.path);
+        var ebuf: [16]u8 = undefined;
+        const key: []const u8 = if (core.file_kind.of(f.mime, name, false)) |k|
+            @tagName(k)
+        else
+            core.file_kind.extKey(&ebuf, name);
+        if (key.len > 0) {
+            if (ui.settings.setOpenWith(key, id)) ui.saveSettings() else |err| log.warn(
+                "default app for {s}: {t}",
+                .{ key, err },
+            );
+        }
+    }
+    if (!run.openWith(f.path, id)) return;
+    ui.hide();
+}
+
 pub fn performSetting(ui: *Ui, s: item_mod.Setting, op: item_mod.Op) void {
     const locked: ?[]const u8 = switch (s) {
         .theme => "theme",
@@ -712,23 +756,7 @@ pub fn performSetting(ui: *Ui, s: item_mod.Setting, op: item_mod.Op) void {
             ui.setReselect("pick:{s}", .{ui.settings.open_with.get(@tagName(k)) orelse ""});
             ui.navigate(.choose);
         },
-        .pick => |v| switch (ui.choosing) {
-            .setting => |ch| {
-                _ = ui.settings.setChoice(ch, v);
-                ui.saveSettings();
-                ui.goBack();
-            },
-            .kind => |k| {
-                if (ui.settings.setOpenWith(@tagName(k), v)) ui.saveSettings() else |err| log.warn(
-                    "default app for {t}: {t}",
-                    .{ k, err },
-                );
-                ui.goBack();
-            },
-            .pref => |i| prefs_view.pick(ui, i, v),
-            .field => |i| form_view.pick(ui, i, v),
-            else => {},
-        },
+        .pick => |v| pick(ui, v),
         .go => |v| {
             ui.reselect_len = 0;
             ui.navigate(v);
@@ -747,27 +775,7 @@ pub fn performSetting(ui: *Ui, s: item_mod.Setting, op: item_mod.Op) void {
             ui.setReselect("style:{s}", .{id});
             ui.rebuild();
         },
-        .open_with => |id| {
-            if (ui.choosing != .file) return;
-            const f = ui.choosing.file;
-            if (op == .always_use) {
-                const name = std.Io.Dir.path.basename(f.path);
-                var ebuf: [16]u8 = undefined;
-                const key: []const u8 = if (core.file_kind.of(
-                    f.mime,
-                    name,
-                    false,
-                )) |k| @tagName(k) else core.file_kind.extKey(&ebuf, name);
-                if (key.len > 0) {
-                    if (ui.settings.setOpenWith(key, id)) ui.saveSettings() else |err| log.warn(
-                        "default app for {s}: {t}",
-                        .{ key, err },
-                    );
-                }
-            }
-            if (!run.openWith(f.path, id)) return;
-            ui.hide();
-        },
+        .open_with => |id| openWith(ui, id, op == .always_use),
         .open_file => {
             // Write the defaults first: an empty editor helps nobody.
             if (os.info(ui.settings_path.ptr) == null) ui.saveSettings();
