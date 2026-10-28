@@ -111,7 +111,7 @@ fn onRegistry(reg: *Host.Registry, ctx: ?*anyopaque) void {
     }
     if (ui.view != .ext) {
         // Same row as before the reload (an update from Settings, say).
-        if (ui.selectedItem()) |it| ui.setReselect("{s}", .{it.key});
+        ui.keepSelection();
         ui.rebuild();
     } else if (if (open_id) |id| find(reg, id) else null) |i| {
         ui.ext_cmd = i;
@@ -149,7 +149,7 @@ fn onRoot(res: *Host.RootResult, ctx: ?*anyopaque) void {
         res.query,
         std.mem.trim(u8, ui.query(), " "),
     )) {
-        if (ui.selectedItem()) |it| ui.setReselect("{s}", .{it.key});
+        ui.keepSelection();
         ui.refresh();
     }
     if (old) |o| o.destroy(ui.gpa);
@@ -200,7 +200,7 @@ fn onList(res: *Host.ListResult, ctx: ?*anyopaque) void {
     ui.ext_result = res;
     ui.ext_pending = false;
     if (ui.view == .ext) {
-        if (ui.selectedItem()) |it| ui.setReselect("{s}", .{it.key});
+        ui.keepSelection();
         ui.rebuild();
     }
     if (old) |o| o.destroy(ui.gpa);
@@ -220,7 +220,7 @@ fn onAct(res: *Host.ActResult, ctx: ?*anyopaque) void {
         .close => ui.hide(),
         .stay => ui.select(ui.selected),
         .refresh => if (ui.view == .ext) {
-            if (ui.selectedItem()) |it| ui.setReselect("{s}", .{it.key});
+            ui.keepSelection();
             ui.setView(.ext);
         } else if (ui.view == .form) {
             // A form "refreshes" by starting over, ready for the next one.

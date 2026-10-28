@@ -19,6 +19,7 @@ const themes = @import("themes.zig");
 const Kind = core.file_kind.Kind;
 const Ui = @import("Ui.zig");
 const prefs_view = @import("prefs_view.zig");
+const Host = @import("../ext/Host.zig");
 const form_view = @import("form_view.zig");
 
 const log = std.log.scoped(.ui);
@@ -257,7 +258,18 @@ fn settingName(s: item_mod.Setting) ?[]const u8 {
     };
 }
 
-const Option = struct { value: [:0]const u8, label: [:0]const u8 };
+const Option = Host.PrefChoice;
+
+/// A row of the choose view: `o`, checked when it is the `current` value.
+pub fn pickRow(a: std.mem.Allocator, o: Option, current: []const u8) std.mem.Allocator.Error!Item {
+    return .{
+        .key = try a.print("pick:{s}", .{o.value}),
+        .title = o.label,
+        .accessory = if (std.mem.eql(u8, o.value, current)) "✓" else "",
+        .icon = .{ .tile = .{ .name = "object-select-symbolic", .color = .gray } },
+        .action = .{ .setting = .{ .pick = o.value } },
+    };
+}
 
 /// The values a choice can take, in the order they are listed.
 pub fn choiceOptions(ui: *Ui, a: std.mem.Allocator, ch: settings_mod.Choice) []const Option {
@@ -426,15 +438,7 @@ pub fn chooseCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
         .setting => |ch| {
             var buf: [32]u8 = undefined;
             const current = ui.settings.choiceValue(ch, &buf);
-            for (choiceOptions(ui, a, ch)) |o| {
-                out.append(a, .{
-                    .key = a.print("pick:{s}", .{o.value}) catch "",
-                    .title = o.label,
-                    .accessory = if (std.mem.eql(u8, o.value, current)) "✓" else "",
-                    .icon = .{ .tile = .{ .name = "object-select-symbolic", .color = .gray } },
-                    .action = .{ .setting = .{ .pick = o.value } },
-                }) catch break;
-            }
+            for (choiceOptions(ui, a, ch)) |o| out.append(a, pickRow(a, o, current) catch break) catch break;
         },
         .kind => |k| appOptions(
             ui,

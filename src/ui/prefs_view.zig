@@ -199,24 +199,38 @@ pub fn edit(ui: *Ui, i: u16) void {
     const p = &reg.prefs[i];
     var arena: std.heap.ArenaAllocator = .init(ui.gpa);
     defer arena.deinit();
-    const value = current(arena.allocator(), p);
+    editValue(ui, .{ .pref = i }, p, current(arena.allocator(), p));
+}
+
+/// Enter on a preference or a form field whose value is `value`: flips a
+/// toggle, lists a choice's values, or opens the input view for text.
+pub fn editValue(ui: *Ui, target: Ui.Edited, p: *const Host.Pref, value: []const u8) void {
     switch (p.kind) {
         .toggle => {
-            // Not saved: the row keeps saying why.
-            if (!save(ui, p, .{ .bool = !std.mem.eql(u8, value, "true") })) return;
-            ui.setReselect("pref:{s}", .{p.name});
+            const on = !std.mem.eql(u8, value, "true");
+            switch (target) {
+                // Not saved: the row keeps saying why.
+                .pref => if (!save(ui, p, .{ .bool = on })) return,
+                .field => |i| form_view.setValue(ui, i, if (on) "true" else "false"),
+            }
+            // Row keys are "pref:<name>" and "field:<name>".
+            ui.setReselect("{t}:{s}", .{ target, p.name });
             ui.rebuild();
         },
         .choice => {
-            settings_view.setChoosing(ui, .{ .pref = i });
+            settings_view.setChoosing(ui, switch (target) {
+                .pref => |i| .{ .pref = i },
+                .field => |i| .{ .field = i },
+            });
             ui.setReselect("pick:{s}", .{value});
             ui.navigate(.choose);
         },
         .text, .password => {
-            ui.input = .{ .pref = i };
+            ui.input = target;
             ui.navigate(.input);
             // After the view change, which clears the search bar.
-            const z = arena.allocator().dupeSentinel(u8, value, 0) catch return;
+            const z = ui.gpa.dupeSentinel(u8, value, 0) catch return;
+            defer ui.gpa.free(z);
             c.gtk_editable_set_text(@ptrCast(ui.entry), z.ptr);
             c.gtk_editable_set_position(@ptrCast(ui.entry), -1);
         },
@@ -229,15 +243,7 @@ pub fn choiceCandidates(ui: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item)
     if (i >= reg.prefs.len) return;
     const p = &reg.prefs[i];
     const value = current(a, p);
-    for (p.choices) |ch| {
-        out.append(a, .{
-            .key = a.print("pick:{s}", .{ch.value}) catch continue,
-            .title = ch.label,
-            .accessory = if (std.mem.eql(u8, ch.value, value)) "✓" else "",
-            .icon = .{ .tile = .{ .name = "object-select-symbolic", .color = .gray } },
-            .action = .{ .setting = .{ .pick = ch.value } },
-        }) catch return;
-    }
+    for (p.choices) |ch| out.append(a, settings_view.pickRow(a, ch, value) catch return) catch return;
 }
 
 /// A value picked in the choose view.

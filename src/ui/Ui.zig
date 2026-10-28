@@ -239,7 +239,7 @@ prefs_ext: [64]u8 = undefined,
 prefs_ext_len: usize = 0,
 /// What the input view edits: a preference (index in the registry) or a
 /// field of the open form.
-input: union(enum) { pref: u16, field: u16 } = .{ .pref = 0 },
+input: Edited = .{ .pref = 0 },
 /// The open form (index in the registry) and its fields' values (gpa).
 form_cmd: u16 = 0,
 form_values: std.ArrayList([:0]u8) = .empty,
@@ -269,6 +269,10 @@ nav_len: usize = 0,
 /// Row to select once the view is built (by its item key).
 reselect: [80]u8 = undefined,
 reselect_len: usize = 0,
+
+/// A value being edited: an extension's preference or a field of the open
+/// form (indexes in the registry and the form).
+pub const Edited = union(enum) { pref: u16, field: u16 };
 
 pub const Choosing = union(enum) {
     none,
@@ -855,6 +859,12 @@ fn onColorScheme(_: *c.GSettings, _: [*:0]const u8, data: ?*anyopaque) callconv(
     if (self.view == .settings or self.view == .themes) self.rebuild();
 }
 
+/// After the next rebuild, the row selected now is selected again (by its
+/// key), wherever it moved.
+pub fn keepSelection(self: *Ui) void {
+    if (self.selectedItem()) |it| self.setReselect("{s}", .{it.key});
+}
+
 pub fn setReselect(self: *Ui, comptime fmt: []const u8, args: anytype) void {
     const k = std.mem.print(&self.reselect, fmt, args) catch "";
     self.reselect_len = k.len;
@@ -1218,6 +1228,13 @@ pub fn query(self: *Ui) []const u8 {
 
 /// No rows (what they pointed to is going away).
 pub fn clearRows(self: *Ui) void {
+    self.resetRows();
+    self.primary = "";
+}
+
+/// Forgets the rows and the items behind them, and anything queued to
+/// build them.
+fn resetRows(self: *Ui) void {
     _ = self.query_arena.reset(.retain_capacity);
     self.items = .empty;
     self.rows = .empty;
@@ -1227,31 +1244,12 @@ pub fn clearRows(self: *Ui) void {
     self.shown_content = null;
     self.ext_shown = null;
     self.selected = null;
-    self.primary = "";
     c.gtk_list_box_remove_all(@ptrCast(self.list));
 }
 
 pub fn refresh(self: *Ui) void {
     const t0 = stats.now();
-    // Contents: the rows on screen are the last result's; asking the worker
-    // for the new query changes nothing on screen until it answers (which
-    // refreshes again). Building them again cost a frame per keystroke.
-    if (self.view == .ext and ext_view.waitingForSearch(
-        self,
-        std.mem.trim(u8, self.query(), " "),
-    )) return;
-    if (self.view == .contents) if (self.content_search) |cs| if (self.content_result) |r| {
-        const q = std.mem.trim(u8, self.query(), " ");
-        if (q.len >= 3 and r == self.shown_content and !std.mem.eql(
-            u8,
-            r.query,
-            ContentSearch.clip(q),
-        )) {
-            self.content_gen = cs.submit(q, t0);
-            self.content_pending = true;
-            return;
-        }
-    };
+    if (self.answerPending(t0)) return;
     self.search_ns = 0;
     defer {
         const total = stats.now() - t0;
@@ -1263,24 +1261,39 @@ pub fn refresh(self: *Ui) void {
             .is_show = false,
         };
     }
-    _ = self.query_arena.reset(.retain_capacity);
-    const a = self.query_arena.allocator();
-    self.items = .empty;
-    self.rows = .empty;
-    self.pending = .empty;
-    if (self.pending_idle != 0) _ = c.g_source_remove(self.pending_idle);
-    self.pending_idle = 0;
-    self.shown_content = null;
-    self.ext_shown = null;
-    self.selected = null;
+    self.resetRows();
     self.confirm_key = "";
-    c.gtk_list_box_remove_all(@ptrCast(self.list));
     c.gtk_flow_box_remove_all(@ptrCast(self.grid));
     // The rows holding the previous icons are gone; GtkImage kept its refs.
     for (self.icons.items) |icon| c.g_object_unref(icon);
     self.icons.clearRetainingCapacity();
 
+    const a = self.query_arena.allocator();
     const q = std.mem.trim(u8, self.query(), " ");
+    self.fill(a, q, t0);
+    self.showEmptyOrResults(a, q);
+    self.selectAfterRefresh();
+}
+
+/// The rows on screen stay while the answer to a new query is on its way
+/// (it refreshes again when it comes): building them again cost a frame
+/// per keystroke. True when that is the case and the query was sent.
+fn answerPending(self: *Ui, t0: u64) bool {
+    const q = std.mem.trim(u8, self.query(), " ");
+    // An extension's search command.
+    if (self.view == .ext and ext_view.waitingForSearch(self, q)) return true;
+    // Contents: the rows on screen are the last result's.
+    if (self.view != .contents) return false;
+    const cs = self.content_search orelse return false;
+    const r = self.content_result orelse return false;
+    if (q.len < 3 or r != self.shown_content or std.mem.eql(u8, r.query, ContentSearch.clip(q))) return false;
+    self.content_gen = cs.submit(q, t0);
+    self.content_pending = true;
+    return true;
+}
+
+/// The current view's rows for `q`.
+fn fill(self: *Ui, a: std.mem.Allocator, q: []const u8, t0: u64) void {
     switch (self.view) {
         .root => self.fillRoot(a, q),
         .clipboard => self.fillFiltered(a, q, true),
@@ -1289,29 +1302,7 @@ pub fn refresh(self: *Ui) void {
             self.addSection("Files");
             for (file_results.fileItems(self, a, q, 60)) |it| self.addItem(it);
         },
-        .contents => if (q.len >= 3) {
-            if (self.content_search) |cs| {
-                // Ask the worker unless the result for this exact query is
-                // already here; meanwhile keep showing the last result.
-                // The worker searches the clipped query: compare with that,
-                // or a query longer than the clip never counts as answered.
-                const fresh = if (self.content_result) |r| std.mem.eql(
-                    u8,
-                    r.query,
-                    ContentSearch.clip(q),
-                ) else false;
-                if (!fresh) self.content_gen = cs.submit(q, t0);
-                self.content_pending = !fresh;
-                if (self.content_result) |r| {
-                    self.addSection("Matches");
-                    for (file_results.itemsFromHits(self, a, r.hits)) |it| self.addItem(it);
-                    self.shown_content = r;
-                }
-            } else {
-                self.addSection("Matches");
-                for (file_results.contentItems(self, a, q, 50)) |it| self.addItem(it);
-            }
-        },
+        .contents => if (q.len >= 3) self.fillContents(a, q, t0),
         .settings, .themes, .default_apps, .choose => self.fillSectioned(a, q),
         // Search commands are asked for `q`; list commands filter here.
         .ext => {
@@ -1324,6 +1315,31 @@ pub fn refresh(self: *Ui) void {
         .input => self.fillSectioned(a, ""),
         .form => self.fillSectioned(a, q),
     }
+}
+
+fn fillContents(self: *Ui, a: std.mem.Allocator, q: []const u8, t0: u64) void {
+    const cs = self.content_search orelse {
+        self.addSection("Matches");
+        for (file_results.contentItems(self, a, q, 50)) |it| self.addItem(it);
+        return;
+    };
+    // Ask the worker unless the result for this exact query is already
+    // here; meanwhile keep showing the last result. The worker searches the
+    // clipped query: compare with that, or a query longer than the clip
+    // never counts as answered.
+    const fresh = if (self.content_result) |r| std.mem.eql(u8, r.query, ContentSearch.clip(q)) else false;
+    if (!fresh) self.content_gen = cs.submit(q, t0);
+    self.content_pending = !fresh;
+    if (self.content_result) |r| {
+        self.addSection("Matches");
+        for (file_results.itemsFromHits(self, a, r.hits)) |it| self.addItem(it);
+        self.shown_content = r;
+    }
+}
+
+/// "No Results" (or the view's empty text) when there is nothing to show,
+/// and which of the list, the grid and the results panel show.
+fn showEmptyOrResults(self: *Ui, a: std.mem.Allocator, q: []const u8) void {
     const searching = self.view == .files or self.view == .contents;
     if (self.rows.items.len == 0 or (searching and self.items.items.len == 0)) {
         if (self.rows.items.len > 0) c.gtk_list_box_remove_all(@ptrCast(self.list));
@@ -1343,7 +1359,10 @@ pub fn refresh(self: *Ui) void {
     c.gtk_widget_set_visible(self.results, @intFromBool(!alone));
     // One panel with only the search bar showing rounds all its corners.
     cssClass(self.column, "alone", alone);
+}
 
+/// Selects the first row, or the one asked for with `setReselect`.
+fn selectAfterRefresh(self: *Ui) void {
     const adj = c.gtk_scrolled_window_get_vadjustment(@ptrCast(self.scroller));
     c.gtk_adjustment_set_value(adj, 0);
     var first = self.nextSelectable(null, 1);
@@ -1969,7 +1988,7 @@ fn reloadApps(data: ?*anyopaque) callconv(.c) c.gboolean {
     self.apps_reload_timer = 0;
     self.apps.reload();
     if (c.gtk_widget_get_visible(self.window) != 0) {
-        if (self.selectedItem()) |it| self.setReselect("{s}", .{it.key});
+        self.keepSelection();
         self.rebuild();
     }
     return 0;

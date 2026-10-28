@@ -162,7 +162,7 @@ fn onRebuildTimer(data: ?*anyopaque) callconv(.c) c.gboolean {
 fn showLines(s: *Session) void {
     const ui = s.ui;
     if (ui.view == .dmenu) {
-        if (ui.selectedItem()) |it| ui.setReselect("{s}", .{it.key});
+        ui.keepSelection();
         ui.rebuild();
     }
 }

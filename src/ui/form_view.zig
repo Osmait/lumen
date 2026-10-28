@@ -94,38 +94,13 @@ pub fn candidates(ui: *Ui, a: std.mem.Allocator) []Item {
 /// Enter on field `i`.
 pub fn edit(ui: *Ui, i: u16) void {
     const f = field(ui, i) orelse return;
-    switch (f.kind) {
-        .toggle => {
-            setValue(ui, i, if (std.mem.eql(u8, value(ui, i), "true")) "false" else "true");
-            ui.setReselect("field:{s}", .{f.name});
-            ui.rebuild();
-        },
-        .choice => {
-            settings_view.setChoosing(ui, .{ .field = i });
-            ui.setReselect("pick:{s}", .{value(ui, i)});
-            ui.navigate(.choose);
-        },
-        .text, .password => {
-            ui.input = .{ .field = i };
-            ui.navigate(.input);
-            c.gtk_editable_set_text(@ptrCast(ui.entry), value(ui, i).ptr);
-            c.gtk_editable_set_position(@ptrCast(ui.entry), -1);
-        },
-    }
+    prefs_view.editValue(ui, .{ .field = i }, f, value(ui, i));
 }
 
 /// The values of choice field `i`, for the choose view.
 pub fn choiceCandidates(ui: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item), i: u16) void {
     const f = field(ui, i) orelse return;
-    for (f.choices) |ch| {
-        out.append(a, .{
-            .key = a.print("pick:{s}", .{ch.value}) catch continue,
-            .title = ch.label,
-            .accessory = if (std.mem.eql(u8, ch.value, value(ui, i))) "✓" else "",
-            .icon = .{ .tile = .{ .name = "object-select-symbolic", .color = .gray } },
-            .action = .{ .setting = .{ .pick = ch.value } },
-        }) catch return;
-    }
+    for (f.choices) |ch| out.append(a, settings_view.pickRow(a, ch, value(ui, i)) catch return) catch return;
 }
 
 pub fn pick(ui: *Ui, i: u16, v: []const u8) void {
