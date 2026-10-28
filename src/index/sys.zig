@@ -229,6 +229,46 @@ pub const AtomicFile = struct {
     }
 };
 
+/// Grows a file in place: what is written goes past its current end, then
+/// `writeAt` patches the start (a header pointing at it) and `sync` makes it
+/// durable. Nothing written before is touched, so mappings of it stay valid.
+pub const AppendFile = struct {
+    fd: i32,
+    /// Where the next `write` goes.
+    len: usize,
+
+    /// Null when the file is not `expect_len` bytes long (someone else wrote
+    /// it): the caller rewrites it whole instead.
+    pub fn open(path: [*:0]const u8, expect_len: usize) Error!?AppendFile {
+        const fd: i32 = @intCast(try check(linux.open(path, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0)));
+        errdefer close(fd);
+        const size = try check(linux.lseek(fd, 0, linux.SEEK.END));
+        if (size != expect_len) {
+            close(fd);
+            return null;
+        }
+        return .{ .fd = fd, .len = size };
+    }
+
+    pub fn write(f: *AppendFile, data: []const u8) Error!void {
+        try f.writeAt(data, f.len);
+        f.len += data.len;
+    }
+
+    pub fn writeAt(f: *AppendFile, data: []const u8, at: usize) Error!void {
+        var off: usize = 0;
+        while (off < data.len) off += try check(linux.pwrite(f.fd, data[off..].ptr, data.len - off, @intCast(at + off)));
+    }
+
+    pub fn sync(f: *AppendFile) Error!void {
+        _ = try check(linux.fsync(f.fd));
+    }
+
+    pub fn deinit(f: *AppendFile) void {
+        close(f.fd);
+    }
+};
+
 /// Creates missing directories, owner-only (existing ones are untouched).
 pub fn mkdirP(path: []const u8) void {
     var buf: [4096]u8 = undefined;

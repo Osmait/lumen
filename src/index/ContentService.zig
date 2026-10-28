@@ -413,7 +413,9 @@ fn refresh(s: *ContentService) void {
     const whole = if (s.index) |*ix| blk: {
         const removed = ix.n_removed + d.gone.len;
         const total = ix.n_docs + d.added.len;
-        break :blk removed * 100 > total * s.opts.max_removed_percent or ix.n_segs >= s.opts.max_segments;
+        break :blk removed * 100 > total * s.opts.max_removed_percent or ix.n_segs >= s.opts.max_segments or
+            // What updates left behind in the file: over 30 %.
+            ix.buf.len * 10 > ix.live_bytes * 13;
     } else true;
     // A whole build indexes every file: they must be listed.
     if (whole and docs == null) {
@@ -429,7 +431,13 @@ fn refresh(s: *ContentService) void {
     if (std.mem.findScalarLast(u8, s.cache_path, '/')) |slash| sys.mkdirP(s.cache_path[0..slash]);
     // Written to the cache file as it grows and served mapped: clean page
     // cache, never the whole index in heap.
-    const written = if (whole)
+    // An update is appended to the file the index is mapped from; rewritten
+    // whole if that file is not what the index was mapped from.
+    const appended: ?content.FileError!content.Index = if (!whole and s.index.?.mapped and !s.unsaved)
+        if (content.appendFile(s.gpa, s.build_pool, &s.index.?, d.gone, d.added, reader, s.cache_path, null)) |r| (if (r) |ix| ix else null) else |err| err
+    else
+        null;
+    const written = appended orelse if (whole)
         content.buildFile(s.gpa, s.build_pool, docs.?, reader, s.cache_path, null)
     else
         content.updateFile(s.gpa, s.build_pool, &s.index.?, d.gone, d.added, reader, s.cache_path, null);

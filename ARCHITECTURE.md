@@ -196,10 +196,18 @@ directory (2.8 s cold) and every core.
   folders it could not watch, and at least every 30 minutes (a .gitignore
   edited in place). Changed and new files are read and added in a segment of their own,
   the old versions and deleted files are flagged removed (queries skip
-  them), and the other segments are copied as they are (`content.update`):
-  two edited files cost 23 ms instead of a 1.6 s rebuild, on 49 k
-  documents. Past 20 % removed or 32 segments it is rebuilt whole, which
-  leaves it clean again. Either way the result is swapped in under a lock.
+  them). The update is appended to the file (`content.appendFile`): the new
+  segment, a new doc table whose path offsets point at the paths already in
+  the file, and a directory referring to the old segments where they are;
+  then fsync, the 64-byte header, fsync. Bytes already written never change,
+  so the old mapping keeps serving until the swap, and a crash before the
+  header leaves the old index intact (bytes past the header's total are
+  ignored). Two edited files: 1.5 MB written and 11 ms, against a 79 MB
+  rewrite (180 ms) or a 1.6 s rebuild before. A run of 4 small segments at
+  the end is merged into the next update's, without removed documents'
+  postings. Past 20 % removed, 32 segments or 30 % of the file no longer
+  used, it is rebuilt whole. Either way the result is swapped in under a
+  lock.
 
 Measured on the same desktop: 43k files / 438 MB of text → 66 MB index, built
 in 0.9 s (first run with extraction of 274 documents: ~38 s, once); queries

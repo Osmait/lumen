@@ -51,6 +51,9 @@ All notable changes are listed here. The format follows
   of ~58 ms, and each copy
   into the clipboard history no longer starts a GTK process. Install both
   files (see the README).
+- Keeping the content index current writes 1.5 MB per change instead of
+  rewriting the whole 79 MB file (11 ms instead of 180): changes are
+  appended to it. The index format changes (LUMCTX04): it is rebuilt once.
 - Typing in Search Files is about twice as fast (23 → 12 ms per key) and
   in Search File Contents a third faster: only the rows you can see are
   built with each keystroke, the rest right after.
