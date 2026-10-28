@@ -116,6 +116,62 @@ pub const Engine = struct {
         const refine = e.cache_valid and e.last_query.items.len > 0 and
             ql.len > e.last_query.items.len and std.mem.startsWith(u8, ql, e.last_query.items);
 
+        var sifted = try e.sift(gpa, pool, store, ql, qmask, limit, refine, cacheable);
+        defer sifted.deinit(gpa);
+        const finalists = &sifted.finalists;
+
+        // Layer 4: the fine scorer ranks, with no volume pressure left. In
+        // blocks on the pool: the UI's 60 results make 3840 finalists, ~1.2
+        // ms on one core.
+        var hits: std.ArrayList(Pair) = .empty;
+        defer hits.deinit(gpa);
+        try hits.resize(gpa, finalists.items.len);
+        var fctx: FineCtx = .{ .store = store, .q = ql, .in = finalists.items, .out = hits.items };
+        pool.runBlocks(finalists.items.len, fine_block, &fctx, FineCtx.block);
+        std.mem.sort(Pair, hits.items, {}, lessThan);
+
+        if (opts.recency) byRecency(pool, store, hits.items, limit);
+
+        const take = @min(limit, hits.items.len);
+        try out.ensureTotalCapacity(gpa, take);
+        for (hits.items[0..take]) |h| out.appendAssumeCapacity(.{ .id = h.id, .score = h.score });
+
+        if (cacheable and !sifted.overflow and sifted.cands.items.len <= cache_max) {
+            e.last_query.clearRetainingCapacity();
+            try e.last_query.appendSlice(gpa, ql);
+            e.last_candidates.clearRetainingCapacity();
+            try e.last_candidates.appendSlice(gpa, sifted.cands.items);
+            e.cache_valid = true;
+        } else e.cache_valid = false;
+    }
+
+    const Sifted = struct {
+        /// The best `limit * finalist_mul` by cheap score.
+        finalists: std.ArrayList(Pair) = .empty,
+        /// Every entry that matched, for refining the next keystroke.
+        cands: std.ArrayList(u32) = .empty,
+        /// Some chunk ran out of memory: `cands` is incomplete.
+        overflow: bool = false,
+
+        fn deinit(f: *Sifted, gpa: std.mem.Allocator) void {
+            f.finalists.deinit(gpa);
+            f.cands.deinit(gpa);
+        }
+    };
+
+    /// Layers 2 and 3 over the index (or the last query's candidates when
+    /// refining), chunk by chunk on the pool, then the chunks' tops merged.
+    fn sift(
+        e: *const Engine,
+        gpa: std.mem.Allocator,
+        pool: *Pool,
+        store: *const Store,
+        ql: []const u8,
+        qmask: u64,
+        limit: usize,
+        refine: bool,
+        cacheable: bool,
+    ) std.mem.Allocator.Error!Sifted {
         const keep = limit * finalist_mul;
         const source_len: usize = if (refine) e.last_candidates.items.len else store.len();
         // Fewer chunks when refining: split the finalist budget among them,
@@ -126,7 +182,6 @@ pub const Engine = struct {
             limit * per_chunk_mul,
             std.math.divCeil(usize, keep, n_chunks) catch keep,
         );
-
         const partials = try gpa.alloc(Partial, n_chunks);
         defer {
             for (partials) |*p| p.deinit(gpa);
@@ -146,66 +201,20 @@ pub const Engine = struct {
         };
         pool.runBlocks(source_len, chunk_entries, &ctx, siftChunk);
 
-        // Merge the per-chunk tops and keep the finalists.
-        var finalists: std.ArrayList(Pair) = .empty;
-        defer finalists.deinit(gpa);
-        var cands: std.ArrayList(u32) = .empty;
-        defer cands.deinit(gpa);
-        var overflow = false;
+        var out: Sifted = .{};
+        errdefer out.deinit(gpa);
         for (partials) |*p| {
-            try finalists.appendSlice(gpa, p.top.items);
-            overflow = overflow or p.overflow;
+            try out.finalists.appendSlice(gpa, p.top.items);
+            out.overflow = out.overflow or p.overflow;
         }
-        if (cacheable and !overflow) {
-            for (partials) |*p| try cands.appendSlice(gpa, p.cands.items);
+        if (cacheable and !out.overflow) {
+            for (partials) |*p| try out.cands.appendSlice(gpa, p.cands.items);
         }
-        if (finalists.items.len > keep) {
-            selectTop(finalists.items, keep);
-            finalists.shrinkRetainingCapacity(keep);
+        if (out.finalists.items.len > keep) {
+            selectTop(out.finalists.items, keep);
+            out.finalists.shrinkRetainingCapacity(keep);
         }
-
-        // Layer 4: the fine scorer ranks, with no volume pressure left. In
-        // blocks on the pool: the UI's 60 results make 3840 finalists, ~1.2
-        // ms on one core.
-        var hits: std.ArrayList(Pair) = .empty;
-        defer hits.deinit(gpa);
-        try hits.resize(gpa, finalists.items.len);
-        var fctx: FineCtx = .{ .store = store, .q = ql, .in = finalists.items, .out = hits.items };
-        pool.runBlocks(finalists.items.len, fine_block, &fctx, FineCtx.block);
-        std.mem.sort(Pair, hits.items, {}, lessThan);
-
-        // Without this the thousands of "Cargo.toml" tie and their order is
-        // arbitrary; the mtime decides which one you meant. A stat costs ~1 us
-        // so only the head is checked: with the bonus capped at
-        // `recency_max`, nothing below `cut - recency_max` can climb into the
-        // top `limit`. The cut comes from position `limit`, not further down.
-        if (opts.recency and hits.items.len > 0) {
-            const cut = hits.items[@min(limit, hits.items.len) - 1].score;
-            const floor = cut -| recency_max;
-            var n: usize = 0;
-            while (n < hits.items.len and hits.items[n].score >= floor) n += 1;
-            n = @min(n, limit * recency_mul);
-            // Up to 960 path rebuilds and stats for the UI's 60: on the pool.
-            var rctx: RecencyCtx = .{
-                .store = store,
-                .hits = hits.items[0..n],
-                .now = sys.nowSeconds(),
-            };
-            pool.runBlocks(n, recency_block, &rctx, RecencyCtx.block);
-            std.mem.sort(Pair, hits.items[0..n], {}, lessThan);
-        }
-
-        const take = @min(limit, hits.items.len);
-        try out.ensureTotalCapacity(gpa, take);
-        for (hits.items[0..take]) |h| out.appendAssumeCapacity(.{ .id = h.id, .score = h.score });
-
-        if (cacheable and !overflow and cands.items.len <= cache_max) {
-            e.last_query.clearRetainingCapacity();
-            try e.last_query.appendSlice(gpa, ql);
-            e.last_candidates.clearRetainingCapacity();
-            try e.last_candidates.appendSlice(gpa, cands.items);
-            e.cache_valid = true;
-        } else e.cache_valid = false;
+        return out;
     }
 };
 
@@ -490,6 +499,24 @@ const RecencyCtx = struct {
         for (ctx.hits[lo..hi]) |*h| h.score += recencyBonus(ctx.store, h.id, ctx.now, &buf);
     }
 };
+
+/// Without this the thousands of "Cargo.toml" tie and their order is
+/// arbitrary; the mtime decides which one you meant. A stat costs ~1 us so
+/// only the head of `hits` (sorted) is checked: with the bonus capped at
+/// `recency_max`, nothing below `cut - recency_max` can climb into the top
+/// `limit`. The cut comes from position `limit`, not further down.
+fn byRecency(pool: *Pool, store: *const Store, hits: []Pair, limit: usize) void {
+    if (hits.len == 0) return;
+    const cut = hits[@min(limit, hits.len) - 1].score;
+    const floor = cut -| recency_max;
+    var n: usize = 0;
+    while (n < hits.len and hits[n].score >= floor) n += 1;
+    n = @min(n, limit * recency_mul);
+    // Up to 960 path rebuilds and stats for the UI's 60: on the pool.
+    var rctx: RecencyCtx = .{ .store = store, .hits = hits[0..n], .now = sys.nowSeconds() };
+    pool.runBlocks(n, recency_block, &rctx, RecencyCtx.block);
+    std.mem.sort(Pair, hits[0..n], {}, lessThan);
+}
 
 /// Coarse on purpose: today vs this month vs old.
 fn recencyBonus(store: *const Store, id: u32, now: i64, buf: *[4096]u8) i32 {

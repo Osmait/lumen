@@ -168,89 +168,121 @@ fn xmlToText(gpa: std.mem.Allocator, xml: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     try out.ensureTotalCapacity(gpa, xml.len / 4 + 16);
-
-    const W = struct {
-        out: *std.ArrayList(u8),
-        gpa: std.mem.Allocator,
-        gap: Gap = .none,
-
-        fn sep(w: *@This(), g: Gap) void {
-            if (@backingInt(g) > @backingInt(w.gap)) w.gap = g;
-        }
-        fn text(w: *@This(), s: []const u8) !void {
-            if (w.gap != .none and w.out.items.len > 0)
-                try w.out.append(w.gpa, if (w.gap == .newline) '\n' else ' ');
-            w.gap = .none;
-            try w.out.appendSlice(w.gpa, s);
-        }
-        /// Character data, entities not decoded (CDATA) or already decoded.
-        fn raw(w: *@This(), s: []const u8) !void {
-            var i: usize = 0;
-            while (i < s.len) {
-                if (isSpace(s[i])) {
-                    w.sep(.space);
-                    i += 1;
-                    continue;
-                }
-                const start = i;
-                while (i < s.len and !isSpace(s[i])) i += 1;
-                try w.text(s[start..i]);
-            }
-        }
-    };
-    var w: W = .{ .out = &out, .gpa = gpa };
-
-    var skip_name: ?[]const u8 = null;
-    var skip_depth: usize = 0;
+    var w: TextOut = .{ .out = &out, .gpa = gpa };
+    var skip: Skip = .{};
     var i: usize = 0;
     while (i < xml.len) {
-        const rest = xml[i..];
-        if (rest[0] != '<') {
-            const end = i + (std.mem.findAny(u8, rest, "<&") orelse rest.len);
-            if (skip_name == null) try w.raw(xml[i..end]);
-            i = end;
-            if (i < xml.len and xml[i] == '&') {
-                const r = decodeEntity(xml[i..]);
-                if (skip_name == null) {
-                    if (r.len == 0) {
-                        try w.text("&");
-                    } else if (r.cp) |cp| {
-                        var buf: [4]u8 = undefined;
-                        switch (cp) {
-                            '\n' => w.sep(.newline),
-                            ' ', '\t', '\r' => w.sep(.space),
-                            else => try w.text(
-                                buf[0 .. std.unicode.utf8Encode(cp, &buf) catch unreachable],
-                            ), // decodeEntity returns only encodable code points
-                        }
-                    }
-                }
-                i += @max(r.len, 1);
+        if (xml[i] != '<') {
+            i = try w.charData(xml, i, skip.name != null);
+            continue;
+        }
+        if (try w.markup(xml, i, skip.name != null)) |next| {
+            i = next;
+            continue;
+        }
+        const tag = Tag.parse(xml, i) orelse break; // truncated
+        i = tag.end + 1;
+        if (skip.swallow(tag)) continue;
+        if (!tag.closing and !tag.self_closing and skipped(tag.local)) {
+            skip = .{ .name = tag.name, .depth = 1 };
+            continue;
+        }
+        w.sep(gapOf(tag.local));
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// Text as it comes out: whitespace runs collapsed into the strongest gap
+/// (a newline beats a space) between words.
+const TextOut = struct {
+    out: *std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+    gap: Gap = .none,
+
+    fn sep(w: *TextOut, g: Gap) void {
+        if (@backingInt(g) > @backingInt(w.gap)) w.gap = g;
+    }
+
+    fn text(w: *TextOut, s: []const u8) !void {
+        if (w.gap != .none and w.out.items.len > 0)
+            try w.out.append(w.gpa, if (w.gap == .newline) '\n' else ' ');
+        w.gap = .none;
+        try w.out.appendSlice(w.gpa, s);
+    }
+
+    /// Character data, entities not decoded (CDATA) or already decoded.
+    fn raw(w: *TextOut, s: []const u8) !void {
+        var i: usize = 0;
+        while (i < s.len) {
+            if (isSpace(s[i])) {
+                w.sep(.space);
+                i += 1;
+                continue;
             }
-            continue;
+            const start = i;
+            while (i < s.len and !isSpace(s[i])) i += 1;
+            try w.text(s[start..i]);
         }
-        if (std.mem.startsWith(u8, rest, "<!--")) {
-            i = if (std.mem.findPos(u8, xml, i + 4, "-->")) |e| e + 3 else xml.len;
-            continue;
+    }
+
+    /// Text from `i` up to the next tag, its entities decoded; where it
+    /// ends. Dropped inside a skipped element.
+    fn charData(w: *TextOut, xml: []const u8, i: usize, skipping: bool) !usize {
+        const rest = xml[i..];
+        const end = i + (std.mem.findAny(u8, rest, "<&") orelse rest.len);
+        if (!skipping) try w.raw(xml[i..end]);
+        if (end == xml.len or xml[end] != '&') return end;
+        const r = decodeEntity(xml[end..]);
+        if (!skipping) {
+            if (r.len == 0) {
+                try w.text("&");
+            } else if (r.cp) |cp| switch (cp) {
+                '\n' => w.sep(.newline),
+                ' ', '\t', '\r' => w.sep(.space),
+                else => {
+                    var buf: [4]u8 = undefined;
+                    // decodeEntity returns only encodable code points.
+                    try w.text(buf[0 .. std.unicode.utf8Encode(cp, &buf) catch unreachable]);
+                },
+            };
         }
+        return end + @max(r.len, 1);
+    }
+
+    /// A comment, CDATA section, declaration or doctype at `i`: where it
+    /// ends. Null for a tag.
+    fn markup(w: *TextOut, xml: []const u8, i: usize, skipping: bool) !?usize {
+        const rest = xml[i..];
+        if (std.mem.startsWith(u8, rest, "<!--"))
+            return if (std.mem.findPos(u8, xml, i + 4, "-->")) |e| e + 3 else xml.len;
         if (std.mem.startsWith(u8, rest, "<![CDATA[")) {
             const e = std.mem.findPos(u8, xml, i + 9, "]]>") orelse xml.len;
-            if (skip_name == null) try w.raw(xml[i + 9 .. e]);
-            i = @min(e + 3, xml.len);
-            continue;
+            if (!skipping) try w.raw(xml[i + 9 .. e]);
+            return @min(e + 3, xml.len);
         }
         if (std.mem.startsWith(u8, rest, "<?")) {
             // A declaration starts each concatenated member (pptx slides).
             w.sep(.newline);
-            i = if (std.mem.findPos(u8, xml, i + 2, "?>")) |e| e + 2 else xml.len;
-            continue;
+            return if (std.mem.findPos(u8, xml, i + 2, "?>")) |e| e + 2 else xml.len;
         }
-        if (std.mem.startsWith(u8, rest, "<!")) {
-            i = if (std.mem.findScalarPos(u8, xml, i + 2, '>')) |e| e + 1 else xml.len;
-            continue;
-        }
+        if (std.mem.startsWith(u8, rest, "<!"))
+            return if (std.mem.findScalarPos(u8, xml, i + 2, '>')) |e| e + 1 else xml.len;
+        return null;
+    }
+};
 
-        // A tag; `>` may appear inside quoted attribute values.
+const Tag = struct {
+    name: []const u8,
+    /// Without its namespace prefix.
+    local: []const u8,
+    closing: bool,
+    self_closing: bool,
+    /// Index of its `>`.
+    end: usize,
+
+    /// The tag starting at `xml[i]` ('<'); null when the input ends inside
+    /// it. `>` may appear inside quoted attribute values.
+    fn parse(xml: []const u8, i: usize) ?Tag {
         var e = i + 1;
         var quote: u8 = 0;
         while (e < xml.len) : (e += 1) {
@@ -261,34 +293,40 @@ fn xmlToText(gpa: std.mem.Allocator, xml: []const u8) ![]u8 {
                 quote = c;
             } else if (c == '>') break;
         }
-        if (e >= xml.len) break; // truncated
+        if (e >= xml.len) return null;
         const closing = xml[i + 1] == '/';
-        const self_closing = xml[e - 1] == '/';
         const name_start = i + 1 + @intFromBool(closing);
         var name_end = name_start;
         while (name_end < e and !isSpace(xml[name_end]) and xml[name_end] != '/') name_end += 1;
         const name = xml[name_start..name_end];
-        const local = name[if (std.mem.findScalarLast(u8, name, ':')) |c| c + 1 else 0..];
-        i = e + 1;
-
-        if (skip_name) |s| {
-            if (std.mem.eql(u8, name, s)) {
-                if (closing) {
-                    skip_depth -= 1;
-                    if (skip_depth == 0) skip_name = null;
-                } else if (!self_closing) skip_depth += 1;
-            }
-            continue;
-        }
-        if (!closing and !self_closing and skipped(local)) {
-            skip_name = name;
-            skip_depth = 1;
-            continue;
-        }
-        w.sep(gapOf(local));
+        return .{
+            .name = name,
+            .local = name[if (std.mem.findScalarLast(u8, name, ':')) |c| c + 1 else 0..],
+            .closing = closing,
+            .self_closing = xml[e - 1] == '/',
+            .end = e,
+        };
     }
-    return out.toOwnedSlice(gpa);
-}
+};
+
+/// The element whose content is being dropped (`skipped`), and how deep
+/// same-named elements nest inside it.
+const Skip = struct {
+    name: ?[]const u8 = null,
+    depth: usize = 0,
+
+    /// True while inside it (this tag included), counting nesting.
+    fn swallow(s: *Skip, tag: Tag) bool {
+        const name = s.name orelse return false;
+        if (std.mem.eql(u8, tag.name, name)) {
+            if (tag.closing) {
+                s.depth -= 1;
+                if (s.depth == 0) s.* = .{};
+            } else if (!tag.self_closing) s.depth += 1;
+        }
+        return true;
+    }
+};
 
 fn isSpace(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\n' or c == '\r';

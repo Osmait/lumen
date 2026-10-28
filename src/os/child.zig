@@ -77,115 +77,132 @@ pub fn run(
         child.kill(io);
     };
 
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    var err: std.ArrayList(u8) = .empty;
-    errdefer err.deinit(gpa);
-
-    // Writing stdin and reading both outputs in one poll loop: a program
-    // that answers before reading all its input cannot deadlock us.
-    var stdin_fd: i32 = -1;
-    if (child.stdin) |f| {
-        stdin_fd = f.handle;
-        const nonblock: u32 = @bitCast(linux.O{ .NONBLOCK = true });
-        _ = linux.fcntl(
-            stdin_fd,
-            linux.F.SETFL,
-            linux.fcntl(stdin_fd, linux.F.GETFL, 0) | nonblock,
-        );
-    }
-    var written: usize = 0;
-    var out_open = true;
-    var err_open = opts.stderr == .collect;
-    var timed_out = false;
-    var capped = false;
-    poll: while (out_open or err_open) {
-        const now = os.monotonicNs();
-        if (now >= opts.deadline_ns) {
-            timed_out = true;
-            break;
-        }
-        var fds: [3]linux.pollfd = undefined;
-        var n: usize = 0;
-        if (out_open) {
-            fds[n] = .{ .fd = child.stdout.?.handle, .events = linux.POLL.IN, .revents = 0 };
-            n += 1;
-        }
-        if (err_open) {
-            fds[n] = .{ .fd = child.stderr.?.handle, .events = linux.POLL.IN, .revents = 0 };
-            n += 1;
-        }
-        if (stdin_fd >= 0) {
-            fds[n] = .{ .fd = stdin_fd, .events = linux.POLL.OUT, .revents = 0 };
-            n += 1;
-        }
-        const left_ms: i32 = @intCast(@min(
-            (opts.deadline_ns - now) / std.time.ns_per_ms + 1,
-            std.math.maxInt(i32),
-        ));
-        const rc = linux.poll(&fds, n, left_ms);
-        switch (linux.errno(rc)) {
-            .SUCCESS => {},
-            .INTR => continue,
-            else => return error.Syscall,
-        }
-        for (fds[0..n]) |p| {
-            if (p.revents == 0) continue;
-            if (p.fd == stdin_fd) {
-                const rest = stdin_bytes[written..];
-                const w = linux.write(stdin_fd, rest.ptr, rest.len);
-                switch (linux.errno(w)) {
-                    .SUCCESS => written += w,
-                    .AGAIN, .INTR => {},
-                    // The program closed its stdin: it does not want the rest.
-                    else => written = stdin_bytes.len,
-                }
-                if (written == stdin_bytes.len) {
-                    child.stdin.?.close(io);
-                    child.stdin = null;
-                    stdin_fd = -1;
-                }
-                continue;
-            }
-            const is_out = child.stdout != null and p.fd == child.stdout.?.handle;
-            const list = if (is_out) &out else &err;
-            var buf: [64 * 1024]u8 = undefined;
-            const r = linux.read(p.fd, &buf, buf.len);
-            switch (linux.errno(r)) {
-                .SUCCESS => if (r == 0) {
-                    if (is_out) out_open = false else err_open = false;
-                } else {
-                    const keep = @min(r, opts.max_output_bytes -| list.items.len);
-                    try list.appendSlice(gpa, buf[0..keep]);
-                    if (opts.at_cap == .kill and list.items.len == opts.max_output_bytes) {
-                        capped = true;
-                        break :poll;
-                    }
-                },
-                .AGAIN, .INTR => {},
-                else => return error.Syscall,
-            }
-        }
-    }
+    var p: Pump = .{
+        .gpa = gpa,
+        .io = io,
+        .child = &child,
+        .opts = &opts,
+        .stdin_bytes = stdin_bytes,
+        .err_open = opts.stderr == .collect,
+    };
+    errdefer p.out.deinit(gpa);
+    errdefer p.err.deinit(gpa);
+    const end = try p.loop();
 
     // Both outputs closed, but the program may live on (it closed them, or
     // a background child holds them): wait for its exit up to the deadline.
-    if (!timed_out and !capped and !os.waitExit(child.id.?, opts.deadline_ns)) timed_out = true;
+    const timed_out = end == .timed_out or
+        (end == .closed and !os.waitExit(child.id.?, opts.deadline_ns));
     var code: ?u8 = null;
-    if (!timed_out and !capped) {
+    if (end == .closed and !timed_out) {
         if (child.wait(io)) |term| switch (term) {
             .exited => |x| code = x,
             else => {},
         } else |_| {}
     }
     return .{
-        .stdout = try out.toOwnedSlice(gpa),
-        .stderr = try err.toOwnedSlice(gpa),
+        .stdout = try p.out.toOwnedSlice(gpa),
+        .stderr = try p.err.toOwnedSlice(gpa),
         .code = code,
         .timed_out = timed_out,
-        .capped = capped,
+        .capped = end == .capped,
     };
 }
+
+/// A running program's pipes: stdin written and both outputs read in one
+/// poll loop, so a program that answers before reading all its input
+/// cannot deadlock it.
+const Pump = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    child: *std.process.Child,
+    opts: *const Options,
+    stdin_bytes: []const u8,
+    written: usize = 0,
+    out: std.ArrayList(u8) = .empty,
+    err: std.ArrayList(u8) = .empty,
+    out_open: bool = true,
+    err_open: bool,
+
+    const End = enum { closed, timed_out, capped };
+
+    fn loop(p: *Pump) Error!End {
+        if (p.child.stdin) |f| {
+            const nonblock: u32 = @bitCast(linux.O{ .NONBLOCK = true });
+            _ = linux.fcntl(f.handle, linux.F.SETFL, linux.fcntl(f.handle, linux.F.GETFL, 0) | nonblock);
+        }
+        while (p.out_open or p.err_open) {
+            const now_ns = os.monotonicNs();
+            if (now_ns >= p.opts.deadline_ns) return .timed_out;
+            var fds: [3]linux.pollfd = undefined;
+            var n: usize = 0;
+            if (p.out_open) {
+                fds[n] = .{ .fd = p.child.stdout.?.handle, .events = linux.POLL.IN, .revents = 0 };
+                n += 1;
+            }
+            if (p.err_open) {
+                fds[n] = .{ .fd = p.child.stderr.?.handle, .events = linux.POLL.IN, .revents = 0 };
+                n += 1;
+            }
+            if (p.child.stdin) |f| {
+                fds[n] = .{ .fd = f.handle, .events = linux.POLL.OUT, .revents = 0 };
+                n += 1;
+            }
+            const left_ms: i32 = @intCast(@min(
+                (p.opts.deadline_ns - now_ns) / std.time.ns_per_ms + 1,
+                std.math.maxInt(i32),
+            ));
+            switch (linux.errno(linux.poll(&fds, n, left_ms))) {
+                .SUCCESS => {},
+                .INTR => continue,
+                else => return error.Syscall,
+            }
+            for (fds[0..n]) |pfd| {
+                if (pfd.revents == 0) continue;
+                if (pfd.events == linux.POLL.OUT) p.feed() else if (try p.drain(pfd.fd)) return .capped;
+            }
+        }
+        return .closed;
+    }
+
+    /// Writes what stdin can take; closes it once all is written.
+    fn feed(p: *Pump) void {
+        const fd = p.child.stdin.?.handle;
+        const rest = p.stdin_bytes[p.written..];
+        const w = linux.write(fd, rest.ptr, rest.len);
+        switch (linux.errno(w)) {
+            .SUCCESS => p.written += w,
+            .AGAIN, .INTR => {},
+            // The program closed its stdin: it does not want the rest.
+            else => p.written = p.stdin_bytes.len,
+        }
+        if (p.written == p.stdin_bytes.len) {
+            p.child.stdin.?.close(p.io);
+            p.child.stdin = null;
+        }
+    }
+
+    /// Reads what output `fd` has. True when the program is to be killed
+    /// at the cap.
+    fn drain(p: *Pump, fd: i32) Error!bool {
+        const is_out = fd == p.child.stdout.?.handle;
+        const list = if (is_out) &p.out else &p.err;
+        var buf: [64 * 1024]u8 = undefined;
+        const r = linux.read(fd, &buf, buf.len);
+        switch (linux.errno(r)) {
+            .SUCCESS => if (r == 0) {
+                if (is_out) p.out_open = false else p.err_open = false;
+            } else {
+                const keep = @min(r, p.opts.max_output_bytes -| list.items.len);
+                try list.appendSlice(p.gpa, buf[0..keep]);
+                return p.opts.at_cap == .kill and list.items.len == p.opts.max_output_bytes;
+            },
+            .AGAIN, .INTR => {},
+            else => return error.Syscall,
+        }
+        return false;
+    }
+};
 
 const testing = std.testing;
 
