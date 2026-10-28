@@ -29,218 +29,91 @@ pub fn settingKey(a: std.mem.Allocator, name: []const u8) []const u8 {
     return a.print("set:{s}", .{name}) catch "";
 }
 
+/// Where a settings row's value and action come from.
+const RowSource = union(enum) {
+    theme,
+    default_apps,
+    choice: settings_mod.Choice,
+    toggle: settings_mod.Toggle,
+};
+
+/// A row: title, icon, source, and extra words it is found by.
+const RowSpec = struct { [:0]const u8, [:0]const u8, RowSource, []const u8 };
+
+/// The Settings view, section by section; a section's rows share a color.
+const setting_rows = [_]struct { [:0]const u8, item_mod.Color, []const RowSpec }{
+    .{ "Appearance", .purple, &.{
+        .{ "Theme", "applications-graphics-symbolic", .theme, "color dark light appearance" },
+        .{ "Text Size", "preferences-desktop-font-symbolic", .{ .choice = .text_size }, "font scale zoom bigger smaller" },
+        .{ "Window Opacity", "display-brightness-symbolic", .{ .choice = .opacity }, "transparency translucent background" },
+        .{ "Window Position", "preferences-desktop-display-symbolic", .{ .choice = .position }, "center top place" },
+        .{ "Icon Theme", "preferences-desktop-icons-symbolic", .{ .choice = .icon_theme }, "icons pack papirus adwaita" },
+    } },
+    .{ "Layout", .green, &.{
+        .{ "Window Width", "view-dual-symbolic", .{ .choice = .width }, "size wide narrow layout" },
+        .{ "Window Height", "view-list-symbolic", .{ .choice = .height }, "size tall short rows results layout" },
+        .{ "Density", "view-grid-symbolic", .{ .choice = .density }, "compact comfortable spacing icons rows layout" },
+    } },
+    .{ "Search", .orange, &.{
+        .{ "Show Files in Main Search", "folder-saved-search-symbolic", .{ .toggle = .files_in_root }, "results" },
+        .{ "Show Suggestions", "starred-symbolic", .{ .toggle = .suggestions }, "frecency recent most used" },
+    } },
+    .{ "Clipboard", .red, &.{
+        .{ "Clipboard History", "edit-paste-symbolic", .{ .toggle = .clipboard }, "copy paste record" },
+        .{ "Clipboard Entries to Keep", "document-open-recent-symbolic", .{ .choice = .clipboard_keep }, "history size limit" },
+    } },
+    .{ "Apps", .blue, &.{
+        .{ "Default Apps", "applications-system-symbolic", .default_apps, "open with file types associations mime" },
+        .{ "Terminal", "utilities-terminal-symbolic", .{ .choice = .terminal }, "console shell emulator" },
+        .{ "Editor for Open at Line", "accessories-text-editor-symbolic", .{ .choice = .editor }, "code vim nvim" },
+    } },
+};
+
+/// A row of `setting_rows`, its value as it is now. Rows are found again by
+/// their setting's name (`settingKey`).
+fn settingRow(ui: *Ui, a: std.mem.Allocator, section: [:0]const u8, color: item_mod.Color, r: RowSpec) Item {
+    const title, const icon, const source, const keywords = r;
+    const name: []const u8, const value: [:0]const u8, const action: item_mod.Setting = switch (source) {
+        .theme => .{ "theme", themes.displayName(a, ui.settings.theme, ui.preferDark()), .{ .go = .themes } },
+        .default_apps => .{ "default_apps", defaultAppsSummary(ui, a), .{ .go = .default_apps } },
+        .choice => |ch| .{ @tagName(ch), choiceLabel(ui, a, ch), .{ .choose = ch } },
+        .toggle => |t| .{ @tagName(t), if (ui.settings.get(t)) "On" else "Off", .{ .toggle = t } },
+    };
+    return .{
+        .key = settingKey(a, name),
+        .section = section,
+        .title = title,
+        .accessory = value,
+        .icon = .{ .tile = .{ .name = icon, .color = color } },
+        .action = .{ .setting = action },
+        .keywords = keywords,
+    };
+}
+
 pub fn settingsCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
     var out: std.ArrayList(Item) = .empty;
-    const st = &ui.settings;
-    const S = struct {
-        const Row = struct {
-            section: [:0]const u8,
-            /// The key the row is found by again (reselect).
-            name: []const u8,
-            title: [:0]const u8,
-            /// The current value, shown on the right.
-            value: [:0]const u8,
-            icon: [:0]const u8,
-            color: item_mod.Color,
-            action: item_mod.Setting,
-            /// Extra words it is found by.
-            keywords: []const u8 = "",
-        };
-        fn row(al: std.mem.Allocator, r: Row) Item {
-            return .{
-                .key = settingKey(al, r.name),
-                .section = r.section,
-                .title = r.title,
-                .accessory = r.value,
-                .icon = .{ .tile = .{ .name = r.icon, .color = r.color } },
-                .action = .{ .setting = r.action },
-                .keywords = r.keywords,
-            };
-        }
-        fn onOff(b: bool) [:0]const u8 {
-            return if (b) "On" else "Off";
-        }
+    for (setting_rows) |sec| for (sec[2]) |r| {
+        out.append(a, settingRow(ui, a, sec[0], sec[1], r)) catch break;
     };
-    const choose = struct {
-        fn f(ch: settings_mod.Choice) item_mod.Setting {
-            return .{ .choose = ch };
-        }
-    }.f;
-    out.append(a, S.row(a, .{
-        .section = "Appearance",
-        .name = "theme",
-        .title = "Theme",
-        .value = themes.displayName(a, st.theme, ui.preferDark()),
-        .icon = "applications-graphics-symbolic",
-        .color = .purple,
-        .action = .{ .go = .themes },
-        .keywords = "color dark light appearance",
-    })) catch {};
-    out.append(a, S.row(a, .{
-        .section = "Appearance",
-        .name = "text_size",
-        .title = "Text Size",
-        .value = choiceLabel(ui, a, .text_size),
-        .icon = "preferences-desktop-font-symbolic",
-        .color = .purple,
-        .action = choose(.text_size),
-        .keywords = "font scale zoom bigger smaller",
-    })) catch {};
-    out.append(a, S.row(a, .{
-        .section = "Appearance",
-        .name = "opacity",
-        .title = "Window Opacity",
-        .value = choiceLabel(ui, a, .opacity),
-        .icon = "display-brightness-symbolic",
-        .color = .purple,
-        .action = choose(.opacity),
-        .keywords = "transparency translucent background",
-    })) catch {};
-    out.append(a, S.row(a, .{
-        .section = "Appearance",
-        .name = "position",
-        .title = "Window Position",
-        .value = choiceLabel(ui, a, .position),
-        .icon = "preferences-desktop-display-symbolic",
-        .color = .purple,
-        .action = choose(.position),
-        .keywords = "center top place",
-    })) catch {};
-    out.append(a, S.row(a, .{
-        .section = "Appearance",
-        .name = "icon_theme",
-        .title = "Icon Theme",
-        .value = choiceLabel(ui, a, .icon_theme),
-        .icon = "preferences-desktop-icons-symbolic",
-        .color = .purple,
-        .action = choose(.icon_theme),
-        .keywords = "icons pack papirus adwaita",
-    })) catch {};
-    out.append(a, S.row(a, .{
-        .section = "Layout",
-        .name = "width",
-        .title = "Window Width",
-        .value = choiceLabel(ui, a, .width),
-        .icon = "view-dual-symbolic",
-        .color = .green,
-        .action = choose(.width),
-        .keywords = "size wide narrow layout",
-    })) catch {};
-    out.append(a, S.row(a, .{
-        .section = "Layout",
-        .name = "height",
-        .title = "Window Height",
-        .value = choiceLabel(ui, a, .height),
-        .icon = "view-list-symbolic",
-        .color = .green,
-        .action = choose(.height),
-        .keywords = "size tall short rows results layout",
-    })) catch {};
-    out.append(a, S.row(a, .{
-        .section = "Layout",
-        .name = "density",
-        .title = "Density",
-        .value = choiceLabel(ui, a, .density),
-        .icon = "view-grid-symbolic",
-        .color = .green,
-        .action = choose(.density),
-        .keywords = "compact comfortable spacing icons rows layout",
-    })) catch {};
-    out.append(a, S.row(a, .{
-        .section = "Search",
-        .name = "files_in_root",
-        .title = "Show Files in Main Search",
-        .value = S.onOff(st.files_in_root),
-        .icon = "folder-saved-search-symbolic",
-        .color = .orange,
-        .action = .{ .toggle = .files_in_root },
-        .keywords = "results",
-    })) catch {};
-    out.append(a, S.row(a, .{
-        .section = "Search",
-        .name = "suggestions",
-        .title = "Show Suggestions",
-        .value = S.onOff(st.suggestions),
-        .icon = "starred-symbolic",
-        .color = .orange,
-        .action = .{ .toggle = .suggestions },
-        .keywords = "frecency recent most used",
-    })) catch {};
-    out.append(a, S.row(a, .{
-        .section = "Clipboard",
-        .name = "clipboard",
-        .title = "Clipboard History",
-        .value = S.onOff(st.clipboard),
-        .icon = "edit-paste-symbolic",
-        .color = .red,
-        .action = .{ .toggle = .clipboard },
-        .keywords = "copy paste record",
-    })) catch {};
-    out.append(a, S.row(a, .{
-        .section = "Clipboard",
-        .name = "clipboard_keep",
-        .title = "Clipboard Entries to Keep",
-        .value = choiceLabel(ui, a, .clipboard_keep),
-        .icon = "document-open-recent-symbolic",
-        .color = .red,
-        .action = choose(.clipboard_keep),
-        .keywords = "history size limit",
-    })) catch {};
-    out.append(a, S.row(a, .{
-        .section = "Apps",
-        .name = "default_apps",
-        .title = "Default Apps",
-        .value = defaultAppsSummary(ui, a),
-        .icon = "applications-system-symbolic",
-        .color = .blue,
-        .action = .{ .go = .default_apps },
-        .keywords = "open with file types associations mime",
-    })) catch {};
-    out.append(a, S.row(a, .{
-        .section = "Apps",
-        .name = "terminal",
-        .title = "Terminal",
-        .value = choiceLabel(ui, a, .terminal),
-        .icon = "utilities-terminal-symbolic",
-        .color = .blue,
-        .action = choose(.terminal),
-        .keywords = "console shell emulator",
-    })) catch {};
-    out.append(a, S.row(a, .{
-        .section = "Apps",
-        .name = "editor",
-        .title = "Editor for Open at Line",
-        .value = choiceLabel(ui, a, .editor),
-        .icon = "accessories-text-editor-symbolic",
-        .color = .blue,
-        .action = choose(.editor),
-        .keywords = "code vim nvim",
-    })) catch {};
     prefs_view.extensionRows(ui, a, &out);
-    var file_item = S.row(a, .{
+    out.append(a, .{
+        .key = settingKey(a, "open_file"),
         .section = "Lumen",
-        .name = "open_file",
         .title = "Open Settings File",
-        .value = "",
-        .icon = "document-edit-symbolic",
-        .color = .gray,
-        .action = .open_file,
+        .subtitle = labels.homeRelative(a, ui.settings_path),
+        .icon = .{ .tile = .{ .name = "document-edit-symbolic", .color = .gray } },
+        .action = .{ .setting = .open_file },
         .keywords = "config edit text",
-    });
-    file_item.subtitle = labels.homeRelative(a, ui.settings_path);
-    out.append(a, file_item) catch {};
-    var reset = S.row(a, .{
+    }) catch {};
+    out.append(a, .{
+        .key = settingKey(a, "reset"),
         .section = "Lumen",
-        .name = "reset",
         .title = "Reset All Settings",
-        .value = "",
-        .icon = "edit-undo-symbolic",
-        .color = .gray,
-        .action = .reset,
+        .icon = .{ .tile = .{ .name = "edit-undo-symbolic", .color = .gray } },
+        .action = .{ .setting = .reset },
         .keywords = "defaults restore",
-    });
-    reset.confirm = true;
-    out.append(a, reset) catch {};
+        .confirm = true,
+    }) catch {};
     // What init.lua fixes cannot be changed here.
     for (out.items) |*it| {
         const key = settingName(it.action.setting) orelse continue;

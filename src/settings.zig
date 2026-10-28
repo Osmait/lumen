@@ -179,19 +179,17 @@ pub const Settings = struct {
         return false;
     }
 
+    // Toggle's and Choice's tags are the names of the fields they set.
+
     pub fn get(s: *const Settings, t: Toggle) bool {
         return switch (t) {
-            .files_in_root => s.files_in_root,
-            .suggestions => s.suggestions,
-            .clipboard => s.clipboard,
+            inline else => |tag| @field(s, @tagName(tag)),
         };
     }
 
     pub fn setToggle(s: *Settings, t: Toggle, on: bool) void {
         switch (t) {
-            .files_in_root => s.files_in_root = on,
-            .suggestions => s.suggestions = on,
-            .clipboard => s.clipboard = on,
+            inline else => |tag| @field(s, @tagName(tag)) = on,
         }
     }
 
@@ -237,16 +235,14 @@ pub const Settings = struct {
     /// The current value of a choice as its text (what `setChoice` takes).
     pub fn choiceValue(s: *const Settings, ch: Choice, buf: []u8) []const u8 {
         return switch (ch) {
-            .text_size => @tagName(s.text_size),
-            .position => @tagName(s.position),
-            .width => @tagName(s.width),
-            .height => @tagName(s.height),
-            .density => @tagName(s.density),
-            .opacity => std.mem.print(buf, "{d}", .{s.opacity}) catch "",
-            .clipboard_keep => std.mem.print(buf, "{d}", .{s.clipboard_keep}) catch "",
-            .terminal => s.terminal,
-            .editor => s.editor,
-            .icon_theme => s.icon_theme,
+            inline else => |tag| {
+                const v = @field(s, @tagName(tag));
+                return switch (@typeInfo(@TypeOf(v))) {
+                    .@"enum" => @tagName(v),
+                    .int => std.mem.print(buf, "{d}", .{v}) catch "",
+                    else => v,
+                };
+            },
         };
     }
 

@@ -97,8 +97,8 @@ where they fit a desktop program:
   the command-line flags) are exempt, and so is a hot loop that was
   measured.
 - **Lines of up to 100 columns**: a trailing comma makes `zig fmt` break a
-  call or initializer, the long last argument first. String literals and
-  test names may run over.
+  call or initializer, the long last argument first. String literals, the
+  rows of a table and test names may run over.
 - **Handle every error** (see above); a bind or a write that can fail is
   checked, never discarded.
 - **Prefer one copy**: when the same lines appear a third time, they become
