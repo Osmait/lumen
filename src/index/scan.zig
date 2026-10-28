@@ -75,6 +75,46 @@ const LevelCtx = struct {
 /// is read: a change is then either in the read or arrives as an event,
 /// never lost in between (scanning first and arming later leaves a blind
 /// window as long as the arming).
+/// Adds what one level's folders hold to the index, and the folders among
+/// it to `next` (when the walk goes `deeper`).
+fn addLevel(
+    gpa: std.mem.Allocator,
+    b: *Builder,
+    frontier: []const Frontier,
+    batches: []const Batch,
+    depth: u16,
+    deeper: bool,
+    next: *std.ArrayList(Frontier),
+    st: *Stats,
+) std.mem.Allocator.Error!void {
+    for (frontier, batches) |parent, *batch| {
+        st.errors += batch.errors;
+        var start: usize = 0;
+        for (batch.ends.items, batch.flags.items) |end, fl0| {
+            const name = batch.names.items[start..end];
+            start = end;
+            // Hidden is inherited: everything under a dot-dir is noise
+            // even if its own name has no dot.
+            const fl = if (parent.hidden) fl0 | store_mod.flag_hidden else fl0;
+            const id = try b.push(gpa, name, parent.id, fl, depth);
+            if (fl & store_mod.flag_dir == 0) {
+                st.files += 1;
+                continue;
+            }
+            st.dirs += 1;
+            if (!deeper) continue;
+            const sep = if (std.mem.endsWith(u8, parent.path, "/")) "" else "/";
+            const child = try gpa.printSentinel("{s}{s}{s}", .{ parent.path, sep, name }, 0);
+            errdefer gpa.free(child);
+            try next.append(gpa, .{
+                .id = id,
+                .path = child,
+                .hidden = fl & store_mod.flag_hidden != 0,
+            });
+        }
+    }
+}
+
 pub fn scan(
     gpa: std.mem.Allocator,
     pool: *Pool,
@@ -128,37 +168,7 @@ pub fn scan(
             for (next.items) |f| gpa.free(f.path);
             next.deinit(gpa);
         }
-        for (frontier.items, batches) |parent, *batch| {
-            st.errors += batch.errors;
-            var start: usize = 0;
-            for (batch.ends.items, batch.flags.items) |end, fl0| {
-                const name = batch.names.items[start..end];
-                start = end;
-                // Hidden is inherited: everything under a dot-dir is noise
-                // even if its own name has no dot.
-                const fl = if (parent.hidden) fl0 | store_mod.flag_hidden else fl0;
-                const id = try b.push(gpa, name, parent.id, fl, depth);
-                if (fl & store_mod.flag_dir != 0) {
-                    st.dirs += 1;
-                    if (depth < cfg.max_depth) {
-                        const child = try gpa.printSentinel(
-                            "{s}{s}{s}",
-                            .{
-                                parent.path,
-                                if (std.mem.endsWith(u8, parent.path, "/")) "" else "/",
-                                name,
-                            },
-                            0,
-                        );
-                        try next.append(gpa, .{
-                            .id = id,
-                            .path = child,
-                            .hidden = fl & store_mod.flag_hidden != 0,
-                        });
-                    }
-                } else st.files += 1;
-            }
-        }
+        try addLevel(gpa, &b, frontier.items, batches, depth, depth < cfg.max_depth, &next, &st);
         for (frontier.items) |f| gpa.free(f.path);
         frontier.deinit(gpa);
         frontier = next;

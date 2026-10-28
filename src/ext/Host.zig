@@ -917,6 +917,78 @@ fn parseField(
     return pref;
 }
 
+/// Which of items, search, run or submit the command has (at most one);
+/// null for none.
+fn commandMode(L: *lua.State, t: c_int, where: []const u8) ?Mode {
+    var mode: ?Mode = null;
+    // The field, its mode, and whether a table is allowed (a fixed list).
+    const kinds = [_]struct { [:0]const u8, Mode, bool }{
+        .{ "items", .list, true },
+        .{ "search", .search, false },
+        .{ "run", .run, false },
+        .{ "submit", .form, false },
+    };
+    for (kinds) |k| {
+        const ty = lua.getField(L, t, k[0]);
+        defer lua.c.lua_settop(L, -2);
+        if (ty == lua.c.LUA_TNIL) continue;
+        const ok = ty == lua.c.LUA_TFUNCTION or (k[2] and ty == lua.c.LUA_TTABLE);
+        if (!ok) lua.raise(L, "{s}.{s}: {s} expected, got {s}", .{
+            where,
+            k[0],
+            if (k[2]) "function or table" else "function",
+            lua.typeName(L, -1),
+        });
+        if (mode != null) lua.raise(
+            L,
+            "{s}: give it one of items, search or run, not several",
+            .{where},
+        );
+        mode = k[1];
+    }
+    return mode;
+}
+
+/// A form's fields (1 to 20, names unique); none for another command,
+/// which must not have any.
+fn formFields(
+    L: *lua.State,
+    ctx: *LoadCtx,
+    t: c_int,
+    is_form: bool,
+    where: []const u8,
+    ext_title: [:0]const u8,
+) []const Pref {
+    if (!is_form) {
+        const ty = lua.getField(L, t, "fields");
+        lua.c.lua_settop(L, -2);
+        if (ty != lua.c.LUA_TNIL) lua.raise(L, "{s}.fields: a form needs submit too", .{where});
+        return &.{};
+    }
+    if (lua.getField(L, t, "fields") != lua.c.LUA_TTABLE) lua.raise(
+        L,
+        "{s}.fields: a list of fields expected for a form",
+        .{where},
+    );
+    defer lua.c.lua_settop(L, -2);
+    const list_idx = lua.absIndex(L, -1);
+    const n = lua.c.lua_rawlen(L, list_idx);
+    if (n == 0 or n > 20) lua.raise(L, "{s}.fields: 1 to 20 fields", .{where});
+    const out = ctx.load.a.alloc(Pref, n) catch lua.oom(L);
+    for (out, 1..) |*f, i| {
+        var wbuf: [48]u8 = undefined;
+        const fwhere = std.mem.print(&wbuf, "{s}.fields[{d}]", .{ where, i }) catch where;
+        f.* = parseField(L, ctx, lua.tableAt(L, list_idx, i, fwhere), fwhere, ext_title);
+        lua.c.lua_settop(L, -2);
+        for (out[0 .. i - 1]) |prev| if (std.mem.eql(u8, prev.name, f.name)) lua.raise(
+            L,
+            "{s}: two fields named \"{s}\"",
+            .{ where, f.name },
+        );
+    }
+    return out;
+}
+
 fn parseCommand(
     L: *lua.State,
     ctx: *LoadCtx,
@@ -962,65 +1034,14 @@ fn parseCommand(
         );
         break :blk ty == lua.c.LUA_TFUNCTION;
     };
-    var mode: ?Mode = null;
-    const kinds = [_]struct { [:0]const u8, Mode, bool }{ .{ "items", .list, true }, .{
-        "search",
-        .search,
-        false,
-    }, .{ "run", .run, false }, .{ "submit", .form, false } };
-    for (kinds) |k| {
-        const ty = lua.getField(L, t, k[0]);
-        defer lua.c.lua_settop(L, -2);
-        if (ty == lua.c.LUA_TNIL) continue;
-        const ok = ty == lua.c.LUA_TFUNCTION or (k[2] and ty == lua.c.LUA_TTABLE);
-        if (!ok) lua.raise(L, "{s}.{s}: {s} expected, got {s}", .{
-            where,
-            k[0],
-            if (k[2]) "function or table" else "function",
-            lua.typeName(L, -1),
-        });
-        if (mode != null) lua.raise(
-            L,
-            "{s}: give it one of items, search or run, not several",
-            .{where},
-        );
-        mode = k[1];
-    }
+    const mode = commandMode(L, t, where);
 
     var icon = default_icon;
     _ = lua.getField(L, t, "icon");
     if (parseIcon(L, a, -1, where)) |x| icon = x;
     lua.c.lua_settop(L, -2);
 
-    var fields: []const Pref = &.{};
-    if (mode == .form) {
-        if (lua.getField(L, t, "fields") != lua.c.LUA_TTABLE) lua.raise(
-            L,
-            "{s}.fields: a list of fields expected for a form",
-            .{where},
-        );
-        const list_idx = lua.absIndex(L, -1);
-        const n = lua.c.lua_rawlen(L, list_idx);
-        if (n == 0 or n > 20) lua.raise(L, "{s}.fields: 1 to 20 fields", .{where});
-        const out = a.alloc(Pref, n) catch lua.oom(L);
-        for (out, 1..) |*f, i| {
-            var wbuf: [48]u8 = undefined;
-            const fwhere = std.mem.print(&wbuf, "{s}.fields[{d}]", .{ where, i }) catch where;
-            f.* = parseField(L, ctx, lua.tableAt(L, list_idx, i, fwhere), fwhere, ext_title);
-            lua.c.lua_settop(L, -2);
-            for (out[0 .. i - 1]) |prev| if (std.mem.eql(u8, prev.name, f.name)) lua.raise(
-                L,
-                "{s}: two fields named \"{s}\"",
-                .{ where, f.name },
-            );
-        }
-        lua.c.lua_settop(L, -2);
-        fields = out;
-    } else {
-        const ty = lua.getField(L, t, "fields");
-        lua.c.lua_settop(L, -2);
-        if (ty != lua.c.LUA_TNIL) lua.raise(L, "{s}.fields: a form needs submit too", .{where});
-    }
+    const fields = formFields(L, ctx, t, mode == .form, where, ext_title);
 
     const cmd: Command = .{
         .id = id,

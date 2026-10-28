@@ -473,103 +473,99 @@ fn layout(L: *lua.State) lua.Error!c_int {
             .{layout_mod.keys},
         );
         if (std.mem.eql(u8, key, "searchbar") or std.mem.eql(u8, key, "row")) {
-            if (c.lua_type(L, -1) != c.LUA_TTABLE) return lua.fail(
-                L,
-                "lumen.layout: {s} is a list of part names",
-                .{key},
-            );
-            var names: [8][]const u8 = undefined;
-            const n = c.lua_rawlen(L, -1);
-            if (n == 0 or n > names.len) return lua.fail(
-                L,
-                "lumen.layout: {s} lists 1 to 6 parts",
-                .{key},
-            );
-            for (names[0..n], 1..) |*name, i| {
-                _ = c.lua_rawgeti(L, -1, @intCast(i));
-                name.* = lua.toSlice(L, -1) orelse return lua.fail(
-                    L,
-                    "lumen.layout: {s}[{d}] is a part name",
-                    .{ key, i },
-                );
-                c.lua_settop(L, -2);
-            }
-            const is_bar = key[0] == 's';
-            const ok = if (is_bar) layout_mod.setParts(
-                layout_mod.BarPart,
-                &l.searchbar,
-                names[0..n],
-                .entry,
-            ) else layout_mod.setParts(layout_mod.RowPart, &l.row, names[0..n], .text);
-            ok catch return lua.fail(L, "lumen.layout: {s} takes each of {s} at most once, {s} included", .{
-                key,
-                if (is_bar) "back, icon, prompt, scope, entry, keys" else "icon, text, accessory, hint",
-                if (is_bar) "entry" else "text",
-            });
+            try layoutParts(L, &l, key);
         } else if (std.mem.eql(u8, key, "prompt") or std.mem.eql(u8, key, "placeholder")) {
             const p = lua.toSlice(L, -1) orelse return lua.fail(
                 L,
                 "lumen.layout: {s} is a string",
                 .{key},
             );
-            const text = load.a.dupeSentinel(
-                u8,
-                p[0..@min(p.len, 64)],
-                0,
-            ) catch return lua.failOom(L);
+            const text = load.a.dupeSentinel(u8, p[0..@min(p.len, 64)], 0) catch return lua.failOom(L);
             if (key[1] == 'r') l.prompt = text else l.placeholder = text;
         } else if (std.mem.eql(u8, key, "show")) {
-            if (c.lua_type(L, -1) != c.LUA_TTABLE) return lua.fail(
-                L,
-                "lumen.layout: show is a table of true/false",
-                .{},
-            );
-            const show = lua.absIndex(L, -1);
-            c.lua_pushnil(L);
-            while (c.lua_next(L, show) != 0) {
-                const sk = lua.toSlice(L, -2) orelse return lua.fail(
-                    L,
-                    "lumen.layout: show's keys are {s}",
-                    .{layout_mod.show_keys},
-                );
-                if (c.lua_type(L, -1) != c.LUA_TBOOLEAN) return lua.fail(
-                    L,
-                    "lumen.layout: show.{s} is true or false",
-                    .{sk},
-                );
-                layout_mod.setShow(&l.show, sk, c.lua_toboolean(L, -1) != 0) catch
-                    return lua.fail(
-                        L,
-                        "lumen.layout: show has no \"{s}\" (it has {s})",
-                        .{ sk, layout_mod.show_keys },
-                    );
-                c.lua_settop(L, -2);
-            }
+            try layoutShow(L, &l);
         } else {
-            const value: layout_mod.Value = switch (c.lua_type(L, -1)) {
-                c.LUA_TNUMBER => .{ .number = c.lua_tonumberx(L, -1, null) },
-                c.LUA_TSTRING => .{ .string = lua.toSlice(L, -1).? },
-                c.LUA_TBOOLEAN => .{ .boolean = c.lua_toboolean(L, -1) != 0 },
-                else => .{},
-            };
-            layout_mod.set(&l, key, value) catch |err| return switch (err) {
-                error.UnknownKey => lua.fail(
-                    L,
-                    "lumen.layout: no \"{s}\" (it has {s})",
-                    .{ key, layout_mod.keys },
-                ),
-                error.BadValue => lua.fail(
-                    L,
-                    "lumen.layout: bad value for {s} (see EXTENSIONS.md)",
-                    .{key},
-                ),
-            };
+            try layoutValue(L, &l, key);
         }
         c.lua_settop(L, -2);
     }
     load.layout = l;
     load.has_layout = true;
     return 0;
+}
+
+/// `searchbar` or `row` (on top of the stack): the parts in order.
+fn layoutParts(L: *lua.State, l: *layout_mod.Layout, key: []const u8) lua.Error!void {
+    if (c.lua_type(L, -1) != c.LUA_TTABLE) return lua.fail(
+        L,
+        "lumen.layout: {s} is a list of part names",
+        .{key},
+    );
+    var names: [8][]const u8 = undefined;
+    const n = c.lua_rawlen(L, -1);
+    if (n == 0 or n > names.len) return lua.fail(L, "lumen.layout: {s} lists 1 to 6 parts", .{key});
+    for (names[0..n], 1..) |*name, i| {
+        _ = c.lua_rawgeti(L, -1, @intCast(i));
+        name.* = lua.toSlice(L, -1) orelse return lua.fail(
+            L,
+            "lumen.layout: {s}[{d}] is a part name",
+            .{ key, i },
+        );
+        c.lua_settop(L, -2);
+    }
+    const is_bar = key[0] == 's';
+    const ok = if (is_bar)
+        layout_mod.setParts(layout_mod.BarPart, &l.searchbar, names[0..n], .entry)
+    else
+        layout_mod.setParts(layout_mod.RowPart, &l.row, names[0..n], .text);
+    ok catch return lua.fail(L, "lumen.layout: {s} takes each of {s} at most once, {s} included", .{
+        key,
+        if (is_bar) "back, icon, prompt, scope, entry, keys" else "icon, text, accessory, hint",
+        if (is_bar) "entry" else "text",
+    });
+}
+
+/// `show` (on top of the stack): which parts of the window show.
+fn layoutShow(L: *lua.State, l: *layout_mod.Layout) lua.Error!void {
+    if (c.lua_type(L, -1) != c.LUA_TTABLE) return lua.fail(
+        L,
+        "lumen.layout: show is a table of true/false",
+        .{},
+    );
+    const show = lua.absIndex(L, -1);
+    c.lua_pushnil(L);
+    while (c.lua_next(L, show) != 0) {
+        const sk = lua.toSlice(L, -2) orelse return lua.fail(
+            L,
+            "lumen.layout: show's keys are {s}",
+            .{layout_mod.show_keys},
+        );
+        if (c.lua_type(L, -1) != c.LUA_TBOOLEAN) return lua.fail(
+            L,
+            "lumen.layout: show.{s} is true or false",
+            .{sk},
+        );
+        layout_mod.setShow(&l.show, sk, c.lua_toboolean(L, -1) != 0) catch return lua.fail(
+            L,
+            "lumen.layout: show has no \"{s}\" (it has {s})",
+            .{ sk, layout_mod.show_keys },
+        );
+        c.lua_settop(L, -2);
+    }
+}
+
+/// Any other key: a number, string or boolean setting.
+fn layoutValue(L: *lua.State, l: *layout_mod.Layout, key: []const u8) lua.Error!void {
+    const value: layout_mod.Value = switch (c.lua_type(L, -1)) {
+        c.LUA_TNUMBER => .{ .number = c.lua_tonumberx(L, -1, null) },
+        c.LUA_TSTRING => .{ .string = lua.toSlice(L, -1).? },
+        c.LUA_TBOOLEAN => .{ .boolean = c.lua_toboolean(L, -1) != 0 },
+        else => .{},
+    };
+    layout_mod.set(l, key, value) catch |err| return switch (err) {
+        error.UnknownKey => lua.fail(L, "lumen.layout: no \"{s}\" (it has {s})", .{ key, layout_mod.keys }),
+        error.BadValue => lua.fail(L, "lumen.layout: bad value for {s} (see EXTENSIONS.md)", .{key}),
+    };
 }
 
 /// `lumen.icons { ["app:firefox"] = "~/icons/fox.svg", ["cmd:clipboard"] =

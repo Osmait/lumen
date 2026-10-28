@@ -458,19 +458,9 @@ fn refresh(s: *ContentService) void {
     var arena_state: std.heap.ArenaAllocator = .init(s.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    var t = sys.monotonicNs();
     const names = if (s.opts.names) |n| n.nameChanges() else null;
-    const must_list = s.index == null or names == null or s.listed_names == null or
-        names.? != s.listed_names.? or t - s.last_listing_at >= s.opts.list_every_ns;
     var docs: ?[]content.DocIn = null;
-    var d = if (must_list) blk: {
-        docs = s.listAll(arena, names) orelse return;
-        break :blk s.diff(arena, docs.?) catch return;
-    } else blk: {
-        const r = s.indexedChanges(arena) catch return;
-        s.last_stat_ns.store(sys.monotonicNs() - t, .monotonic);
-        break :blk r;
-    };
+    var d = s.changes(arena, names, &docs) orelse return;
     if (s.index != null and d.gone.len == 0 and d.added.len == 0) {
         if (s.unsaved) s.retrySave();
         return;
@@ -479,83 +469,18 @@ fn refresh(s: *ContentService) void {
     s.building.store(true, .release);
     defer s.building.store(false, .release);
     defer @import("root.zig").trimHeap();
-    // Whole when there is nothing to update, or when what updates leave
-    // behind (removed versions, small segments) has piled up.
-    const whole = if (s.index) |*ix| blk: {
-        const removed = ix.n_removed + d.gone.len;
-        const total = ix.n_docs + d.added.len;
-        break :blk removed * 100 > total * s.opts.max_removed_percent or ix.n_segs >= s.opts.max_segments or
-            // What updates left behind in the file: over 30 %.
-            ix.buf.len * 10 > ix.live_bytes * 13;
-    } else true;
+    const whole = s.wantsWhole(d);
     // A whole build indexes every file: they must be listed.
     if (whole and docs == null) {
         docs = s.listAll(arena, names) orelse return;
         d = s.diff(arena, docs.?) catch return;
     }
-    t = sys.monotonicNs();
+    var t = sys.monotonicNs();
     s.extractMissing(if (whole) docs.? else d.added);
     s.last_extract_ns.store(sys.monotonicNs() - t, .monotonic);
     if (s.stop.load(.acquire)) return;
     t = sys.monotonicNs();
-    const reader: content.TextReader = .{ .read = textOf, .ctx = s };
-    if (std.mem.findScalarLast(u8, s.cache_path, '/')) |slash| sys.mkdirP(s.cache_path[0..slash]);
-    // Written to the cache file as it grows and served mapped: clean page
-    // cache, never the whole index in heap.
-    // An update is appended to the file the index is mapped from; rewritten
-    // whole if that file is not what the index was mapped from.
-    const appended: ?content.FileError!content.Index = if (!whole and s.index.?.mapped and !s.unsaved)
-        if (content.appendFile(
-            s.gpa,
-            s.build_pool,
-            &s.index.?,
-            d.gone,
-            d.added,
-            reader,
-            s.cache_path,
-            null,
-        )) |r| (if (r) |ix| ix else null) else |err| err
-    else
-        null;
-    const written = appended orelse if (whole)
-        content.buildFile(s.gpa, s.build_pool, docs.?, reader, s.cache_path, null)
-    else
-        content.updateFile(
-            s.gpa,
-            s.build_pool,
-            &s.index.?,
-            d.gone,
-            d.added,
-            reader,
-            s.cache_path,
-            null,
-        );
-    const fresh = written catch |file_err| blk: {
-        if (file_err == error.OutOfMemory) {
-            log.warn("building the content index: out of memory", .{});
-            return;
-        }
-        // Not written (a full disk, a read-only cache): built in memory and
-        // served from there; saving is retried on the next check.
-        log.warn("writing the content index: {t}", .{file_err});
-        s.unsaved = true;
-        break :blk (if (whole)
-            content.build(s.gpa, s.build_pool, docs.?, reader, null)
-        else
-            content.update(
-                s.gpa,
-                s.build_pool,
-                &s.index.?,
-                d.gone,
-                d.added,
-                reader,
-                null,
-            )) catch |err| {
-            log.warn("building the content index: {t}", .{err});
-            return;
-        };
-    };
-    if (fresh.mapped) s.unsaved = false;
+    const fresh = s.buildNext(if (whole) docs.? else null, d) orelse return;
     s.last_build_ns.store(sys.monotonicNs() - t, .monotonic);
     _ = s.builds.fetchAdd(1, .release);
     if (!whole) _ = s.updates.fetchAdd(1, .release);
@@ -571,6 +496,80 @@ fn refresh(s: *ContentService) void {
         s.dropStaleText(o, d.gone);
         o.deinit(s.gpa);
     }
+}
+
+/// What changed since the index was built: every file listed again (no
+/// index yet, names created or removed, or the listing is old), or only
+/// the indexed ones checked. A listing is left in `docs`.
+fn changes(s: *ContentService, arena: std.mem.Allocator, names: ?u64, docs: *?[]content.DocIn) ?Diff {
+    const t = sys.monotonicNs();
+    const must_list = s.index == null or names == null or s.listed_names == null or
+        names.? != s.listed_names.? or t - s.last_listing_at >= s.opts.list_every_ns;
+    if (must_list) {
+        docs.* = s.listAll(arena, names) orelse return null;
+        return s.diff(arena, docs.*.?) catch null;
+    }
+    const r = s.indexedChanges(arena) catch return null;
+    s.last_stat_ns.store(sys.monotonicNs() - t, .monotonic);
+    return r;
+}
+
+/// Whole when there is nothing to update, or when what updates leave
+/// behind (removed versions, small segments) has piled up.
+fn wantsWhole(s: *const ContentService, d: Diff) bool {
+    const ix = &(s.index orelse return true);
+    const removed = ix.n_removed + d.gone.len;
+    const total = ix.n_docs + d.added.len;
+    return removed * 100 > total * s.opts.max_removed_percent or
+        ix.n_segs >= s.opts.max_segments or
+        // What updates left behind in the file: over 30 %.
+        ix.buf.len * 10 > ix.live_bytes * 13;
+}
+
+/// The next index: `all` of the documents built whole, or the current one
+/// updated with `d`. Written to the cache file as it grows and served
+/// mapped (clean page cache, never the whole index in heap); an update is
+/// appended to the file the index is mapped from, or the file rewritten if
+/// it is not that one any more. Null (logged) when out of memory.
+fn buildNext(s: *ContentService, all: ?[]const content.DocIn, d: Diff) ?content.Index {
+    const reader: content.TextReader = .{ .read = textOf, .ctx = s };
+    if (std.mem.findScalarLast(u8, s.cache_path, '/')) |slash| sys.mkdirP(s.cache_path[0..slash]);
+    const appended: ?content.FileError!content.Index = if (all == null and s.index.?.mapped and !s.unsaved)
+        if (content.appendFile(
+            s.gpa,
+            s.build_pool,
+            &s.index.?,
+            d.gone,
+            d.added,
+            reader,
+            s.cache_path,
+            null,
+        )) |r| (if (r) |ix| ix else null) else |err| err
+    else
+        null;
+    const written = appended orelse if (all) |docs|
+        content.buildFile(s.gpa, s.build_pool, docs, reader, s.cache_path, null)
+    else
+        content.updateFile(s.gpa, s.build_pool, &s.index.?, d.gone, d.added, reader, s.cache_path, null);
+    const fresh = written catch |file_err| blk: {
+        if (file_err == error.OutOfMemory) {
+            log.warn("building the content index: out of memory", .{});
+            return null;
+        }
+        // Not written (a full disk, a read-only cache): built in memory and
+        // served from there; saving is retried on the next check.
+        log.warn("writing the content index: {t}", .{file_err});
+        s.unsaved = true;
+        break :blk (if (all) |docs|
+            content.build(s.gpa, s.build_pool, docs, reader, null)
+        else
+            content.update(s.gpa, s.build_pool, &s.index.?, d.gone, d.added, reader, null)) catch |err| {
+            log.warn("building the content index: {t}", .{err});
+            return null;
+        };
+    };
+    if (fresh.mapped) s.unsaved = false;
+    return fresh;
 }
 
 fn retrySave(s: *ContentService) void {
