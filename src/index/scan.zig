@@ -14,6 +14,7 @@
 //! dropped it for being `unsafe`; in Zig it is the natural API.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const store_mod = @import("store.zig");
 const Store = store_mod.Store;
 const Builder = store_mod.Builder;
@@ -282,32 +283,43 @@ fn readDir(
             ) catch continue;
             kind = sys.kindOf(full);
         }
-        var fl: u8 = 0;
+        var flags: u8 = 0;
         // Dot-dirs and caches are noise: searchable, ranked low, and the
         // flag is inherited by everything below ("~/orca/skein-zig-pkg-cache"
         // READMEs outranked the user's own).
-        if (e.name[0] == '.' or std.ascii.findIgnoreCase(
-            e.name,
-            "cache",
-        ) != null) fl |= store_mod.flag_hidden;
-        if (kind == sys.Kind.symlink) fl |= store_mod.flag_symlink;
+        if (hiddenByName(e.name)) flags |= store_mod.flag_hidden;
+        if (kind == sys.Kind.symlink) flags |= store_mod.flag_symlink;
         // A skipped directory is still indexed (searchable), just not opened.
-        if (kind == sys.Kind.dir and shouldDescend(path, e.name, cfg)) fl |= store_mod.flag_dir;
+        if (kind == sys.Kind.dir and shouldDescend(path, e.name, cfg)) flags |= store_mod.flag_dir;
         try batch.names.appendSlice(gpa, e.name);
         try batch.ends.append(gpa, @intCast(batch.names.items.len));
-        try batch.flags.append(gpa, fl);
+        try batch.flags.append(gpa, flags);
     }
 }
 
-fn shouldDescend(parent: []const u8, name: []const u8, cfg: *const Config) bool {
+/// Whether `name` hides itself and what is below it: a dot-name, or one
+/// that says "cache". The scan sets `flag_hidden` by it, and so does `Live`
+/// for what appears after the scan.
+pub fn hiddenByName(name: []const u8) bool {
+    assert(name.len > 0);
+    if (name[0] == '.') return true;
+    return std.ascii.findIgnoreCase(name, "cache") != null;
+}
+
+/// Whether directory `name` in `parent` is opened, or only indexed: the
+/// `skip` rules, and caches marked by a CACHEDIR.TAG. The scan decides by
+/// it, and so does `Live` for a directory created after the scan.
+pub fn shouldDescend(parent: []const u8, name: []const u8, cfg: *const Config) bool {
     for (cfg.skip) |rule| {
         if (std.mem.findScalarLast(u8, rule, '/')) |slash| {
-            if (std.mem.eql(
-                u8,
-                rule[slash + 1 ..],
-                name,
-            ) and std.mem.endsWith(u8, parent, rule[0..slash])) return false;
-        } else if (std.mem.eql(u8, rule, name)) return false;
+            // "a/b": a directory `b` inside one whose path ends in `a`.
+            const rule_name = rule[slash + 1 ..];
+            const rule_parent = rule[0..slash];
+            if (!std.mem.eql(u8, rule_name, name)) continue;
+            if (std.mem.endsWith(u8, parent, rule_parent)) return false;
+        } else {
+            if (std.mem.eql(u8, rule, name)) return false;
+        }
     }
     for (cfg.cachedir_probe) |probe| {
         if (!std.mem.eql(u8, probe, name)) continue;
