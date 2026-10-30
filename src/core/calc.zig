@@ -7,6 +7,7 @@
 //! typing an app name never shows a result.
 
 const std = @import("std");
+const assert = std.debug.assert;
 
 pub const Result = struct {
     value: f64,
@@ -24,6 +25,8 @@ pub fn evaluate(input: []const u8) ?Result {
 
     var p: Parser = .{ .src = text };
     const v = p.parseExpr() catch return null;
+    // Every level parseUnary entered, it left.
+    assert(p.depth == 0);
     p.skipSpaces();
     if (p.pos != text.len) return null;
     if (!p.saw_operator) return null;
@@ -338,9 +341,13 @@ const Parser = struct {
     /// Every recursive path (parentheses, function arguments, signs,
     /// exponents) goes through here, so the depth is counted here.
     fn parseUnary(p: *Parser) Error!f64 {
-        if (p.depth >= max_depth) return error.TooDeep;
+        if (p.depth == max_depth) return error.TooDeep;
+        assert(p.depth < max_depth);
         p.depth += 1;
-        defer p.depth -= 1;
+        defer {
+            assert(p.depth > 0);
+            p.depth -= 1;
+        }
         const c = p.peek();
         if (c == '-') {
             p.pos += 1;
