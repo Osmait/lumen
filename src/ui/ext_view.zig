@@ -80,14 +80,6 @@ fn onRegistry(reg: *Host.Registry, ctx: ?*anyopaque) void {
     const ui: *Ui = @ptrCast(@alignCast(ctx.?));
     const old = ui.ext_registry;
     const old_result = ui.ext_result;
-    // The open command, found again by its id in the new registry.
-    const open_id: ?[]const u8 = if (ui.view != .ext)
-        null
-    else if (command(ui)) |cmd|
-        cmd.id
-    else
-        null;
-
     const old_root = ui.ext_root;
     ui.ext_registry = reg;
     ui.ext_result = null;
@@ -97,6 +89,9 @@ fn onRegistry(reg: *Host.Registry, ctx: ?*anyopaque) void {
     // Answers still on their way were asked of the old files: drop them.
     ui.ext_gen = 0;
     ui.ext_root_gen = 0;
+    // What the views point at by index, found again by id (before anything
+    // rebuilds them): the open view may have lost it.
+    const lost = if (old) |o| remap(ui, o, reg) else false;
     themes.custom = reg.themes;
     ui.layout = reg.layout;
     ui.applyStructure();
@@ -114,14 +109,15 @@ fn onRegistry(reg: *Host.Registry, ctx: ?*anyopaque) void {
         }
         if (changed) ui.saveSettings();
     }
-    if (ui.view != .ext) {
+    if (lost or (ui.view == .ext and command(ui) == null)) {
+        ui.setView(.root);
+    } else if (ui.view == .ext) {
+        ui.setView(.ext);
+    } else {
         // Same row as before the reload (an update from Settings, say).
         ui.keepSelection();
         ui.rebuild();
-    } else if (if (open_id) |id| find(reg, id) else null) |i| {
-        ui.ext_cmd = i;
-        ui.setView(.ext);
-    } else ui.setView(.root);
+    }
     if (old_result) |r| r.destroy(ui.gpa);
     if (old_root) |r| r.destroy(ui.gpa);
     if (old) |r| r.destroy(ui.gpa);
@@ -146,19 +142,50 @@ fn onRoot(res: *Host.RootResult, ctx: ?*anyopaque) void {
         if (it.icon == .none and
             sec.command < reg.commands.len) it.icon = reg.commands[sec.command].icon;
     };
-    const old = ui.ext_root;
-    ui.ext_root = res;
     ui.ext_root_pending = false;
-    // Answers for a query typed over meanwhile change nothing on screen.
-    if (ui.view == .root and res.sections.len > 0 and std.mem.eql(
-        u8,
-        res.query,
-        std.mem.trim(u8, ui.query(), " "),
-    )) {
-        ui.keepSelection();
-        ui.refresh();
+    const old = ui.ext_root;
+    const typed: ?[]const u8 = if (ui.view == .root) std.mem.trim(u8, ui.query(), " ") else null;
+    switch (rootAnswer(typed, if (old) |o| o.query else null, res.query, res.sections.len > 0)) {
+        .show => {
+            ui.ext_root = res;
+            ui.keepSelection();
+            ui.refresh();
+        },
+        .keep => ui.ext_root = res,
+        .drop => {
+            res.destroy(ui.gpa);
+            return;
+        },
     }
     if (old) |o| o.destroy(ui.gpa);
+}
+
+const RootAnswer = enum {
+    /// It answers what is typed: take it and build the rows again.
+    show,
+    /// Take it for later (typing that query again shows it at once).
+    keep,
+    /// The rows on screen are the last answer's, which must outlive them.
+    drop,
+};
+
+/// What an answer to the root search for `answer` does, with `typed` in the
+/// search bar (null: the root search is not showing) and the last answer,
+/// for `last`, in hand. Rows copy only the Item, whose strings stay in the
+/// answer: one whose rows may be on screen is freed only once they are
+/// built again. (Typing "abc" then going back to "ab" before its answer came
+/// showed "ab"'s rows again; freeing them for "abc"'s answer left the rows
+/// pointing at freed memory.)
+fn rootAnswer(
+    typed: ?[]const u8,
+    last: ?[]const u8,
+    answer: []const u8,
+    has_rows: bool,
+) RootAnswer {
+    const t = typed orelse return .keep;
+    const last_shown = if (last) |l| std.mem.eql(u8, l, t) else false;
+    if (std.mem.eql(u8, answer, t) and (has_rows or last_shown)) return .show;
+    return if (last_shown) .drop else .keep;
 }
 
 /// Extension rows for the root search `q`: shown when they answer `q`,
@@ -233,6 +260,74 @@ fn onAct(res: *Host.ActResult, ctx: ?*anyopaque) void {
 fn find(reg: *const Host.Registry, id: []const u8) ?u16 {
     for (reg.commands, 0..) |cmd, i| if (std.mem.eql(u8, cmd.id, id)) return @intCast(i);
     return null;
+}
+
+/// An index no registry has: what a view held that a reload took away.
+/// Lookups by it find nothing (the host keeps commands under maxInt(u16)).
+const gone = std.math.maxInt(u16);
+
+/// The open command and form, the preference or field being typed or
+/// chosen: indexes into `old`, moved to `new` by id (Enter would otherwise
+/// save into another extension's preferences, or submit another form).
+/// True when the open view lost what it shows. Call with `new` in place.
+fn remap(ui: *Ui, old: *const Host.Registry, new: *const Host.Registry) bool {
+    ui.ext_cmd = sameCommand(old, new, ui.ext_cmd) orelse gone;
+    const form = sameCommand(old, new, ui.form_cmd);
+    // A form whose fields changed starts over: values are kept by position.
+    const same_form = if (form) |i|
+        sameFields(old.commands[ui.form_cmd].fields, new.commands[i].fields)
+    else
+        false;
+    ui.form_cmd = form orelse gone;
+    if (form != null and !same_form) form_view.reset(ui);
+    switch (ui.input) {
+        .pref => |i| ui.input = .{ .pref = samePref(old, new, i) orelse gone },
+        .field => if (!same_form) {
+            ui.input = .{ .field = gone };
+        },
+    }
+    switch (ui.choosing) {
+        .pref => |i| ui.choosing = .{ .pref = samePref(old, new, i) orelse gone },
+        .field => if (!same_form) {
+            ui.choosing = .{ .field = gone };
+        },
+        else => {},
+    }
+    return switch (ui.view) {
+        .ext => ui.ext_cmd == gone,
+        .form => ui.form_cmd == gone,
+        .input => switch (ui.input) {
+            .pref, .field => |i| i == gone,
+        },
+        .choose => switch (ui.choosing) {
+            .pref, .field => |i| i == gone,
+            else => false,
+        },
+        else => false,
+    };
+}
+
+/// Command `i` of `old` in `new`, by id.
+fn sameCommand(old: *const Host.Registry, new: *const Host.Registry, i: u16) ?u16 {
+    if (i >= old.commands.len) return null;
+    return find(new, old.commands[i].id);
+}
+
+/// Preference `i` of `old` in `new`: the same extension, name and kind.
+fn samePref(old: *const Host.Registry, new: *const Host.Registry, i: u16) ?u16 {
+    if (i >= old.prefs.len) return null;
+    const p = old.prefs[i];
+    for (new.prefs, 0..) |q, j| {
+        if (std.mem.eql(u8, q.ext, p.ext) and std.mem.eql(u8, q.name, p.name) and
+            q.kind == p.kind) return @intCast(j);
+    }
+    return null;
+}
+
+fn sameFields(a: []const Host.Pref, b: []const Host.Pref) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (!std.mem.eql(u8, x.name, y.name) or x.kind != y.kind) return false;
+    return true;
 }
 
 /// The first line of an error (the rest is the traceback), in `a`.
@@ -475,4 +570,99 @@ pub fn openTarget(ui: *Ui, target: []const u8, text: ?[*:0]const u8) bool {
 /// `lumen --key ctrl+g` for keys that are not built in.
 pub fn parseKey(name: []const u8) ?api.Keys {
     return api.parseKeys(name);
+}
+
+// ---------------------------------------------------------------- tests
+
+const testing = std.testing;
+
+test "an answer whose rows may be on screen outlives them" {
+    // "ab" shown, "abc" asked, back to "ab" before "abc" was answered: "ab"'s
+    // rows are on screen again, so its answer stays.
+    try testing.expectEqual(RootAnswer.drop, rootAnswer("ab", "ab", "abc", true));
+    try testing.expectEqual(RootAnswer.show, rootAnswer("abc", "ab", "abc", true));
+    // An empty answer to what is typed: rows from the last one, when they
+    // answer the same, are built again before it is freed.
+    try testing.expectEqual(RootAnswer.show, rootAnswer("ab", "ab", "ab", false));
+    try testing.expectEqual(RootAnswer.keep, rootAnswer("abc", "ab", "abc", false));
+    try testing.expectEqual(RootAnswer.keep, rootAnswer("abcd", "ab", "abc", true));
+    try testing.expectEqual(RootAnswer.keep, rootAnswer("ab", null, "abc", true));
+    // Another view shows no root rows.
+    try testing.expectEqual(RootAnswer.keep, rootAnswer(null, "ab", "abc", true));
+}
+
+fn testCommand(id: [:0]const u8, fields: []const Host.Pref) Host.Command {
+    return .{
+        .id = id,
+        .title = id,
+        .subtitle = "",
+        .icon = .none,
+        .keywords = "",
+        .placeholder = "",
+        .mode = if (fields.len > 0) .form else .list,
+        .detail = false,
+        .root = false,
+        .fields = fields,
+    };
+}
+
+fn testPref(ext: [:0]const u8, name: [:0]const u8, kind: Host.PrefKind) Host.Pref {
+    return .{
+        .ext = ext,
+        .ext_title = ext,
+        .file = "",
+        .name = name,
+        .title = name,
+        .description = "",
+        .kind = kind,
+        .default = "",
+    };
+}
+
+test "indexes into the registry follow their ids across a reload" {
+    const name = [_]Host.Pref{testPref("notes", "name", .text)};
+    const renamed = [_]Host.Pref{testPref("notes", "title", .text)};
+    const old_cmds = [_]Host.Command{
+        testCommand("a.list", &.{}),
+        testCommand("notes.new", &name),
+        testCommand("b.gone", &.{}),
+    };
+    // An extension added before them shifts every index.
+    const new_cmds = [_]Host.Command{
+        testCommand("aaa.first", &.{}),
+        testCommand("a.list", &.{}),
+        testCommand("notes.new", &renamed),
+    };
+    const old_prefs = [_]Host.Pref{
+        testPref("a", "token", .password),
+        testPref("b", "key", .password),
+    };
+    const new_prefs = [_]Host.Pref{
+        testPref("aaa", "token", .password),
+        testPref("a", "token", .password),
+        testPref("b", "key", .text),
+    };
+    const old: Host.Registry = .{
+        .gen = 1,
+        .commands = &old_cmds,
+        .prefs = &old_prefs,
+        .arena = undefined,
+    };
+    const new: Host.Registry = .{
+        .gen = 2,
+        .commands = &new_cmds,
+        .prefs = &new_prefs,
+        .arena = undefined,
+    };
+    try testing.expectEqual(@as(?u16, 1), sameCommand(&old, &new, 0));
+    try testing.expectEqual(@as(?u16, 2), sameCommand(&old, &new, 1));
+    try testing.expectEqual(@as(?u16, null), sameCommand(&old, &new, 2));
+    try testing.expectEqual(@as(?u16, null), sameCommand(&old, &new, gone));
+    // Not "aaa"'s token, which took its place.
+    try testing.expectEqual(@as(?u16, 1), samePref(&old, &new, 0));
+    // Now a text: typing a password for it would show it.
+    try testing.expectEqual(@as(?u16, null), samePref(&old, &new, 1));
+    try testing.expect(sameFields(&name, &name));
+    try testing.expect(!sameFields(&name, &renamed));
+    try testing.expect(!sameFields(&name, &.{}));
 }

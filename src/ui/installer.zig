@@ -61,6 +61,26 @@ pub fn nameFromUrl(buf: []u8, url: []const u8) []const u8 {
     return buf[0..n];
 }
 
+/// `fmt` in `buf`, cut to what fits, as valid UTF-8: it goes to the caller
+/// over D-Bus, whose strings must be.
+fn format(buf: []u8, comptime fmt: []const u8, args: anytype) [:0]const u8 {
+    var w: std.Io.Writer = .fixed(buf[0 .. buf.len - 1]);
+    w.print(fmt, args) catch {};
+    const n = core.utf8.validPrefix(w.buffered()).len;
+    buf[n] = 0;
+    return buf[0..n :0];
+}
+
+/// The end of `s` in at most `max` bytes, from a character on, after "..."
+/// when cut: the last lines git prints say why it failed. Formats as two
+/// strings: `"{s}{s}"`.
+fn tail(s: []const u8, max: usize) struct { []const u8, []const u8 } {
+    if (s.len <= max) return .{ "", s };
+    var i = s.len - max;
+    while (i < s.len and s[i] & 0xC0 == 0x80) i += 1;
+    return .{ "...", s[i..] };
+}
+
 /// A failure: to the caller's stderr (exit 1), or on the selected row.
 fn fail(
     ui: *Ui,
@@ -69,7 +89,7 @@ fn fail(
     args: anytype,
 ) void {
     var buf: [1024]u8 = undefined;
-    const msg = std.mem.printSentinel(&buf, fmt, args, 0) catch "failed";
+    const msg = format(&buf, fmt, args);
     const cl = cmdline orelse return note(ui, msg);
     c.g_application_command_line_printerr(cl, "lumen: %s\n", msg.ptr);
     c.g_application_command_line_set_exit_status(cl, 1);
@@ -96,6 +116,12 @@ pub fn install(
         ui,
         cmdline,
         "\"{s}\" cannot be an extension name (a-z, 0-9, - and _); pick one with --as NAME",
+        .{name},
+    );
+    if (Host.reservedId(name)) return fail(
+        ui,
+        cmdline,
+        "\"{s}\" is taken (init.lua and the style run as it); pick another with --as NAME",
         .{name},
     );
     var dbuf: [4096]u8 = undefined;
@@ -203,8 +229,21 @@ fn start(
     // extDir builds it in a buffer of this size: it always fits.
     std.debug.assert(dir.len <= @TypeOf(job.dir).capacity);
     job.dir.set(dir);
-    c.g_subprocess_communicate_utf8_async(sp, null, null, &onDone, job);
+    // As bytes: git prints file names and messages in any encoding, and the
+    // UTF-8 variant fails on the first byte that is not.
+    c.g_subprocess_communicate_async(sp, null, null, &onDone, job);
 }
+
+/// What the job printed, as UTF-8 (U+FFFD for what is not, NUL included):
+/// it goes to the caller over D-Bus and onto a row. Free with g_free.
+fn outputText(bytes: ?*c.GBytes) [:0]u8 {
+    var len: usize = 0;
+    const data: [*]const u8 = if (bytes) |b| c.g_bytes_get_data(b, &len) orelse "" else "";
+    return std.mem.span(c.g_utf8_make_valid(data, @intCast(len)));
+}
+
+/// What git says last on a failure, in bytes: the message has to fit 1 KB.
+const max_failure_output = 800;
 
 fn onDone(_: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) void {
     const job: *Job = @ptrCast(@alignCast(data.?));
@@ -216,26 +255,24 @@ fn onDone(_: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) 
         if (cmdline) |cl| c.g_object_unref(cl);
         ui.gpa.destroy(job);
     }
-    var out: ?[*:0]u8 = null;
+    var out: ?*c.GBytes = null;
     var err: ?*c.GError = null;
-    const ran = c.g_subprocess_communicate_utf8_finish(job.sp, res, &out, null, &err) != 0;
-    defer if (out) |o| c.g_free(o);
-    if (err) |e| {
-        fail(ui, cmdline, "{s}", .{std.mem.span(e.message)});
-        c.g_error_free(e);
-        return;
-    }
-    const output: []const u8 = if (out) |o| std.mem.span(o) else "";
-    const ok = ran and c.g_subprocess_get_successful(job.sp) != 0;
+    const ran = c.g_subprocess_communicate_finish(job.sp, res, &out, null, &err) != 0;
+    defer if (err) |e| c.g_error_free(e);
+    defer if (out) |b| c.g_bytes_unref(b);
+    const output = outputText(out);
+    defer c.g_free(output.ptr);
+    // Failed or not, the files may have changed (half a pull, a clone
+    // removed again): the extensions load again, after the message.
+    defer ext_view.reload(ui);
+    const ok = ran and err == null and c.g_subprocess_get_successful(job.sp) != 0;
     if (!ok) {
-        if (job.kind == .install) {
-            // A failed clone can leave half a folder behind.
-            removeTree(job.dirZ());
-        }
-        return fail(ui, cmdline, "{s} failed:\n{s}", .{
-            @tagName(job.kind),
-            std.mem.trim(u8, output, " \n"),
-        });
+        // A failed clone can leave half a folder behind, and the next
+        // install would find it there.
+        if (job.kind == .install) removeTree(job.dirZ());
+        const why = if (err) |e| std.mem.span(e.message) else std.mem.trim(u8, output, " \n");
+        const end = tail(why, max_failure_output);
+        return fail(ui, cmdline, "{s} failed:\n{s}{s}", .{ @tagName(job.kind), end[0], end[1] });
     }
     switch (job.kind) {
         .install => {
@@ -257,25 +294,22 @@ fn onDone(_: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) 
                 .{ job.nameSlice(), job.dirZ() },
             );
         },
-        .update => if (cmdline != null)
-            print(ui, cmdline, "{s}", .{if (output.len > 0) output else "Up to date\n"})
-        else
+        .update => if (cmdline != null) {
+            const end = tail(if (output.len > 0) output else "Up to date\n", max_print - 8);
+            print(ui, cmdline, "{s}{s}", .{ end[0], end[1] });
+        } else {
             // git's own lines are too long for a row: a summary.
-            note(
-                ui,
-                if (std.mem.find(
-                    u8,
-                    output,
-                    "Already up to date",
-                ) != null or output.len == 0) "Already up to date" else "Updated",
-            ),
+            const none = output.len == 0 or std.mem.find(u8, output, "Already up to date") != null;
+            note(ui, if (none) "Already up to date" else "Updated");
+        },
         .uninstall => print(ui, cmdline, "Removed {s}\n", .{job.nameSlice()}),
     }
     if (cmdline) |cl| c.g_application_command_line_set_exit_status(cl, 0);
     // From Settings: the removed extension's page has nothing left to show.
     if (cmdline == null and job.kind == .uninstall and ui.view == .prefs) ui.goBack();
-    ext_view.reload(ui);
 }
+
+const max_print = 8192;
 
 /// Success: to the caller's stdout, or on the selected row.
 fn print(
@@ -284,8 +318,8 @@ fn print(
     comptime fmt: []const u8,
     args: anytype,
 ) void {
-    var buf: [8192]u8 = undefined;
-    const msg = std.mem.printSentinel(&buf, fmt, args, 0) catch return;
+    var buf: [max_print]u8 = undefined;
+    const msg = format(&buf, fmt, args);
     const cl = cmdline orelse return note(ui, msg);
     c.g_application_command_line_print(cl, "%s", msg.ptr);
 }
@@ -308,6 +342,20 @@ fn removeTree(dir: [:0]const u8) void {
     ) == 0) {
         proc.warnError(.install, err, "rm {s}", .{dir});
     }
+}
+
+test "long output keeps its end, and messages stay valid UTF-8" {
+    const short = tail("fatal: no such repo", 100);
+    try std.testing.expectEqualStrings("", short[0]);
+    try std.testing.expectEqualStrings("fatal: no such repo", short[1]);
+    // Cut before "é" would split it: from the next character on.
+    const cut = tail("aaaaé fatal", 7);
+    try std.testing.expectEqualStrings("...", cut[0]);
+    try std.testing.expectEqualStrings(" fatal", cut[1]);
+    var buf: [8]u8 = undefined;
+    // Too long: what fits, never half a character.
+    try std.testing.expectEqualStrings("abcdé", format(&buf, "{s}", .{"abcdéé"}));
+    try std.testing.expectEqualStrings("ok", format(&buf, "{s}", .{"ok"}));
 }
 
 test "extension names come from the repository" {

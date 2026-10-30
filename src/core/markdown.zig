@@ -95,10 +95,16 @@ const max_depth = 3;
 /// Inline spans of one line; `depth` spans around it.
 fn inline_(w: *std.Io.Writer, s: []const u8, depth: u8) Error!void {
     std.debug.assert(depth <= max_depth);
+    // Searches for closing markers, each picking up where the last ended.
+    var bold: Finder = .{ .marker = "**", .after_text = true };
+    var star: Finder = .{ .marker = "*", .after_text = true };
+    var underscore: Finder = .{ .marker = "_", .after_text = true };
+    var link_end: Link = .{};
     var i: usize = 0;
     while (i < s.len) {
         const ch = s[i];
         if (ch == '`') {
+            // Unclosed, it has no "`" after it: no later one searches again.
             if (std.mem.findScalarPos(u8, s, i + 1, '`')) |end| {
                 try w.writeAll("<tt>");
                 try escape(w, s[i + 1 .. end]);
@@ -107,7 +113,7 @@ fn inline_(w: *std.Io.Writer, s: []const u8, depth: u8) Error!void {
                 continue;
             }
         } else if (ch == '*' and i + 1 < s.len and s[i + 1] == '*') {
-            if (closing(s, i + 2, "**")) |end| {
+            if (closing(s, i + 2, &bold)) |end| {
                 try w.writeAll("<b>");
                 try inline_(w, s[i + 2 .. end], depth + 1);
                 try w.writeAll("</b>");
@@ -117,7 +123,7 @@ fn inline_(w: *std.Io.Writer, s: []const u8, depth: u8) Error!void {
         } else if (ch == '*' or ch == '_') {
             // Not inside a word for "_" (snake_case stays as it is).
             const word_inside = ch == '_' and i > 0 and std.ascii.isAlphanumeric(s[i - 1]);
-            if (!word_inside) if (closing(s, i + 1, s[i .. i + 1])) |end| {
+            if (!word_inside) if (closing(s, i + 1, if (ch == '*') &star else &underscore)) |end| {
                 try w.writeAll("<i>");
                 try inline_(w, s[i + 1 .. end], depth + 1);
                 try w.writeAll("</i>");
@@ -125,7 +131,7 @@ fn inline_(w: *std.Io.Writer, s: []const u8, depth: u8) Error!void {
                 continue;
             };
         } else if (ch == '[') {
-            if (link(s, i)) |l| {
+            if (link_end.at(s, i)) |l| {
                 try w.writeAll("<a href=\"");
                 try escape(w, l.url);
                 try w.writeAll("\">");
@@ -135,42 +141,102 @@ fn inline_(w: *std.Io.Writer, s: []const u8, depth: u8) Error!void {
                 continue;
             }
         }
-        try escape(w, s[i .. i + 1]);
+        // Text up to the next character that may open a span, whole: a
+        // character of several bytes is escaped in one piece.
+        const next = std.mem.findAnyPos(u8, s, i + 1, "`*_[") orelse s.len;
+        try escape(w, s[i..next]);
+        i = next;
+    }
+}
+
+/// Where a span opened just before `from` closes: not right after the
+/// opening, not after a space (so "a * b * c" stays text).
+fn closing(s: []const u8, from: usize, marker: *Finder) ?usize {
+    if (from >= s.len or s[from] == ' ') return null;
+    return marker.next(s, from + 1);
+}
+
+/// Searches one line for `marker` from positions that only grow (the line
+/// is read left to right), each starting where the last one stopped. Every
+/// unclosed marker searched the rest of the line again: quadratic, 6 s for
+/// a 400 KB line, in a Lua call the time limit cannot stop.
+const Finder = struct {
+    marker: []const u8,
+    /// Only matches right after something other than a space.
+    after_text: bool = false,
+    /// The first match at or after `from` (null: none), once searched.
+    from: usize = 0,
+    found: ?usize = null,
+    searched: bool = false,
+
+    fn next(f: *Finder, s: []const u8, from: usize) ?usize {
+        std.debug.assert(!f.searched or from >= f.from);
+        if (f.searched) {
+            const at = f.found orelse return null;
+            if (from <= at) return at;
+        }
+        var pos = from;
+        f.found = while (std.mem.findPos(u8, s, pos, f.marker)) |at| {
+            if (!f.after_text or (at > 0 and s[at - 1] != ' ')) break at;
+            pos = at + 1;
+        } else null;
+        f.from = from;
+        f.searched = true;
+        return f.found;
+    }
+};
+
+/// `[text](url)` links of one line, searched like `Finder`'s markers.
+const Link = struct {
+    close: Finder = .{ .marker = "]" },
+    paren: Finder = .{ .marker = ")" },
+
+    fn at(l: *Link, s: []const u8, start: usize) ?struct {
+        text: []const u8,
+        url: []const u8,
+        end: usize,
+    } {
+        const close = l.close.next(s, start + 1) orelse return null;
+        if (close + 1 >= s.len or s[close + 1] != '(') return null;
+        const paren = l.paren.next(s, close + 2) orelse return null;
+        const url = s[close + 2 .. paren];
+        if (url.len == 0 or std.mem.findScalar(u8, url, ' ') != null) return null;
+        return .{ .text = s[start + 1 .. close], .url = url, .end = paren + 1 };
+    }
+};
+
+/// Text as markup: valid UTF-8 whatever the input (U+FFFD for each byte
+/// that does not start a character), without NUL. GTK refuses markup that
+/// is not, and the label then keeps the text it had: the last row's.
+fn escape(w: *std.Io.Writer, s: []const u8) Error!void {
+    var i: usize = 0;
+    while (i < s.len) {
+        const ch = s[i];
+        if (ch >= 0x80) {
+            const n = std.unicode.utf8ByteSequenceLength(ch) catch 0;
+            if (n > 0 and i + n <= s.len and std.unicode.utf8ValidateSlice(s[i..][0..n])) {
+                try w.writeAll(s[i..][0..n]);
+                i += n;
+            } else {
+                try w.writeAll(replacement);
+                i += 1;
+            }
+            continue;
+        }
+        switch (ch) {
+            '&' => try w.writeAll("&amp;"),
+            '<' => try w.writeAll("&lt;"),
+            '>' => try w.writeAll("&gt;"),
+            '"' => try w.writeAll("&quot;"),
+            '\'' => try w.writeAll("&#39;"),
+            0 => try w.writeAll(replacement),
+            else => try w.writeByte(ch),
+        }
         i += 1;
     }
 }
 
-/// Where `marker` closes a span opened just before `from`: not right after
-/// the opening, not after a space (so "a * b * c" stays text).
-fn closing(s: []const u8, from: usize, marker: []const u8) ?usize {
-    if (from >= s.len or s[from] == ' ') return null;
-    var pos = from + 1;
-    while (std.mem.findPos(u8, s, pos, marker)) |at| {
-        if (s[at - 1] != ' ') return at;
-        pos = at + 1;
-    }
-    return null;
-}
-
-fn link(s: []const u8, start: usize) ?struct { text: []const u8, url: []const u8, end: usize } {
-    const close = std.mem.findScalarPos(u8, s, start + 1, ']') orelse return null;
-    if (close + 1 >= s.len or s[close + 1] != '(') return null;
-    const paren = std.mem.findScalarPos(u8, s, close + 2, ')') orelse return null;
-    const url = s[close + 2 .. paren];
-    if (url.len == 0 or std.mem.findScalar(u8, url, ' ') != null) return null;
-    return .{ .text = s[start + 1 .. close], .url = url, .end = paren + 1 };
-}
-
-fn escape(w: *std.Io.Writer, s: []const u8) Error!void {
-    for (s) |ch| switch (ch) {
-        '&' => try w.writeAll("&amp;"),
-        '<' => try w.writeAll("&lt;"),
-        '>' => try w.writeAll("&gt;"),
-        '"' => try w.writeAll("&quot;"),
-        '\'' => try w.writeAll("&#39;"),
-        else => try w.writeByte(ch),
-    };
-}
+const replacement = "\u{FFFD}";
 
 const testing = std.testing;
 
@@ -211,6 +277,61 @@ test "unclosed or stray markers stay as text" {
     try expectMarkup("`open", "`open");
     try expectMarkup("#nohash", "#nohash");
     try expectMarkup("a < b > c \"q\"", "a &lt; b &gt; c &quot;q&quot;");
+}
+
+test "the markup is valid UTF-8 without NUL, whatever the bytes" {
+    try expectMarkup("caf\xc3 \xff**b\x00**", "caf\u{FFFD} \u{FFFD}<b>b\u{FFFD}</b>");
+    try expectMarkup(
+        "ok é `\xe2\x82` [x\xff](u)",
+        "ok é <tt>\u{FFFD}\u{FFFD}</tt> <a href=\"u\">x\u{FFFD}</a>",
+    );
+    // Characters of several bytes around markers stay whole.
+    try expectMarkup("*ñ*_ü_", "<i>ñ</i><i>ü</i>");
+}
+
+/// What closing searched before Finder: every search from scratch.
+fn closingNaive(s: []const u8, from: usize, marker: []const u8) ?usize {
+    if (from >= s.len or s[from] == ' ') return null;
+    var pos = from + 1;
+    while (std.mem.findPos(u8, s, pos, marker)) |at| {
+        if (s[at - 1] != ' ') return at;
+        pos = at + 1;
+    }
+    return null;
+}
+
+test "searches that pick up where the last ended find what a fresh one does" {
+    var prng: std.Random.DefaultPrng = .init(7);
+    const r = prng.random();
+    const alphabet = "**_ a";
+    var s: [64]u8 = undefined;
+    for (0..2000) |_| {
+        for (&s) |*ch| ch.* = alphabet[r.uintLessThan(usize, alphabet.len)];
+        inline for (.{ "**", "*", "_" }) |marker| {
+            var f: Finder = .{ .marker = marker, .after_text = true };
+            var from: usize = 0;
+            while (from < s.len) : (from += 1 + r.uintLessThan(usize, 4)) {
+                try testing.expectEqual(closingNaive(&s, from, marker), closing(&s, from, &f));
+            }
+        }
+    }
+}
+
+test "a long line of unclosed markers takes linear time" {
+    // Each pattern opened a span the rest of the line could not close: a
+    // search to the end of the line for every marker (minutes, not ms, at
+    // this size).
+    const patterns = [_][]const u8{ "*a ", "**a ", "_a ", "[", "[a](", "x`" };
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    for (patterns) |p| {
+        const md = try testing.allocator.alloc(u8, 200_000 / p.len * p.len);
+        defer testing.allocator.free(md);
+        for (0..md.len / p.len) |k| @memcpy(md[k * p.len ..][0..p.len], p);
+        out.clearRetainingCapacity();
+        try toMarkup(&out.writer, md);
+        try testing.expect(out.written().len >= md.len);
+    }
 }
 
 test "spans nest no deeper than max_depth, whatever the input" {

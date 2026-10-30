@@ -32,9 +32,25 @@ const memory_limit_bytes = 64 << 20;
 const load_budget_ns = 5 * std.time.ns_per_s;
 const list_budget_ns = 10 * std.time.ns_per_s;
 const act_budget_ns = 30 * std.time.ns_per_s;
+/// For anything Lua still runs as a state closes (lumen.exec waits no
+/// longer than this).
+const close_budget_ns = 1 * std.time.ns_per_s;
 pub const max_items = 1000;
 pub const max_actions = 9;
 const max_query = 1024;
+
+/// A row's one-line texts (title, subtitle, accessory, section, id): longer
+/// is unreadable in a row, and a label of megabytes takes seconds to lay out.
+const max_line_bytes = 1024;
+const max_keywords_bytes = 4096;
+const max_path_bytes = 4096;
+/// A row's `detail` or `markdown`.
+const max_detail_bytes = 128 << 10;
+/// What one answer's rows take in all. They are copied out of the state, so
+/// its memory cap does not hold them: one string that 1000 rows refer to
+/// becomes 1000 copies.
+const max_rows_bytes = 16 << 20;
+const rows_too_big = "the rows take more than 16 MB";
 
 // ------------------------------------------------------------- results
 
@@ -246,6 +262,14 @@ pub const Ext = struct {
         e.budget.deadline_ns = os.monotonicNs() + budget_ns;
         defer e.budget.deadline_ns = std.math.maxInt(u64);
         return lua.protect(e.L, a, T, ctx, handler);
+    }
+
+    /// Closes its state. Closing runs the finalizers left, with the
+    /// instruction hook off (Lua turns hooks off in `__gc`); extensions
+    /// cannot set any (lua.openLibs), and lumen.exec gets a deadline anyway.
+    fn close(e: *Ext) void {
+        e.budget.deadline_ns = os.monotonicNs() + close_budget_ns;
+        lua.c.lua_close(e.L);
     }
 };
 
@@ -591,7 +615,7 @@ fn run(h: *Host) void {
 
 fn closeAll(h: *Host) void {
     for (h.exts.items) |e| {
-        lua.c.lua_close(e.L);
+        e.close();
         h.gpa.destroy(e);
     }
     h.exts.clearRetainingCapacity();
@@ -637,6 +661,14 @@ fn doReload(h: *Host) void {
             problem(&load, id, "extension folder names may use only a-z, 0-9, - and _");
             continue;
         }
+        if (reservedId(id)) {
+            problem(
+                &load,
+                id,
+                "\"config\" and \"style\" are taken (init.lua and the style); rename the folder",
+            );
+            continue;
+        }
         if (os.info(path) == null) {
             problem(&load, id, "no init.lua in the extension's folder");
             continue;
@@ -679,6 +711,13 @@ pub fn validId(id: []const u8) bool {
     for (id) |ch| if (!(std.ascii.isLower(ch) or std.ascii.isDigit(ch) or ch == '-' or
         ch == '_')) return false;
     return true;
+}
+
+/// The ids init.lua and the style run as. An extension named so would share
+/// their preferences and storage, and its themes and settings would pass
+/// for theirs.
+pub fn reservedId(id: []const u8) bool {
+    return std.mem.eql(u8, id, "config") or std.mem.eql(u8, id, "style");
 }
 
 fn problem(load: *Load, ext: []const u8, message: []const u8) void {
@@ -755,7 +794,7 @@ fn loadSource(
     } else |_| {};
     load.rollback(before);
     problem(load, id, err orelse "out of memory");
-    lua.c.lua_close(e.L);
+    e.close();
     h.gpa.destroy(e);
 }
 
@@ -1072,12 +1111,16 @@ fn parseCommand(
     ctx.load.commands.append(a, cmd) catch lua.oom(L);
 }
 
-/// `keywords`: a string, or a list of strings joined with spaces.
+/// `keywords`: a string, or a list of strings joined with spaces; up to
+/// `max_keywords_bytes`.
 fn keywords(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8) []const u8 {
     defer lua.c.lua_settop(L, -2);
     switch (lua.getField(L, t, "keywords")) {
         lua.c.LUA_TNIL => return "",
-        lua.c.LUA_TSTRING => return a.dupe(u8, lua.toSlice(L, -1).?) catch lua.oom(L),
+        lua.c.LUA_TSTRING => return a.dupe(
+            u8,
+            lua.cut(lua.toSlice(L, -1).?, max_keywords_bytes),
+        ) catch lua.oom(L),
         lua.c.LUA_TTABLE => {
             var out: std.ArrayList(u8) = .empty;
             const n = lua.c.lua_rawlen(L, -1);
@@ -1089,6 +1132,7 @@ fn keywords(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8) []
                     "{s}.keywords[{d}]: string expected",
                     .{ where, i },
                 );
+                if (out.items.len + 1 + s.len > max_keywords_bytes) break;
                 if (out.items.len > 0) out.append(a, ' ') catch lua.oom(L);
                 out.appendSlice(a, s) catch lua.oom(L);
             }
@@ -1172,8 +1216,17 @@ fn doList(h: *Host, req: ListReq, query: []const u8) void {
         return;
     };
     const e = h.exts.items[wc.ext];
-    var ctx: ListCtx = .{ .e = e, .wc = wc, .req = req, .res = res, .query = query };
+    var rows: lua.Capped = .{ .child = a, .max = max_rows_bytes };
+    var ctx: ListCtx = .{
+        .e = e,
+        .wc = wc,
+        .req = req,
+        .res = res,
+        .query = query,
+        .rows = rows.allocator(),
+    };
     res.err = e.run(a, list_budget_ns, ListCtx, &ctx, ListCtx.run);
+    if (res.err != null and rows.refused) res.err = rows_too_big;
 }
 
 const ListCtx = struct {
@@ -1182,6 +1235,8 @@ const ListCtx = struct {
     req: ListReq,
     res: *ListResult,
     query: []const u8,
+    /// The result's arena, up to `max_rows_bytes`.
+    rows: std.mem.Allocator,
 
     fn run(L: *lua.State, ctx: *ListCtx) void {
         _ = lua.pushRef(L, ctx.wc.ref);
@@ -1208,7 +1263,7 @@ const ListCtx = struct {
         keep(L, &ctx.wc.list, list_idx, ctx.req.gen);
         ctx.res.items = parseItems(
             L,
-            ctx.res.arena.allocator(),
+            ctx.rows,
             list_idx,
             .{ .gen = ctx.req.gen, .command = ctx.req.command },
             ctx.e.id,
@@ -1262,7 +1317,7 @@ fn parseItem(
 ) Item {
     // A plain string is a row with that title.
     if (lua.toSlice(L, t)) |s| {
-        const title = a.dupeSentinel(u8, s, 0) catch lua.oom(L);
+        const title = a.dupeSentinel(u8, lua.cut(s, max_line_bytes), 0) catch lua.oom(L);
         return .{ .key = key(L, a, ext_id, title), .title = title, .action = .{
             .ext_item = defaultActions(a, L, origin, pos, title),
         } };
@@ -1272,36 +1327,47 @@ fn parseItem(
         "{s}: table or string expected, got {s}",
         .{ where, lua.typeName(L, t) },
     );
-    const title = lua.fieldString(L, a, t, "title", where) orelse lua.raise(
+    const title = line(L, a, t, "title", where) orelse lua.raise(
         L,
         "{s}.title is missing",
         .{where},
     );
     var it: Item = .{
-        .key = key(L, a, ext_id, lua.fieldString(L, a, t, "id", where) orelse title),
+        .key = key(L, a, ext_id, line(L, a, t, "id", where) orelse title),
         .title = title,
-        .subtitle = lua.fieldString(L, a, t, "subtitle", where) orelse "",
-        .accessory = lua.fieldString(L, a, t, "accessory", where) orelse "",
+        .subtitle = line(L, a, t, "subtitle", where) orelse "",
+        .accessory = line(L, a, t, "accessory", where) orelse "",
         .keywords = keywords(L, a, t, where),
-        .detail = lua.fieldString(L, a, t, "detail", where) orelse "",
-        .section = lua.fieldString(L, a, t, "section", where) orelse "",
+        .detail = lua.fieldStringMax(L, a, t, "detail", where, max_detail_bytes) orelse "",
+        .section = line(L, a, t, "section", where) orelse "",
         .confirm = lua.fieldBool(L, t, "confirm", false, where),
         .action = undefined,
     };
     _ = lua.getField(L, t, "icon");
     if (parseIcon(L, a, -1, where)) |icon| it.icon = icon;
     lua.c.lua_settop(L, -2);
-    if (lua.fieldString(L, a, t, "markdown", where)) |md| {
+    if (lua.fieldStringMax(L, a, t, "markdown", where, max_detail_bytes)) |md| {
         var out: std.Io.Writer.Allocating = .init(a);
         core.markdown.toMarkup(&out.writer, md) catch lua.oom(L);
         it.detail = out.written();
         it.markup = true;
     }
     it.meta = metadata(L, a, t, where);
-    it.image = lua.fieldString(L, a, t, "image", where) orelse "";
+    it.image = lua.fieldStringMax(L, a, t, "image", where, max_path_bytes) orelse "";
 
     it.action = .{ .ext_item = rowActions(L, a, t, where, origin, pos, title) };
     return it;
+}
+
+/// A row's one-line text `t[name]`, cut to `max_line_bytes`.
+fn line(
+    L: *lua.State,
+    a: std.mem.Allocator,
+    t: c_int,
+    name: [:0]const u8,
+    where: []const u8,
+) ?[:0]const u8 {
+    return lua.fieldStringMax(L, a, t, name, where, max_line_bytes);
 }
 
 /// A row's `actions` (up to `max_actions`, Lua functions or lumen.action
@@ -1376,20 +1442,8 @@ fn metadata(
         const pair = lua.tableAt(L, pairs, i, mwhere);
         defer lua.c.lua_settop(L, -2);
         m.* = .{
-            .label = lua.fieldString(
-                L,
-                a,
-                pair,
-                "label",
-                mwhere,
-            ) orelse pairPart(L, a, pair, 1, mwhere),
-            .value = lua.fieldString(
-                L,
-                a,
-                pair,
-                "value",
-                mwhere,
-            ) orelse pairPart(L, a, pair, 2, mwhere),
+            .label = line(L, a, pair, "label", mwhere) orelse pairPart(L, a, pair, 1, mwhere),
+            .value = line(L, a, pair, "value", mwhere) orelse pairPart(L, a, pair, 2, mwhere),
         };
     }
     return out;
@@ -1397,7 +1451,7 @@ fn metadata(
 
 const max_meta = 4;
 
-/// `pair[i]` as text (numbers too).
+/// `pair[i]` as text (numbers too), cut to `max_line_bytes`.
 fn pairPart(
     L: *lua.State,
     a: std.mem.Allocator,
@@ -1410,7 +1464,7 @@ fn pairPart(
         lua.c.LUA_TSTRING, lua.c.LUA_TNUMBER => blk: {
             var len: usize = 0;
             const p = lua.c.lua_tolstring(L, -1, &len);
-            break :blk a.dupeSentinel(u8, p[0..len], 0) catch lua.oom(L);
+            break :blk a.dupeSentinel(u8, lua.cut(p[0..len], max_line_bytes), 0) catch lua.oom(L);
         },
         else => lua.raise(L, "{s}: {{ label, value }} expected", .{where}),
     };
@@ -1529,6 +1583,8 @@ fn doRoot(h: *Host, req: RootReq, query: []const u8) void {
     defer h.deliver(.{ .root = res });
     if (req.registry != h.registry_gen) return;
     var sections: std.ArrayList(RootSection) = .empty;
+    // Every provider's rows together.
+    var rows: lua.Capped = .{ .child = a, .max = max_rows_bytes };
     for (h.wcmds, 0..) |*wc, i| {
         if (!wc.root) continue;
         // A newer query came in: this one is already stale.
@@ -1540,11 +1596,12 @@ fn doRoot(h: *Host, req: RootReq, query: []const u8) void {
             .command = @intCast(i),
             .gen = req.gen,
             .query = query,
-            .a = a,
+            .a = rows.allocator(),
         };
         if (e.run(a, root_budget_ns, RootCtx, &ctx, RootCtx.run)) |err| {
             // One provider failing must not hide the others' rows.
-            log.warn("{s}: root search: {s}", .{ e.id, err });
+            log.warn("{s}: root search: {s}", .{ e.id, if (rows.refused) rows_too_big else err });
+            rows.refused = false;
             continue;
         }
         if (ctx.items.len > 0) sections.append(a, .{
@@ -2217,4 +2274,115 @@ test "preferences read Settings' file over their defaults; storage persists" {
     const after = try probe.take("res");
     defer after.destroy(testing.allocator);
     try testing.expectEqualStrings("2", after.items[3].title);
+}
+
+test "storage never writes over what it cannot read, and reads back what it wrote" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dbuf: [4096]u8 = undefined;
+    const dir = try os.tmpDirPath(&tmp, &dbuf);
+    const read_back =
+        \\local function file() local f = io.open(lumen.data_dir .. "/storage.json") local t = f:read("a") f:close() return t end
+        \\local ok, err = pcall(lumen.storage.set, "k", "v")
+        \\local back = ok and lumen.json.decode(file()).k
+        \\return lumen.extension { commands = { { name = "show", title = "Show", items = {
+        \\  tostring(ok), (tostring(err):find("not overwritten") and "not overwritten" or tostring(err)),
+        \\  file(), tostring(lumen.storage.get("k")), tostring(back),
+        \\} } } }
+    ;
+    try writeTestFile(dir, "extensions/broken/init.lua", read_back);
+    try writeTestFile(dir, "data/extensions/broken/storage.json", "{\"a\": 1, oops");
+    // Bytes that are not UTF-8 are stored as U+FFFD, so the file still reads.
+    try writeTestFile(dir, "extensions/bytes/init.lua", "lumen.storage.set('x', 'a\\xffb')\n" ++ read_back);
+    // Folders named like init.lua and the style would share their files.
+    try writeTestFile(dir, "extensions/config/init.lua", "return nil");
+    try writeTestFile(dir, "extensions/style/init.lua", "return nil");
+
+    var probe: Probe = .{};
+    defer probe.deinit();
+    const h = try testHost(&probe, dir);
+    defer h.shutdown();
+    h.reload();
+    try probe.wait("reg");
+    const reg = probe.reg.?;
+    try testing.expectEqual(@as(usize, 2), reg.problems.len);
+    for (reg.problems) |p| try testing.expect(std.mem.find(u8, p.message, "are taken") != null);
+
+    _ = h.list(reg.gen, 0, "");
+    const broken = try probe.take("res");
+    defer broken.destroy(testing.allocator);
+    try testing.expect(broken.err == null);
+    const want = [_][]const u8{ "false", "not overwritten", "{\"a\": 1, oops", "nil" };
+    for (want, broken.items[0..want.len]) |w, it| try testing.expectEqualStrings(w, it.title);
+
+    _ = h.list(reg.gen, 1, "");
+    const bytes = try probe.take("res");
+    defer bytes.destroy(testing.allocator);
+    try testing.expect(bytes.err == null);
+    try testing.expectEqualStrings("true", bytes.items[0].title);
+    try testing.expectEqualStrings("v", bytes.items[4].title);
+    try testing.expect(std.mem.find(u8, bytes.items[2].title, "\"a\u{FFFD}b\"") != null);
+}
+
+test "rows are kept to a size, and lumen.exec's strings outlive its options" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dbuf: [4096]u8 = undefined;
+    const dir = try os.tmpDirPath(&tmp, &dbuf);
+    try writeTestFile(dir, "extensions/odd/init.lua",
+        \\return lumen.extension { commands = {
+        \\  { name = "big", title = "Big", items = function()
+        \\      local s = string.rep("x", 5 << 20)
+        \\      local rows = {}
+        \\      for i = 1, 1000 do rows[i] = { title = "r" .. i, actions = { lumen.action.copy(s) } } end
+        \\      return rows
+        \\  end },
+        \\  { name = "long", title = "Long", items = function()
+        \\      return { { title = string.rep("é", 1000), detail = string.rep("d", 1 << 20),
+        \\                 metadata = { { "k", string.rep("v", 5000) } } } }
+        \\  end },
+        \\  { name = "exec", title = "Exec", items = function()
+        \\      -- Long strings are not interned: `want` is another string, and
+        \\      -- once argv lets go, argv[3] can be collected.
+        \\      local argv = { "printf", "%s", string.rep("x", 200) .. "z" }
+        \\      local want = string.rep("x", 200) .. "z"
+        \\      local opts = setmetatable({}, { __index = function()
+        \\          argv[1], argv[2], argv[3] = nil, nil, nil
+        \\          collectgarbage() collectgarbage()
+        \\          for i = 1, 2000 do local _ = string.rep("y", 201) .. i end
+        \\      end })
+        \\      return { tostring(lumen.exec(argv, opts) == want) }
+        \\  end },
+        \\} }
+    );
+
+    var probe: Probe = .{};
+    defer probe.deinit();
+    const h = try testHost(&probe, dir);
+    defer h.shutdown();
+    h.reload();
+    try probe.wait("reg");
+    const reg = probe.reg.?;
+
+    // One string 1000 rows copy: 5 GB outside the state's memory cap.
+    _ = h.list(reg.gen, 0, "");
+    const big = try probe.take("res");
+    defer big.destroy(testing.allocator);
+    try testing.expectEqualStrings(rows_too_big, big.err.?);
+
+    _ = h.list(reg.gen, 1, "");
+    const long = try probe.take("res");
+    defer long.destroy(testing.allocator);
+    try testing.expect(long.err == null);
+    const row = long.items[0];
+    // Cut between characters: 512 "é" of two bytes each.
+    try testing.expectEqual(@as(usize, max_line_bytes), row.title.len);
+    try testing.expectEqual(@as(usize, max_detail_bytes), row.detail.len);
+    try testing.expectEqual(@as(usize, max_line_bytes), row.meta[0].value.len);
+
+    _ = h.list(reg.gen, 2, "");
+    const ran = try probe.take("res");
+    defer ran.destroy(testing.allocator);
+    try testing.expect(ran.err == null);
+    try testing.expectEqualStrings("true", ran.items[0].title);
 }

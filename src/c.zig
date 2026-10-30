@@ -453,6 +453,7 @@ pub extern fn g_subprocess_communicate_finish(
     stderr_buf: ?*?*GBytes,
     err: ?*?*GError,
 ) gboolean;
+pub extern fn g_utf8_make_valid(str: [*]const u8, len: isize) [*:0]u8;
 pub extern fn g_shell_parse_argv(
     command_line: [*:0]const u8,
     argcp: ?*c_int,

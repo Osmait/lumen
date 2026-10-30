@@ -92,18 +92,32 @@ pub fn install(L: *lua.State, e: *Host.Ext) void {
 /// lumen.extension (it notes the preferences' defaults), lumen.preferences
 /// and lumen.storage. Both files live in the extension's data folder
 /// (lumen.data_dir): storage.json is the extension's, preferences.json is
-/// written by Settings.
+/// written by Settings. A file that is there but does not read as a JSON
+/// object is never written over: that would lose every value in it.
 const prelude =
     \\local lumen = ...
+    \\-- The object in the file: {} when there is none yet, nil and why when
+    \\-- it cannot be read as one.
     \\local function read_json(path)
-    \\  local f = io.open(path, "r")
-    \\  if not f then return {} end
+    \\  local f, err, code = io.open(path, "r")
+    \\  if not f then
+    \\    if code == 2 then return {} end -- ENOENT
+    \\    return nil, err
+    \\  end
     \\  local text = f:read("a")
     \\  f:close()
-    \\  local ok, value = pcall(lumen.json.decode, text)
+    \\  if text and not text:find("%S") then return {} end
+    \\  local ok, value = pcall(lumen.json.decode, text or "")
     \\  if ok and type(value) == "table" then return value end
-    \\  lumen.log("ignoring unreadable " .. path)
-    \\  return {}
+    \\  return nil, path .. " is not a JSON object"
+    \\end
+    \\local function write_file(path, text)
+    \\  local f, err = io.open(path .. ".tmp", "w")
+    \\  if not f then return nil, err end
+    \\  local wrote, werr = f:write(text)
+    \\  local closed, cerr = f:close()
+    \\  if not wrote or not closed then return nil, werr or cerr end
+    \\  return os.rename(path .. ".tmp", path)
     \\end
     \\
     \\local defaults = {}
@@ -127,7 +141,11 @@ const prelude =
     \\local saved
     \\lumen.preferences = setmetatable({}, {
     \\  __index = function(_, name)
-    \\    saved = saved or read_json(lumen.data_dir .. "/preferences.json")
+    \\    if not saved then
+    \\      local values, err = read_json(lumen.data_dir .. "/preferences.json")
+    \\      if not values then lumen.log("ignoring " .. err) end
+    \\      saved = values or {}
+    \\    end
     \\    local v = saved[name]
     \\    if v == nil then v = defaults[name] end
     \\    return v
@@ -135,21 +153,35 @@ const prelude =
     \\  __newindex = function() error("lumen.preferences is read-only: change them in Settings", 2) end,
     \\})
     \\
-    \\local storage, data = {}, nil
-    \\local function load() data = data or read_json(lumen.data_dir .. "/storage.json") return data end
-    \\local function save()
-    \\  local path = lumen.data_dir .. "/storage.json"
-    \\  local f = assert(io.open(path .. ".tmp", "w"))
-    \\  f:write(lumen.json.encode(data))
-    \\  f:close()
-    \\  assert(os.rename(path .. ".tmp", path))
+    \\local storage, data, unreadable = {}, nil, nil
+    \\local function load()
+    \\  if not data then
+    \\    local values, err = read_json(lumen.data_dir .. "/storage.json")
+    \\    if not values then lumen.log("ignoring " .. err) unreadable = err end
+    \\    data = values or {}
+    \\  end
+    \\  return data
+    \\end
+    \\-- Sets the key and writes the file; when either fails, nothing changes.
+    \\local function save(key, value)
+    \\  local d = load()
+    \\  if unreadable then error("lumen.storage: " .. unreadable .. "; not overwritten", 3) end
+    \\  local old = d[key]
+    \\  d[key] = value
+    \\  local encoded, text = pcall(lumen.json.encode, d)
+    \\  local done, err = false, text
+    \\  if encoded then done, err = write_file(lumen.data_dir .. "/storage.json", text) end
+    \\  if not done then
+    \\    d[key] = old
+    \\    error("lumen.storage: " .. tostring(err), 3)
+    \\  end
     \\end
     \\local function check(key)
     \\  if type(key) ~= "string" then error("lumen.storage: keys are strings, not " .. type(key), 3) end
     \\end
     \\function storage.get(key) check(key) return load()[key] end
-    \\function storage.set(key, value) check(key) load()[key] = value save() end
-    \\function storage.remove(key) check(key) load()[key] = nil save() end
+    \\function storage.set(key, value) check(key) save(key, value) end
+    \\function storage.remove(key) check(key) save(key, nil) end
     \\function storage.all()
     \\  local copy = {}
     \\  for k, v in pairs(load()) do copy[k] = v end
@@ -164,7 +196,9 @@ const prelude =
 const ExecArgs = struct { argc: usize, stdin: []const u8, timeout_ns: u64 };
 
 /// lumen.exec's arguments: the argv list (into `argv`) and the options
-/// table. The strings stay alive in the arguments' tables.
+/// table. The strings stay on the stack, so they live until lumen.exec
+/// returns: reading the options can run Lua code (an `__index`), which may
+/// empty the argv table and let the collector free strings still in use.
 fn execArgs(L: *lua.State, argv: *[64][]const u8) lua.Error!ExecArgs {
     const n = c.lua_rawlen(L, 1);
     if (n == 0 or n > argv.len) return lua.fail(
@@ -172,28 +206,29 @@ fn execArgs(L: *lua.State, argv: *[64][]const u8) lua.Error!ExecArgs {
         "lumen.exec: argv needs 1 to {d} strings",
         .{argv.len},
     );
+    if (c.lua_checkstack(L, @intCast(n + 4)) == 0) return lua.fail(L, "Lua stack overflow", .{});
+    // The options at 2 (nil when not given), the strings from 3 on.
+    c.lua_settop(L, 2);
     for (argv[0..n], 1..) |*arg, i| {
         _ = c.lua_rawgeti(L, 1, @intCast(i));
-        // The table keeps the string alive after the pop.
         arg.* = lua.toSlice(L, -1) orelse return lua.fail(
             L,
             "lumen.exec: argv[{d}] is a {s}, not a string",
             .{ i, lua.typeName(L, -1) },
         );
-        c.lua_settop(L, -2);
     }
     var stdin: []const u8 = "";
     var timeout_ns: u64 = std.math.maxInt(u64);
     switch (c.lua_type(L, 2)) {
         c.LUA_TNONE, c.LUA_TNIL => {},
         c.LUA_TTABLE => {
+            // Left on the stack, like argv's strings.
             if (c.lua_getfield(L, 2, "stdin") != c.LUA_TNIL)
                 stdin = lua.toSlice(L, -1) orelse return lua.fail(
                     L,
                     "lumen.exec: stdin must be a string",
                     .{},
                 );
-            c.lua_settop(L, -2);
             if (c.lua_getfield(L, 2, "timeout") != c.LUA_TNIL) {
                 const s = c.lua_tonumberx(L, -1, null);
                 if (!(s > 0)) return lua.fail(
@@ -265,8 +300,14 @@ fn notify(L: *lua.State) lua.Error!c_int {
         2,
         "lumen.notify",
     );
-    proc.spawn(&.{ "notify-send", "-a", "Lumen", title, body });
+    proc.spawn(&notifyArgv(title, body));
     return 0;
+}
+
+/// notify-send parses options after the summary too: "--" first, so a body
+/// like "--help" or "-i x" is text.
+fn notifyArgv(title: [:0]const u8, body: [:0]const u8) [6][:0]const u8 {
+    return .{ "notify-send", "-a", "Lumen", "--", title, body };
 }
 
 /// `lumen.log(...)` and `print(...)`: to Lumen's log, tagged with the
@@ -706,6 +747,13 @@ test "keys parse like ctrl+g" {
     try std.testing.expect(parseKeys("hyper+g") == null);
     try std.testing.expect(parseKeys("ctrl+nosuchkey") == null);
     try std.testing.expect(parseKeys("ctrl+") == null);
+}
+
+test "a notification's text is never read as options" {
+    const argv = notifyArgv("-u critical", "--help");
+    try std.testing.expectEqualStrings("--", argv[3]);
+    try std.testing.expectEqualStrings("-u critical", argv[4]);
+    try std.testing.expectEqualStrings("--help", argv[5]);
 }
 
 test "theme colours parse as #rrggbb" {

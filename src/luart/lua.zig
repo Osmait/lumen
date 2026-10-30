@@ -53,19 +53,87 @@ pub fn newState(budget: *Budget) ?*State {
 /// Opens the libraries, then removes what an extension must not reach:
 /// exiting the process, blocking shell calls without a timeout (`lumen.exec`
 /// has one), native modules, and `debug` (it could unset the time limit).
+/// What the time limit cannot stop goes too: `__gc` metamethods (Lua runs
+/// finalizers with hooks off, so a loop in one would never end; it marks an
+/// object for finalization only when its metatable has `__gc` as
+/// `setmetatable` runs, and the files' metatable is hidden so its `__gc`
+/// cannot be replaced), the daemon's standard input, and opening a FIFO, a
+/// socket or a device that a read or write could wait on forever.
 /// Extensions are still trusted code: they run as the user.
 /// Call inside `protect`.
 pub fn openLibs(L: *State) void {
     c.luaL_openlibs(L);
     const sandbox =
+        \\local refuse = ...
         \\debug = nil; package.loaded.debug = nil
         \\os.exit, os.execute, os.setlocale = nil, nil, nil
         \\io.popen = nil
         \\package.loadlib = nil; package.cpath = ""
         \\package.searchers[4] = nil; package.searchers[3] = nil
+        \\local setmt, rawget, type, error = setmetatable, rawget, type, error
+        \\function setmetatable(t, mt)
+        \\  if type(mt) == "table" and rawget(mt, "__gc") ~= nil then
+        \\    error("setmetatable: __gc is not available (finalizers run past the time limit)", 2)
+        \\  end
+        \\  return setmt(t, mt)
+        \\end
+        \\getmetatable(io.stdout).__metatable = false
+        \\pcall(io.input, "/dev/null")
+        \\io.stdin = nil
+        \\local open = io.open
+        \\function io.open(path, ...)
+        \\  local why = refuse(path)
+        \\  if why then return nil, why end
+        \\  return open(path, ...)
+        \\end
+        \\local by_name = {
+        \\  { io, "lines" }, { io, "input" }, { io, "output" }, { _G, "loadfile" }, { _G, "dofile" },
+        \\}
+        \\for _, lib in ipairs(by_name) do
+        \\  local t, name = lib[1], lib[2]
+        \\  local f = t[name]
+        \\  t[name] = function(path, ...)
+        \\    -- Without a file name, loadfile and dofile read standard input.
+        \\    if path == nil and t == _G then error(name .. ": a file name expected", 2) end
+        \\    local why = refuse(path)
+        \\    if why then error(why, 2) end
+        \\    return f(path, ...)
+        \\  end
+        \\end
     ;
     if (c.luaL_loadstring(L, sandbox) != c.LUA_OK) _ = c.lua_error(L);
-    c.lua_callk(L, 0, 0, 0, null);
+    c.lua_pushcclosure(L, wrap(refuseOpen), 0);
+    c.lua_callk(L, 1, 0, 0, null);
+}
+
+/// For the sandbox's io.open and the others that open a file by name: a
+/// message when `path` (argument 1) is something a read or write may wait
+/// on forever (a FIFO, a socket, a terminal or another device), else
+/// nothing. Regular files, folders, missing paths and the devices that
+/// never wait pass. Arguments that are not strings pass too: the function
+/// they go to reports them.
+fn refuseOpen(L: *State) Error!c_int {
+    const path = toSlice(L, 1) orelse return 0;
+    if (opensSafely(path)) return 0;
+    pushFmt(L, "{s}: not a regular file (Lumen does not open FIFOs, sockets or devices)", .{path});
+    return 1;
+}
+
+fn opensSafely(path: [*:0]const u8) bool {
+    const linux = std.os.linux;
+    var stx: linux.Statx = undefined;
+    const rc = linux.statx(linux.AT.FDCWD, path, 0, .{ .TYPE = true }, &stx);
+    // Missing, or out of reach: the open fails on its own.
+    if (linux.errno(rc) != .SUCCESS) return true;
+    return switch (stx.mode & linux.S.IFMT) {
+        linux.S.IFREG, linux.S.IFDIR => true,
+        // The memory devices: null, zero, full, random and urandom.
+        linux.S.IFCHR => stx.rdev_major == 1 and switch (stx.rdev_minor) {
+            3, 5, 7, 8, 9 => true,
+            else => false,
+        },
+        else => false,
+    };
 }
 
 fn alloc(ud: ?*anyopaque, ptr: ?*anyopaque, osize: usize, nsize: usize) callconv(.c) ?*anyopaque {
@@ -84,8 +152,77 @@ fn alloc(ud: ?*anyopaque, ptr: ?*anyopaque, osize: usize, nsize: usize) callconv
 }
 
 fn hook(L: ?*State, _: ?*c.lua_Debug) callconv(.c) void {
-    if (os.monotonicNs() > budgetOf(L.?).deadline_ns) _ = c.luaL_error(L, "timed out");
+    if (pastDeadline(L.?)) _ = c.luaL_error(L, "timed out");
 }
+
+/// Whether the code running in `L` is past its deadline: for long work in
+/// Zig, where the instruction hook does not run.
+pub fn pastDeadline(L: *State) bool {
+    return os.monotonicNs() > budgetOf(L).deadline_ns;
+}
+
+/// An allocator over `child` that holds at most `max` bytes at once: for
+/// Zig memory a state's work takes outside the state's own cap (JSON text
+/// and trees, the rows a list returns).
+pub const Capped = struct {
+    child: std.mem.Allocator,
+    max: usize,
+    used: usize = 0,
+    /// An allocation was refused for going over `max`.
+    refused: bool = false,
+
+    /// What is left under the state's own cap: whatever the work makes has
+    /// to fit in there in the end.
+    pub fn leftIn(L: *State, child: std.mem.Allocator) Capped {
+        const b = budgetOf(L);
+        return .{ .child = child, .max = b.max -| b.used };
+    }
+
+    pub fn allocator(self: *Capped) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = cappedAlloc,
+            .resize = cappedResize,
+            .remap = cappedRemap,
+            .free = cappedFree,
+        } };
+    }
+
+    /// Whether a block may go from `old` to `new` bytes.
+    fn fits(self: *Capped, old: usize, new: usize) bool {
+        if (new <= old or self.used - old + new <= self.max) return true;
+        self.refused = true;
+        return false;
+    }
+
+    fn cappedAlloc(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *Capped = @ptrCast(@alignCast(ctx));
+        if (!self.fits(0, len)) return null;
+        const p = self.child.rawAlloc(len, al, ra) orelse return null;
+        self.used += len;
+        return p;
+    }
+
+    fn cappedResize(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, len: usize, ra: usize) bool {
+        const self: *Capped = @ptrCast(@alignCast(ctx));
+        if (!self.fits(m.len, len) or !self.child.rawResize(m, al, len, ra)) return false;
+        self.used = self.used - m.len + len;
+        return true;
+    }
+
+    fn cappedRemap(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+        const self: *Capped = @ptrCast(@alignCast(ctx));
+        if (!self.fits(m.len, len)) return null;
+        const p = self.child.rawRemap(m, al, len, ra) orelse return null;
+        self.used = self.used - m.len + len;
+        return p;
+    }
+
+    fn cappedFree(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, ra: usize) void {
+        const self: *Capped = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(m, al, ra);
+        self.used -= m.len;
+    }
+};
 
 /// Only reached by a Lua error outside every protected call: a bug here.
 fn panic(L: ?*State) callconv(.c) c_int {
@@ -292,22 +429,37 @@ pub fn fieldString(
     name: [:0]const u8,
     where: []const u8,
 ) ?[:0]const u8 {
+    return fieldStringMax(L, a, t, name, where, std.math.maxInt(usize));
+}
+
+/// `fieldString` cut to at most `max` bytes, between UTF-8 characters.
+pub fn fieldStringMax(
+    L: *State,
+    a: std.mem.Allocator,
+    t: c_int,
+    name: [:0]const u8,
+    where: []const u8,
+    max: usize,
+) ?[:0]const u8 {
     defer c.lua_settop(L, -2);
-    return switch (getField(L, t, name)) {
-        c.LUA_TNIL => null,
-        c.LUA_TSTRING => a.dupeSentinel(u8, toSlice(L, -1).?, 0) catch raise(
-            L,
-            "not enough memory",
-            .{},
-        ),
+    switch (getField(L, t, name)) {
+        c.LUA_TNIL => return null,
         // A number reads as text: `subtitle = 42` is fine.
-        c.LUA_TNUMBER => blk: {
-            var len: usize = 0;
-            const p = c.lua_tolstring(L, -1, &len);
-            break :blk a.dupeSentinel(u8, p[0..len], 0) catch raise(L, "not enough memory", .{});
-        },
+        c.LUA_TSTRING, c.LUA_TNUMBER => {},
         else => raise(L, "{s}.{s}: string expected, got {s}", .{ where, name, typeName(L, -1) }),
-    };
+    }
+    var len: usize = 0;
+    const p = c.lua_tolstring(L, -1, &len);
+    return a.dupeSentinel(u8, cut(p[0..len], max), 0) catch oom(L);
+}
+
+/// `s` cut to at most `max` bytes, before the UTF-8 character `max` falls
+/// in.
+pub fn cut(s: []const u8, max: usize) []const u8 {
+    if (s.len <= max) return s;
+    var n = max;
+    while (n > 0 and s[n] & 0xC0 == 0x80) n -= 1;
+    return s[0..n];
 }
 
 /// `t[name]` as a boolean (nil is `default`).
@@ -438,4 +590,84 @@ test "memory is capped per state" {
     try testing.expect(budget.used <= budget.max);
     // Still usable afterwards.
     try testing.expect(runCode(L, arena.allocator(), "x = 1") == null);
+}
+
+test "what the time limit cannot stop is out of reach" {
+    var budget: Budget = .{ .max = 8 << 20 };
+    const L = try testState(&budget);
+    defer c.lua_close(L);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A finalizer runs with the instruction hook off: none can be set.
+    const gc = runCode(L, a, "setmetatable({}, { __gc = function() while true do end end })").?;
+    try testing.expect(std.mem.find(u8, gc, "__gc is not available") != null);
+    try testing.expect(runCode(L, a, "setmetatable({}, { __gc = false })") != null);
+    try testing.expect(runCode(
+        L,
+        a,
+        "local t = setmetatable({}, { __index = string }) assert(t.rep == string.rep)",
+    ) == null);
+    // Nor through the files' metatable, which every open file is marked by.
+    try testing.expect(runCode(L, a, "assert(getmetatable(io.stdout) == false)") == null);
+    try testing.expect(runCode(L, a, "io.stdout:write('')") == null);
+    // The daemon's standard input reads as empty.
+    try testing.expect(runCode(
+        L,
+        a,
+        "assert(io.stdin == nil and io.read() == nil and io.lines()() == nil)",
+    ) == null);
+    try testing.expect(std.mem.find(u8, runCode(L, a, "dofile()").?, "file name expected") != null);
+
+    // A FIFO would wait for a writer forever; regular and missing files
+    // behave as usual.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dbuf: [512]u8 = undefined;
+    const dir = try os.tmpDirPath(&tmp, &dbuf);
+    const fifo = try std.fmt.allocPrintSentinel(a, "{s}/fifo", .{dir}, 0);
+    const linux = std.os.linux;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(
+        linux.mknodat(linux.AT.FDCWD, fifo, linux.S.IFIFO | 0o600, 0),
+    ));
+    const code = try std.fmt.allocPrintSentinel(a,
+        \\local fifo = "{s}"
+        \\local f, err = io.open(fifo)
+        \\assert(f == nil and err:find("not a regular file"), err)
+        \\assert(not pcall(io.lines, fifo) and not pcall(io.output, fifo) and not pcall(dofile, fifo))
+        \\assert(io.open(fifo .. ".missing") == nil)
+        \\local w = assert(io.open(fifo .. ".txt", "w")) w:write("hi") w:close()
+        \\assert(io.open(fifo .. ".txt"):read("a") == "hi")
+        \\assert(io.open("/dev/null"):read("a") == "")
+    , .{fifo}, 0);
+    if (runCode(L, a, code)) |msg| {
+        std.debug.print("{s}\n", .{msg});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "a capped allocator holds no more than its cap" {
+    var capped: Capped = .{ .child = testing.allocator, .max = 1000 };
+    const a = capped.allocator();
+    const x = try a.alloc(u8, 600);
+    try testing.expectError(error.OutOfMemory, a.alloc(u8, 600));
+    try testing.expect(capped.refused);
+    a.free(x);
+    try testing.expectEqual(@as(usize, 0), capped.used);
+    // Growing counts too.
+    var y = try a.alloc(u8, 900);
+    try testing.expectError(error.OutOfMemory, a.realloc(y, 1200));
+    y = try a.realloc(y, 1000);
+    try testing.expectEqual(@as(usize, 1000), capped.used);
+    a.free(y);
+    try testing.expectEqual(@as(usize, 0), capped.used);
+}
+
+test "strings are cut between characters" {
+    try testing.expectEqualStrings("abc", cut("abc", 5));
+    try testing.expectEqualStrings("ab", cut("abc", 2));
+    // "é" is two bytes: cutting inside it drops it whole.
+    try testing.expectEqualStrings("a", cut("aé", 2));
+    try testing.expectEqualStrings("aé", cut("aéz", 3));
 }

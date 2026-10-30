@@ -2,7 +2,13 @@
 //!
 //! null becomes nil (absent in objects, a hole in arrays). A table encodes
 //! as an array when it has a sequence part (`#t > 0`), else as an object
-//! with string keys; `{}` encodes as `{}`.
+//! with string keys; `{}` encodes as `{}`. Strings are bytes in Lua: what
+//! is not UTF-8 encodes as U+FFFD, so the text always decodes again.
+//!
+//! Both run in Zig, where the state's memory cap and instruction hook do
+//! not reach: the memory they take outside the state is capped at what is
+//! left under its cap (the result has to fit in there anyway), and a long
+//! encode checks the deadline itself.
 
 const std = @import("std");
 const lua = @import("lua.zig");
@@ -13,7 +19,8 @@ const max_depth = 200;
 /// `lumen.json.decode(text)`: pushes the decoded value. Parsing allocates
 /// from `gpa`, freed before returning; the push runs under `tryCall`.
 pub fn decode(L: *lua.State, gpa: std.mem.Allocator, text: []const u8) lua.Error!void {
-    var parsed = std.json.parseFromSlice(std.json.Value, gpa, text, .{}) catch |err|
+    var capped: lua.Capped = .leftIn(L, gpa);
+    var parsed = std.json.parseFromSlice(std.json.Value, capped.allocator(), text, .{}) catch |err|
         return lua.fail(L, "json.decode: {s}", .{switch (err) {
             error.OutOfMemory => "out of memory",
             error.SyntaxError, error.UnexpectedEndOfInput => "invalid JSON",
@@ -60,7 +67,10 @@ fn push(L: *lua.State, v: std.json.Value, depth: usize) void {
 /// `lumen.json.encode(value)`: encodes the value at `idx` and pushes the
 /// text. The walk runs under `tryCall`; the buffer is freed either way.
 pub fn encode(L: *lua.State, gpa: std.mem.Allocator, idx: c_int) lua.Error!void {
-    var out: std.Io.Writer.Allocating = .init(gpa);
+    // Shared tables are written once per reference: `t = {t, t}` forty
+    // times over is 2^40 values in a few bytes of Lua.
+    var capped: lua.Capped = .leftIn(L, gpa);
+    var out: std.Io.Writer.Allocating = .init(capped.allocator());
     defer out.deinit();
     var enc: Encoder = .{ .w = &out.writer };
     c.lua_pushvalue(L, idx);
@@ -78,6 +88,8 @@ const Text = struct {
 
 const Encoder = struct {
     w: *std.Io.Writer,
+    /// Values written, for checking the deadline now and then.
+    values: u32 = 0,
 
     fn run(L: *lua.State, e: *Encoder) void {
         e.value(L, 2, 0);
@@ -86,7 +98,9 @@ const Encoder = struct {
     fn value(e: *Encoder, L: *lua.State, idx: c_int, depth: usize) void {
         if (depth > max_depth) lua.raise(L, "json.encode: nested too deeply (a cycle?)", .{});
         if (c.lua_checkstack(L, 3) == 0) lua.raise(L, "json.encode: nested too deeply", .{});
-        e.write(L, idx, depth) catch lua.raise(L, "not enough memory", .{});
+        e.values +%= 1;
+        if (e.values % 4096 == 0 and lua.pastDeadline(L)) lua.raise(L, "timed out", .{});
+        e.write(L, idx, depth) catch lua.raise(L, "json.encode: not enough memory", .{});
     }
 
     fn write(e: *Encoder, L: *lua.State, idx: c_int, depth: usize) std.Io.Writer.Error!void {
@@ -101,7 +115,7 @@ const Encoder = struct {
                 if (!std.math.isFinite(f)) lua.raise(L, "json.encode: cannot encode {d}", .{f});
                 try w.print("{d}", .{f});
             },
-            c.LUA_TSTRING => try std.json.Stringify.encodeJsonString(lua.toSlice(L, idx).?, .{}, w),
+            c.LUA_TSTRING => try writeString(w, lua.toSlice(L, idx).?),
             c.LUA_TTABLE => {
                 const t = lua.absIndex(L, idx);
                 const n = c.lua_rawlen(L, t);
@@ -130,7 +144,7 @@ const Encoder = struct {
                         );
                     if (!first) try w.writeByte(',');
                     first = false;
-                    try std.json.Stringify.encodeJsonString(key, .{}, w);
+                    try writeString(w, key);
                     try w.writeByte(':');
                     e.value(L, -1, depth + 1);
                     c.lua_settop(L, -2);
@@ -142,14 +156,46 @@ const Encoder = struct {
     }
 };
 
+/// `s` as a JSON string, each byte that does not start a valid UTF-8
+/// sequence as U+FFFD: std.json, like any JSON reader, refuses text that
+/// is not UTF-8, and storage.json written that way could not be read back.
+fn writeString(w: *std.Io.Writer, s: []const u8) std.Io.Writer.Error!void {
+    try w.writeByte('"');
+    var i: usize = 0;
+    while (i < s.len) {
+        var end = i;
+        while (end < s.len) {
+            if (s[end] < 0x80) {
+                end += 1;
+                continue;
+            }
+            const n = std.unicode.utf8ByteSequenceLength(s[end]) catch break;
+            if (end + n > s.len or !std.unicode.utf8ValidateSlice(s[end..][0..n])) break;
+            end += n;
+        }
+        try std.json.Stringify.encodeJsonStringChars(s[i..end], .{}, w);
+        if (end < s.len) {
+            try w.writeAll("\u{FFFD}");
+            end += 1;
+        }
+        i = end;
+    }
+    try w.writeByte('"');
+}
+
 // ---------------------------------------------------------------- tests
 
 const testing = std.testing;
+const os = @import("os");
 
 /// Runs `code` with `json` set to decode/encode backed by testing.allocator.
 fn run(code: [:0]const u8) !?[]const u8 {
     var budget: lua.Budget = .{ .max = 16 << 20 };
-    const L = lua.newState(&budget) orelse return error.OutOfMemory;
+    return runIn(&budget, code);
+}
+
+fn runIn(budget: *lua.Budget, code: [:0]const u8) !?[]const u8 {
+    const L = lua.newState(budget) orelse return error.OutOfMemory;
     defer c.lua_close(L);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
@@ -221,4 +267,37 @@ test "json reports bad input instead of crashing" {
         "json.decode(string.rep('[', 1000) .. string.rep(']', 1000))",
         "nested too deeply",
     );
+}
+
+test "json encodes any bytes as text that decodes again" {
+    try expectOk(
+        \\local s = "ok \xff\xfe é \xc3 \xed\xa0\x80 \0 end"
+        \\local text = json.encode({ [s] = s, list = { s } })
+        \\local back = json.decode(text)
+        \\local want = "ok \u{FFFD}\u{FFFD} é \u{FFFD} \u{FFFD}\u{FFFD}\u{FFFD} \0 end"
+        \\assert(back.list[1] == want and back[want] == want, text)
+        \\assert(json.encode("é\xff") == '"é\u{FFFD}"')
+    );
+}
+
+test "json stops at the memory left and at the deadline" {
+    // Shared tables are written out in full each time: 2^40 values.
+    try expectError(
+        "local t = {} for i = 1, 40 do t = { t, t } end json.encode(t)",
+        "not enough memory",
+    );
+    // Decoding takes memory outside the state for its tree: capped too.
+    try expectError(
+        "json.decode('[' .. string.rep('[],', 1e6) .. '[]]')",
+        "out of memory",
+    );
+    // With memory to spare, the deadline stops it.
+    var budget: lua.Budget = .{ .max = 1 << 30 };
+    budget.deadline_ns = os.monotonicNs() + 50 * std.time.ns_per_ms;
+    const t0 = os.monotonicNs();
+    const doubling = "local t = {} for i = 1, 40 do t = { t, t } end json.encode(t)";
+    const msg = (try runIn(&budget, doubling)).?;
+    defer testing.allocator.free(msg);
+    try testing.expect(std.mem.find(u8, msg, "timed out") != null);
+    try testing.expect(os.monotonicNs() - t0 < 5 * std.time.ns_per_s);
 }
