@@ -213,7 +213,8 @@ lumen.storage.set("seen", seen)
 Keys are strings. It is a JSON file written atomically, in
 `~/.local/share/lumen/extensions/<id>/storage.json`, so keep it to settings,
 lists and small caches, not megabytes. `lumen.data_dir` is that folder, for
-files of your own.
+files of your own. If `storage.json` is there but cannot be read, `set` and
+`remove` raise an error instead of writing over it.
 
 ## Forms
 
@@ -262,7 +263,7 @@ Anywhere an icon is given (commands, rows, `lumen.icons`):
 | `lumen.extension(spec)` | What `init.lua` returns. |
 | `lumen.exec(argv [, opts])` | Runs a program and waits for it. Returns `stdout, code, stderr`, or `nil, message` when it cannot run or times out. `opts.stdin` is written to its input; `opts.timeout` is in seconds. It inherits Lumen's environment and searches `PATH`. |
 | `lumen.json.decode(text)` | JSON to Lua values; null becomes nil. |
-| `lumen.json.encode(value)` | Lua values to JSON. A table with a sequence part is an array, else an object with string keys. |
+| `lumen.json.encode(value)` | Lua values to JSON. A table with a sequence part is an array, else an object with string keys. Bytes that are not UTF-8 become U+FFFD. |
 | `lumen.notify(title [, body])` | A desktop notification. |
 | `lumen.log(...)`, `print(...)` | To Lumen's log, tagged with the extension. |
 | `lumen.dir` | The extension's folder. |
@@ -278,7 +279,12 @@ Anywhere an icon is given (commands, rows, `lumen.icons`):
 `require("name")` loads `name.lua` or `name/init.lua` from the extension's
 folder. The standard library is there except `os.exit`, `os.execute`,
 `os.setlocale`, `io.popen`, `debug` and native modules. Use `lumen.exec` to
-run programs, since it has a time limit.
+run programs, since it has a time limit. There is no standard input
+(`io.stdin` is gone, `io.read()` reads nothing), and `io.open` and the
+functions that open files refuse FIFOs, sockets and devices other than
+`/dev/null`, `zero`, `full`, `random` and `urandom`: reading one could block
+past any limit. `setmetatable` refuses a metatable with `__gc`, since
+finalizers run where no limit can stop them.
 
 An extension's commands share one Lua state. A table they all `require` (or a
 global) keeps values between calls until the files are reloaded.
@@ -486,8 +492,8 @@ to load included: its preferences, its folder, Update (for git checkouts)
 and Uninstall.
 
 The name comes from the repository (`lumen-`, `lumen-ext-` and `-lumen` are
-dropped) unless `--as` gives one. A repository without an `init.lua` is
-refused. Lumen loads the extension at once, and it runs as you: read its
+dropped) unless `--as` gives one; `config` and `style` are taken. A
+repository without an `init.lua` is refused. Lumen loads the extension at once, and it runs as you: read its
 `init.lua` first, as you would a script.
 
 To publish one, push the folder (with its `init.lua` at the root) to any git
@@ -516,8 +522,9 @@ bind = ALT SHIFT, G, exec, lumen --command github.prs
 | Root search rows (`root`) | 3 s |
 | A `run` | 30 s |
 | `lumen.exec` | its `timeout`, never past the limit of the call it is in |
-| Memory | 64 MB per extension |
-| Rows | 1000 per list |
+| Memory | 64 MB per extension, `lumen.json` included |
+| Rows | 1000 per list, 16 MB in all |
+| A row's fields | 1 KB for one-line fields (title, subtitle...), 4 KB for `keywords` and `image`, 128 KB for `detail` and `markdown`; longer ones are cut |
 
 Code still running at its limit is stopped with an error. Lists run one at a
 time, and a newer query replaces one that has not started yet.

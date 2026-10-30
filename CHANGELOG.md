@@ -6,6 +6,59 @@ All notable changes are listed here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- The file index's format changed: the first start after updating rescans
+  your home folder once. Cached document text is renamed, not extracted
+  again.
+- Images whose size cannot be read from their header (JPEG XL, ICO, TGA...)
+  are no longer previewed, and images larger than 8192×8192 are not either.
+- Extensions: one-line row fields are cut at 1 KB, `detail` and `markdown`
+  at 128 KB, and a list's rows can take 16 MB in all. `setmetatable` refuses
+  `__gc`, there is no standard input, and `io.open` refuses FIFOs, sockets
+  and most devices. Extensions cannot be named `config` or `style`.
+- Release workflows pin their actions to commits and keep no credentials.
+
+### Fixed
+
+- The window could freeze while the content index extracted documents or
+  verified a slow search, and while a large folder was moved.
+- A crash when an extension's root-search rows were replaced as you typed
+  and deleted.
+- Huge images (a small file declaring 20000×20000 pixels) no longer take
+  gigabytes to preview, and grid pictures load off the UI thread.
+- Slow copies are no longer dropped and no longer freeze the window.
+- A folder replaced by a link is no longer followed, moved folders leave no
+  ghost files behind, and `mv -T` over an empty folder is picked up.
+- A damaged content index no longer crashes Lumen at every start.
+- Building the content index over many large, varied files stays within its
+  memory bound.
+- PDFs and Office files that timed out or lacked a tool are tried again;
+  edits within the same second are picked up; an encrypted Office file no
+  longer hangs extraction for 15 s; the text cache is cleaned up.
+- `lumen.storage` no longer erases storage.json after saving a file name
+  that is not UTF-8, and never writes over a file it cannot read.
+- `lumen.json.encode` and the `__gc` metamethod could get past an
+  extension's memory and time limits.
+- A preference typed during a reload could be saved to another extension.
+- A failed `--install` no longer leaves a half-cloned folder behind.
+- Markdown with many unclosed `**` no longer takes seconds, and a detail
+  pane with invalid bytes no longer shows the previous row's text.
+- Lines of several megabytes in `lumen --dmenu` no longer freeze it.
+- Clipboard History no longer keeps every entry's whole text in memory.
+- The clipboard database and its journal files are owner-only (0600).
+- File names with Unicode direction controls can no longer disguise their
+  extension.
+- Script and extension notifications whose text starts with `-` are shown.
+- Show in Folder works with a `'` in the path.
+- Open at Line works with `$EDITOR` or `$TERMINAL` holding arguments
+  (`code --wait`).
+- `lumen` checks that the daemon on the socket is yours, and the daemon
+  refuses a socket folder it does not own.
+- `lumen` no longer dies with exit 141 when the daemon hangs up.
+- install.sh restarts a daemon whose binary was replaced.
+- Quitting no longer waits for ripgrep or a text extraction to finish.
+
 ## [0.1.0] - 2026-10-30
 
 First release.

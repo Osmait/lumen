@@ -9,14 +9,19 @@ window when `lumen` is called again.
 the reference machine: an empty program linked against libgtk-4 takes 41
 ms, 13 of them for libGLX, which GStreamer GL pulls in), and the keyboard
 shortcut used to pay that before every window. The client connects to
-`$XDG_RUNTIME_DIR/lumen/<app id>.sock` (owner-only; the daemon also checks
-the peer's uid), sends its arguments, prints the answer: under 1 ms. What
+`$XDG_RUNTIME_DIR/lumen/<app id>.sock` (owner-only; each end checks the
+other's uid, and the daemon refuses a folder it does not own), sends its
+arguments, prints the answer: under 1 ms. The daemon never waits on a
+client: each connection is read and answered from its own fd watch, with a
+deadline. What
 it cannot pass on (no daemon yet, `--daemon`, `--dmenu`, installs, unknown
 flags) it hands to `lumen-gtk` with `execve`, where GApplication forwards
 the command line to the running instance as before. Both paths run the
 same handler in `main.zig`. The clipboard watcher runs `lumen
 --clip-store` for every copy, so copies go through the socket too, into the
-daemon's open database.
+daemon's open database. The client reads the whole copy before it connects
+(the app copying may take its time); with no daemon, it hands what it read
+to `lumen-gtk` through a memfd as its stdin.
 
 ## Layout
 
@@ -46,8 +51,9 @@ src/ui/           the window: Ui.zig (state and flow), widgets, labels,
                   settings_view, file_results, detail_pane, backdrop, keyboard,
                   ext_view (extensions in the window), prefs_view (their
                   preferences, the input view), form_view, dmenu (lumen
-                  --dmenu), installer (extensions from git), themes, the
-                  stylesheet
+                  --dmenu), installer (extensions from git), pictures (image
+                  files: sizes read from headers, decoded one at a time on
+                  a worker), themes, the stylesheet
 src/actions.zig   what each action does to the system
 src/settings.zig  the settings file
 src/c.zig         hand-written GTK/GLib/gtk4-layer-shell bindings
@@ -97,8 +103,16 @@ is an arena owned by the caller). Zig functions Lua calls return an error
 union and raise only once their own frames are gone; work that must clean up
 (a child process, a buffer) finishes first or runs under its own protected
 call. Every state has a 64 MB allocator cap and an instruction-count hook
-that stops code past its deadline. `lumen.exec` polls stdin, stdout and stderr
+that stops code past its deadline. Zig-side work done for a state (JSON both
+ways, rows copied out) counts against the same cap (`lua.Capped`), and a
+list's rows against 16 MB. Lua runs `__gc` finalizers with hooks off, so the
+sandbox refuses `__gc` metatables and hides the file handles' metatable;
+closing a state gives `lumen.exec` a deadline too. `lumen.exec` polls stdin, stdout and stderr
 together until the same deadline, and waits for the exit on a pidfd.
+
+A reload finds the open command, form and preference again by id, never by
+index. Root-search rows that may be on screen are freed only once the rows
+are rebuilt from a newer answer.
 
 Reloads are cheap to detect: the stat of `init.lua` and of each extension's
 `.lua` files, hashed and compared when the window opens.
@@ -128,7 +142,10 @@ stdin with GIO's async reads, so lines show as they arrive; git runs as a
   name + parent id): start-up maps `~/.cache/lumen/files.idx`, then a rescan
   always runs in the background (a saved index is a photo).
 - **Scan level by level** with raw `getdents64` (d_type, zero `stat`), each
-  level in parallel; parents end up sorted, so children are a binary search.
+  level in parallel; parents end up sorted, so children are a binary search,
+  and each folder's entries are sorted by name, so a name in a folder is
+  one too. Links are never followed below the root (`O_NOFOLLOW`,
+  `IN_DONT_FOLLOW`); the root itself may be one.
 - **Cascaded search**: incremental refinement → 64-bit character mask →
   greedy cheap score with a per-chunk top-K → optimal alignment (fzf-style,
   in `fine.zig`) on the finalists → recency (`statx`) on the head of the list
@@ -136,7 +153,11 @@ stdin with GIO's async reads, so lines show as they arrive; git runs as a
 - **Live**: inotify watches armed in batches, deletes are a zeroed mask,
   additions go to a small delta, rescans build unlocked on half the cores and
   swap in microseconds. Events lost to an error or a queue overflow trigger a
-  rescan instead.
+  rescan instead; rescans asked for in a row back off from 1 s to 60 s. A new
+  folder is read with the lock released (one over 20 k entries asks for a
+  rescan instead), and the watches of a folder that left the tree are
+  removed. Recency is not looked up under network or FUSE mounts, so a hung
+  one cannot stall a search.
 - **Words and names**: spaces separate words (`cargo toml`), a name without
   its extension counts as exact (`readme` → `README.md`), directories named
   `*cache*` rank as noise, and after each rescan the heap copy is replaced by
@@ -167,12 +188,16 @@ directory (2.8 s cold) and every core.
   (`unzip` + XML to text, `extract.zig`). Extracted text is cached per
   document version in `~/.cache/lumen/text/`; a document that cannot be
   extracted is remembered, a passing failure (timeout, missing tool, memory)
-  is retried.
+  is left out of the index and retried by the next check. The cache is keyed
+  by (path, mtime, size) and swept of files no document uses on start and
+  after each whole build. unzip gets `-P ''`, so an encrypted member fails
+  instead of prompting.
 - **Format**: one mapped file (`~/.cache/lumen/content.idx`): document table
   (path, mtime, size) and segments of sorted trigram keys with varint-delta
   posting lists. Building dedups each file's trigrams with a 16M-bit map and
-  radix-sorts (trigram, doc) pairs, closing a segment every 4 M pairs so
-  memory stays bounded, and writes the file as segments close
+  radix-sorts (trigram, doc) pairs, closing a segment every 4 M pairs, and
+  reads no more documents at a time than could make 4 M pairs, so memory
+  stays bounded whatever the text, and writes the file as segments close
   (`os.AtomicFile`: a temporary file, the header patched in last, fsync,
   rename), so the finished index is never whole in the heap; an update
   copies the old segments from their mapping straight to the file. On 49 k
@@ -190,7 +215,10 @@ directory (2.8 s cold) and every core.
   the next candidate and offers its match to a shared top 50, whose worst
   score stops everyone once no unread candidate can beat it. "SELECT * FROM"
   read 4000 files (all it was allowed) and now reads 379: 42 → 5 ms. With several words, the exact
-  phrase ranks first. Queries run on a worker thread; the newest one wins.
+  phrase ranks first. Queries run on a worker thread; the newest one wins,
+  and one still verifying stops at its next file when a newer one waits.
+  The content index has its own thread pools, so its builds and
+  verification never hold up the name index or the window.
 - **Freshness**: on start, every 5 minutes and when the window opens, the
   files are compared with the index by (path, mtime, size). Listing them
   takes ripgrep ~150 ms and ~0.45 s of CPU, so it is done only when needed:
@@ -223,7 +251,11 @@ reproduces it.
 
 Every index file read from disk is validated before use (layout arithmetic is
 overflow-checked, parent chains are proven to end), and fuzz tests feed them
-garbage.
+garbage, updates and appends included. The name index's mapping is also
+checked where it is read (name offsets, bounded parent walks), since another
+process could write the file after it was validated. Doc order across the
+content index's segments is not checked on open; queries and merges cope
+with repeats.
 
 ## Measuring
 
@@ -237,8 +269,8 @@ tools/lumen-stats.sh --scenario    # + drives the window (every view, x3) and
                                    # measures CPU and GPU during it
 ```
 
-Threads are named (`lm-search-N`, `lm-scan-N`, `lm-files`, `lm-content`) so
-CPU can be attributed. Latency is measured to GdkFrameClock's `after-paint`,
+Threads are named (`lm-search-N`, `lm-scan-N`, `lm-csearch-N`, `lm-cbuild-N`,
+`lm-files`, `lm-content`) so CPU can be attributed. Latency is measured to GdkFrameClock's `after-paint`,
 so it includes GTK's layout and drawing, not only the search.
 
 What the measurements changed (12 threads, 1.06 M files and 43 k text
@@ -275,7 +307,19 @@ with a test:
   checked to be regular (a blocking open of a FIFO froze the launcher)
 - file names that are invalid UTF-8 or contain newlines: shown with U+FFFD /
   a space, searchable by content (`rg --null`), actions use the raw path
-- caches and indexes are owner-only (0700 / 0600) and written atomically
+- caches, indexes and the clipboard database (with its `-wal`/`-shm`) are
+  owner-only (0700 / 0600); caches and indexes are written atomically, the
+  temporary file opened `O_EXCL|O_NOFOLLOW`
+- a folder replaced by a link, `mv -T` over an empty folder, files added to
+  a folder that is then moved away: the index stays right, each with a test
+- images are decoded only if the size their header declares is within
+  limits (8192² for previews and grid pictures, 2048² for icons), at most
+  2048 px wide for a preview; formats whose size cannot be read from the
+  header (JPEG XL, ICO, TGA...) are not previewed
+- rows show at most 512 bytes of a title (dmenu still prints the whole
+  line), and Unicode bidi controls are left out of displayed names
+- Clipboard History loads the first 2000 characters of each entry; the
+  whole entry is read when it is shown, copied or pasted
 - the clipboard watcher is restarted with backoff if it dies
 - pasting into a terminal sends Ctrl+Shift+V
 - file-name queries up to 255 bytes; a hung mount cannot block the content
