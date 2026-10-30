@@ -1497,11 +1497,14 @@ pub fn findFold(hay: []const u8, needle: []const u8, from: usize) ?Span {
     // Folded once here, so the comparisons below read one byte per
     // character. An ASCII folded needle (nearly every query) gets the
     // tightest loop; a long one is folded on the fly instead.
-    var nbuf: [256]u8 = undefined;
-    if (needle.len <= nbuf.len) {
-        const f = fold.foldInto(&nbuf, needle);
-        if (fold.isAscii(f)) return findFoldImpl(.ascii, hay, f, f.len, from);
-        return findFoldImpl(.folded, hay, f, f.len, from);
+    var needle_folded_buffer: [256]u8 = undefined;
+    if (needle.len <= needle_folded_buffer.len) {
+        const needle_folded = fold.foldInto(&needle_folded_buffer, needle);
+        const count = needle_folded.len;
+        if (fold.isAscii(needle_folded)) {
+            return findFoldImpl(.ascii, hay, needle_folded, count, from);
+        }
+        return findFoldImpl(.folded, hay, needle_folded, count, from);
     }
     return findFoldImpl(.raw, hay, needle, fold.foldedLen(needle), from);
 }
@@ -1519,15 +1522,16 @@ fn findFoldImpl(
     comptime kind: NeedleKind,
     hay: []const u8,
     needle: []const u8,
-    n_folded: usize,
+    needle_folded_count: usize,
     from: usize,
 ) ?Span {
     // Each folded character takes at least one byte of `hay`.
-    if (hay.len < n_folded or from > hay.len - n_folded) return null;
+    if (hay.len < needle_folded_count) return null;
+    if (from > hay.len - needle_folded_count) return null;
     var j: usize = 0;
     const first = fold.step(needle, &j);
     const letter = first >= 'a' and first <= 'z';
-    const last_start = hay.len - n_folded;
+    const last_start = hay.len - needle_folded_count;
     const V = @Vector(32, u8);
     var i = from;
     while (i + 32 <= last_start + 1) : (i += 32) {
@@ -1546,14 +1550,16 @@ fn findFoldImpl(
         }
         while (mask != 0) {
             const at = i + @ctz(mask);
-            if (matchAt(kind, hay, at, needle, from)) |e| return .{ .start = at, .end = e };
+            if (matchAt(kind, hay, at, needle, from)) |end| return .{ .start = at, .end = end };
             mask &= mask - 1;
         }
     }
     while (i <= last_start) : (i += 1) {
-        const c = hay[i];
-        if (std.ascii.toLower(c) != first and !(letter and c >= 0xC3 and c <= 0xC5)) continue;
-        if (matchAt(kind, hay, i, needle, from)) |e| return .{ .start = i, .end = e };
+        const byte = hay[i];
+        const candidate = std.ascii.toLower(byte) == first or
+            (letter and byte >= 0xC3 and byte <= 0xC5);
+        if (!candidate) continue;
+        if (matchAt(kind, hay, i, needle, from)) |end| return .{ .start = i, .end = end };
     }
     return null;
 }
@@ -1594,7 +1600,8 @@ inline fn matchAt(
 
 /// `findFold`, start only.
 pub fn findCI(hay: []const u8, needle: []const u8, from: usize) ?usize {
-    return if (findFold(hay, needle, from)) |m| m.start else null;
+    const span = findFold(hay, needle, from) orelse return null;
+    return span.start;
 }
 
 /// Reference for `findFold`: fold `hay[from..]` whole (remembering where
@@ -1619,6 +1626,17 @@ fn findFoldNaive(gpa: std.mem.Allocator, hay: []const u8, needle: []const u8, fr
 
 pub const Verified = struct { count: u32, line: u32, snippet: []const u8, phrase: bool };
 
+/// A hit further into its line than `snippet_lead_max` bytes starts the
+/// snippet `snippet_lead` bytes before it, so that it shows.
+const snippet_lead_max = 60;
+const snippet_lead = 40;
+const snippet_bytes_max = 200;
+
+comptime {
+    assert(snippet_lead <= snippet_lead_max);
+    assert(snippet_lead < snippet_bytes_max);
+}
+
 /// Checks that `text` holds every word and describes the first hit. With
 /// several words, the whole `phrase` (the query as typed) is looked for
 /// first: when present, that is the hit shown. Matching is folded
@@ -1635,31 +1653,34 @@ pub fn verify(
     // looked for where its trigrams are not all present (`maybe_phrase`).
     const phrase_hit = if (words.len > 1 and maybe_phrase) findFold(text, phrase, 0) else null;
     var first = phrase_hit;
-    if (phrase_hit == null) for (words, 0..) |w, i| {
-        const h = findFold(text, w, 0) orelse return null;
-        if (i == 0) first = h;
-    };
-    const w0 = if (phrase_hit != null) phrase else words[0];
+    if (phrase_hit == null) {
+        for (words, 0..) |word, word_index| {
+            const word_hit = findFold(text, word, 0) orelse return null;
+            if (word_index == 0) first = word_hit;
+        }
+    }
+    const counted = if (phrase_hit != null) phrase else words[0];
     const hit = first.?;
     const at = hit.start;
     // The ranking stops caring after `count_cap` hits; so does counting
     // (in a 4 MB book, "the" would otherwise scan the whole text).
     var count: u32 = 0;
-    var p = hit;
+    var occurrence = hit;
     while (count < count_cap) {
         count += 1;
-        p = findFold(text, w0, p.end) orelse break;
+        occurrence = findFold(text, counted, occurrence.end) orelse break;
     }
-    const line_start = if (std.mem.findScalarLast(u8, text[0..at], '\n')) |nl| nl + 1 else 0;
+    const line_start = if (std.mem.findScalarLast(u8, text[0..at], '\n')) |newline| newline + 1 else 0;
     const line_end = std.mem.findScalarPos(u8, text, at, '\n') orelse text.len;
-    const line_no: u32 = @intCast(std.mem.count(u8, text[0..at], "\n") + 1);
+    const line_number: u32 = @intCast(std.mem.count(u8, text[0..at], "\n") + 1);
     // Keep the hit visible: start the snippet a little before it.
-    const start = if (at - line_start > 60) at - 40 else line_start;
-    const raw = std.mem.trim(u8, text[start..@min(line_end, start + 200)], " \t\r");
+    const snippet_start = if (at - line_start > snippet_lead_max) at - snippet_lead else line_start;
+    const snippet_end = @min(line_end, snippet_start + snippet_bytes_max);
+    const snippet = std.mem.trim(u8, text[snippet_start..snippet_end], " \t\r");
     return .{
         .count = count,
-        .line = line_no,
-        .snippet = arena.dupe(u8, utf8.validWindow(raw)) catch "",
+        .line = line_number,
+        .snippet = arena.dupe(u8, utf8.validWindow(snippet)) catch "",
         .phrase = phrase_hit != null,
     };
 }
@@ -2014,11 +2035,11 @@ test "verify finds the line and counts hits" {
 /// Words of a query: split on spaces, folded (`core.fold`) into `arena`.
 pub fn splitWords(
     arena: std.mem.Allocator,
-    q: []const u8,
+    query: []const u8,
 ) std.mem.Allocator.Error![]const []const u8 {
     var words: std.ArrayList([]const u8) = .empty;
-    var it = std.mem.tokenizeAny(u8, q, " \t");
-    while (it.next()) |w| try words.append(arena, try fold.foldAlloc(arena, w));
+    var tokens = std.mem.tokenizeAny(u8, query, " \t");
+    while (tokens.next()) |word| try words.append(arena, try fold.foldAlloc(arena, word));
     return words.items;
 }
 
@@ -2047,7 +2068,7 @@ pub fn plainPath(_: *anyopaque, doc: DocIn, buf: []u8) ?[:0]const u8 {
 
 /// A candidate in verification order: by `bound`, the most its score can
 /// be once its text is read.
-const Cand = struct { doc: u32, bound: i32, maybe_phrase: bool };
+const Candidate = struct { doc: u32, bound: i32, maybe_phrase: bool };
 
 /// Verification shared by the pool's threads: each takes the next candidate
 /// (no batches, so nobody waits for the slowest file of a batch) until the
@@ -2055,125 +2076,150 @@ const Cand = struct { doc: u32, bound: i32, maybe_phrase: bool };
 const VerifyCtx = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    ix: *const Index,
+    index: *const Index,
     words: []const []const u8,
     phrase: []const u8,
-    cands: []const Cand,
+    candidates: []const Candidate,
     text_path: PathFn,
     text_ctx: *anyopaque,
     stop: ?*const std.atomic.Value(bool),
     arenas: []std.heap.ArenaAllocator,
-    now: i64,
+    now_s: i64,
     next: std.atomic.Value(usize) = .init(0),
     /// The worst score among the best `top.len`, once there are that many.
     floor: std.atomic.Value(i32) = .init(std.math.minInt(i32)),
     /// Under `lock`: the best matches so far, snippets in `arena`.
     lock: std.Io.Mutex = .init,
     top: []Match,
-    n_top: usize = 0,
+    top_count: usize = 0,
     arena: std.mem.Allocator,
     oom: std.atomic.Value(bool) = .init(false),
 
-    fn offer(ctx: *VerifyCtx, m: Match) void {
+    fn offer(ctx: *VerifyCtx, match: Match) void {
         ctx.lock.lockUncancelable(ctx.io);
         defer ctx.lock.unlock(ctx.io);
-        var slot = ctx.n_top;
-        if (ctx.n_top == ctx.top.len) {
+        assert(ctx.top_count <= ctx.top.len);
+        var slot = ctx.top_count;
+        if (ctx.top_count == ctx.top.len) {
             slot = worst(ctx.top);
-            if (!better(m, ctx.top[slot])) return;
+            if (!matchRanksBefore(match, ctx.top[slot])) return;
         }
-        var copy = m;
-        copy.snippet = ctx.arena.dupe(u8, m.snippet) catch {
+        var copy = match;
+        copy.snippet = ctx.arena.dupe(u8, match.snippet) catch {
             ctx.oom.store(true, .release);
             return;
         };
         ctx.top[slot] = copy;
-        if (ctx.n_top < ctx.top.len) ctx.n_top += 1;
-        if (ctx.n_top == ctx.top.len) ctx.floor.store(ctx.top[worst(ctx.top)].score, .release);
+        if (ctx.top_count < ctx.top.len) ctx.top_count += 1;
+        if (ctx.top_count == ctx.top.len) {
+            ctx.floor.store(ctx.top[worst(ctx.top)].score, .release);
+        }
     }
 };
 
 /// Ranking order: score, then doc id.
-fn better(x: Match, y: Match) bool {
-    return x.score > y.score or (x.score == y.score and x.doc < y.doc);
+fn matchRanksBefore(a: Match, b: Match) bool {
+    if (a.score != b.score) return a.score > b.score;
+    return a.doc < b.doc;
 }
 
-fn worst(ms: []const Match) usize {
-    var w: usize = 0;
-    for (ms[1..], 1..) |m, i| if (better(ms[w], m)) {
-        w = i;
-    };
-    return w;
+/// Verification order: bound, then doc id.
+fn candidateRanksBefore(a: Candidate, b: Candidate) bool {
+    if (a.bound != b.bound) return a.bound > b.bound;
+    return a.doc < b.doc;
 }
 
-fn verifyTask(ctx: *VerifyCtx, t: usize) void {
-    var pbuf: [4096]u8 = undefined;
+fn worst(matches: []const Match) usize {
+    assert(matches.len > 0);
+    var worst_index: usize = 0;
+    for (matches[1..], 1..) |match, match_index| {
+        if (matchRanksBefore(matches[worst_index], match)) worst_index = match_index;
+    }
+    return worst_index;
+}
+
+fn verifyTask(ctx: *VerifyCtx, task: usize) void {
+    var path_buffer: [4096]u8 = undefined;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.gpa);
-    const a = ctx.arenas[t].allocator();
+    const arena = ctx.arenas[task].allocator();
     while (true) {
-        if (ctx.stop) |s| if (s.load(.acquire)) return;
-        const i = ctx.next.fetchAdd(1, .monotonic);
-        if (i >= ctx.cands.len) return;
-        const cand = ctx.cands[i];
+        if (ctx.stop) |stop| {
+            if (stop.load(.acquire)) return;
+        }
+        const candidate_index = ctx.next.fetchAdd(1, .monotonic);
+        if (candidate_index >= ctx.candidates.len) return;
+        const candidate = ctx.candidates[candidate_index];
         // Candidates come by bound: none after this one can enter either.
-        if (cand.bound < ctx.floor.load(.acquire)) {
-            ctx.next.store(ctx.cands.len, .monotonic);
+        if (candidate.bound < ctx.floor.load(.acquire)) {
+            ctx.next.store(ctx.candidates.len, .monotonic);
             return;
         }
-        defer _ = ctx.arenas[t].reset(.retain_capacity);
-        const doc = cand.doc;
-        const d = ctx.ix.docIn(doc);
-        const p = ctx.text_path(ctx.text_ctx, d, &pbuf) orelse continue;
+        defer _ = ctx.arenas[task].reset(.retain_capacity);
+        const doc = ctx.index.docIn(candidate.doc);
+        const text_path = ctx.text_path(ctx.text_ctx, doc, &path_buffer) orelse continue;
         // Plain files (1 MB at most) are read into a reused buffer: cheaper
         // than map + unmap, whose TLB shootdown hits every core of a
         // 24-thread process. Extracted texts run to megabytes and usually
         // match early, so those are mapped and only touched where scanned.
         var mapped: ?[]align(8) u8 = null;
-        defer if (mapped) |m| sys.unmap(m);
-        const text: []const u8 = if (d.source == .plain) blk: {
-            // BytesAligned8 of memory: this candidate is left out of the results.
-            if (!(readPlain(ctx.gpa, p, &buf) catch false)) continue;
-            break :blk buf.items;
-        } else blk: {
-            mapped = sys.mapPrivate(p) catch continue;
-            break :blk mapped.?;
+        defer if (mapped) |bytes| sys.unmap(bytes);
+        const text: []const u8 = switch (doc.source) {
+            .plain => blk: {
+                // Out of memory: this candidate is left out of the results.
+                const has_text = readPlain(ctx.gpa, text_path, &buf) catch false;
+                if (!has_text) continue;
+                break :blk buf.items;
+            },
+            .extracted => blk: {
+                mapped = sys.mapPrivate(text_path) catch continue;
+                break :blk mapped.?;
+            },
         };
-        const v = verify(text, ctx.words, ctx.phrase, cand.maybe_phrase, a) orelse continue;
-        const phrase_bonus: i32 = if (v.phrase) phrase_max else 0;
+        const verified = verify(text, ctx.words, ctx.phrase, candidate.maybe_phrase, arena) orelse
+            continue;
+        const phrase_bonus: i32 = if (verified.phrase) phrase_max else 0;
         ctx.offer(.{
-            .doc = doc,
-            .count = v.count,
-            .line = v.line,
-            .snippet = v.snippet,
-            .score = rank(d, v.count, ctx.words, ctx.now) + phrase_bonus,
+            .doc = candidate.doc,
+            .count = verified.count,
+            .line = verified.line,
+            .snippet = verified.snippet,
+            .score = rank(doc, verified.count, ctx.words, ctx.now_s) + phrase_bonus,
         });
     }
 }
 
 /// Hits counted per document; more do not change the ranking.
 pub const count_cap = 10;
+/// Score of each hit counted.
+const count_score = 20;
 /// Most of the hit count's weight in the final score.
-const count_max: i32 = count_cap * 20;
+const count_max: i32 = count_cap * count_score;
 /// Bonus when several words appear together, exactly as typed.
 const phrase_max: i32 = 250;
+/// Bonus for each word that the file's name contains.
+const name_word_score = 150;
+/// Penalty for each folder between the root and the file.
+const depth_penalty = 5;
 
 /// More hits, a matching file name, recent edits and shallow paths first.
-fn rank(d: DocIn, count: u32, words: []const []const u8, now: i64) i32 {
-    return @as(i32, @intCast(@min(count, count_cap))) * 20 + staticScore(d, words, now);
+fn rank(doc: DocIn, count: u32, words: []const []const u8, now_s: i64) i32 {
+    const counted: i32 = @intCast(@min(count, count_cap));
+    return counted * count_score + staticScore(doc, words, now_s);
 }
 
 /// The part of the score known without opening the file.
-fn staticScore(d: DocIn, words: []const []const u8, now: i64) i32 {
-    var s: i32 = 0;
-    const slash = std.mem.findScalarLast(u8, d.path, '/') orelse 0;
-    const name = d.path[slash + 1 ..];
-    for (words) |w| if (findFold(name, w, 0) != null) {
-        s += 150;
-    };
+fn staticScore(doc: DocIn, words: []const []const u8, now_s: i64) i32 {
+    var score: i32 = 0;
+    const slash = std.mem.findScalarLast(u8, doc.path, '/') orelse 0;
+    const name = doc.path[slash + 1 ..];
+    for (words) |word| {
+        if (findFold(name, word, 0) != null) score += name_word_score;
+    }
     // Saturating: mtimes come from the index file, which may be damaged.
-    const age_days = @divTrunc(now -| d.mtime, 86_400);
-    s += switch (age_days) {
+    // Whole days: one edited in the future counts as today.
+    const age_days = @divFloor(now_s -| doc.mtime, std.time.s_per_day);
+    score += switch (age_days) {
         std.math.minInt(i64)...0 => 300,
         1...6 => 220,
         7...29 => 140,
@@ -2181,8 +2227,8 @@ fn staticScore(d: DocIn, words: []const []const u8, now: i64) i32 {
         180...364 => 20,
         else => 0,
     };
-    s -= @intCast(std.mem.count(u8, d.path, "/") * 5);
-    return s;
+    score -= @intCast(std.mem.count(u8, doc.path, "/") * depth_penalty);
+    return score;
 }
 
 pub const candidates_verified_max = 4000;
@@ -2196,9 +2242,9 @@ fn orderCandidates(
     gpa: std.mem.Allocator,
     words: []const []const u8,
     phrase: []const u8,
-    cands: []const u32,
-    now: i64,
-) std.mem.Allocator.Error![]Cand {
+    docs: []const u32,
+    now_s: i64,
+) std.mem.Allocator.Error![]Candidate {
     // Only documents holding every trigram of the whole phrase (spaces
     // included) can get its bonus: the others' bound leaves it out, so they
     // need not be read once enough better matches are in. Too short to
@@ -2209,26 +2255,29 @@ fn orderCandidates(
     const phrase_known = several and phrase.len >= 3;
     if (phrase_known) try index.candidates(gpa, &.{phrase}, &phrase_docs);
 
-    const ordered = try gpa.alloc(Cand, cands.len);
+    const ordered = try gpa.alloc(Candidate, docs.len);
     errdefer gpa.free(ordered);
-    var pi: usize = 0;
-    for (cands, ordered) |doc, *o| {
+    var phrase_index: usize = 0;
+    for (docs, ordered) |doc, *candidate| {
         // Both lists ascend.
-        while (pi < phrase_docs.items.len and phrase_docs.items[pi] < doc) pi += 1;
-        const maybe_phrase = several and
-            (!phrase_known or (pi < phrase_docs.items.len and phrase_docs.items[pi] == doc));
-        const d: DocIn = .{ .path = index.path(doc), .mtime = index.mtimes[doc], .size = index.sizes[doc] };
-        o.* = .{
+        const phrase_items = phrase_docs.items;
+        while (phrase_index < phrase_items.len and phrase_items[phrase_index] < doc) {
+            phrase_index += 1;
+        }
+        const phrase_has_doc = phrase_index < phrase_items.len and phrase_items[phrase_index] == doc;
+        const maybe_phrase = several and (!phrase_known or phrase_has_doc);
+        const bound_phrase: i32 = if (maybe_phrase) phrase_max else 0;
+        candidate.* = .{
             .doc = doc,
             .maybe_phrase = maybe_phrase,
-            .bound = staticScore(d, words, now) + count_max + if (maybe_phrase) phrase_max else 0,
+            .bound = staticScore(index.docIn(doc), words, now_s) + count_max + bound_phrase,
         };
     }
-    std.mem.sort(Cand, ordered, {}, struct {
-        fn gt(_: void, x: Cand, y: Cand) bool {
-            return x.bound > y.bound or (x.bound == y.bound and x.doc < y.doc);
+    std.mem.sort(Candidate, ordered, {}, struct {
+        fn before(_: void, a: Candidate, b: Candidate) bool {
+            return candidateRanksBefore(a, b);
         }
-    }.gt);
+    }.before);
     return ordered;
 }
 
@@ -2251,53 +2300,54 @@ pub fn search(
     const words = try splitWords(arena, query);
     const phrase = try fold.foldAlloc(arena, std.mem.trim(u8, query, " \t"));
     var longest: usize = 0;
-    for (words) |w| longest = @max(longest, w.len);
-    if (longest < 3) return; // nothing a trigram can narrow
-    var cands: std.ArrayList(u32) = .empty;
-    defer cands.deinit(gpa);
-    try index.candidates(gpa, words, &cands);
-    if (cands.items.len == 0) return;
-    const now = sys.nowSeconds();
+    for (words) |word| longest = @max(longest, word.len);
+    // Nothing a trigram can narrow.
+    if (longest < 3) return;
+    var docs: std.ArrayList(u32) = .empty;
+    defer docs.deinit(gpa);
+    try index.candidates(gpa, words, &docs);
+    if (docs.items.len == 0) return;
+    const now_s = sys.nowSeconds();
 
-    const ordered = try orderCandidates(index, gpa, words, phrase, cands.items, now);
+    const ordered = try orderCandidates(index, gpa, words, phrase, docs.items, now_s);
     defer gpa.free(ordered);
 
     const tasks = pool.threads.len + 1;
     const arenas = try gpa.alloc(std.heap.ArenaAllocator, tasks);
     defer {
-        for (arenas) |*x| x.deinit();
+        for (arenas) |*task_arena| task_arena.deinit();
         gpa.free(arenas);
     }
-    for (arenas) |*x| x.* = .init(gpa);
+    for (arenas) |*task_arena| task_arena.* = .init(gpa);
     const top = try gpa.alloc(Match, limit);
     defer gpa.free(top);
     var ctx: VerifyCtx = .{
         .gpa = gpa,
         .io = pool.io,
-        .ix = index,
+        .index = index,
         .words = words,
         .phrase = phrase,
-        .cands = ordered[0..@min(ordered.len, candidates_verified_max)],
+        .candidates = ordered[0..@min(ordered.len, candidates_verified_max)],
         .text_path = text_path,
         .text_ctx = text_ctx,
         .stop = opts.stop,
         .arenas = arenas,
-        .now = now,
+        .now_s = now_s,
         .top = top,
         .arena = arena,
     };
-    pool.run(@min(tasks, ctx.cands.len), &ctx, verifyTask);
+    pool.run(@min(tasks, ctx.candidates.len), &ctx, verifyTask);
     if (ctx.oom.load(.acquire)) return error.OutOfMemory;
-    try out.appendSlice(arena, top[0..ctx.n_top]);
+    try out.appendSlice(arena, top[0..ctx.top_count]);
     sortMatches(out.items);
 }
 
-fn sortMatches(items: []Match) void {
-    std.mem.sort(Match, items, {}, struct {
-        fn gt(_: void, x: Match, y: Match) bool {
-            return x.score > y.score or (x.score == y.score and x.doc < y.doc);
+fn sortMatches(matches: []Match) void {
+    std.mem.sort(Match, matches, {}, struct {
+        fn before(_: void, a: Match, b: Match) bool {
+            return matchRanksBefore(a, b);
         }
-    }.gt);
+    }.before);
 }
 
 test "SIMD findFold agrees with the naive folded scan" {
