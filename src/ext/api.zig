@@ -1,9 +1,11 @@
 //! The `lumen` module extensions see (`local lumen = require("lumen")`).
 //! EXTENSIONS.md documents it; keep the two in step.
+//!
+//! `lua.c` is Lua's C API; `gtk` is GTK and GLib (what other files call
+//! `c`).
 
 const std = @import("std");
 const lua = @import("luart").lua;
-const c = lua.c;
 const Host = @import("Host.zig");
 const json = @import("luart").json;
 const proc = @import("../sys/proc.zig");
@@ -15,28 +17,41 @@ const Settings = @import("../settings.zig").Settings;
 const layout_mod = @import("../layout.zig");
 
 const log = std.log.scoped(.ext);
+const assert = std.debug.assert;
 
-fn extOf(L: *lua.State) *Host.Ext {
+/// The most words a program's argv takes, in `lumen.exec` and in
+/// `lumen.action.exec`.
+pub const argv_max = 64;
+/// A layout's prompt or placeholder: a few words in the search bar.
+const layout_text_bytes_max = 64;
+/// The longest key name GDK knows is shorter.
+const key_name_bytes_max = 31;
+/// One `print` or `lumen.log` line; longer output is cut, as a log line is
+/// not a dump.
+const log_line_bytes_max = 2048;
+
+/// The extension whose state `L` is: its budget is the state's allocator
+/// data, and a field of the extension.
+fn extensionOf(L: *lua.State) *Host.Ext {
     return @fieldParentPtr("budget", lua.budgetOf(L));
 }
 
-/// Sets up `lumen` (also a global), `require` for the extension's own
-/// modules, and `print` (to Lumen's log). Inside `protect`.
-pub fn install(L: *lua.State, e: *Host.Ext) void {
-    // require("x") finds x.lua and x/init.lua in the extension's folder.
-    _ = c.lua_getglobal(L, "package");
-    var buf: [4200]u8 = undefined;
-    const path = std.mem.printSentinel(
-        &buf,
-        "{s}/?.lua;{s}/?/init.lua",
-        .{ e.dir, e.dir },
-        0,
-    ) catch lua.raise(L, "extension path too long", .{});
-    _ = c.lua_pushstring(L, path.ptr);
-    c.lua_setfield(L, -2, "path");
-    c.lua_settop(L, -2);
+/// The file being loaded, or an error for a function only a file being
+/// loaded may call (`func` names it).
+fn loadOf(L: *lua.State, func: []const u8) lua.Error!*Host.Load {
+    return extensionOf(L).load orelse lua.fail(L, "{s} works only while a file loads", .{func});
+}
 
-    c.lua_createtable(L, 0, 16);
+/// Sets up `lumen` (also a global), `require` for the extension's own
+/// modules, and `print` (to Lumen's log). Inside `protect`; leaves the
+/// stack as it found it.
+pub fn install(L: *lua.State, extension: *Host.Ext) void {
+    const mark: lua.StackMark = .init(L);
+    defer mark.expectPushed(L, 0);
+    setRequirePath(L, extension.dir);
+
+    lua.c.lua_createtable(L, 0, 16);
+    const lumen = lua.absIndex(L, -1);
     lua.setFuncs(L, &.{
         .{ "exec", execFn },
         .{ "notify", notify },
@@ -47,46 +62,65 @@ pub fn install(L: *lua.State, e: *Host.Ext) void {
         .{ "layout", layout },
         .{ "icons", icons },
     });
-    _ = c.lua_pushstring(L, e.data.ptr);
-    c.lua_setfield(L, -2, "data_dir");
-    _ = c.lua_pushstring(L, e.dir.ptr);
-    c.lua_setfield(L, -2, "dir");
-    _ = c.lua_pushstring(L, e.id.ptr);
-    c.lua_setfield(L, -2, "id");
+    setStringField(L, lumen, "data_dir", extension.data);
+    setStringField(L, lumen, "dir", extension.dir);
+    setStringField(L, lumen, "id", extension.id);
 
-    c.lua_createtable(L, 0, 4);
+    lua.c.lua_createtable(L, 0, 4);
     lua.setFuncs(L, &.{
         .{ "open", actionOpen },
         .{ "copy", actionCopy },
         .{ "paste", actionPaste },
         .{ "exec", actionExec },
     });
-    c.lua_setfield(L, -2, "action");
+    lua.c.lua_setfield(L, lumen, "action");
 
-    c.lua_createtable(L, 0, 2);
+    lua.c.lua_createtable(L, 0, 2);
     lua.setFuncs(L, &.{ .{ "decode", jsonDecode }, .{ "encode", jsonEncode } });
-    c.lua_setfield(L, -2, "json");
+    lua.c.lua_setfield(L, lumen, "json");
 
-    _ = c.lua_getglobal(L, "package");
-    _ = c.lua_getfield(L, -1, "loaded");
-    c.lua_pushvalue(L, -3);
-    c.lua_setfield(L, -2, "lumen");
-    c.lua_settop(L, -3);
-    c.lua_setglobal(L, "lumen");
+    // require("lumen") finds the same table as the global.
+    _ = lua.c.lua_getglobal(L, "package");
+    _ = lua.c.lua_getfield(L, -1, "loaded");
+    lua.c.lua_pushvalue(L, lumen);
+    lua.c.lua_setfield(L, -2, "lumen");
+    lua.c.lua_settop(L, lumen);
+    lua.c.lua_setglobal(L, "lumen");
 
-    c.lua_pushcclosure(L, lua.wrap(logFn), 0);
-    c.lua_setglobal(L, "print");
+    lua.c.lua_pushcclosure(L, lua.wrap(logFn), 0);
+    lua.c.lua_setglobal(L, "print");
 
-    // The parts written in Lua: lumen.extension, preferences, storage.
-    if (c.luaL_loadbufferx(
-        L,
-        prelude.ptr,
-        prelude.len,
-        "=lumen",
-        "t",
-    ) != c.LUA_OK) _ = c.lua_error(L);
-    _ = c.lua_getglobal(L, "lumen");
-    c.lua_callk(L, 1, 0, 0, null);
+    runPrelude(L);
+}
+
+/// require("x") finds x.lua and x/init.lua in the extension's folder.
+fn setRequirePath(L: *lua.State, dir: [:0]const u8) void {
+    const mark: lua.StackMark = .init(L);
+    defer mark.restore(L);
+    _ = lua.c.lua_getglobal(L, "package");
+    // A folder path (at most 4096 bytes) twice, and the pattern around it.
+    var path_buffer: [2 * 4096 + 32]u8 = undefined;
+    const path = std.mem.printSentinel(
+        &path_buffer,
+        "{s}/?.lua;{s}/?/init.lua",
+        .{ dir, dir },
+        0,
+    ) catch lua.raise(L, "extension path too long", .{});
+    _ = lua.c.lua_pushstring(L, path.ptr);
+    lua.c.lua_setfield(L, -2, "path");
+}
+
+fn setStringField(L: *lua.State, table: c_int, name: [:0]const u8, value: [:0]const u8) void {
+    _ = lua.c.lua_pushstring(L, value.ptr);
+    lua.c.lua_setfield(L, table, name.ptr);
+}
+
+/// Runs `prelude` with the `lumen` table as its argument.
+fn runPrelude(L: *lua.State) void {
+    const loaded = lua.c.luaL_loadbufferx(L, prelude.ptr, prelude.len, "=lumen", "t");
+    if (loaded != lua.c.LUA_OK) _ = lua.c.lua_error(L);
+    _ = lua.c.lua_getglobal(L, "lumen");
+    lua.c.lua_callk(L, 1, 0, 0, null);
 }
 
 /// lumen.extension (it notes the preferences' defaults), lumen.preferences
@@ -190,10 +224,6 @@ const prelude =
     \\lumen.storage = storage
 ;
 
-/// The most words a program's argv takes, in `lumen.exec` and in
-/// `lumen.action.exec`.
-pub const argv_max = 64;
-
 /// lumen.exec's arguments, checked.
 const ExecArgs = struct { argc: usize, stdin: []const u8, timeout_ns: u64 };
 
@@ -202,45 +232,49 @@ const ExecArgs = struct { argc: usize, stdin: []const u8, timeout_ns: u64 };
 /// returns: reading the options can run Lua code (an `__index`), which may
 /// empty the argv table and let the collector free strings still in use.
 fn execArgs(L: *lua.State, argv: *[argv_max][]const u8) lua.Error!ExecArgs {
-    const n = c.lua_rawlen(L, 1);
-    if (n == 0 or n > argv.len) return lua.fail(
-        L,
-        "lumen.exec: argv needs 1 to {d} strings",
-        .{argv.len},
-    );
-    if (c.lua_checkstack(L, @intCast(n + 4)) == 0) return lua.fail(L, "Lua stack overflow", .{});
+    const words_count = lua.c.lua_rawlen(L, 1);
+    if (words_count == 0 or words_count > argv.len) {
+        return lua.fail(L, "lumen.exec: argv needs 1 to {d} strings", .{argv.len});
+    }
+    if (lua.c.lua_checkstack(L, @intCast(words_count + 4)) == 0) {
+        return lua.fail(L, "Lua stack overflow", .{});
+    }
     // The options at 2 (nil when not given), the strings from 3 on.
-    c.lua_settop(L, 2);
-    for (argv[0..n], 1..) |*arg, i| {
-        _ = c.lua_rawgeti(L, 1, @intCast(i));
-        arg.* = lua.toSlice(L, -1) orelse return lua.fail(
-            L,
-            "lumen.exec: argv[{d}] is a {s}, not a string",
-            .{ i, lua.typeName(L, -1) },
-        );
+    lua.c.lua_settop(L, 2);
+    for (argv[0..words_count], 1..) |*word, word_number| {
+        _ = lua.c.lua_rawgeti(L, 1, @intCast(word_number));
+        word.* = lua.toSlice(L, -1) orelse {
+            const type_name = lua.typeName(L, -1);
+            return lua.fail(
+                L,
+                "lumen.exec: argv[{d}] is a {s}, not a string",
+                .{ word_number, type_name },
+            );
+        };
     }
     var stdin: []const u8 = "";
     var timeout_ns: u64 = std.math.maxInt(u64);
-    switch (c.lua_type(L, 2)) {
-        c.LUA_TNONE, c.LUA_TNIL => {},
-        c.LUA_TTABLE => {
+    switch (lua.c.lua_type(L, 2)) {
+        lua.c.LUA_TNONE, lua.c.LUA_TNIL => {},
+        lua.c.LUA_TTABLE => {
             // Left on the stack, like argv's strings.
-            if (c.lua_getfield(L, 2, "stdin") != c.LUA_TNIL)
-                stdin = lua.toSlice(L, -1) orelse return lua.fail(
-                    L,
-                    "lumen.exec: stdin must be a string",
-                    .{},
-                );
-            if (c.lua_getfield(L, 2, "timeout") != c.LUA_TNIL) {
-                const s = c.lua_tonumberx(L, -1, null);
-                if (!(s > 0)) return lua.fail(
-                    L,
-                    "lumen.exec: timeout must be a positive number of seconds",
-                    .{},
-                );
-                timeout_ns = @intFromFloat(@min(s, 3600) * std.time.ns_per_s);
+            if (lua.c.lua_getfield(L, 2, "stdin") != lua.c.LUA_TNIL) {
+                stdin = lua.toSlice(L, -1) orelse
+                    return lua.fail(L, "lumen.exec: stdin must be a string", .{});
             }
-            c.lua_settop(L, -2);
+            if (lua.c.lua_getfield(L, 2, "timeout") != lua.c.LUA_TNIL) {
+                const timeout_s = lua.c.lua_tonumberx(L, -1, null);
+                // Written so that NaN is refused too (lua.inRange).
+                if (!(timeout_s > 0)) {
+                    return lua.fail(
+                        L,
+                        "lumen.exec: timeout must be a positive number of seconds",
+                        .{},
+                    );
+                }
+                timeout_ns = @intFromFloat(@min(timeout_s, 3600) * std.time.ns_per_s);
+            }
+            lua.c.lua_settop(L, -2);
         },
         else => return lua.fail(
             L,
@@ -248,7 +282,7 @@ fn execArgs(L: *lua.State, argv: *[argv_max][]const u8) lua.Error!ExecArgs {
             .{lua.typeName(L, 2)},
         ),
     }
-    return .{ .argc = n, .stdin = stdin, .timeout_ns = timeout_ns };
+    return .{ .argc = words_count, .stdin = stdin, .timeout_ns = timeout_ns };
 }
 
 /// `lumen.exec(argv [, { stdin = "", timeout = seconds }])` returns
@@ -257,54 +291,51 @@ fn execArgs(L: *lua.State, argv: *[argv_max][]const u8) lua.Error!ExecArgs {
 fn execFn(L: *lua.State) lua.Error!c_int {
     try lua.argTable(L, 1, "lumen.exec");
     var argv: [argv_max][]const u8 = undefined;
-    const req = try execArgs(L, &argv);
-    const n = req.argc;
-    const stdin = req.stdin;
-    const timeout_ns = req.timeout_ns;
+    const args = try execArgs(L, &argv);
 
-    const e = extOf(L);
+    const extension = extensionOf(L);
     // Never past the deadline of the call that runs it.
-    const deadline = @min(e.budget.deadline_ns, os.monotonicNs() +| timeout_ns);
-    var r = exec.run(e.gpa(), e.io(), argv[0..n], .{
-        .stdin = .{ .bytes = stdin },
-        .deadline_ns = deadline,
+    const deadline_ns = @min(extension.budget.deadline_ns, os.monotonicNs() +| args.timeout_ns);
+    var result = exec.run(extension.gpa(), extension.io(), argv[0..args.argc], .{
+        .stdin = .{ .bytes = args.stdin },
+        .deadline_ns = deadline_ns,
     }) catch |err| {
-        c.lua_pushnil(L);
-        lua.pushFmt(L, "lumen.exec: {s}: {s}", .{ argv[0], switch (err) {
+        const why = switch (err) {
             error.FileNotFound => "not found",
             error.AccessDenied => "permission denied",
             else => @errorName(err),
-        } });
+        };
+        lua.c.lua_pushnil(L);
+        lua.pushFmt(L, "lumen.exec: {s}: {s}", .{ argv[0], why });
         return 2;
     };
     // Freed before anything is pushed outside tryCall: a push can raise (the
     // memory cap) and a raise skips defers (lua.zig), leaking the output.
-    if (r.timed_out) {
-        r.deinit(e.gpa());
-        c.lua_pushnil(L);
+    if (result.timed_out) {
+        result.deinit(extension.gpa());
+        lua.c.lua_pushnil(L);
         lua.pushFmt(L, "lumen.exec: {s} timed out", .{argv[0]});
         return 2;
     }
-    const pushed = lua.tryCall(L, exec.Result, &r, pushExec, 0, 3);
-    r.deinit(e.gpa());
+    const pushed = lua.tryCall(L, exec.Result, &result, pushExec, 0, 3);
+    result.deinit(extension.gpa());
     if (!pushed) return error.Raise;
     return 3;
 }
 
-fn pushExec(L: *lua.State, r: *exec.Result) void {
-    lua.pushString(L, r.stdout);
-    if (r.code) |code| c.lua_pushinteger(L, code) else c.lua_pushnil(L);
-    lua.pushString(L, r.stderr);
+fn pushExec(L: *lua.State, result: *exec.Result) void {
+    lua.pushString(L, result.stdout);
+    if (result.code) |code| lua.c.lua_pushinteger(L, code) else lua.c.lua_pushnil(L);
+    lua.pushString(L, result.stderr);
 }
 
 /// `lumen.notify(title [, body])`: a desktop notification.
 fn notify(L: *lua.State) lua.Error!c_int {
     const title = try lua.argString(L, 1, "lumen.notify");
-    const body: [:0]const u8 = if (c.lua_type(L, 2) <= 0) "" else try lua.argString(
-        L,
-        2,
-        "lumen.notify",
-    );
+    const body: [:0]const u8 = if (lua.isNoneOrNil(L, 2))
+        ""
+    else
+        try lua.argString(L, 2, "lumen.notify");
     proc.spawn(&notifyArgv(title, body));
     return 0;
 }
@@ -316,20 +347,21 @@ fn notifyArgv(title: [:0]const u8, body: [:0]const u8) [6][:0]const u8 {
 }
 
 /// `lumen.log(...)` and `print(...)`: to Lumen's log, tagged with the
-/// extension.
+/// extension. A line longer than `log_line_bytes_max` is cut.
 fn logFn(L: *lua.State) lua.Error!c_int {
-    var buf: [2048]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
-    const n = c.lua_gettop(L);
-    var i: c_int = 1;
-    while (i <= n) : (i += 1) {
+    var buffer: [log_line_bytes_max]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    const arguments_count = lua.c.lua_gettop(L);
+    var argument: c_int = 1;
+    while (argument <= arguments_count) : (argument += 1) {
         var len: usize = 0;
-        const s = c.luaL_tolstring(L, i, &len);
-        if (i > 1) w.writeByte('\t') catch {};
-        w.writeAll(s[0..len]) catch {};
-        c.lua_settop(L, -2);
+        const text = lua.c.luaL_tolstring(L, argument, &len);
+        // A full buffer only cuts the line.
+        if (argument > 1) writer.writeByte('\t') catch {};
+        writer.writeAll(text[0..len]) catch {};
+        lua.c.lua_settop(L, -2);
     }
-    log.info("[{s}] {s}", .{ extOf(L).id, w.buffered() });
+    log.info("[{s}] {s}", .{ extensionOf(L).id, writer.buffered() });
     return 0;
 }
 
@@ -337,66 +369,61 @@ fn logFn(L: *lua.State) lua.Error!c_int {
 /// theme for Change Theme. Colours are "#rrggbb". init.lua only.
 fn theme(L: *lua.State) lua.Error!c_int {
     try lua.argTable(L, 1, "lumen.theme");
-    const e = extOf(L);
-    const load = e.load orelse return lua.fail(L, "lumen.theme works only while a file loads", .{});
-    const a = load.arena;
-    const id = lua.fieldString(L, a, 1, "id", "theme") orelse return lua.fail(
-        L,
-        "theme.id is missing",
-        .{},
-    );
-    if (!Host.validId(id) or std.mem.eql(u8, id, themes.auto_id)) return lua.fail(
-        L,
-        "theme.id: use a-z, 0-9, - and _ (got \"{s}\")",
-        .{id},
-    );
-    for (themes.all) |t| if (std.mem.eql(u8, t.id, id)) return lua.fail(
-        L,
-        "theme.id \"{s}\" is a built-in theme",
-        .{id},
-    );
-    for (load.themes.items) |t| if (std.mem.eql(u8, t.id, id)) return lua.fail(
-        L,
-        "two themes named \"{s}\"",
-        .{id},
-    );
-    const name = lua.fieldString(L, a, 1, "name", "theme") orelse return lua.fail(
-        L,
-        "theme.name is missing",
-        .{},
-    );
-    const bg = try color(L, a, "bg", null);
-    const fg = try color(L, a, "fg", null);
-    const t: themes.Theme = .{
+    const extension = extensionOf(L);
+    const load = try loadOf(L, "lumen.theme");
+    const arena = load.arena;
+    const id = lua.fieldString(L, arena, 1, "id", "theme") orelse
+        return lua.fail(L, "theme.id is missing", .{});
+    if (!Host.validId(id) or std.mem.eql(u8, id, themes.auto_id)) {
+        return lua.fail(L, "theme.id: use a-z, 0-9, - and _ (got \"{s}\")", .{id});
+    }
+    for (themes.all) |built_in| {
+        if (std.mem.eql(u8, built_in.id, id)) {
+            return lua.fail(L, "theme.id \"{s}\" is a built-in theme", .{id});
+        }
+    }
+    for (load.themes.items) |declared| {
+        if (std.mem.eql(u8, declared.id, id)) {
+            return lua.fail(L, "two themes named \"{s}\"", .{id});
+        }
+    }
+    const name = lua.fieldString(L, arena, 1, "name", "theme") orelse
+        return lua.fail(L, "theme.name is missing", .{});
+    const background = try color(L, arena, "bg", null);
+    const foreground = try color(L, arena, "fg", null);
+    const new_theme: themes.Theme = .{
         .id = id,
         .name = name,
         .dark = lua.fieldBool(L, 1, "dark", true, "theme"),
-        .bg = bg,
-        .surface = try color(L, a, "surface", bg),
-        .fg = fg,
-        .ink = try color(L, a, "ink", fg),
-        .accent = try color(L, a, "accent", null),
-        .from_style = std.mem.eql(u8, e.id, "style"),
+        .bg = background,
+        .surface = try color(L, arena, "surface", background),
+        .fg = foreground,
+        .ink = try color(L, arena, "ink", foreground),
+        .accent = try color(L, arena, "accent", null),
+        .from_style = std.mem.eql(u8, extension.id, "style"),
     };
-    load.themes.append(a, t) catch return lua.failOom(L);
+    load.themes.append(arena, new_theme) catch return lua.failOom(L);
     return 0;
 }
 
-fn color(L: *lua.State, a: std.mem.Allocator, field: [:0]const u8, default: ?u24) lua.Error!u24 {
-    const s = lua.fieldString(L, a, 1, field, "theme") orelse {
-        if (default) |d| return d;
+/// The theme's colour `field` (argument 1), or `default` when it has none.
+fn color(
+    L: *lua.State,
+    arena: std.mem.Allocator,
+    field: [:0]const u8,
+    default: ?u24,
+) lua.Error!u24 {
+    const text = lua.fieldString(L, arena, 1, field, "theme") orelse {
+        if (default) |default_color| return default_color;
         return lua.fail(L, "theme.{s} is missing", .{field});
     };
-    return parseHex(s) orelse lua.fail(
-        L,
-        "theme.{s}: \"#rrggbb\" expected (got \"{s}\")",
-        .{ field, s },
-    );
+    return parseHex(text) orelse
+        lua.fail(L, "theme.{s}: \"#rrggbb\" expected (got \"{s}\")", .{ field, text });
 }
 
-pub fn parseHex(s: []const u8) ?u24 {
-    if (s.len != 7 or s[0] != '#') return null;
-    return std.fmt.parseInt(u24, s[1..], 16) catch null;
+pub fn parseHex(text: []const u8) ?u24 {
+    if (text.len != 7 or text[0] != '#') return null;
+    return std.fmt.parseInt(u24, text[1..], 16) catch null;
 }
 
 /// `lumen.keymap("ctrl+g", "github.prs")`: a key that opens a command (or
@@ -404,66 +431,71 @@ pub fn parseHex(s: []const u8) ?u24 {
 fn keymap(L: *lua.State) lua.Error!c_int {
     const keys = try lua.argString(L, 1, "lumen.keymap");
     const target = try lua.argString(L, 2, "lumen.keymap");
-    const e = extOf(L);
-    const load = e.load orelse return lua.fail(
-        L,
-        "lumen.keymap works only while a file loads",
-        .{},
-    );
+    const extension = extensionOf(L);
+    const load = try loadOf(L, "lumen.keymap");
     const parsed = parseKeys(keys) orelse return lua.fail(
         L,
         "lumen.keymap: \"{s}\" is not a key (write it like \"ctrl+g\" or \"alt+shift+F5\")",
         .{keys},
     );
-    if (parsed.mods & (gtk.GDK_CONTROL_MASK | gtk.GDK_ALT_MASK | gtk.GDK_SUPER_MASK) == 0)
+    const modifiers_required = gtk.GDK_CONTROL_MASK | gtk.GDK_ALT_MASK | gtk.GDK_SUPER_MASK;
+    if (parsed.mods & modifiers_required == 0) {
         return lua.fail(
             L,
             "lumen.keymap: \"{s}\" needs ctrl, alt or super (plain keys type into the search)",
             .{keys},
         );
-    const a = load.arena;
-    load.keymaps.append(a, .{
+    }
+    const arena = load.arena;
+    load.keymaps.append(arena, .{
         .keyval = parsed.keyval,
         .mods = parsed.mods,
-        .keys = a.dupeSentinel(u8, keys, 0) catch return lua.failOom(L),
-        .target = a.dupeSentinel(u8, target, 0) catch return lua.failOom(L),
-        .ext = a.dupeSentinel(u8, e.id, 0) catch return lua.failOom(L),
+        .keys = arena.dupeSentinel(u8, keys, 0) catch return lua.failOom(L),
+        .target = arena.dupeSentinel(u8, target, 0) catch return lua.failOom(L),
+        .ext = arena.dupeSentinel(u8, extension.id, 0) catch return lua.failOom(L),
     }) catch return lua.failOom(L);
     return 0;
 }
 
 pub const Keys = struct { keyval: c_uint, mods: gtk.GdkModifierType };
 
+const Modifier = struct { name: []const u8, mask: gtk.GdkModifierType };
+
+const modifiers = [_]Modifier{
+    .{ .name = "ctrl", .mask = gtk.GDK_CONTROL_MASK },
+    .{ .name = "control", .mask = gtk.GDK_CONTROL_MASK },
+    .{ .name = "alt", .mask = gtk.GDK_ALT_MASK },
+    .{ .name = "shift", .mask = gtk.GDK_SHIFT_MASK },
+    .{ .name = "super", .mask = gtk.GDK_SUPER_MASK },
+};
+
 /// "ctrl+shift+g", "alt+F5", "super+space": modifiers, then a key named as
 /// GDK names it (letters in either case). Null when it is not a key.
-pub fn parseKeys(s: []const u8) ?Keys {
+pub fn parseKeys(text: []const u8) ?Keys {
     var mods: gtk.GdkModifierType = 0;
-    var it = std.mem.splitScalar(u8, s, '+');
-    var key: []const u8 = "";
-    while (it.next()) |part| {
-        if (it.peek() == null) {
-            key = part;
+    var parts = std.mem.splitScalar(u8, text, '+');
+    var key_name: []const u8 = "";
+    while (parts.next()) |part| {
+        if (parts.peek() == null) {
+            key_name = part;
             break;
         }
-        const names = [_]struct { []const u8, gtk.GdkModifierType }{
-            .{ "ctrl", gtk.GDK_CONTROL_MASK }, .{ "control", gtk.GDK_CONTROL_MASK },
-            .{ "alt", gtk.GDK_ALT_MASK },      .{ "shift", gtk.GDK_SHIFT_MASK },
-            .{ "super", gtk.GDK_SUPER_MASK },
-        };
-        for (names) |n| {
-            if (std.ascii.eqlIgnoreCase(part, n[0])) {
-                mods |= n[1];
-                break;
-            }
-        } else return null;
+        mods |= modifierMask(part) orelse return null;
     }
-    if (key.len == 0 or key.len > 31) return null;
-    var buf: [32:0]u8 = @splat(0);
-    @memcpy(buf[0..key.len], key);
-    if (key.len == 1) buf[0] = std.ascii.toLower(key[0]);
-    const kv = gtk.gdk_keyval_from_name(&buf);
-    if (kv == 0 or kv == gtk.GDK_KEY_VoidSymbol) return null;
-    return .{ .keyval = gtk.gdk_keyval_to_lower(kv), .mods = mods };
+    if (key_name.len == 0 or key_name.len > key_name_bytes_max) return null;
+    var name_z: [key_name_bytes_max + 1:0]u8 = @splat(0);
+    @memcpy(name_z[0..key_name.len], key_name);
+    if (key_name.len == 1) name_z[0] = std.ascii.toLower(key_name[0]);
+    const keyval = gtk.gdk_keyval_from_name(&name_z);
+    if (keyval == 0 or keyval == gtk.GDK_KEY_VoidSymbol) return null;
+    return .{ .keyval = gtk.gdk_keyval_to_lower(keyval), .mods = mods };
+}
+
+fn modifierMask(name: []const u8) ?gtk.GdkModifierType {
+    for (modifiers) |modifier| {
+        if (std.ascii.eqlIgnoreCase(name, modifier.name)) return modifier.mask;
+    }
+    return null;
 }
 
 /// `lumen.set { width = "wide", density = "compact", suggestions = false }`:
@@ -471,164 +503,167 @@ pub fn parseKeys(s: []const u8) ?Keys {
 /// values are those of settings.conf.
 fn set(L: *lua.State) lua.Error!c_int {
     try lua.argTable(L, 1, "lumen.set");
-    const e = extOf(L);
-    const load = e.load orelse return lua.fail(L, "lumen.set works only while a file loads", .{});
-    const a = load.arena;
-    c.lua_pushnil(L);
-    while (c.lua_next(L, 1) != 0) {
-        const key = lua.toSlice(L, -2) orelse return lua.fail(
-            L,
-            "lumen.set: keys are setting names, not {s}",
-            .{lua.typeName(L, -2)},
-        );
-        var buf: [64]u8 = undefined;
-        const value: []const u8 = switch (c.lua_type(L, -1)) {
-            c.LUA_TBOOLEAN => if (c.lua_toboolean(L, -1) != 0) "true" else "false",
-            c.LUA_TSTRING => lua.toSlice(L, -1).?,
-            c.LUA_TNUMBER => std.mem.print(&buf, "{d}", .{c.lua_tointegerx(L, -1, null)}) catch "",
-            else => return lua.fail(
-                L,
-                "lumen.set: {s} cannot be a {s}",
-                .{ key, lua.typeName(L, -1) },
-            ),
+    const extension = extensionOf(L);
+    const load = try loadOf(L, "lumen.set");
+    const arena = load.arena;
+    // A style's settings are defaults for when it is chosen; init.lua's fix them.
+    const settings = if (std.mem.eql(u8, extension.id, "style"))
+        &load.style_settings
+    else
+        &load.settings;
+    lua.c.lua_pushnil(L);
+    while (lua.c.lua_next(L, 1) != 0) {
+        const key = lua.toSlice(L, -2) orelse {
+            const type_name = lua.typeName(L, -2);
+            return lua.fail(L, "lumen.set: keys are setting names, not {s}", .{type_name});
+        };
+        var number_buffer: [64]u8 = undefined;
+        const value: []const u8 = switch (lua.c.lua_type(L, -1)) {
+            lua.c.LUA_TBOOLEAN => if (lua.c.lua_toboolean(L, -1) != 0) "true" else "false",
+            lua.c.LUA_TSTRING => lua.toSlice(L, -1).?,
+            lua.c.LUA_TNUMBER => blk: {
+                const integer = lua.c.lua_tointegerx(L, -1, null);
+                // 64 bytes hold any integer.
+                break :blk std.mem.print(&number_buffer, "{d}", .{integer}) catch unreachable;
+            },
+            else => {
+                const type_name = lua.typeName(L, -1);
+                return lua.fail(L, "lumen.set: {s} cannot be a {s}", .{ key, type_name });
+            },
         };
         switch (Settings.check(key, value)) {
             .ok => {},
             .unknown_key => return lua.fail(L, "lumen.set: no setting named \"{s}\"", .{key}),
-            .bad_value => return lua.fail(
-                L,
-                "lumen.set: \"{s}\" is not a value for {s}",
-                .{ value, key },
-            ),
+            .bad_value => {
+                return lua.fail(L, "lumen.set: \"{s}\" is not a value for {s}", .{ value, key });
+            },
         }
-        // A style's settings are defaults for when it is chosen; init.lua's fix them.
-        const list = if (std.mem.eql(u8, e.id, "style")) &load.style_settings else &load.settings;
-        list.append(a, .{
-            .key = a.dupeSentinel(u8, key, 0) catch return lua.failOom(L),
-            .value = a.dupeSentinel(u8, value, 0) catch return lua.failOom(L),
+        settings.append(arena, .{
+            .key = arena.dupeSentinel(u8, key, 0) catch return lua.failOom(L),
+            .value = arena.dupeSentinel(u8, value, 0) catch return lua.failOom(L),
         }) catch return lua.failOom(L);
-        c.lua_settop(L, -2);
+        // Pops the value; `lua_next` takes the key off next.
+        lua.c.lua_settop(L, -2);
     }
     return 0;
 }
+
+/// The keys of `lumen.layout` that this file reads itself; layout.set
+/// takes the others.
+const LayoutKey = enum { searchbar, row, prompt, placeholder, show };
 
 /// `lumen.layout { width = 820, panels = "single", footer = true, show = {
 /// hints = false } }`: the window's structure. Several calls add up.
 fn layout(L: *lua.State) lua.Error!c_int {
     try lua.argTable(L, 1, "lumen.layout");
-    const e = extOf(L);
-    const load = e.load orelse return lua.fail(
-        L,
-        "lumen.layout works only while a file loads",
-        .{},
-    );
-    var l = load.layout;
-    c.lua_pushnil(L);
-    while (c.lua_next(L, 1) != 0) {
-        const key = lua.toSlice(L, -2) orelse return lua.fail(
-            L,
-            "lumen.layout: keys are names ({s})",
-            .{layout_mod.keys},
-        );
-        if (std.mem.eql(u8, key, "searchbar") or std.mem.eql(u8, key, "row")) {
-            try layoutParts(L, &l, key);
-        } else if (std.mem.eql(u8, key, "prompt") or std.mem.eql(u8, key, "placeholder")) {
-            const p = lua.toSlice(L, -1) orelse return lua.fail(
-                L,
-                "lumen.layout: {s} is a string",
-                .{key},
-            );
-            const text = load.arena.dupeSentinel(
-                u8,
-                p[0..@min(p.len, 64)],
-                0,
-            ) catch return lua.failOom(L);
-            if (key[1] == 'r') l.prompt = text else l.placeholder = text;
-        } else if (std.mem.eql(u8, key, "show")) {
-            try layoutShow(L, &l);
+    const load = try loadOf(L, "lumen.layout");
+    var layout_new = load.layout;
+    lua.c.lua_pushnil(L);
+    while (lua.c.lua_next(L, 1) != 0) {
+        const key = lua.toSlice(L, -2) orelse
+            return lua.fail(L, "lumen.layout: keys are names ({s})", .{layout_mod.keys});
+        if (std.meta.stringToEnum(LayoutKey, key)) |layout_key| switch (layout_key) {
+            .searchbar => try layoutParts(L, layout_mod.BarPart, &layout_new.searchbar, key),
+            .row => try layoutParts(L, layout_mod.RowPart, &layout_new.row, key),
+            .prompt => layout_new.prompt = try layoutText(L, load.arena, key),
+            .placeholder => layout_new.placeholder = try layoutText(L, load.arena, key),
+            .show => try layoutShow(L, &layout_new.show),
         } else {
-            try layoutValue(L, &l, key);
+            try layoutValue(L, &layout_new, key);
         }
-        c.lua_settop(L, -2);
+        // Pops the value; `lua_next` takes the key off next.
+        lua.c.lua_settop(L, -2);
     }
-    load.layout = l;
+    load.layout = layout_new;
     load.has_layout = true;
     return 0;
 }
 
-/// `searchbar` or `row` (on top of the stack): the parts in order.
-fn layoutParts(L: *lua.State, l: *layout_mod.Layout, key: []const u8) lua.Error!void {
-    if (c.lua_type(L, -1) != c.LUA_TTABLE) return lua.fail(
-        L,
-        "lumen.layout: {s} is a list of part names",
-        .{key},
-    );
-    // The longer of the two orders: a part may appear at most once.
-    var names: [@typeInfo(layout_mod.BarPart).@"enum".field_names.len][]const u8 = undefined;
-    comptime std.debug.assert(names.len >= @typeInfo(layout_mod.RowPart).@"enum".field_names.len);
-    const n = c.lua_rawlen(L, -1);
-    if (n == 0 or n > names.len) {
+/// `prompt` or `placeholder` (on top of the stack), cut to
+/// `layout_text_bytes_max`.
+fn layoutText(L: *lua.State, arena: std.mem.Allocator, key: []const u8) lua.Error![:0]const u8 {
+    const text = lua.toSlice(L, -1) orelse
+        return lua.fail(L, "lumen.layout: {s} is a string", .{key});
+    return arena.dupeSentinel(u8, lua.cut(text, layout_text_bytes_max), 0) catch
+        lua.failOom(L);
+}
+
+/// `searchbar` or `row` (on top of the stack): the parts in order, each at
+/// most once.
+fn layoutParts(
+    L: *lua.State,
+    comptime Part: type,
+    parts: *layout_mod.Parts(Part),
+    key: []const u8,
+) lua.Error!void {
+    if (lua.c.lua_type(L, -1) != lua.c.LUA_TTABLE) {
+        return lua.fail(L, "lumen.layout: {s} is a list of part names", .{key});
+    }
+    const part_names = @typeInfo(Part).@"enum".field_names;
+    var names: [part_names.len][]const u8 = undefined;
+    const names_count = lua.c.lua_rawlen(L, -1);
+    if (names_count == 0 or names_count > names.len) {
         return lua.fail(L, "lumen.layout: {s} lists 1 to {d} parts", .{ key, names.len });
     }
-    for (names[0..n], 1..) |*name, i| {
-        _ = c.lua_rawgeti(L, -1, @intCast(i));
-        name.* = lua.toSlice(L, -1) orelse return lua.fail(
-            L,
-            "lumen.layout: {s}[{d}] is a part name",
-            .{ key, i },
-        );
-        c.lua_settop(L, -2);
+    for (names[0..names_count], 1..) |*name, name_number| {
+        _ = lua.c.lua_rawgeti(L, -1, @intCast(name_number));
+        name.* = lua.toSlice(L, -1) orelse
+            return lua.fail(L, "lumen.layout: {s}[{d}] is a part name", .{ key, name_number });
+        lua.c.lua_settop(L, -2);
     }
-    const is_bar = key[0] == 's';
-    const ok = if (is_bar)
-        layout_mod.setParts(layout_mod.BarPart, &l.searchbar, names[0..n], .entry)
-    else
-        layout_mod.setParts(layout_mod.RowPart, &l.row, names[0..n], .text);
-    ok catch return lua.fail(L, "lumen.layout: {s} takes each of {s} at most once, {s} included", .{
-        key,
-        if (is_bar) "back, icon, prompt, scope, entry, keys" else "icon, text, accessory, hint",
-        if (is_bar) "entry" else "text",
-    });
+    const required: Part = if (Part == layout_mod.BarPart) .entry else .text;
+    layout_mod.setParts(Part, parts, names[0..names_count], required) catch {
+        const all = comptime partNames(Part);
+        return lua.fail(
+            L,
+            "lumen.layout: {s} takes each of {s} at most once, {s} included",
+            .{ key, all, @tagName(required) },
+        );
+    };
+}
+
+/// "back, icon, prompt": the names of a kind of part, for messages.
+fn partNames(comptime Part: type) []const u8 {
+    var all: []const u8 = "";
+    for (@typeInfo(Part).@"enum".field_names, 0..) |name, index| {
+        all = all ++ (if (index > 0) ", " else "") ++ name;
+    }
+    return all;
 }
 
 /// `show` (on top of the stack): which parts of the window show.
-fn layoutShow(L: *lua.State, l: *layout_mod.Layout) lua.Error!void {
-    if (c.lua_type(L, -1) != c.LUA_TTABLE) return lua.fail(
-        L,
-        "lumen.layout: show is a table of true/false",
-        .{},
-    );
-    const show = lua.absIndex(L, -1);
-    c.lua_pushnil(L);
-    while (c.lua_next(L, show) != 0) {
-        const sk = lua.toSlice(L, -2) orelse return lua.fail(
-            L,
-            "lumen.layout: show's keys are {s}",
-            .{layout_mod.show_keys},
-        );
-        if (c.lua_type(L, -1) != c.LUA_TBOOLEAN) return lua.fail(
-            L,
-            "lumen.layout: show.{s} is true or false",
-            .{sk},
-        );
-        layout_mod.setShow(&l.show, sk, c.lua_toboolean(L, -1) != 0) catch return lua.fail(
+fn layoutShow(L: *lua.State, show: *layout_mod.Show) lua.Error!void {
+    if (lua.c.lua_type(L, -1) != lua.c.LUA_TTABLE) {
+        return lua.fail(L, "lumen.layout: show is a table of true/false", .{});
+    }
+    const show_table = lua.absIndex(L, -1);
+    lua.c.lua_pushnil(L);
+    while (lua.c.lua_next(L, show_table) != 0) {
+        const show_key = lua.toSlice(L, -2) orelse
+            return lua.fail(L, "lumen.layout: show's keys are {s}", .{layout_mod.show_keys});
+        if (lua.c.lua_type(L, -1) != lua.c.LUA_TBOOLEAN) {
+            return lua.fail(L, "lumen.layout: show.{s} is true or false", .{show_key});
+        }
+        const on = lua.c.lua_toboolean(L, -1) != 0;
+        layout_mod.setShow(show, show_key, on) catch return lua.fail(
             L,
             "lumen.layout: show has no \"{s}\" (it has {s})",
-            .{ sk, layout_mod.show_keys },
+            .{ show_key, layout_mod.show_keys },
         );
-        c.lua_settop(L, -2);
+        // Pops the value; `lua_next` takes the key off next.
+        lua.c.lua_settop(L, -2);
     }
 }
 
 /// Any other key: a number, string or boolean setting.
-fn layoutValue(L: *lua.State, l: *layout_mod.Layout, key: []const u8) lua.Error!void {
-    const value: layout_mod.Value = switch (c.lua_type(L, -1)) {
-        c.LUA_TNUMBER => .{ .number = c.lua_tonumberx(L, -1, null) },
-        c.LUA_TSTRING => .{ .string = lua.toSlice(L, -1).? },
-        c.LUA_TBOOLEAN => .{ .boolean = c.lua_toboolean(L, -1) != 0 },
+fn layoutValue(L: *lua.State, layout_new: *layout_mod.Layout, key: []const u8) lua.Error!void {
+    const value: layout_mod.Value = switch (lua.c.lua_type(L, -1)) {
+        lua.c.LUA_TNUMBER => .{ .number = lua.c.lua_tonumberx(L, -1, null) },
+        lua.c.LUA_TSTRING => .{ .string = lua.toSlice(L, -1).? },
+        lua.c.LUA_TBOOLEAN => .{ .boolean = lua.c.lua_toboolean(L, -1) != 0 },
         else => .{},
     };
-    layout_mod.set(l, key, value) catch |err| return switch (err) {
+    layout_mod.set(layout_new, key, value) catch |err| return switch (err) {
         error.UnknownKey => lua.fail(
             L,
             "lumen.layout: no \"{s}\" (it has {s})",
@@ -647,69 +682,67 @@ fn layoutValue(L: *lua.State, l: *layout_mod.Layout, key: []const u8) lua.Error!
 /// icons of apps, commands and file kinds replaced. Several calls add up.
 fn icons(L: *lua.State) lua.Error!c_int {
     try lua.argTable(L, 1, "lumen.icons");
-    const e = extOf(L);
-    const load = e.load orelse return lua.fail(L, "lumen.icons works only while a file loads", .{});
-    const a = load.arena;
-    c.lua_pushnil(L);
-    while (c.lua_next(L, 1) != 0) {
+    const load = try loadOf(L, "lumen.icons");
+    const arena = load.arena;
+    lua.c.lua_pushnil(L);
+    while (lua.c.lua_next(L, 1) != 0) {
         const key = lua.toSlice(L, -2) orelse return lua.fail(
             L,
             "lumen.icons: keys are item keys like \"app:firefox\" or \"cmd:clipboard\"",
             .{},
         );
-        if (std.mem.findScalar(u8, key, ':') == null)
+        if (std.mem.findScalar(u8, key, ':') == null) {
             return lua.fail(
                 L,
                 "lumen.icons: \"{s}\" is not a key (app:, cmd:, sys:, win:, script:, ext:, file:)",
                 .{key},
             );
-        const icon = Host.parseIcon(L, a, -1, "lumen.icons") orelse return lua.fail(
-            L,
-            "lumen.icons: no icon for {s}",
-            .{key},
-        );
-        // "app:firefox" means firefox.desktop.
-        const full = if (std.mem.startsWith(u8, key, "app:") and !std.mem.endsWith(
-            u8,
-            key,
-            ".desktop",
-        ))
-            a.printSentinel("{s}.desktop", .{key}, 0)
-        else
-            a.dupeSentinel(u8, key, 0);
-        load.icons.append(a, .{
-            .key = full catch return lua.failOom(L),
-            .icon = icon,
-        }) catch
+        }
+        const icon = Host.parseIcon(L, arena, -1, "lumen.icons") orelse
+            return lua.fail(L, "lumen.icons: no icon for {s}", .{key});
+        const full_key = iconKey(arena, key) catch return lua.failOom(L);
+        load.icons.append(arena, .{ .key = full_key, .icon = icon }) catch
             return lua.failOom(L);
-        c.lua_settop(L, -2);
+        // Pops the value; `lua_next` takes the key off next.
+        lua.c.lua_settop(L, -2);
     }
     return 0;
 }
 
+/// An item key as rows have it: "app:firefox" means firefox.desktop.
+fn iconKey(arena: std.mem.Allocator, key: []const u8) error{OutOfMemory}![:0]const u8 {
+    const is_app = std.mem.startsWith(u8, key, "app:");
+    if (is_app and !std.mem.endsWith(u8, key, ".desktop")) {
+        return arena.printSentinel("{s}.desktop", .{key}, 0);
+    }
+    return arena.dupeSentinel(u8, key, 0);
+}
+
 // lumen.action.*: tables a row's `actions` list takes.
 
+/// `{ kind = kind, [field] = argument 1, title = argument 2 }`: what
+/// `lumen.action.<kind>` returns. `field` is a list for exec, else a string.
 fn actionOf(
     L: *lua.State,
     kind: [:0]const u8,
     field: [:0]const u8,
     func: []const u8,
 ) lua.Error!c_int {
-    if (std.mem.eql(
-        u8,
-        field,
-        "argv",
-    )) try lua.argTable(L, 1, func) else _ = try lua.argString(L, 1, func);
-    const has_title = c.lua_type(L, 2) > 0;
+    if (std.mem.eql(u8, field, "argv")) {
+        try lua.argTable(L, 1, func);
+    } else {
+        _ = try lua.argString(L, 1, func);
+    }
+    const has_title = !lua.isNoneOrNil(L, 2);
     if (has_title) _ = try lua.argString(L, 2, func);
-    c.lua_createtable(L, 0, 3);
-    _ = c.lua_pushstring(L, kind.ptr);
-    c.lua_setfield(L, -2, "kind");
-    c.lua_pushvalue(L, 1);
-    c.lua_setfield(L, -2, field.ptr);
+    lua.c.lua_createtable(L, 0, 3);
+    _ = lua.c.lua_pushstring(L, kind.ptr);
+    lua.c.lua_setfield(L, -2, "kind");
+    lua.c.lua_pushvalue(L, 1);
+    lua.c.lua_setfield(L, -2, field.ptr);
     if (has_title) {
-        c.lua_pushvalue(L, 2);
-        c.lua_setfield(L, -2, "title");
+        lua.c.lua_pushvalue(L, 2);
+        lua.c.lua_setfield(L, -2, "title");
     }
     return 1;
 }
@@ -729,17 +762,15 @@ fn actionExec(L: *lua.State) lua.Error!c_int {
 
 fn jsonDecode(L: *lua.State) lua.Error!c_int {
     const text = try lua.argString(L, 1, "lumen.json.decode");
-    try json.decode(L, extOf(L).gpa(), text);
+    try json.decode(L, extensionOf(L).gpa(), text);
     return 1;
 }
 
 fn jsonEncode(L: *lua.State) lua.Error!c_int {
-    if (c.lua_type(L, 1) == c.LUA_TNONE) return lua.fail(
-        L,
-        "bad argument #1 to 'lumen.json.encode' (value expected)",
-        .{},
-    );
-    try json.encode(L, extOf(L).gpa(), 1);
+    if (lua.c.lua_type(L, 1) == lua.c.LUA_TNONE) {
+        return lua.fail(L, "bad argument #1 to 'lumen.json.encode' (value expected)", .{});
+    }
+    try json.encode(L, extensionOf(L).gpa(), 1);
     return 1;
 }
 
