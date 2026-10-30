@@ -236,18 +236,18 @@ pub fn choiceOptions(ui: *Ui, a: std.mem.Allocator, ch: settings_mod.Choice) []c
 fn iconThemes(a: std.mem.Allocator) []const Option {
     var out: std.ArrayList(Option) = .empty;
     out.append(a, .{ .value = "", .label = "Automatic (the desktop's)" }) catch return out.items;
+    // Out of memory, a folder is left out of the list: the themes in the
+    // others still show.
     var roots: std.ArrayList([]const u8) = .empty;
     const home = std.mem.span(c.g_get_home_dir());
+    const user_data_dir = std.mem.span(c.g_get_user_data_dir());
     roots.append(a, a.print("{s}/.icons", .{home}) catch "") catch {};
-    roots.append(
-        a,
-        a.print("{s}/icons", .{std.mem.span(c.g_get_user_data_dir())}) catch "",
-    ) catch {};
-    var dirs = c.g_get_system_data_dirs();
-    while (dirs[0]) |d| : (dirs += 1) roots.append(
-        a,
-        a.print("{s}/icons", .{std.mem.span(d)}) catch "",
-    ) catch {};
+    roots.append(a, a.print("{s}/icons", .{user_data_dir}) catch "") catch {};
+    var system_data_dirs = c.g_get_system_data_dirs();
+    while (system_data_dirs[0]) |data_dir| : (system_data_dirs += 1) {
+        const root = a.print("{s}/icons", .{std.mem.span(data_dir)}) catch "";
+        roots.append(a, root) catch {};
+    }
     for (roots.items) |root| {
         const rz = a.dupeSentinel(u8, root, 0) catch continue;
         const dir = c.g_dir_open(rz.ptr, 0, null) orelse continue;
@@ -310,17 +310,17 @@ pub fn setChoosing(ui: *Ui, next: Ui.Choosing) void {
         ui.gpa.free(ui.choosing.file.mime);
     }
     ui.choosing = next;
-    // A name too long for the buffer is cut (on a character boundary), not
-    // dropped: an empty title helped nobody.
+    // A title longer than the buffer is cut on a character boundary rather
+    // than dropped, because an empty title tells the user nothing.
     var w: std.Io.Writer = .fixed(ui.choose_title[0 .. ui.choose_title.len - 1]);
     switch (next) {
         .none => {},
         .setting => |ch| w.writeAll(chooseTitle(ch)) catch {},
         .kind => |k| w.print("Open {s} With", .{k.title()}) catch {},
         .file => |f| w.print("Open {s} With", .{std.Io.Dir.path.basename(f.path)}) catch {},
-        .pref => |i| if (ui.ext_registry) |reg| if (i < reg.prefs.len) w.writeAll(
-            reg.prefs[i].title,
-        ) catch {},
+        .pref => |i| if (ui.ext_registry) |reg| {
+            if (i < reg.prefs.len) w.writeAll(reg.prefs[i].title) catch {};
+        },
         .field => |i| if (form_view.field(ui, i)) |f| w.writeAll(f.title) catch {},
     }
     const n = core.utf8.validPrefix(w.buffered()).len;
@@ -496,14 +496,14 @@ pub fn themeCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
         .{styleTitle(a, ui.settings.style)},
         0,
     ) catch "Style Themes";
-    for (themes.custom) |*t| if (t.from_style) out.append(
-        a,
-        themeItem(ui, a, t, style_section),
-    ) catch break;
-    for (themes.custom) |*t| if (!t.from_style) out.append(
-        a,
-        themeItem(ui, a, t, "Your Themes"),
-    ) catch break;
+    for (themes.custom) |*theme| {
+        if (!theme.from_style) continue;
+        out.append(a, themeItem(ui, a, theme, style_section)) catch break;
+    }
+    for (themes.custom) |*theme| {
+        if (theme.from_style) continue;
+        out.append(a, themeItem(ui, a, theme, "Your Themes")) catch break;
+    }
     return out.items;
 }
 
@@ -595,10 +595,11 @@ fn pick(ui: *Ui, v: [:0]const u8) void {
             ui.goBack();
         },
         .kind => |k| {
-            if (ui.settings.setOpenWith(@tagName(k), v)) ui.saveSettings() else |err| log.warn(
-                "default app for {t}: {t}",
-                .{ k, err },
-            );
+            if (ui.settings.setOpenWith(@tagName(k), v)) {
+                ui.saveSettings();
+            } else |err| {
+                log.warn("default app for {t}: {t}", .{ k, err });
+            }
             ui.goBack();
         },
         .pref => |i| prefs_view.pick(ui, i, v),
@@ -620,10 +621,11 @@ fn openWith(ui: *Ui, id: [:0]const u8, always: bool) void {
         else
             core.file_kind.extKey(&ebuf, name);
         if (key.len > 0) {
-            if (ui.settings.setOpenWith(key, id)) ui.saveSettings() else |err| log.warn(
-                "default app for {s}: {t}",
-                .{ key, err },
-            );
+            if (ui.settings.setOpenWith(key, id)) {
+                ui.saveSettings();
+            } else |err| {
+                log.warn("default app for {s}: {t}", .{ key, err });
+            }
         }
     }
     if (!run.openWith(f.path, id)) return;

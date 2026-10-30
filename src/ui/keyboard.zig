@@ -29,8 +29,8 @@ pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
         ui.openPanel();
         return 1;
     }
-    // dmenu: Ctrl+Enter, or Enter with nothing matching, answers with the
-    // text typed.
+    // In dmenu, Ctrl+Enter (or Enter when no row matches) answers with the
+    // typed text instead of a row.
     if (enter and ui.view == .dmenu and (ctrl or ui.selectedItem() == null)) {
         Ui.dmenu.chooseTyped(ui);
         return 1;

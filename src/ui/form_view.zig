@@ -69,13 +69,11 @@ pub fn candidates(ui: *Ui, a: std.mem.Allocator) []Item {
     const cmd = command(ui) orelse return &.{};
     var out: std.ArrayList(Item) = .empty;
     for (cmd.fields, 0..) |*f, i| {
+        // A required field is marked with a star after its title.
+        const field_title = if (f.required) a.printSentinel("{s} *", .{f.title}, 0) catch f.title else f.title;
         out.append(a, .{
             .key = a.print("field:{s}", .{f.name}) catch continue,
-            .title = if (f.required) a.printSentinel(
-                "{s} *",
-                .{f.title},
-                0,
-            ) catch f.title else f.title,
+            .title = field_title,
             .subtitle = f.description,
             .accessory = prefs_view.display(a, f, value(ui, i)),
             .icon = prefs_view.iconOf(f.kind),

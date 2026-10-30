@@ -12,8 +12,8 @@ const os = @import("os");
 const pictures = @import("pictures.zig");
 
 /// A small picture of a theme: its background, two lines of text and an
-/// accent dot. Made once per set of colours and kept (themes from init.lua
-/// included, up to the cache's size).
+/// accent dot. Each set of colours is drawn once and cached, init.lua's
+/// themes included, until the cache is full.
 pub fn swatchTexture(bg: u24, fg: u24, accent: u24) ?*c.GdkTexture {
     const Cache = struct {
         var ring: TextureRing(64, u72) = .{};

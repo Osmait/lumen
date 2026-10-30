@@ -117,7 +117,8 @@ key_chip: *c.GtkWidget = undefined,
 search_icon: *c.GtkWidget = undefined,
 /// lumen.layout's prompt (rofi's "drun"), before the text.
 prompt_label: *c.GtkWidget = undefined,
-/// The widgets exist (settings read before `build` made them wait).
+/// True once `build` has made the widgets. Settings read before that are
+/// applied to the widgets when they exist.
 built: bool = false,
 entry: *c.GtkWidget = undefined,
 back: *c.GtkWidget = undefined,
@@ -144,8 +145,9 @@ contents: ?*index.ContentService = null,
 content_search: ?*ContentSearch = null,
 /// The latest content result applied; its arena backs the rows shown.
 content_result: ?*ContentSearch.Result = null,
-/// The result the rows on screen were built from: a keystroke that only
-/// asks the worker leaves them as they are.
+/// The result the visible rows were built from. A keystroke that only sends
+/// a new query to the worker keeps these rows on screen until its answer
+/// arrives.
 shown_content: ?*ContentSearch.Result = null,
 /// Generation of the last query submitted; older results are dropped.
 content_gen: u32 = 0,
@@ -198,8 +200,8 @@ settings: Settings,
 /// $XDG_CONFIG_HOME/lumen: settings, init.lua, extensions, style.css.
 config_dir: [:0]const u8 = "",
 settings_path: [:0]const u8 = "",
-/// The settings file as last read or written: a different one on disk was
-/// edited by hand.
+/// The settings file's stamp when Lumen last read or wrote it. A different
+/// stamp on disk means the file was edited by hand.
 settings_stamp: settings_mod.Stamp = .none,
 /// Called after the settings change (main starts or stops the clipboard
 /// watcher).
@@ -226,7 +228,8 @@ ext_registry: ?*ExtHost.Registry = null,
 ext_stamp: u64 = 0,
 /// The command the ext view shows (its index in the registry).
 ext_cmd: u16 = 0,
-/// Its latest rows; they point into it.
+/// The latest list answer for `ext_cmd`. The visible items point into it, so
+/// it is destroyed only after the rows are built again.
 ext_result: ?*ExtHost.ListResult = null,
 /// The result the rows on screen were built from (see `shown_content`).
 ext_shown: ?*ExtHost.ListResult = null,
@@ -252,11 +255,11 @@ form_cmd: u16 = 0,
 form_values: std.ArrayList([:0]u8) = .empty,
 /// ~/.config/lumen/icons as last read (widgets.renamed points into it).
 icon_arena: ?std.heap.ArenaAllocator = null,
-/// A message for the selected row once the extensions have reloaded (the
-/// reload rebuilds the rows, and would wipe it).
+/// A message to show on the selected row after the next extension reload.
+/// The reload rebuilds every row, so a message set before it would be lost.
 after_reload: core.FixedStr(160) = .{},
-/// `after_reload` waits for the next reload (the row may still point at
-/// the text after that: it is never cleared, only replaced).
+/// True while `after_reload` waits for the next reload. The text itself is
+/// never cleared, only replaced, because the row may still point at it.
 after_reload_pending: bool = false,
 /// `lumen --dmenu` waiting for an answer.
 picker: ?*dmenu.Session = null,
@@ -337,9 +340,9 @@ const Navigation = struct {
     }
 };
 
-/// Rows built with the keystroke's frame: the ~8 the list shows, and some
-/// to scroll into. Files listed 61 rows (~430 widgets) per key, and GTK
-/// laid them all out: ~14 of the view's 23 ms.
+/// Rows built in the keystroke's frame: the ~8 the list shows and a few to
+/// scroll into. Building all 61 file rows (~430 widgets) per key cost ~14 of
+/// the view's 23 ms, because GTK laid out every one.
 const eager_rows = 14;
 
 /// What the view and query arenas keep for next time when reset. They kept
@@ -530,7 +533,8 @@ fn buildResults(self: *Ui, column: *c.GtkWidget) void {
     c.gtk_widget_set_valign(self.grid, c.GTK_ALIGN_START);
     c.gtk_widget_set_visible(self.grid, 0);
     widgets.connect(self.grid, "child-activated", &onGridActivated, self);
-    // Both in the scroller; one shows at a time.
+    // The list and the grid share the scroller; showEmptyOrResults shows one
+    // of them at a time.
     const lists = widgets.vbox(0);
     c.gtk_box_append(@ptrCast(lists), self.list);
     c.gtk_box_append(@ptrCast(lists), self.grid);
@@ -586,9 +590,11 @@ fn buildPanel(self: *Ui, overlay: *c.GtkWidget) void {
 /// (widgets.renamed). Read when the window opens: a handful of files.
 fn scanIconDir(self: *Ui) void {
     widgets.renamed = .empty;
-    if (self.icon_arena) |*ar| _ = ar.reset(
-        .retain_capacity,
-    ) else self.icon_arena = .init(self.gpa);
+    if (self.icon_arena) |*icon_arena| {
+        _ = icon_arena.reset(.retain_capacity);
+    } else {
+        self.icon_arena = .init(self.gpa);
+    }
     const a = self.icon_arena.?.allocator();
     const dir = a.printSentinel("{s}/icons", .{self.config_dir}, 0) catch return;
     const d = c.g_dir_open(dir.ptr, 0, null) orelse return;
@@ -682,15 +688,9 @@ pub fn applyStructure(self: *Ui) void {
         self.results,
         if (l.detail == .bottom) c.GTK_ORIENTATION_VERTICAL else c.GTK_ORIENTATION_HORIZONTAL,
     );
-    if (l.detail == .left) c.gtk_box_reorder_child_after(
-        island,
-        self.detail,
-        null,
-    ) else c.gtk_box_reorder_child_after(
-        island,
-        self.detail,
-        self.scroller,
-    );
+    // Null puts the detail pane first: on the left of the list.
+    const detail_after: ?*c.GtkWidget = if (l.detail == .left) null else self.scroller;
+    c.gtk_box_reorder_child_after(island, self.detail, detail_after);
     cssClass(self.results, "detail-left", l.detail == .left);
     cssClass(self.results, "detail-bottom", l.detail == .bottom);
     self.applyLayout();
@@ -724,11 +724,9 @@ fn applyLayout(self: *Ui) void {
         _ = c.gtk_widget_grab_focus(self.entry);
     }
     // The list beside a detail pane keeps ~40% of the width.
-    if (c.gtk_widget_get_visible(self.detail) != 0) c.gtk_widget_set_size_request(
-        self.scroller,
-        @divTrunc(w * 2, 5),
-        -1,
-    );
+    if (c.gtk_widget_get_visible(self.detail) != 0) {
+        c.gtk_widget_set_size_request(self.scroller, @divTrunc(w * 2, 5), -1);
+    }
 }
 
 fn loadCss(self: *Ui) void {
@@ -761,10 +759,9 @@ pub fn reloadSettings(self: *Ui) void {
 /// The Icon Theme setting, for Lumen's process only.
 fn applyIconTheme(self: *Ui) void {
     const gs = c.gtk_settings_get_default() orelse return;
-    if (self.settings.icon_theme.len == 0) return c.gtk_settings_reset_property(
-        gs,
-        "gtk-icon-theme-name",
-    );
+    if (self.settings.icon_theme.len == 0) {
+        return c.gtk_settings_reset_property(gs, "gtk-icon-theme-name");
+    }
     var buf: [128]u8 = undefined;
     const name = std.mem.printSentinel(&buf, "{s}", .{self.settings.icon_theme}, 0) catch return;
     c.g_object_set(gs, "gtk-icon-theme-name", name.ptr, @as(?*anyopaque, null));
@@ -961,10 +958,10 @@ pub fn showWith(self: *Ui, view: View, text: ?[*:0]const u8) void {
     // Without it, results are ranked by match quality alone.
     self.frec = self.db.loadFrecency(self.frec_arena.allocator(), labels.now()) catch .empty;
     if (c.gtk_widget_get_visible(self.window) == 0) {
-        // Edited by hand since the last look?
-        if (!settings_mod.Stamp.of(
-            self.settings_path.ptr,
-        ).eql(self.settings_stamp)) self.reloadSettings();
+        // The settings file may have been edited by hand since the window
+        // last opened.
+        const settings_stamp = settings_mod.Stamp.of(self.settings_path.ptr);
+        if (!settings_stamp.eql(self.settings_stamp)) self.reloadSettings();
         if (self.userCssChanged()) self.applyAppearance(null);
         self.scanIconDir();
         ext_view.checkReload(self);
@@ -973,8 +970,8 @@ pub fn showWith(self: *Ui, view: View, text: ?[*:0]const u8) void {
         if (self.contents) |cs| cs.poke();
     }
     self.navigation.clear();
-    // The choose view only means something reached from a setting, the
-    // ext view from a command.
+    // The choose view needs a setting to choose for, and the ext view a
+    // command to show; without one, their parent view opens instead.
     self.setView(
         if (view == .choose and self.choosing == .none) .settings else if (view == .ext and
             ext_view.command(self) == null) .root else view,
@@ -1025,7 +1022,8 @@ pub fn hide(self: *Ui) void {
     // Window actions wait for Hyprland to give the focus back.
     hypr.sendAfterHide();
     dmenu.finish(self, null);
-    // A theme previewed but not chosen.
+    // Moving through Change Theme previews each theme; hiding without
+    // choosing one puts back the theme in use.
     if (self.view == .themes) self.applyAppearance(null);
     self.closePanel();
     self.confirm_key = "";
@@ -1102,7 +1100,8 @@ pub fn rebuild(self: *Ui) void {
     _ = self.data_arena.reset(arena_keep);
     self.base = self.loadBase(self.data_arena.allocator());
     self.refresh();
-    // Nothing points into the app lists a reload replaced any more.
+    // The rows were built again from the current app list, so the lists an
+    // earlier reload replaced can be freed.
     self.apps.dropStale();
 }
 
@@ -1128,13 +1127,13 @@ fn loadBase(self: *Ui, a: std.mem.Allocator) []Item {
 
 pub fn setView(self: *Ui, view: View) void {
     const leaving_themes = self.view == .themes and view != .themes;
-    // Somewhere else now: the dmenu caller gets no answer.
+    // Leaving the dmenu view answers the waiting `lumen --dmenu` with
+    // nothing.
     if (self.view == .dmenu and view != .dmenu) dmenu.finish(self, null);
     // Change Theme starts on the theme in use.
-    if (view == .themes and self.reselect.len == 0) self.setReselect(
-        "theme:{s}",
-        .{self.settings.theme},
-    );
+    if (view == .themes and self.reselect.len == 0) {
+        self.setReselect("theme:{s}", .{self.settings.theme});
+    }
     self.view = view;
     if (view == .root) self.navigation.clear();
     if (leaving_themes) self.applyAppearance(null);
@@ -1142,7 +1141,7 @@ pub fn setView(self: *Ui, view: View) void {
     self.confirm_key = "";
     _ = self.data_arena.reset(arena_keep);
     if (view == .ext) ext_view.enter(self);
-    // Passwords are typed unseen.
+    // A password preference hides what is typed.
     c.gtk_text_set_visibility(@ptrCast(self.entry), @intFromBool(
         !(view == .input and prefs_view.isPassword(self)),
     ));
@@ -1160,13 +1159,14 @@ pub fn setView(self: *Ui, view: View) void {
     ));
     c.gtk_label_set_text(@ptrCast(self.footer_title), self.viewTitle());
 
-    // Setting the text triggers `changed`, which refreshes.
-    if (c.gtk_editable_get_text(
-        @ptrCast(self.entry),
-    )[0] == 0) self.refresh() else c.gtk_editable_set_text(
-        @ptrCast(self.entry),
-        "",
-    );
+    // Clearing the text emits `changed`, which refreshes; an entry that is
+    // already empty emits nothing, so it is refreshed here.
+    const entry_empty = c.gtk_editable_get_text(@ptrCast(self.entry))[0] == 0;
+    if (entry_empty) {
+        self.refresh();
+    } else {
+        c.gtk_editable_set_text(@ptrCast(self.entry), "");
+    }
     // The rows are this base's now: nothing points into replaced app lists.
     self.apps.dropStale();
 }
@@ -1380,11 +1380,9 @@ fn answerPending(self: *Ui, t0: u64) bool {
     if (self.view != .contents) return false;
     const cs = self.content_search orelse return false;
     const r = self.content_result orelse return false;
-    if (q.len < 3 or r != self.shown_content or std.mem.eql(
-        u8,
-        r.query,
-        ContentSearch.clip(q),
-    )) return false;
+    if (q.len < 3) return false;
+    if (r != self.shown_content) return false;
+    if (std.mem.eql(u8, r.query, ContentSearch.clip(q))) return false;
     self.content_gen = cs.submit(q, t0);
     self.content_pending = true;
     return true;
@@ -1402,14 +1400,16 @@ fn fill(self: *Ui, a: std.mem.Allocator, q: []const u8, t0: u64) void {
         },
         .contents => if (q.len >= 3) self.fillContents(a, q, t0),
         .settings, .themes, .default_apps, .choose => self.fillSectioned(a, q),
-        // Search commands are asked for `q`; list commands filter here.
+        // A search command is asked for the query; a list command's rows are
+        // filtered here.
         .ext => {
             self.fillSectioned(a, if (ext_view.prepare(self, q)) q else "");
             self.ext_shown = self.ext_result;
         },
         .dmenu => dmenu.fill(self, a, q),
         .prefs => self.fillSectioned(a, q),
-        // What is typed is the value, not a filter.
+        // In the input view the typed text is the value being edited, so it
+        // does not filter the rows.
         .input => self.fillSectioned(a, ""),
         .form => self.fillSectioned(a, q),
     }
@@ -1574,12 +1574,8 @@ fn fillRoot(self: *Ui, a: std.mem.Allocator, q: []const u8) void {
     self.search_ns += stats.now() - t_search;
     // Files from 3 letters on, right after the best few results so they are
     // visible without scrolling; the rest of the results follow.
-    const files = if (q.len >= 3 and self.settings.files_in_root) file_results.fileItems(
-        self,
-        a,
-        q,
-        root_files_max,
-    ) else &.{};
+    const files_wanted = q.len >= 3 and self.settings.files_in_root;
+    const files = if (files_wanted) file_results.fileItems(self, a, q, root_files_max) else &.{};
     const shown = @min(hits.items.len, root_results_max);
     const head = if (files.len > 0) @min(shown, root_results_before_files_max) else shown;
     for (hits.items[0..head]) |it| self.addItem(it);
@@ -1648,17 +1644,15 @@ pub fn addSection(self: *Ui, title: [:0]const u8) void {
     self.buildSection(title);
 }
 
-/// Queues a row past the first `eager_rows`; false: build it now.
+/// Queues the row and returns true when `eager_rows` rows are built already.
+/// Returns false when the caller must build it now.
 fn deferRow(self: *Ui, p: Pending) bool {
     if (self.grid_mode or
         (self.rows.items.len < eager_rows and self.pending.items.len == 0)) return false;
     self.pending.append(self.query_arena.allocator(), p) catch return false;
-    if (self.pending_idle == 0) self.pending_idle = c.g_idle_add_full(
-        c.G_PRIORITY_LOW,
-        &onPendingRows,
-        self,
-        null,
-    );
+    if (self.pending_idle == 0) {
+        self.pending_idle = c.g_idle_add_full(c.G_PRIORITY_LOW, &onPendingRows, self, null);
+    }
     return true;
 }
 
@@ -1849,12 +1843,11 @@ fn setHint(self: *Ui, text: []const u8, warn: bool) void {
 
 fn scrollTo(self: *Ui, row: *c.GtkWidget) void {
     var b: c.graphene_rect_t = undefined;
-    // A row just added has no place yet: once the list's layout is done.
-    if (c.gtk_widget_compute_bounds(
-        row,
-        if (self.grid_mode) self.grid else self.list,
-        &b,
-    ) == 0 or b.size.height == 0) {
+    // A row just added has no place yet: it is scrolled to on a later frame,
+    // once the list's layout is done.
+    const container = if (self.grid_mode) self.grid else self.list;
+    const placed = c.gtk_widget_compute_bounds(row, container, &b) != 0 and b.size.height != 0;
+    if (!placed) {
         if (self.scroll_tick == 0) {
             self.scroll_tries = 0;
             self.scroll_tick = c.gtk_widget_add_tick_callback(
@@ -1873,13 +1866,11 @@ fn scrollTo(self: *Ui, row: *c.GtkWidget) void {
     const bottom: f64 = top + b.size.height;
     // Keep a section header above the first item visible, and the selection
     // clear of the fade at the bottom edge (style.css, undershoot).
-    if (top < value + 4) c.gtk_adjustment_set_value(
-        adj,
-        @max(top - 30, 0),
-    ) else if (bottom > value + page - 20) c.gtk_adjustment_set_value(
-        adj,
-        bottom - page + 20,
-    );
+    if (top < value + 4) {
+        c.gtk_adjustment_set_value(adj, @max(top - 30, 0));
+    } else if (bottom > value + page - 20) {
+        c.gtk_adjustment_set_value(adj, bottom - page + 20);
+    }
 }
 
 fn onScrollTick(_: ?*c.GtkWidget, _: ?*c.GdkFrameClock, data: ?*anyopaque) callconv(.c) c.gboolean {
@@ -2010,19 +2001,19 @@ pub fn perform(self: *Ui, op: item_mod.Op) void {
     const it = self.selectedItem() orelse return;
     if (it.confirm and (op == .run or op == .open) and self.needsConfirm(it)) return;
     self.closePanel();
-    // Ranking only (Db logs failures): the action goes ahead regardless.
-    if (it.key.len > 0 and it.action != .setting and (op == .run or op == .open)) self.db.recordUse(
-        it.key,
-        labels.now(),
-    ) catch {};
-    if (it.action == .ext_command and (op == .run or op == .open)) return ext_view.activate(
-        self,
-        it.action.ext_command.index,
-    );
-    if (it.action == .pick) return if (op == .pick_typed) dmenu.chooseTyped(self) else dmenu.choose(
-        self,
-        it.action.pick.index,
-    );
+    const primary = op == .run or op == .open;
+    // Ranking only, and Db logs its own failures: the action goes ahead
+    // whether or not the use was recorded.
+    if (primary and it.key.len > 0 and it.action != .setting) {
+        self.db.recordUse(it.key, labels.now()) catch {};
+    }
+    if (primary and it.action == .ext_command) {
+        return ext_view.activate(self, it.action.ext_command.index);
+    }
+    if (it.action == .pick) {
+        if (op == .pick_typed) return dmenu.chooseTyped(self);
+        return dmenu.choose(self, it.action.pick.index);
+    }
 
     // A clipboard row holds the head of its entry: what is pasted or copied
     // is all of it, read now.
@@ -2105,11 +2096,9 @@ fn onBackClicked(
 /// parsing) for the burst. Hidden, the next show builds its view anew.
 fn onAppsChanged(_: *c.GAppInfoMonitor, data: ?*anyopaque) callconv(.c) void {
     const self: *Ui = @ptrCast(@alignCast(data));
-    if (self.apps_reload_timer == 0) self.apps_reload_timer = c.g_timeout_add(
-        500,
-        &reloadApps,
-        self,
-    );
+    if (self.apps_reload_timer == 0) {
+        self.apps_reload_timer = c.g_timeout_add(500, &reloadApps, self);
+    }
 }
 
 fn reloadApps(data: ?*anyopaque) callconv(.c) c.gboolean {

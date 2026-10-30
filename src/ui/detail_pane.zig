@@ -117,11 +117,8 @@ var image_mtime: i64 = 0;
 const preview_px = 2048;
 
 fn showImage(ui: *Ui, path: [:0]const u8, mtime: i64) void {
-    if (image_len == path.len and image_mtime == mtime and std.mem.eql(
-        u8,
-        image_path[0..image_len],
-        path,
-    )) return;
+    const same_image = image_mtime == mtime and std.mem.eql(u8, image_path[0..image_len], path);
+    if (same_image) return;
     forgetImage(ui);
     if (path.len > image_path.len) return;
     @memcpy(image_path[0..path.len], path);
@@ -167,11 +164,9 @@ pub fn showFileDetail(ui: *Ui, it: *const Item) void {
 
     // Only regular files: a FIFO named *.png is no picture (and the decoder
     // checks again on the descriptor it reads).
-    const image = (c.g_content_type_is_a(ct, "image/*") != 0 or std.mem.startsWith(
-        u8,
-        std.mem.span(ct),
-        "image/",
-    )) and os.isRegular(f.path);
+    const image_type = c.g_content_type_is_a(ct, "image/*") != 0 or
+        std.mem.startsWith(u8, std.mem.span(ct), "image/");
+    const image = image_type and os.isRegular(f.path);
     const info = os.info(f.path);
     c.gtk_widget_set_visible(ui.detail_picture, @intFromBool(image));
     if (image) showImage(ui, f.path, if (info) |i| i.mtime else 0) else forgetImage(ui);
@@ -181,14 +176,10 @@ pub fn showFileDetail(ui: *Ui, it: *const Item) void {
     if (!image and !f.is_dir) {
         const head = os.readHead(f.path, a.alloc(u8, 4096) catch return);
         const valid = core.utf8.validPrefix(head);
-        if (valid.len + 4 >= head.len and std.mem.findScalar(
-            u8,
-            valid,
-            0,
-        ) == null) text = labels.firstLines(
-            valid,
-            preview_lines,
-        );
+        // Up to 4 bytes may be a character cut at the end of the head; any
+        // more invalid bytes, or a NUL, and it is not text.
+        const text_like = valid.len + 4 >= head.len and std.mem.findScalar(u8, valid, 0) == null;
+        if (text_like) text = labels.firstLines(valid, preview_lines);
     }
     c.gtk_label_set_text(@ptrCast(ui.detail_text), (a.dupeSentinel(u8, text, 0) catch return).ptr);
 
@@ -213,7 +204,7 @@ fn showExtDetail(ui: *Ui, it: ?*const Item) void {
     const label: *c.GtkLabel = @ptrCast(ui.detail_text);
     const markup = if (it) |i| i.markup else false;
     if (markup) {
-        // Whole: cutting markup could leave a tag open.
+        // Markup is shown whole: cutting it could leave a tag open.
         c.gtk_label_set_markup(label, (a.dupeSentinel(u8, it.?.detail, 0) catch return).ptr);
         c.gtk_widget_add_css_class(ui.detail_text, "markdown");
     } else {

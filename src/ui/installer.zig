@@ -112,34 +112,35 @@ pub fn install(
 ) void {
     var nbuf: [64]u8 = undefined;
     const name = as orelse nameFromUrl(&nbuf, url);
-    if (!Host.validId(name)) return fail(
-        ui,
-        cmdline,
-        "\"{s}\" cannot be an extension name (a-z, 0-9, - and _); pick one with --as NAME",
-        .{name},
-    );
-    if (Host.reservedId(name)) return fail(
-        ui,
-        cmdline,
-        "\"{s}\" is taken (init.lua and the style run as it); pick another with --as NAME",
-        .{name},
-    );
+    if (!Host.validId(name)) {
+        return fail(
+            ui,
+            cmdline,
+            "\"{s}\" cannot be an extension name (a-z, 0-9, - and _); pick one with --as NAME",
+            .{name},
+        );
+    }
+    if (Host.reservedId(name)) {
+        return fail(
+            ui,
+            cmdline,
+            "\"{s}\" is taken (init.lua and the style run as it); pick another with --as NAME",
+            .{name},
+        );
+    }
     var dbuf: [4096]u8 = undefined;
     const dir = extDir(ui, &dbuf, name) orelse return fail(ui, cmdline, "path too long", .{});
-    if (os.info(dir) != null) return fail(
-        ui,
-        cmdline,
-        "{s} already exists: lumen --update {s}, or --as another name",
-        .{ dir, name },
-    );
+    if (os.info(dir) != null) {
+        return fail(ui, cmdline, "{s} already exists: lumen --update {s}, or --as another name", .{
+            dir,
+            name,
+        });
+    }
     os.mkdirP(dir[0 .. std.mem.findScalarLast(u8, dir, '/') orelse dir.len]);
-    var ubuf: [2048]u8 = undefined;
-    const url_z = std.mem.printSentinel(&ubuf, "{s}", .{url}, 0) catch return fail(
-        ui,
-        cmdline,
-        "URL too long",
-        .{},
-    );
+    var url_buffer: [2048]u8 = undefined;
+    const url_z = std.mem.printSentinel(&url_buffer, "{s}", .{url}, 0) catch {
+        return fail(ui, cmdline, "URL too long", .{});
+    };
     // "--": a URL starting with "-" is not an option.
     var argv = [_:null]?[*:0]const u8{ "git", "clone", "--depth", "1", "--", url_z.ptr, dir.ptr };
     start(ui, cmdline, .install, name, dir, &argv);
@@ -150,12 +151,7 @@ pub fn update(ui: *Ui, cmdline: ?*c.GApplicationCommandLine, name: ?[]const u8) 
     if (name) |n| {
         if (!Host.validId(n)) return fail(ui, cmdline, "no extension named \"{s}\"", .{n});
         const dir = extDir(ui, &dbuf, n) orelse return fail(ui, cmdline, "path too long", .{});
-        if (os.info(dir) == null) return fail(
-            ui,
-            cmdline,
-            "no extension named \"{s}\"",
-            .{n},
-        );
+        if (os.info(dir) == null) return fail(ui, cmdline, "no extension named \"{s}\"", .{n});
         var argv = [_:null]?[*:0]const u8{ "git", "-C", dir.ptr, "pull", "--ff-only" };
         return start(ui, cmdline, .update, n, dir, &argv);
     }
@@ -186,12 +182,9 @@ pub fn uninstall(ui: *Ui, cmdline: ?*c.GApplicationCommandLine, name: []const u8
     if (!Host.validId(name)) return fail(ui, cmdline, "no extension named \"{s}\"", .{name});
     var dbuf: [4096]u8 = undefined;
     const dir = extDir(ui, &dbuf, name) orelse return fail(ui, cmdline, "path too long", .{});
-    if (os.info(dir) == null) return fail(
-        ui,
-        cmdline,
-        "no extension named \"{s}\"",
-        .{name},
-    );
+    if (os.info(dir) == null) {
+        return fail(ui, cmdline, "no extension named \"{s}\"", .{name});
+    }
     var argv = [_:null]?[*:0]const u8{ "rm", "-rf", "--", dir.ptr };
     start(ui, cmdline, .uninstall, name, dir, &argv);
 }

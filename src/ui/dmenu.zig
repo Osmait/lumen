@@ -154,11 +154,10 @@ fn onRead(_: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) 
         if (s.rebuild_timer != 0) _ = c.g_source_remove(s.rebuild_timer);
         s.rebuild_timer = 0;
         showLines(s);
-    } else if (s.rebuild_timer == 0) s.rebuild_timer = c.g_timeout_add(
-        rebuildDelay(s.lines.items.len),
-        &onRebuildTimer,
-        s,
-    );
+    } else if (s.rebuild_timer == 0) {
+        const delay_ms = rebuildDelay(s.lines.items.len);
+        s.rebuild_timer = c.g_timeout_add(delay_ms, &onRebuildTimer, s);
+    }
 }
 
 /// Milliseconds between rebuilds while lines arrive. With a query typed a
@@ -245,7 +244,7 @@ pub fn choose(ui: *Ui, index: u32) void {
     ui.hide();
 }
 
-/// Ctrl+Enter, or Enter with nothing matching: what was typed.
+/// Ctrl+Enter, or Enter when no row matches: answers with the typed text.
 pub fn chooseTyped(ui: *Ui) void {
     if (ui.picker == null) return;
     finish(ui, ui.query());

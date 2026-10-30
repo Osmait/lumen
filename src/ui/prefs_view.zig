@@ -155,7 +155,8 @@ pub fn display(a: std.mem.Allocator, p: *const Host.Pref, value: []const u8) [:0
 /// (saving over it would lose every other value).
 const Stored = union(enum) { absent, unreadable, values: std.json.ObjectMap };
 
-/// Larger is not a preferences file Lumen wrote.
+/// Lumen never writes a preferences file this large, so a larger one is
+/// refused instead of parsed.
 const prefs_bytes_max = 1 << 20;
 
 fn readStored(arena: std.mem.Allocator, file: [:0]const u8) Stored {
@@ -207,7 +208,7 @@ pub fn editValue(ui: *Ui, target: Ui.Edited, p: *const Host.Pref, value: []const
         .toggle => {
             const on = !std.mem.eql(u8, value, "true");
             switch (target) {
-                // Not saved: the row keeps saying why.
+                // The value was not saved; the row's hint already says why.
                 .pref => if (!save(ui, p, .{ .bool = on })) return,
                 .field => |i| form_view.setValue(ui, i, if (on) "true" else "false"),
             }
@@ -280,17 +281,12 @@ pub fn isPassword(ui: *Ui) bool {
 pub fn inputCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
     const p = inputPref(ui) orelse return &.{};
     const row = a.alloc(Item, 1) catch return &.{};
+    // A form's field is only set until the form is submitted; a
+    // preference is saved at once.
+    const verb: [:0]const u8 = if (ui.input == .field) "Set" else "Save";
     row[0] = .{
         .key = "input:save",
-        .title = if (ui.input == .field) a.printSentinel(
-            "Set {s}",
-            .{p.title},
-            0,
-        ) catch "Set" else a.printSentinel(
-            "Save {s}",
-            .{p.title},
-            0,
-        ) catch "Save",
+        .title = a.printSentinel("{s} {s}", .{ verb, p.title }, 0) catch verb,
         .subtitle = if (p.description.len > 0) p.description else "Type the value above",
         .icon = iconOf(p.kind),
         .action = .{ .setting = .save_input },

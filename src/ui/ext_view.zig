@@ -86,7 +86,8 @@ fn onRegistry(reg: *Host.Registry, ctx: ?*anyopaque) void {
     ui.ext_root = null;
     ui.ext_pending = false;
     ui.ext_root_pending = false;
-    // Answers still on their way were asked of the old files: drop them.
+    // Answers still in flight come from the old files; resetting the
+    // generations drops them when they arrive.
     ui.ext_gen = 0;
     ui.ext_root_gen = 0;
     // What the views point at by index, found again by id (before anything
@@ -218,8 +219,8 @@ fn onList(res: *Host.ListResult, ctx: ?*anyopaque) void {
         return;
     }
     if (res.err) |e| log.warn("{s}: {s}", .{ if (command(ui)) |cmd| cmd.id else "?", e });
-    // Rows without an icon wear their command's (the registry outlives the
-    // result: a reload drops results first).
+    // Rows without an icon take their command's. The icon points into the
+    // registry, which outlives the result: a reload destroys results first.
     if (command(ui)) |cmd| for (res.items) |*it| {
         if (it.icon == .none) it.icon = cmd.icon;
     };
@@ -403,11 +404,10 @@ pub fn waitingForSearch(ui: *Ui, q: []const u8) bool {
 pub fn prepare(ui: *Ui, q: []const u8) bool {
     const cmd = command(ui) orelse return true;
     if (cmd.mode != .search) return true;
-    const answered = if (ui.ext_result) |r| r.command == ui.ext_cmd and std.mem.eql(
-        u8,
-        r.query,
-        q,
-    ) else false;
+    const answered = if (ui.ext_result) |result|
+        result.command == ui.ext_cmd and std.mem.eql(u8, result.query, q)
+    else
+        false;
     const asked = ui.ext_pending and ui.ext_asked.eql(q);
     if (!answered and !asked) ask(ui, q);
     return false;
@@ -524,12 +524,14 @@ pub fn keymap(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) bool {
     const reg = ui.ext_registry orelse return false;
     const mask = c.GDK_CONTROL_MASK | c.GDK_ALT_MASK | c.GDK_SHIFT_MASK | c.GDK_SUPER_MASK;
     const key = c.gdk_keyval_to_lower(keyval);
-    for (reg.keymaps) |k| {
-        if (k.keyval != key or k.mods != state & mask) continue;
-        if (!openTarget(ui, k.target, null)) log.warn(
-            "keymap {s} ({s}): no command or view \"{s}\"",
-            .{ k.keys, k.ext, k.target },
-        );
+    for (reg.keymaps) |binding| {
+        if (binding.keyval != key or binding.mods != state & mask) continue;
+        if (!openTarget(ui, binding.target, null)) {
+            log.warn(
+                "keymap {s} ({s}): no command or view \"{s}\"",
+                .{ binding.keys, binding.ext, binding.target },
+            );
+        }
         return true;
     }
     return false;
