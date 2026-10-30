@@ -9,6 +9,8 @@
 //! buffer; loading is an `mmap`: no parsing, no copy.
 
 const std = @import("std");
+const builtin = @import("builtin");
+const assert = std.debug.assert;
 const linux = std.os.linux;
 const sys = @import("os");
 const format = @import("format.zig");
@@ -24,7 +26,31 @@ pub const flag_hidden: u8 = 1 << 2;
 /// 02: masks are built from folded names (accents and case, `core.fold`).
 /// 03: each directory's children are sorted by name (`findChild`).
 const magic = "LUMIDX03";
-const header = 24;
+
+/// The first bytes of the file. The arrays after it are read in place, in
+/// the host's byte order, and so is this: the format is little-endian, and
+/// so must the host be (asserted).
+const Header = extern struct {
+    magic: [8]u8,
+    entries_count: u64,
+    names_size: u64,
+
+    comptime {
+        assert(builtin.cpu.arch.endian() == .little);
+        assert(@sizeOf(Header) == 24);
+        assert(@offsetOf(Header, "entries_count") == 8);
+        assert(@offsetOf(Header, "names_size") == 16);
+    }
+
+    fn encode(header: Header) [@sizeOf(Header)]u8 {
+        assert(std.mem.eql(u8, &header.magic, magic));
+        return std.mem.toBytes(header);
+    }
+
+    fn decode(bytes: *const [@sizeOf(Header)]u8) Header {
+        return std.mem.bytesToValue(Header, bytes);
+    }
+};
 
 /// Byte -> bit (0..63) for the mask prefilter, built at compile time.
 pub const char_bit: [256]u6 = blk: {
@@ -82,37 +108,40 @@ fn foldedMask(s: []const u8) u64 {
 /// Offset of each array inside the buffer. Computed the same way when
 /// building and when mapping, which is what makes both formats one.
 const Layout = struct {
-    n: usize,
-    names_len: usize,
-    masks: usize,
-    name_off: usize,
-    parent: usize,
-    depth: usize,
-    name_len: usize,
-    flags: usize,
-    names: usize,
-    total: usize,
+    entries_count: usize,
+    names_size: usize,
+    masks_offset: usize,
+    name_offsets_offset: usize,
+    parents_offset: usize,
+    depths_offset: usize,
+    name_sizes_offset: usize,
+    flags_offset: usize,
+    names_offset: usize,
+    size_total: usize,
 
-    fn init(n: usize, names_len: usize) Layout {
-        const masks = header;
-        const name_off = masks + n * 8;
-        const parent = name_off + n * 4;
-        const depth = parent + n * 4;
-        const name_len = depth + n * 2;
-        const flags = name_len + n * 2;
-        const names = align8(flags + n);
-        return .{
-            .n = n,
-            .names_len = names_len,
-            .masks = masks,
-            .name_off = name_off,
-            .parent = parent,
-            .depth = depth,
-            .name_len = name_len,
-            .flags = flags,
-            .names = names,
-            .total = names + names_len,
+    fn init(entries_count: usize, names_size: usize) Layout {
+        // Widest first, so every array stays aligned whatever the count.
+        const masks_offset = @sizeOf(Header);
+        const name_offsets_offset = masks_offset + entries_count * @sizeOf(u64);
+        const parents_offset = name_offsets_offset + entries_count * @sizeOf(u32);
+        const depths_offset = parents_offset + entries_count * @sizeOf(u32);
+        const name_sizes_offset = depths_offset + entries_count * @sizeOf(u16);
+        const flags_offset = name_sizes_offset + entries_count * @sizeOf(u16);
+        const names_offset = align8(flags_offset + entries_count * @sizeOf(u8));
+        const layout: Layout = .{
+            .entries_count = entries_count,
+            .names_size = names_size,
+            .masks_offset = masks_offset,
+            .name_offsets_offset = name_offsets_offset,
+            .parents_offset = parents_offset,
+            .depths_offset = depths_offset,
+            .name_sizes_offset = name_sizes_offset,
+            .flags_offset = flags_offset,
+            .names_offset = names_offset,
+            .size_total = names_offset + names_size,
         };
+        assert(layout.flags_offset + entries_count == @sizeOf(Header) + entries_count * entry_size);
+        return layout;
     }
 };
 
@@ -120,7 +149,7 @@ const Layout = struct {
 pub const Store = struct {
     buf: []align(8) u8,
     mapped: bool,
-    lay: Layout,
+    layout: Layout,
 
     pub fn deinit(store: *Store, gpa: std.mem.Allocator) void {
         format.release(store.buf, store.mapped, gpa);
@@ -128,35 +157,35 @@ pub const Store = struct {
     }
 
     pub fn len(store: *const Store) u32 {
-        return @intCast(store.lay.n);
+        return @intCast(store.layout.entries_count);
     }
 
     fn arr(store: *const Store, comptime T: type, off: usize) []T {
         const p: [*]T = @ptrCast(@alignCast(store.buf.ptr + off));
-        return p[0..store.lay.n];
+        return p[0..store.layout.entries_count];
     }
 
     pub fn masks(store: *const Store) []u64 {
-        return store.arr(u64, store.lay.masks);
+        return store.arr(u64, store.layout.masks_offset);
     }
     pub fn parents(store: *const Store) []u32 {
-        return store.arr(u32, store.lay.parent);
+        return store.arr(u32, store.layout.parents_offset);
     }
     pub fn depths(store: *const Store) []u16 {
-        return store.arr(u16, store.lay.depth);
+        return store.arr(u16, store.layout.depths_offset);
     }
     pub fn flags(store: *const Store) []u8 {
-        return store.arr(u8, store.lay.flags);
+        return store.arr(u8, store.layout.flags_offset);
     }
 
     /// Checked again on every use, not only by `validate`: a private mapping
     /// still shows what others write to the file afterwards (pages not yet
     /// copied), and a bad offset read past the buffer.
     pub fn name(store: *const Store, id: u32) []const u8 {
-        const off = store.arr(u32, store.lay.name_off)[id];
-        const n = store.arr(u16, store.lay.name_len)[id];
-        if (@as(usize, off) + n > store.lay.names_len) return "";
-        const start = store.lay.names + off;
+        const off = store.arr(u32, store.layout.name_offsets_offset)[id];
+        const n = store.arr(u16, store.layout.name_sizes_offset)[id];
+        if (@as(usize, off) + n > store.layout.names_size) return "";
+        const start = store.layout.names_offset + off;
         return store.buf[start .. start + n];
     }
 
@@ -172,7 +201,7 @@ pub const Store = struct {
     /// made the first one spin forever.
     pub fn path(store: *const Store, id: u32, out: []u8) ?[]const u8 {
         const ps = store.parents();
-        const n_all = store.lay.n;
+        const n_all = store.layout.entries_count;
         var total: usize = 0;
         var cur = id;
         var steps: usize = 0;
@@ -307,38 +336,45 @@ pub const Store = struct {
     /// the names blob, and every parent is `no_parent` (roots, first) or an
     /// earlier entry, so walking up from any entry ends at a root.
     pub fn parse(buf: []align(8) u8, mapped: bool) error{BadIndex}!Store {
-        return .{ .buf = buf, .mapped = mapped, .lay = try validate(buf) };
+        return .{ .buf = buf, .mapped = mapped, .layout = try validate(buf) };
     }
 };
 
-/// Bytes per entry across all the arrays (mask, name_off, parent, depth,
-/// name_len, flags).
-const entry_bytes = 8 + 4 + 4 + 2 + 2 + 1;
+/// Bytes per entry across all the arrays: mask, name offset, parent, depth,
+/// name size and flags.
+const entry_size = @sizeOf(u64) + @sizeOf(u32) + @sizeOf(u32) + @sizeOf(u16) + @sizeOf(u16) +
+    @sizeOf(u8);
+
+comptime {
+    assert(entry_size == 21);
+}
 
 fn validate(buf: []align(8) const u8) error{BadIndex}!Layout {
-    if (buf.len < header or !std.mem.eql(u8, buf[0..8], magic)) return error.BadIndex;
-    const n64 = std.mem.readInt(u64, buf[8..16], .little);
-    const names_len64 = std.mem.readInt(u64, buf[16..24], .little);
+    if (buf.len < @sizeOf(Header)) return error.BadIndex;
+    const header = Header.decode(buf[0..@sizeOf(Header)]);
+    if (!std.mem.eql(u8, &header.magic, magic)) return error.BadIndex;
     // Bound both before any arithmetic on them, so the layout cannot
     // overflow. Ids are u32 and `no_parent` is reserved.
-    if (n64 > (buf.len - header) / entry_bytes or n64 >= no_parent) return error.BadIndex;
-    if (names_len64 > buf.len) return error.BadIndex;
-    const lay = Layout.init(@intCast(n64), @intCast(names_len64));
-    if (lay.total != buf.len) return error.BadIndex;
+    if (header.entries_count > (buf.len - @sizeOf(Header)) / entry_size) return error.BadIndex;
+    if (header.entries_count >= no_parent) return error.BadIndex;
+    if (header.names_size > buf.len) return error.BadIndex;
+    const layout = Layout.init(@intCast(header.entries_count), @intCast(header.names_size));
+    if (layout.size_total != buf.len) return error.BadIndex;
 
-    const n = lay.n;
-    const name_off = viewConst(u32, buf, lay.name_off, n);
-    const name_len = viewConst(u16, buf, lay.name_len, n);
-    for (name_off, name_len) |off, l| {
-        if (@as(u64, off) + l > lay.names_len) return error.BadIndex;
+    const entries_count = layout.entries_count;
+    const name_offsets = viewConst(u32, buf, layout.name_offsets_offset, entries_count);
+    const name_sizes = viewConst(u16, buf, layout.name_sizes_offset, entries_count);
+    for (name_offsets, name_sizes) |name_offset, name_size| {
+        if (@as(u64, name_offset) + name_size > layout.names_size) return error.BadIndex;
     }
-    const parents = viewConst(u32, buf, lay.parent, n);
-    var i: usize = 0;
-    while (i < n and parents[i] == no_parent) i += 1;
-    for (parents[i..], i..) |p, id| {
-        if (p >= id) return error.BadIndex; // also rejects a late no_parent
+    const parents = viewConst(u32, buf, layout.parents_offset, entries_count);
+    var roots_count: usize = 0;
+    while (roots_count < entries_count and parents[roots_count] == no_parent) roots_count += 1;
+    for (parents[roots_count..], roots_count..) |parent, id| {
+        // Also rejects a `no_parent` after the roots.
+        if (parent >= id) return error.BadIndex;
     }
-    return lay;
+    return layout;
 }
 
 fn viewConst(comptime T: type, buf: []align(8) const u8, off: usize, n: usize) []const T {
@@ -371,28 +407,28 @@ pub const Builder = struct {
     pub const empty: Builder = .{};
 
     names: std.ArrayList(u8) = .empty,
-    name_off: std.ArrayList(u32) = .empty,
-    name_len: std.ArrayList(u16) = .empty,
-    parent: std.ArrayList(u32) = .empty,
+    name_offsets: std.ArrayList(u32) = .empty,
+    name_sizes: std.ArrayList(u16) = .empty,
+    parents: std.ArrayList(u32) = .empty,
     flags: std.ArrayList(u8) = .empty,
     masks: std.ArrayList(u64) = .empty,
-    depth: std.ArrayList(u16) = .empty,
+    depths: std.ArrayList(u16) = .empty,
 
     pub fn deinit(builder: *Builder, gpa: std.mem.Allocator) void {
         inline for (.{
             "names",
-            "name_off",
-            "name_len",
-            "parent",
+            "name_offsets",
+            "name_sizes",
+            "parents",
             "flags",
             "masks",
-            "depth",
+            "depths",
         }) |f| @field(builder, f).deinit(gpa);
         builder.* = .empty; // reusable: `finish` leaves an empty builder
     }
 
     pub fn len(builder: *const Builder) u32 {
-        return @intCast(builder.name_off.items.len);
+        return @intCast(builder.name_offsets.items.len);
     }
 
     pub fn push(
@@ -405,13 +441,13 @@ pub const Builder = struct {
     ) std.mem.Allocator.Error!u32 {
         const id = builder.len();
         const short = n[0..@min(n.len, std.math.maxInt(u16))];
-        try builder.name_off.append(gpa, @intCast(builder.names.items.len));
+        try builder.name_offsets.append(gpa, @intCast(builder.names.items.len));
         try builder.names.appendSlice(gpa, short);
-        try builder.name_len.append(gpa, @intCast(short.len));
-        try builder.parent.append(gpa, parent);
+        try builder.name_sizes.append(gpa, @intCast(short.len));
+        try builder.parents.append(gpa, parent);
         try builder.flags.append(gpa, fl);
         try builder.masks.append(gpa, charMask(short));
-        try builder.depth.append(gpa, depth);
+        try builder.depths.append(gpa, depth);
         return id;
     }
 
@@ -437,21 +473,26 @@ pub const Builder = struct {
     /// Builds the store and empties the builder. On error the builder is
     /// left as it was.
     pub fn finish(builder: *Builder, gpa: std.mem.Allocator) std.mem.Allocator.Error!Store {
-        const lay = Layout.init(builder.len(), builder.names.items.len);
-        const buf = try gpa.alignedAlloc(u8, .@"8", lay.total);
+        const layout = Layout.init(builder.len(), builder.names.items.len);
+        assert(layout.entries_count < no_parent);
+        assert(layout.names_size <= std.math.maxInt(u32));
+        const buf = try gpa.alignedAlloc(u8, .@"8", layout.size_total);
         defer builder.deinit(gpa);
         @memset(buf, 0);
-        @memcpy(buf[0..8], magic);
-        std.mem.writeInt(u64, buf[8..16], lay.n, .little);
-        std.mem.writeInt(u64, buf[16..24], lay.names_len, .little);
-        put(buf, lay.masks, builder.masks.items);
-        put(buf, lay.name_off, builder.name_off.items);
-        put(buf, lay.parent, builder.parent.items);
-        put(buf, lay.depth, builder.depth.items);
-        put(buf, lay.name_len, builder.name_len.items);
-        put(buf, lay.flags, builder.flags.items);
-        put(buf, lay.names, builder.names.items);
-        return .{ .buf = buf, .mapped = false, .lay = lay };
+        const header: Header = .{
+            .magic = magic.*,
+            .entries_count = layout.entries_count,
+            .names_size = layout.names_size,
+        };
+        @memcpy(buf[0..@sizeOf(Header)], &header.encode());
+        put(buf, layout.masks_offset, builder.masks.items);
+        put(buf, layout.name_offsets_offset, builder.name_offsets.items);
+        put(buf, layout.parents_offset, builder.parents.items);
+        put(buf, layout.depths_offset, builder.depths.items);
+        put(buf, layout.name_sizes_offset, builder.name_sizes.items);
+        put(buf, layout.flags_offset, builder.flags.items);
+        put(buf, layout.names_offset, builder.names.items);
+        return .{ .buf = buf, .mapped = false, .layout = layout };
     }
 };
 
@@ -529,7 +570,7 @@ test "a mapping written to after it was checked never hangs or reads out of boun
     parents[1] = 99; // out of range
     try testing.expectEqual(@as(?[]const u8, null), s.path(3, &buf));
     parents[1] = 0;
-    s.arr(u32, s.lay.name_off)[2] = std.math.maxInt(u32);
+    s.arr(u32, s.layout.name_offsets_offset)[2] = std.math.maxInt(u32);
     try testing.expectEqualStrings("", s.name(2));
     try testing.expectEqualStrings("/home/u/proj/Cargo.toml", s.path(3, &buf).?);
     // Too long for the buffer: no path, not an empty one.
@@ -614,7 +655,7 @@ test "corrupt indexes are rejected, not trusted" {
 
     const bad = try gpa.alignedAlloc(u8, .@"8", good.len);
     defer gpa.free(bad);
-    const lay = (try Store.parse(good, false)).lay;
+    const layout = (try Store.parse(good, false)).layout;
 
     // Truncated anywhere (a save interrupted by a full disk), or empty.
     for (0..good.len) |cut| try testing.expectError(
@@ -641,10 +682,10 @@ test "corrupt indexes are rejected, not trusted" {
 
     // A name past the end of the names blob.
     @memcpy(bad, good);
-    std.mem.writeInt(u32, bad[lay.name_off + 4 * 2 ..][0..4], @intCast(lay.names_len - 3), .little);
+    std.mem.writeInt(u32, bad[layout.name_offsets_offset + 4 * 2 ..][0..4], @intCast(layout.names_size - 3), .little);
     try testing.expectError(error.BadIndex, Store.parse(bad, false));
     @memcpy(bad, good);
-    std.mem.writeInt(u16, bad[lay.name_len + 2 * 4 ..][0..2], std.math.maxInt(u16), .little);
+    std.mem.writeInt(u16, bad[layout.name_sizes_offset + 2 * 4 ..][0..2], std.math.maxInt(u16), .little);
     try testing.expectError(error.BadIndex, Store.parse(bad, false));
 
     // A parent out of range, a cycle (path() would loop forever), a parent
@@ -656,7 +697,7 @@ test "corrupt indexes are rejected, not trusted" {
         .{ .id = 2, .parent = no_parent },
     }) |c| {
         @memcpy(bad, good);
-        std.mem.writeInt(u32, bad[lay.parent + 4 * c.id ..][0..4], c.parent, .little);
+        std.mem.writeInt(u32, bad[layout.parents_offset + 4 * c.id ..][0..4], c.parent, .little);
         try testing.expectError(error.BadIndex, Store.parse(bad, false));
     }
 }
@@ -704,10 +745,10 @@ fn fuzzParse(_: void, smith: *testing.Smith) anyerror!void {
     const b = buf[0..smith.slice(&buf)];
     // Often give it a plausible header, so the fuzzer gets past the magic
     // and the length check to the per-entry ones.
-    if (b.len >= header and smith.value(bool)) {
+    if (b.len >= @sizeOf(Header) and smith.value(bool)) {
         @memcpy(b[0..8], magic);
-        const n = smith.valueRangeAtMost(u32, 0, @intCast((b.len - header) / entry_bytes));
-        const fixed = Layout.init(n, 0).total;
+        const n = smith.valueRangeAtMost(u32, 0, @intCast((b.len - @sizeOf(Header)) / entry_size));
+        const fixed = Layout.init(n, 0).size_total;
         std.mem.writeInt(u64, b[8..16], n, .little);
         std.mem.writeInt(u64, b[16..24], b.len -| fixed, .little);
     }

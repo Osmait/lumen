@@ -276,8 +276,8 @@ fn deltaChild(live: *const Live, dir: u32, n: []const u8) ?u32 {
     const kids = live.kids.get(dir) orelse return null;
     for (kids.items) |i| {
         if (b.masks.items[i] == 0) continue;
-        const off = b.name_off.items[i];
-        if (std.mem.eql(u8, b.names.items[off..][0..b.name_len.items[i]], n)) return i;
+        const off = b.name_offsets.items[i];
+        if (std.mem.eql(u8, b.names.items[off..][0..b.name_sizes.items[i]], n)) return i;
     }
     return null;
 }
