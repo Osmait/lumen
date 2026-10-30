@@ -439,7 +439,8 @@ pub fn argString(L: *State, arg: c_int, func: []const u8) Error![:0]const u8 {
 pub fn argTable(L: *State, arg: c_int, func: []const u8) Error!void {
     if (c.lua_type(L, arg) == c.LUA_TTABLE) return;
     const type_name = typeName(L, arg);
-    return fail(L, "bad argument #{d} to '{s}' (table expected, got {s})", .{ arg, func, type_name });
+    const format = "bad argument #{d} to '{s}' (table expected, got {s})";
+    return fail(L, format, .{ arg, func, type_name });
 }
 
 pub fn pushString(L: *State, text: []const u8) void {

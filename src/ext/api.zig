@@ -339,7 +339,7 @@ fn theme(L: *lua.State) lua.Error!c_int {
     try lua.argTable(L, 1, "lumen.theme");
     const e = extOf(L);
     const load = e.load orelse return lua.fail(L, "lumen.theme works only while a file loads", .{});
-    const a = load.a;
+    const a = load.arena;
     const id = lua.fieldString(L, a, 1, "id", "theme") orelse return lua.fail(
         L,
         "theme.id is missing",
@@ -421,7 +421,7 @@ fn keymap(L: *lua.State) lua.Error!c_int {
             "lumen.keymap: \"{s}\" needs ctrl, alt or super (plain keys type into the search)",
             .{keys},
         );
-    const a = load.a;
+    const a = load.arena;
     load.keymaps.append(a, .{
         .keyval = parsed.keyval,
         .mods = parsed.mods,
@@ -473,7 +473,7 @@ fn set(L: *lua.State) lua.Error!c_int {
     try lua.argTable(L, 1, "lumen.set");
     const e = extOf(L);
     const load = e.load orelse return lua.fail(L, "lumen.set works only while a file loads", .{});
-    const a = load.a;
+    const a = load.arena;
     c.lua_pushnil(L);
     while (c.lua_next(L, 1) != 0) {
         const key = lua.toSlice(L, -2) orelse return lua.fail(
@@ -538,7 +538,7 @@ fn layout(L: *lua.State) lua.Error!c_int {
                 "lumen.layout: {s} is a string",
                 .{key},
             );
-            const text = load.a.dupeSentinel(
+            const text = load.arena.dupeSentinel(
                 u8,
                 p[0..@min(p.len, 64)],
                 0,
@@ -649,7 +649,7 @@ fn icons(L: *lua.State) lua.Error!c_int {
     try lua.argTable(L, 1, "lumen.icons");
     const e = extOf(L);
     const load = e.load orelse return lua.fail(L, "lumen.icons works only while a file loads", .{});
-    const a = load.a;
+    const a = load.arena;
     c.lua_pushnil(L);
     while (c.lua_next(L, 1) != 0) {
         const key = lua.toSlice(L, -2) orelse return lua.fail(
