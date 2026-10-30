@@ -195,7 +195,7 @@ pub fn status(service: *ContentService) Status {
         .building = service.building.load(.acquire),
         .ready = service.index != null,
         .extracted = extracted,
-        .segments = if (service.index) |ix| ix.n_segs else 0,
+        .segments = if (service.index) |ix| ix.segments_count else 0,
         .index_bytes = if (service.index) |ix| ix.buf.len else 0,
         .builds = service.builds.load(.acquire),
         .updates = service.updates.load(.acquire),
@@ -483,11 +483,11 @@ fn diff(
     const ix = if (service.index) |*i| i else return .{ .gone = &.{}, .added = docs };
     var ids: std.StringHashMapUnmanaged(u32) = .empty;
     try ids.ensureTotalCapacity(arena, @intCast(ix.live()));
-    for (0..ix.n_docs) |i| if (!ix.removed(@intCast(i))) ids.putAssumeCapacity(
+    for (0..ix.docs_count) |i| if (!ix.removed(@intCast(i))) ids.putAssumeCapacity(
         ix.path(@intCast(i)),
         @intCast(i),
     );
-    const seen = try arena.alloc(bool, ix.n_docs);
+    const seen = try arena.alloc(bool, ix.docs_count);
     @memset(seen, false);
     var gone: std.ArrayList(u32) = .empty;
     var added: std.ArrayList(content.DocIn) = .empty;
@@ -502,7 +502,7 @@ fn diff(
         }
         try added.append(arena, d);
     }
-    for (0..ix.n_docs) |i| if (!ix.removed(@intCast(i)) and !seen[i]) try gone.append(
+    for (0..ix.docs_count) |i| if (!ix.removed(@intCast(i)) and !seen[i]) try gone.append(
         arena,
         @intCast(i),
     );
@@ -533,7 +533,7 @@ fn indexedChanges(service: *ContentService, arena: std.mem.Allocator) std.mem.Al
     var gone: std.ArrayList(u32) = .empty;
     var added: std.ArrayList(content.DocIn) = .empty;
     var zbuf: [4096]u8 = undefined;
-    for (0..ix.n_docs) |i| {
+    for (0..ix.docs_count) |i| {
         const id: u32 = @intCast(i);
         if (ix.removed(id)) continue;
         const d = ix.docIn(id);
@@ -642,12 +642,12 @@ fn changes(
 /// behind (removed versions, small segments) has piled up.
 fn wantsWhole(service: *const ContentService, d: Diff) bool {
     const ix = &(service.index orelse return true);
-    const removed = ix.n_removed + d.gone.len;
-    const total = ix.n_docs + d.added.len;
+    const removed = ix.docs_removed_count + d.gone.len;
+    const total = ix.docs_count + d.added.len;
     return removed * 100 > total * service.opts.max_removed_percent or
-        ix.n_segs >= service.opts.max_segments or
+        ix.segments_count >= service.opts.max_segments or
         // What updates left behind in the file: over 30 %.
-        ix.buf.len * 10 > ix.live_bytes * 13;
+        ix.buf.len * 10 > ix.bytes_live * 13;
 }
 
 /// The next index: `all` of the documents built whole, or the current one
@@ -756,7 +756,7 @@ fn sweepText(service: *ContentService) void {
     const arena = arena_state.allocator();
     // A name in the cache -> the name it should have.
     var keep: std.StringHashMapUnmanaged([]const u8) = .empty;
-    for (0..ix.n_docs) |i| {
+    for (0..ix.docs_count) |i| {
         const id: u32 = @intCast(i);
         if (ix.removed(id) or ix.sources[id] != @backingInt(content.Source.extracted)) continue;
         const d = ix.docIn(id);
@@ -1100,7 +1100,7 @@ test "content service: rebuilt whole once removed versions pile up" {
     // Whole again: nothing removed is left.
     s.lock.lockSharedUncancelable(s.io);
     defer s.lock.unlockShared(s.io);
-    try testing.expectEqual(@as(usize, 0), s.index.?.n_removed);
+    try testing.expectEqual(@as(usize, 0), s.index.?.docs_removed_count);
 }
 
 test "content service: Office documents are extracted once per version" {

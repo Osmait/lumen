@@ -23,6 +23,7 @@
 //! lists in segment order.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const Pool = @import("Pool.zig");
@@ -38,7 +39,7 @@ const utf8 = @import("core").utf8;
 /// 04: path offsets are positions in the file, so an appended doc table
 /// refers to the paths already there instead of writing them all again.
 const magic = "LUMCTX04";
-const header_len = 64;
+const header_size = 64;
 
 /// Plain text files above this are not indexed (logs, dumps, data).
 pub const max_text = 1 << 20;
@@ -91,75 +92,146 @@ const Trigrams = struct {
     }
 };
 
-const SegEntry = extern struct {
-    n_keys: u64,
-    keys_off: u64,
-    offs_off: u64,
-    post_off: u64,
-    post_len: u64,
+/// The first bytes of the file. The doc table's columns and the segments'
+/// arrays are read in place, in the host's byte order, and so is this: the
+/// format is little-endian, and so must the host be (asserted).
+const Header = extern struct {
+    magic: [8]u8,
+    docs_count: u64,
+    segments_count: u64,
+    /// Bytes of the paths the doc table added (an appended table refers to
+    /// the paths already in the file and adds only its new documents').
+    paths_size: u64,
+    docs_offset: u64,
+    /// Where the segment directory starts: `segments_count` entries.
+    directory_offset: u64,
+    /// Bytes the header refers to. An update appends, then points the
+    /// header at what it added: bytes past this are an update whose header
+    /// never got written.
+    size_total: u64,
+    reserved: [8]u8,
+
+    comptime {
+        assert(builtin.cpu.arch.endian() == .little);
+        assert(@sizeOf(Header) == header_size);
+        assert(@offsetOf(Header, "docs_count") == 8);
+        assert(@offsetOf(Header, "segments_count") == 16);
+        assert(@offsetOf(Header, "paths_size") == 24);
+        assert(@offsetOf(Header, "docs_offset") == 32);
+        assert(@offsetOf(Header, "directory_offset") == 40);
+        assert(@offsetOf(Header, "size_total") == 48);
+    }
+
+    fn encode(header: Header) [header_size]u8 {
+        assert(std.mem.eql(u8, &header.magic, magic));
+        return std.mem.toBytes(header);
+    }
+
+    fn decode(bytes: *const [header_size]u8) Header {
+        return std.mem.bytesToValue(Header, bytes);
+    }
 };
+
+/// One segment's arrays, as the segment directory lists them.
+const SegmentEntry = extern struct {
+    keys_count: u64,
+    /// `keys_count` trigrams, u32, strictly ascending.
+    keys_offset: u64,
+    /// `keys_count + 1` u32 offsets into the postings, one list per key.
+    offsets_offset: u64,
+    postings_offset: u64,
+    postings_size: u64,
+
+    comptime {
+        assert(@sizeOf(SegmentEntry) == 5 * @sizeOf(u64));
+    }
+};
+
+/// The doc table's columns, one after another, each `docs_count` long:
+/// mtime, size, path offset, path size, source, flags. `writeDocs` writes
+/// them in this order and `DocColumns.parse` reads them back.
+const doc_size = @sizeOf(i64) + @sizeOf(u64) + @sizeOf(u32) + @sizeOf(u16) + 1 + 1;
+
+comptime {
+    // The columns go from the widest to the narrowest, so each one stays
+    // aligned whatever `docs_count` is, as long as the table starts
+    // 8-aligned.
+    assert(doc_size == 24);
+}
 
 /// The doc table of an index file, checked: every path inside the file,
 /// every source a known kind, no unknown flag.
-const ParsedDocs = struct {
-    mt: []const i64,
-    sz: []const u64,
-    po: []const u32,
-    pl: []const u16,
-    src: []const u8,
-    fl: []u8,
+const DocColumns = struct {
+    mtimes: []const i64,
+    sizes: []const u64,
+    path_offsets: []const u32,
+    path_sizes: []const u16,
+    sources: []const u8,
+    flags: []u8,
     /// Bytes of all paths, and documents marked removed.
-    all_paths: usize,
-    n_removed: usize,
+    paths_size_total: usize,
+    docs_removed_count: usize,
 
-    fn parse(buf: []align(8) u8, docs_off: usize, n: usize) error{BadIndex}!ParsedDocs {
-        var o = docs_off;
-        var t: ParsedDocs = undefined;
-        t.mt = sliceAt(i64, buf, o, n);
-        o += n * 8;
-        t.sz = sliceAt(u64, buf, o, n);
-        o += n * 8;
-        t.po = sliceAt(u32, buf, o, n);
-        o += n * 4;
-        t.pl = sliceAt(u16, buf, o, n);
-        o += n * 2;
-        t.src = buf[o..][0..n];
-        o += n;
-        t.fl = buf[o..][0..n];
-        t.all_paths = 0;
-        for (t.po, t.pl) |off, l| {
-            if (@as(u64, off) + l > buf.len) return error.BadIndex;
-            t.all_paths += l;
+    fn parse(
+        buf: []align(8) u8,
+        docs_offset: usize,
+        docs_count: usize,
+    ) error{BadIndex}!DocColumns {
+        assert(docs_offset % 8 == 0);
+        assert(docs_offset + docs_count * doc_size <= buf.len);
+        var cursor = docs_offset;
+        var columns: DocColumns = undefined;
+        columns.mtimes = sliceAt(i64, buf, cursor, docs_count);
+        cursor += docs_count * @sizeOf(i64);
+        columns.sizes = sliceAt(u64, buf, cursor, docs_count);
+        cursor += docs_count * @sizeOf(u64);
+        columns.path_offsets = sliceAt(u32, buf, cursor, docs_count);
+        cursor += docs_count * @sizeOf(u32);
+        columns.path_sizes = sliceAt(u16, buf, cursor, docs_count);
+        cursor += docs_count * @sizeOf(u16);
+        columns.sources = buf[cursor..][0..docs_count];
+        cursor += docs_count;
+        columns.flags = buf[cursor..][0..docs_count];
+        cursor += docs_count;
+        assert(cursor == docs_offset + docs_count * doc_size);
+
+        columns.paths_size_total = 0;
+        for (columns.path_offsets, columns.path_sizes) |path_offset, path_size| {
+            if (@as(u64, path_offset) + path_size > buf.len) return error.BadIndex;
+            columns.paths_size_total += path_size;
         }
-        for (t.src) |k| if (std.enums.fromInt(Source, k) == null) return error.BadIndex;
-        t.n_removed = 0;
-        for (t.fl) |f| {
-            if (f & ~flag_removed != 0) return error.BadIndex;
-            t.n_removed += f & flag_removed;
+        for (columns.sources) |source| {
+            if (std.enums.fromInt(Source, source) == null) return error.BadIndex;
         }
-        return t;
+        columns.docs_removed_count = 0;
+        for (columns.flags) |flags| {
+            if (flags & ~flag_removed != 0) return error.BadIndex;
+            columns.docs_removed_count += flags & flag_removed;
+        }
+        return columns;
     }
 };
 
 pub const Index = struct {
     buf: []align(8) u8,
     mapped: bool,
-    n_docs: usize,
-    n_segs: usize,
+    docs_count: usize,
+    segments_count: usize,
     mtimes: []const i64,
     sizes: []const u64,
-    path_off: []const u32,
-    path_len: []const u16,
+    path_offsets: []const u32,
+    path_sizes: []const u16,
     sources: []const u8,
     flags: []const u8,
-    /// The file up to `total`: paths are found at their offsets in it.
+    /// The file up to `Header.size_total`: paths are found at their offsets
+    /// in it.
     file: []const u8,
-    segs: []const SegEntry,
+    segments: []const SegmentEntry,
     /// Documents flagged removed: their ids stay, queries skip them.
-    n_removed: usize,
+    docs_removed_count: usize,
     /// Bytes the header refers to; the rest of the file is what updates
     /// left behind (old doc tables, merged segments).
-    live_bytes: usize,
+    bytes_live: usize,
 
     pub fn deinit(index: *Index, gpa: std.mem.Allocator) void {
         format.release(index.buf, index.mapped, gpa);
@@ -167,7 +239,7 @@ pub const Index = struct {
     }
 
     pub fn path(index: *const Index, doc: u32) []const u8 {
-        return index.file[index.path_off[doc]..][0..index.path_len[doc]];
+        return index.file[index.path_offsets[doc]..][0..index.path_sizes[doc]];
     }
 
     pub fn removed(index: *const Index, doc: u32) bool {
@@ -176,20 +248,20 @@ pub const Index = struct {
 
     /// Documents a query can find.
     pub fn live(index: *const Index) usize {
-        return index.n_docs - index.n_removed;
+        return index.docs_count - index.docs_removed_count;
     }
 
-    pub fn docIn(index: *const Index, d: u32) DocIn {
+    pub fn docIn(index: *const Index, doc: u32) DocIn {
         return .{
-            .path = index.path(d),
-            .mtime = index.mtimes[d],
-            .size = index.sizes[d],
-            .source = @fromBackingInt(@intCast(index.sources[d])),
+            .path = index.path(doc),
+            .mtime = index.mtimes[doc],
+            .size = index.sizes[doc],
+            .source = @fromBackingInt(@intCast(index.sources[doc])),
         };
     }
 
-    /// Checks that `buf` is a well-formed index and wraps it without copying
-    /// (`mapped` says how `deinit` releases it).
+    /// Checks that `whole` is a well-formed index and wraps it without
+    /// copying (`mapped` says how `deinit` releases it).
     ///
     /// The file comes from disk: it may be truncated, from another version or
     /// garbage. Everything later accesses index with is checked here, in
@@ -205,56 +277,56 @@ pub const Index = struct {
     /// segments copes with ids that repeat or go back instead (`candidates`,
     /// `closeSegment`).
     pub fn parse(whole: []align(8) u8, mapped: bool) error{BadIndex}!Index {
-        if (whole.len < header_len or !std.mem.eql(u8, whole[0..8], magic)) return error.BadIndex;
-        const rd = struct {
-            fn u(b: []const u8, at: usize) u64 {
-                return std.mem.readInt(u64, b[at..][0..8], .little);
-            }
-        }.u;
-        // Updates append, then point the header at what they added: bytes
-        // past `total` are an update whose header never got written.
-        const total64 = rd(whole, 48);
-        if (total64 > whole.len or total64 < header_len) return error.BadIndex;
-        const buf = whole[0..@intCast(total64)];
-        const n64 = rd(buf, 8);
-        const n_segs64 = rd(buf, 16);
-        const paths_len64 = rd(buf, 24);
-        const docs_off64 = rd(buf, 32);
-        const dir_off64 = rd(buf, 40);
+        if (whole.len < header_size) return error.BadIndex;
+        const header = Header.decode(whole[0..header_size]);
+        if (!std.mem.eql(u8, &header.magic, magic)) return error.BadIndex;
+        if (header.size_total > whole.len) return error.BadIndex;
+        if (header.size_total < header_size) return error.BadIndex;
+        const buf = whole[0..@intCast(header.size_total)];
         // Doc ids are u32 in posting lists and results.
-        if (n64 > std.math.maxInt(u32)) return error.BadIndex;
-        const n: usize = @intCast(n64);
-        const docs_off = try region(buf.len, docs_off64, n, doc_bytes, 8);
-        if (docs_off < header_len) return error.BadIndex;
-        const paths_off = docs_off + n * doc_bytes;
-        if (paths_len64 > buf.len - paths_off) return error.BadIndex;
-        const dir_off = try region(buf.len, dir_off64, n_segs64, @sizeOf(SegEntry), 8);
-        const n_segs: usize = @intCast(n_segs64);
+        if (header.docs_count > std.math.maxInt(u32)) return error.BadIndex;
+        const docs_count: usize = @intCast(header.docs_count);
+        const docs_offset = try region(buf.len, header.docs_offset, docs_count, doc_size, 8);
+        if (docs_offset < header_size) return error.BadIndex;
+        const paths_offset = docs_offset + docs_count * doc_size;
+        if (header.paths_size > buf.len - paths_offset) return error.BadIndex;
+        const directory_offset = try region(
+            buf.len,
+            header.directory_offset,
+            header.segments_count,
+            @sizeOf(SegmentEntry),
+            8,
+        );
+        const segments_count: usize = @intCast(header.segments_count);
 
-        const t = try ParsedDocs.parse(buf, docs_off, n);
+        const columns = try DocColumns.parse(buf, docs_offset, docs_count);
 
-        const segs = sliceAt(SegEntry, buf, dir_off, n_segs);
-        var used = header_len + n * doc_bytes + t.all_paths + n_segs * @sizeOf(SegEntry);
-        for (segs) |seg| {
-            try checkSegment(buf, seg);
-            used += @as(usize, @intCast(seg.n_keys)) * 8 + 4 + @as(usize, @intCast(seg.post_len));
+        const segments = sliceAt(SegmentEntry, buf, directory_offset, segments_count);
+        var bytes_live = header_size + docs_count * doc_size + columns.paths_size_total +
+            segments_count * @sizeOf(SegmentEntry);
+        for (segments) |segment| {
+            try checkSegment(buf, segment);
+            const keys_count: usize = @intCast(segment.keys_count);
+            // Keys, and one more offset than keys.
+            bytes_live += keys_count * @sizeOf(u32) + (keys_count + 1) * @sizeOf(u32);
+            bytes_live += @intCast(segment.postings_size);
         }
 
         return .{
             .buf = whole,
             .mapped = mapped,
-            .n_docs = n,
-            .n_segs = n_segs,
-            .mtimes = t.mt,
-            .sizes = t.sz,
-            .path_off = t.po,
-            .path_len = t.pl,
-            .sources = t.src,
-            .flags = t.fl,
+            .docs_count = docs_count,
+            .segments_count = segments_count,
+            .mtimes = columns.mtimes,
+            .sizes = columns.sizes,
+            .path_offsets = columns.path_offsets,
+            .path_sizes = columns.path_sizes,
+            .sources = columns.sources,
+            .flags = columns.flags,
             .file = buf,
-            .segs = segs,
-            .n_removed = t.n_removed,
-            .live_bytes = used,
+            .segments = segments,
+            .docs_removed_count = columns.docs_removed_count,
+            .bytes_live = bytes_live,
         };
     }
 
@@ -271,8 +343,8 @@ pub const Index = struct {
 
     /// Posting list bytes of `key` in segment `s` (empty if absent).
     fn list(index: *const Index, s: usize, key: u32) []const u8 {
-        const seg = index.segs[s];
-        const keys = sliceAt(u32, index.buf, seg.keys_off, seg.n_keys);
+        const seg = index.segments[s];
+        const keys = sliceAt(u32, index.buf, seg.keys_offset, seg.keys_count);
         var lo: usize = 0;
         var hi: usize = keys.len;
         while (lo < hi) {
@@ -280,8 +352,8 @@ pub const Index = struct {
             if (keys[mid] < key) lo = mid + 1 else hi = mid;
         }
         if (lo == keys.len or keys[lo] != key) return &.{};
-        const offs = sliceAt(u32, index.buf, seg.offs_off, seg.n_keys + 1);
-        return index.buf[seg.post_off + offs[lo] .. seg.post_off + offs[lo + 1]];
+        const offs = sliceAt(u32, index.buf, seg.offsets_offset, seg.keys_count + 1);
+        return index.buf[seg.postings_offset + offs[lo] .. seg.postings_offset + offs[lo + 1]];
     }
 
     /// Documents containing every trigram of every word, folded (words of 3+
@@ -312,7 +384,7 @@ pub const Index = struct {
         var next: std.ArrayList(u32) = .empty;
         defer next.deinit(gpa);
 
-        for (0..index.n_segs) |s| {
+        for (0..index.segments_count) |s| {
             var empty = false;
             for (uniq, 0..) |k, i| {
                 lists[i] = index.list(s, k);
@@ -326,11 +398,11 @@ pub const Index = struct {
                 }
             }.lt);
             cur.clearRetainingCapacity();
-            try decodeAll(gpa, lists[0], index.n_docs, &cur);
+            try decodeAll(gpa, lists[0], index.docs_count, &cur);
             for (lists[1..]) |l| {
                 if (cur.items.len == 0) break;
                 next.clearRetainingCapacity();
-                try intersect(gpa, cur.items, l, index.n_docs, &next);
+                try intersect(gpa, cur.items, l, index.docs_count, &next);
                 std.mem.swap(std.ArrayList(u32), &cur, &next);
             }
             for (cur.items) |d| if (!index.removed(d)) try out.append(gpa, d);
@@ -346,14 +418,10 @@ pub const Index = struct {
 
     pub fn postingBytes(index: *const Index) usize {
         var n: usize = 0;
-        for (index.segs) |s| n += s.post_len;
+        for (index.segments) |s| n += s.postings_size;
         return n;
     }
 };
-
-/// Bytes per document in the doc table (mtime, size, path_off, path_len,
-/// source, flags).
-const doc_bytes = 8 + 8 + 4 + 2 + 1 + 1;
 
 /// A document whose old version an update replaced, or that is gone.
 const flag_removed: u8 = 1;
@@ -368,25 +436,25 @@ fn region(len: usize, off: u64, count: u64, size: u64, alignment: u64) error{Bad
     return @intCast(off);
 }
 
-fn checkSegment(buf: []align(8) const u8, seg: SegEntry) error{BadIndex}!void {
-    const keys_off = try region(buf.len, seg.keys_off, seg.n_keys, 4, 4);
-    const n_keys: usize = @intCast(seg.n_keys); // fits: bounded by buf.len
-    const n_offs = std.math.add(u64, seg.n_keys, 1) catch return error.BadIndex;
-    const offs_off = try region(buf.len, seg.offs_off, n_offs, 4, 4);
-    _ = try region(buf.len, seg.post_off, seg.post_len, 1, 1);
-    const keys = sliceAt(u32, @constCast(buf), keys_off, n_keys);
-    const offs = sliceAt(u32, @constCast(buf), offs_off, n_keys + 1);
-    if (n_keys > 1) {
-        for (keys[0 .. n_keys - 1], keys[1..]) |a, b| if (a >= b) return error.BadIndex;
+fn checkSegment(buf: []align(8) const u8, seg: SegmentEntry) error{BadIndex}!void {
+    const keys_offset = try region(buf.len, seg.keys_offset, seg.keys_count, 4, 4);
+    const keys_count: usize = @intCast(seg.keys_count); // fits: bounded by buf.len
+    const n_offs = std.math.add(u64, seg.keys_count, 1) catch return error.BadIndex;
+    const offsets_offset = try region(buf.len, seg.offsets_offset, n_offs, 4, 4);
+    _ = try region(buf.len, seg.postings_offset, seg.postings_size, 1, 1);
+    const keys = sliceAt(u32, @constCast(buf), keys_offset, keys_count);
+    const offs = sliceAt(u32, @constCast(buf), offsets_offset, keys_count + 1);
+    if (keys_count > 1) {
+        for (keys[0 .. keys_count - 1], keys[1..]) |a, b| if (a >= b) return error.BadIndex;
     }
     // Ascending: the last key is the largest.
-    if (n_keys > 0 and keys[n_keys - 1] > 0xff_ffff) return error.BadIndex;
+    if (keys_count > 0 and keys[keys_count - 1] > 0xff_ffff) return error.BadIndex;
     var prev: u32 = 0;
     for (offs) |x| {
         if (x < prev) return error.BadIndex;
         prev = x;
     }
-    if (offs[n_keys] > seg.post_len) return error.BadIndex;
+    if (offs[keys_count] > seg.postings_size) return error.BadIndex;
 }
 
 fn sliceAt(comptime T: type, buf: []align(8) u8, off: usize, n: usize) []T {
@@ -436,10 +504,10 @@ fn readVarint(b: []const u8, pos: *usize) ?u32 {
 /// Decodes a posting list (first id, then deltas). A list from a damaged
 /// file ends at the first id that is malformed, not increasing, overflowing
 /// or not a document of the index: what comes out is always strictly
-/// ascending and below `n_docs`, so callers can index the doc table with it.
+/// ascending and below `docs_count`, so callers can index the doc table with it.
 const ListReader = struct {
     b: []const u8,
-    n_docs: usize,
+    docs_count: usize,
     pos: usize = 0,
     doc: u32 = 0,
     started: bool = false,
@@ -453,7 +521,7 @@ const ListReader = struct {
             reader.doc = d;
             reader.started = true;
         }
-        if (reader.doc >= reader.n_docs) return reader.stop();
+        if (reader.doc >= reader.docs_count) return reader.stop();
         return reader.doc;
     }
 
@@ -472,8 +540,8 @@ fn writeVarint(gpa: std.mem.Allocator, out: *std.ArrayList(u8), v0: u32) !void {
     try out.append(gpa, @intCast(v));
 }
 
-fn decodeAll(gpa: std.mem.Allocator, b: []const u8, n_docs: usize, out: *std.ArrayList(u32)) !void {
-    var r: ListReader = .{ .b = b, .n_docs = n_docs };
+fn decodeAll(gpa: std.mem.Allocator, b: []const u8, docs_count: usize, out: *std.ArrayList(u32)) !void {
+    var r: ListReader = .{ .b = b, .docs_count = docs_count };
     while (r.next()) |doc| try out.append(gpa, doc);
 }
 
@@ -482,10 +550,10 @@ fn intersect(
     gpa: std.mem.Allocator,
     a: []const u32,
     b: []const u8,
-    n_docs: usize,
+    docs_count: usize,
     out: *std.ArrayList(u32),
 ) !void {
-    var r: ListReader = .{ .b = b, .n_docs = n_docs };
+    var r: ListReader = .{ .b = b, .docs_count = docs_count };
     var doc: u32 = 0;
     var i: usize = 0;
     var have = false;
@@ -721,7 +789,7 @@ pub fn updateFile(
 /// directory that refers to `old`'s segments where they are; then the
 /// header, last. Bytes already there never change, so `old`'s mapping stays
 /// good; what the previous table and directory took is left behind
-/// (`live_bytes` says how much is still used). A run of small segments at
+/// (`bytes_live` says how much is still used). A run of small segments at
 /// the end (one per update) is merged into the new one, without the
 /// postings of removed documents. Null when the file is not as `old` saw it.
 pub fn appendFile(
@@ -738,13 +806,18 @@ pub fn appendFile(
     defer file.deinit();
     var sink: Sink = .{ .gpa = gpa, .app = &file, .written = file.len };
     defer sink.deinit();
-    const h = try appendInto(&sink, pool, old, gone, added, text, stats);
+    const header = try appendInto(&sink, pool, old, gone, added, text, stats);
     try sink.flush();
     // Everything the header will point at is on disk before it does.
     try file.sync();
-    try file.writeAt(&headerBytes(h), 0);
+    try file.writeAt(&header.encode(), 0);
     try file.sync();
-    return try Index.open(path_z);
+    const index = try Index.open(path_z);
+    // Read back as written (the pair of `finish`'s assertions).
+    assert(index.docs_count == header.docs_count);
+    assert(index.segments_count == header.segments_count);
+    assert(index.file.len == header.size_total);
+    return index;
 }
 
 /// A segment smaller than this is merged with the next update's.
@@ -770,16 +843,16 @@ fn mergeDocs(
     gone: []const u32,
     added: []const DocIn,
 ) (std.mem.Allocator.Error || error{IndexTooLarge})!Merged {
-    const n = old.n_docs + added.len;
+    const n = old.docs_count + added.len;
     // Doc ids are u32 in posting lists and results.
     if (n > std.math.maxInt(u32)) return error.IndexTooLarge;
     const docs = try gpa.alloc(DocIn, n);
     errdefer gpa.free(docs);
-    for (docs[0..old.n_docs], 0..) |*d, i| d.* = old.docIn(@intCast(i));
-    @memcpy(docs[old.n_docs..], added);
+    for (docs[0..old.docs_count], 0..) |*d, i| d.* = old.docIn(@intCast(i));
+    @memcpy(docs[old.docs_count..], added);
     const flags = try gpa.alloc(u8, n);
-    @memcpy(flags[0..old.n_docs], old.flags);
-    @memset(flags[old.n_docs..], 0);
+    @memcpy(flags[0..old.docs_count], old.flags);
+    @memset(flags[old.docs_count..], 0);
     for (gone) |id| flags[id] |= flag_removed;
     return .{ .docs = docs, .flags = flags };
 }
@@ -801,18 +874,22 @@ fn appendInto(
     const docs = m.docs;
     const flags = m.flags;
 
-    var keep = old.segs.len;
-    while (keep > 0 and old.segs[keep - 1].post_len < small_postings) keep -= 1;
-    if (old.segs.len - keep < merge_small) keep = old.segs.len;
-    var dir: std.ArrayList(SegEntry) = .empty;
+    var keep = old.segments.len;
+    while (keep > 0 and old.segments[keep - 1].postings_size < small_postings) keep -= 1;
+    if (old.segments.len - keep < merge_small) keep = old.segments.len;
+    var dir: std.ArrayList(SegmentEntry) = .empty;
     defer dir.deinit(gpa);
     // Where they are: the file only grows.
-    try dir.appendSlice(gpa, old.segs[0..keep]);
+    try dir.appendSlice(gpa, old.segments[0..keep]);
     var merged: std.ArrayList(u64) = .empty;
     defer merged.deinit(gpa);
-    for (old.segs[keep..]) |seg| try segmentPairs(gpa, old, seg, flags, &merged);
-    try indexDocs(sink, pool, &dir, docs, old.n_docs, text, &st, merged.items);
-    const table = try writeDocs(sink, docs, flags, false, old.path_off);
+    for (old.segments[keep..]) |seg| try segmentPairs(gpa, old, seg, flags, &merged);
+    try indexDocs(sink, pool, &dir, docs, old.docs_count, text, &st, merged.items);
+    const table = try writeDocs(sink, docs, .{
+        .flags = flags,
+        .header = .none,
+        .path_offsets_reused = old.path_offsets,
+    });
     st.docs_indexed = added.len;
     return finish(sink, dir.items, docs.len, table, t0, &st, stats);
 }
@@ -822,16 +899,16 @@ fn appendInto(
 fn segmentPairs(
     gpa: std.mem.Allocator,
     index: *const Index,
-    seg: SegEntry,
+    seg: SegmentEntry,
     flags: []const u8,
     out: *std.ArrayList(u64),
 ) std.mem.Allocator.Error!void {
-    const n_keys: usize = @intCast(seg.n_keys);
-    const keys = sliceAt(u32, index.buf, @intCast(seg.keys_off), n_keys);
-    const offs = sliceAt(u32, index.buf, @intCast(seg.offs_off), n_keys + 1);
-    const post = index.buf[@intCast(seg.post_off)..][0..@intCast(seg.post_len)];
+    const keys_count: usize = @intCast(seg.keys_count);
+    const keys = sliceAt(u32, index.buf, @intCast(seg.keys_offset), keys_count);
+    const offs = sliceAt(u32, index.buf, @intCast(seg.offsets_offset), keys_count + 1);
+    const post = index.buf[@intCast(seg.postings_offset)..][0..@intCast(seg.postings_size)];
     for (keys, 0..) |k, i| {
-        var r: ListReader = .{ .b = post[offs[i]..offs[i + 1]], .n_docs = index.n_docs };
+        var r: ListReader = .{ .b = post[offs[i]..offs[i + 1]], .docs_count = index.docs_count };
         while (r.next()) |doc| if (flags[doc] & flag_removed == 0) try out.append(
             gpa,
             @as(u64, k) << 32 | doc,
@@ -893,28 +970,6 @@ const Sink = struct {
     }
 };
 
-/// The header, once everything after it is written.
-const Header = struct {
-    n: usize,
-    n_segs: usize,
-    paths_len: usize,
-    docs_off: usize,
-    dir_off: usize,
-    total: usize,
-};
-
-fn headerBytes(header: Header) [header_len]u8 {
-    var b: [header_len]u8 = @splat(0);
-    @memcpy(b[0..8], magic);
-    std.mem.writeInt(u64, b[8..16], header.n, .little);
-    std.mem.writeInt(u64, b[16..24], header.n_segs, .little);
-    std.mem.writeInt(u64, b[24..32], header.paths_len, .little);
-    std.mem.writeInt(u64, b[32..40], header.docs_off, .little);
-    std.mem.writeInt(u64, b[40..48], header.dir_off, .little);
-    std.mem.writeInt(u64, b[48..56], header.total, .little);
-    return b;
-}
-
 /// A sink without a file never fails to write one.
 fn memoryOnly(err: FileError) BuildError {
     return switch (err) {
@@ -924,7 +979,7 @@ fn memoryOnly(err: FileError) BuildError {
 }
 
 fn toMemory(sink: *Sink, header: Header) BuildError!Index {
-    @memcpy(sink.buf.items[0..header_len], &headerBytes(header));
+    @memcpy(sink.buf.items[0..header_size], &header.encode());
     const buf = try sink.buf.toOwnedSlice(sink.gpa);
     errdefer sink.gpa.free(buf);
     return Index.parse(buf, false);
@@ -933,7 +988,7 @@ fn toMemory(sink: *Sink, header: Header) BuildError!Index {
 fn toFile(sink: *Sink, header: Header, path_z: [:0]const u8) FileError!Index {
     try sink.flush();
     const f = sink.file.?;
-    try f.writeAt(&headerBytes(header), 0);
+    try f.writeAt(&header.encode(), 0);
     try f.commit();
     return Index.open(path_z);
 }
@@ -947,9 +1002,13 @@ fn buildInto(
 ) FileError!Header {
     const t0 = sys.monotonicNs();
     var st: BuildStats = .{};
-    var dir: std.ArrayList(SegEntry) = .empty;
+    var dir: std.ArrayList(SegmentEntry) = .empty;
     defer dir.deinit(sink.gpa);
-    const table = try writeDocs(sink, docs, null, true, &.{});
+    const table = try writeDocs(sink, docs, .{
+        .flags = null,
+        .header = .reserve,
+        .path_offsets_reused = &.{},
+    });
     try indexDocs(sink, pool, &dir, docs, 0, text, &st, &.{});
     st.docs_indexed = docs.len;
     return finish(sink, dir.items, docs.len, table, t0, &st, stats);
@@ -972,76 +1031,99 @@ fn updateInto(
     const docs = m.docs;
     const flags = m.flags;
 
-    var dir: std.ArrayList(SegEntry) = .empty;
+    var dir: std.ArrayList(SegmentEntry) = .empty;
     defer dir.deinit(gpa);
-    const table = try writeDocs(sink, docs, flags, true, &.{});
-    for (old.segs) |seg| try copySegment(sink, &dir, old.buf, seg);
-    try indexDocs(sink, pool, &dir, docs, old.n_docs, text, &st, &.{});
+    const table = try writeDocs(sink, docs, .{
+        .flags = flags,
+        .header = .reserve,
+        .path_offsets_reused = &.{},
+    });
+    for (old.segments) |seg| try copySegment(sink, &dir, old.buf, seg);
+    try indexDocs(sink, pool, &dir, docs, old.docs_count, text, &st, &.{});
     st.docs_indexed = added.len;
     return finish(sink, dir.items, docs.len, table, t0, &st, stats);
 }
 
-const DocTable = struct { off: usize, paths_len: usize };
+/// Where `writeDocs` put the doc table, and how many bytes of paths it
+/// added after it.
+const DocTableWritten = struct { offset: usize, paths_size: usize };
 
-/// Header room (a new file), then the doc table and the paths it adds.
-/// The first `reuse.len` documents' paths are already in the file, at those
-/// offsets (an appended table); the others' are written after the table.
+const WriteDocsOptions = struct {
+    /// Each document's flags; none set when null.
+    flags: ?[]const u8,
+    /// A new file starts with room for the header; an append does not.
+    header: enum { reserve, none },
+    /// The first `path_offsets_reused.len` documents' paths are already in
+    /// the file, at these offsets (an appended table); the others' are
+    /// written after the table.
+    path_offsets_reused: []const u32,
+};
+
+/// The doc table, then the paths it adds.
 fn writeDocs(
     sink: *Sink,
     docs: []const DocIn,
-    flags: ?[]const u8,
-    header_room: bool,
-    reuse: []const u32,
-) FileError!DocTable {
-    if (header_room) try sink.zeros(header_len);
+    options: WriteDocsOptions,
+) FileError!DocTableWritten {
+    const reused = options.path_offsets_reused;
+    assert(reused.len <= docs.len);
+    if (options.flags) |flags| assert(flags.len == docs.len);
+    switch (options.header) {
+        .reserve => try sink.zeros(header_size),
+        .none => assert(sink.pos() >= header_size),
+    }
     try sink.pad8();
-    var paths_len: usize = 0;
-    for (docs[reuse.len..]) |d| paths_len += d.path.len;
-    // The path length column is u16; `DocIn.path` promises that it fits.
-    for (docs) |d| assert(d.path.len <= path_bytes_max);
-    const docs_off = sink.pos();
-    const paths_at = docs_off + docs.len * doc_bytes;
+    var paths_size: usize = 0;
+    for (docs[reused.len..]) |doc| paths_size += doc.path.len;
+    // The path size column is u16; `DocIn.path` promises that it fits.
+    for (docs) |doc| assert(doc.path.len <= path_bytes_max);
+    const docs_offset = sink.pos();
+    const paths_offset = docs_offset + docs.len * doc_size;
     // Path offsets are stored as u32, so the doc table and its paths must
     // end below 4 GiB.
-    if (paths_at + paths_len > std.math.maxInt(u32)) return error.IndexTooLarge;
+    if (paths_offset + paths_size > std.math.maxInt(u32)) return error.IndexTooLarge;
+
     // Built in the buffer: nothing is written before the doc table is done.
-    const at = sink.buf.items.len;
-    try sink.zeros(align8(docs.len * doc_bytes + paths_len));
-    const b = sink.buf.items;
-    var o = at;
-    for (docs) |d| {
-        std.mem.writeInt(i64, b[o..][0..8], d.mtime, .little);
-        o += 8;
+    const table_start = sink.buf.items.len;
+    try sink.zeros(align8(docs.len * doc_size + paths_size));
+    const table = sink.buf.items;
+    var cursor = table_start;
+    for (docs) |doc| {
+        std.mem.writeInt(i64, table[cursor..][0..8], doc.mtime, .little);
+        cursor += @sizeOf(i64);
     }
-    for (docs) |d| {
-        std.mem.writeInt(u64, b[o..][0..8], d.size, .little);
-        o += 8;
+    for (docs) |doc| {
+        std.mem.writeInt(u64, table[cursor..][0..8], doc.size, .little);
+        cursor += @sizeOf(u64);
     }
-    var po: usize = paths_at;
-    for (docs, 0..) |d, i| {
-        if (i < reuse.len) {
-            std.mem.writeInt(u32, b[o..][0..4], reuse[i], .little);
+    var path_offset: usize = paths_offset;
+    for (docs, 0..) |doc, doc_index| {
+        if (doc_index < reused.len) {
+            std.mem.writeInt(u32, table[cursor..][0..4], reused[doc_index], .little);
         } else {
-            std.mem.writeInt(u32, b[o..][0..4], @intCast(po), .little);
-            po += d.path.len;
+            std.mem.writeInt(u32, table[cursor..][0..4], @intCast(path_offset), .little);
+            path_offset += doc.path.len;
         }
-        o += 4;
+        cursor += @sizeOf(u32);
     }
-    for (docs) |d| {
-        std.mem.writeInt(u16, b[o..][0..2], @intCast(d.path.len), .little);
-        o += 2;
+    for (docs) |doc| {
+        std.mem.writeInt(u16, table[cursor..][0..2], @intCast(doc.path.len), .little);
+        cursor += @sizeOf(u16);
     }
-    for (docs) |d| {
-        b[o] = @backingInt(d.source);
-        o += 1;
+    for (docs) |doc| {
+        table[cursor] = @backingInt(doc.source);
+        cursor += 1;
     }
-    if (flags) |f| @memcpy(b[o..][0..docs.len], f);
-    o += docs.len;
-    for (docs[reuse.len..]) |d| {
-        @memcpy(b[o..][0..d.path.len], d.path);
-        o += d.path.len;
+    if (options.flags) |flags| @memcpy(table[cursor..][0..docs.len], flags);
+    cursor += docs.len;
+    assert(cursor == table_start + docs.len * doc_size);
+
+    for (docs[reused.len..]) |doc| {
+        @memcpy(table[cursor..][0..doc.path.len], doc.path);
+        cursor += doc.path.len;
     }
-    return .{ .off = docs_off, .paths_len = paths_len };
+    assert(path_offset == paths_offset + paths_size);
+    return .{ .offset = docs_offset, .paths_size = paths_size };
 }
 
 /// Indexes `docs[from..]` (ids are positions in `docs`), closing segments as
@@ -1056,7 +1138,7 @@ fn writeDocs(
 fn indexDocs(
     sink: *Sink,
     pool: *Pool,
-    dir: *std.ArrayList(SegEntry),
+    dir: *std.ArrayList(SegmentEntry),
     docs: []const DocIn,
     from: usize,
     text: TextReader,
@@ -1125,7 +1207,7 @@ fn roundEnd(docs: []const DocIn, lo: usize, text: TextReader) usize {
 
 fn closePairs(
     sink: *Sink,
-    dir: *std.ArrayList(SegEntry),
+    dir: *std.ArrayList(SegmentEntry),
     pairs: *std.ArrayList(u64),
     scratch: *std.ArrayList(u64),
     st: *BuildStats,
@@ -1140,50 +1222,67 @@ fn closePairs(
 /// A segment of another index, as it is.
 fn copySegment(
     sink: *Sink,
-    dir: *std.ArrayList(SegEntry),
+    dir: *std.ArrayList(SegmentEntry),
     from: []align(8) const u8,
-    seg: SegEntry,
+    seg: SegmentEntry,
 ) FileError!void {
-    const n_keys: usize = @intCast(seg.n_keys);
+    const keys_count: usize = @intCast(seg.keys_count);
     try sink.pad8();
-    const keys_off = sink.pos();
-    try sink.append(from[@intCast(seg.keys_off)..][0 .. n_keys * 4]);
+    const keys_offset = sink.pos();
+    try sink.append(from[@intCast(seg.keys_offset)..][0 .. keys_count * 4]);
     try sink.pad8();
-    const offs_off = sink.pos();
-    try sink.append(from[@intCast(seg.offs_off)..][0 .. (n_keys + 1) * 4]);
-    const post_off = sink.pos();
-    try sink.append(from[@intCast(seg.post_off)..][0..@intCast(seg.post_len)]);
+    const offsets_offset = sink.pos();
+    try sink.append(from[@intCast(seg.offsets_offset)..][0 .. (keys_count + 1) * 4]);
+    const postings_offset = sink.pos();
+    try sink.append(from[@intCast(seg.postings_offset)..][0..@intCast(seg.postings_size)]);
     try dir.append(sink.gpa, .{
-        .n_keys = seg.n_keys,
-        .keys_off = keys_off,
-        .offs_off = offs_off,
-        .post_off = post_off,
-        .post_len = seg.post_len,
+        .keys_count = seg.keys_count,
+        .keys_offset = keys_offset,
+        .offsets_offset = offsets_offset,
+        .postings_offset = postings_offset,
+        .postings_size = seg.postings_size,
     });
 }
 
 /// The segment directory; returns the header to put first.
+///
+/// What `Index.parse` checks on reading is asserted here on writing, so a
+/// file this code wrote and one it rejects can only differ by damage.
 fn finish(
     sink: *Sink,
-    dir: []const SegEntry,
-    n_docs: usize,
-    table: DocTable,
+    dir: []const SegmentEntry,
+    docs_count: usize,
+    table: DocTableWritten,
     t0: u64,
     st: *BuildStats,
     stats: ?*BuildStats,
 ) FileError!Header {
     try sink.pad8();
-    const dir_off = sink.pos();
+    const directory_offset = sink.pos();
     try sink.append(std.mem.sliceAsBytes(dir));
+    const size_total = sink.pos();
     st.ns = sys.monotonicNs() - t0;
     if (stats) |s| s.* = st.*;
+
+    assert(docs_count <= std.math.maxInt(u32));
+    assert(table.offset >= header_size);
+    assert(table.offset % 8 == 0);
+    assert(table.offset + docs_count * doc_size + table.paths_size <= directory_offset);
+    assert(directory_offset % 8 == 0);
+    for (dir) |segment| {
+        assert(segment.keys_offset % 4 == 0);
+        assert(segment.offsets_offset % 4 == 0);
+        assert(segment.postings_offset + segment.postings_size <= directory_offset);
+    }
     return .{
-        .n = n_docs,
-        .n_segs = dir.len,
-        .paths_len = table.paths_len,
-        .docs_off = table.off,
-        .dir_off = dir_off,
-        .total = sink.pos(),
+        .magic = magic.*,
+        .docs_count = docs_count,
+        .segments_count = dir.len,
+        .paths_size = table.paths_size,
+        .docs_offset = table.offset,
+        .directory_offset = directory_offset,
+        .size_total = size_total,
+        .reserved = @splat(0),
     };
 }
 
@@ -1198,7 +1297,7 @@ const Out = std.array_list.Aligned(u8, .@"8");
 /// sorted whole and deduplicated, never encoded as wrapped deltas.
 fn closeSegment(
     sink: *Sink,
-    dir: *std.ArrayList(SegEntry),
+    dir: *std.ArrayList(SegmentEntry),
     pairs: []u64,
     scratch: *std.ArrayList(u64),
 ) FileError!void {
@@ -1217,19 +1316,19 @@ fn closeSegment(
     }
 
     try sink.pad8();
-    const keys_off = sink.pos();
+    const keys_offset = sink.pos();
     try sink.append(std.mem.sliceAsBytes(lists.keys.items));
     try sink.pad8();
-    const offs_off = sink.pos();
+    const offsets_offset = sink.pos();
     try sink.append(std.mem.sliceAsBytes(lists.offs.items));
-    const post_off = sink.pos();
+    const postings_offset = sink.pos();
     try sink.append(lists.post.items);
     try dir.append(gpa, .{
-        .n_keys = lists.keys.items.len,
-        .keys_off = keys_off,
-        .offs_off = offs_off,
-        .post_off = post_off,
-        .post_len = lists.post.items.len,
+        .keys_count = lists.keys.items.len,
+        .keys_offset = keys_offset,
+        .offsets_offset = offsets_offset,
+        .postings_offset = postings_offset,
+        .postings_size = lists.post.items.len,
     });
 }
 
@@ -1638,7 +1737,7 @@ test "update: edited and deleted documents leave, new ones join, old ids keep th
     );
     defer up.deinit(gpa);
     try testing.expectEqual(@as(usize, 2), st.docs_indexed);
-    try testing.expectEqual(ix.n_segs + 1, up.n_segs);
+    try testing.expectEqual(ix.segments_count + 1, up.segments_count);
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1653,7 +1752,7 @@ test "update: edited and deleted documents leave, new ones join, old ids keep th
     var got: std.ArrayList(u32) = .empty;
     defer got.deinit(gpa);
     for ([_]*const Index{ &up, &mapped }) |x| {
-        try testing.expectEqual(@as(usize, 5), x.n_docs);
+        try testing.expectEqual(@as(usize, 5), x.docs_count);
         try testing.expectEqual(@as(usize, 3), x.live());
         try testing.expect(x.removed(1) and x.removed(2) and !x.removed(0));
         try testing.expectEqualStrings("1", x.path(3));
@@ -1705,7 +1804,7 @@ test "update: edited and deleted documents leave, new ones join, old ids keep th
         null,
     );
     defer again.deinit(gpa);
-    try testing.expectEqual(mapped.n_segs, again.n_segs);
+    try testing.expectEqual(mapped.segments_count, again.segments_count);
     try testing.expectEqual(@as(usize, 2), again.live());
     try again.candidates(gpa, &.{"zanzibar"}, &got);
     try testing.expectEqual(@as(usize, 0), got.items.len);
@@ -1780,9 +1879,9 @@ test "appended updates: same results as rewritten ones, old mappings stay good, 
         mem.deinit(gpa);
         cur = next;
         mem = next_mem;
-        try testing.expectEqual(mem.n_docs, cur.n_docs);
+        try testing.expectEqual(mem.docs_count, cur.docs_count);
         try testing.expectEqualSlices(u8, mem.flags, cur.flags);
-        for (0..cur.n_docs) |i| try testing.expectEqualStrings(
+        for (0..cur.docs_count) |i| try testing.expectEqualStrings(
             mem.path(@intCast(i)),
             cur.path(@intCast(i)),
         );
@@ -1793,8 +1892,8 @@ test "appended updates: same results as rewritten ones, old mappings stay good, 
         }
     }
     // Six updates of tiny segments: merged, not six more segments.
-    try testing.expect(cur.n_segs < mem.n_segs);
-    try testing.expect(cur.buf.len > cur.live_bytes);
+    try testing.expect(cur.segments_count < mem.segments_count);
+    try testing.expect(cur.buf.len > cur.bytes_live);
 
     // An append whose header never got written (a crash): the file still
     // opens as it was.
@@ -1805,7 +1904,7 @@ test "appended updates: same results as rewritten ones, old mappings stay good, 
     }
     var reopened = try Index.open(p);
     defer reopened.deinit(gpa);
-    try testing.expectEqual(cur.n_docs, reopened.n_docs);
+    try testing.expectEqual(cur.docs_count, reopened.docs_count);
     try reopened.candidates(gpa, &.{"okavango"}, &got);
     try mem.candidates(gpa, &.{"okavango"}, &want);
     try testing.expectEqualSlices(u32, want.items, got.items);
@@ -2494,7 +2593,7 @@ fn exerciseIndex(index: *const Index, gpa: std.mem.Allocator) !void {
         try index.candidates(gpa, q, &got);
         try testing.expect(strictlyAscending(u32, got.items));
         for (got.items) |d| {
-            try testing.expect(d < index.n_docs);
+            try testing.expect(d < index.docs_count);
             const src: Source = @fromBackingInt(@intCast(index.sources[d]));
             sum +%= index.path(d).len +% @as(
                 usize,
@@ -2502,7 +2601,7 @@ fn exerciseIndex(index: *const Index, gpa: std.mem.Allocator) !void {
             ) +% index.sizes[d] +% @backingInt(src);
         }
     }
-    for (0..index.n_docs) |d| sum +%= index.path(@intCast(d)).len;
+    for (0..index.docs_count) |d| sum +%= index.path(@intCast(d)).len;
     std.mem.doNotOptimizeAway(sum);
 }
 
@@ -2530,10 +2629,10 @@ test "corrupt content indexes are rejected, not trusted" {
         Index.parse(good[0..cut], false),
     );
 
-    const docs_off = std.mem.readInt(u64, good[32..40], .little);
-    const dir_off = std.mem.readInt(u64, good[40..48], .little);
-    const n = ix.n_docs;
-    const seg = ix.segs[0];
+    const docs_offset = std.mem.readInt(u64, good[32..40], .little);
+    const directory_offset = std.mem.readInt(u64, good[40..48], .little);
+    const n = ix.docs_count;
+    const seg = ix.segments[0];
     const max = std.math.maxInt(u64);
     const Case = struct { at: usize, v: u64, wide: bool = true };
     const cases = [_]Case{
@@ -2542,33 +2641,33 @@ test "corrupt content indexes are rejected, not trusted" {
         .{ .at = 8, .v = n + 1 }, // count off by one: the arrays shift onto other data
         .{ .at = 8, .v = @as(u64, std.math.maxInt(u32)) + 1 },
         .{ .at = 16, .v = max / 8 }, // segment count
-        .{ .at = 16, .v = ix.n_segs + 1 },
+        .{ .at = 16, .v = ix.segments_count + 1 },
         .{ .at = 24, .v = good.len }, // paths blob past the end
-        .{ .at = 32, .v = docs_off + 4 }, // misaligned doc table
+        .{ .at = 32, .v = docs_offset + 4 }, // misaligned doc table
         .{ .at = 32, .v = good.len + 8 }, // past the end
         .{ .at = 32, .v = 0 }, // over the header
-        .{ .at = 40, .v = dir_off + 4 }, // misaligned directory
+        .{ .at = 40, .v = directory_offset + 4 }, // misaligned directory
         .{ .at = 40, .v = good.len - 8 }, // directory past the end
         .{ .at = 48, .v = good.len - 1 }, // total length
         // Segment directory entry.
-        .{ .at = dir_off, .v = max }, // n_keys: overflows
-        .{ .at = dir_off, .v = seg.n_keys * 100 }, // keys past the end
-        .{ .at = dir_off + 8, .v = seg.keys_off + 2 }, // misaligned keys
-        .{ .at = dir_off + 8, .v = good.len }, // keys past the end
-        .{ .at = dir_off + 16, .v = good.len - 4 }, // offsets past the end
-        .{ .at = dir_off + 24, .v = good.len }, // postings past the end
-        .{ .at = dir_off + 32, .v = good.len }, // postings longer than the file
-        .{ .at = dir_off + 32, .v = 0 }, // offsets beyond the postings
+        .{ .at = directory_offset, .v = max }, // keys_count: overflows
+        .{ .at = directory_offset, .v = seg.keys_count * 100 }, // keys past the end
+        .{ .at = directory_offset + 8, .v = seg.keys_offset + 2 }, // misaligned keys
+        .{ .at = directory_offset + 8, .v = good.len }, // keys past the end
+        .{ .at = directory_offset + 16, .v = good.len - 4 }, // offsets past the end
+        .{ .at = directory_offset + 24, .v = good.len }, // postings past the end
+        .{ .at = directory_offset + 32, .v = good.len }, // postings longer than the file
+        .{ .at = directory_offset + 32, .v = 0 }, // offsets beyond the postings
         // A path past the end of the file, an unknown document kind.
-        .{ .at = docs_off + n * 16, .v = 0xffff_fff0, .wide = false },
-        .{ .at = docs_off + n * 22, .v = 9, .wide = false },
+        .{ .at = docs_offset + n * 16, .v = 0xffff_fff0, .wide = false },
+        .{ .at = docs_offset + n * 22, .v = 9, .wide = false },
         // Keys out of order (binary search would miss), offsets going back.
-        .{ .at = seg.keys_off, .v = 0xffff_ff, .wide = false },
-        .{ .at = seg.offs_off + 4, .v = 0xffff_ffff, .wide = false },
+        .{ .at = seg.keys_offset, .v = 0xffff_ff, .wide = false },
+        .{ .at = seg.offsets_offset + 4, .v = 0xffff_ffff, .wide = false },
     };
     for (cases, 0..) |c, i| {
         @memcpy(bad, good);
-        if (c.at == docs_off + n * 22) {
+        if (c.at == docs_offset + n * 22) {
             bad[c.at] = @intCast(c.v);
         } else if (c.wide) H.put(bad, c.at, c.v) else H.put32(bad, c.at, @intCast(c.v));
         if (Index.parse(bad, false)) |_| {
@@ -2626,14 +2725,14 @@ test "malformed posting lists end, never over-read" {
     // its continuation bit (each list now ends in a truncated varint).
     var ix = try smallIndex(gpa);
     defer ix.deinit(gpa);
-    const seg = ix.segs[0];
-    const offs = sliceAt(u32, ix.buf, seg.offs_off, seg.n_keys + 1);
+    const seg = ix.segments[0];
+    const offs = sliceAt(u32, ix.buf, seg.offsets_offset, seg.keys_count + 1);
     for (offs[1..]) |o| if (o > 0) {
-        ix.buf[seg.post_off + o - 1] |= 0x80;
+        ix.buf[seg.postings_offset + o - 1] |= 0x80;
     };
     try exerciseIndex(&ix, gpa);
     // And with garbage postings: ids past the documents never come out.
-    @memset(ix.buf[seg.post_off..][0..seg.post_len], 0x7f);
+    @memset(ix.buf[seg.postings_offset..][0..seg.postings_size], 0x7f);
     try exerciseIndex(&ix, gpa);
 }
 
@@ -2687,7 +2786,7 @@ fn appendMemory(
     errdefer gpa.free(buf);
     @memcpy(buf[0..old.buf.len], old.buf);
     @memcpy(buf[old.buf.len..], sink.buf.items);
-    @memcpy(buf[0..header_len], &headerBytes(h));
+    @memcpy(buf[0..header_size], &h.encode());
     return Index.parse(buf, false);
 }
 
@@ -2701,7 +2800,7 @@ fn exerciseUpdates(index: *const Index, gpa: std.mem.Allocator, pool: *Pool) !vo
         .{ .path = "0", .mtime = 200, .size = 1 },
         .{ .path = "3", .mtime = 200, .size = 1 },
     };
-    const gone: []const u32 = if (index.n_docs > 0) &.{0} else &.{};
+    const gone: []const u32 = if (index.docs_count > 0) &.{0} else &.{};
     var up = try update(gpa, pool, index, gone, &added, reader, null);
     defer up.deinit(gpa);
     try exerciseIndex(&up, gpa);
@@ -2716,13 +2815,13 @@ test "segments that repeat or reorder doc ids (a damaged file): queries, updates
     defer pool.destroy();
     var ix = try segmentedIndex(gpa, pool);
     defer ix.deinit(gpa);
-    try testing.expectEqual(@as(usize, 5), ix.n_segs);
+    try testing.expectEqual(@as(usize, 5), ix.segments_count);
     // The last segment holds document 63 ("config arena zig") alone: each
     // of its lists is that id, one byte. Make it 61 ("token arena
     // parser"): "arena" lists 61 in segment 2 and again in segment 4, and
     // "zig" lists 62 in segment 3, then 61. Nothing `parse` checks.
-    const last = ix.segs[4];
-    @memset(ix.buf[@intCast(last.post_off)..][0..@intCast(last.post_len)], 61);
+    const last = ix.segments[4];
+    @memset(ix.buf[@intCast(last.postings_offset)..][0..@intCast(last.postings_size)], 61);
     _ = try Index.parse(ix.buf, false);
 
     var got: std.ArrayList(u32) = .empty;
@@ -2758,7 +2857,7 @@ test "segments that repeat or reorder doc ids (a damaged file): queries, updates
         null,
     )).?;
     defer app.deinit(gpa);
-    try testing.expectEqual(@as(usize, 1), app.n_segs);
+    try testing.expectEqual(@as(usize, 1), app.segments_count);
     try app.candidates(gpa, &.{"zig"}, &got);
     try testing.expect(strictlyAscending(u32, got.items));
     // 61 by the damage, 62, and 64 (the new "arena zig élan").
@@ -2916,22 +3015,46 @@ fn fuzzParseBytes(_: void, smith: *testing.Smith) anyerror!void {
     const b = buf[0..smith.slice(&buf)];
     // Often make the header plausible, so the fuzzer reaches the checks
     // behind it.
-    if (b.len >= header_len and smith.value(bool)) {
+    if (b.len >= header_size and smith.value(bool)) {
         @memcpy(b[0..8], magic);
-        const room = (b.len - header_len) / doc_bytes;
+        const room = (b.len - header_size) / doc_size;
         const n = smith.valueRangeAtMost(u32, 0, @intCast(@min(room, 1000)));
-        const paths_len = smith.valueRangeAtMost(u32, 0, @intCast(
-            b.len - header_len - n * doc_bytes,
+        const paths_size = smith.valueRangeAtMost(u32, 0, @intCast(
+            b.len - header_size - n * doc_size,
         ));
-        const dir_off = align8(header_len + n * doc_bytes + paths_len);
+        const directory_offset = align8(header_size + n * doc_size + paths_size);
         std.mem.writeInt(u64, b[8..16], n, .little);
         std.mem.writeInt(u64, b[16..24], smith.valueRangeAtMost(u8, 0, 4), .little);
-        std.mem.writeInt(u64, b[24..32], paths_len, .little);
-        std.mem.writeInt(u64, b[32..40], header_len, .little);
-        std.mem.writeInt(u64, b[40..48], dir_off, .little);
+        std.mem.writeInt(u64, b[24..32], paths_size, .little);
+        std.mem.writeInt(u64, b[32..40], header_size, .little);
+        std.mem.writeInt(u64, b[40..48], directory_offset, .little);
         std.mem.writeInt(u64, b[48..56], b.len, .little);
     }
     if (Index.parse(b, false)) |ix| try exerciseIndex(&ix, testing.allocator) else |_| {}
+}
+
+test "content: the header struct lays out the bytes LUMCTX04 always had" {
+    const header: Header = .{
+        .magic = magic.*,
+        .docs_count = 1,
+        .segments_count = 2,
+        .paths_size = 3,
+        .docs_offset = 4,
+        .directory_offset = 5,
+        .size_total = 6,
+        .reserved = @splat(0),
+    };
+    // The layout as it was written field by field before `Header` existed.
+    var expected: [header_size]u8 = @splat(0);
+    @memcpy(expected[0..8], magic);
+    std.mem.writeInt(u64, expected[8..16], 1, .little);
+    std.mem.writeInt(u64, expected[16..24], 2, .little);
+    std.mem.writeInt(u64, expected[24..32], 3, .little);
+    std.mem.writeInt(u64, expected[32..40], 4, .little);
+    std.mem.writeInt(u64, expected[40..48], 5, .little);
+    std.mem.writeInt(u64, expected[48..56], 6, .little);
+    try testing.expectEqualSlices(u8, &expected, &header.encode());
+    try testing.expectEqual(header, Header.decode(&expected));
 }
 
 test "fuzz: parsing arbitrary bytes as a content index never crashes" {
