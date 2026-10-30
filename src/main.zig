@@ -759,6 +759,7 @@ test {
     _ = @import("ui/installer.zig");
     _ = @import("layout.zig");
     _ = @import("providers/scripts.zig");
+    _ = @import("stats.zig");
 }
 
 test "the views the usage lists open" {
