@@ -182,11 +182,11 @@ pub const Store = struct {
     /// still shows what others write to the file afterwards (pages not yet
     /// copied), and a bad offset read past the buffer.
     pub fn name(store: *const Store, id: u32) []const u8 {
-        const off = store.arr(u32, store.layout.name_offsets_offset)[id];
-        const n = store.arr(u16, store.layout.name_sizes_offset)[id];
-        if (@as(usize, off) + n > store.layout.names_size) return "";
-        const start = store.layout.names_offset + off;
-        return store.buf[start .. start + n];
+        const name_offset = store.arr(u32, store.layout.name_offsets_offset)[id];
+        const name_size = store.arr(u16, store.layout.name_sizes_offset)[id];
+        if (@as(usize, name_offset) + name_size > store.layout.names_size) return "";
+        const start = store.layout.names_offset + name_offset;
+        return store.buf[start .. start + name_size];
     }
 
     pub fn isDir(store: *const Store, id: u32) bool {
@@ -200,38 +200,43 @@ pub const Store = struct {
     /// `name`: a parent cycle written to the file after it was checked
     /// made the first one spin forever.
     pub fn path(store: *const Store, id: u32, out: []u8) ?[]const u8 {
-        const ps = store.parents();
-        const n_all = store.layout.entries_count;
-        var total: usize = 0;
-        var cur = id;
+        const parents_all = store.parents();
+        const entries_count = store.layout.entries_count;
+        var path_size: usize = 0;
+        var entry = id;
         var steps: usize = 0;
         while (true) : (steps += 1) {
-            if (cur >= n_all or steps >= n_all) return null;
-            total += store.name(cur).len;
-            const p = ps[cur];
-            if (p == no_parent) break;
-            if (p >= n_all) return null;
-            if (!std.mem.endsWith(u8, store.name(p), "/")) total += 1;
-            if (total > out.len) return null;
-            cur = p;
+            if (entry >= entries_count) return null;
+            if (steps >= entries_count) return null;
+            path_size += store.name(entry).len;
+            const parent = parents_all[entry];
+            if (parent == no_parent) break;
+            if (parent >= entries_count) return null;
+            if (!std.mem.endsWith(u8, store.name(parent), "/")) path_size += 1;
+            if (path_size > out.len) return null;
+            entry = parent;
         }
-        if (total > out.len) return null;
-        var end = total;
-        cur = id;
+        if (path_size > out.len) return null;
+        var end = path_size;
+        entry = id;
         for (0..steps + 1) |_| {
-            const n = store.name(cur);
-            if (n.len > end) return null;
-            @memcpy(out[end - n.len .. end], n);
-            end -= n.len;
-            const p = ps[cur];
-            if (p == no_parent) return if (end == 0) out[0..total] else null;
-            if (p >= n_all) return null;
-            if (!std.mem.endsWith(u8, store.name(p), "/")) {
+            const entry_name = store.name(entry);
+            if (entry_name.len > end) return null;
+            @memcpy(out[end - entry_name.len .. end], entry_name);
+            end -= entry_name.len;
+            const parent = parents_all[entry];
+            if (parent == no_parent) {
+                // The file changed between the two passes otherwise.
+                if (end != 0) return null;
+                return out[0..path_size];
+            }
+            if (parent >= entries_count) return null;
+            if (!std.mem.endsWith(u8, store.name(parent), "/")) {
                 if (end == 0) return null;
                 end -= 1;
                 out[end] = '/';
             }
-            cur = p;
+            entry = parent;
         }
         return null;
     }
@@ -250,12 +255,12 @@ pub const Store = struct {
 
     /// Roots come first, with `no_parent`.
     pub fn nRoots(store: *const Store) u32 {
-        var n: u32 = 0;
-        for (store.parents()) |p| {
-            if (p != no_parent) break;
-            n += 1;
+        var roots_count: u32 = 0;
+        for (store.parents()) |parent| {
+            if (parent != no_parent) break;
+            roots_count += 1;
         }
-        return n;
+        return roots_count;
     }
 
     /// Range of the direct children of `dir`. The level-by-level scan leaves
@@ -270,16 +275,16 @@ pub const Store = struct {
         return .{ .lo = @intCast(lo), .hi = @intCast(hi) };
     }
 
-    /// Child of `dir` named `n`: two binary searches, one for the children
-    /// and one among them by name (scan-built stores only: the scan sorts
-    /// each directory's entries).
-    pub fn findChild(store: *const Store, dir: u32, n: []const u8) ?u32 {
-        const r = store.children(dir);
-        var lo = r.lo;
-        var hi = r.hi;
+    /// Child of `dir` named `child_name`: two binary searches, one for the
+    /// children and one among them by name (scan-built stores only: the scan
+    /// sorts each directory's entries).
+    pub fn findChild(store: *const Store, dir: u32, child_name: []const u8) ?u32 {
+        const range = store.children(dir);
+        var lo = range.lo;
+        var hi = range.hi;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            switch (std.mem.order(u8, store.name(mid), n)) {
+            switch (std.mem.order(u8, store.name(mid), child_name)) {
                 .lt => lo = mid + 1,
                 .gt => hi = mid,
                 .eq => return if (store.isTombstoned(mid)) null else mid,
@@ -289,11 +294,12 @@ pub const Store = struct {
     }
 
     /// Same by linear scan: for stores not built level by level (the delta).
-    pub fn findChildScan(store: *const Store, dir: u32, n: []const u8) ?u32 {
-        const ps = store.parents();
-        for (0..store.len()) |i| {
-            const id: u32 = @intCast(i);
-            if (ps[i] == dir and !store.isTombstoned(id) and std.mem.eql(u8, store.name(id), n)) return id;
+    pub fn findChildScan(store: *const Store, dir: u32, child_name: []const u8) ?u32 {
+        for (store.parents(), 0..) |parent, entry| {
+            const id: u32 = @intCast(entry);
+            if (parent != dir) continue;
+            if (store.isTombstoned(id)) continue;
+            if (std.mem.eql(u8, store.name(id), child_name)) return id;
         }
         return null;
     }
@@ -301,14 +307,16 @@ pub const Store = struct {
     pub fn parentsSorted(store: *const Store) bool {
         const tail = store.parents()[store.nRoots()..];
         if (tail.len < 2) return true;
-        for (tail[0 .. tail.len - 1], tail[1..]) |a, b| if (a > b) return false;
+        for (tail[0 .. tail.len - 1], tail[1..]) |a, b| {
+            if (a > b) return false;
+        }
         return true;
     }
 
     pub fn liveLen(store: *const Store) usize {
-        var n: usize = 0;
-        for (store.masks()) |m| n += @intFromBool(m != 0);
-        return n;
+        var live_count: usize = 0;
+        for (store.masks()) |mask| live_count += @intFromBool(mask != 0);
+        return live_count;
     }
 
     /// Writes the buffer as is to `path_z`, atomically (a temporary file,
@@ -423,29 +431,37 @@ pub const Builder = struct {
             "flags",
             "masks",
             "depths",
-        }) |f| @field(builder, f).deinit(gpa);
-        builder.* = .empty; // reusable: `finish` leaves an empty builder
+        }) |column| @field(builder, column).deinit(gpa);
+        // Reusable: `finish` leaves an empty builder.
+        builder.* = .empty;
     }
 
     pub fn len(builder: *const Builder) u32 {
         return @intCast(builder.name_offsets.items.len);
     }
 
+    /// Adds an entry under `parent` (an earlier entry, or `no_parent` for a
+    /// root). A name longer than a u16 can measure is cut (Linux names stop
+    /// at 255 bytes; a root is a whole path, at most 4096).
     pub fn push(
         builder: *Builder,
         gpa: std.mem.Allocator,
-        n: []const u8,
+        entry_name: []const u8,
         parent: u32,
-        fl: u8,
+        flags: u8,
         depth: u16,
     ) std.mem.Allocator.Error!u32 {
         const id = builder.len();
-        const short = n[0..@min(n.len, std.math.maxInt(u16))];
+        assert(id < no_parent);
+        // The pair of `validate`'s check, except for the delta's scaffolding
+        // roots, which come after other entries.
+        if (parent != no_parent) assert(parent < id);
+        const short = entry_name[0..@min(entry_name.len, std.math.maxInt(u16))];
         try builder.name_offsets.append(gpa, @intCast(builder.names.items.len));
         try builder.names.appendSlice(gpa, short);
         try builder.name_sizes.append(gpa, @intCast(short.len));
         try builder.parents.append(gpa, parent);
-        try builder.flags.append(gpa, fl);
+        try builder.flags.append(gpa, flags);
         try builder.masks.append(gpa, charMask(short));
         try builder.depths.append(gpa, depth);
         return id;
@@ -456,12 +472,12 @@ pub const Builder = struct {
     pub fn pushStructural(
         builder: *Builder,
         gpa: std.mem.Allocator,
-        n: []const u8,
+        entry_name: []const u8,
         parent: u32,
-        fl: u8,
+        flags: u8,
         depth: u16,
     ) std.mem.Allocator.Error!u32 {
-        const id = try builder.push(gpa, n, parent, fl, depth);
+        const id = try builder.push(gpa, entry_name, parent, flags, depth);
         builder.masks.items[id] = 0;
         return id;
     }
@@ -682,10 +698,12 @@ test "corrupt indexes are rejected, not trusted" {
 
     // A name past the end of the names blob.
     @memcpy(bad, good);
-    std.mem.writeInt(u32, bad[layout.name_offsets_offset + 4 * 2 ..][0..4], @intCast(layout.names_size - 3), .little);
+    const name_offset_bad: u32 = @intCast(layout.names_size - 3);
+    std.mem.writeInt(u32, bad[layout.name_offsets_offset + 4 * 2 ..][0..4], name_offset_bad, .little);
     try testing.expectError(error.BadIndex, Store.parse(bad, false));
     @memcpy(bad, good);
-    std.mem.writeInt(u16, bad[layout.name_sizes_offset + 2 * 4 ..][0..2], std.math.maxInt(u16), .little);
+    const name_size_bad = std.math.maxInt(u16);
+    std.mem.writeInt(u16, bad[layout.name_sizes_offset + 2 * 4 ..][0..2], name_size_bad, .little);
     try testing.expectError(error.BadIndex, Store.parse(bad, false));
 
     // A parent out of range, a cycle (path() would loop forever), a parent

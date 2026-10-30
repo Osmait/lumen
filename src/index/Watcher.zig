@@ -13,6 +13,7 @@
 //! Not thread-safe: its owner (`Live`) is used under the service's lock.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const linux = std.os.linux;
 const sys = @import("os");
 
@@ -77,7 +78,12 @@ pub const WatchError = error{ WatchLimit, Watch, OutOfMemory };
 /// changes. Failing is not fatal for the caller (the directory goes
 /// unwatched until the next rescan); hitting the kernel's limit is counted
 /// in `unwatched` and logged once.
-pub fn watch(watcher: *Watcher, gpa: std.mem.Allocator, path: [*:0]const u8, id: u32) WatchError!void {
+pub fn watch(
+    watcher: *Watcher,
+    gpa: std.mem.Allocator,
+    path: [*:0]const u8,
+    id: u32,
+) WatchError!void {
     return watcher.add(gpa, path, id, mask);
 }
 
@@ -116,18 +122,26 @@ pub fn watchBestEffort(
     };
 }
 
-fn add(watcher: *Watcher, gpa: std.mem.Allocator, path: [*:0]const u8, id: u32, m: u32) WatchError!void {
+fn add(
+    watcher: *Watcher,
+    gpa: std.mem.Allocator,
+    path: [*:0]const u8,
+    id: u32,
+    events: u32,
+) WatchError!void {
     // Room first: a watch the kernel made but the map could not hold would
     // report events nobody can attribute.
     try watcher.wd_to_id.ensureUnusedCapacity(gpa, 1);
-    const rc = linux.inotify_add_watch(watcher.fd, path, m);
+    const rc = linux.inotify_add_watch(watcher.fd, path, events);
     switch (linux.errno(rc)) {
         .SUCCESS => {},
         .NOSPC => {
-            if (watcher.unwatched == 0) log.warn(
-                "inotify watch limit reached: raise fs.inotify.max_user_watches to watch every folder",
-                .{},
-            );
+            if (watcher.unwatched == 0) {
+                log.warn(
+                    "inotify watch limit reached: raise fs.inotify.max_user_watches to watch every folder",
+                    .{},
+                );
+            }
             watcher.unwatched += 1;
             return error.WatchLimit;
         },
@@ -148,11 +162,12 @@ pub fn prune(
 ) void {
     var dead: std.ArrayList(i32) = .empty;
     defer dead.deinit(gpa);
-    var it = watcher.wd_to_id.iterator();
-    while (it.next()) |e| if (!alive(ctx, e.value_ptr.*)) {
+    var watches = watcher.wd_to_id.iterator();
+    while (watches.next()) |entry| {
+        if (alive(ctx, entry.value_ptr.*)) continue;
         // Out of memory: what is not pruned now is at the next rescan.
-        dead.append(gpa, e.key_ptr.*) catch break;
-    };
+        dead.append(gpa, entry.key_ptr.*) catch break;
+    }
     for (dead.items) |wd| {
         // Its IN_IGNORED comes later and finds nothing to forget.
         _ = linux.inotify_rm_watch(watcher.fd, wd);
@@ -163,7 +178,11 @@ pub fn prune(
 /// Reads everything pending without waiting. Names live in `arena`.
 pub const DrainError = error{Read} || std.mem.Allocator.Error;
 
-pub fn drain(watcher: *Watcher, arena: std.mem.Allocator, out: *std.ArrayList(Change)) DrainError!void {
+pub fn drain(
+    watcher: *Watcher,
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(Change),
+) DrainError!void {
     while (true) {
         const rc = linux.read(watcher.fd, &watcher.buf, watcher.buf.len);
         switch (linux.errno(rc)) {
@@ -173,52 +192,58 @@ pub fn drain(watcher: *Watcher, arena: std.mem.Allocator, out: *std.ArrayList(Ch
             else => return error.Read,
         }
         if (rc == 0) return;
+        assert(rc <= watcher.buf.len);
         try watcher.parse(arena, rc, out);
         // read() returns whole events only, so a full queue rarely fills the
         // buffer to the byte: `rc < buf.len` stopped after one read, and an
         // overflow at the end of the queue was seen thousands of (wasted)
         // changes later. Stop once there clearly was room for more.
-        if (rc + @sizeOf(linux.inotify_event) + 256 < watcher.buf.len) return;
+        if (rc + @sizeOf(linux.inotify_event) + linux.NAME_MAX + 1 < watcher.buf.len) return;
     }
 }
 
-fn parse(watcher: *Watcher, arena: std.mem.Allocator, n: usize, out: *std.ArrayList(Change)) !void {
-    const head = @sizeOf(linux.inotify_event);
-    var off: usize = 0;
-    while (off + head <= n) {
-        const ev: *align(1) const linux.inotify_event = @ptrCast(&watcher.buf[off]);
-        const name_start = off + head;
-        if (name_start + ev.len > n) break;
-        defer off = name_start + ev.len;
+fn parse(
+    watcher: *Watcher,
+    arena: std.mem.Allocator,
+    bytes_read: usize,
+    out: *std.ArrayList(Change),
+) !void {
+    const event_head_size = @sizeOf(linux.inotify_event);
+    var offset: usize = 0;
+    while (offset + event_head_size <= bytes_read) {
+        const event: *align(1) const linux.inotify_event = @ptrCast(&watcher.buf[offset]);
+        const name_start = offset + event_head_size;
+        if (name_start + event.len > bytes_read) break;
+        defer offset = name_start + event.len;
 
-        if (ev.mask & linux.IN.Q_OVERFLOW != 0) {
+        if (event.mask & linux.IN.Q_OVERFLOW != 0) {
             try out.append(arena, .overflow);
             continue;
         }
         // The kernel dropped the watch (directory deleted): forget it, or
         // `count` kept growing with every directory ever removed.
-        if (ev.mask & linux.IN.IGNORED != 0) {
-            _ = watcher.wd_to_id.remove(ev.wd);
+        if (event.mask & linux.IN.IGNORED != 0) {
+            _ = watcher.wd_to_id.remove(event.wd);
             continue;
         }
-        const id = watcher.wd_to_id.get(ev.wd) orelse continue;
-        if (ev.mask & (linux.IN.DELETE_SELF | linux.IN.MOVE_SELF) != 0) {
+        const id = watcher.wd_to_id.get(event.wd) orelse continue;
+        if (event.mask & (linux.IN.DELETE_SELF | linux.IN.MOVE_SELF) != 0) {
             try out.append(arena, .{ .dir_gone = id });
             continue;
         }
-        if (ev.len == 0) continue;
+        if (event.len == 0) continue;
         // The name is NUL-padded up to `len`.
-        const raw = watcher.buf[name_start .. name_start + ev.len];
-        const name = std.mem.sliceTo(raw, 0);
+        const name_padded = watcher.buf[name_start .. name_start + event.len];
+        const name = std.mem.sliceTo(name_padded, 0);
         if (name.len == 0) continue;
         const owned = try arena.dupe(u8, name);
-        if (ev.mask & (linux.IN.CREATE | linux.IN.MOVED_TO) != 0) {
+        if (event.mask & (linux.IN.CREATE | linux.IN.MOVED_TO) != 0) {
             try out.append(arena, .{ .created = .{
                 .parent = id,
                 .name = owned,
-                .is_dir = ev.mask & linux.IN.ISDIR != 0,
+                .is_dir = event.mask & linux.IN.ISDIR != 0,
             } });
-        } else if (ev.mask & (linux.IN.DELETE | linux.IN.MOVED_FROM) != 0) {
+        } else if (event.mask & (linux.IN.DELETE | linux.IN.MOVED_FROM) != 0) {
             try out.append(arena, .{ .removed = .{ .parent = id, .name = owned } });
         }
     }
