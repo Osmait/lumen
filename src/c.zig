@@ -735,3 +735,22 @@ pub extern fn g_task_return_pointer(
 pub extern fn g_task_propagate_pointer(task: *GTask, err: ?*?*GError) ?*anyopaque;
 pub extern fn gdk_texture_new_from_filename(path: [*:0]const u8, err: ?*?*GError) ?*GdkTexture;
 pub extern fn gtk_picture_set_paintable(picture: *GtkWidget, paintable: ?*anyopaque) void;
+
+// ------------------------------------- pictures decoded from bytes (widgets.zig)
+
+pub extern fn g_memory_input_stream_new_from_data(
+    data: ?*const anyopaque,
+    len: isize,
+    destroy: ?*const fn (?*anyopaque) callconv(.c) void,
+) *GInputStream;
+pub extern fn gdk_pixbuf_new_from_stream_at_scale(
+    stream: *GInputStream,
+    width: c_int,
+    height: c_int,
+    keep_aspect: gboolean,
+    cancellable: ?*GCancellable,
+    err: ?*?*GError,
+) ?*GdkPixbuf;
+pub extern fn gtk_box_remove(box: *GtkBox, child: *GtkWidget) void;
+pub extern fn gtk_box_prepend(box: *GtkBox, child: *GtkWidget) void;
+pub extern fn gtk_widget_get_parent(w: *GtkWidget) ?*GtkWidget;

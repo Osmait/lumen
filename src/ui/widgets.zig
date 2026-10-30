@@ -9,20 +9,17 @@ const logos = @import("logos.zig");
 const themes = @import("themes.zig");
 const labels = @import("labels.zig");
 const os = @import("os");
+const pictures = @import("pictures.zig");
 
 /// A small picture of a theme: its background, two lines of text and an
 /// accent dot. Made once per set of colours and kept (themes from init.lua
 /// included, up to the cache's size).
 pub fn swatchTexture(bg: u24, fg: u24, accent: u24) ?*c.GdkTexture {
     const Cache = struct {
-        var keys: [64]u72 = @splat(0);
-        var textures: [64]?*c.GdkTexture = @splat(null);
-        var len: usize = 0;
-        /// Next slot to reuse once full; images keep their own reference.
-        var next: usize = 0;
+        var ring: TextureRing(64, u72) = .{};
     };
     const colors = (@as(u72, bg) << 48) | (@as(u72, fg) << 24) | accent;
-    for (Cache.keys[0..Cache.len], Cache.textures[0..Cache.len]) |ck, t| if (ck == colors) return t;
+    if (Cache.ring.get(colors)) |t| return t;
     const n = 44;
     var px: [n * n * 4]u8 = undefined;
     const r: f32 = 10;
@@ -54,14 +51,50 @@ pub fn swatchTexture(bg: u24, fg: u24, accent: u24) ?*c.GdkTexture {
     const bytes = c.g_bytes_new(&px, px.len);
     defer c.g_bytes_unref(bytes);
     const tex = c.gdk_memory_texture_new(n, n, c.GDK_MEMORY_R8G8B8A8, bytes, n * 4);
-    const slot = if (Cache.len < Cache.keys.len) Cache.len else Cache.next;
-    if (Cache.len < Cache.keys.len) {
-        Cache.len += 1;
-    } else Cache.next = (Cache.next + 1) % Cache.keys.len;
-    if (Cache.textures[slot]) |old| c.g_object_unref(old);
-    Cache.keys[slot] = colors;
-    Cache.textures[slot] = tex;
+    Cache.ring.put(colors, tex);
     return tex;
+}
+
+/// Textures by key, the oldest replaced once full (widgets showing one keep
+/// their own reference). A key can map to null: known not to load. Main
+/// thread.
+fn TextureRing(comptime n: usize, comptime Key: type) type {
+    return struct {
+        keys: [n]Key = undefined,
+        textures: [n]?*c.GdkTexture = @splat(null),
+        len: usize = 0,
+        /// Next slot to reuse once full.
+        next: usize = 0,
+
+        /// Null: not in the ring; null inside: known not to load.
+        fn get(r: *const @This(), key: Key) ??*c.GdkTexture {
+            for (r.keys[0..r.len], r.textures[0..r.len]) |k, t| if (k == key) return t;
+            return null;
+        }
+
+        /// Takes `tex`'s reference.
+        fn put(r: *@This(), key: Key, tex: ?*c.GdkTexture) void {
+            const slot = if (r.len < n) r.len else r.next;
+            if (r.len < n) {
+                r.len += 1;
+            } else r.next = (r.next + 1) % n;
+            if (r.textures[slot]) |old| c.g_object_unref(old);
+            r.keys[slot] = key;
+            r.textures[slot] = tex;
+        }
+    };
+}
+
+/// A key for what `path` holds now, decoded at `w`×`h`: an edited file gets
+/// a new one (mtime to the nanosecond, size, inode). Null when it is gone.
+fn fileKey(path: [*:0]const u8, w: c_int, h: c_int) ?u64 {
+    const st = os.Stamp.of(path);
+    if (st.eql(.none)) return null;
+    var hash: std.hash.Wyhash = .init(0);
+    hash.update(std.mem.span(path));
+    const parts = [_]i64{ st.sec, st.nsec, @bitCast(st.size), @bitCast(st.ino), w, h };
+    hash.update(std.mem.asBytes(&parts));
+    return hash.final();
 }
 
 /// Icon size in result rows, from the Density setting (main thread).
@@ -77,36 +110,18 @@ pub var rows_inline = false;
 pub var row_parts: @import("../layout.zig").Parts(@import("../layout.zig").RowPart) = .{};
 
 /// An image file as an icon, decoded at twice `size` (sharp on HiDPI) and
-/// kept: the same few icons show again and again. Regular files only:
-/// decoding blocks, and a FIFO would never answer.
+/// kept until the file changes: the same few icons show again and again.
+/// Decoded on the UI thread, so within the small `pictures.icon_limits`.
 fn fileTexture(path: [:0]const u8, size: c_int) ?*c.GdkTexture {
     const Cache = struct {
-        var keys: [128]u64 = @splat(0);
-        var textures: [128]?*c.GdkTexture = @splat(null);
-        var len: usize = 0;
-        var next: usize = 0;
+        var ring: TextureRing(128, u64) = .{};
     };
-    var h: std.hash.Wyhash = .init(@intCast(size));
-    h.update(path);
-    const k = h.final();
-    for (Cache.keys[0..Cache.len], Cache.textures[0..Cache.len]) |ck, t| if (ck == k) return t;
-    if (!os.isRegular(path.ptr)) return null;
-    const pb = c.gdk_pixbuf_new_from_file_at_scale(
-        path.ptr,
-        size * 2,
-        size * 2,
-        1,
-        null,
-    ) orelse return null;
-    defer c.g_object_unref(pb);
-    const tex = c.gdk_texture_new_for_pixbuf(pb);
-    const slot = if (Cache.len < Cache.keys.len) Cache.len else Cache.next;
-    if (Cache.len < Cache.keys.len) {
-        Cache.len += 1;
-    } else Cache.next = (Cache.next + 1) % Cache.keys.len;
-    if (Cache.textures[slot]) |old| c.g_object_unref(old);
-    Cache.keys[slot] = k;
-    Cache.textures[slot] = tex;
+    const key = fileKey(path.ptr, size * 2, size * 2) orelse return null;
+    if (Cache.ring.get(key)) |t| return t;
+    const pb = pictures.decodeImage(path.ptr, size * 2, size * 2, pictures.icon_limits);
+    defer if (pb) |p| c.g_object_unref(p);
+    const tex = if (pb) |p| c.gdk_texture_new_for_pixbuf(p) else null;
+    Cache.ring.put(key, tex);
     return tex;
 }
 
@@ -124,12 +139,12 @@ pub fn itemRow(it: Item, parts: *RowParts) *c.GtkWidget {
             const text = if (rows_inline) hbox(10) else vbox(1);
             c.gtk_widget_set_valign(text, c.GTK_ALIGN_CENTER);
             c.gtk_widget_set_hexpand(text, 1);
-            const title = label(it.title, "title");
+            const title = shortLabel(it.title, "title");
             c.gtk_label_set_ellipsize(@ptrCast(title), c.PANGO_ELLIPSIZE_END);
             c.gtk_label_set_max_width_chars(@ptrCast(title), 60);
             c.gtk_box_append(@ptrCast(text), title);
             if (it.subtitle.len > 0 and show.subtitles) {
-                const sub = label(it.subtitle, "subtitle");
+                const sub = shortLabel(it.subtitle, "subtitle");
                 c.gtk_label_set_ellipsize(@ptrCast(sub), c.PANGO_ELLIPSIZE_END);
                 c.gtk_label_set_max_width_chars(@ptrCast(sub), 60);
                 c.gtk_box_append(@ptrCast(text), sub);
@@ -137,7 +152,7 @@ pub fn itemRow(it: Item, parts: *RowParts) *c.GtkWidget {
             c.gtk_box_append(@ptrCast(box), text);
         },
         .accessory => if (it.accessory.len > 0 and show.accessories) {
-            parts.accessory = label(it.accessory, "accessory");
+            parts.accessory = shortLabel(it.accessory, "accessory");
             c.gtk_box_append(@ptrCast(box), parts.accessory.?);
         },
         .hint => {
@@ -156,35 +171,92 @@ pub fn gridCell(it: Item, w: c_int) *c.GtkWidget {
     const box = vbox(6);
     c.gtk_widget_add_css_class(box, "cell");
     const pic_h = @divTrunc(w * 5, 8);
-    var picture: ?*c.GtkWidget = null;
-    // Only regular files: decoding blocks, and a FIFO would never answer.
-    if (it.image.len > 0 and os.isRegular(it.image.ptr)) {
-        if (c.gdk_pixbuf_new_from_file_at_scale(it.image.ptr, w, pic_h, 1, null)) |pb| {
-            defer c.g_object_unref(pb);
-            const tex = c.gdk_texture_new_for_pixbuf(pb);
-            defer c.g_object_unref(tex);
-            const pic = c.gtk_picture_new_for_paintable(tex);
-            c.gtk_picture_set_content_fit(@ptrCast(pic), c.GTK_CONTENT_FIT_COVER);
-            c.gtk_widget_set_size_request(pic, -1, pic_h);
-            c.gtk_widget_set_overflow(pic, c.GTK_OVERFLOW_HIDDEN);
-            picture = pic;
-        }
-    }
-    const top = picture orelse blk: {
+    const key = if (it.image.len > 0) fileKey(it.image.ptr, w, pic_h) else null;
+    const cached = if (key) |k| GridPictures.ring.get(k) else null;
+    const top = if (cached) |t| (if (t) |tex| cellPicture(tex, pic_h) else null) else null;
+    const decode = key != null and cached == null;
+    const shown = top orelse blk: {
         const icon = iconWidget(it.icon, @min(@divTrunc(w, 2), 56));
         c.gtk_widget_set_halign(icon, c.GTK_ALIGN_CENTER);
-        c.gtk_widget_set_size_request(icon, -1, @min(pic_h, 64));
+        // As tall as the picture on its way, so the cell keeps its size
+        // when it comes.
+        c.gtk_widget_set_size_request(icon, -1, if (decode) pic_h else @min(pic_h, 64));
         break :blk icon;
     };
-    c.gtk_box_append(@ptrCast(box), top);
-    const title = label(it.title, "cell-title");
+    c.gtk_box_append(@ptrCast(box), shown);
+    const title = shortLabel(it.title, "cell-title");
     c.gtk_label_set_ellipsize(@ptrCast(title), c.PANGO_ELLIPSIZE_END);
     c.gtk_label_set_xalign(@ptrCast(title), 0.5);
     c.gtk_label_set_max_width_chars(@ptrCast(title), 1);
     c.gtk_widget_set_hexpand(title, 1);
     c.gtk_box_append(@ptrCast(box), title);
     c.gtk_widget_set_size_request(box, w, -1);
+    if (decode) GridPictures.request(it.image, w, pic_h, key.?, box, shown);
     return box;
+}
+
+fn cellPicture(tex: *c.GdkTexture, h: c_int) *c.GtkWidget {
+    const pic = c.gtk_picture_new_for_paintable(tex);
+    c.gtk_picture_set_content_fit(@ptrCast(pic), c.GTK_CONTENT_FIT_COVER);
+    c.gtk_widget_set_size_request(pic, -1, h);
+    c.gtk_widget_set_overflow(pic, c.GTK_OVERFLOW_HIDDEN);
+    return pic;
+}
+
+/// Grid pictures. Every cell decoded its image on the UI thread, uncached,
+/// each time the grid was built (every keystroke): a 20000×20000 PNG cost
+/// 2 s and 1.2 GB per key. Now a cell shows its icon until its picture,
+/// decoded on a worker (`pictures.requestPicture`), replaces it; they are kept
+/// for the next build. A new build drops what the last one asked for and
+/// was not decoded yet.
+const GridPictures = struct {
+    var ring: TextureRing(128, u64) = .{};
+
+    /// A cell waiting for its picture; its widgets are referenced until then.
+    const Wait = struct { key: u64, h: c_int, box: *c.GtkWidget, icon: *c.GtkWidget };
+
+    fn request(
+        path: []const u8,
+        w: c_int,
+        h: c_int,
+        key: u64,
+        box: *c.GtkWidget,
+        icon: *c.GtkWidget,
+    ) void {
+        const wait = std.heap.c_allocator.create(Wait) catch return;
+        wait.* = .{
+            .key = key,
+            .h = h,
+            .box = @ptrCast(c.g_object_ref(box)),
+            .icon = @ptrCast(c.g_object_ref(icon)),
+        };
+        pictures.requestPicture(path, w, h, &pictures.grid_lane, false, &done, wait);
+    }
+
+    fn done(ctx: ?*anyopaque, pb: ?*c.GdkPixbuf, current: bool) void {
+        const wait: *Wait = @ptrCast(@alignCast(ctx.?));
+        defer {
+            c.g_object_unref(wait.box);
+            c.g_object_unref(wait.icon);
+            std.heap.c_allocator.destroy(wait);
+        }
+        // Dropped for a newer build before it was decoded: nothing learnt.
+        if (pb == null and !current) return;
+        const tex = if (pb) |p| c.gdk_texture_new_for_pixbuf(p) else null;
+        ring.put(wait.key, tex);
+        // The cell may be gone (another keystroke): the new build's cell
+        // for the same picture finds it in the ring.
+        const t = tex orelse return;
+        if (c.gtk_widget_get_parent(wait.icon) != wait.box) return;
+        c.gtk_box_remove(@ptrCast(wait.box), wait.icon);
+        c.gtk_box_prepend(@ptrCast(wait.box), cellPicture(t, wait.h));
+    }
+};
+
+/// The grid is being built again: what its last build asked for and is
+/// not decoded yet is not wanted any more.
+pub fn forgetGridPictures() void {
+    pictures.grid_lane.forget();
 }
 
 pub fn calcRow(it: Item) *c.GtkWidget {
@@ -310,4 +382,24 @@ pub fn label(text: [*:0]const u8, css: ?[*:0]const u8) *c.GtkWidget {
     c.gtk_label_set_xalign(@ptrCast(l), 0);
     if (css) |cls| c.gtk_widget_add_css_class(l, cls);
     return l;
+}
+
+/// Bytes of a row's title, subtitle or accessory given to its label. A row
+/// shows about 60 characters, but Pango lays out and measures all of the
+/// text, several times per frame: a 1 MB line from `lumen --dmenu` took
+/// 324 ms each time. The item keeps all of it (dmenu prints the whole line).
+pub const max_row_text = 512;
+
+/// A label for row text, cut to `max_row_text` bytes on a character boundary.
+fn shortLabel(text: [:0]const u8, css: ?[*:0]const u8) *c.GtkWidget {
+    if (text.len <= max_row_text) return label(text, css);
+    var buf: [max_row_text + 1]u8 = undefined;
+    const n = core.utf8.floorBoundary(text, max_row_text);
+    @memcpy(buf[0..n], text[0..n]);
+    buf[n] = 0;
+    return label(buf[0..n :0], css);
+}
+
+test {
+    _ = @import("pictures.zig");
 }

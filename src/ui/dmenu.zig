@@ -24,6 +24,11 @@ const max_bytes = 64 << 20;
 /// Rows listed with nothing typed, and best matches listed when filtering.
 const shown_all = 500;
 const shown_matches = 200;
+/// Bytes of a line, and of its meta, that filtering matches against. Each
+/// keystroke scores every line on the main thread, and one multi-MB line
+/// cost as much as thousands of short ones. Rows show less still
+/// (`widgets.max_row_text`); the whole line is what gets printed.
+const match_bytes = 1024;
 
 const Line = struct {
     text: [:0]const u8,
@@ -50,8 +55,8 @@ pub const Session = struct {
     finished: bool = false,
     done_reading: bool = false,
     ui: *Ui,
-    /// One rebuild per 50 ms while lines arrive: rebuilding the view for
-    /// every read made a slow producer keep the main thread busy.
+    /// One rebuild per `rebuildDelay` while lines arrive: rebuilding the
+    /// view for every read made a slow producer keep the main thread busy.
     rebuild_timer: c_uint = 0,
 
     fn destroy(s: *Session) void {
@@ -144,12 +149,22 @@ fn onRead(_: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) 
             s.done_reading = true;
         } else readMore(s);
     }
-    // The first lines at once, the end at once, the rest every 50 ms.
+    // The first lines at once, the end at once, the rest now and then.
     if (s.done_reading or s.lines.items.len <= 500) {
         if (s.rebuild_timer != 0) _ = c.g_source_remove(s.rebuild_timer);
         s.rebuild_timer = 0;
         showLines(s);
-    } else if (s.rebuild_timer == 0) s.rebuild_timer = c.g_timeout_add(50, &onRebuildTimer, s);
+    } else if (s.rebuild_timer == 0) s.rebuild_timer = c.g_timeout_add(
+        rebuildDelay(s.lines.items.len),
+        &onRebuildTimer,
+        s,
+    );
+}
+
+/// Milliseconds between rebuilds while lines arrive. With a query typed a
+/// rebuild scores every line read so far: past 10 000 lines, less often.
+fn rebuildDelay(lines: usize) c_uint {
+    return if (lines > 10_000) 250 else 50;
 }
 
 fn onRebuildTimer(data: ?*anyopaque) callconv(.c) c.gboolean {
@@ -257,7 +272,7 @@ pub fn fill(ui: *Ui, a: std.mem.Allocator, q: []const u8) void {
     const Hit = struct { score: i32, i: u32 };
     var hits: std.ArrayList(Hit) = .empty;
     for (lines, 0..) |l, i| {
-        const fields = [_][]const u8{ l.text, l.meta };
+        const fields = [_][]const u8{ matched(l.text), matched(l.meta) };
         const sc = core.fuzzy.scoreFields(q, &fields);
         if (sc == core.fuzzy.no_match) continue;
         hits.append(a, .{ .score = sc, .i = @intCast(i) }) catch break;
@@ -272,6 +287,25 @@ pub fn fill(ui: *Ui, a: std.mem.Allocator, q: []const u8) void {
         hits.items.len,
         shown_matches,
     )]) |h| ui.addItem(itemOf(a, lines[h.i], h.i));
+}
+
+/// The part of `s` filtering looks at.
+fn matched(s: []const u8) []const u8 {
+    return s[0..core.utf8.floorBoundary(s, match_bytes)];
+}
+
+test "a long line is matched by its head and printed whole" {
+    var long: [3 * match_bytes]u8 = @splat('a');
+    @memcpy(long[long.len - 6 ..], "needle");
+    try std.testing.expectEqual(match_bytes, matched(&long).len);
+    const score = core.fuzzy.scoreFields("needle", &.{matched(&long)});
+    try std.testing.expect(score == core.fuzzy.no_match);
+    try std.testing.expectEqualStrings("short", matched("short"));
+    // Never half a character.
+    var accents: [match_bytes + 1]u8 = undefined;
+    accents[0] = 'x';
+    for (0..match_bytes / 2) |i| @memcpy(accents[1 + 2 * i ..][0..2], "é");
+    try std.testing.expectEqual(match_bytes - 1, matched(&accents).len);
 }
 
 fn itemOf(a: std.mem.Allocator, l: Line, i: u32) Item {

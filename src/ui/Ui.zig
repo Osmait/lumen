@@ -299,6 +299,11 @@ const Pending = union(enum) { item: usize, section: [:0]const u8 };
 /// laid them all out: ~14 of the view's 23 ms.
 const eager_rows = 14;
 
+/// What the view and query arenas keep for next time when reset. They kept
+/// all they had ever held: a view that once needed hundreds of MB (the
+/// clipboard history loaded whole) held on to them while hidden.
+const arena_keep: std.heap.ArenaAllocator.ResetMode = .{ .retain_with_limit = 4 << 20 };
+
 /// End-to-end tests run a second, isolated Lumen (LUMEN_TEST=1): it must not
 /// take the keyboard from the session, nor ask Hyprland where to go.
 pub fn testMode() bool {
@@ -1059,7 +1064,7 @@ pub fn goBack(self: *Ui) void {
 
 /// The view's rows again, query and place kept (a setting changed).
 pub fn rebuild(self: *Ui) void {
-    _ = self.data_arena.reset(.retain_capacity);
+    _ = self.data_arena.reset(arena_keep);
     self.base = self.loadBase(self.data_arena.allocator());
     self.refresh();
     // Nothing points into the app lists a reload replaced any more.
@@ -1100,7 +1105,7 @@ pub fn setView(self: *Ui, view: View) void {
     if (leaving_themes) self.applyAppearance(null);
     self.closePanel();
     self.confirm_key = "";
-    _ = self.data_arena.reset(.retain_capacity);
+    _ = self.data_arena.reset(arena_keep);
     if (view == .ext) ext_view.enter(self);
     // Passwords are typed unseen.
     c.gtk_text_set_visibility(@ptrCast(self.entry), @intFromBool(
@@ -1229,10 +1234,12 @@ fn clipCandidates(self: *Ui, a: std.mem.Allocator) []Item {
     var out: std.ArrayList(Item) = .empty;
     for (clips) |clip| {
         out.append(a, .{
-            .title = labels.firstLine(a, clip.content),
+            .title = labels.firstLine(a, clip.head),
             .icon = .{ .tile = .{ .name = "edit-copy-symbolic", .color = .gray } },
+            // The head only: the detail pane and the actions read the whole
+            // entry (`clipContent`).
             .action = .{ .clip = clip.id },
-            .detail = clip.content,
+            .detail = clip.head,
             .time_s = clip.last_copied,
         }) catch break;
     }
@@ -1273,7 +1280,7 @@ pub fn clearRows(self: *Ui) void {
 /// Forgets the rows and the items behind them, and anything queued to
 /// build them.
 fn resetRows(self: *Ui) void {
-    _ = self.query_arena.reset(.retain_capacity);
+    _ = self.query_arena.reset(arena_keep);
     self.items = .empty;
     self.rows = .empty;
     self.pending = .empty;
@@ -1302,6 +1309,7 @@ pub fn refresh(self: *Ui) void {
     self.resetRows();
     self.confirm_key = "";
     c.gtk_flow_box_remove_all(@ptrCast(self.grid));
+    widgets.forgetGridPictures();
     // The rows holding the previous icons are gone; GtkImage kept its refs.
     for (self.icons.items) |icon| c.g_object_unref(icon);
     self.icons.clearRetainingCapacity();
@@ -1964,7 +1972,18 @@ pub fn perform(self: *Ui, op: item_mod.Op) void {
         it.action.pick.index,
     );
 
-    const outcome = run.perform(self.actionCtx(), it, op);
+    // A clipboard row holds the head of its entry: what is pasted or copied
+    // is all of it, read now.
+    var whole = it.*;
+    var clip_arena: std.heap.ArenaAllocator = .init(self.gpa);
+    defer clip_arena.deinit();
+    if (it.action == .clip and (op == .run or op == .open or op == .clip_paste or
+        op == .clip_copy))
+    {
+        const content = self.db.clipContent(clip_arena.allocator(), it.action.clip) catch null;
+        whole.detail = content orelse return self.showFailure("Could not read the entry");
+    }
+    const outcome = run.perform(self.actionCtx(), &whole, op);
     switch (outcome) {
         .hide => self.hide(),
         .stay => {},
@@ -2048,6 +2067,15 @@ fn reloadApps(data: ?*anyopaque) callconv(.c) c.gboolean {
     if (c.gtk_widget_get_visible(self.window) != 0) {
         self.keepSelection();
         self.rebuild();
+    } else {
+        // Hidden, nothing needs the replaced list before the next show
+        // builds its view anew: it goes now, with the rows and candidates
+        // pointing into it (their widgets hold their own references). Each
+        // reload while hidden kept one more until then, and a long upgrade
+        // reloads many times.
+        self.clearRows();
+        self.base = &.{};
+        self.apps.dropStale();
     }
     return 0;
 }
@@ -2206,4 +2234,8 @@ fn emptyText(self: *Ui, a: std.mem.Allocator) [:0]const u8 {
     if (self.view == .ext) return ext_view.emptyText(self, a, q);
     if (self.view == .dmenu) return dmenu.emptyText(self);
     return "No Results";
+}
+
+test {
+    _ = @import("dmenu.zig");
 }

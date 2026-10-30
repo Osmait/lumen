@@ -17,6 +17,7 @@ handle: *c.sqlite3,
 pub const Error = error{ DbOpen, DbExec, DbPrepare, DbBind, DbStep };
 
 pub fn open(path: [:0]const u8) Error!Db {
+    if (!std.mem.eql(u8, path, ":memory:")) makePrivate(path);
     var h: ?*c.sqlite3 = null;
     if (c.sqlite3_open(path.ptr, &h) != c.SQLITE_OK) {
         if (h) |hh| {
@@ -47,6 +48,30 @@ pub fn open(path: [:0]const u8) Error!Db {
         \\CREATE INDEX IF NOT EXISTS clipboard_by_time ON clipboard(last_copied);
     );
     return db;
+}
+
+/// The history holds whatever was copied, passwords too, and SQLite creates
+/// its files with the umask's mode (0644 here). The database is created
+/// owner-only before SQLite opens it, or made so if it exists; SQLite gives
+/// the -wal and -shm it creates the database's mode, and ones left by
+/// earlier versions are fixed too.
+fn makePrivate(path: [:0]const u8) void {
+    const linux = std.os.linux;
+    const rc = linux.open(
+        path,
+        .{ .ACCMODE = .RDONLY, .CREAT = true, .CLOEXEC = true, .NONBLOCK = true, .NOCTTY = true },
+        0o600,
+    );
+    if (linux.errno(rc) == .SUCCESS) {
+        const fd: i32 = @intCast(rc);
+        _ = linux.fchmod(fd, 0o600);
+        _ = linux.close(fd);
+    }
+    for ([_][]const u8{ "-wal", "-shm" }) |suffix| {
+        var buf: [4096]u8 = undefined;
+        const side = std.mem.printSentinel(&buf, "{s}{s}", .{ path, suffix }, 0) catch continue;
+        _ = linux.chmod(side, 0o600);
+    }
 }
 
 pub fn close(db: *Db) void {
@@ -203,10 +228,15 @@ pub fn addClip(db: *Db, content: []const u8, now: i64, keep: u32) Error!void {
 
 pub const Clip = struct {
     id: i64,
-    content: []const u8,
+    /// The first `head_chars` characters; `clipContent` has all of it.
+    head: []const u8,
     created_at: i64,
     last_copied: i64,
 };
+
+/// Characters of each entry `recentClips` loads: what a row shows and
+/// searches. The list loaded every entry whole, up to 500 of up to 1 MiB.
+pub const head_chars = 2000;
 
 /// Most recent first; the slice and strings live in `arena`.
 pub fn recentClips(
@@ -218,19 +248,33 @@ pub fn recentClips(
     // Times have one-second resolution; the id breaks ties in copy order
     // (two copies within a second came back oldest first).
     const stmt = try db.prepare(
-        "SELECT id, content, created_at, last_copied FROM clipboard ORDER BY last_copied DESC, id DESC LIMIT ?1",
+        \\SELECT id, substr(content, 1, ?2), created_at, last_copied FROM clipboard
+        \\ORDER BY last_copied DESC, id DESC LIMIT ?1
     );
     defer _ = c.sqlite3_finalize(stmt);
-    try db.bind(stmt, .{limit});
+    try db.bind(stmt, .{ limit, head_chars });
     while (try db.nextRow(stmt)) {
         try list.append(arena, .{
             .id = c.sqlite3_column_int64(stmt, 0),
-            .content = try arena.dupe(u8, columnText(stmt, 1)),
+            .head = try arena.dupe(u8, columnText(stmt, 1)),
             .created_at = c.sqlite3_column_int64(stmt, 2),
             .last_copied = c.sqlite3_column_int64(stmt, 3),
         });
     }
     return list.toOwnedSlice(arena);
+}
+
+/// All of entry `id`, in `a`; null when it is gone.
+pub fn clipContent(
+    db: *Db,
+    a: std.mem.Allocator,
+    id: i64,
+) (Error || std.mem.Allocator.Error)!?[]const u8 {
+    const stmt = try db.prepare("SELECT content FROM clipboard WHERE id = ?1");
+    defer _ = c.sqlite3_finalize(stmt);
+    try db.bind(stmt, .{id});
+    if (!try db.nextRow(stmt)) return null;
+    return try a.dupe(u8, columnText(stmt, 0));
 }
 
 pub fn touchClip(db: *Db, id: i64, now: i64) Error!void {
@@ -269,7 +313,7 @@ test "clipboard dedupes and orders by recency" {
     defer arena.deinit();
     const clips = try db.recentClips(arena.allocator(), 10);
     try std.testing.expectEqual(@as(usize, 2), clips.len);
-    try std.testing.expectEqualStrings("one", clips[0].content);
+    try std.testing.expectEqualStrings("one", clips[0].head);
 }
 
 test "copies within the same second keep their order" {
@@ -281,8 +325,8 @@ test "copies within the same second keep their order" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const clips = try db.recentClips(arena.allocator(), 10);
-    try std.testing.expectEqualStrings("third", clips[0].content);
-    try std.testing.expectEqualStrings("first", clips[2].content);
+    try std.testing.expectEqualStrings("third", clips[0].head);
+    try std.testing.expectEqualStrings("first", clips[2].head);
 }
 
 test "the history keeps as many entries as the setting says" {
@@ -296,8 +340,46 @@ test "the history keeps as many entries as the setting says" {
     defer arena.deinit();
     const clips = try db.recentClips(arena.allocator(), 100);
     try std.testing.expectEqual(@as(usize, 5), clips.len);
-    try std.testing.expectEqualStrings("clip 7", clips[0].content);
-    try std.testing.expectEqualStrings("clip 3", clips[4].content);
+    try std.testing.expectEqualStrings("clip 7", clips[0].head);
+    try std.testing.expectEqualStrings("clip 3", clips[4].head);
+}
+
+test "the list loads each entry's head, the entry is read whole by id" {
+    var db = try Db.open(":memory:");
+    defer db.close();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Two bytes a character: the head is cut by characters, never mid-one.
+    const long = try a.alloc(u8, 2 * (head_chars + 500));
+    for (0..head_chars + 500) |i| @memcpy(long[2 * i ..][0..2], "é");
+    try db.addClip(long, 1, Db.max_entries);
+    const clips = try db.recentClips(a, 10);
+    try std.testing.expectEqual(2 * head_chars, clips[0].head.len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(clips[0].head));
+    try std.testing.expectEqualStrings(long, (try db.clipContent(a, clips[0].id)).?);
+    try db.deleteClip(clips[0].id);
+    try std.testing.expect(try db.clipContent(a, clips[0].id) == null);
+}
+
+test "the database and its -wal and -shm are owner-only" {
+    const linux = std.os.linux;
+    var dir: @import("os").TestDir = try .init();
+    defer dir.deinit();
+    var buf: [4096]u8 = undefined;
+    // Made world-readable, as earlier versions left it.
+    try dir.write("lumen.db", "");
+    _ = linux.chmod(try dir.path(&buf, "lumen.db"), 0o644);
+    var db = try Db.open(try dir.path(&buf, "lumen.db"));
+    defer db.close();
+    try db.addClip("a password", 1, Db.max_entries);
+    for ([_][]const u8{ "lumen.db", "lumen.db-wal", "lumen.db-shm" }) |name| {
+        var stx: linux.Statx = undefined;
+        const path = try dir.path(&buf, name);
+        const rc = linux.statx(linux.AT.FDCWD, path, 0, .{ .MODE = true }, &stx);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+        try std.testing.expectEqual(@as(u16, 0o600), stx.mode & 0o777);
+    }
 }
 
 test "frecency accumulates" {

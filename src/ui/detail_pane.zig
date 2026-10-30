@@ -7,6 +7,7 @@ const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
 const index = @import("index");
 const os = @import("os");
+const pictures = @import("pictures.zig");
 const stats = @import("../stats.zig");
 const Ui = @import("Ui.zig");
 const widgets = @import("widgets.zig");
@@ -104,14 +105,16 @@ pub fn showContentDetail(ui: *Ui, it: *const Item) void {
 
 /// The image the preview shows or is loading. Decoding happened on the UI
 /// thread for every keystroke that kept an image as the top hit (a 24 MP
-/// photo: ~100 ms each); now on a GTask thread (GdkTexture loading is
-/// thread-safe), and not again for the same file.
+/// photo: ~100 ms each); now on a worker (`pictures.requestPicture`: within
+/// `picture_limits`, one at a time, a request the selection has left
+/// behind dropped before it is decoded), and not again for the same file.
 var image_path: [4096]u8 = undefined;
 var image_len: usize = 0;
 var image_mtime: i64 = 0;
-var image_gen: u32 = 0;
 
-const ImageJob = struct { gen: u32, path: [:0]u8, ui: *Ui };
+/// The preview's size: sharp on a HiDPI screen, and a 24 MP photo kept as
+/// 16 MB instead of 96.
+const preview_px = 2048;
 
 fn showImage(ui: *Ui, path: [:0]const u8, mtime: i64) void {
     if (image_len == path.len and image_mtime == mtime and std.mem.eql(
@@ -124,49 +127,31 @@ fn showImage(ui: *Ui, path: [:0]const u8, mtime: i64) void {
     @memcpy(image_path[0..path.len], path);
     image_len = path.len;
     image_mtime = mtime;
-    const job = ui.gpa.create(ImageJob) catch return;
-    job.* = .{ .gen = image_gen, .path = ui.gpa.dupeSentinel(u8, path, 0) catch {
-        ui.gpa.destroy(job);
-        return;
-    }, .ui = ui };
-    const task = c.g_task_new(null, null, &onImageLoaded, job);
-    c.g_task_set_task_data(task, job, null);
-    c.g_task_run_in_thread(task, &loadImage);
-    c.g_object_unref(task);
+    pictures.requestPicture(
+        path,
+        preview_px,
+        preview_px,
+        &pictures.preview_lane,
+        true,
+        &onImageLoaded,
+        ui,
+    );
 }
 
-/// No image: what is on its way is dropped when it arrives.
+/// No image: what is on its way is dropped (before it is decoded, if it
+/// has not started).
 fn forgetImage(ui: *Ui) void {
-    image_gen +%= 1;
+    pictures.preview_lane.forget();
     image_len = 0;
     c.gtk_picture_set_paintable(ui.detail_picture, null);
 }
 
-fn loadImage(
-    task: *c.GTask,
-    _: ?*c.GObject,
-    data: ?*anyopaque,
-    _: ?*c.GCancellable,
-) callconv(.c) void {
-    const job: *ImageJob = @ptrCast(@alignCast(data.?));
-    const tex = c.gdk_texture_new_from_filename(job.path.ptr, null);
-    c.g_task_return_pointer(task, tex, &unrefObject);
-}
-
-fn unrefObject(p: ?*anyopaque) callconv(.c) void {
-    if (p) |o| c.g_object_unref(o);
-}
-
-fn onImageLoaded(_: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) void {
-    const job: *ImageJob = @ptrCast(@alignCast(data.?));
-    const ui = job.ui;
-    defer {
-        ui.gpa.free(job.path);
-        ui.gpa.destroy(job);
-    }
-    const tex = c.g_task_propagate_pointer(@ptrCast(res), null);
-    defer unrefObject(tex);
-    if (job.gen != image_gen) return;
+fn onImageLoaded(ctx: ?*anyopaque, pb: ?*c.GdkPixbuf, current: bool) void {
+    const ui: *Ui = @ptrCast(@alignCast(ctx.?));
+    if (!current) return;
+    const p = pb orelse return;
+    const tex = c.gdk_texture_new_for_pixbuf(p);
+    defer c.g_object_unref(tex);
     c.gtk_picture_set_paintable(ui.detail_picture, tex);
 }
 
@@ -180,8 +165,8 @@ pub fn showFileDetail(ui: *Ui, it: *const Item) void {
     defer if (ctype) |t| c.g_free(t);
     const ct: [*:0]const u8 = if (ctype) |t| t else "inode/directory";
 
-    // Only regular files: GTK reads the picture synchronously, and a FIFO
-    // named *.png would block the UI.
+    // Only regular files: a FIFO named *.png is no picture (and the decoder
+    // checks again on the descriptor it reads).
     const image = (c.g_content_type_is_a(ct, "image/*") != 0 or std.mem.startsWith(
         u8,
         std.mem.span(ct),
@@ -275,14 +260,19 @@ pub fn showDetail(ui: *Ui, it: ?*const Item) void {
     var arena: std.heap.ArenaAllocator = .init(ui.gpa);
     defer arena.deinit();
     const a = arena.allocator();
-    const text = i.detail[0..@min(i.detail.len, 20_000)];
+    // The row holds the head of the entry; the counts are of all of it.
+    const content = if (i.action == .clip)
+        (ui.db.clipContent(a, i.action.clip) catch null) orelse i.detail
+    else
+        i.detail;
+    const text = content[0..@min(content.len, 20_000)];
     c.gtk_label_set_text(
         @ptrCast(ui.detail_text),
         (a.dupeSentinel(u8, core.utf8.validPrefix(text), 0) catch return).ptr,
     );
-    const chars = std.unicode.utf8CountCodepoints(i.detail) catch i.detail.len;
+    const chars = std.unicode.utf8CountCodepoints(content) catch content.len;
     var words: usize = 0;
-    var tok = std.mem.tokenizeAny(u8, i.detail, " \t\r\n");
+    var tok = std.mem.tokenizeAny(u8, content, " \t\r\n");
     while (tok.next()) |_| words += 1;
     setMeta(ui, .{
         "Text",

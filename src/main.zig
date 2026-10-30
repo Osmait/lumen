@@ -430,6 +430,9 @@ fn dbPath() ?[*:0]u8 {
     const dir = c.g_build_filename(c.g_get_user_data_dir(), "lumen", @as(?*const anyopaque, null));
     defer c.g_free(dir);
     if (c.g_mkdir_with_parents(dir, 0o700) != 0) return null;
+    // Owner-only even if it already existed (made by hand or by another
+    // tool); one that is not ours stays as it is (EPERM).
+    _ = std.os.linux.chmod(dir, 0o700);
     return c.g_build_filename(dir, "lumen.db", @as(?*const anyopaque, null));
 }
 

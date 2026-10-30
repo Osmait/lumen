@@ -20,7 +20,10 @@ pub fn homeRelative(a: std.mem.Allocator, dir: []const u8) [:0]const u8 {
 /// Text fit for a GtkLabel. Linux file names are bytes: they can hold invalid
 /// UTF-8 (Pango then warns and draws garbage, and `--dump` failed outright)
 /// or a newline (a two-line row). Invalid sequences become U+FFFD and
-/// control characters a space. Only for display: actions keep the raw path.
+/// control characters a space. Bidirectional controls are left out: with
+/// them `invoice\u{202E}fdp.sh` showed as "invoicehs.pdf"; without, text
+/// shows in the order it is stored. Only for display: actions keep the raw
+/// path.
 pub fn displayText(a: std.mem.Allocator, raw: []const u8) [:0]const u8 {
     var out: std.ArrayList(u8) = .empty;
     out.ensureTotalCapacity(a, raw.len + 1) catch return "";
@@ -34,10 +37,22 @@ pub fn displayText(a: std.mem.Allocator, raw: []const u8) [:0]const u8 {
         }
         if (n == 1 and (raw[i] < 0x20 or raw[i] == 0x7f)) {
             out.append(a, ' ') catch return "";
-        } else out.appendSlice(a, raw[i .. i + n]) catch return "";
+        } else if (!isBidiControl(std.unicode.utf8Decode(raw[i .. i + n]) catch 0)) {
+            out.appendSlice(a, raw[i .. i + n]) catch return "";
+        }
         i += n;
     }
     return out.toOwnedSliceSentinel(a, 0) catch "";
+}
+
+/// Embeddings and overrides (U+202A–202E), isolates (U+2066–2069) and the
+/// marks (U+200E, U+200F, U+061C): they reorder or place the text around
+/// them and draw nothing.
+fn isBidiControl(cp: u21) bool {
+    return switch (cp) {
+        0x202a...0x202e, 0x2066...0x2069, 0x200e, 0x200f, 0x061c => true,
+        else => false,
+    };
 }
 
 /// Lines shown after the matching one in a content preview.
@@ -185,13 +200,14 @@ pub fn formatWhen(a: std.mem.Allocator, unix: i64) [:0]const u8 {
     return a.dupeSentinel(u8, std.mem.span(s), 0) catch "";
 }
 
-/// First non-blank line, collapsed and capped, for a clipboard row title.
+/// First non-blank line, collapsed and capped, for a clipboard row title
+/// (made safe like a file name: copied text can hold anything).
 pub fn firstLine(a: std.mem.Allocator, text: []const u8) [:0]const u8 {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |l| {
         const t = std.mem.trim(u8, l, " \t\r");
         if (t.len == 0) continue;
-        return a.dupeSentinel(u8, core.utf8.validPrefix(t[0..@min(t.len, 120)]), 0) catch "";
+        return displayText(a, core.utf8.validPrefix(t[0..@min(t.len, 120)]));
     }
     return "";
 }
@@ -207,4 +223,21 @@ test "displayText makes any file name safe for a label" {
     try std.testing.expectEqualStrings("line1 line2.txt", displayText(a, "line1\nline2.txt"));
     try std.testing.expectEqualStrings("acción ñandú 🔊", displayText(a, "acción ñandú 🔊"));
     try std.testing.expectEqualStrings("trunc\u{FFFD}", displayText(a, "trunc\xc3"));
+}
+
+test "bidirectional controls cannot disguise a name" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("invoicefdp.sh", displayText(a, "invoice\u{202E}fdp.sh"));
+    try std.testing.expectEqualStrings(
+        "abc.txt",
+        displayText(a, "\u{2066}a\u{200E}b\u{200F}c\u{061C}\u{2069}.txt"),
+    );
+    // Right-to-left text itself stays.
+    try std.testing.expectEqualStrings("שלום.txt", displayText(a, "שלום.txt"));
+    // Clipboard titles go the same way.
+    const title = firstLine(a, "\n  pay \u{202E}fdp.exe\nmore");
+    try std.testing.expectEqualStrings("pay fdp.exe", title);
+    try std.testing.expectEqualStrings("a b", firstLine(a, "a\tb"));
 }
