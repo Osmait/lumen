@@ -43,42 +43,44 @@ fn extDir(ui: *Ui, buf: []u8, name: []const u8) ?[:0]const u8 {
 
 /// "https://github.com/me/lumen-weather.git" → "weather".
 pub fn nameFromUrl(buf: []u8, url: []const u8) []const u8 {
-    var s = std.mem.trimEnd(u8, url, "/");
-    if (std.mem.endsWith(u8, s, ".git")) s = s[0 .. s.len - 4];
-    if (std.mem.findLastAny(u8, s, "/:")) |i| s = s[i + 1 ..];
-    for ([_][]const u8{ "lumen-ext-", "lumen-extension-", "lumen-" }) |p| {
-        if (std.mem.startsWith(u8, s, p) and s.len > p.len) {
-            s = s[p.len..];
+    var trimmed = std.mem.trimEnd(u8, url, "/");
+    if (std.mem.endsWith(u8, trimmed, ".git")) trimmed = trimmed[0 .. trimmed.len - 4];
+    if (std.mem.findLastAny(u8, trimmed, "/:")) |i| trimmed = trimmed[i + 1 ..];
+    for ([_][]const u8{ "lumen-ext-", "lumen-extension-", "lumen-" }) |prefix| {
+        if (std.mem.startsWith(u8, trimmed, prefix) and trimmed.len > prefix.len) {
+            trimmed = trimmed[prefix.len..];
             break;
         }
     }
-    if (std.mem.endsWith(u8, s, "-lumen") and s.len > 6) s = s[0 .. s.len - 6];
-    const n = @min(s.len, buf.len);
-    for (s[0..n], buf[0..n]) |ch, *o| {
-        const l = std.ascii.toLower(ch);
-        o.* = if (std.ascii.isAlphanumeric(l) or l == '-' or l == '_') l else '-';
+    if (std.mem.endsWith(u8, trimmed, "-lumen") and trimmed.len > 6) {
+        trimmed = trimmed[0 .. trimmed.len - 6];
     }
-    return buf[0..n];
+    const length = @min(trimmed.len, buf.len);
+    for (trimmed[0..length], buf[0..length]) |ch, *o| {
+        const lower = std.ascii.toLower(ch);
+        o.* = if (std.ascii.isAlphanumeric(lower) or lower == '-' or lower == '_') lower else '-';
+    }
+    return buf[0..length];
 }
 
 /// `fmt` in `buf`, cut to what fits, as valid UTF-8: it goes to the caller
 /// over D-Bus, whose strings must be.
 fn format(buf: []u8, comptime fmt: []const u8, args: anytype) [:0]const u8 {
-    var w: std.Io.Writer = .fixed(buf[0 .. buf.len - 1]);
-    w.print(fmt, args) catch {};
-    const n = core.utf8.validPrefix(w.buffered()).len;
-    buf[n] = 0;
-    return buf[0..n :0];
+    var writer: std.Io.Writer = .fixed(buf[0 .. buf.len - 1]);
+    writer.print(fmt, args) catch {};
+    const valid_len = core.utf8.validPrefix(writer.buffered()).len;
+    buf[valid_len] = 0;
+    return buf[0..valid_len :0];
 }
 
 /// The end of `s` in at most `max` bytes, from a character on, after "..."
 /// when cut: the last lines git prints say why it failed. Formats as two
 /// strings: `"{s}{s}"`.
-fn tail(s: []const u8, max: usize) struct { []const u8, []const u8 } {
-    if (s.len <= max) return .{ "", s };
-    var i = s.len - max;
-    while (i < s.len and s[i] & 0xC0 == 0x80) i += 1;
-    return .{ "...", s[i..] };
+fn tail(text: []const u8, max: usize) struct { []const u8, []const u8 } {
+    if (text.len <= max) return .{ "", text };
+    var i = text.len - max;
+    while (i < text.len and text[i] & 0xC0 == 0x80) i += 1;
+    return .{ "...", text[i..] };
 }
 
 /// A failure: to the caller's stderr (exit 1), or on the selected row.
@@ -112,34 +114,35 @@ pub fn install(
 ) void {
     var nbuf: [64]u8 = undefined;
     const name = as orelse nameFromUrl(&nbuf, url);
-    if (!Host.validId(name)) return fail(
-        ui,
-        cmdline,
-        "\"{s}\" cannot be an extension name (a-z, 0-9, - and _); pick one with --as NAME",
-        .{name},
-    );
-    if (Host.reservedId(name)) return fail(
-        ui,
-        cmdline,
-        "\"{s}\" is taken (init.lua and the style run as it); pick another with --as NAME",
-        .{name},
-    );
+    if (!Host.validId(name)) {
+        return fail(
+            ui,
+            cmdline,
+            "\"{s}\" cannot be an extension name (a-z, 0-9, - and _); pick one with --as NAME",
+            .{name},
+        );
+    }
+    if (Host.reservedId(name)) {
+        return fail(
+            ui,
+            cmdline,
+            "\"{s}\" is taken (init.lua and the style run as it); pick another with --as NAME",
+            .{name},
+        );
+    }
     var dbuf: [4096]u8 = undefined;
     const dir = extDir(ui, &dbuf, name) orelse return fail(ui, cmdline, "path too long", .{});
-    if (os.info(dir) != null) return fail(
-        ui,
-        cmdline,
-        "{s} already exists: lumen --update {s}, or --as another name",
-        .{ dir, name },
-    );
+    if (os.info(dir) != null) {
+        return fail(ui, cmdline, "{s} already exists: lumen --update {s}, or --as another name", .{
+            dir,
+            name,
+        });
+    }
     os.mkdirP(dir[0 .. std.mem.findScalarLast(u8, dir, '/') orelse dir.len]);
-    var ubuf: [2048]u8 = undefined;
-    const url_z = std.mem.printSentinel(&ubuf, "{s}", .{url}, 0) catch return fail(
-        ui,
-        cmdline,
-        "URL too long",
-        .{},
-    );
+    var url_buffer: [2048]u8 = undefined;
+    const url_z = std.mem.printSentinel(&url_buffer, "{s}", .{url}, 0) catch {
+        return fail(ui, cmdline, "URL too long", .{});
+    };
     // "--": a URL starting with "-" is not an option.
     var argv = [_:null]?[*:0]const u8{ "git", "clone", "--depth", "1", "--", url_z.ptr, dir.ptr };
     start(ui, cmdline, .install, name, dir, &argv);
@@ -147,17 +150,21 @@ pub fn install(
 
 pub fn update(ui: *Ui, cmdline: ?*c.GApplicationCommandLine, name: ?[]const u8) void {
     var dbuf: [4096]u8 = undefined;
-    if (name) |n| {
-        if (!Host.validId(n)) return fail(ui, cmdline, "no extension named \"{s}\"", .{n});
-        const dir = extDir(ui, &dbuf, n) orelse return fail(ui, cmdline, "path too long", .{});
-        if (os.info(dir) == null) return fail(
+    if (name) |extension_name| {
+        if (!Host.validId(extension_name)) {
+            return fail(ui, cmdline, "no extension named \"{s}\"", .{extension_name});
+        }
+        const dir = extDir(ui, &dbuf, extension_name) orelse return fail(
             ui,
             cmdline,
-            "no extension named \"{s}\"",
-            .{n},
+            "path too long",
+            .{},
         );
+        if (os.info(dir) == null) {
+            return fail(ui, cmdline, "no extension named \"{s}\"", .{extension_name});
+        }
         var argv = [_:null]?[*:0]const u8{ "git", "-C", dir.ptr, "pull", "--ff-only" };
-        return start(ui, cmdline, .update, n, dir, &argv);
+        return start(ui, cmdline, .update, extension_name, dir, &argv);
     }
     // Every extension that is a git checkout.
     const dir = std.mem.printSentinel(
@@ -186,12 +193,9 @@ pub fn uninstall(ui: *Ui, cmdline: ?*c.GApplicationCommandLine, name: []const u8
     if (!Host.validId(name)) return fail(ui, cmdline, "no extension named \"{s}\"", .{name});
     var dbuf: [4096]u8 = undefined;
     const dir = extDir(ui, &dbuf, name) orelse return fail(ui, cmdline, "path too long", .{});
-    if (os.info(dir) == null) return fail(
-        ui,
-        cmdline,
-        "no extension named \"{s}\"",
-        .{name},
-    );
+    if (os.info(dir) == null) {
+        return fail(ui, cmdline, "no extension named \"{s}\"", .{name});
+    }
     var argv = [_:null]?[*:0]const u8{ "rm", "-rf", "--", dir.ptr };
     start(ui, cmdline, .uninstall, name, dir, &argv);
 }
@@ -210,9 +214,9 @@ fn start(
         c.G_SUBPROCESS_FLAGS_STDOUT_PIPE | c.G_SUBPROCESS_FLAGS_STDERR_MERGE,
         &err,
     ) orelse {
-        const msg: []const u8 = if (err) |e| std.mem.span(e.message) else "cannot start";
+        const msg: []const u8 = if (err) |gerror| std.mem.span(gerror.message) else "cannot start";
         fail(ui, cmdline, "{s}: {s}", .{ std.mem.span(argv[0].?), msg });
-        if (err) |e| c.g_error_free(e);
+        if (err) |gerror| c.g_error_free(gerror);
         return;
     };
     const job = ui.gpa.create(Job) catch {
@@ -238,14 +242,17 @@ fn start(
 /// it goes to the caller over D-Bus and onto a row. Free with g_free.
 fn outputText(bytes: ?*c.GBytes) [:0]u8 {
     var len: usize = 0;
-    const data: [*]const u8 = if (bytes) |b| c.g_bytes_get_data(b, &len) orelse "" else "";
+    const data: [*]const u8 = if (bytes) |data_bytes| c.g_bytes_get_data(
+        data_bytes,
+        &len,
+    ) orelse "" else "";
     return std.mem.span(c.g_utf8_make_valid(data, @intCast(len)));
 }
 
 /// What git says last on a failure, in bytes: the message has to fit 1 KB.
 const max_failure_output = 800;
 
-fn onDone(_: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) void {
+fn onDone(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) void {
     const job: *Job = @ptrCast(@alignCast(data.?));
     const ui = job.ui;
     const cmdline = job.cmdline;
@@ -257,9 +264,9 @@ fn onDone(_: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) 
     }
     var out: ?*c.GBytes = null;
     var err: ?*c.GError = null;
-    const ran = c.g_subprocess_communicate_finish(job.sp, res, &out, null, &err) != 0;
-    defer if (err) |e| c.g_error_free(e);
-    defer if (out) |b| c.g_bytes_unref(b);
+    const ran = c.g_subprocess_communicate_finish(job.sp, async_result, &out, null, &err) != 0;
+    defer if (err) |gerror| c.g_error_free(gerror);
+    defer if (out) |output_bytes| c.g_bytes_unref(output_bytes);
     const output = outputText(out);
     defer c.g_free(output.ptr);
     // Failed or not, the files may have changed (half a pull, a clone
@@ -270,7 +277,11 @@ fn onDone(_: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) 
         // A failed clone can leave half a folder behind, and the next
         // install would find it there.
         if (job.kind == .install) removeTree(job.dirZ());
-        const why = if (err) |e| std.mem.span(e.message) else std.mem.trim(u8, output, " \n");
+        const why = if (err) |gerror| std.mem.span(gerror.message) else std.mem.trim(
+            u8,
+            output,
+            " \n",
+        );
         const end = tail(why, max_failure_output);
         return fail(ui, cmdline, "{s} failed:\n{s}{s}", .{ @tagName(job.kind), end[0], end[1] });
     }

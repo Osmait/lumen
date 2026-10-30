@@ -59,13 +59,13 @@ pub const Session = struct {
     /// view for every read made a slow producer keep the main thread busy.
     rebuild_timer: c_uint = 0,
 
-    fn destroy(s: *Session) void {
-        if (s.rebuild_timer != 0) _ = c.g_source_remove(s.rebuild_timer);
-        if (s.stream) |st| c.g_object_unref(st);
-        c.g_object_unref(s.cancel);
-        s.partial.deinit(s.gpa);
-        s.arena.deinit();
-        s.gpa.destroy(s);
+    fn destroy(session: *Session) void {
+        if (session.rebuild_timer != 0) _ = c.g_source_remove(session.rebuild_timer);
+        if (session.stream) |st| c.g_object_unref(st);
+        c.g_object_unref(session.cancel);
+        session.partial.deinit(session.gpa);
+        session.arena.deinit();
+        session.gpa.destroy(session);
     }
 };
 
@@ -77,11 +77,11 @@ pub fn start(
     query: ?[*:0]const u8,
 ) void {
     if (ui.picker != null) finish(ui, null);
-    const s = ui.gpa.create(Session) catch {
+    const session = ui.gpa.create(Session) catch {
         c.g_application_command_line_set_exit_status(cmdline, 1);
         return;
     };
-    s.* = .{
+    session.* = .{
         .gpa = ui.gpa,
         .cmdline = @ptrCast(c.g_object_ref(cmdline)),
         .stream = c.g_application_command_line_get_stdin(cmdline),
@@ -90,75 +90,81 @@ pub fn start(
         .prompt = "",
         .ui = ui,
     };
-    s.prompt = s.arena.allocator().dupeSentinel(u8, prompt orelse "", 0) catch "";
-    ui.picker = s;
-    if (s.stream == null) s.done_reading = true else readMore(s);
+    session.prompt = session.arena.allocator().dupeSentinel(u8, prompt orelse "", 0) catch "";
+    ui.picker = session;
+    if (session.stream == null) session.done_reading = true else readMore(session);
     ui.showWith(.dmenu, query);
 }
 
-fn readMore(s: *Session) void {
-    s.reading = true;
-    c.g_input_stream_read_bytes_async(s.stream.?, 256 * 1024, 0, s.cancel, &onRead, s);
+fn readMore(session: *Session) void {
+    session.reading = true;
+    c.g_input_stream_read_bytes_async(
+        session.stream.?,
+        256 * 1024,
+        0,
+        session.cancel,
+        &onRead,
+        session,
+    );
 }
 
-fn onRead(_: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) void {
-    const s: *Session = @ptrCast(@alignCast(data.?));
-    s.reading = false;
+fn onRead(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) void {
+    const session: *Session = @ptrCast(@alignCast(data.?));
+    session.reading = false;
     var err: ?*c.GError = null;
-    const bytes = c.g_input_stream_read_bytes_finish(s.stream.?, res, &err);
-    defer if (bytes) |b| c.g_bytes_unref(b);
-    if (err) |e| c.g_error_free(e);
-    if (s.finished) return s.destroy();
+    const bytes = c.g_input_stream_read_bytes_finish(session.stream.?, async_result, &err);
+    defer if (bytes) |bytes_some| c.g_bytes_unref(bytes_some);
+    if (err) |err_some| c.g_error_free(err_some);
+    if (session.finished) return session.destroy();
 
     var len: usize = 0;
-    const chunk: []const u8 = if (bytes) |b| if (c.g_bytes_get_data(
-        b,
+    const chunk: []const u8 = if (bytes) |bytes_some| if (c.g_bytes_get_data(
+        bytes_some,
         &len,
-    )) |p| p[0..len] else "" else "";
+    )) |data_ptr| data_ptr[0..len] else "" else "";
     if (chunk.len == 0) {
         // End of input (or an error): the last line may lack its newline.
-        if (s.partial.items.len > 0) addLine(s, s.partial.items);
-        s.partial.clearRetainingCapacity();
-        s.done_reading = true;
+        if (session.partial.items.len > 0) addLine(session, session.partial.items);
+        session.partial.clearRetainingCapacity();
+        session.done_reading = true;
     } else {
-        s.bytes += chunk.len;
+        session.bytes += chunk.len;
         var rest = chunk;
         // Out of memory, a line would be cut and could be picked and printed
         // as it is not: reading stops at the last whole line instead.
         var oom = false;
         while (std.mem.findScalar(u8, rest, '\n')) |nl| {
-            if (s.partial.items.len > 0) {
-                s.partial.appendSlice(s.gpa, rest[0..nl]) catch {
+            if (session.partial.items.len > 0) {
+                session.partial.appendSlice(session.gpa, rest[0..nl]) catch {
                     oom = true;
                     break;
                 };
-                addLine(s, s.partial.items);
-                s.partial.clearRetainingCapacity();
-            } else addLine(s, rest[0..nl]);
+                addLine(session, session.partial.items);
+                session.partial.clearRetainingCapacity();
+            } else addLine(session, rest[0..nl]);
             rest = rest[nl + 1 ..];
         }
-        if (!oom) s.partial.appendSlice(s.gpa, rest) catch {
+        if (!oom) session.partial.appendSlice(session.gpa, rest) catch {
             oom = true;
         };
         if (oom) {
-            log.warn("out of memory: stopped reading after {d} lines", .{s.lines.items.len});
-            s.partial.clearRetainingCapacity();
-            s.done_reading = true;
-        } else if (s.lines.items.len >= max_lines or s.bytes >= max_bytes) {
-            log.warn("stopped reading after {d} lines", .{s.lines.items.len});
-            s.done_reading = true;
-        } else readMore(s);
+            log.warn("out of memory: stopped reading after {d} lines", .{session.lines.items.len});
+            session.partial.clearRetainingCapacity();
+            session.done_reading = true;
+        } else if (session.lines.items.len >= max_lines or session.bytes >= max_bytes) {
+            log.warn("stopped reading after {d} lines", .{session.lines.items.len});
+            session.done_reading = true;
+        } else readMore(session);
     }
     // The first lines at once, the end at once, the rest now and then.
-    if (s.done_reading or s.lines.items.len <= 500) {
-        if (s.rebuild_timer != 0) _ = c.g_source_remove(s.rebuild_timer);
-        s.rebuild_timer = 0;
-        showLines(s);
-    } else if (s.rebuild_timer == 0) s.rebuild_timer = c.g_timeout_add(
-        rebuildDelay(s.lines.items.len),
-        &onRebuildTimer,
-        s,
-    );
+    if (session.done_reading or session.lines.items.len <= 500) {
+        if (session.rebuild_timer != 0) _ = c.g_source_remove(session.rebuild_timer);
+        session.rebuild_timer = 0;
+        showLines(session);
+    } else if (session.rebuild_timer == 0) {
+        const delay_ms = rebuildDelay(session.lines.items.len);
+        session.rebuild_timer = c.g_timeout_add(delay_ms, &onRebuildTimer, session);
+    }
 }
 
 /// Milliseconds between rebuilds while lines arrive. With a query typed a
@@ -168,23 +174,23 @@ fn rebuildDelay(lines: usize) c_uint {
 }
 
 fn onRebuildTimer(data: ?*anyopaque) callconv(.c) c.gboolean {
-    const s: *Session = @ptrCast(@alignCast(data.?));
-    s.rebuild_timer = 0;
-    showLines(s);
+    const session: *Session = @ptrCast(@alignCast(data.?));
+    session.rebuild_timer = 0;
+    showLines(session);
     return 0;
 }
 
-fn showLines(s: *Session) void {
-    const ui = s.ui;
+fn showLines(session: *Session) void {
+    const ui = session.ui;
     if (ui.view == .dmenu) {
         ui.keepSelection();
         ui.rebuild();
     }
 }
 
-fn addLine(s: *Session, raw: []const u8) void {
-    if (s.lines.items.len >= max_lines) return;
-    const a = s.arena.allocator();
+fn addLine(session: *Session, raw: []const u8) void {
+    if (session.lines.items.len >= max_lines) return;
+    const arena = session.arena.allocator();
     var text = raw;
     if (text.len > 0 and text[text.len - 1] == '\r') text = text[0 .. text.len - 1];
     var line: Line = .{ .text = "" };
@@ -194,12 +200,12 @@ fn addLine(s: *Session, raw: []const u8) void {
         while (opts.next()) |key| {
             const value = opts.next() orelse break;
             if (std.mem.eql(u8, key, "icon")) {
-                const name = a.dupeSentinel(u8, value, 0) catch continue;
+                const name = arena.dupeSentinel(u8, value, 0) catch continue;
                 line.icon = if (value.len > 0 and value[0] >= 0x80) .{
                     .emoji = name,
                 } else .byName(name);
             } else if (std.mem.eql(u8, key, "meta")) {
-                line.meta = a.dupe(u8, value) catch "";
+                line.meta = arena.dupe(u8, value) catch "";
             } else if (std.mem.eql(u8, key, "nonselectable")) {
                 line.selectable = !std.mem.eql(u8, value, "true");
             }
@@ -207,41 +213,45 @@ fn addLine(s: *Session, raw: []const u8) void {
         text = text[0..nul];
     }
     if (!std.unicode.utf8ValidateSlice(text)) return;
-    line.text = a.dupeSentinel(u8, text, 0) catch return;
-    s.lines.append(a, line) catch {};
+    line.text = arena.dupeSentinel(u8, text, 0) catch return addLineOutOfMemory();
+    session.lines.append(arena, line) catch return addLineOutOfMemory();
+}
+
+fn addLineOutOfMemory() void {
+    log.warn("out of memory: a line of standard input is left out", .{});
 }
 
 /// Answers the caller with `choice` (null: nothing chosen, exit 1) and ends
 /// the session. The window is left as it is.
 pub fn finish(ui: *Ui, choice: ?[]const u8) void {
-    const s = ui.picker orelse return;
+    const session = ui.picker orelse return;
     ui.picker = null;
-    if (choice) |t| {
+    if (choice) |choice_text| {
         c.g_application_command_line_print(
-            s.cmdline,
+            session.cmdline,
             "%.*s\n",
-            @as(c_int, @intCast(@min(t.len, std.math.maxInt(c_int)))),
-            t.ptr,
+            @as(c_int, @intCast(@min(choice_text.len, std.math.maxInt(c_int)))),
+            choice_text.ptr,
         );
-        c.g_application_command_line_set_exit_status(s.cmdline, 0);
-    } else c.g_application_command_line_set_exit_status(s.cmdline, 1);
+        c.g_application_command_line_set_exit_status(session.cmdline, 0);
+    } else c.g_application_command_line_set_exit_status(session.cmdline, 1);
     // The caller's `lumen --dmenu` returns once this is released.
-    c.g_object_unref(s.cmdline);
-    s.finished = true;
+    c.g_object_unref(session.cmdline);
+    session.finished = true;
     // The rows point into the session's lines.
     if (ui.view == .dmenu) ui.clearRows();
-    if (s.reading) c.g_cancellable_cancel(s.cancel) else s.destroy();
+    if (session.reading) c.g_cancellable_cancel(session.cancel) else session.destroy();
 }
 
 /// Enter on a row.
 pub fn choose(ui: *Ui, index: u32) void {
-    const s = ui.picker orelse return;
-    if (index >= s.lines.items.len) return;
-    finish(ui, s.lines.items[index].text);
+    const session = ui.picker orelse return;
+    if (index >= session.lines.items.len) return;
+    finish(ui, session.lines.items[index].text);
     ui.hide();
 }
 
-/// Ctrl+Enter, or Enter with nothing matching: what was typed.
+/// Ctrl+Enter, or Enter when no row matches: answers with the typed text.
 pub fn chooseTyped(ui: *Ui) void {
     if (ui.picker == null) return;
     finish(ui, ui.query());
@@ -249,33 +259,33 @@ pub fn chooseTyped(ui: *Ui) void {
 }
 
 pub fn title(ui: *Ui) [*:0]const u8 {
-    const s = ui.picker orelse return "Choose";
-    return if (s.prompt.len > 0) s.prompt.ptr else "Choose";
+    const session = ui.picker orelse return "Choose";
+    return if (session.prompt.len > 0) session.prompt.ptr else "Choose";
 }
 
 pub fn emptyText(ui: *Ui) [:0]const u8 {
-    const s = ui.picker orelse return "No Results";
-    if (!s.done_reading) return "Reading...";
+    const session = ui.picker orelse return "No Results";
+    if (!session.done_reading) return "Reading...";
     return "No matches: Ctrl ↵ uses what you typed";
 }
 
 /// The rows for `q`: the first lines in order, or the best matches.
-pub fn fill(ui: *Ui, a: std.mem.Allocator, q: []const u8) void {
-    const s = ui.picker orelse return;
-    const lines = s.lines.items;
-    if (q.len == 0) {
-        for (lines[0..@min(lines.len, shown_all)], 0..) |l, i| ui.addItem(
-            itemOf(a, l, @intCast(i)),
+pub fn fill(ui: *Ui, arena: std.mem.Allocator, query: []const u8) void {
+    const session = ui.picker orelse return;
+    const lines = session.lines.items;
+    if (query.len == 0) {
+        for (lines[0..@min(lines.len, shown_all)], 0..) |line, i| ui.addItem(
+            itemOf(arena, line, @intCast(i)),
         );
         return;
     }
     const Hit = struct { score: i32, i: u32 };
     var hits: std.ArrayList(Hit) = .empty;
-    for (lines, 0..) |l, i| {
-        const fields = [_][]const u8{ matched(l.text), matched(l.meta) };
-        const sc = core.fuzzy.scoreFields(q, &fields);
-        if (sc == core.fuzzy.no_match) continue;
-        hits.append(a, .{ .score = sc, .i = @intCast(i) }) catch break;
+    for (lines, 0..) |line, i| {
+        const fields = [_][]const u8{ matched(line.text), matched(line.meta) };
+        const score = core.fuzzy.scoreFields(query, &fields);
+        if (score == core.fuzzy.no_match) continue;
+        hits.append(arena, .{ .score = score, .i = @intCast(i) }) catch break;
     }
     // Best first; ties keep the input's order.
     std.mem.sort(Hit, hits.items, {}, struct {
@@ -286,12 +296,12 @@ pub fn fill(ui: *Ui, a: std.mem.Allocator, q: []const u8) void {
     for (hits.items[0..@min(
         hits.items.len,
         shown_matches,
-    )]) |h| ui.addItem(itemOf(a, lines[h.i], h.i));
+    )]) |hit| ui.addItem(itemOf(arena, lines[hit.i], hit.i));
 }
 
 /// The part of `s` filtering looks at.
-fn matched(s: []const u8) []const u8 {
-    return s[0..core.utf8.floorBoundary(s, match_bytes)];
+fn matched(text: []const u8) []const u8 {
+    return text[0..core.utf8.floorBoundary(text, match_bytes)];
 }
 
 test "a long line is matched by its head and printed whole" {
@@ -308,12 +318,12 @@ test "a long line is matched by its head and printed whole" {
     try std.testing.expectEqual(match_bytes - 1, matched(&accents).len);
 }
 
-fn itemOf(a: std.mem.Allocator, l: Line, i: u32) Item {
+fn itemOf(arena: std.mem.Allocator, line: Line, i: u32) Item {
     return .{
-        .key = a.print("d:{d}", .{i}) catch "",
-        .title = l.text,
-        .icon = l.icon,
-        .keywords = l.meta,
-        .action = .{ .pick = .{ .index = i, .selectable = l.selectable } },
+        .key = arena.print("d:{d}", .{i}) catch "",
+        .title = line.text,
+        .icon = line.icon,
+        .keywords = line.meta,
+        .action = .{ .pick = .{ .index = i, .selectable = line.selectable } },
     };
 }

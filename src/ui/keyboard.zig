@@ -1,6 +1,7 @@
 //! The keyboard: navigation, actions, the action panel.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const c = @import("c");
 const item_mod = @import("../item.zig");
 const Ui = @import("Ui.zig");
@@ -28,16 +29,21 @@ pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
         ui.openPanel();
         return 1;
     }
-    // dmenu: Ctrl+Enter, or Enter with nothing matching, answers with the
-    // text typed.
+    // In dmenu, Ctrl+Enter (or Enter when no row matches) answers with the
+    // typed text instead of a row.
     if (enter and ui.view == .dmenu and (ctrl or ui.selectedItem() == null)) {
         Ui.dmenu.chooseTyped(ui);
         return 1;
     }
     if (enter) {
-        const it = ui.selectedItem() orelse return 1;
-        const actions = item_mod.actionsFor(it);
-        if (ctrl and actions.len > 1) ui.performEntry(actions[1]) else ui.performEntry(actions[0]);
+        const item = ui.selectedItem() orelse return 1;
+        const actions = item_mod.actionsFor(item);
+        assert(actions.len > 0);
+        if (ctrl and actions.len > 1) {
+            ui.performEntry(actions[1]);
+        } else {
+            ui.performEntry(actions[0]);
+        }
         return 1;
     }
     if (itemShortcut(ui, keyval, ctrl, shift)) return 1;
@@ -52,6 +58,9 @@ pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
 
 /// Keys while the action panel is open: they all go to it.
 fn panelKey(ui: *Ui, keyval: c_uint, ctrl: bool, down: bool, up: bool, enter: bool) void {
+    assert(ui.panel_open);
+    assert(ui.panel_entries.len > 0);
+    assert(ui.panel_selected < ui.panel_entries.len);
     if (keyval == c.GDK_KEY_Escape or (ctrl and keyval == c.GDK_KEY_k and !up)) {
         ui.closePanel();
     } else if (down) {
@@ -83,8 +92,8 @@ fn move(ui: *Ui, keyval: c_uint, down: bool, up: bool) bool {
     if (ui.grid_mode and ui.rows.items.len > 0 and
         (down or up or keyval == c.GDK_KEY_Left or keyval == c.GDK_KEY_Right))
     {
-        const n: i64 = @intCast(ui.rows.items.len);
-        const cur: i64 = if (ui.selected) |s| @intCast(s) else 0;
+        const cell_count: i64 = @intCast(ui.rows.items.len);
+        const current: i64 = if (ui.selected) |selected| @intCast(selected) else 0;
         const step: i64 = if (down)
             ui.grid_columns
         else if (up)
@@ -93,8 +102,8 @@ fn move(ui: *Ui, keyval: c_uint, down: bool, up: bool) bool {
             1
         else
             -1;
-        const next = cur + step;
-        if (next >= 0 and next < n) ui.select(@intCast(next));
+        const next = current + step;
+        if (next >= 0 and next < cell_count) ui.select(@intCast(next));
         return true;
     }
     if (down or up) {
@@ -122,9 +131,9 @@ fn itemShortcut(ui: *Ui, keyval: c_uint, ctrl: bool, shift: bool) bool {
         if (shift) "Shift " else "",
         letter,
     }) catch return false;
-    const it = ui.selectedItem() orelse return false;
-    for (item_mod.actionsFor(it)) |e| if (std.mem.eql(u8, e.keys, chord)) {
-        ui.performEntry(e);
+    const item = ui.selectedItem() orelse return false;
+    for (item_mod.actionsFor(item)) |entry| if (std.mem.eql(u8, entry.keys, chord)) {
+        ui.performEntry(entry);
         return true;
     };
     return false;

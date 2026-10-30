@@ -2,6 +2,7 @@
 //! command shows, its actions, keymaps, and reloading edited files.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const c = @import("c");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
@@ -40,60 +41,61 @@ pub fn start(ui: *Ui) void {
 
 /// Loads the Style setting's style, if it is not the one loaded.
 pub fn syncStyle(ui: *Ui) void {
-    const h = ui.ext_host orelse return;
-    if (h.setStyle(ui.settings.style)) h.reload();
+    const host = ui.ext_host orelse return;
+    if (host.setStyle(ui.settings.style)) host.reload();
 }
 
 /// After the GTK main loop has stopped.
 pub fn shutdown(ui: *Ui) void {
-    const h = ui.ext_host orelse return;
+    const host = ui.ext_host orelse return;
     ui.ext_host = null;
-    h.shutdown();
+    host.shutdown();
 }
 
 /// Reloads when init.lua or an extension's files changed since the last
 /// look (the window is about to open).
 pub fn checkReload(ui: *Ui) void {
-    const h = ui.ext_host orelse return;
-    const s = Host.stamp(ui.config_dir, ui.settings.style);
-    if (s == ui.ext_stamp) return;
-    ui.ext_stamp = s;
-    h.reload();
+    const host = ui.ext_host orelse return;
+    const stamp = Host.stamp(ui.config_dir, ui.settings.style);
+    if (stamp == ui.ext_stamp) return;
+    ui.ext_stamp = stamp;
+    host.reload();
 }
 
 /// `lumen --reload`.
 pub fn reload(ui: *Ui) void {
-    const h = ui.ext_host orelse return;
+    const host = ui.ext_host orelse return;
     ui.ext_stamp = Host.stamp(ui.config_dir, ui.settings.style);
-    h.reload();
+    host.reload();
 }
 
 pub fn command(ui: *Ui) ?*const Host.Command {
-    const reg = ui.ext_registry orelse return null;
-    if (ui.ext_cmd >= reg.commands.len) return null;
-    return &reg.commands[ui.ext_cmd];
+    const registry = ui.ext_registry orelse return null;
+    if (ui.ext_cmd >= registry.commands.len) return null;
+    return &registry.commands[ui.ext_cmd];
 }
 
 // ------------------------------------------------------------- results
 
-fn onRegistry(reg: *Host.Registry, ctx: ?*anyopaque) void {
+fn onRegistry(registry: *Host.Registry, ctx: ?*anyopaque) void {
     const ui: *Ui = @ptrCast(@alignCast(ctx.?));
     const old = ui.ext_registry;
     const old_result = ui.ext_result;
     const old_root = ui.ext_root;
-    ui.ext_registry = reg;
+    ui.ext_registry = registry;
     ui.ext_result = null;
     ui.ext_root = null;
     ui.ext_pending = false;
     ui.ext_root_pending = false;
-    // Answers still on their way were asked of the old files: drop them.
+    // Answers still in flight come from the old files; resetting the
+    // generations drops them when they arrive.
     ui.ext_gen = 0;
     ui.ext_root_gen = 0;
     // What the views point at by index, found again by id (before anything
     // rebuilds them): the open view may have lost it.
-    const lost = if (old) |o| remap(ui, o, reg) else false;
-    themes.custom = reg.themes;
-    ui.layout = reg.layout;
+    const lost = if (old) |old_value| remap(ui, old_value, registry) else false;
+    themes.custom = registry.themes;
+    ui.layout = registry.layout;
     ui.applyStructure();
     // Rows and theme names point into the old registry: rebuild before
     // freeing it. A theme from init.lua may be the one in use, and lumen.set
@@ -103,9 +105,9 @@ fn onRegistry(reg: *Host.Registry, ctx: ?*anyopaque) void {
     if (ui.style_defaults_pending) {
         ui.style_defaults_pending = false;
         var changed = false;
-        for (reg.style_settings) |o| {
-            if (ui.overridden(o.key)) continue;
-            changed = ui.settings.set(o.key, o.value) or changed;
+        for (registry.style_settings) |old_value| {
+            if (ui.overridden(old_value.key)) continue;
+            changed = ui.settings.set(old_value.key, old_value.value) or changed;
         }
         if (changed) ui.saveSettings();
     }
@@ -128,36 +130,43 @@ fn onRegistry(reg: *Host.Registry, ctx: ?*anyopaque) void {
     }
 }
 
-fn onRoot(res: *Host.RootResult, ctx: ?*anyopaque) void {
+fn onRoot(answer: *Host.RootResult, ctx: ?*anyopaque) void {
     const ui: *Ui = @ptrCast(@alignCast(ctx.?));
-    if (res.gen != ui.ext_root_gen) {
-        res.destroy(ui.gpa);
+    if (answer.gen != ui.ext_root_gen) {
+        answer.destroy(ui.gpa);
         return;
     }
-    const reg = ui.ext_registry orelse {
-        res.destroy(ui.gpa);
+    // Each answer is delivered once: the one shown is never handed back.
+    assert(answer != ui.ext_root);
+    const registry = ui.ext_registry orelse {
+        answer.destroy(ui.gpa);
         return;
     };
-    for (res.sections) |sec| for (sec.items) |*it| {
-        if (it.icon == .none and
-            sec.command < reg.commands.len) it.icon = reg.commands[sec.command].icon;
+    for (answer.sections) |sec| for (sec.items) |*item| {
+        if (item.icon == .none and
+            sec.command < registry.commands.len) item.icon = registry.commands[sec.command].icon;
     };
     ui.ext_root_pending = false;
     const old = ui.ext_root;
     const typed: ?[]const u8 = if (ui.view == .root) std.mem.trim(u8, ui.query(), " ") else null;
-    switch (rootAnswer(typed, if (old) |o| o.query else null, res.query, res.sections.len > 0)) {
+    switch (rootAnswer(
+        typed,
+        if (old) |old_value| old_value.query else null,
+        answer.query,
+        answer.sections.len > 0,
+    )) {
         .show => {
-            ui.ext_root = res;
+            ui.ext_root = answer;
             ui.keepSelection();
             ui.refresh();
         },
-        .keep => ui.ext_root = res,
+        .keep => ui.ext_root = answer,
         .drop => {
-            res.destroy(ui.gpa);
+            answer.destroy(ui.gpa);
             return;
         },
     }
-    if (old) |o| o.destroy(ui.gpa);
+    if (old) |old_value| old_value.destroy(ui.gpa);
 }
 
 const RootAnswer = enum {
@@ -182,68 +191,69 @@ fn rootAnswer(
     answer: []const u8,
     has_rows: bool,
 ) RootAnswer {
-    const t = typed orelse return .keep;
-    const last_shown = if (last) |l| std.mem.eql(u8, l, t) else false;
-    if (std.mem.eql(u8, answer, t) and (has_rows or last_shown)) return .show;
+    const typed_query = typed orelse return .keep;
+    const last_shown = if (last) |last_query| std.mem.eql(u8, last_query, typed_query) else false;
+    if (std.mem.eql(u8, answer, typed_query) and (has_rows or last_shown)) return .show;
     return if (last_shown) .drop else .keep;
 }
 
 /// Extension rows for the root search `q`: shown when they answer `q`,
 /// asked for otherwise (they arrive with onRoot).
-pub fn addRootSections(ui: *Ui, q: []const u8) void {
-    const reg = ui.ext_registry orelse return;
-    const h = ui.ext_host orelse return;
+pub fn addRootSections(ui: *Ui, query: []const u8) void {
+    const registry = ui.ext_registry orelse return;
+    const host = ui.ext_host orelse return;
     var any = false;
-    for (reg.commands) |cmd| any = any or cmd.root;
-    if (!any or q.len < 2) return;
-    if (ui.ext_root) |r| if (std.mem.eql(u8, r.query, q)) {
+    for (registry.commands) |cmd| any = any or cmd.root;
+    if (!any or query.len < 2) return;
+    if (ui.ext_root) |r| if (std.mem.eql(u8, r.query, query)) {
         for (r.sections) |sec| {
-            if (sec.command >= reg.commands.len) continue;
-            ui.addSection(reg.commands[sec.command].title);
-            for (sec.items) |it| ui.addItem(it);
+            if (sec.command >= registry.commands.len) continue;
+            ui.addSection(registry.commands[sec.command].title);
+            for (sec.items) |item| ui.addItem(item);
         }
         return;
     };
-    const asked = ui.ext_root_pending and ui.ext_root_asked.eql(q);
+    const asked = ui.ext_root_pending and ui.ext_root_asked.eql(query);
     if (asked) return;
-    ui.ext_root_asked.set(q);
-    ui.ext_root_gen = h.root(reg.gen, q);
+    ui.ext_root_asked.set(query);
+    ui.ext_root_gen = host.root(registry.gen, query);
     ui.ext_root_pending = true;
 }
 
-fn onList(res: *Host.ListResult, ctx: ?*anyopaque) void {
+fn onList(answer: *Host.ListResult, ctx: ?*anyopaque) void {
     const ui: *Ui = @ptrCast(@alignCast(ctx.?));
-    if (res.gen != ui.ext_gen) {
-        res.destroy(ui.gpa);
+    if (answer.gen != ui.ext_gen) {
+        answer.destroy(ui.gpa);
         return;
     }
-    if (res.err) |e| log.warn("{s}: {s}", .{ if (command(ui)) |cmd| cmd.id else "?", e });
-    // Rows without an icon wear their command's (the registry outlives the
-    // result: a reload drops results first).
-    if (command(ui)) |cmd| for (res.items) |*it| {
-        if (it.icon == .none) it.icon = cmd.icon;
+    assert(answer != ui.ext_result);
+    if (answer.err) |e| log.warn("{s}: {s}", .{ if (command(ui)) |cmd| cmd.id else "?", e });
+    // Rows without an icon take their command's. The icon points into the
+    // registry, which outlives the result: a reload destroys results first.
+    if (command(ui)) |cmd| for (answer.items) |*item| {
+        if (item.icon == .none) item.icon = cmd.icon;
     };
     const old = ui.ext_result;
-    ui.ext_result = res;
+    ui.ext_result = answer;
     ui.ext_pending = false;
     if (ui.view == .ext) {
         ui.keepSelection();
         ui.rebuild();
     }
-    if (old) |o| o.destroy(ui.gpa);
+    if (old) |old_value| old_value.destroy(ui.gpa);
 }
 
-fn onAct(res: *Host.ActResult, ctx: ?*anyopaque) void {
+fn onAct(answer: *Host.ActResult, ctx: ?*anyopaque) void {
     const ui: *Ui = @ptrCast(@alignCast(ctx.?));
-    defer res.destroy(ui.gpa);
-    if (res.gen != ui.ext_act_gen) return;
+    defer answer.destroy(ui.gpa);
+    if (answer.gen != ui.ext_act_gen) return;
     ui.ext_act_gen = 0;
-    if (res.err) |e| {
+    if (answer.err) |e| {
         log.warn("action: {s}", .{e});
         ui.showFailure(firstLine(ui.query_arena.allocator(), e));
         return;
     }
-    switch (res.outcome) {
+    switch (answer.outcome) {
         .close => ui.hide(),
         .stay => ui.select(ui.selected),
         .refresh => if (ui.view == .ext) {
@@ -257,8 +267,8 @@ fn onAct(res: *Host.ActResult, ctx: ?*anyopaque) void {
     }
 }
 
-fn find(reg: *const Host.Registry, id: []const u8) ?u16 {
-    for (reg.commands, 0..) |cmd, i| if (std.mem.eql(u8, cmd.id, id)) return @intCast(i);
+fn find(registry: *const Host.Registry, id: []const u8) ?u16 {
+    for (registry.commands, 0..) |cmd, i| if (std.mem.eql(u8, cmd.id, id)) return @intCast(i);
     return null;
 }
 
@@ -316,36 +326,42 @@ fn sameCommand(old: *const Host.Registry, new: *const Host.Registry, i: u16) ?u1
 /// Preference `i` of `old` in `new`: the same extension, name and kind.
 fn samePref(old: *const Host.Registry, new: *const Host.Registry, i: u16) ?u16 {
     if (i >= old.prefs.len) return null;
-    const p = old.prefs[i];
-    for (new.prefs, 0..) |q, j| {
-        if (std.mem.eql(u8, q.ext, p.ext) and std.mem.eql(u8, q.name, p.name) and
-            q.kind == p.kind) return @intCast(j);
+    const preference = old.prefs[i];
+    for (new.prefs, 0..) |query, j| {
+        if (std.mem.eql(u8, query.ext, preference.ext) and std.mem.eql(
+            u8,
+            query.name,
+            preference.name,
+        ) and
+            query.kind == preference.kind) return @intCast(j);
     }
     return null;
 }
 
-fn sameFields(a: []const Host.Pref, b: []const Host.Pref) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| if (!std.mem.eql(u8, x.name, y.name) or x.kind != y.kind) return false;
+fn sameFields(fields_old: []const Host.Pref, fields_new: []const Host.Pref) bool {
+    if (fields_old.len != fields_new.len) return false;
+    for (fields_old, fields_new) |x, y| {
+        if (!std.mem.eql(u8, x.name, y.name) or x.kind != y.kind) return false;
+    }
     return true;
 }
 
 /// The first line of an error (the rest is the traceback), in `a`.
-fn firstLine(a: std.mem.Allocator, msg: []const u8) [:0]const u8 {
+fn firstLine(arena: std.mem.Allocator, msg: []const u8) [:0]const u8 {
     const end = std.mem.findScalar(u8, msg, '\n') orelse msg.len;
-    return a.dupeSentinel(u8, msg[0..@min(end, 200)], 0) catch "Failed";
+    return arena.dupeSentinel(u8, msg[0..@min(end, 200)], 0) catch "Failed";
 }
 
 // ----------------------------------------------------------------- rows
 
 /// Commands, and the files that failed to load, for the root search.
-pub fn rootItems(ui: *Ui, a: std.mem.Allocator) []const Item {
-    const reg = ui.ext_registry orelse return &.{};
+pub fn rootItems(ui: *Ui, arena: std.mem.Allocator) []const Item {
+    const registry = ui.ext_registry orelse return &.{};
     var out: std.ArrayList(Item) = .empty;
-    for (reg.commands, 0..) |cmd, i| {
+    for (registry.commands, 0..) |cmd, i| {
         if (cmd.mode == .provider) continue;
-        out.append(a, .{
-            .key = a.print("ext:{s}", .{cmd.id}) catch continue,
+        out.append(arena, .{
+            .key = arena.print("ext:{s}", .{cmd.id}) catch continue,
             .title = cmd.title,
             .subtitle = cmd.subtitle,
             .accessory = "Command",
@@ -354,18 +370,18 @@ pub fn rootItems(ui: *Ui, a: std.mem.Allocator) []const Item {
             .action = .{ .ext_command = .{ .index = @intCast(i), .run = cmd.mode == .run } },
         }) catch break;
     }
-    for (reg.problems) |p| {
-        out.append(a, .{
-            .title = a.printSentinel(
+    for (registry.problems) |problem| {
+        out.append(arena, .{
+            .title = arena.printSentinel(
                 "Extension \"{s}\" failed to load",
-                .{p.ext},
+                .{problem.ext},
                 0,
             ) catch continue,
-            .subtitle = firstLine(a, p.message),
+            .subtitle = firstLine(arena, problem.message),
             .accessory = "Error",
             .icon = .{ .tile = .{ .name = "dialog-warning-symbolic", .color = .red } },
             .action = .ext_problem,
-            .detail = p.message,
+            .detail = problem.message,
         }) catch break;
     }
     return out.items;
@@ -387,46 +403,45 @@ pub fn enter(ui: *Ui) void {
 /// rows on screen are the last answer's and stay as they are (rebuilding
 /// them cost a frame per keystroke; `onList` rebuilds when it comes). True
 /// when the request is made and nothing else is to be done.
-pub fn waitingForSearch(ui: *Ui, q: []const u8) bool {
+pub fn waitingForSearch(ui: *Ui, query: []const u8) bool {
     const cmd = command(ui) orelse return false;
     if (cmd.mode != .search) return false;
     const r = ui.ext_result orelse return false;
     if (r != ui.ext_shown) return false;
-    if (r.command == ui.ext_cmd and std.mem.eql(u8, r.query, q)) return false;
-    _ = prepare(ui, q);
+    if (r.command == ui.ext_cmd and std.mem.eql(u8, r.query, query)) return false;
+    _ = prepare(ui, query);
     return true;
 }
 
 /// On each refresh: search commands ask for the query typed, unless it is
 /// already answered or on its way. True when the rows are local (filtered
 /// by Lumen).
-pub fn prepare(ui: *Ui, q: []const u8) bool {
+pub fn prepare(ui: *Ui, query: []const u8) bool {
     const cmd = command(ui) orelse return true;
     if (cmd.mode != .search) return true;
-    const answered = if (ui.ext_result) |r| r.command == ui.ext_cmd and std.mem.eql(
-        u8,
-        r.query,
-        q,
-    ) else false;
-    const asked = ui.ext_pending and ui.ext_asked.eql(q);
-    if (!answered and !asked) ask(ui, q);
+    const answered = if (ui.ext_result) |result|
+        result.command == ui.ext_cmd and std.mem.eql(u8, result.query, query)
+    else
+        false;
+    const asked = ui.ext_pending and ui.ext_asked.eql(query);
+    if (!answered and !asked) ask(ui, query);
     return false;
 }
 
-fn ask(ui: *Ui, q: []const u8) void {
-    const h = ui.ext_host orelse return;
-    const reg = ui.ext_registry orelse return;
-    ui.ext_asked.set(q);
-    ui.ext_gen = h.list(reg.gen, ui.ext_cmd, q);
+fn ask(ui: *Ui, query: []const u8) void {
+    const host = ui.ext_host orelse return;
+    const registry = ui.ext_registry orelse return;
+    ui.ext_asked.set(query);
+    ui.ext_gen = host.list(registry.gen, ui.ext_cmd, query);
     ui.ext_pending = true;
 }
 
-pub fn emptyText(ui: *Ui, a: std.mem.Allocator, q: []const u8) [:0]const u8 {
+pub fn emptyText(ui: *Ui, arena: std.mem.Allocator, query: []const u8) [:0]const u8 {
     const cmd = command(ui) orelse return "No Results";
     if (ui.ext_result) |r| if (r.command == ui.ext_cmd) if (r.err) |e|
-        return a.printSentinel("Error: {s}", .{firstLine(a, e)}, 0) catch "Error";
+        return arena.printSentinel("Error: {s}", .{firstLine(arena, e)}, 0) catch "Error";
     if (ui.ext_pending) return "Loading...";
-    if (cmd.mode == .search and q.len == 0) return "Type to search";
+    if (cmd.mode == .search and query.len == 0) return "Type to search";
     return "No Results";
 }
 
@@ -448,12 +463,12 @@ pub fn placeholder(ui: *Ui, buf: []u8) [*:0]const u8 {
 
 /// Enter on a command in the root search: opens its list, or runs it.
 pub fn activate(ui: *Ui, i: u16) void {
-    const reg = ui.ext_registry orelse return;
-    if (i >= reg.commands.len) return;
-    switch (reg.commands[i].mode) {
+    const registry = ui.ext_registry orelse return;
+    if (i >= registry.commands.len) return;
+    switch (registry.commands[i].mode) {
         .run => {
-            const h = ui.ext_host orelse return;
-            ui.ext_act_gen = h.act(reg.gen, i, false, 0, null, 0);
+            const host = ui.ext_host orelse return;
+            ui.ext_act_gen = host.act(registry.gen, i, false, 0, null, 0);
             ui.showRunning();
         },
         .form => form_view.open(ui, i),
@@ -467,17 +482,17 @@ pub fn activate(ui: *Ui, i: u16) void {
 
 /// Action `index` of the selected extension row.
 pub fn perform(ui: *Ui, index_: u8) void {
-    const it = ui.selectedItem() orelse return;
-    if (it.action != .ext_item) return;
-    const x = it.action.ext_item;
+    const item = ui.selectedItem() orelse return;
+    if (item.action != .ext_item) return;
+    const x = item.action.ext_item;
     if (index_ >= x.actions.len) return;
-    if (it.confirm and index_ == 0 and ui.needsConfirm(it)) return;
+    if (item.confirm and index_ == 0 and ui.needsConfirm(item)) return;
     ui.closePanel();
     switch (x.actions[index_]) {
         .lua => {
-            const h = ui.ext_host orelse return;
-            const reg = ui.ext_registry orelse return;
-            ui.ext_act_gen = h.act(reg.gen, x.command, x.root, x.gen, x.index, index_);
+            const host = ui.ext_host orelse return;
+            const registry = ui.ext_registry orelse return;
+            ui.ext_act_gen = host.act(registry.gen, x.command, x.root, x.gen, x.index, index_);
             ui.showRunning();
             return;
         },
@@ -521,15 +536,17 @@ fn open(ui: *Ui, target: [:0]const u8) void {
 
 /// A keymap from init.lua or an extension: opens its command or view.
 pub fn keymap(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) bool {
-    const reg = ui.ext_registry orelse return false;
+    const registry = ui.ext_registry orelse return false;
     const mask = c.GDK_CONTROL_MASK | c.GDK_ALT_MASK | c.GDK_SHIFT_MASK | c.GDK_SUPER_MASK;
     const key = c.gdk_keyval_to_lower(keyval);
-    for (reg.keymaps) |k| {
-        if (k.keyval != key or k.mods != state & mask) continue;
-        if (!openTarget(ui, k.target, null)) log.warn(
-            "keymap {s} ({s}): no command or view \"{s}\"",
-            .{ k.keys, k.ext, k.target },
-        );
+    for (registry.keymaps) |binding| {
+        if (binding.keyval != key or binding.mods != state & mask) continue;
+        if (!openTarget(ui, binding.target, null)) {
+            log.warn(
+                "keymap {s} ({s}): no command or view \"{s}\"",
+                .{ binding.keys, binding.ext, binding.target },
+            );
+        }
         return true;
     }
     return false;
@@ -538,8 +555,8 @@ pub fn keymap(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) bool {
 /// Opens a command by id ("github.prs") or a built-in view by name, with
 /// `text` typed. False when there is no such thing.
 pub fn openTarget(ui: *Ui, target: []const u8, text: ?[*:0]const u8) bool {
-    if (ui.ext_registry) |reg| if (find(reg, target)) |i| {
-        switch (reg.commands[i].mode) {
+    if (ui.ext_registry) |registry| if (find(registry, target)) |i| {
+        switch (registry.commands[i].mode) {
             .provider => return false,
             .run => {
                 activate(ui, i);

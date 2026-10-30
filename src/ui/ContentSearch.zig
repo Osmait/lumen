@@ -31,7 +31,7 @@ pub fn clip(query: []const u8) []const u8 {
 pub const Result = struct {
     gen: u32,
     /// When the keystroke that asked for it happened (latency stats).
-    t0: u64,
+    start_ns: u64,
     search_ns: u64,
     query: []const u8,
     hits: []index.ContentService.Hit,
@@ -39,9 +39,9 @@ pub const Result = struct {
     err: ?std.mem.Allocator.Error = null,
     arena: std.heap.ArenaAllocator,
 
-    pub fn destroy(r: *Result, gpa: std.mem.Allocator) void {
-        r.arena.deinit();
-        gpa.destroy(r);
+    pub fn destroy(result: *Result, gpa: std.mem.Allocator) void {
+        result.arena.deinit();
+        gpa.destroy(result);
     }
 };
 
@@ -63,7 +63,7 @@ gen: std.atomic.Value(u32) = .init(0),
 newer: std.atomic.Value(bool) = .init(false),
 stop: std.atomic.Value(bool) = .init(false),
 query: core.FixedStr(max_query) = .{},
-query_t0: u64 = 0,
+query_start_ns: u64 = 0,
 
 pub const StartError = std.mem.Allocator.Error || std.Thread.SpawnError;
 
@@ -76,9 +76,9 @@ pub fn start(
     on_result: Callback,
     ctx: ?*anyopaque,
 ) StartError!*ContentSearch {
-    const cs = try gpa.create(ContentSearch);
-    errdefer gpa.destroy(cs);
-    cs.* = .{
+    const content_search = try gpa.create(ContentSearch);
+    errdefer gpa.destroy(content_search);
+    content_search.* = .{
         .gpa = gpa,
         .io = io,
         .service = service,
@@ -86,105 +86,111 @@ pub fn start(
         .on_result = on_result,
         .ctx = ctx,
     };
-    cs.thread = try std.Thread.spawn(.{}, run, .{cs});
-    cs.thread.setName(io, "lm-csearch") catch {};
-    return cs;
+    content_search.thread = try std.Thread.spawn(.{}, run, .{content_search});
+    content_search.thread.setName(io, "lm-csearch") catch {};
+    return content_search;
 }
 
 /// Stops and joins the worker. Call once the GTK main loop has stopped:
 /// a result still queued with g_idle_add would otherwise reach a freed `cs`.
-pub fn shutdown(cs: *ContentSearch) void {
-    cs.stop.store(true, .release);
-    cs.newer.store(true, .release);
-    _ = cs.gen.fetchAdd(1, .release);
-    cs.io.futexWake(u32, &cs.gen.raw, 1);
-    cs.thread.join();
-    cs.gpa.destroy(cs);
+pub fn shutdown(content_search: *ContentSearch) void {
+    content_search.stop.store(true, .release);
+    content_search.newer.store(true, .release);
+    _ = content_search.gen.fetchAdd(1, .release);
+    content_search.io.futexWake(u32, &content_search.gen.raw, 1);
+    content_search.thread.join();
+    content_search.gpa.destroy(content_search);
 }
 
 /// Asks for `clip(query)`; returns its generation. Results of older
 /// generations still in flight should be dropped by the receiver.
 /// Thread-safe.
-pub fn submit(cs: *ContentSearch, query: []const u8, t0: u64) u32 {
-    const q = clip(query);
-    const g = blk: {
-        cs.lock.lockUncancelable(cs.io);
-        defer cs.lock.unlock(cs.io);
-        cs.query.set(q);
-        cs.query_t0 = t0;
-        cs.newer.store(true, .release);
-        break :blk cs.gen.fetchAdd(1, .release) + 1;
+pub fn submit(content_search: *ContentSearch, query: []const u8, start_ns: u64) u32 {
+    const query_clipped = clip(query);
+    const generation = blk: {
+        content_search.lock.lockUncancelable(content_search.io);
+        defer content_search.lock.unlock(content_search.io);
+        content_search.query.set(query_clipped);
+        content_search.query_start_ns = start_ns;
+        content_search.newer.store(true, .release);
+        break :blk content_search.gen.fetchAdd(1, .release) + 1;
     };
-    cs.io.futexWake(u32, &cs.gen.raw, 1);
-    return g;
+    content_search.io.futexWake(u32, &content_search.gen.raw, 1);
+    return generation;
 }
 
-fn run(cs: *ContentSearch) void {
+fn run(content_search: *ContentSearch) void {
     var seen: u32 = 0;
     while (true) {
-        while (cs.gen.load(.acquire) == seen and !cs.stop.load(.acquire)) {
-            cs.io.futexWaitUncancelable(u32, &cs.gen.raw, seen);
+        while (content_search.gen.load(.acquire) == seen and !content_search.stop.load(.acquire)) {
+            content_search.io.futexWaitUncancelable(u32, &content_search.gen.raw, seen);
         }
-        if (cs.stop.load(.acquire)) return;
+        if (content_search.stop.load(.acquire)) return;
 
-        const r = cs.gpa.create(Result) catch {
+        const result = content_search.gpa.create(Result) catch {
             // Drop this query rather than spin on it: the next keystroke
             // asks again.
-            seen = cs.gen.load(.acquire);
+            seen = content_search.gen.load(.acquire);
             log.warn("content search: out of memory", .{});
             continue;
         };
-        r.* = .{
+        result.* = .{
             .gen = 0,
-            .t0 = 0,
+            .start_ns = 0,
             .search_ns = 0,
             .query = "",
             .hits = &.{},
-            .arena = .init(cs.gpa),
+            .arena = .init(content_search.gpa),
         };
-        const a = r.arena.allocator();
+        const arena = result.arena.allocator();
         {
-            cs.lock.lockUncancelable(cs.io);
-            defer cs.lock.unlock(cs.io);
-            seen = cs.gen.load(.acquire);
+            content_search.lock.lockUncancelable(content_search.io);
+            defer content_search.lock.unlock(content_search.io);
+            seen = content_search.gen.load(.acquire);
             // Unless shutting down, which may have set it just before.
-            cs.newer.store(cs.stop.load(.acquire), .release);
-            r.gen = seen;
-            r.t0 = cs.query_t0;
-            r.query = a.dupe(u8, cs.query.slice()) catch |err| blk: {
-                r.err = err;
+            content_search.newer.store(content_search.stop.load(.acquire), .release);
+            result.gen = seen;
+            result.start_ns = content_search.query_start_ns;
+            result.query = arena.dupe(u8, content_search.query.slice()) catch |err| blk: {
+                result.err = err;
                 break :blk "";
             };
         }
 
-        const t = os.monotonicNs();
+        const now_ns = os.monotonicNs();
         var hits: std.ArrayList(index.ContentService.Hit) = .empty;
-        if (r.err == null) {
-            cs.service.searchUntil(a, r.query, cs.limit, &cs.newer, &hits) catch |err| {
-                r.err = err;
+        if (result.err == null) {
+            content_search.service.searchUntil(
+                arena,
+                result.query,
+                content_search.limit,
+                &content_search.newer,
+                &hits,
+            ) catch |err| {
+                result.err = err;
             };
         }
-        r.search_ns = os.monotonicNs() - t;
-        r.hits = hits.items;
+        result.search_ns = os.monotonicNs() - now_ns;
+        result.hits = hits.items;
         // A newer query arrived meanwhile: this answer is already stale.
-        if (cs.gen.load(.acquire) != seen) {
-            r.destroy(cs.gpa);
+        if (content_search.gen.load(.acquire) != seen) {
+            result.destroy(content_search.gpa);
             continue;
         }
-        const hop = cs.gpa.create(Hop) catch {
-            r.destroy(cs.gpa);
+        const hop = content_search.gpa.create(Hop) catch {
+            result.destroy(content_search.gpa);
             continue;
         };
-        hop.* = .{ .cs = cs, .result = r };
+        hop.* = .{ .content_search = content_search, .result = result };
         _ = c.g_idle_add(&deliver, hop);
     }
 }
 
-const Hop = struct { cs: *ContentSearch, result: *Result };
+const Hop = struct { content_search: *ContentSearch, result: *Result };
 
 fn deliver(data: ?*anyopaque) callconv(.c) c.gboolean {
     const hop: *Hop = @ptrCast(@alignCast(data.?));
-    defer hop.cs.gpa.destroy(hop);
-    hop.cs.on_result(hop.result, hop.cs.ctx);
+    defer hop.content_search.gpa.destroy(hop);
+    hop.content_search.on_result(hop.result, hop.content_search.ctx);
     return 0;
 }
