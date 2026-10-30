@@ -1454,7 +1454,10 @@ fn radixByKey(pairs: []u64, scratch: []u64) void {
     var target = scratch;
     inline for (.{ 32, 32 + radix_bits }) |shift| {
         var count: [radix_buckets + 1]usize = @splat(0);
-        for (source) |pair| count[@as(usize, @intCast((pair >> shift) & (radix_buckets - 1))) + 1] += 1;
+        for (source) |pair| {
+            const bucket: usize = @intCast((pair >> shift) & (radix_buckets - 1));
+            count[bucket + 1] += 1;
+        }
         for (1..radix_buckets + 1) |j| count[j] += count[j - 1];
         for (source) |pair| {
             const bucket: usize = @intCast((pair >> shift) & (radix_buckets - 1));
@@ -1670,7 +1673,8 @@ pub fn verify(
         count += 1;
         occurrence = findFold(text, counted, occurrence.end) orelse break;
     }
-    const line_start = if (std.mem.findScalarLast(u8, text[0..at], '\n')) |newline| newline + 1 else 0;
+    const newline_before = std.mem.findScalarLast(u8, text[0..at], '\n');
+    const line_start = if (newline_before) |newline| newline + 1 else 0;
     const line_end = std.mem.findScalarPos(u8, text, at, '\n') orelse text.len;
     const line_number: u32 = @intCast(std.mem.count(u8, text[0..at], "\n") + 1);
     // Keep the hit visible: start the snippet a little before it.
@@ -2264,7 +2268,8 @@ fn orderCandidates(
         while (phrase_index < phrase_items.len and phrase_items[phrase_index] < doc) {
             phrase_index += 1;
         }
-        const phrase_has_doc = phrase_index < phrase_items.len and phrase_items[phrase_index] == doc;
+        const phrase_has_doc = phrase_index < phrase_items.len and
+            phrase_items[phrase_index] == doc;
         const maybe_phrase = several and (!phrase_known or phrase_has_doc);
         const bound_phrase: i32 = if (maybe_phrase) phrase_max else 0;
         candidate.* = .{
