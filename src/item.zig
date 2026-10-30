@@ -8,16 +8,6 @@ const settings = @import("settings.zig");
 pub const Color = enum { red, orange, yellow, green, blue, purple, pink, gray };
 
 pub const Icon = union(enum) {
-    /// An icon given by name: "*-symbolic" on a grey tile, anything else in
-    /// full colour. `name` must outlive the icon.
-    pub fn byName(name: [:0]const u8) Icon {
-        if (name.len > 0 and name[0] == '/') return .{ .file = name };
-        return if (std.mem.endsWith(u8, name, "-symbolic")) .{ .tile = .{
-            .name = name,
-            .color = .gray,
-        } } else .{ .named = name };
-    }
-
     none,
     /// App icon from its .desktop file.
     gicon: *c.GIcon,
@@ -34,6 +24,17 @@ pub const Icon = union(enum) {
     logo: core.file_badge.Logo,
     /// A theme's colours, as a small preview tile.
     swatch: struct { id: []const u8, bg: u24, fg: u24, accent: u24 },
+
+    /// An icon given by name: a path is a file, "*-symbolic" goes on a grey
+    /// tile, anything else shows in full colour. `name` must outlive the
+    /// icon.
+    pub fn byName(name: [:0]const u8) Icon {
+        if (name.len > 0 and name[0] == '/') return .{ .file = name };
+        if (std.mem.endsWith(u8, name, "-symbolic")) {
+            return .{ .tile = .{ .name = name, .color = .gray } };
+        }
+        return .{ .named = name };
+    }
 };
 
 /// `ext`: the list of an extension command (which one is in the UI).
@@ -171,7 +172,7 @@ pub const Setting = union(enum) {
     pref: u16,
     /// Saves what was typed in the input view.
     save_input,
-    /// Changes field `i` of the open form.
+    /// Changes a field of the open form (its index in the form).
     field: u16,
     /// Submits the open form.
     submit_form,
@@ -278,7 +279,7 @@ pub fn actionsFor(item: *const Item) []const Entry {
             .{ .label = "Delete Entry", .keys = "Ctrl X", .op = .clip_delete },
             .{ .label = "Delete All Entries", .keys = "Ctrl Shift X", .op = .clip_clear },
         },
-        .file => |f| if (f.line > 0 and !f.extracted) &.{
+        .file => |file| if (file.line > 0 and !file.extracted) &.{
             .{ .label = "Open at Line", .keys = "↵", .op = .open_at_line },
             .{ .label = "Open", .keys = "Ctrl ↵", .op = .open },
             .{ .label = "Open With...", .keys = "Ctrl O", .op = .open_with },
@@ -293,7 +294,7 @@ pub fn actionsFor(item: *const Item) []const Entry {
             .{ .label = "Copy File", .keys = "Ctrl Shift F", .op = .copy_file },
             .{ .label = "Move to Trash", .keys = "Ctrl X", .op = .trash },
         },
-        .setting => |s| switch (s) {
+        .setting => |setting| switch (setting) {
             .toggle => &.{.{ .label = "Toggle", .keys = "↵", .op = .run }},
             .choose, .kind, .go => &.{.{ .label = "Change", .keys = "↵", .op = .run }},
             .pick => &.{.{ .label = "Select", .keys = "↵", .op = .run }},
@@ -316,16 +317,16 @@ pub fn actionsFor(item: *const Item) []const Entry {
             .{ .label = "Copy Answer", .keys = "↵", .op = .calc_copy },
             .{ .label = "Paste Answer", .keys = "Ctrl ↵", .op = .calc_paste },
         },
-        .ext_command => |x| if (x.run) &.{
+        .ext_command => |command| if (command.run) &.{
             .{ .label = "Run Command", .keys = "↵", .op = .run },
             .{ .label = "Reset Ranking", .keys = "", .op = .reset_ranking },
         } else &.{
             .{ .label = "Open Command", .keys = "↵", .op = .open },
             .{ .label = "Reset Ranking", .keys = "", .op = .reset_ranking },
         },
-        .ext_item => |x| x.entries,
+        .ext_item => |ext_item| ext_item.entries,
         .ext_problem => &.{.{ .label = "Copy Error", .keys = "↵", .op = .copy_detail }},
-        .pick => |p| if (p.selectable) &.{
+        .pick => |pick| if (pick.selectable) &.{
             .{ .label = "Select", .keys = "↵", .op = .run },
             .{ .label = "Use Typed Text", .keys = "Ctrl ↵", .op = .pick_typed },
         } else &.{
