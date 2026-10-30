@@ -4,12 +4,14 @@
 //! this decides what is there.
 
 const std = @import("std");
+const assert = std.debug.assert;
 
 pub const Position = enum { top, upper_third, center, bottom };
 pub const Panels = enum { split, single };
 pub const Search = enum { top, bottom };
 pub const Detail = enum { right, left, bottom };
-/// A row's subtitle under its title, or after it on the same line.
+/// A row's subtitle under its title, or after it on the same line. The
+/// value is "inline"; the tag is `inline_` because `inline` is a keyword.
 pub const Rows = enum { stacked, inline_ };
 /// The search bar's pieces: the back arrow, the magnifier, the prompt, the
 /// open view's name, the text field and the "Ctrl K" chip.
@@ -25,11 +27,12 @@ pub fn Parts(comptime T: type) type {
         items: [n]T = std.enums.values(T)[0..n].*,
         len: u8 = n,
 
-        pub fn slice(p: *const @This()) []const T {
-            return p.items[0..p.len];
+        pub fn slice(parts: *const @This()) []const T {
+            return parts.items[0..parts.len];
         }
-        pub fn has(p: *const @This(), part: T) bool {
-            return std.mem.findScalar(T, p.slice(), part) != null;
+
+        pub fn has(parts: *const @This(), part: T) bool {
+            return std.mem.findScalar(T, parts.slice(), part) != null;
         }
     };
 }
@@ -77,10 +80,20 @@ pub const Layout = struct {
     /// other views show their name and "…". Registry memory, like prompt.
     placeholder: [:0]const u8 = "",
 
-    pub const min_width = 360;
-    pub const max_width = 2400;
-    pub const min_height = 240;
-    pub const max_height = 1600;
+    pub const width_min = 360;
+    pub const width_max = 2400;
+    pub const height_min = 240;
+    pub const height_max = 1600;
+    /// Pixels either way.
+    pub const offset_max = 2000;
+
+    comptime {
+        assert(width_min < width_max);
+        assert(height_min < height_max);
+        assert(width_max <= std.math.maxInt(u16));
+        assert(height_max <= std.math.maxInt(u16));
+        assert(offset_max <= std.math.maxInt(i16));
+    }
 };
 
 /// The layout keys, for error messages.
@@ -89,57 +102,61 @@ pub const show_keys = "hints, subtitles, accessories, icons, section_titles, key
 
 pub const SetError = error{ UnknownKey, BadValue };
 
+/// The keys `set` takes; the extension API reads show, searchbar, row,
+/// prompt and placeholder itself.
+const Key = enum { width, height, offset, position, panels, search, detail, rows, footer };
+
 /// Sets one key from a Lua-ish value: a number, a string or a boolean.
-pub fn set(l: *Layout, key: []const u8, value: Value) SetError!void {
-    const eql = std.mem.eql;
-    if (eql(u8, key, "width") or eql(u8, key, "height")) {
-        const n = value.number orelse return error.BadValue;
-        const lo: f64 = if (key[0] == 'w') Layout.min_width else Layout.min_height;
-        const hi: f64 = if (key[0] == 'w') Layout.max_width else Layout.max_height;
-        if (!(n >= lo and n <= hi)) return error.BadValue;
-        const px: u16 = @intFromFloat(n);
-        if (key[0] == 'w') l.width = px else l.height = px;
-    } else if (eql(u8, key, "offset")) {
-        const n = value.number orelse return error.BadValue;
-        if (!(n >= -2000 and n <= 2000)) return error.BadValue;
-        l.offset = @intFromFloat(n);
-    } else if (eql(u8, key, "position")) {
-        l.position = std.meta.stringToEnum(
-            Position,
-            value.string orelse return error.BadValue,
-        ) orelse return error.BadValue;
-    } else if (eql(u8, key, "panels")) {
-        l.panels = std.meta.stringToEnum(
-            Panels,
-            value.string orelse return error.BadValue,
-        ) orelse return error.BadValue;
-    } else if (eql(u8, key, "search")) {
-        l.search = std.meta.stringToEnum(
-            Search,
-            value.string orelse return error.BadValue,
-        ) orelse return error.BadValue;
-    } else if (eql(u8, key, "detail")) {
-        l.detail = std.meta.stringToEnum(
-            Detail,
-            value.string orelse return error.BadValue,
-        ) orelse return error.BadValue;
-    } else if (eql(u8, key, "rows")) {
-        const v = value.string orelse return error.BadValue;
-        l.rows = if (eql(
-            u8,
-            v,
-            "stacked",
-        )) .stacked else if (eql(u8, v, "inline")) .inline_ else return error.BadValue;
-    } else if (eql(u8, key, "footer")) {
-        l.footer = value.boolean orelse return error.BadValue;
-    } else return error.UnknownKey;
+pub fn set(layout: *Layout, key_name: []const u8, value: Value) SetError!void {
+    const key = std.meta.stringToEnum(Key, key_name) orelse return error.UnknownKey;
+    switch (key) {
+        .width => layout.width = try pixels(value, Layout.width_min, Layout.width_max),
+        .height => layout.height = try pixels(value, Layout.height_min, Layout.height_max),
+        .offset => {
+            const number = value.number orelse return error.BadValue;
+            if (!inRange(number, -Layout.offset_max, Layout.offset_max)) return error.BadValue;
+            layout.offset = @intFromFloat(number);
+        },
+        .position => layout.position = try enumValue(Position, value),
+        .panels => layout.panels = try enumValue(Panels, value),
+        .search => layout.search = try enumValue(Search, value),
+        .detail => layout.detail = try enumValue(Detail, value),
+        .rows => layout.rows = try rowsValue(value),
+        .footer => layout.footer = value.boolean orelse return error.BadValue,
+    }
+}
+
+/// A size in pixels, from `min` to `max`.
+fn pixels(value: Value, min: u16, max: u16) SetError!u16 {
+    const number = value.number orelse return error.BadValue;
+    if (!inRange(number, @floatFromInt(min), @floatFromInt(max))) return error.BadValue;
+    return @intFromFloat(number);
+}
+
+/// Whether `number` is from `min` to `max`. False for NaN (a Lua number
+/// may be 0/0): written as `number < min or number > max`, NaN would pass,
+/// and turning it into an integer is then illegal behaviour.
+fn inRange(number: f64, min: f64, max: f64) bool {
+    return number >= min and number <= max;
+}
+
+fn enumValue(comptime Enum: type, value: Value) SetError!Enum {
+    const name = value.string orelse return error.BadValue;
+    return std.meta.stringToEnum(Enum, name) orelse error.BadValue;
+}
+
+fn rowsValue(value: Value) SetError!Rows {
+    const name = value.string orelse return error.BadValue;
+    if (std.mem.eql(u8, name, "stacked")) return .stacked;
+    if (std.mem.eql(u8, name, "inline")) return .inline_;
+    return error.BadValue;
 }
 
 /// Sets one `show` flag.
-pub fn setShow(s: *Show, key: []const u8, on: bool) SetError!void {
+pub fn setShow(show: *Show, key: []const u8, on: bool) SetError!void {
     inline for (@typeInfo(Show).@"struct".field_names) |name| {
         if (std.mem.eql(u8, key, name)) {
-            @field(s, name) = on;
+            @field(show, name) = on;
             return;
         }
     }
@@ -148,21 +165,22 @@ pub fn setShow(s: *Show, key: []const u8, on: bool) SetError!void {
 
 /// Sets an order of parts from their names; it must keep `required`.
 pub fn setParts(
-    comptime T: type,
-    p: *Parts(T),
+    comptime Part: type,
+    parts: *Parts(Part),
     names: []const []const u8,
-    required: T,
+    required: Part,
 ) SetError!void {
-    if (names.len == 0 or names.len > p.items.len) return error.BadValue;
-    var out: Parts(T) = .{ .len = 0 };
-    for (names) |n| {
-        const part = std.meta.stringToEnum(T, n) orelse return error.UnknownKey;
-        if (out.has(part)) return error.BadValue;
-        out.items[out.len] = part;
-        out.len += 1;
+    if (names.len == 0 or names.len > parts.items.len) return error.BadValue;
+    var parts_new: Parts(Part) = .{ .len = 0 };
+    for (names) |name| {
+        const part = std.meta.stringToEnum(Part, name) orelse return error.UnknownKey;
+        if (parts_new.has(part)) return error.BadValue;
+        parts_new.items[parts_new.len] = part;
+        parts_new.len += 1;
     }
-    if (!out.has(required)) return error.BadValue;
-    p.* = out;
+    if (!parts_new.has(required)) return error.BadValue;
+    assert(parts_new.len == names.len);
+    parts.* = parts_new;
 }
 
 pub const Value = struct {
@@ -206,6 +224,10 @@ test "layout keys and values" {
     try std.testing.expectError(error.BadValue, set(&l, "panels", .{ .string = "triple" }));
     try std.testing.expectError(error.BadValue, set(&l, "footer", .{ .string = "yes" }));
     try std.testing.expectError(error.UnknownKey, set(&l, "colour", .{ .string = "red" }));
+    try std.testing.expectError(error.BadValue, set(&l, "width", .{ .number = std.math.nan(f64) }));
+    try set(&l, "rows", .{ .string = "inline" });
+    try std.testing.expectEqual(Rows.inline_, l.rows);
+    try std.testing.expectError(error.BadValue, set(&l, "rows", .{ .string = "inline_" }));
     try setShow(&l.show, "icons", false);
     try std.testing.expect(!l.show.icons);
     try std.testing.expectError(error.UnknownKey, setShow(&l.show, "iconz", false));
