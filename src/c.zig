@@ -30,6 +30,17 @@ pub const graphene_rect_t = extern struct {
     size: extern struct { width: f32, height: f32 },
 };
 
+// The structs above are copied by hand from the headers: their sizes, as
+// the C compiler lays them out on x86_64 and aarch64, catch a field
+// copied wrong.
+comptime {
+    const std = @import("std");
+    std.debug.assert(@sizeOf(GError) == 16);
+    std.debug.assert(@sizeOf(GList) == 3 * @sizeOf(usize));
+    std.debug.assert(@sizeOf(GdkRectangle) == 16);
+    std.debug.assert(@sizeOf(graphene_rect_t) == 16);
+}
+
 pub const GObject = opaque {};
 pub const GDir = opaque {};
 pub const GDateTime = opaque {};

@@ -4,6 +4,7 @@
 //! No GTK, no libc: the client reads it too.
 
 const std = @import("std");
+const assert = std.debug.assert;
 
 pub const Flag = enum {
     toggle,
@@ -38,7 +39,8 @@ pub const Spec = struct {
     value: Value = .none,
     /// What the usage shows after the flag.
     arg: []const u8 = "",
-    /// Lines broken with \n.
+    /// Help text; "\n" starts a continuation line, indented under the
+    /// first.
     help: []const u8 = "",
     group: Group,
     /// `lumen` hands it to a running daemon; the others run lumen-gtk.
@@ -161,6 +163,17 @@ pub const specs: std.enums.EnumArray(Flag, Spec) = .init(.{
     .clip_store = .{ .group = .hidden },
 });
 
+comptime {
+    for (std.enums.values(Flag)) |flag| {
+        const spec = specs.get(flag);
+        // A value the client passes on is never optional: it could not
+        // tell a value from the next flag the way lumen-gtk does.
+        if (spec.socket) assert(spec.value != .optional);
+        // What the usage shows after a flag is the name of its value.
+        if (spec.value == .none) assert(spec.arg.len == 0);
+    }
+}
+
 /// "--clip-store" for .clip_store.
 pub fn name(flag: Flag) []const u8 {
     return names.get(flag);
@@ -168,18 +181,20 @@ pub fn name(flag: Flag) []const u8 {
 
 const names: std.enums.EnumArray(Flag, []const u8) = blk: {
     var out: std.enums.EnumArray(Flag, []const u8) = .initUndefined();
-    for (std.enums.values(Flag)) |f| {
-        var n: [@tagName(f).len]u8 = @tagName(f).*;
-        std.mem.replaceScalar(u8, &n, '_', '-');
-        const final = n;
-        out.set(f, "--" ++ &final);
+    for (std.enums.values(Flag)) |flag| {
+        var dashed: [@tagName(flag).len]u8 = @tagName(flag).*;
+        std.mem.replaceScalar(u8, &dashed, '_', '-');
+        const final = dashed;
+        out.set(flag, "--" ++ &final);
     }
     break :blk out;
 };
 
 /// The flag `arg` names, or null.
 pub fn parse(arg: []const u8) ?Flag {
-    for (std.enums.values(Flag)) |f| if (std.mem.eql(u8, arg, name(f))) return f;
+    for (std.enums.values(Flag)) |flag| {
+        if (std.mem.eql(u8, arg, name(flag))) return flag;
+    }
     return null;
 }
 
@@ -193,17 +208,18 @@ pub const usage: [:0]const u8 = blk: {
         .{ .extensions, "\nExtensions:\n" },
         .{ .dmenu, "\nAs dmenu (lumen --dmenu < lines):\n" },
         .{ .tests, "\nFor tests:\n" },
-    }) |g| {
-        text = text ++ g[1];
-        for (std.enums.values(Flag)) |f| {
-            const s = specs.get(f);
-            if (s.group != g[0]) continue;
-            const left = name(f) ++ (if (s.arg.len > 0) " " ++ s.arg else "");
+    }) |section| {
+        const group, const heading = section;
+        text = text ++ heading;
+        for (std.enums.values(Flag)) |flag| {
+            const spec = specs.get(flag);
+            if (spec.group != group) continue;
+            const left = name(flag) ++ (if (spec.arg.len > 0) " " ++ spec.arg else "");
             // Continuation lines start under the first one.
             var help: []const u8 = "";
-            var lines = std.mem.splitScalar(u8, s.help, '\n');
+            var lines = std.mem.splitScalar(u8, spec.help, '\n');
             help = help ++ lines.first();
-            while (lines.next()) |l| help = help ++ "\n" ++ &help_indent ++ l;
+            while (lines.next()) |line| help = help ++ "\n" ++ &help_indent ++ line;
             text = text ++ std.fmt.comptimePrint("  {s:<20} {s}\n", .{ left, help });
         }
     }
@@ -217,16 +233,10 @@ test "names, parsing and the usage" {
     try std.testing.expect(parse("--nope") == null);
     try std.testing.expect(parse("view") == null);
     var lines = std.mem.splitScalar(u8, usage, '\n');
-    while (lines.next()) |l| try std.testing.expect(l.len <= 80);
+    while (lines.next()) |line| try std.testing.expect(line.len <= 80);
     // Every flag people use is in the usage, the internal one is not.
-    for (std.enums.values(Flag)) |f| {
-        const listed = std.mem.find(u8, usage, name(f)) != null;
-        try std.testing.expectEqual(specs.get(f).group != .hidden, listed);
-    }
-    // A value the client passes on is never optional: it could not tell
-    // a value from the next flag the way lumen-gtk does.
-    for (std.enums.values(Flag)) |f| {
-        const s = specs.get(f);
-        if (s.socket) try std.testing.expect(s.value != .optional);
+    for (std.enums.values(Flag)) |flag| {
+        const listed = std.mem.find(u8, usage, name(flag)) != null;
+        try std.testing.expectEqual(specs.get(flag).group != .hidden, listed);
     }
 }
