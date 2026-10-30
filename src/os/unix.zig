@@ -9,8 +9,8 @@ const os = @import("root.zig");
 
 /// The errno of a raw syscall result, null when it succeeded.
 pub fn failed(rc: usize) ?linux.E {
-    const e = linux.errno(rc);
-    return if (e == .SUCCESS) null else e;
+    const errno = linux.errno(rc);
+    return if (errno == .SUCCESS) null else errno;
 }
 
 pub const ConnectOptions = struct { nonblock: bool = false };
@@ -47,14 +47,14 @@ pub fn send(fd: linux.fd_t, bytes: []const u8) usize {
 
 /// Sends all of `bytes` on a blocking socket; false when the peer went first.
 pub fn sendAll(fd: linux.fd_t, bytes: []const u8) bool {
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = send(fd, bytes[off..]);
-        if (failed(n)) |e| switch (e) {
+    var sent: usize = 0;
+    while (sent < bytes.len) {
+        const rc = send(fd, bytes[sent..]);
+        if (failed(rc)) |errno| switch (errno) {
             .INTR => continue,
             else => return false,
         };
-        off += n;
+        sent += rc;
     }
     return true;
 }
@@ -68,7 +68,8 @@ pub fn peerUid(fd: linux.fd_t) ?u32 {
     var cred: Ucred = undefined;
     var len: linux.socklen_t = @sizeOf(Ucred);
     const rc = linux.getsockopt(fd, linux.SOL.SOCKET, linux.SO.PEERCRED, @ptrCast(&cred), &len);
-    if (failed(rc) != null or len != @sizeOf(Ucred)) return null;
+    if (failed(rc) != null) return null;
+    if (len != @sizeOf(Ucred)) return null;
     return cred.uid;
 }
 
@@ -90,8 +91,8 @@ pub fn readSome(fd: linux.fd_t, buf: []u8, deadline_ns: u64) ReadError!usize {
             ));
             if (!os.waitReadable(fd, left_ms)) continue;
         }
-        const n = linux.read(fd, buf.ptr, buf.len);
-        if (failed(n)) |e| switch (e) {
+        const rc = linux.read(fd, buf.ptr, buf.len);
+        if (failed(rc)) |errno| switch (errno) {
             .INTR => continue,
             // A non-blocking descriptor with nothing yet (a stdin left
             // O_NONBLOCK): wait for it rather than spin on read.
@@ -101,19 +102,19 @@ pub fn readSome(fd: linux.fd_t, buf: []u8, deadline_ns: u64) ReadError!usize {
             },
             else => return error.Syscall,
         };
-        return n;
+        return rc;
     }
 }
 
 /// Reads until end of input or `buf` is full; the bytes read.
 pub fn readAll(fd: linux.fd_t, buf: []u8, deadline_ns: u64) ReadError!usize {
-    var got: usize = 0;
-    while (got < buf.len) {
-        const n = try readSome(fd, buf[got..], deadline_ns);
-        if (n == 0) break;
-        got += n;
+    var bytes_read: usize = 0;
+    while (bytes_read < buf.len) {
+        const chunk_len = try readSome(fd, buf[bytes_read..], deadline_ns);
+        if (chunk_len == 0) break;
+        bytes_read += chunk_len;
     }
-    return got;
+    return bytes_read;
 }
 
 test "whole reads and writes over a socket pair" {

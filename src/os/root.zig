@@ -3,6 +3,7 @@
 //! `lumen` client uses it too.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const linux = std.os.linux;
 
 pub const unix = @import("unix.zig");
@@ -54,72 +55,82 @@ pub const DirIter = struct {
 
     pub const Entry = struct { name: []const u8, kind: u8 };
 
-    pub fn next(it: *DirIter) Error!?Entry {
+    pub fn next(iterator: *DirIter) Error!?Entry {
         while (true) {
-            if (it.pos >= it.end) {
-                const n = try check(linux.getdents64(it.fd, &it.buf, it.buf.len));
-                if (n == 0) return null;
-                it.pos = 0;
-                it.end = n;
+            if (iterator.pos == iterator.end) {
+                const buf = &iterator.buf;
+                const bytes_read = try check(linux.getdents64(iterator.fd, buf, buf.len));
+                if (bytes_read == 0) return null;
+                iterator.pos = 0;
+                iterator.end = bytes_read;
             }
-            const d: *align(1) linux.dirent64 = @ptrCast(&it.buf[it.pos]);
-            it.pos += d.reclen;
-            const name_ptr: [*:0]const u8 = @ptrCast(
-                &it.buf[it.pos - d.reclen + @offsetOf(linux.dirent64, "name")],
-            );
+            const entry_start = iterator.pos;
+            const dirent: *align(1) linux.dirent64 = @ptrCast(&iterator.buf[entry_start]);
+            // A zero-length record would never advance: a bug in the
+            // kernel's buffer, or in this walk of it.
+            assert(dirent.reclen > 0);
+            iterator.pos += dirent.reclen;
+            assert(iterator.pos <= iterator.end);
+            const name_offset = entry_start + @offsetOf(linux.dirent64, "name");
+            const name_ptr: [*:0]const u8 = @ptrCast(&iterator.buf[name_offset]);
             const name = std.mem.span(name_ptr);
-            if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-            return .{ .name = name, .kind = d.type };
+            if (std.mem.eql(u8, name, ".")) continue;
+            if (std.mem.eql(u8, name, "..")) continue;
+            return .{ .name = name, .kind = dirent.type };
         }
     }
 };
 
 /// Names of the folders directly in `path` (links to folders count), that
-/// `keep` accepts, sorted, in `a`. Hidden ones are skipped. Empty when the
-/// folder cannot be read; out of memory, the ones found so far.
+/// `keep` accepts, sorted, in `arena`. Hidden ones are skipped. Empty when
+/// the folder cannot be read; out of memory, the ones found so far.
 pub fn subdirs(
-    a: std.mem.Allocator,
+    arena: std.mem.Allocator,
     path: [:0]const u8,
     keep: *const fn ([]const u8) bool,
 ) []const [:0]const u8 {
     const fd = openDir(path) catch return &.{};
     defer close(fd);
-    var it: DirIter = .{ .fd = fd };
+    var iterator: DirIter = .{ .fd = fd };
     var names: std.ArrayList([:0]const u8) = .empty;
-    while (it.next() catch null) |e| {
-        if (e.name[0] == '.' or !keep(e.name)) continue;
-        if (e.kind != Kind.dir) {
-            if (e.kind != Kind.symlink and e.kind != Kind.unknown) continue;
-            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-            const full = std.mem.printSentinel(
-                &buf,
-                "{s}/{s}",
-                .{ path, e.name },
-                0,
-            ) catch continue;
-            const i = info(full) orelse continue;
-            if (!i.is_dir) continue;
-        }
-        names.append(a, a.dupeSentinel(u8, e.name, 0) catch break) catch break;
+    while (iterator.next() catch null) |entry| {
+        if (entry.name[0] == '.') continue;
+        if (!keep(entry.name)) continue;
+        if (!isDirEntry(path, entry)) continue;
+        const name = arena.dupeSentinel(u8, entry.name, 0) catch break;
+        names.append(arena, name) catch break;
     }
     std.mem.sort([:0]const u8, names.items, {}, struct {
-        fn lt(_: void, x: [:0]const u8, y: [:0]const u8) bool {
-            return std.mem.order(u8, x, y) == .lt;
+        fn lessThan(_: void, left: [:0]const u8, right: [:0]const u8) bool {
+            return std.mem.order(u8, left, right) == .lt;
         }
-    }.lt);
+    }.lessThan);
     return names.items;
+}
+
+/// Whether `entry` of the folder at `path` is a folder, following a link
+/// (and asking the file system when d_type is unknown).
+fn isDirEntry(path: [:0]const u8, entry: DirIter.Entry) bool {
+    if (entry.kind == Kind.dir) return true;
+    if (entry.kind != Kind.symlink and entry.kind != Kind.unknown) return false;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const full = std.mem.printSentinel(&buf, "{s}/{s}", .{ path, entry.name }, 0) catch {
+        return false;
+    };
+    const entry_info = info(full) orelse return false;
+    return entry_info.is_dir;
 }
 
 /// A file's identity for "did it change?": modification time to the
 /// nanosecond, size and inode (editors that save by renaming a new file).
 pub const Stamp = struct {
-    /// What no file has: the first look always counts as a change.
-    pub const none: Stamp = .{};
-
     sec: i64 = -1,
     nsec: u32 = 0,
     size: u64 = 0,
     ino: u64 = 0,
+
+    /// What no file has: the first look always counts as a change.
+    pub const none: Stamp = .{};
 
     pub fn of(path: [*:0]const u8) Stamp {
         var st: linux.Statx = undefined;
@@ -134,8 +145,8 @@ pub const Stamp = struct {
         return .{ .sec = st.mtime.sec, .nsec = st.mtime.nsec, .size = st.size, .ino = st.ino };
     }
 
-    pub fn eql(a: Stamp, b: Stamp) bool {
-        return a.sec == b.sec and a.nsec == b.nsec and a.size == b.size and a.ino == b.ino;
+    pub fn eql(left: Stamp, right: Stamp) bool {
+        return std.meta.eql(left, right);
     }
 };
 
@@ -249,7 +260,7 @@ pub fn slowMounts(gpa: std.mem.Allocator, under: []const u8) std.mem.Allocator.E
     try readUpTo(gpa, fd, &text, 4 << 20);
     var out: std.ArrayList([]u8) = .empty;
     errdefer {
-        for (out.items) |x| gpa.free(x);
+        for (out.items) |mount| gpa.free(mount);
         out.deinit(gpa);
     }
     var lines = std.mem.tokenizeScalar(u8, text.items, '\n');
@@ -262,9 +273,7 @@ pub fn slowMounts(gpa: std.mem.Allocator, under: []const u8) std.mem.Allocator.E
         var tail = std.mem.tokenizeScalar(u8, line[dash + 3 ..], ' ');
         if (!mayHang(tail.next() orelse continue)) continue;
         const mount = try unescapeMount(gpa, escaped);
-        const below = std.mem.startsWith(u8, mount, under) and (mount.len == under.len or
-            mount[under.len] == '/' or std.mem.endsWith(u8, under, "/"));
-        if (!below) {
+        if (!isAtOrBelow(mount, under)) {
             gpa.free(mount);
             continue;
         }
@@ -276,69 +285,89 @@ pub fn slowMounts(gpa: std.mem.Allocator, under: []const u8) std.mem.Allocator.E
     return out.toOwnedSlice(gpa);
 }
 
+/// `path` is `root` itself or inside it ("/home/u" is below "/home", and
+/// "/homework" is not).
+fn isAtOrBelow(path: []const u8, root: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, root)) return false;
+    if (path.len == root.len) return true;
+    if (std.mem.endsWith(u8, root, "/")) return true;
+    return path[root.len] == '/';
+}
+
 pub fn freeList(gpa: std.mem.Allocator, list: []const []u8) void {
-    for (list) |x| gpa.free(x);
+    for (list) |item| gpa.free(item);
     gpa.free(list);
 }
 
 fn mayHang(fstype: []const u8) bool {
     // Plain "fuseblk" is a local disk (ntfs-3g).
-    if (std.mem.startsWith(u8, fstype, "fuse.") or std.mem.eql(u8, fstype, "fuse")) return true;
-    for ([_][]const u8{
+    if (std.mem.startsWith(u8, fstype, "fuse.")) return true;
+    if (std.mem.eql(u8, fstype, "fuse")) return true;
+    const network = [_][]const u8{
         "nfs",  "nfs4",      "cifs",   "smb3", "smbfs", "9p",
         "ceph", "glusterfs", "lustre", "afs",  "davfs", "ncpfs",
-    }) |t| if (std.mem.eql(u8, fstype, t)) return true;
+    };
+    for (network) |network_fstype| {
+        if (std.mem.eql(u8, fstype, network_fstype)) return true;
+    }
     return false;
 }
 
 /// mountinfo writes space, tab, newline and backslash as `\ooo`.
-fn unescapeMount(gpa: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error![]u8 {
+fn unescapeMount(gpa: std.mem.Allocator, escaped: []const u8) std.mem.Allocator.Error![]u8 {
     var buf: [4096]u8 = undefined;
-    var n: usize = 0;
-    var i: usize = 0;
-    while (i < s.len and n < buf.len) : (n += 1) {
-        if (s[i] == '\\' and i + 3 < s.len) {
-            if (std.fmt.parseInt(u8, s[i + 1 .. i + 4], 8)) |b| {
-                buf[n] = b;
-                i += 4;
+    var len: usize = 0;
+    var pos: usize = 0;
+    while (pos < escaped.len and len < buf.len) : (len += 1) {
+        if (escaped[pos] == '\\' and pos + 3 < escaped.len) {
+            if (std.fmt.parseInt(u8, escaped[pos + 1 .. pos + 4], 8)) |byte| {
+                buf[len] = byte;
+                pos += 4;
                 continue;
             } else |_| {}
         }
-        buf[n] = s[i];
-        i += 1;
+        buf[len] = escaped[pos];
+        pos += 1;
     }
-    return gpa.dupe(u8, buf[0..n]);
+    return gpa.dupe(u8, buf[0..len]);
 }
 
 test "slow mounts: escapes undone, only below the root" {
     const gpa = std.testing.allocator;
-    const m = try unescapeMount(gpa, "/home/u/my\\040share");
-    defer gpa.free(m);
-    try std.testing.expectEqualStrings("/home/u/my share", m);
-    try std.testing.expect(mayHang("fuse.sshfs") and mayHang("nfs4") and !mayHang("fuseblk"));
-    try std.testing.expect(!mayHang("ext4") and !mayHang("btrfs") and !mayHang("tmpfs"));
+    const mount = try unescapeMount(gpa, "/home/u/my\\040share");
+    defer gpa.free(mount);
+    try std.testing.expectEqualStrings("/home/u/my share", mount);
+    for ([_][]const u8{ "fuse.sshfs", "nfs4" }) |fstype| try std.testing.expect(mayHang(fstype));
+    for ([_][]const u8{ "fuseblk", "ext4", "btrfs", "tmpfs" }) |fstype| {
+        try std.testing.expect(!mayHang(fstype));
+    }
+    try std.testing.expect(isAtOrBelow("/home", "/home"));
+    try std.testing.expect(isAtOrBelow("/home/u", "/home"));
+    try std.testing.expect(isAtOrBelow("/home/u", "/home/"));
+    try std.testing.expect(!isAtOrBelow("/homework", "/home"));
     // Whatever this machine mounts, nothing is outside what was asked for.
     const list = try slowMounts(gpa, "/home");
     defer freeList(gpa, list);
-    for (list) |x| try std.testing.expect(std.mem.startsWith(u8, x, "/home"));
+    for (list) |item| try std.testing.expect(std.mem.startsWith(u8, item, "/home"));
 }
 
 pub fn nowSeconds() i64 {
     var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(.REALTIME, &ts);
+    // These clocks exist on every Linux Lumen runs on: a failure is a bug.
+    assert(linux.errno(linux.clock_gettime(.REALTIME, &ts)) == .SUCCESS);
     return ts.sec;
 }
 
 pub fn monotonicNs() u64 {
     var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    assert(linux.errno(linux.clock_gettime(.MONOTONIC, &ts)) == .SUCCESS);
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
+/// Sleeps `us` microseconds; a signal may cut it short.
 pub fn sleepUs(us: u64) void {
-    const ts: linux.timespec = .{ .sec = @intCast(us / std.time.us_per_s), .nsec = @intCast(
-        (us % std.time.us_per_s) * 1000,
-    ) };
+    const nsec = (us % std.time.us_per_s) * std.time.ns_per_us;
+    const ts: linux.timespec = .{ .sec = @intCast(us / std.time.us_per_s), .nsec = @intCast(nsec) };
     _ = linux.nanosleep(&ts, null);
 }
 
@@ -360,16 +389,17 @@ pub fn writeAll(fd: i32, data: []const u8) Error!void {
 }
 
 pub fn writeAllAt(fd: i32, data: []const u8, at: ?usize) Error!void {
-    var off: usize = 0;
-    while (off < data.len) {
-        const rest = data[off..];
-        const rc = if (at) |a|
-            linux.pwrite(fd, rest.ptr, rest.len, @intCast(a + off))
+    var written: usize = 0;
+    while (written < data.len) {
+        const rest = data[written..];
+        const rc = if (at) |offset|
+            linux.pwrite(fd, rest.ptr, rest.len, @intCast(offset + written))
         else
             linux.write(fd, rest.ptr, rest.len);
         if (linux.errno(rc) == .INTR) continue;
-        off += try check(rc);
+        written += try check(rc);
     }
+    assert(written == data.len);
 }
 
 /// Reads `fd` into `buf` until its end or `buf` holds `max_bytes` (it can
@@ -383,10 +413,11 @@ pub fn readUpTo(
     while (buf.items.len < max_bytes) {
         try buf.ensureUnusedCapacity(gpa, 64 * 1024);
         const spare = buf.unusedCapacitySlice();
-        const n = linux.read(fd, spare.ptr, spare.len);
-        switch (linux.errno(n)) {
-            .SUCCESS => if (n == 0) return else {
-                buf.items.len += n;
+        const bytes_read = linux.read(fd, spare.ptr, spare.len);
+        switch (linux.errno(bytes_read)) {
+            .SUCCESS => {
+                if (bytes_read == 0) return;
+                buf.items.len += bytes_read;
             },
             .INTR => {},
             else => return,
@@ -402,10 +433,10 @@ pub fn rename(from: [*:0]const u8, to: [*:0]const u8) Error!void {
 /// full disk never leaves a truncated `path` behind, and a failed write
 /// leaves no `.tmp`. Owner-only.
 pub fn writeFileAtomic(path: []const u8, data: []const u8) Error!void {
-    var f = try AtomicFile.create(path);
-    errdefer f.abort();
-    try f.write(data);
-    try f.commit();
+    var file = try AtomicFile.create(path);
+    errdefer file.abort();
+    try file.write(data);
+    try file.commit();
 }
 
 /// `writeFileAtomic` a piece at a time: `<path>.tmp`, written in order, a
@@ -419,23 +450,16 @@ pub const AtomicFile = struct {
     final_len: usize = 0,
 
     pub fn create(path: []const u8) Error!AtomicFile {
-        var f: AtomicFile = .{ .fd = -1 };
-        const final = std.mem.printSentinel(
-            &f.final,
-            "{s}",
-            .{path},
-            0,
-        ) catch return error.NameTooLong;
-        const tmp = std.mem.printSentinel(
-            &f.tmp,
-            "{s}.tmp",
-            .{path},
-            0,
-        ) catch return error.NameTooLong;
-        f.final_len = final.len;
-        f.tmp_len = tmp.len;
-        f.fd = try openTemp(tmp);
-        return f;
+        var file: AtomicFile = .{ .fd = -1 };
+        const print = std.mem.printSentinel;
+        const final = print(&file.final, "{s}", .{path}, 0) catch return error.NameTooLong;
+        const tmp = print(&file.tmp, "{s}.tmp", .{path}, 0) catch return error.NameTooLong;
+        assert(final.len > 0);
+        assert(tmp.len > final.len);
+        file.final_len = final.len;
+        file.tmp_len = tmp.len;
+        file.fd = try openTemp(tmp);
+        return file;
     }
 
     /// A new file, never one that is there: `O_TRUNC` wrote through a link
@@ -456,26 +480,30 @@ pub const AtomicFile = struct {
         return @intCast(try check(rc));
     }
 
-    pub fn write(f: *AtomicFile, data: []const u8) Error!void {
-        try writeAll(f.fd, data);
+    pub fn write(file: *AtomicFile, data: []const u8) Error!void {
+        assert(file.fd >= 0);
+        try writeAll(file.fd, data);
     }
 
-    pub fn writeAt(f: *AtomicFile, data: []const u8, at: usize) Error!void {
-        try writeAllAt(f.fd, data, at);
+    pub fn writeAt(file: *AtomicFile, data: []const u8, at: usize) Error!void {
+        assert(file.fd >= 0);
+        try writeAllAt(file.fd, data, at);
     }
 
-    pub fn commit(f: *AtomicFile) Error!void {
-        errdefer f.abort();
-        _ = try check(linux.fsync(f.fd));
-        close(f.fd);
-        f.fd = -1;
-        try rename(f.tmp[0..f.tmp_len :0], f.final[0..f.final_len :0]);
+    pub fn commit(file: *AtomicFile) Error!void {
+        assert(file.fd >= 0);
+        errdefer file.abort();
+        _ = try check(linux.fsync(file.fd));
+        close(file.fd);
+        file.fd = -1;
+        try rename(file.tmp[0..file.tmp_len :0], file.final[0..file.final_len :0]);
     }
 
-    pub fn abort(f: *AtomicFile) void {
-        if (f.fd >= 0) close(f.fd);
-        f.fd = -1;
-        _ = linux.unlink(f.tmp[0..f.tmp_len :0]);
+    /// Safe to call after a failed `commit` (it already aborted).
+    pub fn abort(file: *AtomicFile) void {
+        if (file.fd >= 0) close(file.fd);
+        file.fd = -1;
+        _ = linux.unlink(file.tmp[0..file.tmp_len :0]);
     }
 };
 
@@ -504,21 +532,21 @@ pub const AppendFile = struct {
         return .{ .fd = fd, .len = size };
     }
 
-    pub fn write(f: *AppendFile, data: []const u8) Error!void {
-        try f.writeAt(data, f.len);
-        f.len += data.len;
+    pub fn write(file: *AppendFile, data: []const u8) Error!void {
+        try file.writeAt(data, file.len);
+        file.len += data.len;
     }
 
-    pub fn writeAt(f: *AppendFile, data: []const u8, at: usize) Error!void {
-        try writeAllAt(f.fd, data, at);
+    pub fn writeAt(file: *AppendFile, data: []const u8, at: usize) Error!void {
+        try writeAllAt(file.fd, data, at);
     }
 
-    pub fn sync(f: *AppendFile) Error!void {
-        _ = try check(linux.fsync(f.fd));
+    pub fn sync(file: *AppendFile) Error!void {
+        _ = try check(linux.fsync(file.fd));
     }
 
-    pub fn deinit(f: *AppendFile) void {
-        close(f.fd);
+    pub fn deinit(file: *AppendFile) void {
+        close(file.fd);
     }
 };
 
@@ -526,11 +554,14 @@ pub const AppendFile = struct {
 pub fn mkdirP(path: []const u8) void {
     var buf: [4096]u8 = undefined;
     if (path.len >= buf.len) return;
-    var i: usize = 1;
-    while (i <= path.len) : (i += 1) {
-        if (i == path.len or path[i] == '/') {
-            @memcpy(buf[0..i], path[0..i]);
-            buf[i] = 0;
+    // Each prefix that ends a component, the whole path last. A mkdir that
+    // fails (it exists, or a parent could not be made) is left for the
+    // caller's next step to notice.
+    var end: usize = 1;
+    while (end <= path.len) : (end += 1) {
+        if (end == path.len or path[end] == '/') {
+            @memcpy(buf[0..end], path[0..end]);
+            buf[end] = 0;
             _ = linux.mkdir(@ptrCast(&buf), 0o700);
         }
     }
@@ -540,8 +571,8 @@ pub fn mkdirP(path: []const u8) void {
 /// earlier versions were 0755, with world-readable files inside.
 pub fn makePrivate(path: []const u8) void {
     var buf: [4096]u8 = undefined;
-    const z = std.mem.printSentinel(&buf, "{s}", .{path}, 0) catch return;
-    _ = linux.chmod(z, 0o700);
+    const path_z = std.mem.printSentinel(&buf, "{s}", .{path}, 0) catch return;
+    _ = linux.chmod(path_z, 0o700);
 }
 
 pub fn unmap(buf: []align(8) u8) void {
@@ -562,8 +593,8 @@ pub fn mapPrivate(path: [*:0]const u8) Error![]align(8) u8 {
         fd,
         0,
     ));
-    const p: [*]align(8) u8 = @ptrFromInt(addr);
-    return p[0..size];
+    const mapping: [*]align(8) u8 = @ptrFromInt(addr);
+    return mapping[0..size];
 }
 
 /// A testing tmp dir with its absolute path (tests run from the build
@@ -582,27 +613,27 @@ pub const TestDir = struct {
         return .{ .tmp = tmp, .abs = try std.testing.allocator.print("{s}/{s}", .{ cwd, rel }) };
     }
 
-    pub fn deinit(t: *TestDir) void {
-        std.testing.allocator.free(t.abs);
-        t.tmp.cleanup();
+    pub fn deinit(test_dir: *TestDir) void {
+        std.testing.allocator.free(test_dir.abs);
+        test_dir.tmp.cleanup();
     }
 
-    /// Absolute path of `name` (static buffer per call site is the caller's).
-    pub fn path(t: *const TestDir, buf: []u8, name: []const u8) ![:0]u8 {
-        return std.mem.printSentinel(buf, "{s}/{s}", .{ t.abs, name }, 0);
+    /// Absolute path of `name`, in the caller's `buf`.
+    pub fn path(test_dir: *const TestDir, buf: []u8, name: []const u8) ![:0]u8 {
+        return std.mem.printSentinel(buf, "{s}/{s}", .{ test_dir.abs, name }, 0);
     }
 
     /// Writes `name` (creating parent dirs) with `data`.
-    pub fn write(t: *const TestDir, name: []const u8, data: []const u8) !void {
+    pub fn write(test_dir: *const TestDir, name: []const u8, data: []const u8) !void {
         var buf: [4096]u8 = undefined;
-        const p = try t.path(&buf, name);
-        if (std.mem.findScalarLast(u8, p, '/')) |slash| mkdirP(p[0..slash]);
-        try writeFile(p, data);
+        const file_path = try test_dir.path(&buf, name);
+        if (std.mem.findScalarLast(u8, file_path, '/')) |slash| mkdirP(file_path[0..slash]);
+        try writeFile(file_path, data);
     }
 
-    pub fn mkdir(t: *const TestDir, name: []const u8) !void {
+    pub fn mkdir(test_dir: *const TestDir, name: []const u8) !void {
         var buf: [4096]u8 = undefined;
-        mkdirP(try t.path(&buf, name));
+        mkdirP(try test_dir.path(&buf, name));
     }
 };
 

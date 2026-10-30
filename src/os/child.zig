@@ -3,6 +3,7 @@
 //! runs (pdftotext, unzip).
 
 const std = @import("std");
+const assert = std.debug.assert;
 const linux = std.os.linux;
 const os = @import("root.zig");
 
@@ -42,9 +43,9 @@ pub const Result = struct {
     /// Killed at `max_output_bytes` (`at_cap = .kill`).
     capped: bool = false,
 
-    pub fn deinit(r: *Result, gpa: std.mem.Allocator) void {
-        gpa.free(r.stdout);
-        gpa.free(r.stderr);
+    pub fn deinit(result: *Result, gpa: std.mem.Allocator) void {
+        gpa.free(result.stdout);
+        gpa.free(result.stderr);
     }
 };
 
@@ -61,14 +62,14 @@ pub fn run(
     var empty_env = std.process.Environ.Map.init(gpa);
     defer empty_env.deinit();
     const stdin_bytes = switch (opts.stdin) {
-        .bytes => |b| b,
+        .bytes => |bytes| bytes,
         .fd => "",
     };
     var child = try std.process.spawn(io, .{
         .argv = argv,
         .environ_map = if (opts.environ == .empty) &empty_env else null,
         .stdin = switch (opts.stdin) {
-            .bytes => |b| if (b.len > 0) .pipe else .ignore,
+            .bytes => |bytes| if (bytes.len > 0) .pipe else .ignore,
             .fd => |fd| .{ .file = .{ .handle = fd, .flags = .{ .nonblocking = false } } },
         },
         .stdout = .pipe,
@@ -80,7 +81,7 @@ pub fn run(
         child.kill(io);
     };
 
-    var p: Pump = .{
+    var pump: Pump = .{
         .gpa = gpa,
         .io = io,
         .child = &child,
@@ -88,9 +89,9 @@ pub fn run(
         .stdin_bytes = stdin_bytes,
         .err_open = opts.stderr == .collect,
     };
-    errdefer p.out.deinit(gpa);
-    errdefer p.err.deinit(gpa);
-    const end = try p.loop();
+    errdefer pump.out.deinit(gpa);
+    errdefer pump.err.deinit(gpa);
+    const end = try pump.loop();
 
     // Both outputs closed, but the program may live on (it closed them, or
     // a background child holds them): wait for its exit up to the deadline.
@@ -98,29 +99,34 @@ pub fn run(
         (end == .closed and !waitExit(child.id.?, &opts));
     var code: ?u8 = null;
     if (end == .closed and !timed_out) {
+        // A wait that fails leaves the code unknown, as a signal does; the
+        // deferred kill reaps the child either way.
         if (child.wait(io)) |term| switch (term) {
-            .exited => |x| code = x,
+            .exited => |exit_code| code = exit_code,
             else => {},
         } else |_| {}
     }
     return .{
-        .stdout = try p.out.toOwnedSlice(gpa),
-        .stderr = try p.err.toOwnedSlice(gpa),
+        .stdout = try pump.out.toOwnedSlice(gpa),
+        .stderr = try pump.err.toOwnedSlice(gpa),
         .code = code,
         .timed_out = timed_out,
         .capped = end == .capped,
     };
 }
 
-/// Whether the program exited before its deadline, looked at every 100 ms
-/// when it can be cancelled.
+/// How often a run that can be cancelled looks at its `cancel` flag.
+const cancel_poll_ms = 100;
+
+/// Whether the program exited before its deadline, looked at every
+/// `cancel_poll_ms` when it can be cancelled.
 fn waitExit(pid: linux.pid_t, opts: *const Options) bool {
     const cancel = opts.cancel orelse return os.waitExit(pid, opts.deadline_ns);
     while (!cancel.load(.acquire)) {
         const now_ns = os.monotonicNs();
         if (now_ns >= opts.deadline_ns) return false;
-        const slice_end = @min(opts.deadline_ns, now_ns + 100 * std.time.ns_per_ms);
-        if (os.waitExit(pid, slice_end)) return true;
+        const slice_end_ns = @min(opts.deadline_ns, now_ns + cancel_poll_ms * std.time.ns_per_ms);
+        if (os.waitExit(pid, slice_end_ns)) return true;
     }
     return false;
 }
@@ -142,84 +148,112 @@ const Pump = struct {
 
     const End = enum { closed, timed_out, capped };
 
-    fn loop(p: *Pump) Error!End {
+    fn loop(pump: *Pump) Error!End {
         // A blocking stdin would let one write stall the whole poll loop,
         // deadline included: if it cannot be made non-blocking, give up.
-        if (p.child.stdin) |f| try setNonblocking(f.handle);
-        while (p.out_open or p.err_open) {
+        if (pump.child.stdin) |stdin| try setNonblocking(stdin.handle);
+        while (pump.out_open or pump.err_open) {
             const now_ns = os.monotonicNs();
-            if (now_ns >= p.opts.deadline_ns) return .timed_out;
-            const cancel = p.opts.cancel;
-            if (cancel != null and cancel.?.load(.acquire)) return .timed_out;
-            var fds: [3]linux.pollfd = undefined;
-            var n: usize = 0;
-            if (p.out_open) {
-                fds[n] = .{ .fd = p.child.stdout.?.handle, .events = linux.POLL.IN, .revents = 0 };
-                n += 1;
-            }
-            if (p.err_open) {
-                fds[n] = .{ .fd = p.child.stderr.?.handle, .events = linux.POLL.IN, .revents = 0 };
-                n += 1;
-            }
-            if (p.child.stdin) |f| {
-                fds[n] = .{ .fd = f.handle, .events = linux.POLL.OUT, .revents = 0 };
-                n += 1;
-            }
-            const left_ms: i32 = @intCast(@min(
-                (p.opts.deadline_ns - now_ns) / std.time.ns_per_ms + 1,
-                @as(u64, if (cancel != null) 100 else std.math.maxInt(i32)),
-            ));
-            switch (linux.errno(linux.poll(&fds, n, left_ms))) {
+            if (now_ns >= pump.opts.deadline_ns) return .timed_out;
+            if (pump.cancelled()) return .timed_out;
+            var poll_fds: [3]linux.pollfd = undefined;
+            const poll_fds_count = pump.pollFds(&poll_fds);
+            const rc = linux.poll(&poll_fds, poll_fds_count, pump.pollTimeoutMs(now_ns));
+            switch (linux.errno(rc)) {
                 .SUCCESS => {},
                 .INTR => continue,
                 else => return error.Syscall,
             }
-            for (fds[0..n]) |pfd| {
-                if (pfd.revents == 0) continue;
-                if (pfd.events == linux.POLL.OUT) {
-                    p.feed();
-                } else if (try p.drain(pfd.fd)) return .capped;
+            for (poll_fds[0..poll_fds_count]) |poll_fd| {
+                if (poll_fd.revents == 0) continue;
+                if (poll_fd.events == linux.POLL.OUT) {
+                    pump.feed();
+                } else if (try pump.drain(poll_fd.fd)) {
+                    return .capped;
+                }
             }
         }
         return .closed;
     }
 
+    fn cancelled(pump: *const Pump) bool {
+        const cancel = pump.opts.cancel orelse return false;
+        return cancel.load(.acquire);
+    }
+
+    /// The open outputs to read and, while there is input left, stdin to
+    /// write; how many were filled in.
+    fn pollFds(pump: *const Pump, poll_fds: *[3]linux.pollfd) usize {
+        var count: usize = 0;
+        if (pump.out_open) {
+            poll_fds[count] = pollFd(pump.child.stdout.?.handle, linux.POLL.IN);
+            count += 1;
+        }
+        if (pump.err_open) {
+            poll_fds[count] = pollFd(pump.child.stderr.?.handle, linux.POLL.IN);
+            count += 1;
+        }
+        if (pump.child.stdin) |stdin| {
+            poll_fds[count] = pollFd(stdin.handle, linux.POLL.OUT);
+            count += 1;
+        }
+        assert(count > 0);
+        return count;
+    }
+
+    fn pollFd(fd: i32, events: i16) linux.pollfd {
+        return .{ .fd = fd, .events = events, .revents = 0 };
+    }
+
+    /// Until the deadline; in slices of `cancel_poll_ms` when the run can
+    /// be cancelled, so a cancel is seen in time.
+    fn pollTimeoutMs(pump: *const Pump, now_ns: u64) i32 {
+        assert(now_ns < pump.opts.deadline_ns);
+        const left_ms = (pump.opts.deadline_ns - now_ns) / std.time.ns_per_ms + 1;
+        const cancellable = pump.opts.cancel != null;
+        const slice_ms: u64 = if (cancellable) cancel_poll_ms else std.math.maxInt(i32);
+        return @intCast(@min(left_ms, slice_ms));
+    }
+
     /// Writes what stdin can take; closes it once all is written.
-    fn feed(p: *Pump) void {
-        const fd = p.child.stdin.?.handle;
-        const rest = p.stdin_bytes[p.written..];
-        const w = linux.write(fd, rest.ptr, rest.len);
-        switch (linux.errno(w)) {
-            .SUCCESS => p.written += w,
+    fn feed(pump: *Pump) void {
+        const fd = pump.child.stdin.?.handle;
+        const rest = pump.stdin_bytes[pump.written..];
+        const rc = linux.write(fd, rest.ptr, rest.len);
+        switch (linux.errno(rc)) {
+            .SUCCESS => pump.written += rc,
             .AGAIN, .INTR => {},
             // The program closed its stdin: it does not want the rest.
-            else => p.written = p.stdin_bytes.len,
+            else => pump.written = pump.stdin_bytes.len,
         }
-        if (p.written == p.stdin_bytes.len) {
-            p.child.stdin.?.close(p.io);
-            p.child.stdin = null;
+        assert(pump.written <= pump.stdin_bytes.len);
+        if (pump.written == pump.stdin_bytes.len) {
+            pump.child.stdin.?.close(pump.io);
+            pump.child.stdin = null;
         }
     }
 
     /// Reads what output `fd` has. True when the program is to be killed
     /// at the cap.
-    fn drain(p: *Pump, fd: i32) Error!bool {
-        const is_out = fd == p.child.stdout.?.handle;
-        const list = if (is_out) &p.out else &p.err;
+    fn drain(pump: *Pump, fd: i32) Error!bool {
+        const is_out = fd == pump.child.stdout.?.handle;
+        const list = if (is_out) &pump.out else &pump.err;
         var buf: [64 * 1024]u8 = undefined;
-        const r = linux.read(fd, &buf, buf.len);
-        switch (linux.errno(r)) {
-            .SUCCESS => if (r == 0) {
-                if (is_out) p.out_open = false else p.err_open = false;
-            } else {
-                const keep = @min(r, p.opts.max_output_bytes -| list.items.len);
-                try list.appendSlice(p.gpa, buf[0..keep]);
-                return p.opts.at_cap == .kill and list.items.len == p.opts.max_output_bytes;
-            },
-            .AGAIN, .INTR => {},
+        const rc = linux.read(fd, &buf, buf.len);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            .AGAIN, .INTR => return false,
             else => return error.Syscall,
         }
-        return false;
+        if (rc == 0) {
+            if (is_out) pump.out_open = false else pump.err_open = false;
+            return false;
+        }
+        const output_bytes_max = pump.opts.max_output_bytes;
+        const keep = @min(rc, output_bytes_max -| list.items.len);
+        try list.appendSlice(pump.gpa, buf[0..keep]);
+        assert(list.items.len <= output_bytes_max);
+        return pump.opts.at_cap == .kill and list.items.len == output_bytes_max;
     }
 };
 
@@ -239,46 +273,45 @@ fn deadline(ms: u64) u64 {
 }
 
 test "output, exit code and stdin" {
-    var r = try run(
+    var result = try run(
         testing.allocator,
         testing.io,
         &.{ "sh", "-c", "echo out; echo err >&2; exit 3" },
         .{ .deadline_ns = deadline(5000) },
     );
-    defer r.deinit(testing.allocator);
-    try testing.expectEqualStrings("out\n", r.stdout);
-    try testing.expectEqualStrings("err\n", r.stderr);
-    try testing.expectEqual(@as(?u8, 3), r.code);
+    defer result.deinit(testing.allocator);
+    try testing.expectEqualStrings("out\n", result.stdout);
+    try testing.expectEqualStrings("err\n", result.stderr);
+    try testing.expectEqual(@as(?u8, 3), result.code);
 
     // More input than a pipe holds: written while the output is read.
     const big = try testing.allocator.alloc(u8, 300_000);
     defer testing.allocator.free(big);
     @memset(big, 'x');
-    var w = try run(testing.allocator, testing.io, &.{ "wc", "-c" }, .{
+    var counted = try run(testing.allocator, testing.io, &.{ "wc", "-c" }, .{
         .stdin = .{ .bytes = big },
         .deadline_ns = deadline(5000),
     });
-    defer w.deinit(testing.allocator);
-    try testing.expectEqualStrings("300000", std.mem.trim(u8, w.stdout, " \n"));
+    defer counted.deinit(testing.allocator);
+    try testing.expectEqualStrings("300000", std.mem.trim(u8, counted.stdout, " \n"));
 }
 
 test "a program past its deadline is killed" {
-    const t0 = os.monotonicNs();
-    var r = try run(testing.allocator, testing.io, &.{ "sleep", "30" }, .{
+    const start_ns = os.monotonicNs();
+    var result = try run(testing.allocator, testing.io, &.{ "sleep", "30" }, .{
         .deadline_ns = deadline(100),
     });
-    defer r.deinit(testing.allocator);
-    try testing.expect(r.timed_out);
-    try testing.expectEqual(@as(?u8, null), r.code);
-    try testing.expect(os.monotonicNs() - t0 < 2 * std.time.ns_per_s);
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.timed_out);
+    try testing.expectEqual(@as(?u8, null), result.code);
+    try testing.expect(os.monotonicNs() - start_ns < 2 * std.time.ns_per_s);
 }
 
 test "a program that closes its output but keeps running still times out" {
-    var r = try run(testing.allocator, testing.io, &.{ "sh", "-c", "exec >&- 2>&-; sleep 30" }, .{
-        .deadline_ns = deadline(150),
-    });
-    defer r.deinit(testing.allocator);
-    try testing.expect(r.timed_out);
+    const argv = &.{ "sh", "-c", "exec >&- 2>&-; sleep 30" };
+    var result = try run(testing.allocator, testing.io, argv, .{ .deadline_ns = deadline(150) });
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.timed_out);
 }
 
 test "a descriptor that cannot be made non-blocking is an error" {
