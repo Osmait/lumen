@@ -6,10 +6,10 @@ const script_meta = @import("core").script_meta;
 const os = @import("os");
 const Item = @import("../item.zig").Item;
 
-/// ~/.config/lumen/scripts, in `a`; null only when out of memory.
-pub fn dir(a: std.mem.Allocator) ?[:0]const u8 {
+/// ~/.config/lumen/scripts, in `arena`; null only when out of memory.
+pub fn dir(arena: std.mem.Allocator) ?[:0]const u8 {
     const config = std.mem.span(c.g_get_user_config_dir());
-    return a.printSentinel("{s}/lumen/scripts", .{config}, 0) catch null;
+    return arena.printSentinel("{s}/lumen/scripts", .{config}, 0) catch null;
 }
 
 /// The last scan's scripts, and what the folder looked like then: the root
@@ -43,19 +43,21 @@ pub fn load(arena: std.mem.Allocator) []Item {
     return items;
 }
 
-/// The cached item with its strings in `a`.
-fn copy(a: std.mem.Allocator, it: Item) std.mem.Allocator.Error!Item {
-    var o = it;
-    o.key = try a.dupe(u8, it.key);
-    o.title = try a.dupeSentinel(u8, it.title, 0);
-    o.subtitle = try a.dupeSentinel(u8, it.subtitle, 0);
-    o.keywords = try a.dupe(u8, it.keywords);
-    if (it.icon == .emoji) o.icon = .{ .emoji = try a.dupeSentinel(u8, it.icon.emoji, 0) };
-    o.action = .{ .script = .{
-        .path = try a.dupeSentinel(u8, it.action.script.path, 0),
-        .mode = it.action.script.mode,
+/// The cached item with its strings in `arena`.
+fn copy(arena: std.mem.Allocator, cached: Item) std.mem.Allocator.Error!Item {
+    var copied = cached;
+    copied.key = try arena.dupe(u8, cached.key);
+    copied.title = try arena.dupeSentinel(u8, cached.title, 0);
+    copied.subtitle = try arena.dupeSentinel(u8, cached.subtitle, 0);
+    copied.keywords = try arena.dupe(u8, cached.keywords);
+    if (cached.icon == .emoji) {
+        copied.icon = .{ .emoji = try arena.dupeSentinel(u8, cached.icon.emoji, 0) };
+    }
+    copied.action = .{ .script = .{
+        .path = try arena.dupeSentinel(u8, cached.action.script.path, 0),
+        .mode = cached.action.script.mode,
     } };
-    return o;
+    return copied;
 }
 
 /// What the scripts folder looked like: whether it exists, and a hash of
@@ -88,42 +90,63 @@ fn stamp(path: [:0]const u8) FolderStamp {
     return .{ .hashed = hasher.final() };
 }
 
-/// Scans the scripts directory at `path`. Everything lives in `a`.
-fn scan(a: std.mem.Allocator, path: [:0]const u8) []Item {
-    const d = c.g_dir_open(path.ptr, 0, null) orelse return &.{};
-    defer c.g_dir_close(d);
+/// Scans the scripts directory at `path`. Everything lives in `arena`.
+fn scan(arena: std.mem.Allocator, path: [:0]const u8) []Item {
+    const dir_handle = c.g_dir_open(path.ptr, 0, null) orelse return &.{};
+    defer c.g_dir_close(dir_handle);
 
     var items: std.ArrayList(Item) = .empty;
-    while (c.g_dir_read_name(d)) |name_c| {
+    var dropped: usize = 0;
+    defer if (dropped > 0) log.warn("{d} scripts left out: out of memory", .{dropped});
+    while (c.g_dir_read_name(dir_handle)) |name_c| {
         const name = std.mem.span(name_c);
         if (name.len == 0 or name[0] == '.') continue;
-        const full = a.printSentinel("{s}/{s}", .{ path, name }, 0) catch continue;
-
-        // The header is all that is read of it.
-        var head_buf: [4096]u8 = undefined;
-        const head = os.readHead(full.ptr, &head_buf);
-        const meta = script_meta.parse(head) orelse continue;
-
-        const emoji = meta.icon.len > 0 and meta.icon.len <= 8 and meta.icon[0] >= 0x80;
-        items.append(a, .{
-            .key = a.print("script:{s}", .{name}) catch continue,
-            .title = a.dupeSentinel(u8, meta.title, 0) catch continue,
-            .subtitle = a.dupeSentinel(
-                u8,
-                if (meta.package_name.len > 0) meta.package_name else "Script Command",
-                0,
-            ) catch continue,
-            .accessory = "Script",
-            .keywords = a.dupe(u8, meta.description) catch "",
-            .confirm = meta.needs_confirmation,
-            .icon = if (emoji)
-                .{ .emoji = a.dupeSentinel(u8, meta.icon, 0) catch "" }
-            else
-                .{ .tile = .{ .name = "utilities-terminal-symbolic", .color = .gray } },
-            .action = .{ .script = .{ .path = full, .mode = meta.mode } },
-        }) catch continue;
+        const item = (itemOf(arena, path, name) catch {
+            dropped += 1;
+            continue;
+        }) orelse continue;
+        items.append(arena, item) catch {
+            dropped += 1;
+            continue;
+        };
     }
-    return items.toOwnedSlice(a) catch &.{};
+    return items.toOwnedSlice(arena) catch items.items;
+}
+
+/// The row for the script `name` in the folder at `path`, or null when the
+/// file is not a script command (no title in its header).
+fn itemOf(
+    arena: std.mem.Allocator,
+    path: [:0]const u8,
+    name: []const u8,
+) std.mem.Allocator.Error!?Item {
+    const file_path = try arena.printSentinel("{s}/{s}", .{ path, name }, 0);
+    // Only the first 4 KB is read: script metadata lives in the header
+    // comments.
+    var head_buf: [4096]u8 = undefined;
+    const head = os.readHead(file_path.ptr, &head_buf);
+    const meta = script_meta.parse(head) orelse return null;
+    const subtitle = if (meta.package_name.len > 0) meta.package_name else "Script Command";
+    return .{
+        .key = try arena.print("script:{s}", .{name}),
+        .title = try arena.dupeSentinel(u8, meta.title, 0),
+        .subtitle = try arena.dupeSentinel(u8, subtitle, 0),
+        .accessory = "Script",
+        .keywords = try arena.dupe(u8, meta.description),
+        .confirm = meta.needs_confirmation,
+        .icon = if (looksLikeEmoji(meta.icon))
+            .{ .emoji = try arena.dupeSentinel(u8, meta.icon, 0) }
+        else
+            .{ .tile = .{ .name = "utilities-terminal-symbolic", .color = .gray } },
+        .action = .{ .script = .{ .path = file_path, .mode = meta.mode } },
+    };
+}
+
+/// Non-ASCII and short: an emoji, not an icon name.
+fn looksLikeEmoji(icon: []const u8) bool {
+    if (icon.len == 0) return false;
+    if (icon.len > 8) return false;
+    return icon[0] >= 0x80;
 }
 
 test "a missing folder and an empty one stamp differently, and edits show" {
