@@ -130,7 +130,7 @@ scenario() {
     thread_ticks >"$a"; t0=$(date +%s%N)
     for _ in 1 2 3; do
         "$LUMEN" --show; sleep 0.3
-        for q in f fi fir fire firef firefox; do "$LUMEN" --query "$q"; sleep 0.08; done
+        for q in f "fi" fir fire firef firefox; do "$LUMEN" --query "$q"; sleep 0.08; done
         for q in 2+2 "10 km to mi"; do "$LUMEN" --query "$q"; sleep 0.1; done
         for q in ma mai main main.z main.zig; do "$LUMEN" --view files --query "$q"; sleep 0.1; done
         for q in Arena ArenaAlloc ArenaAllocator TODO useState "fn main"; do "$LUMEN" --view contents --query "$q"; sleep 0.15; done

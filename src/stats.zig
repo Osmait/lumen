@@ -10,6 +10,7 @@ const std = @import("std");
 const c = @import("c");
 const index = @import("index");
 const os = @import("os");
+const version = @import("build_options").version;
 const View = @import("item.zig").View;
 
 /// The last `cap` samples, in nanoseconds.
@@ -120,7 +121,8 @@ pub fn report(
     errdefer out.deinit();
     const w = &out.writer;
     const up_s = (now() - started_ns) / std.time.ns_per_s;
-    try w.print("Lumen  pid {d}  up {d}h{d:0>2}m  started in {d:.0} ms\n\n", .{
+    try w.print("Lumen {s}  pid {d}  up {d}h{d:0>2}m  started in {d:.0} ms\n\n", .{
+        version,
         std.os.linux.getpid(),
         up_s / 3600,
         up_s / 60 % 60,

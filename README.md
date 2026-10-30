@@ -51,23 +51,49 @@ Search ignores case and accents everywhere: `accion` finds *acción*.
   KDE...), but window search, window management and placing the window on the
   focused monitor talk to Hyprland; on other compositors they do nothing.
   Reports from other compositors are welcome.
-- [Zig 0.17](https://ziglang.org/download/) to build.
-- GTK 4, gtk4-layer-shell, SQLite and Lua 5.4.
+- GTK 4 (4.12 or newer) and gtk4-layer-shell.
 - At run time, for the features that use them: `wl-clipboard` and `wtype`
   (clipboard, paste), `ripgrep` (file contents), `poppler` and `unzip` (PDF and
   Office documents), `wpctl` (volume), `playerctl` (media keys).
 
 | Distribution | Packages |
 |---|---|
-| Arch | `sudo pacman -S gtk4 gtk4-layer-shell sqlite lua54 wl-clipboard wtype ripgrep poppler unzip wireplumber playerctl` |
-| Fedora | `sudo dnf install gtk4-devel gtk4-layer-shell-devel sqlite-devel lua-devel wl-clipboard wtype ripgrep poppler-utils unzip wireplumber playerctl` |
-| Debian / Ubuntu | `sudo apt install libgtk-4-dev libgtk4-layer-shell-dev libsqlite3-dev liblua5.4-dev wl-clipboard wtype ripgrep poppler-utils unzip wireplumber playerctl` |
+| Arch | `sudo pacman -S gtk4 gtk4-layer-shell wl-clipboard wtype ripgrep poppler unzip wireplumber playerctl` |
+| Fedora | `sudo dnf install gtk4 gtk4-layer-shell wl-clipboard wtype ripgrep poppler-utils unzip wireplumber playerctl` |
+| Debian / Ubuntu | `sudo apt install libgtk-4-1 libgtk4-layer-shell0 wl-clipboard wtype ripgrep poppler-utils unzip wireplumber playerctl` |
 
-Names can differ between releases; gtk4-layer-shell is packaged in recent
-ones (for example Debian 13 and Ubuntu 24.04). Fedora names Lua 5.4 `lua` for
-pkg-config: build there with `zig build -Dlua-pkg=lua ...`.
+gtk4-layer-shell is packaged in recent releases (Debian 13, Ubuntu 24.04,
+Fedora 40 and later).
 
 ## Install
+
+The latest release, into `~/.local/bin` (no sudo):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Osmait/lumen/main/install.sh | sh
+```
+
+Run it again to update: it restarts the daemon it installed.
+`LUMEN_VERSION=0.1.0` installs a given release, `LUMEN_INSTALL_DIR` another
+folder, and `sh -s -- --uninstall` removes it (settings and data stay). It
+checks the download against the release's `SHA256SUMS`, which catches a
+damaged download, not a compromised release. To read it before it runs:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/Osmait/lumen/main/install.sh
+less install.sh && sh install.sh
+```
+
+Releases are built for x86_64 and run on any distribution with the packages
+above; each is also on the [releases page](https://github.com/Osmait/lumen/releases)
+as a tarball. `lumen --version` prints the version, and the running
+daemon's: after an update it says when that one is still the old one.
+
+### From source
+
+With [Zig 0.17](https://ziglang.org/download/) and the development packages
+of GTK 4 and gtk4-layer-shell (`gtk4`, `gtk4-layer-shell` on Arch; `-devel`
+on Fedora, `libgtk-4-dev libgtk4-layer-shell-dev` on Debian and Ubuntu):
 
 ```sh
 git clone https://github.com/Osmait/lumen.git
@@ -75,6 +101,9 @@ cd lumen
 zig build -Doptimize=ReleaseSafe
 install -Dm755 zig-out/bin/lumen zig-out/bin/lumen-gtk -t ~/.local/bin
 ```
+
+SQLite and Lua are built in (the build downloads their sources once);
+`-Dsystem-libs` links the system's instead (`-Dlua-pkg=lua` on Fedora).
 
 Make sure `~/.local/bin` is on your `PATH`. `lumen` is what you run: a tiny
 program that hands its arguments to the daemon (`lumen-gtk`, installed

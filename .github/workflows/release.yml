@@ -1,0 +1,71 @@
+name: Release
+
+# Pushing a tag vX.Y.Z publishes Lumen X.Y.Z: the tag must match
+# build.zig.zon's version (the build refuses otherwise), and CHANGELOG.md
+# must have a "## [X.Y.Z]" section, which becomes the release notes.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # The binaries link the system's GTK: built on Arch's, for glibc 2.36, so
+    # they run on any distribution with GTK 4.12+ and gtk4-layer-shell.
+    container: archlinux:latest
+    steps:
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm --needed git gtk4 gtk4-layer-shell ripgrep poppler \
+            unzip zip pkgconf gcc binutils github-cli
+
+      - uses: actions/checkout@v4
+        with:
+          # git describe needs the tags.
+          fetch-depth: 0
+
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - uses: mlugg/setup-zig@v2
+
+      - name: Unit and integration tests
+        run: zig build test --summary all
+
+      - name: Build
+        run: |
+          zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu.2.36 \
+            --search-prefix /usr --prefix dist
+
+      - name: Check the binaries
+        run: tools/check-release.sh dist/bin "${GITHUB_REF_NAME#v}"
+
+      - name: Package
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          name=lumen-$version-x86_64-linux
+          mkdir -p "pkg/$name"
+          cp dist/bin/lumen dist/bin/lumen-gtk LICENSE README.md CHANGELOG.md "pkg/$name/"
+          cp -r examples "pkg/$name/"
+          tar -C pkg -czf "$name.tar.gz" "$name"
+          sha256sum "$name.tar.gz" > SHA256SUMS
+          # This version's section of the changelog, without its heading.
+          awk -v v="$version" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            on && /^## \[/ { exit }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "CHANGELOG.md has no section for $version" >&2
+            exit 1
+          fi
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --title "Lumen ${GITHUB_REF_NAME#v}" \
+            --notes-file notes.md lumen-*-x86_64-linux.tar.gz SHA256SUMS

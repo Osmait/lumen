@@ -12,6 +12,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const ipc = @import("ipc.zig");
 const cli = @import("cli.zig");
+const version = @import("build_options").version;
 const unix = @import("os").unix;
 const failed = unix.failed;
 const writeAll = unix.writeAll;
@@ -28,6 +29,7 @@ pub fn main(init: std.process.Init.Minimal) void {
         _ = writeAll(1, cli.usage);
         linux.exit_group(0);
     }
+    if (args.len == 1 and cli.parse(std.mem.span(args[0])) == .version) printVersion(init.environ);
     if (std.process.Environ.getPosix(init.environ, "XDG_RUNTIME_DIR")) |rt| {
         const app_id = std.process.Environ.getPosix(
             init.environ,
@@ -64,6 +66,28 @@ fn passable(args: []const [*:0]const u8) bool {
     return true;
 }
 
+/// Its own version, then the running daemon's: after an update the daemon
+/// started before it still runs the old one until it is restarted.
+fn printVersion(environ: std.process.Environ) noreturn {
+    _ = writeAll(1, "lumen " ++ version ++ "\n");
+    const rt = std.process.Environ.getPosix(environ, "XDG_RUNTIME_DIR") orelse linux.exit_group(0);
+    const app_id = std.process.Environ.getPosix(environ, "LUMEN_APP_ID") orelse ipc.default_app_id;
+    const args = [_][*:0]const u8{"--version"};
+    const a = exchange(rt, app_id, &args, false) orelse linux.exit_group(0);
+    const theirs = std.mem.trim(u8, a.out, " \n");
+    if (a.status != 0) {
+        // A daemon from before 0.1.0 does not know the option.
+        _ = writeAll(2, "lumen: the running daemon is older; restart it: lumen --quit; lumen --daemon\n");
+        linux.exit_group(0);
+    }
+    _ = writeAll(1, "daemon ");
+    _ = writeAll(1, theirs);
+    _ = writeAll(1, "\n");
+    if (!std.mem.eql(u8, theirs, version))
+        _ = writeAll(2, "lumen: the daemon runs another version; restart it: lumen --quit; lumen --daemon\n");
+    linux.exit_group(0);
+}
+
 /// The daemon's exit status, or null when there is no daemon to ask.
 fn ask(
     runtime_dir: []const u8,
@@ -71,6 +95,22 @@ fn ask(
     args: []const [*:0]const u8,
     with_stdin: bool,
 ) ?u8 {
+    const a = exchange(runtime_dir, app_id, args, with_stdin) orelse return null;
+    _ = writeAll(1, a.out);
+    _ = writeAll(2, a.err);
+    return a.status;
+}
+
+const Answer = struct { status: u8, out: []const u8, err: []const u8 };
+
+/// Sends `args` (and stdin, `with_stdin`) to the daemon and returns its
+/// answer, in `answer`; null when there is no daemon to ask.
+fn exchange(
+    runtime_dir: []const u8,
+    app_id: []const u8,
+    args: []const [*:0]const u8,
+    with_stdin: bool,
+) ?Answer {
     var path_buf: [256]u8 = undefined;
     const path = ipc.socketPath(&path_buf, runtime_dir, app_id) orelse return null;
     var spans: [ipc.max_args][]const u8 = undefined;
@@ -87,17 +127,19 @@ fn ask(
         // A copy too large to keep is dropped here, as lumen-gtk would.
         if (len == request.len) linux.exit_group(0);
     }
-    if (!writeAll(fd, request[0..len])) return fail("lumen: the daemon closed the connection\n");
+    if (!writeAll(fd, request[0..len])) return failedAnswer("lumen: the daemon closed the connection\n");
     _ = linux.shutdown(fd, linux.SHUT.WR);
     // The daemon answers when it is done, however long that takes.
     const got = unix.readAll(fd, &answer, unix.no_deadline) catch 0;
     _ = linux.close(fd);
-    if (got < 5) return fail("lumen: no answer from the daemon\n");
+    if (got < 5) return failedAnswer("lumen: no answer from the daemon\n");
     const out_len = std.mem.readInt(u32, answer[1..5], .little);
-    if (out_len > got - 5) return fail("lumen: a truncated answer from the daemon\n");
-    _ = writeAll(1, answer[5..][0..out_len]);
-    _ = writeAll(2, answer[5 + out_len .. got]);
-    return answer[0];
+    if (out_len > got - 5) return failedAnswer("lumen: a truncated answer from the daemon\n");
+    return .{ .status = answer[0], .out = answer[5..][0..out_len], .err = answer[5 + out_len .. got] };
+}
+
+fn failedAnswer(msg: []const u8) Answer {
+    return .{ .status = 1, .out = "", .err = msg };
 }
 
 /// lumen-gtk beside this file, else on PATH.
@@ -124,11 +166,6 @@ fn runFull(argv: []const [*:0]const u8, envp: [*:null]const ?[*:0]const u8) nore
     }
     _ = writeAll(2, "lumen: cannot find lumen-gtk (it is installed beside lumen)\n");
     linux.exit_group(127);
-}
-
-fn fail(msg: []const u8) u8 {
-    _ = writeAll(2, msg);
-    return 1;
 }
 
 test "what goes over the socket" {

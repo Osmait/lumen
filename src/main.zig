@@ -21,6 +21,7 @@ const stats = @import("stats.zig");
 const Settings = @import("settings.zig").Settings;
 const ipc = @import("ipc.zig");
 const cli = @import("cli.zig");
+const version_line = std.fmt.comptimePrint("{s}\n", .{@import("build_options").version});
 const ipc_server = @import("sys/ipc_server.zig");
 
 pub const std_options: std.Options = .{
@@ -72,6 +73,10 @@ pub fn main(init: std.process.Init) !void {
         std.Io.File.stdout().writeStreamingAll(init.io, cli.usage) catch {};
         return;
     };
+    if (argv.items.len == 2 and cli.parse(std.mem.span(argv.items[1].?)) == .version) {
+        std.Io.File.stdout().writeStreamingAll(init.io, version_line) catch {};
+        return;
+    }
 
     if (c.g_getenv("LUMEN_APP_ID")) |id| app_id = std.mem.span(id);
     // Commands that only talk to a running daemon must not become one: with
@@ -265,6 +270,11 @@ fn run(app: *c.GApplication, args: []const [:0]const u8, out: *const Out) c_int 
             },
             .help => {
                 out.print(cli.usage);
+                return 0;
+            },
+            // What `lumen --version` compares with its own.
+            .version => {
+                out.print(version_line);
                 return 0;
             },
             .install => {

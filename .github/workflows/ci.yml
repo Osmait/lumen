@@ -16,14 +16,13 @@ jobs:
     steps:
       - name: Install dependencies
         run: |
-          pacman -Syu --noconfirm --needed git gtk4 gtk4-layer-shell sqlite lua54 \
-            ripgrep poppler unzip zip pkgconf gcc
+          pacman -Syu --noconfirm --needed git gtk4 gtk4-layer-shell \
+            ripgrep poppler unzip zip pkgconf gcc binutils shellcheck
 
       - uses: actions/checkout@v4
 
+      # The version build.zig.zon asks for (minimum_zig_version).
       - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.17.0
 
       - name: Format
         run: zig fmt --check src build.zig
@@ -31,8 +30,15 @@ jobs:
       - name: Unit and integration tests
         run: zig build test --summary all
 
+      # As a release is built (SQLite and Lua bundled: not installed above).
       - name: Release build
-        run: zig build -Doptimize=ReleaseSafe
+        run: |
+          zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-gnu.2.36 \
+            --search-prefix /usr --prefix dist
+          tools/check-release.sh dist/bin
+
+      - name: Shell scripts
+        run: shellcheck --severity=warning install.sh tools/*.sh
 
       - name: Performance checks
         # Shared runners are slower and noisier than a desktop.

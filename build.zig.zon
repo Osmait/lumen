@@ -3,6 +3,15 @@
     .version = "0.1.0",
     .fingerprint = 0x348eb6316a568dfa,
     .minimum_zig_version = "0.17.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .lua = .{
+            .url = "https://www.lua.org/ftp/lua-5.4.9.tar.gz",
+            .hash = "N-V-__8AAEQ_FAAnte7Oq7KSLG9FZh_9mjvQimoekgYqkKSK",
+        },
+        .sqlite = .{
+            .url = "https://www.sqlite.org/2026/sqlite-amalgamation-3540100.zip",
+            .hash = "N-V-__8AAETTsABEodUZZFAyfdAm9hEyqBXuLw9pRSO0vFh9",
+        },
+    },
     .paths = .{ "build.zig", "build.zig.zon", "src", "examples/styles", "LICENSE", "README.md" },
 }

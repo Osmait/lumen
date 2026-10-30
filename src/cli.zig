@@ -16,6 +16,7 @@ pub const Flag = enum {
     command,
     stats,
     help,
+    version,
     reload,
     install,
     as,
@@ -89,6 +90,7 @@ pub const specs: std.enums.EnumArray(Flag, Spec) = .init(.{
         .help = "Print memory, index and latency numbers",
     },
     .help = .{ .group = .window, .help = "Print this help" },
+    .version = .{ .group = .window, .help = "Print the version, and the running daemon's" },
     .reload = .{
         .group = .extensions,
         .socket = true,
