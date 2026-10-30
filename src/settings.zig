@@ -11,6 +11,7 @@ const std = @import("std");
 const core = @import("core");
 const sys = @import("os");
 const Kind = core.file_kind.Kind;
+const assert = std.debug.assert;
 
 pub const default_theme = "lumen-dark";
 
@@ -40,8 +41,27 @@ pub const Choice = enum {
 pub const opacity_choices = [_]u8{ 100, 97, 90, 80 };
 pub const keep_choices = [_]u32{ 100, 500, 1000, 5000 };
 
-/// Terminal emulators and editors offered when installed (first word is the
-/// command, the rest its display name).
+/// What a hand-edited file may set beyond the choices Settings offers.
+const opacity_percent_min = 50;
+const opacity_percent_max = 100;
+const clipboard_keep_min = 10;
+const clipboard_keep_max = 100_000;
+/// A value written back into the file: a word, not a paragraph.
+const token_bytes_max = 200;
+
+comptime {
+    for (opacity_choices) |choice| {
+        assert(choice >= opacity_percent_min);
+        assert(choice <= opacity_percent_max);
+    }
+    for (keep_choices) |choice| {
+        assert(choice >= clipboard_keep_min);
+        assert(choice <= clipboard_keep_max);
+    }
+}
+
+/// Terminal emulators and editors offered when installed: each is its
+/// command, then the name Settings shows.
 pub const terminals = [_][2][:0]const u8{
     .{ "ghostty", "Ghostty" },
     .{ "kitty", "Kitty" },
@@ -104,141 +124,148 @@ pub const Settings = struct {
         return .{ .arena = .init(gpa) };
     }
 
-    pub fn deinit(s: *Settings) void {
-        s.arena.deinit();
-        s.* = undefined;
+    pub fn deinit(settings: *Settings) void {
+        settings.arena.deinit();
+        settings.* = undefined;
     }
 
-    fn alloc(s: *Settings) std.mem.Allocator {
-        return s.arena.allocator();
+    fn allocator(settings: *Settings) std.mem.Allocator {
+        return settings.arena.allocator();
     }
 
     /// Settings from the text of a settings file.
     pub fn parse(gpa: std.mem.Allocator, text: []const u8) Settings {
-        var s = Settings.init(gpa);
+        var settings = Settings.init(gpa);
         var section_open_with = false;
         var lines = std.mem.splitScalar(u8, text, '\n');
-        while (lines.next()) |raw| {
-            var line = std.mem.trim(u8, raw, " \t\r");
-            if (std.mem.find(u8, line, " #")) |h| line = std.mem.trimEnd(u8, line[0..h], " \t");
-            if (line.len == 0 or line[0] == '#' or line[0] == ';') continue;
+        while (lines.next()) |raw_line| {
+            const line = withoutComment(std.mem.trim(u8, raw_line, " \t\r"));
+            if (line.len == 0) continue;
             if (line[0] == '[') {
                 section_open_with = std.mem.eql(u8, line, "[open-with]");
                 continue;
             }
-            const eq = std.mem.findScalar(u8, line, '=') orelse continue;
-            const key = std.mem.trim(u8, line[0..eq], " \t");
-            const value = std.mem.trim(u8, line[eq + 1 ..], " \t");
+            const equals = std.mem.findScalar(u8, line, '=') orelse continue;
+            const key = std.mem.trim(u8, line[0..equals], " \t");
+            const value = std.mem.trim(u8, line[equals + 1 ..], " \t");
             if (section_open_with) {
-                s.setOpenWith(key, value) catch |err| switch (err) {
+                settings.setOpenWith(key, value) catch |err| switch (err) {
                     // A bad line is ignored, like a bad value anywhere else.
                     error.BadKey, error.BadApp => {},
-                    error.OutOfMemory => s.incomplete = true,
+                    error.OutOfMemory => settings.incomplete = true,
                 };
-            } else if (!s.set(key, value)) {
-                if (isToken(key)) s.keepUnknown(line) catch {
-                    s.incomplete = true;
+            } else if (!settings.set(key, value) and isToken(key)) {
+                settings.keepUnknown(line) catch {
+                    settings.incomplete = true;
                 };
             }
         }
-        return s;
+        return settings;
     }
 
-    fn keepUnknown(s: *Settings, line: []const u8) std.mem.Allocator.Error!void {
-        const a = s.alloc();
-        try s.unknown.append(a, try a.dupe(u8, line));
+    /// `line` without a comment: a whole-line one (`#`, `;`) or one after
+    /// " #".
+    fn withoutComment(line: []const u8) []const u8 {
+        if (line.len > 0 and (line[0] == '#' or line[0] == ';')) return "";
+        const comment = std.mem.find(u8, line, " #") orelse return line;
+        return std.mem.trimEnd(u8, line[0..comment], " \t");
+    }
+
+    fn keepUnknown(settings: *Settings, line: []const u8) std.mem.Allocator.Error!void {
+        const arena = settings.allocator();
+        try settings.unknown.append(arena, try arena.dupe(u8, line));
     }
 
     /// Sets a top-level key from its text value. False when the key is not
     /// known; a known key with a bad value keeps its current value.
-    pub fn set(s: *Settings, key: []const u8, value: []const u8) bool {
-        if (std.meta.stringToEnum(Toggle, key)) |t| {
-            if (parseBool(value)) |b| s.setToggle(t, b);
+    pub fn set(settings: *Settings, key: []const u8, value: []const u8) bool {
+        if (std.meta.stringToEnum(Toggle, key)) |toggle| {
+            if (parseBool(value)) |on| settings.setToggle(toggle, on);
             return true;
         }
-        if (std.meta.stringToEnum(Choice, key)) |ch| {
-            _ = s.setChoice(ch, value);
+        if (std.meta.stringToEnum(Choice, key)) |choice| {
+            _ = settings.setChoice(choice, value);
             return true;
         }
         if (std.mem.eql(u8, key, "theme")) {
-            if (isToken(value)) s.theme = s.alloc().dupe(u8, value) catch blk: {
-                s.incomplete = true;
-                break :blk s.theme;
-            };
+            if (isToken(value)) settings.setText(&settings.theme, value);
             return true;
         }
         if (std.mem.eql(u8, key, "style")) {
-            if (value.len == 0 or isToken(value)) s.style = s.alloc().dupe(u8, value) catch blk: {
-                s.incomplete = true;
-                break :blk s.style;
-            };
+            // Empty: Lumen's own look.
+            if (value.len == 0 or isToken(value)) settings.setText(&settings.style, value);
             return true;
         }
         return false;
     }
 
-    // Toggle's and Choice's tags are the names of the fields they set.
-
-    pub fn get(s: *const Settings, t: Toggle) bool {
-        return switch (t) {
-            inline else => |tag| @field(s, @tagName(tag)),
+    /// Sets `field` to a copy of `value`; out of memory, it keeps its value
+    /// and the settings are marked incomplete.
+    fn setText(settings: *Settings, field: *[]const u8, value: []const u8) void {
+        field.* = settings.allocator().dupe(u8, value) catch {
+            settings.incomplete = true;
+            return;
         };
     }
 
-    pub fn setToggle(s: *Settings, t: Toggle, on: bool) void {
-        switch (t) {
-            inline else => |tag| @field(s, @tagName(tag)) = on,
+    // Toggle's and Choice's tags are the names of the fields they set.
+
+    pub fn get(settings: *const Settings, toggle: Toggle) bool {
+        return switch (toggle) {
+            inline else => |tag| @field(settings, @tagName(tag)),
+        };
+    }
+
+    pub fn setToggle(settings: *Settings, toggle: Toggle, on: bool) void {
+        switch (toggle) {
+            inline else => |tag| @field(settings, @tagName(tag)) = on,
         }
     }
 
     /// Sets a choice from its value's text ("large", "90", "kitty"); false
     /// when the value is not one of its values.
-    pub fn setChoice(s: *Settings, ch: Choice, value: []const u8) bool {
-        switch (ch) {
-            .text_size => s.text_size = std.meta.stringToEnum(TextSize, value) orelse return false,
-            .position => s.position = std.meta.stringToEnum(Position, value) orelse return false,
-            .width => s.width = std.meta.stringToEnum(Width, value) orelse return false,
-            .height => s.height = std.meta.stringToEnum(Height, value) orelse return false,
-            .density => s.density = std.meta.stringToEnum(Density, value) orelse return false,
+    pub fn setChoice(settings: *Settings, choice: Choice, value: []const u8) bool {
+        switch (choice) {
+            inline .text_size, .position, .width, .height, .density => |tag| {
+                const Field = @FieldType(Settings, @tagName(tag));
+                @field(settings, @tagName(tag)) = std.meta.stringToEnum(Field, value) orelse
+                    return false;
+            },
             .opacity => {
-                const v = std.fmt.parseInt(
-                    u8,
-                    std.mem.trimEnd(u8, value, "%"),
-                    10,
-                ) catch return false;
-                if (v < 50 or v > 100) return false;
-                s.opacity = v;
+                const digits = std.mem.trimEnd(u8, value, "%");
+                const percent = std.fmt.parseInt(u8, digits, 10) catch return false;
+                if (percent < opacity_percent_min) return false;
+                if (percent > opacity_percent_max) return false;
+                settings.opacity = percent;
             },
             .clipboard_keep => {
-                const v = std.fmt.parseInt(u32, value, 10) catch return false;
-                if (v < 10 or v > 100_000) return false;
-                s.clipboard_keep = v;
+                const entries = std.fmt.parseInt(u32, value, 10) catch return false;
+                if (entries < clipboard_keep_min) return false;
+                if (entries > clipboard_keep_max) return false;
+                settings.clipboard_keep = entries;
             },
-            .terminal, .editor, .icon_theme => {
+            // The tag names the field, as in `get` and `setToggle`: a text
+            // choice added here can never write another one's field.
+            inline .terminal, .editor, .icon_theme => |tag| {
                 if (value.len > 0 and !isToken(value)) return false;
-                const owned = s.alloc().dupe(u8, value) catch {
-                    s.incomplete = true;
+                @field(settings, @tagName(tag)) = settings.allocator().dupe(u8, value) catch {
+                    settings.incomplete = true;
                     return false;
                 };
-                switch (ch) {
-                    .terminal => s.terminal = owned,
-                    .editor => s.editor = owned,
-                    else => s.icon_theme = owned,
-                }
             },
         }
         return true;
     }
 
     /// The current value of a choice as its text (what `setChoice` takes).
-    pub fn choiceValue(s: *const Settings, ch: Choice, buf: []u8) []const u8 {
-        return switch (ch) {
+    pub fn choiceValue(settings: *const Settings, choice: Choice, buf: []u8) []const u8 {
+        return switch (choice) {
             inline else => |tag| {
-                const v = @field(s, @tagName(tag));
-                return switch (@typeInfo(@TypeOf(v))) {
-                    .@"enum" => @tagName(v),
-                    .int => std.mem.print(buf, "{d}", .{v}) catch "",
-                    else => v,
+                const value = @field(settings, @tagName(tag));
+                return switch (@typeInfo(@TypeOf(value))) {
+                    .@"enum" => @tagName(value),
+                    .int => std.mem.print(buf, "{d}", .{value}) catch "",
+                    else => value,
                 };
             },
         };
@@ -248,54 +275,77 @@ pub const Settings = struct {
 
     /// `key` is a kind name or ".ext"; an empty `app` removes the entry
     /// (back to the system default).
-    pub fn setOpenWith(s: *Settings, key: []const u8, app: []const u8) OpenWithError!void {
-        const valid_key = std.meta.stringToEnum(Kind, key) != null or
-            (key.len >= 2 and key.len <= 16 and key[0] == '.' and isToken(key[1..]));
-        if (!valid_key) return error.BadKey;
-        var kbuf: [16]u8 = undefined;
-        const k = if (key[0] == '.') std.ascii.lowerString(&kbuf, key) else key;
+    /// An extension key: a dot, then a short token (".log", ".tar.gz").
+    const extension_key_bytes_max = 16;
+
+    pub fn setOpenWith(settings: *Settings, key: []const u8, app: []const u8) OpenWithError!void {
+        if (!isOpenWithKey(key)) return error.BadKey;
+        var lowercase_buffer: [extension_key_bytes_max]u8 = undefined;
+        const key_lowercase = if (key[0] == '.')
+            std.ascii.lowerString(&lowercase_buffer, key)
+        else
+            key;
         if (app.len == 0) {
-            _ = s.open_with.orderedRemove(k);
+            _ = settings.open_with.orderedRemove(key_lowercase);
             return;
         }
-        if (!isToken(app) or !std.mem.endsWith(u8, app, ".desktop")) return error.BadApp;
-        const a = s.alloc();
-        try s.open_with.put(a, try a.dupe(u8, k), try a.dupe(u8, app));
+        if (!isToken(app)) return error.BadApp;
+        if (!std.mem.endsWith(u8, app, ".desktop")) return error.BadApp;
+        const arena = settings.allocator();
+        const key_copy = try arena.dupe(u8, key_lowercase);
+        try settings.open_with.put(arena, key_copy, try arena.dupe(u8, app));
+    }
+
+    /// A kind's name ("pdf"), or a dot and an extension (".log").
+    fn isOpenWithKey(key: []const u8) bool {
+        if (std.meta.stringToEnum(Kind, key) != null) return true;
+        if (key.len < 2 or key.len > extension_key_bytes_max) return false;
+        return key[0] == '.' and isToken(key[1..]);
     }
 
     /// The app chosen for a file: its extension first, then its kind, then
     /// the kind it falls back to.
-    pub fn appFor(s: *const Settings, ext_key: []const u8, kind: ?Kind) ?[]const u8 {
-        if (ext_key.len > 0) if (s.open_with.get(ext_key)) |app| return app;
-        var k = kind orelse return null;
+    pub fn appFor(settings: *const Settings, ext_key: []const u8, kind: ?Kind) ?[]const u8 {
+        if (ext_key.len > 0) {
+            if (settings.open_with.get(ext_key)) |app| return app;
+        }
+        var kind_next = kind orelse return null;
         while (true) {
-            if (s.open_with.get(@tagName(k))) |app| return app;
-            k = k.fallback() orelse return null;
+            if (settings.open_with.get(@tagName(kind_next))) |app| return app;
+            kind_next = kind_next.fallback() orelse return null;
         }
     }
 
-    pub fn write(s: *const Settings, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        return s.writeKeeping(w, s, &.{});
+    pub fn write(settings: *const Settings, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        return settings.writeKeeping(w, settings, &.{});
     }
 
-    /// Writes `s`, except the keys in `kept`, which keep their values from
-    /// `file` (keys init.lua sets stay out of the file).
+    /// Where `writeKeeping` takes each value from.
+    const Source = struct {
+        current: *const Settings,
+        file: *const Settings,
+        kept_keys: []const []const u8,
+
+        /// The value to write for `key`: the file's when init.lua sets the
+        /// key, else the current one. The key is named once, so it can
+        /// never write one field's value under another's name.
+        fn value(source: Source, comptime key: []const u8) @FieldType(Settings, key) {
+            for (source.kept_keys) |kept_key| {
+                if (std.mem.eql(u8, kept_key, key)) return @field(source.file, key);
+            }
+            return @field(source.current, key);
+        }
+    };
+
+    /// Writes `settings`, except the keys in `kept`, which keep their
+    /// values from `file` (keys init.lua sets stay out of the file).
     pub fn writeKeeping(
-        s: *const Settings,
+        settings: *const Settings,
         w: *std.Io.Writer,
         file: *const Settings,
         kept: []const []const u8,
     ) std.Io.Writer.Error!void {
-        const P = struct {
-            s: *const Settings,
-            file: *const Settings,
-            kept: []const []const u8,
-            fn of(p: @This(), key: []const u8) *const Settings {
-                for (p.kept) |k| if (std.mem.eql(u8, k, key)) return p.file;
-                return p.s;
-            }
-        };
-        const p: P = .{ .s = s, .file = file, .kept = kept };
+        const source: Source = .{ .current = settings, .file = file, .kept_keys = kept };
         try w.print(
             \\# Lumen settings. Change them from Lumen (search "Settings") or here:
             \\# Lumen reads this file again when its window opens.
@@ -331,25 +381,25 @@ pub const Settings = struct {
             \\editor = {s}
             \\
         , .{
-            p.of("style").style,
-            p.of("theme").theme,
-            p.of("text_size").text_size,
-            p.of("opacity").opacity,
-            p.of("position").position,
-            p.of("width").width,
-            p.of("height").height,
-            p.of("density").density,
-            p.of("icon_theme").icon_theme,
-            p.of("files_in_root").files_in_root,
-            p.of("suggestions").suggestions,
-            p.of("clipboard").clipboard,
-            p.of("clipboard_keep").clipboard_keep,
-            p.of("terminal").terminal,
-            p.of("editor").editor,
+            source.value("style"),
+            source.value("theme"),
+            source.value("text_size"),
+            source.value("opacity"),
+            source.value("position"),
+            source.value("width"),
+            source.value("height"),
+            source.value("density"),
+            source.value("icon_theme"),
+            source.value("files_in_root"),
+            source.value("suggestions"),
+            source.value("clipboard"),
+            source.value("clipboard_keep"),
+            source.value("terminal"),
+            source.value("editor"),
         });
-        if (s.unknown.items.len > 0) {
+        if (settings.unknown.items.len > 0) {
             try w.writeAll("\n# Not known to this version of Lumen\n");
-            for (s.unknown.items) |l| try w.print("{s}\n", .{l});
+            for (settings.unknown.items) |line| try w.print("{s}\n", .{line});
         }
         try w.writeAll(
             \\
@@ -358,19 +408,21 @@ pub const Settings = struct {
             \\# archive) or an extension (.log) = the app's desktop file id
             \\
         );
-        var it = s.open_with.iterator();
-        while (it.next()) |e| try w.print("{s} = {s}\n", .{ e.key_ptr.*, e.value_ptr.* });
+        var iterator = settings.open_with.iterator();
+        while (iterator.next()) |entry| {
+            try w.print("{s} = {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+        }
     }
 
     /// Reads `path`; a missing or unreadable file gives the defaults.
     pub fn load(gpa: std.mem.Allocator, path: [*:0]const u8) Settings {
-        var buf: [64 * 1024]u8 = undefined;
-        const text = sys.readHead(path, &buf);
-        var s = parse(gpa, text);
+        var buffer: [64 * 1024]u8 = undefined;
+        const text = sys.readHead(path, &buffer);
+        var settings = parse(gpa, text);
         // Filled up: the file goes on past what was read, and saving would
         // cut it there.
-        if (text.len == buf.len) s.incomplete = true;
-        return s;
+        if (text.len == buffer.len) settings.incomplete = true;
+        return settings;
     }
 
     pub const SaveError = sys.Error || std.Io.Writer.Error || error{Incomplete};
@@ -379,18 +431,18 @@ pub const Settings = struct {
     /// full disk never leaves half a file. Owner-only, like Lumen's other
     /// files. The keys in `kept` keep the values the file has now.
     pub fn save(
-        s: *const Settings,
+        settings: *const Settings,
         gpa: std.mem.Allocator,
         path: [:0]const u8,
         kept: []const []const u8,
     ) SaveError!void {
-        if (s.incomplete) return error.Incomplete;
+        if (settings.incomplete) return error.Incomplete;
         if (std.mem.findScalarLast(u8, path, '/')) |slash| sys.mkdirP(path[0..slash]);
         var file = if (kept.len > 0) load(gpa, path.ptr) else Settings.init(gpa);
         defer file.deinit();
         var out: std.Io.Writer.Allocating = .init(gpa);
         defer out.deinit();
-        try s.writeKeeping(&out.writer, &file, kept);
+        try settings.writeKeeping(&out.writer, &file, kept);
         try sys.writeFileAtomic(path, out.written());
     }
 
@@ -399,43 +451,57 @@ pub const Settings = struct {
     /// Whether `key = value` would be taken (`lumen.set` reports both
     /// mistakes instead of ignoring them like a hand-edited file).
     pub fn check(key: []const u8, value: []const u8) Check {
-        if (std.meta.stringToEnum(
-            Toggle,
-            key,
-        ) != null) return if (parseBool(value) != null) .ok else .bad_value;
-        if (std.meta.stringToEnum(Choice, key)) |ch| {
-            var buf: [1024]u8 = undefined;
-            var fba: std.heap.FixedBufferAllocator = .init(&buf);
-            var probe: Settings = .{ .arena = .init(fba.allocator()) };
-            return if (probe.setChoice(ch, value)) .ok else .bad_value;
+        if (std.meta.stringToEnum(Toggle, key) != null) {
+            return if (parseBool(value) != null) .ok else .bad_value;
         }
-        if (std.mem.eql(u8, key, "theme")) return if (isToken(value)) .ok else .bad_value;
-        if (std.mem.eql(
-            u8,
-            key,
-            "style",
-        )) return if (value.len == 0 or isToken(value)) .ok else .bad_value;
+        if (std.meta.stringToEnum(Choice, key)) |choice| {
+            // Checked by the setter itself, on a throwaway copy, so that the
+            // two can never disagree. A value is a token of at most
+            // `token_bytes_max` bytes: the buffer holds its copy.
+            var buffer: [1024]u8 = undefined;
+            comptime assert(buffer.len > token_bytes_max);
+            var fixed: std.heap.FixedBufferAllocator = .init(&buffer);
+            var probe: Settings = .{ .arena = .init(fixed.allocator()) };
+            return if (probe.setChoice(choice, value)) .ok else .bad_value;
+        }
+        if (std.mem.eql(u8, key, "theme")) {
+            return if (isToken(value)) .ok else .bad_value;
+        }
+        if (std.mem.eql(u8, key, "style")) {
+            return if (value.len == 0 or isToken(value)) .ok else .bad_value;
+        }
         return .unknown_key;
     }
 };
 
 pub const Stamp = sys.Stamp;
 
-fn parseBool(v: []const u8) ?bool {
+fn parseBool(text: []const u8) ?bool {
     const yes = [_][]const u8{ "true", "on", "yes", "1" };
     const no = [_][]const u8{ "false", "off", "no", "0" };
-    for (yes) |y| if (std.ascii.eqlIgnoreCase(v, y)) return true;
-    for (no) |n| if (std.ascii.eqlIgnoreCase(v, n)) return false;
+    for (yes) |word| {
+        if (std.ascii.eqlIgnoreCase(text, word)) return true;
+    }
+    for (no) |word| {
+        if (std.ascii.eqlIgnoreCase(text, word)) return false;
+    }
     return null;
 }
 
 /// One word of safe characters: values are written back into the file and
 /// passed to programs, so no spaces, quotes or newlines.
-pub fn isToken(v: []const u8) bool {
-    if (v.len == 0 or v.len > 200) return false;
-    for (v) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == '.' or ch == '-' or ch == '_' or
-        ch == '+')) return false;
+pub fn isToken(text: []const u8) bool {
+    if (text.len == 0) return false;
+    if (text.len > token_bytes_max) return false;
+    for (text) |character| {
+        if (!isTokenCharacter(character)) return false;
+    }
     return true;
+}
+
+fn isTokenCharacter(character: u8) bool {
+    return std.ascii.isAlphanumeric(character) or
+        character == '.' or character == '-' or character == '_' or character == '+';
 }
 
 // ---------------------------------------------------------------- tests
@@ -580,6 +646,19 @@ test "save is atomic and owner-only; load survives a missing file" {
     defer kept.deinit();
     try testing.expectEqual(Width.default, kept.width);
     try testing.expectEqual(TextSize.small, kept.text_size);
+}
+
+test "each text choice sets its own field" {
+    var s = Settings.init(testing.allocator);
+    defer s.deinit();
+    try testing.expect(s.setChoice(.terminal, "kitty"));
+    try testing.expect(s.setChoice(.editor, "hx"));
+    try testing.expect(s.setChoice(.icon_theme, "Papirus"));
+    try testing.expectEqualStrings("kitty", s.terminal);
+    try testing.expectEqualStrings("hx", s.editor);
+    try testing.expectEqualStrings("Papirus", s.icon_theme);
+    try testing.expect(!s.setChoice(.editor, "rm -rf"));
+    try testing.expectEqualStrings("hx", s.editor);
 }
 
 test "check tells unknown keys from bad values" {
