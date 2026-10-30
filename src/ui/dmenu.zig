@@ -207,8 +207,12 @@ fn addLine(s: *Session, raw: []const u8) void {
         text = text[0..nul];
     }
     if (!std.unicode.utf8ValidateSlice(text)) return;
-    line.text = a.dupeSentinel(u8, text, 0) catch return;
-    s.lines.append(a, line) catch {};
+    line.text = a.dupeSentinel(u8, text, 0) catch return addLineOutOfMemory();
+    s.lines.append(a, line) catch return addLineOutOfMemory();
+}
+
+fn addLineOutOfMemory() void {
+    log.warn("out of memory: a line of standard input is left out", .{});
 }
 
 /// Answers the caller with `choice` (null: nothing chosen, exit 1) and ends

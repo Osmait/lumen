@@ -1,6 +1,7 @@
 //! The keyboard: navigation, actions, the action panel.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const c = @import("c");
 const item_mod = @import("../item.zig");
 const Ui = @import("Ui.zig");
@@ -35,9 +36,14 @@ pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
         return 1;
     }
     if (enter) {
-        const it = ui.selectedItem() orelse return 1;
-        const actions = item_mod.actionsFor(it);
-        if (ctrl and actions.len > 1) ui.performEntry(actions[1]) else ui.performEntry(actions[0]);
+        const item = ui.selectedItem() orelse return 1;
+        const actions = item_mod.actionsFor(item);
+        assert(actions.len > 0);
+        if (ctrl and actions.len > 1) {
+            ui.performEntry(actions[1]);
+        } else {
+            ui.performEntry(actions[0]);
+        }
         return 1;
     }
     if (itemShortcut(ui, keyval, ctrl, shift)) return 1;
@@ -52,6 +58,9 @@ pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
 
 /// Keys while the action panel is open: they all go to it.
 fn panelKey(ui: *Ui, keyval: c_uint, ctrl: bool, down: bool, up: bool, enter: bool) void {
+    assert(ui.panel_open);
+    assert(ui.panel_entries.len > 0);
+    assert(ui.panel_selected < ui.panel_entries.len);
     if (keyval == c.GDK_KEY_Escape or (ctrl and keyval == c.GDK_KEY_k and !up)) {
         ui.closePanel();
     } else if (down) {

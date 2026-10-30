@@ -6,6 +6,7 @@
 //! what the global hotkey does.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const c = @import("c");
 const core = @import("core");
 const item_mod = @import("../item.zig");
@@ -78,7 +79,16 @@ fn listMaxH(self: *const Ui) c_int {
 const footer_h = 40;
 /// Clear space around the pieces for their shadows (`.shell` in style.css).
 const shell_margin = 48;
-const max_results = 60;
+/// Rows a search shows at most, per view. More would only cost building
+/// them: nobody scrolls past the first screens of a ranked list.
+const root_results_max = 60;
+const file_results_max = 60;
+const content_results_max = 50;
+/// Clipboard and window searches: the lists are short already.
+const filtered_results_max = 200;
+/// Files in the root search, after this many of the best other results.
+const root_files_max = 5;
+const root_results_before_files_max = 6;
 
 gpa: std.mem.Allocator,
 io: std.Io,
@@ -258,10 +268,8 @@ interface_settings: ?*c.GSettings = null,
 /// What the choose view lists values for.
 choosing: Choosing = .none,
 choose_title: [96:0]u8 = @splat(0),
-/// Views to go back to (Escape, Backspace, the back arrow), each with the
-/// row that was selected there.
-nav: [8]struct { view: View, key: core.FixedStr(80) } = undefined,
-nav_len: usize = 0,
+/// Views to go back to (Escape, Backspace, the back arrow).
+navigation: Navigation = .{},
 /// Row to select once the view is built (by its item key).
 reselect: core.FixedStr(80) = .{},
 
@@ -293,6 +301,41 @@ const Row = struct {
 
 /// A row not built yet: an item (its index) or a section title.
 const Pending = union(enum) { item: usize, section: [:0]const u8 };
+
+/// The views to go back to, each with the key of the row that was selected
+/// there. When it is full, the oldest view is forgotten, so going back
+/// always returns through the views left most recently.
+const Navigation = struct {
+    entries: [capacity]Entry = undefined,
+    count: usize = 0,
+
+    const capacity = 8;
+    const Entry = struct { view: View, key: core.FixedStr(80) };
+
+    fn push(navigation: *Navigation, view: View, selected_key: []const u8) void {
+        assert(navigation.count <= capacity);
+        if (navigation.count == capacity) {
+            std.mem.copyForwards(Entry, navigation.entries[0 .. capacity - 1], navigation.entries[1..]);
+            navigation.count -= 1;
+        }
+        const entry = &navigation.entries[navigation.count];
+        entry.* = .{ .view = view, .key = .{} };
+        entry.key.set(selected_key);
+        navigation.count += 1;
+        assert(navigation.count <= capacity);
+    }
+
+    fn pop(navigation: *Navigation) ?Entry {
+        assert(navigation.count <= capacity);
+        if (navigation.count == 0) return null;
+        navigation.count -= 1;
+        return navigation.entries[navigation.count];
+    }
+
+    fn clear(navigation: *Navigation) void {
+        navigation.count = 0;
+    }
+};
 
 /// Rows built with the keystroke's frame: the ~8 the list shows, and some
 /// to scroll into. Files listed 61 rows (~430 widgets) per key, and GTK
@@ -929,7 +972,7 @@ pub fn showWith(self: *Ui, view: View, text: ?[*:0]const u8) void {
         // Opening is a good moment to look for edited files.
         if (self.contents) |cs| cs.poke();
     }
-    self.nav_len = 0;
+    self.navigation.clear();
     // The choose view only means something reached from a setting, the
     // ext view from a command.
     self.setView(
@@ -1042,24 +1085,16 @@ fn placeOnFocusedMonitor(self: *Ui) void {
 
 /// Opens `view`, remembering where to go back to.
 pub fn navigate(self: *Ui, view: View) void {
-    if (self.nav_len < self.nav.len) {
-        const e = &self.nav[self.nav_len];
-        e.view = self.view;
-        const key = if (self.selectedItem()) |it| it.key else "";
-        e.key = .{};
-        e.key.set(key);
-        self.nav_len += 1;
-    }
+    const selected_key = if (self.selectedItem()) |item| item.key else "";
+    self.navigation.push(self.view, selected_key);
     self.setView(view);
 }
 
 /// Back to the previous view, on the row it was left from.
 pub fn goBack(self: *Ui) void {
-    if (self.nav_len == 0) return self.setView(.root);
-    self.nav_len -= 1;
-    const e = &self.nav[self.nav_len];
-    self.reselect = e.key;
-    self.setView(e.view);
+    const entry = self.navigation.pop() orelse return self.setView(.root);
+    self.reselect = entry.key;
+    self.setView(entry.view);
 }
 
 /// The view's rows again, query and place kept (a setting changed).
@@ -1101,7 +1136,7 @@ pub fn setView(self: *Ui, view: View) void {
         .{self.settings.theme},
     );
     self.view = view;
-    if (view == .root) self.nav_len = 0;
+    if (view == .root) self.navigation.clear();
     if (leaving_themes) self.applyAppearance(null);
     self.closePanel();
     self.confirm_key = "";
@@ -1220,13 +1255,26 @@ fn placeholderFor(self: *Ui, view: View, buf: *[128]u8) [*:0]const u8 {
     };
 }
 
-fn rootCandidates(self: *Ui, a: std.mem.Allocator) []Item {
-    var all: std.ArrayList(Item) = .empty;
-    all.appendSlice(a, self.apps.items) catch {};
-    all.appendSlice(a, &commands.all) catch {};
-    all.appendSlice(a, scripts.load(a)) catch {};
-    all.appendSlice(a, ext_view.rootItems(self, a)) catch {};
-    return all.items;
+fn rootCandidates(self: *Ui, arena: std.mem.Allocator) []Item {
+    const sources = [_][]const Item{
+        self.apps.items,
+        &commands.all,
+        scripts.load(arena),
+        ext_view.rootItems(self, arena),
+    };
+    var count: usize = 0;
+    for (sources) |source| count += source.len;
+    const all = arena.alloc(Item, count) catch {
+        log.warn("out of memory: the root search lists no apps or commands", .{});
+        return &.{};
+    };
+    var filled: usize = 0;
+    for (sources) |source| {
+        @memcpy(all[filled..][0..source.len], source);
+        filled += source.len;
+    }
+    assert(filled == all.len);
+    return all;
 }
 
 fn clipCandidates(self: *Ui, a: std.mem.Allocator) []Item {
@@ -1350,7 +1398,7 @@ fn fill(self: *Ui, a: std.mem.Allocator, q: []const u8, t0: u64) void {
         .windows => self.fillFiltered(a, q, false),
         .files => if (q.len > 0) {
             self.addSection("Files");
-            for (file_results.fileItems(self, a, q, 60)) |it| self.addItem(it);
+            for (file_results.fileItems(self, a, q, file_results_max)) |it| self.addItem(it);
         },
         .contents => if (q.len >= 3) self.fillContents(a, q, t0),
         .settings, .themes, .default_apps, .choose => self.fillSectioned(a, q),
@@ -1370,7 +1418,7 @@ fn fill(self: *Ui, a: std.mem.Allocator, q: []const u8, t0: u64) void {
 fn fillContents(self: *Ui, a: std.mem.Allocator, q: []const u8, t0: u64) void {
     const cs = self.content_search orelse {
         self.addSection("Matches");
-        for (file_results.contentItems(self, a, q, 50)) |it| self.addItem(it);
+        for (file_results.contentItems(self, a, q, content_results_max)) |it| self.addItem(it);
         return;
     };
     // Ask the worker unless the result for this exact query is already
@@ -1530,10 +1578,10 @@ fn fillRoot(self: *Ui, a: std.mem.Allocator, q: []const u8) void {
         self,
         a,
         q,
-        5,
+        root_files_max,
     ) else &.{};
-    const shown = @min(hits.items.len, max_results);
-    const head = if (files.len > 0) @min(shown, 6) else shown;
+    const shown = @min(hits.items.len, root_results_max);
+    const head = if (files.len > 0) @min(shown, root_results_before_files_max) else shown;
     for (hits.items[0..head]) |it| self.addItem(it);
     if (files.len > 0) {
         self.addSection("Files");
@@ -1579,7 +1627,7 @@ fn fillFiltered(self: *Ui, a: std.mem.Allocator, q: []const u8, by_day: bool) vo
     }
     sortByScore(hits.items);
     self.search_ns += stats.now() - t_search;
-    for (hits.items[0..@min(hits.items.len, 200)]) |it| self.addItem(it);
+    for (hits.items[0..@min(hits.items.len, filtered_results_max)]) |it| self.addItem(it);
 }
 
 /// Best first; equal scores by title, so the order never depends on the
@@ -1678,10 +1726,10 @@ pub fn addItem(self: *Ui, it_in: Item) void {
 fn buildItemRow(self: *Ui, item_index: usize) void {
     // Rows follow the items in order: a row queued for an earlier list
     // would point at the wrong item.
-    std.debug.assert(item_index < self.items.items.len);
-    if (self.lastItemRow()) |prev| std.debug.assert(prev < item_index);
+    assert(item_index < self.items.items.len);
+    if (self.lastItemRow()) |prev| assert(prev < item_index);
     // The grid has no section rows: a child's index is its item's.
-    if (self.grid_mode) std.debug.assert(self.rows.items.len == item_index);
+    if (self.grid_mode) assert(self.rows.items.len == item_index);
     const a = self.query_arena.allocator();
     const it = self.items.items[item_index];
     // Room first: a widget without its `rows` entry would shift every later
@@ -1747,7 +1795,7 @@ pub fn select(self: *Ui, row_index: ?usize) void {
     };
     const row = self.rows.items[ri];
     // Section titles are never selected (keyboard.zig skips them).
-    std.debug.assert(row.item != null and row.item.? < self.items.items.len);
+    assert(row.item != null and row.item.? < self.items.items.len);
     if (self.grid_mode)
         c.gtk_flow_box_select_child(@ptrCast(self.grid), @ptrCast(row.widget))
     else
@@ -1887,6 +1935,9 @@ fn viewTitle(self: *Ui) [*:0]const u8 {
 pub fn openPanel(self: *Ui) void {
     const it = self.selectedItem() orelse return;
     self.panel_entries = item_mod.actionsFor(it);
+    // Every item has a primary action: the panel is never empty, and the
+    // keys that move in it count on that.
+    assert(self.panel_entries.len > 0);
     c.gtk_list_box_remove_all(@ptrCast(self.panel_list));
     for (self.panel_entries) |e| {
         const row = c.gtk_list_box_row_new();
@@ -1914,6 +1965,7 @@ pub fn closePanel(self: *Ui) void {
 }
 
 pub fn selectPanel(self: *Ui, i: usize) void {
+    assert(i < self.panel_entries.len);
     self.panel_selected = i;
     const row = c.gtk_list_box_get_row_at_index(@ptrCast(self.panel_list), @intCast(i));
     c.gtk_list_box_select_row(@ptrCast(self.panel_list), row);
@@ -2238,4 +2290,26 @@ fn emptyText(self: *Ui, a: std.mem.Allocator) [:0]const u8 {
 
 test {
     _ = @import("dmenu.zig");
+}
+
+test "Navigation forgets the oldest view when it is full" {
+    var navigation: Navigation = .{};
+    const views = [_]View{ .settings, .themes, .files, .contents, .clipboard, .windows, .prefs, .form, .choose, .input };
+    for (views, 0..) |view, i| {
+        var key_buffer: [8]u8 = undefined;
+        navigation.push(view, try std.fmt.bufPrint(&key_buffer, "row{d}", .{i}));
+    }
+    try std.testing.expectEqual(Navigation.capacity, navigation.count);
+    // The last `capacity` views come back newest first.
+    var expected = views.len;
+    while (navigation.pop()) |entry| {
+        expected -= 1;
+        try std.testing.expectEqual(views[expected], entry.view);
+        var key_buffer: [8]u8 = undefined;
+        try std.testing.expectEqualStrings(
+            try std.fmt.bufPrint(&key_buffer, "row{d}", .{expected}),
+            entry.key.slice(),
+        );
+    }
+    try std.testing.expectEqual(views.len - Navigation.capacity, expected);
 }
