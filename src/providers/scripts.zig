@@ -17,20 +17,30 @@ pub fn dir(a: std.mem.Allocator) ?[:0]const u8 {
 /// thread only.
 var cache_arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
 var cache_items: []Item = &.{};
-var cache_stamp: ?u64 = null;
+/// Null until the first scan.
+var cache_stamp: ?FolderStamp = null;
 
-/// The scripts, in `a`: scanned again only when a file in the folder was
-/// added, removed, renamed or written since the last time.
-pub fn load(a: std.mem.Allocator) []Item {
-    const now = stamp(a);
-    if (cache_stamp == null or cache_stamp.? != now) {
+const log = std.log.scoped(.scripts);
+
+/// The scripts, in `arena`: scanned again only when a file in the folder
+/// was added, removed, renamed or written since the last time.
+pub fn load(arena: std.mem.Allocator) []Item {
+    const path = dir(arena) orelse return &.{};
+    const folder_stamp = stamp(path);
+    const cached = if (cache_stamp) |last| std.meta.eql(last, folder_stamp) else false;
+    if (!cached) {
         _ = cache_arena.reset(.retain_capacity);
-        cache_items = scan(cache_arena.allocator());
-        cache_stamp = now;
+        cache_items = scan(cache_arena.allocator(), path);
+        cache_stamp = folder_stamp;
     }
-    const out = a.alloc(Item, cache_items.len) catch return &.{};
-    for (cache_items, out) |it, *o| o.* = copy(a, it) catch return out[0..0];
-    return out;
+    const items = arena.alloc(Item, cache_items.len) catch return &.{};
+    for (cache_items, items, 0..) |cached_item, *item, copied| {
+        item.* = copy(arena, cached_item) catch {
+            log.warn("out of memory: {d} of {d} scripts listed", .{ copied, items.len });
+            return items[0..copied];
+        };
+    }
+    return items;
 }
 
 /// The cached item with its strings in `a`.
@@ -48,25 +58,38 @@ fn copy(a: std.mem.Allocator, it: Item) std.mem.Allocator.Error!Item {
     return o;
 }
 
-/// Names, sizes and mtimes of the folder's files.
-fn stamp(a: std.mem.Allocator) u64 {
+/// What the scripts folder looked like: whether it exists, and a hash of
+/// its files' names, sizes and mtimes. A tagged union rather than special
+/// hash values: any u64 is a possible hash.
+const FolderStamp = union(enum) {
+    missing,
+    hashed: u64,
+};
+
+/// The folder at `path` as it is now.
+fn stamp(path: [:0]const u8) FolderStamp {
+    const dir_handle = c.g_dir_open(path.ptr, 0, null) orelse return .missing;
+    defer c.g_dir_close(dir_handle);
     var hasher: std.hash.Wyhash = .init(0);
-    const path = dir(a) orelse return 0;
-    const d = c.g_dir_open(path.ptr, 0, null) orelse return 1;
-    defer c.g_dir_close(d);
-    var buf: [4096]u8 = undefined;
-    while (c.g_dir_read_name(d)) |name_c| {
+    var path_buffer: [4096]u8 = undefined;
+    while (c.g_dir_read_name(dir_handle)) |name_c| {
         const name = std.mem.span(name_c);
         hasher.update(name);
-        const full = std.mem.printSentinel(&buf, "{s}/{s}", .{ path, name }, 0) catch continue;
-        if (os.info(full)) |i| hasher.update(std.mem.asBytes(&.{ i.mtime, i.size }));
+        const file_path = std.mem.printSentinel(
+            &path_buffer,
+            "{s}/{s}",
+            .{ path, name },
+            0,
+        ) catch continue;
+        if (os.info(file_path)) |file_info| {
+            hasher.update(std.mem.asBytes(&.{ file_info.mtime, file_info.size }));
+        }
     }
-    return hasher.final();
+    return .{ .hashed = hasher.final() };
 }
 
-/// Scans the scripts directory. Everything lives in `a`.
-fn scan(a: std.mem.Allocator) []Item {
-    const path = dir(a) orelse return &.{};
+/// Scans the scripts directory at `path`. Everything lives in `a`.
+fn scan(a: std.mem.Allocator, path: [:0]const u8) []Item {
     const d = c.g_dir_open(path.ptr, 0, null) orelse return &.{};
     defer c.g_dir_close(d);
 
@@ -101,4 +124,23 @@ fn scan(a: std.mem.Allocator) []Item {
         }) catch continue;
     }
     return items.toOwnedSlice(a) catch &.{};
+}
+
+test "a missing folder and an empty one stamp differently, and edits show" {
+    var test_dir = try os.TestDir.init();
+    defer test_dir.deinit();
+    var path_buffer: [4096]u8 = undefined;
+
+    const missing = try test_dir.path(&path_buffer, "scripts");
+    try std.testing.expectEqual(FolderStamp.missing, stamp(missing));
+
+    try test_dir.mkdir("scripts");
+    const empty = stamp(missing);
+    try std.testing.expect(empty == .hashed);
+
+    try test_dir.write("scripts/hello.sh", "#!/bin/sh\n");
+    const one_file = stamp(missing);
+    try std.testing.expect(one_file == .hashed);
+    try std.testing.expect(!std.meta.eql(empty, one_file));
+    try std.testing.expect(std.meta.eql(one_file, stamp(missing)));
 }

@@ -616,6 +616,7 @@ test {
     _ = @import("ui/ext_view.zig");
     _ = @import("ui/installer.zig");
     _ = @import("layout.zig");
+    _ = @import("providers/scripts.zig");
 }
 
 test "the views the usage lists open" {
