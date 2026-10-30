@@ -42,21 +42,21 @@ const magic = "LUMCTX04";
 const header_size = 64;
 
 /// Plain text files above this are not indexed (logs, dumps, data).
-pub const max_text = 1 << 20;
+pub const text_bytes_max = 1 << 20;
 /// Extracted text kept per document (PDF, Office).
-pub const max_extracted = 4 << 20;
+pub const extracted_bytes_max = 4 << 20;
 /// A segment is closed past this many (trigram, doc) pairs: 32 MB of pairs
 /// and as much again to sort them. 16 M pairs made the build peak at 585 MB
 /// (49 k documents) for no faster queries; 4 M peaks at ~346 MB, for 12
 /// segments instead of 4 and an index 8 % larger.
-const segment_pairs = 4 << 20;
+const segment_pairs_max = 4 << 20;
 /// Documents read in parallel per round, at most.
-const batch_docs = 1024;
+const round_docs_max = 1024;
 /// And at most as many as could give this many pairs (one per byte of
 /// text): a round of 1024 high-entropy 1 MB files once held a billion
 /// pairs, 8 GB, and as much again to sort them. Ordinary text gives a pair
 /// per ~9 bytes, so a round still reads hundreds of files.
-const round_pairs = segment_pairs;
+const round_pairs_max = segment_pairs_max;
 
 /// The doc table stores each path's length as a u16.
 pub const path_bytes_max = std.math.maxInt(u16);
@@ -594,23 +594,23 @@ pub const TextReader = struct {
     ctx: *anyopaque,
     /// Most bytes of text `read` gives for an extracted document (its text
     /// is not the size of the file, the size of the cached text is); null:
-    /// `max_extracted`.
+    /// `extracted_bytes_max`.
     extracted_len: ?*const fn (ctx: *anyopaque, doc: DocIn) u64 = null,
 
     /// Most (trigram, doc) pairs reading `d` can give: one per byte of text.
     fn mostPairs(r: TextReader, d: DocIn) usize {
         const len = switch (d.source) {
-            .plain => @min(d.size, max_text),
+            .plain => @min(d.size, text_bytes_max),
             .extracted => if (r.extracted_len) |f|
-                @min(f(r.ctx, d), max_extracted)
+                @min(f(r.ctx, d), extracted_bytes_max)
             else
-                max_extracted,
+                extracted_bytes_max,
         };
         return @intCast(@min(len, 1 << 24));
     }
 };
 
-/// Plain text of a file: up to `max_text` bytes, rejected if binary (a NUL in
+/// Plain text of a file: up to `text_bytes_max` bytes, rejected if binary (a NUL in
 /// the first 8 KB, git's rule).
 pub fn readPlain(
     gpa: std.mem.Allocator,
@@ -624,8 +624,8 @@ pub fn readPlain(
     const fd = sys.openRegular(z) catch return false;
     defer sys.close(fd);
     // One byte past the limit tells a file over it.
-    try sys.readUpTo(gpa, fd, buf, max_text + 1);
-    if (buf.items.len > max_text) return false;
+    try sys.readUpTo(gpa, fd, buf, text_bytes_max + 1);
+    if (buf.items.len > text_bytes_max) return false;
     const head = buf.items[0..@min(buf.items.len, 8000)];
     return std.mem.findScalar(u8, head, 0) == null;
 }
@@ -821,9 +821,9 @@ pub fn appendFile(
 }
 
 /// A segment smaller than this is merged with the next update's.
-const small_postings = 1 << 20;
+const segment_small_size_max = 1 << 20;
 /// How many small segments at the end make a merge.
-const merge_small = 4;
+const segments_small_merge_min = 4;
 
 /// The old index's documents then `added` (ids are positions), and their
 /// flags with `gone` marked removed.
@@ -875,8 +875,8 @@ fn appendInto(
     const flags = m.flags;
 
     var keep = old.segments.len;
-    while (keep > 0 and old.segments[keep - 1].postings_size < small_postings) keep -= 1;
-    if (old.segments.len - keep < merge_small) keep = old.segments.len;
+    while (keep > 0 and old.segments[keep - 1].postings_size < segment_small_size_max) keep -= 1;
+    if (old.segments.len - keep < segments_small_merge_min) keep = old.segments.len;
     var dir: std.ArrayList(SegmentEntry) = .empty;
     defer dir.deinit(gpa);
     // Where they are: the file only grows.
@@ -1131,9 +1131,9 @@ fn writeDocs(
 /// ids) go first.
 ///
 /// Memory stays bounded whatever the text: a round reads no more documents
-/// than could give `round_pairs` pairs, and its pairs join the segment one
+/// than could give `round_pairs_max` pairs, and its pairs join the segment one
 /// document at a time, closing it as soon as it is full. Pairs held: the
-/// round's, the segment's (`segment_pairs` and one document's at most) and
+/// round's, the segment's (`segment_pairs_max` and one document's at most) and
 /// as many to sort them.
 fn indexDocs(
     sink: *Sink,
@@ -1158,7 +1158,7 @@ fn indexDocs(
         gpa.free(task_out);
     }
     for (task_out) |*t| t.* = .empty;
-    const spans = try gpa.alloc(Pairs, batch_docs);
+    const spans = try gpa.alloc(Pairs, round_docs_max);
     defer gpa.free(spans);
 
     var lo = from;
@@ -1179,11 +1179,11 @@ fn indexDocs(
         // In doc order, which the stable radix sort turns into (key, doc).
         for (spans[0 .. hi - lo]) |s| {
             try pairs.appendSlice(gpa, task_out[s.task].items[s.start..][0..s.len]);
-            if (pairs.items.len >= segment_pairs) try closePairs(sink, dir, &pairs, &scratch, st);
+            if (pairs.items.len >= segment_pairs_max) try closePairs(sink, dir, &pairs, &scratch, st);
         }
         // What a task kept from a large round would add up across rounds.
         for (task_out) |*t| {
-            if (t.capacity > round_pairs / tasks) {
+            if (t.capacity > round_pairs_max / tasks) {
                 t.clearAndFree(gpa);
             } else t.clearRetainingCapacity();
         }
@@ -1192,15 +1192,15 @@ fn indexDocs(
     if (pairs.items.len > 0) try closePairs(sink, dir, &pairs, &scratch, st);
 }
 
-/// Where the round of documents from `lo` ends: `batch_docs` documents, or
-/// fewer when their text could give more than `round_pairs` pairs (one
+/// Where the round of documents from `lo` ends: `round_docs_max` documents, or
+/// fewer when their text could give more than `round_pairs_max` pairs (one
 /// document at least).
 fn roundEnd(docs: []const DocIn, lo: usize, text: TextReader) usize {
     var hi = lo;
     var most: usize = 0;
-    while (hi < docs.len and hi - lo < batch_docs) : (hi += 1) {
+    while (hi < docs.len and hi - lo < round_docs_max) : (hi += 1) {
         most += text.mostPairs(docs[hi]);
-        if (hi > lo and most > round_pairs) break;
+        if (hi > lo and most > round_pairs_max) break;
     }
     return hi;
 }
@@ -2112,7 +2112,7 @@ fn staticScore(d: DocIn, words: []const []const u8, now: i64) i32 {
     return s;
 }
 
-pub const max_candidates = 4000;
+pub const candidates_verified_max = 4000;
 
 /// The candidates, best bound first: what is known without reading them
 /// (recency, depth, name) plus the most reading can add, so verification
@@ -2204,7 +2204,7 @@ pub fn search(
         .ix = index,
         .words = words,
         .phrase = phrase,
-        .cands = ordered[0..@min(ordered.len, max_candidates)],
+        .cands = ordered[0..@min(ordered.len, candidates_verified_max)],
         .text_path = text_path,
         .text_ctx = text_ctx,
         .stop = opts.stop,
@@ -2752,7 +2752,7 @@ fn segmentedIndex(gpa: std.mem.Allocator, pool: *Pool) !Index {
     var ix = try smallIndex(gpa);
     errdefer ix.deinit(gpa);
     var td: TestDocs = .{ .texts = &update_texts };
-    for (0..merge_small) |i| {
+    for (0..segments_small_merge_min) |i| {
         var nbuf: [8]u8 = undefined;
         const added = [_]DocIn{.{
             .path = try std.mem.print(&nbuf, "{d}", .{i}),
@@ -2918,17 +2918,17 @@ const PeakAllocator = struct {
     }
 };
 
-test "a round reads no more than round_pairs of possible text, one document at least" {
+test "a round reads no more than round_pairs_max of possible text, one document at least" {
     var dummy: u8 = 0;
     const reader: TextReader = .{ .read = TestDocs.text, .ctx = &dummy };
     var docs: [2000]DocIn = undefined;
     for (&docs) |*d| d.* = .{ .path = "", .mtime = 0, .size = 4096 };
-    // Small files: `batch_docs` a round, and what is left at the end.
-    try testing.expectEqual(@as(usize, batch_docs), roundEnd(&docs, 0, reader));
+    // Small files: `round_docs_max` a round, and what is left at the end.
+    try testing.expectEqual(@as(usize, round_docs_max), roundEnd(&docs, 0, reader));
     try testing.expectEqual(docs.len, roundEnd(&docs, docs.len - 5, reader));
-    // Files of `max_text` or more (no more than that is read).
+    // Files of `text_bytes_max` or more (no more than that is read).
     for (&docs) |*d| d.size = 1 << 30;
-    try testing.expectEqual(@as(usize, round_pairs / max_text), roundEnd(&docs, 0, reader));
+    try testing.expectEqual(@as(usize, round_pairs_max / text_bytes_max), roundEnd(&docs, 0, reader));
     // Extracted text: as long as the reader says, else the most kept.
     for (&docs) |*d| d.source = .extracted;
     try testing.expectEqual(@as(usize, 1), roundEnd(&docs, 0, reader));
@@ -2939,7 +2939,7 @@ test "a round reads no more than round_pairs of possible text, one document at l
     };
     var known = reader;
     known.extracted_len = Len.small;
-    try testing.expectEqual(@as(usize, batch_docs), roundEnd(&docs, 0, known));
+    try testing.expectEqual(@as(usize, round_docs_max), roundEnd(&docs, 0, known));
 }
 
 test "building high-entropy text: memory stays bounded by rounds and segments" {
@@ -2957,11 +2957,11 @@ test "building high-entropy text: memory stays bounded by rounds and segments" {
     var docs: [n]DocIn = undefined;
     var names: [n][8]u8 = undefined;
     for (&texts, &docs, &names, 0..) |*t, *d, *name, i| {
-        const b = try testing.allocator.alloc(u8, max_text);
+        const b = try testing.allocator.alloc(u8, text_bytes_max);
         prng.random().bytes(b);
         t.* = b;
         made += 1;
-        d.* = .{ .path = try std.mem.print(name, "{d}", .{i}), .mtime = 0, .size = max_text };
+        d.* = .{ .path = try std.mem.print(name, "{d}", .{i}), .mtime = 0, .size = text_bytes_max };
     }
     var pa: PeakAllocator = .{ .child = testing.allocator };
     const gpa = pa.allocator();
