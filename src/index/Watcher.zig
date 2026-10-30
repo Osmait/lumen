@@ -26,8 +26,12 @@ wd_to_id: std.AutoHashMapUnmanaged(i32, u32) = .empty,
 unwatched: u32 = 0,
 buf: [64 * 1024]u8 align(@alignOf(linux.inotify_event)) = undefined,
 
+/// IN_DONT_FOLLOW: a folder swapped for a link to another folder of the
+/// tree re-pointed that folder's watch to the link's entry, and its events
+/// went to an entry that was not there.
 const mask: u32 = linux.IN.CREATE | linux.IN.DELETE | linux.IN.MOVED_FROM | linux.IN.MOVED_TO |
-    linux.IN.DELETE_SELF | linux.IN.MOVE_SELF | linux.IN.EXCL_UNLINK | linux.IN.ONLYDIR;
+    linux.IN.DELETE_SELF | linux.IN.MOVE_SELF | linux.IN.EXCL_UNLINK | linux.IN.ONLYDIR |
+    linux.IN.DONT_FOLLOW;
 
 pub const Change = union(enum) {
     /// Something appeared in directory `parent`; a directory must be
@@ -65,18 +69,30 @@ pub fn count(w: *const Watcher) usize {
     return w.wd_to_id.count();
 }
 
-/// Watches `path`, attributing its events to index entry `id`. The kernel
-/// keys watches by inode: watching the same directory again returns the same
-/// descriptor and only the id it maps to changes. Failing is not fatal for
-/// the caller (the directory goes unwatched until the next rescan); hitting
-/// the kernel's limit is counted in `unwatched` and logged once.
-pub fn watch(
+pub const WatchError = error{ WatchLimit, Watch, OutOfMemory };
+
+/// Watches directory `path` (never a link to one), attributing its events to
+/// index entry `id`. The kernel keys watches by inode: watching the same
+/// directory again returns the same descriptor and only the id it maps to
+/// changes. Failing is not fatal for the caller (the directory goes
+/// unwatched until the next rescan); hitting the kernel's limit is counted
+/// in `unwatched` and logged once.
+pub fn watch(w: *Watcher, gpa: std.mem.Allocator, path: [*:0]const u8, id: u32) WatchError!void {
+    return w.add(gpa, path, id, mask);
+}
+
+/// `watch` for a root of the index, which may be a link ($HOME often is).
+pub fn watchRoot(
     w: *Watcher,
     gpa: std.mem.Allocator,
     path: [*:0]const u8,
     id: u32,
-) error{ WatchLimit, Watch, OutOfMemory }!void {
-    const rc = linux.inotify_add_watch(w.fd, path, mask);
+) WatchError!void {
+    return w.add(gpa, path, id, mask & ~@as(u32, linux.IN.DONT_FOLLOW));
+}
+
+fn add(w: *Watcher, gpa: std.mem.Allocator, path: [*:0]const u8, id: u32, m: u32) WatchError!void {
+    const rc = linux.inotify_add_watch(w.fd, path, m);
     switch (linux.errno(rc)) {
         .SUCCESS => {},
         .NOSPC => {
@@ -91,6 +107,29 @@ pub fn watch(
         else => return error.Watch,
     }
     try w.wd_to_id.put(gpa, @intCast(rc), id);
+}
+
+/// Stops watching every directory whose entry `alive` rejects. A directory
+/// moved out of the tree is not deleted, so the kernel kept its watch (and
+/// everything below's) until the next rescan.
+pub fn prune(
+    w: *Watcher,
+    gpa: std.mem.Allocator,
+    ctx: anytype,
+    comptime alive: fn (@TypeOf(ctx), u32) bool,
+) void {
+    var dead: std.ArrayList(i32) = .empty;
+    defer dead.deinit(gpa);
+    var it = w.wd_to_id.iterator();
+    while (it.next()) |e| if (!alive(ctx, e.value_ptr.*)) {
+        // Out of memory: what is not pruned now is at the next rescan.
+        dead.append(gpa, e.key_ptr.*) catch break;
+    };
+    for (dead.items) |wd| {
+        // Its IN_IGNORED comes later and finds nothing to forget.
+        _ = linux.inotify_rm_watch(w.fd, wd);
+        _ = w.wd_to_id.remove(wd);
+    }
 }
 
 /// Reads everything pending without waiting. Names live in `arena`.
@@ -220,6 +259,48 @@ test "watcher: events become changes attributed to the watched entry" {
     changes.clearRetainingCapacity();
     try w.drain(arena, &changes);
     try testing.expect(changes.items.len == 1 and changes.items[0].created.parent == 9);
+}
+
+test "watcher: links are never followed below a root, and prune drops watches" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dbuf: [4096]u8 = undefined;
+    const dir = try tmpAbs(&tmp, &dbuf);
+    var b1: [4096]u8 = undefined;
+    var b2: [4096]u8 = undefined;
+    const real = try std.mem.printSentinel(&b1, "{s}/real", .{dir}, 0);
+    _ = linux.mkdir(real, 0o755);
+    const link = try std.mem.printSentinel(&b2, "{s}/link", .{dir}, 0);
+    _ = linux.symlink("real", link);
+    const w = try create(gpa);
+    defer w.destroy(gpa);
+
+    // Through the link: refused, and `real` keeps the id it was given.
+    try w.watch(gpa, real, 1);
+    try testing.expectError(error.Watch, w.watch(gpa, link, 2));
+    try testing.expectEqual(1, w.count());
+    var it = w.wd_to_id.valueIterator();
+    try testing.expectEqual(1, it.next().?.*);
+    // A root may be a link: followed.
+    try w.watchRoot(gpa, link, 3);
+    try testing.expectEqual(1, w.count());
+    it = w.wd_to_id.valueIterator();
+    try testing.expectEqual(3, it.next().?.*);
+
+    // Pruned: gone from the map and from the kernel (no more events).
+    w.prune(gpa, @as(u32, 3), struct {
+        fn alive(dead_id: u32, id: u32) bool {
+            return id != dead_id;
+        }
+    }.alive);
+    try testing.expectEqual(0, w.count());
+    try sys.writeFile(try std.mem.printSentinel(&b1, "{s}/real/f", .{dir}, 0), "x");
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    var changes: std.ArrayList(Change) = .empty;
+    try w.drain(arena_state.allocator(), &changes);
+    try testing.expectEqual(0, changes.items.len);
 }
 
 test "watcher: a flooded queue reports the overflow in one drain" {

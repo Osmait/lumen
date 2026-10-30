@@ -64,13 +64,16 @@ pub fn main(init: std.process.Init) !void {
         for (hits.items, 1..) |h, i| std.debug.print("{d:>3}. {d:>5}  {s}\n", .{
             i,
             h.score,
-            store.path(h.id, &buf),
+            store.path(h.id, &buf) orelse "?",
         });
         return;
     }
 
     // Save and map back: the start-up path.
-    const path = "/tmp/lumen-find-bench.idx";
+    var dir: TempDir = try .create();
+    defer dir.remove();
+    var pbuf: [4096]u8 = undefined;
+    const path = try dir.file(&pbuf, "files.idx");
     var t = sys.monotonicNs();
     try store.save(path);
     std.debug.print("save      {d:>8.1} ms\n", .{ms(sys.monotonicNs() - t)});
@@ -163,13 +166,53 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("\ntop 5 for \"cargo.toml\":\n", .{});
     for (hits.items[0..@min(5, hits.items.len)]) |h| std.debug.print(
         "  {s}\n",
-        .{mapped.path(h.id, &buf)},
+        .{mapped.path(h.id, &buf) orelse "?"},
     );
 }
 
 fn ms(ns: u64) f64 {
     return @as(f64, @floatFromInt(ns)) / 1e6;
 }
+
+/// A folder of our own under /tmp for the files a bench writes: a fixed
+/// name there could be anyone's (a link planted to a file of yours).
+const TempDir = struct {
+    buf: [64]u8 = undefined,
+    len: usize = 0,
+    files: [2][:0]const u8 = undefined,
+    n_files: usize = 0,
+
+    fn create() !TempDir {
+        var d: TempDir = .{};
+        const linux = std.os.linux;
+        for (0..100) |i| {
+            const p = try std.mem.printSentinel(&d.buf, "/tmp/lumen-find-{d}-{d}-{d}", .{
+                linux.getpid(),
+                sys.monotonicNs(),
+                i,
+            }, 0);
+            // Fails if anything is there already, a link included.
+            if (linux.errno(linux.mkdir(p, 0o700)) == .SUCCESS) {
+                d.len = p.len;
+                return d;
+            }
+        }
+        return error.TempDir;
+    }
+
+    /// `name` inside it, removed with it.
+    fn file(d: *TempDir, buf: []u8, name: []const u8) ![:0]const u8 {
+        const p = try std.mem.printSentinel(buf, "{s}/{s}", .{ d.buf[0..d.len], name }, 0);
+        d.files[d.n_files] = p;
+        d.n_files += 1;
+        return p;
+    }
+
+    fn remove(d: *TempDir) void {
+        for (d.files[0..d.n_files]) |f| _ = std.os.linux.unlink(f);
+        _ = std.os.linux.rmdir(d.buf[0..d.len :0]);
+    }
+};
 
 fn plainText(
     _: *anyopaque,
@@ -204,7 +247,10 @@ fn contentBench(
     var st: index.content.BuildStats = .{};
     var dummy: u8 = 0;
     // Written to the file as it grows, as the daemon builds it.
-    const path = "/tmp/lumen-content-bench.idx";
+    var dir: TempDir = try .create();
+    defer dir.remove();
+    var pbuf: [4096]u8 = undefined;
+    const path = try dir.file(&pbuf, "content.idx");
     var ix = try index.content.buildFile(
         gpa,
         pool,

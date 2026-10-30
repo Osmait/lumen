@@ -22,7 +22,8 @@ pub const flag_symlink: u8 = 1 << 1;
 pub const flag_hidden: u8 = 1 << 2;
 
 /// 02: masks are built from folded names (accents and case, `core.fold`).
-const magic = "LUMIDX02";
+/// 03: each directory's children are sorted by name (`findChild`).
+const magic = "LUMIDX03";
 const header = 24;
 
 /// Byte -> bit (0..63) for the mask prefilter, built at compile time.
@@ -148,9 +149,13 @@ pub const Store = struct {
         return s.arr(u8, s.lay.flags);
     }
 
+    /// Checked again on every use, not only by `validate`: a private mapping
+    /// still shows what others write to the file afterwards (pages not yet
+    /// copied), and a bad offset read past the buffer.
     pub fn name(s: *const Store, id: u32) []const u8 {
         const off = s.arr(u32, s.lay.name_off)[id];
         const n = s.arr(u16, s.lay.name_len)[id];
+        if (@as(usize, off) + n > s.lay.names_len) return "";
         const start = s.lay.names + off;
         return s.buf[start .. start + n];
     }
@@ -159,35 +164,47 @@ pub const Store = struct {
         return s.flags()[id] & flag_dir != 0;
     }
 
-    /// Absolute path of `id`, written into `out`. Two passes up the parent
-    /// chain: one to measure, one to fill from the end.
-    pub fn path(s: *const Store, id: u32, out: []u8) []const u8 {
+    /// Absolute path of `id`, written into `out`; null if it does not fit
+    /// (PATH_MAX is 4096, a deeper tree is possible) or its parents do not
+    /// lead to a root. Two passes up the parent chain: one to measure, one
+    /// to fill from the end. Both are bounded, for the same reason as
+    /// `name`: a parent cycle written to the file after it was checked
+    /// made the first one spin forever.
+    pub fn path(s: *const Store, id: u32, out: []u8) ?[]const u8 {
         const ps = s.parents();
+        const n_all = s.lay.n;
         var total: usize = 0;
         var cur = id;
-        while (true) {
+        var steps: usize = 0;
+        while (true) : (steps += 1) {
+            if (cur >= n_all or steps >= n_all) return null;
             total += s.name(cur).len;
             const p = ps[cur];
             if (p == no_parent) break;
+            if (p >= n_all) return null;
             if (!std.mem.endsWith(u8, s.name(p), "/")) total += 1;
+            if (total > out.len) return null;
             cur = p;
         }
-        if (total > out.len) return "";
+        if (total > out.len) return null;
         var end = total;
         cur = id;
-        while (true) {
+        for (0..steps + 1) |_| {
             const n = s.name(cur);
+            if (n.len > end) return null;
             @memcpy(out[end - n.len .. end], n);
             end -= n.len;
             const p = ps[cur];
-            if (p == no_parent) break;
+            if (p == no_parent) return if (end == 0) out[0..total] else null;
+            if (p >= n_all) return null;
             if (!std.mem.endsWith(u8, s.name(p), "/")) {
+                if (end == 0) return null;
                 end -= 1;
                 out[end] = '/';
             }
             cur = p;
         }
-        return out[0..total];
+        return null;
     }
 
     /// Deletes an entry without rebuilding: its mask becomes 0, and a
@@ -224,12 +241,20 @@ pub const Store = struct {
         return .{ .lo = @intCast(lo), .hi = @intCast(hi) };
     }
 
-    /// Child of `dir` named `n`, by binary search (scan-built stores only).
+    /// Child of `dir` named `n`: two binary searches, one for the children
+    /// and one among them by name (scan-built stores only: the scan sorts
+    /// each directory's entries).
     pub fn findChild(s: *const Store, dir: u32, n: []const u8) ?u32 {
         const r = s.children(dir);
-        var id = r.lo;
-        while (id < r.hi) : (id += 1) {
-            if (!s.isTombstoned(id) and std.mem.eql(u8, s.name(id), n)) return id;
+        var lo = r.lo;
+        var hi = r.hi;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            switch (std.mem.order(u8, s.name(mid), n)) {
+                .lt => lo = mid + 1,
+                .gt => hi = mid,
+                .eq => return if (s.isTombstoned(mid)) null else mid,
+            }
         }
         return null;
     }
@@ -453,8 +478,8 @@ test "paths are rebuilt from parents" {
     var s = try sample(testing.allocator);
     defer s.deinit(testing.allocator);
     var buf: [256]u8 = undefined;
-    try testing.expectEqualStrings("/home/u/proj/Cargo.toml", s.path(3, &buf));
-    try testing.expectEqualStrings("/home/u", s.path(0, &buf));
+    try testing.expectEqualStrings("/home/u/proj/Cargo.toml", s.path(3, &buf).?);
+    try testing.expectEqualStrings("/home/u", s.path(0, &buf).?);
 }
 
 test "children by binary search and tombstones" {
@@ -468,6 +493,47 @@ test "children by binary search and tombstones" {
     s.tombstone(4);
     try testing.expectEqual(@as(?u32, null), s.findChild(1, "src"));
     try testing.expectEqual(@as(usize, 4), s.liveLen());
+}
+
+test "findChild: a binary search among a directory's sorted children" {
+    const gpa = testing.allocator;
+    var b: Builder = .empty;
+    const root = try b.push(gpa, "/r", no_parent, flag_dir, 0);
+    const a = try b.push(gpa, "a", root, flag_dir, 1);
+    const names = [_][]const u8{ "Z", "b", "c.txt", "d", "e", "f", "g" };
+    for (names) |n| _ = try b.push(gpa, n, root, 0, 1);
+    for (names) |n| _ = try b.push(gpa, n, a, 0, 2);
+    var s = try b.finish(gpa);
+    defer s.deinit(gpa);
+    for (names) |n| {
+        const id = s.findChild(root, n).?;
+        try testing.expectEqualStrings(n, s.name(id));
+        try testing.expectEqual(root, s.parents()[id]);
+        try testing.expectEqual(a, s.parents()[s.findChild(a, n).?]);
+    }
+    try testing.expectEqual(@as(?u32, null), s.findChild(root, "c"));
+    try testing.expectEqual(@as(?u32, null), s.findChild(root, "zz"));
+    s.tombstone(s.findChild(a, "e").?);
+    try testing.expectEqual(@as(?u32, null), s.findChild(a, "e"));
+}
+
+test "a mapping written to after it was checked never hangs or reads out of bounds" {
+    // What `validate` accepted, changed underneath (a private mapping shows
+    // writes to pages it has not copied yet).
+    var s = try sample(testing.allocator);
+    defer s.deinit(testing.allocator);
+    var buf: [256]u8 = undefined;
+    const parents = s.parents();
+    parents[1] = 3; // proj -> Cargo.toml -> proj: a cycle
+    try testing.expectEqual(@as(?[]const u8, null), s.path(3, &buf));
+    parents[1] = 99; // out of range
+    try testing.expectEqual(@as(?[]const u8, null), s.path(3, &buf));
+    parents[1] = 0;
+    s.arr(u32, s.lay.name_off)[2] = std.math.maxInt(u32);
+    try testing.expectEqualStrings("", s.name(2));
+    try testing.expectEqualStrings("/home/u/proj/Cargo.toml", s.path(3, &buf).?);
+    // Too long for the buffer: no path, not an empty one.
+    try testing.expectEqual(@as(?[]const u8, null), s.path(3, buf[0..10]));
 }
 
 test "save and map give the same index; tombstones stay in memory" {
@@ -485,7 +551,7 @@ test "save and map give the same index; tombstones stay in memory" {
     defer m.deinit(testing.allocator);
     try testing.expectEqual(s.len(), m.len());
     var buf: [256]u8 = undefined;
-    try testing.expectEqualStrings("/home/u/proj/Cargo.toml", m.path(3, &buf));
+    try testing.expectEqualStrings("/home/u/proj/Cargo.toml", m.path(3, &buf).?);
     m.tombstone(3);
 
     var again = try Store.open(p);
@@ -525,7 +591,8 @@ fn exercise(s: *const Store) void {
     var sum: usize = s.nRoots() + @intFromBool(s.parentsSorted()) + s.liveLen();
     for (0..s.len()) |i| {
         const id: u32 = @intCast(i);
-        sum +%= s.name(id).len + s.path(id, &buf).len + @intFromBool(s.isDir(id));
+        const plen = if (s.path(id, &buf)) |p| p.len else 0;
+        sum +%= s.name(id).len + plen + @intFromBool(s.isDir(id));
         const r = s.children(id);
         std.debug.assert(r.lo <= r.hi and r.hi <= s.len());
         if (s.findChild(id, "x")) |c| sum +%= c;
@@ -675,8 +742,8 @@ fn fuzzBuilt(_: void, smith: *testing.Smith) anyerror!void {
     var p1: [4096]u8 = undefined;
     var p2: [4096]u8 = undefined;
     for (0..s.len()) |i| try testing.expectEqualStrings(
-        s.path(@intCast(i), &p1),
-        m.path(@intCast(i), &p2),
+        s.path(@intCast(i), &p1) orelse "",
+        m.path(@intCast(i), &p2) orelse "",
     );
     exercise(&m);
 }

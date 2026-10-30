@@ -6,6 +6,10 @@
 //! Two pools exist in the service on purpose: searches get every core, the
 //! background rescan only half. Measured in the Rust version, a rescan on all
 //! cores starved the search thread (worst search 0.5 ms -> 16 ms).
+//!
+//! A run holds the pool until its last item is done, and other callers
+//! wait: work that can take seconds (content verification, extraction) gets
+//! pools of its own, or the name search waits behind it.
 
 const std = @import("std");
 const Io = std.Io;

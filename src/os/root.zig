@@ -28,6 +28,18 @@ pub fn openDir(path: [*:0]const u8) Error!i32 {
     return @intCast(rc);
 }
 
+/// `openDir` that refuses a symbolic link. The file index uses it below its
+/// root: a folder swapped for a link to `/` between the event and the read
+/// was walked whole, under the lock searches wait on.
+pub fn openDirNoFollow(path: [*:0]const u8) Error!i32 {
+    const rc = try check(linux.open(
+        path,
+        .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true },
+        0,
+    ));
+    return @intCast(rc);
+}
+
 pub fn close(fd: i32) void {
     _ = linux.close(fd);
 }
@@ -225,6 +237,92 @@ pub fn readHead(path: [*:0]const u8, buf: []u8) []const u8 {
     return buf[0..n];
 }
 
+/// Mount points at or below `under` whose file system can hang a `stat`:
+/// network file systems and FUSE (sshfs, rclone), where a server that stops
+/// answering blocks every call into the mount. From /proc/self/mountinfo;
+/// empty when it cannot be read. Free with `freeList`.
+pub fn slowMounts(gpa: std.mem.Allocator, under: []const u8) std.mem.Allocator.Error![][]u8 {
+    const fd = openRegular("/proc/self/mountinfo") catch return &.{};
+    defer close(fd);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(gpa);
+    try readUpTo(gpa, fd, &text, 4 << 20);
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |x| gpa.free(x);
+        out.deinit(gpa);
+    }
+    var lines = std.mem.tokenizeScalar(u8, text.items, '\n');
+    while (lines.next()) |line| {
+        // "id parent dev root MOUNT options... - FSTYPE source options"
+        const dash = std.mem.find(u8, line, " - ") orelse continue;
+        var fields = std.mem.tokenizeScalar(u8, line[0..dash], ' ');
+        for (0..4) |_| _ = fields.next();
+        const escaped = fields.next() orelse continue;
+        var tail = std.mem.tokenizeScalar(u8, line[dash + 3 ..], ' ');
+        if (!mayHang(tail.next() orelse continue)) continue;
+        const mount = try unescapeMount(gpa, escaped);
+        const below = std.mem.startsWith(u8, mount, under) and (mount.len == under.len or
+            mount[under.len] == '/' or std.mem.endsWith(u8, under, "/"));
+        if (!below) {
+            gpa.free(mount);
+            continue;
+        }
+        out.append(gpa, mount) catch |err| {
+            gpa.free(mount);
+            return err;
+        };
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+pub fn freeList(gpa: std.mem.Allocator, list: []const []u8) void {
+    for (list) |x| gpa.free(x);
+    gpa.free(list);
+}
+
+fn mayHang(fstype: []const u8) bool {
+    // Plain "fuseblk" is a local disk (ntfs-3g).
+    if (std.mem.startsWith(u8, fstype, "fuse.") or std.mem.eql(u8, fstype, "fuse")) return true;
+    for ([_][]const u8{
+        "nfs",  "nfs4",      "cifs",   "smb3", "smbfs", "9p",
+        "ceph", "glusterfs", "lustre", "afs",  "davfs", "ncpfs",
+    }) |t| if (std.mem.eql(u8, fstype, t)) return true;
+    return false;
+}
+
+/// mountinfo writes space, tab, newline and backslash as `\ooo`.
+fn unescapeMount(gpa: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error![]u8 {
+    var buf: [4096]u8 = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < s.len and n < buf.len) : (n += 1) {
+        if (s[i] == '\\' and i + 3 < s.len) {
+            if (std.fmt.parseInt(u8, s[i + 1 .. i + 4], 8)) |b| {
+                buf[n] = b;
+                i += 4;
+                continue;
+            } else |_| {}
+        }
+        buf[n] = s[i];
+        i += 1;
+    }
+    return gpa.dupe(u8, buf[0..n]);
+}
+
+test "slow mounts: escapes undone, only below the root" {
+    const gpa = std.testing.allocator;
+    const m = try unescapeMount(gpa, "/home/u/my\\040share");
+    defer gpa.free(m);
+    try std.testing.expectEqualStrings("/home/u/my share", m);
+    try std.testing.expect(mayHang("fuse.sshfs") and mayHang("nfs4") and !mayHang("fuseblk"));
+    try std.testing.expect(!mayHang("ext4") and !mayHang("btrfs") and !mayHang("tmpfs"));
+    // Whatever this machine mounts, nothing is outside what was asked for.
+    const list = try slowMounts(gpa, "/home");
+    defer freeList(gpa, list);
+    for (list) |x| try std.testing.expect(std.mem.startsWith(u8, x, "/home"));
+}
+
 pub fn nowSeconds() i64 {
     var ts: linux.timespec = undefined;
     _ = linux.clock_gettime(.REALTIME, &ts);
@@ -336,12 +434,26 @@ pub const AtomicFile = struct {
         ) catch return error.NameTooLong;
         f.final_len = final.len;
         f.tmp_len = tmp.len;
-        f.fd = @intCast(try check(linux.open(
-            tmp,
-            .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true },
-            0o600,
-        )));
+        f.fd = try openTemp(tmp);
         return f;
+    }
+
+    /// A new file, never one that is there: `O_TRUNC` wrote through a link
+    /// planted at `<path>.tmp`. One left by a crash midway is removed first.
+    fn openTemp(tmp: [*:0]const u8) Error!i32 {
+        const flags: linux.O = .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .EXCL = true,
+            .NOFOLLOW = true,
+            .CLOEXEC = true,
+        };
+        var rc = linux.open(tmp, flags, 0o600);
+        if (linux.errno(rc) == .EXIST) {
+            _ = linux.unlink(tmp);
+            rc = linux.open(tmp, flags, 0o600);
+        }
+        return @intCast(try check(rc));
     }
 
     pub fn write(f: *AtomicFile, data: []const u8) Error!void {
@@ -604,6 +716,55 @@ test "atomic writes replace the file and leave no temporary behind" {
     // A directory that is not there: an error, and nothing left over.
     const bad = try std.mem.print(&pbuf, "{s}/missing/f.conf", .{dir});
     try std.testing.expectError(error.NotFound, writeFileAtomic(bad, "x"));
+}
+
+test "atomic writes never write through a temporary left in the way" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dbuf: [4096]u8 = undefined;
+    const dir = try tmpDirPath(&tmp, &dbuf);
+    var pbuf: [4096]u8 = undefined;
+    const p = try std.mem.print(&pbuf, "{s}/f.idx", .{dir});
+    var tbuf: [4096]u8 = undefined;
+    const t = try std.mem.printSentinel(&tbuf, "{s}.tmp", .{p}, 0);
+    var vbuf: [4096]u8 = undefined;
+    const victim = try std.mem.printSentinel(&vbuf, "{s}/victim", .{dir}, 0);
+    var rbuf: [16]u8 = undefined;
+    var zbuf: [4096]u8 = undefined;
+    const pz = try std.mem.printSentinel(&zbuf, "{s}", .{p}, 0);
+
+    // A link to someone else's file: replaced, the file untouched.
+    try writeFile(victim, "keep");
+    _ = linux.symlink(victim, t);
+    try writeFileAtomic(p, "new");
+    try std.testing.expectEqualStrings("keep", readHead(victim, &rbuf));
+    try std.testing.expectEqualStrings("new", readHead(pz, &rbuf));
+    try std.testing.expect(!exists(t));
+
+    // A crash's leftover: removed, the write goes through.
+    try writeFile(t, "half a file");
+    try writeFileAtomic(p, "newer");
+    try std.testing.expectEqualStrings("newer", readHead(pz, &rbuf));
+    try std.testing.expect(!exists(t));
+}
+
+test "openDirNoFollow refuses a link to a folder, openDir follows it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dbuf: [4096]u8 = undefined;
+    const dir = try tmpDirPath(&tmp, &dbuf);
+    var abuf: [4096]u8 = undefined;
+    const real = try std.mem.printSentinel(&abuf, "{s}/real", .{dir}, 0);
+    mkdirP(real);
+    var lbuf: [4096]u8 = undefined;
+    const link = try std.mem.printSentinel(&lbuf, "{s}/link", .{dir}, 0);
+    _ = linux.symlink("real", link);
+    close(try openDirNoFollow(real));
+    close(try openDir(link));
+    if (openDirNoFollow(link)) |fd| {
+        close(fd);
+        return error.TestUnexpectedResult;
+    } else |_| {}
 }
 
 test "Lumen's files and directories are owner-only" {

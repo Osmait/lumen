@@ -50,6 +50,11 @@ pub const Options = struct {
     limit: usize,
     /// Recent files rank higher (costs a statx per finalist).
     recency: bool = true,
+    /// Folders whose files get no recency, never stat'ed: mounts that can
+    /// hang (`sys.slowMounts`). A search runs on the UI thread with the
+    /// index locked, and a stat on an NFS or sshfs mount whose server went
+    /// away blocks until it answers.
+    no_stat: []const []const u8 = &.{},
 };
 
 const Pair = struct {
@@ -130,7 +135,7 @@ pub const Engine = struct {
         pool.runBlocks(finalists.items.len, fine_block, &fctx, FineCtx.block);
         std.mem.sort(Pair, hits.items, {}, lessThan);
 
-        if (opts.recency) byRecency(pool, store, hits.items, limit);
+        if (opts.recency) byRecency(pool, store, hits.items, limit, opts.no_stat);
 
         const take = @min(limit, hits.items.len);
         try out.ensureTotalCapacity(gpa, take);
@@ -493,10 +498,11 @@ const RecencyCtx = struct {
     store: *const Store,
     hits: []Pair,
     now: i64,
+    no_stat: []const []const u8,
 
     fn block(ctx: *RecencyCtx, lo: usize, hi: usize) void {
         var buf: [4096]u8 = undefined;
-        for (ctx.hits[lo..hi]) |*h| h.score += recencyBonus(ctx.store, h.id, ctx.now, &buf);
+        for (ctx.hits[lo..hi]) |*h| h.score += recencyBonus(ctx, h.id, &buf);
     }
 };
 
@@ -505,7 +511,13 @@ const RecencyCtx = struct {
 /// only the head of `hits` (sorted) is checked: with the bonus capped at
 /// `recency_max`, nothing below `cut - recency_max` can climb into the top
 /// `limit`. The cut comes from position `limit`, not further down.
-fn byRecency(pool: *Pool, store: *const Store, hits: []Pair, limit: usize) void {
+fn byRecency(
+    pool: *Pool,
+    store: *const Store,
+    hits: []Pair,
+    limit: usize,
+    no_stat: []const []const u8,
+) void {
     if (hits.len == 0) return;
     const cut = hits[@min(limit, hits.len) - 1].score;
     const floor = cut -| recency_max;
@@ -513,15 +525,28 @@ fn byRecency(pool: *Pool, store: *const Store, hits: []Pair, limit: usize) void 
     while (n < hits.len and hits[n].score >= floor) n += 1;
     n = @min(n, limit * recency_mul);
     // Up to 960 path rebuilds and stats for the UI's 60: on the pool.
-    var rctx: RecencyCtx = .{ .store = store, .hits = hits[0..n], .now = sys.nowSeconds() };
+    var rctx: RecencyCtx = .{
+        .store = store,
+        .hits = hits[0..n],
+        .now = sys.nowSeconds(),
+        .no_stat = no_stat,
+    };
     pool.runBlocks(n, recency_block, &rctx, RecencyCtx.block);
     std.mem.sort(Pair, hits[0..n], {}, lessThan);
 }
 
+/// Whether `path` is folder `dir` or below it ("/a/bc" is not below "/a/b").
+pub fn isUnder(path: []const u8, dir: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, dir)) return false;
+    return path.len == dir.len or path[dir.len] == '/' or std.mem.endsWith(u8, dir, "/");
+}
+
 /// Coarse on purpose: today vs this month vs old.
-fn recencyBonus(store: *const Store, id: u32, now: i64, buf: *[4096]u8) i32 {
-    const p = store.path(id, buf[0 .. buf.len - 1]);
+fn recencyBonus(ctx: *const RecencyCtx, id: u32, buf: *[4096]u8) i32 {
+    const now = ctx.now;
+    const p = ctx.store.path(id, buf[0 .. buf.len - 1]) orelse return 0;
     if (p.len == 0) return 0;
+    for (ctx.no_stat) |dir| if (isUnder(p, dir)) return 0;
     buf[p.len] = 0;
     const mt = sys.mtime(buf[0..p.len :0]) orelse return 0;
     if (mt > now) return recency_max;
@@ -792,4 +817,39 @@ test "a 100-character name is found and ranked first by its full name" {
     ));
     // Longer than any file name: nothing, not a crash.
     try testing.expectEqualStrings("", try topName(gpa, pool, &s, long ++ long ++ long));
+}
+
+test "recency: nothing under a slow mount is stat'ed" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dbuf: [4096]u8 = undefined;
+    const dir = try sys.tmpDirAbs(&tmp, &dbuf);
+    var pbuf: [4096]u8 = undefined;
+    try sys.writeFile(try std.mem.printSentinel(&pbuf, "{s}/recent_note.txt", .{dir}, 0), "x");
+    var b: store_mod.Builder = .empty;
+    const root = try b.push(gpa, dir, store_mod.no_parent, store_mod.flag_dir, 0);
+    _ = try b.push(gpa, "recent_note.txt", root, 0, 1);
+    var s = try b.finish(gpa);
+    defer s.deinit(gpa);
+    const pool = try Pool.create(gpa, testing.io, 1);
+    defer pool.destroy();
+    var e: Engine = .empty;
+    defer e.deinit(gpa);
+    var got: std.ArrayList(Hit) = .empty;
+    defer got.deinit(gpa);
+
+    try e.search(gpa, pool, &s, "recent_note", .{ .limit = 5, .recency = false }, &got);
+    const plain = got.items[0].score;
+    e.reset();
+    try e.search(gpa, pool, &s, "recent_note", .{ .limit = 5 }, &got);
+    try testing.expectEqual(plain + recency_max, got.items[0].score);
+    e.reset();
+    try e.search(gpa, pool, &s, "recent_note", .{ .limit = 5, .no_stat = &.{dir} }, &got);
+    try testing.expectEqual(plain, got.items[0].score);
+
+    try testing.expect(isUnder("/h/u/nfs", "/h/u/nfs"));
+    try testing.expect(isUnder("/h/u/nfs/a", "/h/u/nfs"));
+    try testing.expect(!isUnder("/h/u/nfs2/a", "/h/u/nfs"));
+    try testing.expect(isUnder("/a", "/"));
 }

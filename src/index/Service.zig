@@ -32,6 +32,12 @@ const no_fd: i32 = -1;
 /// Pause between arming batches: without it the thread re-takes the lock at
 /// once and a reader can starve for the whole arming (149 ms measured).
 const arm_yield_us = 300;
+/// A rescan asked for soon after the last one waits, twice as long as the
+/// previous wait, from 1 s up to a minute. Under heavy churn every rescan
+/// overflowed the queue while it ran and asked for the next one at once: a
+/// loop rewriting the index file.
+const backoff_min_ns = 1 * std.time.ns_per_s;
+const backoff_max_ns = 60 * std.time.ns_per_s;
 
 gpa: std.mem.Allocator,
 io: Io,
@@ -44,6 +50,13 @@ wake_fd: i32 = no_fd,
 thread: ?std.Thread = null,
 search_pool: *Pool,
 scan_pool: *Pool,
+/// Lent to the content index (`ContentService.Pools`), never used here.
+/// It had the two above: its verification and extraction hold a pool for
+/// seconds (an extractor may run 15 s), and the UI's name search, or the
+/// event thread holding the lock it waits on, queued behind them (950 ms
+/// measured).
+content_search_pool: *Pool,
+content_build_pool: *Pool,
 cfg: scan.Config,
 roots: [1][]const u8,
 cache_path: [:0]u8,
@@ -55,6 +68,10 @@ name_changes: std.atomic.Value(u64) = .init(0),
 /// For `lumen --stats`, read from other threads.
 rescans: std.atomic.Value(u32) = .init(0),
 last_rescan_ns: std.atomic.Value(u64) = .init(0),
+/// The service thread's own: when the last rescan ended, and how long the
+/// last one asked for soon after it waited (see `backoff_min_ns`).
+last_rescan_end_ns: ?u64 = null,
+backoff_ns: u64 = 0,
 
 pub const StartError = std.mem.Allocator.Error || std.Thread.SpawnError || Watcher.CreateError;
 
@@ -76,14 +93,22 @@ pub fn start(
     errdefer search_pool.destroy();
     const scan_pool = try Pool.create(gpa, io, Pool.halfCores());
     errdefer scan_pool.destroy();
+    const content_search_pool = try Pool.create(gpa, io, Pool.allCores());
+    errdefer content_search_pool.destroy();
+    const content_build_pool = try Pool.create(gpa, io, Pool.halfCores());
+    errdefer content_build_pool.destroy();
     search_pool.nameThreads("lm-search");
     scan_pool.nameThreads("lm-scan");
+    content_search_pool.nameThreads("lm-csearch");
+    content_build_pool.nameThreads("lm-cbuild");
     s.* = .{
         .gpa = gpa,
         .io = io,
         .live = undefined, // set below, once `cfg` has its final address
         .search_pool = search_pool,
         .scan_pool = scan_pool,
+        .content_search_pool = content_search_pool,
+        .content_build_pool = content_build_pool,
         .cfg = undefined,
         .roots = .{root_copy},
         .cache_path = cache,
@@ -102,6 +127,7 @@ pub fn start(
     s.live.pending_resync = true;
     const efd = std.os.linux.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
     if (std.os.linux.errno(efd) == .SUCCESS) s.wake_fd = @intCast(efd);
+    errdefer if (s.wake_fd != no_fd) sys.close(s.wake_fd);
     s.thread = try std.Thread.spawn(.{}, run, .{s});
     s.thread.?.setName(io, "lm-files") catch {};
     return s;
@@ -128,6 +154,8 @@ pub fn shutdown(s: *Service) void {
     s.live.deinit();
     s.search_pool.destroy();
     s.scan_pool.destroy();
+    s.content_search_pool.destroy();
+    s.content_build_pool.destroy();
     s.gpa.free(s.roots[0]);
     s.gpa.free(s.cache_path);
     s.gpa.destroy(s);
@@ -208,12 +236,43 @@ fn concernsContent(s: *Service, ch: Watcher.Change) bool {
     return true;
 }
 
+/// How long a rescan asked for `since` the last one ended waits, `prev`
+/// being the previous wait: nothing after a quiet minute, else twice that.
+fn backoffFor(prev: u64, since: u64) u64 {
+    if (since >= backoff_max_ns) return 0;
+    return std.math.clamp(prev *| 2, backoff_min_ns, backoff_max_ns);
+}
+
+/// Sleeps `ns`, or less if `shutdown` is called: false then.
+fn pause(s: *Service, ns: u64) bool {
+    const deadline = sys.monotonicNs() +| ns;
+    while (!s.stop.load(.acquire)) {
+        const left = deadline -| sys.monotonicNs();
+        if (left == 0) return true;
+        // `shutdown` writes the eventfd and nothing reads it: once written
+        // it stays readable. Without one, a look at `stop` every 100 ms.
+        const ms: i32 = @intCast(@min(left / std.time.ns_per_ms + 1, 100));
+        if (s.wake_fd != no_fd) _ = sys.waitReadable(s.wake_fd, ms) else sys.sleepUs(
+            @as(u64, @intCast(ms)) * std.time.us_per_ms,
+        );
+    }
+    return false;
+}
+
 fn rescan(s: *Service) void {
+    if (s.last_rescan_end_ns) |end| {
+        const since = sys.monotonicNs() -| end;
+        s.backoff_ns = backoffFor(s.backoff_ns, since);
+        // Stopping: the request stays, `shutdown` rescans.
+        if (s.backoff_ns > since and !s.pause(s.backoff_ns - since)) return;
+    }
     const t0 = sys.monotonicNs();
     // Nobody can tell what changed while the index is rebuilt.
     defer _ = s.name_changes.fetchAdd(1, .release);
     defer {
-        s.last_rescan_ns.store(sys.monotonicNs() - t0, .monotonic);
+        const t1 = sys.monotonicNs();
+        s.last_rescan_end_ns = t1;
+        s.last_rescan_ns.store(t1 - t0, .monotonic);
         _ = s.rescans.fetchAdd(1, .monotonic);
         @import("root.zig").trimHeap();
     }
@@ -236,6 +295,44 @@ fn rescan(s: *Service) void {
         log.warn("rescan: {t}", .{err});
         freeReplaced(s.gpa, fresh);
     }
+}
+
+/// Drains and applies what inotify reported; true if a rescan is due.
+fn applyEvents(s: *Service, arena: std.mem.Allocator) bool {
+    var scans: Live.Scans = .empty;
+    var max_entries: usize = 0;
+    {
+        s.lock.lockUncancelable(s.io);
+        defer s.lock.unlock(s.io);
+        var changes: std.ArrayList(Watcher.Change) = .empty;
+        // Events drained from the kernel and then lost would leave the
+        // index wrong for good: a failure asks for a rescan instead.
+        s.live.watcher.drain(arena, &changes) catch |err| {
+            log.warn("reading file events: {t}", .{err});
+            s.live.pending_resync = true;
+        };
+        for (changes.items) |ch| if (s.concernsContent(ch)) {
+            _ = s.name_changes.fetchAdd(1, .release);
+            break;
+        };
+        _ = s.live.apply(changes.items) catch |err| {
+            log.warn("applying file events: {t}", .{err});
+            s.live.pending_resync = true;
+        };
+        if (s.live.scans.items.len == 0) return s.live.pending_resync or s.live.needsCompaction();
+        scans = s.live.takeScans();
+        max_entries = s.live.limits.delta_max;
+    }
+    // New directories are read without the lock: a large tree moved in
+    // held it, and every search with it, for as long as reading took.
+    Live.readScans(s.gpa, s.scan_pool, &s.cfg, scans.items, max_entries);
+    s.lock.lockUncancelable(s.io);
+    defer s.lock.unlock(s.io);
+    s.live.addScans(&scans) catch |err| {
+        log.warn("applying file events: {t}", .{err});
+        s.live.pending_resync = true;
+    };
+    return s.live.pending_resync or s.live.needsCompaction();
 }
 
 fn run(s: *Service) void {
@@ -268,28 +365,7 @@ fn run(s: *Service) void {
         if (!sys.waitEvents(fd, s.wake_fd)) continue;
 
         _ = arena_state.reset(.retain_capacity);
-        const arena = arena_state.allocator();
-        var changes: std.ArrayList(Watcher.Change) = .empty;
-        const needs = blk: {
-            s.lock.lockUncancelable(s.io);
-            defer s.lock.unlock(s.io);
-            // Events drained from the kernel and then lost would leave the
-            // index wrong for good: a failure asks for a rescan instead.
-            s.live.watcher.drain(arena, &changes) catch |err| {
-                log.warn("reading file events: {t}", .{err});
-                s.live.pending_resync = true;
-            };
-            for (changes.items) |ch| if (s.concernsContent(ch)) {
-                _ = s.name_changes.fetchAdd(1, .release);
-                break;
-            };
-            _ = s.live.apply(changes.items) catch |err| {
-                log.warn("applying file events: {t}", .{err});
-                s.live.pending_resync = true;
-            };
-            break :blk s.live.pending_resync or s.live.needsCompaction();
-        };
-        if (needs) s.rescan();
+        if (s.applyEvents(arena_state.allocator())) s.rescan();
     }
 }
 
@@ -551,7 +627,7 @@ test "service: shutdown saves what was learned and the next start maps it" {
     var pbuf: [4096]u8 = undefined;
     try testing.expect(hits.items.len > 0 and std.mem.endsWith(
         u8,
-        saved.path(hits.items[0].id, &pbuf),
+        saved.path(hits.items[0].id, &pbuf).?,
         "/de_la_sesion.rs",
     ));
 
@@ -640,4 +716,17 @@ test "service: the delta threshold triggers a compaction" {
     const delta_live = s.live.delta.liveLen();
     s.lock.unlockShared(s.io);
     try testing.expect(delta_live < 5);
+}
+
+test "service: rescans asked for in a row wait longer each time" {
+    const s = std.time.ns_per_s;
+    // The first one, and any after a quiet minute: at once.
+    try testing.expectEqual(0, backoffFor(0, std.math.maxInt(u64)));
+    try testing.expectEqual(0, backoffFor(8 * s, 61 * s));
+    // In a row: 1, 2, 4... seconds, never past a minute.
+    var wait: u64 = 0;
+    for ([_]u64{ 1, 2, 4, 8, 16, 32, 60, 60 }) |want| {
+        wait = backoffFor(wait, 0);
+        try testing.expectEqual(want * s, wait);
+    }
 }

@@ -394,7 +394,8 @@ fn startFileIndex() void {
         log.warn("file index: {t}", .{err});
         return;
     };
-    // The content index shares the file index's thread pools.
+    // The content index borrows thread pools the file index keeps for it:
+    // sharing the file index's own froze the UI behind content work.
     const files = ui.files.?;
     const cache_dir = std.mem.print(&buf, "{s}/lumen", .{
         std.mem.span(c.g_get_user_cache_dir()),
@@ -405,7 +406,7 @@ fn startFileIndex() void {
         ui.io,
         home,
         cache_dir,
-        .{ .search = files.search_pool, .build = files.scan_pool },
+        .{ .search = files.content_search_pool, .build = files.content_build_pool },
         .{ .names = files },
     ) catch |err| {
         log.warn("content index: {t}", .{err});
