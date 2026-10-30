@@ -35,41 +35,72 @@ var handler: Handler = undefined;
 var gpa: std.mem.Allocator = undefined;
 var conns_open: usize = 0;
 
+pub const ListenError = error{
+    /// $XDG_RUNTIME_DIR is not set.
+    NoRuntimeDir,
+    /// The socket's folder or path does not fit (a sockaddr_un holds 108
+    /// bytes).
+    PathTooLong,
+    /// The socket's folder is a link, someone else's, or open to others.
+    FolderNotPrivate,
+    Socket,
+    Bind,
+    Listen,
+};
+
+/// Listens on $XDG_RUNTIME_DIR/lumen/<app_id>.sock. Without the socket
+/// `lumen` still works, through lumen-gtk, only slower: a failure is
+/// logged here, and the daemon runs on.
 pub fn start(allocator: std.mem.Allocator, app_id: []const u8, h: Handler) void {
-    const rt = std.mem.span(c.g_getenv("XDG_RUNTIME_DIR") orelse return);
-    listenIn(allocator, rt, app_id, h);
+    const runtime_dir = if (c.g_getenv("XDG_RUNTIME_DIR")) |dir| std.mem.span(dir) else "";
+    listenIn(allocator, runtime_dir, app_id, h) catch |err| {
+        log.warn("no socket ({t}): `lumen` goes through lumen-gtk, slower", .{err});
+    };
 }
 
-fn listenIn(allocator: std.mem.Allocator, rt: []const u8, app_id: []const u8, h: Handler) void {
+fn listenIn(
+    allocator: std.mem.Allocator,
+    runtime_dir: []const u8,
+    app_id: []const u8,
+    h: Handler,
+) ListenError!void {
+    if (runtime_dir.len == 0) return error.NoRuntimeDir;
     var dir_buf: [256]u8 = undefined;
-    const dir = ipc.dir(&dir_buf, rt) orelse return;
+    const dir = ipc.dir(&dir_buf, runtime_dir) orelse return error.PathTooLong;
     os.mkdirP(dir);
     if (!isPrivateDir(dir)) {
-        log.warn("{s} is not a folder of ours alone: no socket", .{dir});
-        return;
+        log.warn("{s} is not a folder of ours alone", .{dir});
+        return error.FolderNotPrivate;
     }
-    path = ipc.socketPath(&path_buf, rt, app_id) orelse return;
+    const socket_path = ipc.socketPath(&path_buf, runtime_dir, app_id) orelse {
+        return error.PathTooLong;
+    };
     const rc = linux.socket(
         linux.AF.UNIX,
         linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
         0,
     );
-    if (linux.errno(rc) != .SUCCESS) return;
+    if (failed(rc)) |errno| {
+        log.warn("socket: {t}", .{errno});
+        return error.Socket;
+    }
     const fd: linux.fd_t = @intCast(rc);
+    errdefer _ = linux.close(fd);
     // A socket left by a daemon that crashed; only the primary instance
     // gets here, so it is not a live one.
-    _ = linux.unlink(path.ptr);
+    _ = linux.unlink(socket_path.ptr);
     var addr: linux.sockaddr.un = .{ .path = @splat(0) };
-    @memcpy(addr.path[0..path.len], path);
-    if (linux.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.un))) != .SUCCESS or
-        linux.errno(linux.listen(fd, 16)) != .SUCCESS)
-    {
-        log.warn("cannot listen on {s}", .{path});
-        _ = linux.close(fd);
-        path = "";
-        return;
+    @memcpy(addr.path[0..socket_path.len], socket_path);
+    if (failed(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.un)))) |errno| {
+        log.warn("bind {s}: {t}", .{ socket_path, errno });
+        return error.Bind;
     }
-    _ = linux.chmod(path.ptr, 0o600);
+    if (failed(linux.listen(fd, 16))) |errno| {
+        log.warn("listen {s}: {t}", .{ socket_path, errno });
+        return error.Listen;
+    }
+    _ = linux.chmod(socket_path.ptr, 0o600);
+    path = socket_path;
     listen_fd = fd;
     handler = h;
     gpa = allocator;
@@ -404,9 +435,36 @@ fn testListen(tmp: *std.testing.TmpDir, buf: []u8) ![:0]const u8 {
     var rt_buf: [256]u8 = undefined;
     // Relative: a socket's path must fit in 108 bytes.
     const rt = try os.tmpDirPath(tmp, &rt_buf);
-    listenIn(testing.allocator, rt, "t", &testHandler);
+    try listenIn(testing.allocator, rt, "t", &testHandler);
     try testing.expect(listen_fd >= 0);
     return ipc.socketPath(buf, rt, "t").?;
+}
+
+test "each reason not to listen is an error of its own" {
+    try testing.expectError(error.NoRuntimeDir, listenIn(testing.allocator, "", "t", &testHandler));
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var runtime_buffer: [256]u8 = undefined;
+    const runtime_dir = try os.tmpDirPath(&tmp, &runtime_buffer);
+    const app_id_too_long: [120]u8 = @splat('x');
+    try testing.expectError(
+        error.PathTooLong,
+        listenIn(testing.allocator, runtime_dir, &app_id_too_long, &testHandler),
+    );
+
+    // The folder is a link: refused, whatever it points at.
+    var link_buffer: [512]u8 = undefined;
+    const link_runtime = try std.mem.printSentinel(&link_buffer, "{s}/link", .{runtime_dir}, 0);
+    var folder_buffer: [512]u8 = undefined;
+    const link_folder = try std.mem.printSentinel(&folder_buffer, "{s}/lumen", .{link_runtime}, 0);
+    try testing.expect(failed(linux.mkdir(link_runtime, 0o700)) == null);
+    try testing.expect(failed(linux.symlink("/tmp", link_folder)) == null);
+    try testing.expectError(
+        error.FolderNotPrivate,
+        listenIn(testing.allocator, link_runtime, "t", &testHandler),
+    );
+    try testing.expect(listen_fd < 0);
 }
 
 test "a client that sends nothing holds neither the main loop nor the others" {
