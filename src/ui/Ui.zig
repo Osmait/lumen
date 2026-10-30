@@ -53,7 +53,7 @@ const log = std.log.scoped(.ui);
 /// The window's pieces: lumen.layout's pixels, else the Width and Height
 /// settings.
 fn panelW(self: *const Ui) c_int {
-    if (self.layout.width) |w| return w;
+    if (self.layout.width) |width_px| return width_px;
     return switch (self.settings.width) {
         .narrow => 620,
         .default => 750,
@@ -61,7 +61,7 @@ fn panelW(self: *const Ui) c_int {
     };
 }
 fn panelH(self: *const Ui) c_int {
-    if (self.layout.height) |h| return h;
+    if (self.layout.height) |height_px| return height_px;
     return switch (self.settings.height) {
         .short => 380,
         .default => 474,
@@ -318,7 +318,11 @@ const Navigation = struct {
     fn push(navigation: *Navigation, view: View, selected_key: []const u8) void {
         assert(navigation.count <= capacity);
         if (navigation.count == capacity) {
-            std.mem.copyForwards(Entry, navigation.entries[0 .. capacity - 1], navigation.entries[1..]);
+            std.mem.copyForwards(
+                Entry,
+                navigation.entries[0 .. capacity - 1],
+                navigation.entries[1..],
+            );
             navigation.count -= 1;
         }
         const entry = &navigation.entries[navigation.count];
@@ -439,21 +443,21 @@ fn buildWindow(self: *Ui) *c.GtkWidget {
         self.panelH() + 2 * shell_margin,
     );
 
-    const w: *c.GtkWindow = @ptrCast(win);
-    c.gtk_layer_init_for_window(w);
-    c.gtk_layer_set_layer(w, c.GTK_LAYER_SHELL_LAYER_OVERLAY);
+    const window: *c.GtkWindow = @ptrCast(win);
+    c.gtk_layer_init_for_window(window);
+    c.gtk_layer_set_layer(window, c.GTK_LAYER_SHELL_LAYER_OVERLAY);
     c.gtk_layer_set_keyboard_mode(
-        w,
+        window,
         if (testMode())
             c.GTK_LAYER_SHELL_KEYBOARD_MODE_NONE
         else
             c.GTK_LAYER_SHELL_KEYBOARD_MODE_EXCLUSIVE,
     );
-    c.gtk_layer_set_namespace(w, "lumen");
-    c.gtk_layer_set_anchor(w, c.GTK_LAYER_SHELL_EDGE_TOP, 1);
+    c.gtk_layer_set_namespace(window, "lumen");
+    c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_TOP, 1);
 
     const overlay = c.gtk_overlay_new();
-    c.gtk_window_set_child(w, overlay);
+    c.gtk_window_set_child(window, overlay);
     return overlay;
 }
 
@@ -490,11 +494,11 @@ fn buildSearchBar(self: *Ui, column: *c.GtkWidget) void {
     c.gtk_widget_set_valign(self.entry, c.GTK_ALIGN_CENTER);
     c.gtk_box_append(@ptrCast(search), self.entry);
     widgets.connect(self.entry, "changed", &onChanged, self);
-    const k = widgets.label("Ctrl K", "kbd");
-    self.key_chip = k;
-    c.gtk_widget_set_valign(k, c.GTK_ALIGN_CENTER);
-    c.gtk_widget_set_tooltip_text(k, "Actions");
-    c.gtk_box_append(@ptrCast(search), k);
+    const key_chip = widgets.label("Ctrl K", "kbd");
+    self.key_chip = key_chip;
+    c.gtk_widget_set_valign(key_chip, c.GTK_ALIGN_CENTER);
+    c.gtk_widget_set_tooltip_text(key_chip, "Actions");
+    c.gtk_box_append(@ptrCast(search), key_chip);
     self.spacer = widgets.vbox(0);
     c.gtk_widget_set_vexpand(self.spacer, 1);
     c.gtk_widget_set_visible(self.spacer, 0);
@@ -564,9 +568,9 @@ fn buildFooter(self: *Ui, column: *c.GtkWidget) void {
     c.gtk_widget_set_valign(self.footer_sep, c.GTK_ALIGN_CENTER);
     c.gtk_box_append(@ptrCast(self.footer), self.footer_sep);
     c.gtk_box_append(@ptrCast(self.footer), widgets.label("Actions", "footer-action"));
-    const fk = widgets.label("Ctrl K", "kbd");
-    c.gtk_widget_set_valign(fk, c.GTK_ALIGN_CENTER);
-    c.gtk_box_append(@ptrCast(self.footer), fk);
+    const actions_key_label = widgets.label("Ctrl K", "kbd");
+    c.gtk_widget_set_valign(actions_key_label, c.GTK_ALIGN_CENTER);
+    c.gtk_box_append(@ptrCast(self.footer), actions_key_label);
     c.gtk_widget_set_visible(self.footer, 0);
     c.gtk_box_append(@ptrCast(column), self.footer);
 }
@@ -595,30 +599,37 @@ fn scanIconDir(self: *Ui) void {
     } else {
         self.icon_arena = .init(self.gpa);
     }
-    const a = self.icon_arena.?.allocator();
-    const dir = a.printSentinel("{s}/icons", .{self.config_dir}, 0) catch return;
-    const d = c.g_dir_open(dir.ptr, 0, null) orelse return;
-    defer c.g_dir_close(d);
-    while (c.g_dir_read_name(d)) |n| {
-        const name = std.mem.span(n);
+    const arena = self.icon_arena.?.allocator();
+    const dir = arena.printSentinel("{s}/icons", .{self.config_dir}, 0) catch return;
+    const icon_dir = c.g_dir_open(dir.ptr, 0, null) orelse return;
+    defer c.g_dir_close(icon_dir);
+    while (c.g_dir_read_name(icon_dir)) |name_c| {
+        const name = std.mem.span(name_c);
         const dot = std.mem.findScalarLast(u8, name, '.') orelse continue;
         const ext = name[dot + 1 ..];
         if (!(std.ascii.eqlIgnoreCase(ext, "svg") or std.ascii.eqlIgnoreCase(ext, "png"))) continue;
-        const path = a.printSentinel("{s}/{s}", .{ dir, name }, 0) catch continue;
-        widgets.renamed.put(a, a.dupe(u8, name[0..dot]) catch continue, path) catch continue;
+        const path = arena.printSentinel("{s}/{s}", .{ dir, name }, 0) catch continue;
+        widgets.renamed.put(
+            arena,
+            arena.dupe(u8, name[0..dot]) catch continue,
+            path,
+        ) catch continue;
     }
 }
 
 /// The icon init.lua gave the item with `key` (lumen.icons), if any.
 pub fn keyIcon(self: *const Ui, key: []const u8) ?item_mod.Icon {
-    const reg = self.ext_registry orelse return null;
+    const registry = self.ext_registry orelse return null;
     if (key.len == 0) return null;
-    for (reg.icons) |o| if (std.mem.eql(u8, o.key, key)) return o.icon;
+    for (registry.icons) |override| if (std.mem.eql(u8, override.key, key)) return override.icon;
     return null;
 }
 
-fn cssClass(w: *c.GtkWidget, name: [*:0]const u8, on: bool) void {
-    if (on) c.gtk_widget_add_css_class(w, name) else c.gtk_widget_remove_css_class(w, name);
+fn cssClass(widget: *c.GtkWidget, name: [*:0]const u8, on: bool) void {
+    if (on) c.gtk_widget_add_css_class(widget, name) else c.gtk_widget_remove_css_class(
+        widget,
+        name,
+    );
 }
 
 fn barWidget(self: *Ui, part: layout_mod.BarPart) *c.GtkWidget {
@@ -636,63 +647,63 @@ fn barWidget(self: *Ui, part: layout_mod.BarPart) *c.GtkWidget {
 /// detail pane's side, what rows show; then the size. The caller rebuilds
 /// the rows.
 pub fn applyStructure(self: *Ui) void {
-    const l = self.layout;
-    widgets.show = l.show;
-    widgets.rows_inline = l.rows == .inline_;
-    widgets.row_parts = l.row;
+    const layout = self.layout;
+    widgets.show = layout.show;
+    widgets.rows_inline = layout.rows == .inline_;
+    widgets.row_parts = layout.row;
     // The search bar's parts in order; setView decides which of them show.
     const bar: *c.GtkBox = @ptrCast(self.search_bar);
     var prev: ?*c.GtkWidget = null;
-    for (l.searchbar.slice()) |part| {
-        const w = self.barWidget(part);
-        c.gtk_box_reorder_child_after(bar, w, prev);
-        prev = w;
+    for (layout.searchbar.slice()) |part| {
+        const widget = self.barWidget(part);
+        c.gtk_box_reorder_child_after(bar, widget, prev);
+        prev = widget;
     }
-    c.gtk_label_set_text(@ptrCast(self.prompt_label), l.prompt.ptr);
+    c.gtk_label_set_text(@ptrCast(self.prompt_label), layout.prompt.ptr);
     c.gtk_widget_set_visible(self.prompt_label, @intFromBool(
-        l.prompt.len > 0 and l.searchbar.has(.prompt),
+        layout.prompt.len > 0 and layout.searchbar.has(.prompt),
     ));
     c.gtk_widget_set_visible(self.search_icon, @intFromBool(
-        l.show.search_icon and l.searchbar.has(.icon),
+        layout.show.search_icon and layout.searchbar.has(.icon),
     ));
-    const col: *c.GtkBox = @ptrCast(self.column);
-    c.gtk_box_set_spacing(col, if (l.panels == .single) 0 else 10);
-    cssClass(self.column, "single", l.panels == .single);
-    cssClass(self.column, "search-bottom", l.search == .bottom);
-    cssClass(self.column, "with-footer", l.footer);
+    const column_box: *c.GtkBox = @ptrCast(self.column);
+    c.gtk_box_set_spacing(column_box, if (layout.panels == .single) 0 else 10);
+    cssClass(self.column, "single", layout.panels == .single);
+    cssClass(self.column, "search-bottom", layout.search == .bottom);
+    cssClass(self.column, "with-footer", layout.footer);
     // spacer, then search and results in the chosen order, footer last.
-    c.gtk_box_reorder_child_after(col, self.spacer, null);
-    const first, const second = if (l.search == .bottom) .{
+    c.gtk_box_reorder_child_after(column_box, self.spacer, null);
+    const first, const second = if (layout.search == .bottom) .{
         self.results,
         self.search_bar,
     } else .{ self.search_bar, self.results };
-    c.gtk_box_reorder_child_after(col, first, self.spacer);
-    c.gtk_box_reorder_child_after(col, second, first);
-    c.gtk_box_reorder_child_after(col, self.footer, second);
-    c.gtk_widget_set_visible(self.spacer, @intFromBool(l.search == .bottom));
-    c.gtk_widget_set_visible(self.footer, @intFromBool(l.footer));
+    c.gtk_box_reorder_child_after(column_box, first, self.spacer);
+    c.gtk_box_reorder_child_after(column_box, second, first);
+    c.gtk_box_reorder_child_after(column_box, self.footer, second);
+    c.gtk_widget_set_visible(self.spacer, @intFromBool(layout.search == .bottom));
+    c.gtk_widget_set_visible(self.footer, @intFromBool(layout.footer));
     c.gtk_widget_set_visible(self.key_chip, @intFromBool(
-        l.show.key_hints and l.searchbar.has(.keys),
+        layout.show.key_hints and layout.searchbar.has(.keys),
     ));
     // With a footer, or the search bar at the bottom, the action panel opens
     // down there, above them.
     c.gtk_widget_set_valign(
         self.panel,
-        if (l.footer or l.search == .bottom) c.GTK_ALIGN_END else c.GTK_ALIGN_START,
+        if (layout.footer or layout.search == .bottom) c.GTK_ALIGN_END else c.GTK_ALIGN_START,
     );
-    cssClass(self.panel, "from-footer", l.footer);
-    cssClass(self.panel, "from-bottom", l.search == .bottom);
+    cssClass(self.panel, "from-footer", layout.footer);
+    cssClass(self.panel, "from-bottom", layout.search == .bottom);
 
     const island: *c.GtkBox = @ptrCast(self.results);
     c.gtk_orientable_set_orientation(
         self.results,
-        if (l.detail == .bottom) c.GTK_ORIENTATION_VERTICAL else c.GTK_ORIENTATION_HORIZONTAL,
+        if (layout.detail == .bottom) c.GTK_ORIENTATION_VERTICAL else c.GTK_ORIENTATION_HORIZONTAL,
     );
     // Null puts the detail pane first: on the left of the list.
-    const detail_after: ?*c.GtkWidget = if (l.detail == .left) null else self.scroller;
+    const detail_after: ?*c.GtkWidget = if (layout.detail == .left) null else self.scroller;
     c.gtk_box_reorder_child_after(island, self.detail, detail_after);
-    cssClass(self.results, "detail-left", l.detail == .left);
-    cssClass(self.results, "detail-bottom", l.detail == .bottom);
+    cssClass(self.results, "detail-left", layout.detail == .left);
+    cssClass(self.results, "detail-bottom", layout.detail == .bottom);
     self.applyLayout();
 }
 
@@ -705,18 +716,18 @@ fn applyLayout(self: *Ui) void {
         .comfortable => 38,
     };
     if (!self.built) return;
-    const w = self.panelW();
-    const h = self.panelH();
+    const width_px = self.panelW();
+    const height_px = self.panelH();
     c.gtk_scrolled_window_set_max_content_height(@ptrCast(self.scroller), self.listMaxH());
-    var cw: c_int = 0;
-    var ch: c_int = 0;
-    c.gtk_widget_get_size_request(self.column, &cw, &ch);
-    if (cw == w and ch == h) return;
-    c.gtk_widget_set_size_request(self.column, w, h);
+    var width_current_px: c_int = 0;
+    var height_current_px: c_int = 0;
+    c.gtk_widget_get_size_request(self.column, &width_current_px, &height_current_px);
+    if (width_current_px == width_px and height_current_px == height_px) return;
+    c.gtk_widget_set_size_request(self.column, width_px, height_px);
     c.gtk_window_set_default_size(
         @ptrCast(self.window),
-        w + 2 * shell_margin,
-        h + 2 * shell_margin,
+        width_px + 2 * shell_margin,
+        height_px + 2 * shell_margin,
     );
     if (c.gtk_widget_get_visible(self.window) != 0) {
         c.gtk_widget_set_visible(self.window, 0);
@@ -725,7 +736,7 @@ fn applyLayout(self: *Ui) void {
     }
     // The list beside a detail pane keeps ~40% of the width.
     if (c.gtk_widget_get_visible(self.detail) != 0) {
-        c.gtk_widget_set_size_request(self.scroller, @divTrunc(w * 2, 5), -1);
+        c.gtk_widget_set_size_request(self.scroller, @divTrunc(width_px * 2, 5), -1);
     }
 }
 
@@ -753,44 +764,47 @@ pub fn reloadSettings(self: *Ui) void {
     self.applyIconTheme();
     // The style may have changed in the file, or from init.lua.
     ext_view.syncStyle(self);
-    if (self.on_settings_changed) |f| f();
+    if (self.on_settings_changed) |callback| callback();
 }
 
 /// The Icon Theme setting, for Lumen's process only.
 fn applyIconTheme(self: *Ui) void {
-    const gs = c.gtk_settings_get_default() orelse return;
+    const gtk_settings = c.gtk_settings_get_default() orelse return;
     if (self.settings.icon_theme.len == 0) {
-        return c.gtk_settings_reset_property(gs, "gtk-icon-theme-name");
+        return c.gtk_settings_reset_property(gtk_settings, "gtk-icon-theme-name");
     }
     var buf: [128]u8 = undefined;
     const name = std.mem.printSentinel(&buf, "{s}", .{self.settings.icon_theme}, 0) catch return;
-    c.g_object_set(gs, "gtk-icon-theme-name", name.ptr, @as(?*anyopaque, null));
+    c.g_object_set(gtk_settings, "gtk-icon-theme-name", name.ptr, @as(?*anyopaque, null));
 }
 
 /// Writes the settings; what init.lua fixes keeps its value in the file.
 pub fn saveSettings(self: *Ui) void {
     var kept: [32][]const u8 = undefined;
-    var n: usize = 0;
-    if (self.ext_registry) |reg| for (reg.settings) |o| if (n < kept.len) {
-        kept[n] = o.key;
-        n += 1;
-    };
+    var kept_count: usize = 0;
+    if (self.ext_registry) |registry| {
+        for (registry.settings) |override| {
+            if (kept_count == kept.len) break;
+            kept[kept_count] = override.key;
+            kept_count += 1;
+        }
+    }
     self.settings.save(
         self.gpa,
         self.settings_path,
-        kept[0..n],
+        kept[0..kept_count],
     ) catch |err| log.warn("saving settings: {t}", .{err});
     self.settings_stamp = settings_mod.Stamp.of(self.settings_path.ptr);
     self.applyAppearance(null);
     self.applyLayout();
     self.applyIconTheme();
-    if (self.on_settings_changed) |f| f();
+    if (self.on_settings_changed) |callback| callback();
 }
 
 /// `lumen.set` in init.lua, over the file's values.
 pub fn applyOverrides(self: *Ui) void {
-    const reg = self.ext_registry orelse return;
-    for (reg.settings) |o| _ = self.settings.set(o.key, o.value);
+    const registry = self.ext_registry orelse return;
+    for (registry.settings) |override| _ = self.settings.set(override.key, override.value);
 }
 
 /// Set by init.lua: Settings shows it but cannot change it.
@@ -799,8 +813,8 @@ pub fn overridden(self: *const Ui, key: []const u8) bool {
     if (std.mem.eql(u8, key, "width") and self.layout.width != null) return true;
     if (std.mem.eql(u8, key, "height") and self.layout.height != null) return true;
     if (std.mem.eql(u8, key, "position") and self.layout.position != null) return true;
-    const reg = self.ext_registry orelse return false;
-    for (reg.settings) |o| if (std.mem.eql(u8, o.key, key)) return true;
+    const registry = self.ext_registry orelse return false;
+    for (registry.settings) |override| if (std.mem.eql(u8, override.key, key)) return true;
     return false;
 }
 
@@ -812,26 +826,26 @@ fn currentTheme(self: *Ui) *const themes.Theme {
 /// they changed. `preview` paints a theme without choosing it (moving
 /// through Change Theme).
 pub fn applyAppearance(self: *Ui, preview: ?*const themes.Theme) void {
-    const t = preview orelse self.currentTheme();
+    const theme = preview orelse self.currentTheme();
     var out: std.Io.Writer.Allocating = .init(self.gpa);
     defer out.deinit();
-    themes.css(&out.writer, t, &self.settings) catch return;
+    themes.css(&out.writer, theme, &self.settings) catch return;
     out.writer.writeAll(@embedFile("style.css")) catch return;
     self.appendStyleCss(&out.writer) catch return;
     self.appendUserCss(&out.writer) catch return;
     out.writer.writeByte(0) catch return;
     const text = out.written();
-    _ = themes.hex(&self.hl_fg, t.fg);
-    _ = themes.hex(&self.hl_bg, t.accent);
-    const h = std.hash.Wyhash.hash(0, text);
-    if (h == self.css_hash) return;
-    self.css_hash = h;
+    _ = themes.hex(&self.hl_fg, theme.fg);
+    _ = themes.hex(&self.hl_bg, theme.accent);
+    const hash = std.hash.Wyhash.hash(0, text);
+    if (hash == self.css_hash) return;
+    self.css_hash = hash;
     c.gtk_css_provider_load_from_string(self.css, @ptrCast(text.ptr));
 }
 
 /// The style's CSS, between Lumen's and the user's: styles/<name>/style.css,
 /// else the built-in style's.
-fn appendStyleCss(self: *Ui, w: *std.Io.Writer) std.Io.Writer.Error!void {
+fn appendStyleCss(self: *Ui, writer: *std.Io.Writer) std.Io.Writer.Error!void {
     self.style_css_stamp = .none;
     const name = self.settings.style;
     if (name.len == 0) return;
@@ -843,9 +857,9 @@ fn appendStyleCss(self: *Ui, w: *std.Io.Writer) std.Io.Writer.Error!void {
         0,
     ) catch return;
     if (os.info(dir) == null) {
-        const s = styles.find(name) orelse return;
-        try w.print("\n/* style {s} */\n", .{name});
-        return w.writeAll(s.css);
+        const style = styles.find(name) orelse return;
+        try writer.print("\n/* style {s} */\n", .{name});
+        return writer.writeAll(style.css);
     }
     var pbuf: [4096]u8 = undefined;
     const path = std.mem.printSentinel(&pbuf, "{s}/style.css", .{dir}, 0) catch return;
@@ -854,14 +868,14 @@ fn appendStyleCss(self: *Ui, w: *std.Io.Writer) std.Io.Writer.Error!void {
     var len: usize = 0;
     if (c.g_file_get_contents(path.ptr, &contents, &len, null) == 0) return;
     defer c.g_free(contents);
-    try w.print("\n/* {s} */\n", .{path});
-    try w.writeAll(contents.?[0..len]);
-    try w.writeByte('\n');
+    try writer.print("\n/* {s} */\n", .{path});
+    try writer.writeAll(contents.?[0..len]);
+    try writer.writeByte('\n');
 }
 
 /// $XDG_CONFIG_HOME/lumen/style.css, after Lumen's rules so it wins. The
 /// classes it can use are listed in EXTENSIONS.md.
-fn appendUserCss(self: *Ui, w: *std.Io.Writer) std.Io.Writer.Error!void {
+fn appendUserCss(self: *Ui, writer: *std.Io.Writer) std.Io.Writer.Error!void {
     var buf: [4096]u8 = undefined;
     const path = std.mem.printSentinel(&buf, "{s}/style.css", .{self.config_dir}, 0) catch return;
     self.user_css_stamp = settings_mod.Stamp.of(path.ptr);
@@ -869,9 +883,9 @@ fn appendUserCss(self: *Ui, w: *std.Io.Writer) std.Io.Writer.Error!void {
     var len: usize = 0;
     if (c.g_file_get_contents(path.ptr, &contents, &len, null) == 0) return;
     defer c.g_free(contents);
-    try w.writeAll("\n/* ~/.config/lumen/style.css */\n");
-    try w.writeAll(contents.?[0..len]);
-    try w.writeByte('\n');
+    try writer.writeAll("\n/* ~/.config/lumen/style.css */\n");
+    try writer.writeAll(contents.?[0..len]);
+    try writer.writeByte('\n');
 }
 
 fn userCssChanged(self: *Ui) bool {
@@ -895,14 +909,14 @@ fn userCssChanged(self: *Ui) bool {
 
 /// The desktop's light/dark preference (dark when it cannot be read).
 pub fn preferDark(self: *Ui) bool {
-    const gs = self.interface_settings orelse return true;
-    const v = c.g_settings_get_string(gs, "color-scheme");
-    defer c.g_free(v);
+    const interface_settings = self.interface_settings orelse return true;
+    const color_scheme = c.g_settings_get_string(interface_settings, "color-scheme");
+    defer c.g_free(color_scheme);
     return !std.mem.eql(
         u8,
-        std.mem.span(v),
+        std.mem.span(color_scheme),
         "prefer-light",
-    ) and !std.mem.eql(u8, std.mem.span(v), "default");
+    ) and !std.mem.eql(u8, std.mem.span(color_scheme), "default");
 }
 
 fn watchColorScheme(self: *Ui) void {
@@ -929,7 +943,7 @@ fn onColorScheme(_: *c.GSettings, _: [*:0]const u8, data: ?*anyopaque) callconv(
 /// After the next rebuild, the row selected now is selected again (by its
 /// key), wherever it moved.
 pub fn keepSelection(self: *Ui) void {
-    if (self.selectedItem()) |it| self.setReselect("{s}", .{it.key});
+    if (self.selectedItem()) |item| self.setReselect("{s}", .{item.key});
 }
 
 pub fn setReselect(self: *Ui, comptime fmt: []const u8, args: anytype) void {
@@ -967,7 +981,7 @@ pub fn showWith(self: *Ui, view: View, text: ?[*:0]const u8) void {
         ext_view.checkReload(self);
         self.placeOnFocusedMonitor();
         // Opening is a good moment to look for edited files.
-        if (self.contents) |cs| cs.poke();
+        if (self.contents) |content_service| content_service.poke();
     }
     self.navigation.clear();
     // The choose view needs a setting to choose for, and the ext view a
@@ -993,9 +1007,9 @@ pub fn showWith(self: *Ui, view: View, text: ?[*:0]const u8) void {
         }
     }
     if (was_hidden) {
-        if (stats.pending) |*p| {
-            p.t0 = t_show;
-            p.is_show = true;
+        if (stats.pending) |*pending_stats| {
+            pending_stats.t0 = t_show;
+            pending_stats.is_show = true;
         }
     }
 }
@@ -1038,40 +1052,43 @@ fn placeOnFocusedMonitor(self: *Ui) void {
     defer arena.deinit();
     const name = hypr.focusedMonitorName(arena.allocator()) orelse return;
     const monitors = c.gdk_display_get_monitors(c.gdk_display_get_default() orelse return);
-    const n = c.g_list_model_get_n_items(monitors);
+    const monitor_count = c.g_list_model_get_n_items(monitors);
     var i: c_uint = 0;
-    while (i < n) : (i += 1) {
+    while (i < monitor_count) : (i += 1) {
         const obj = c.g_list_model_get_item(monitors, i) orelse continue;
         defer c.g_object_unref(obj);
-        const mon: *c.GdkMonitor = @ptrCast(obj);
-        const conn = c.gdk_monitor_get_connector(mon) orelse continue;
-        if (!std.mem.eql(u8, std.mem.span(conn), name)) continue;
-        c.gtk_layer_set_monitor(@ptrCast(self.window), mon);
-        var geo: c.GdkRectangle = undefined;
-        c.gdk_monitor_get_geometry(mon, &geo);
-        const w: *c.GtkWindow = @ptrCast(self.window);
+        const monitor: *c.GdkMonitor = @ptrCast(obj);
+        const connector = c.gdk_monitor_get_connector(monitor) orelse continue;
+        if (!std.mem.eql(u8, std.mem.span(connector), name)) continue;
+        c.gtk_layer_set_monitor(@ptrCast(self.window), monitor);
+        var geometry: c.GdkRectangle = undefined;
+        c.gdk_monitor_get_geometry(monitor, &geometry);
+        const window: *c.GtkWindow = @ptrCast(self.window);
         const chosen: layout_mod.Position = switch (self.settings.position) {
             .upper_third => .upper_third,
             .center => .center,
         };
-        const pos = self.layout.position orelse chosen;
-        const off: c_int = self.layout.offset;
+        const position = self.layout.position orelse chosen;
+        const offset_px: c_int = self.layout.offset;
         // The pieces sit `shell_margin` inside the surface (room for shadows).
-        const at_bottom = pos == .bottom;
-        c.gtk_layer_set_anchor(w, c.GTK_LAYER_SHELL_EDGE_TOP, @intFromBool(!at_bottom));
-        c.gtk_layer_set_anchor(w, c.GTK_LAYER_SHELL_EDGE_BOTTOM, @intFromBool(at_bottom));
-        const margin: c_int = switch (pos) {
-            .top, .bottom => off - shell_margin,
+        const at_bottom = position == .bottom;
+        c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_TOP, @intFromBool(!at_bottom));
+        c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_BOTTOM, @intFromBool(at_bottom));
+        const margin: c_int = switch (position) {
+            .top, .bottom => offset_px - shell_margin,
             .upper_third, .center => @max(
                 @divTrunc(
-                    (geo.height - self.panelH()) * @as(c_int, if (pos == .center) 5 else 3),
+                    (geometry.height - self.panelH()) * @as(
+                        c_int,
+                        if (position == .center) 5 else 3,
+                    ),
                     10,
                 ) - shell_margin,
                 0,
-            ) + off,
+            ) + offset_px,
         };
         c.gtk_layer_set_margin(
-            w,
+            window,
             if (at_bottom) c.GTK_LAYER_SHELL_EDGE_BOTTOM else c.GTK_LAYER_SHELL_EDGE_TOP,
             margin,
         );
@@ -1105,23 +1122,23 @@ pub fn rebuild(self: *Ui) void {
     self.apps.dropStale();
 }
 
-fn loadBase(self: *Ui, a: std.mem.Allocator) []Item {
+fn loadBase(self: *Ui, arena: std.mem.Allocator) []Item {
     return switch (self.view) {
-        .root => self.rootCandidates(a),
-        .clipboard => self.clipCandidates(a),
-        .windows => self.windowCandidates(a),
+        .root => self.rootCandidates(arena),
+        .clipboard => self.clipCandidates(arena),
+        .windows => self.windowCandidates(arena),
         // Searched on every keystroke, straight from the index.
         .files, .contents => &.{},
-        .settings => settings_view.settingsCandidates(self, a),
-        .themes => settings_view.themeCandidates(self, a),
-        .default_apps => settings_view.defaultAppsCandidates(self, a),
-        .choose => settings_view.chooseCandidates(self, a),
+        .settings => settings_view.settingsCandidates(self, arena),
+        .themes => settings_view.themeCandidates(self, arena),
+        .default_apps => settings_view.defaultAppsCandidates(self, arena),
+        .choose => settings_view.chooseCandidates(self, arena),
         .ext => ext_view.base(self),
         // Filtered straight from the session's lines.
         .dmenu => &.{},
-        .prefs => prefs_view.candidates(self, a),
-        .input => prefs_view.inputCandidates(self, a),
-        .form => form_view.candidates(self, a),
+        .prefs => prefs_view.candidates(self, arena),
+        .input => prefs_view.inputCandidates(self, arena),
+        .form => form_view.candidates(self, arena),
     };
 }
 
@@ -1183,7 +1200,7 @@ fn layoutFor(self: *Ui, view: View) void {
         c.gtk_flow_box_set_max_children_per_line(@ptrCast(self.grid), @intCast(self.grid_columns));
     }
     c.gtk_widget_set_visible(self.detail_meta, @intFromBool(view != .ext));
-    for (self.meta_lines) |l| c.gtk_widget_set_visible(l, 1);
+    for (self.meta_lines) |meta_line| c.gtk_widget_set_visible(meta_line, 1);
     const bar = self.layout.searchbar;
     const back_shows = view != .root and self.layout.show.back and bar.has(.back);
     c.gtk_widget_set_visible(self.back, @intFromBool(back_shows));
@@ -1277,12 +1294,12 @@ fn rootCandidates(self: *Ui, arena: std.mem.Allocator) []Item {
     return all;
 }
 
-fn clipCandidates(self: *Ui, a: std.mem.Allocator) []Item {
-    const clips = self.db.recentClips(a, 500) catch return &.{};
+fn clipCandidates(self: *Ui, arena: std.mem.Allocator) []Item {
+    const clips = self.db.recentClips(arena, 500) catch return &.{};
     var out: std.ArrayList(Item) = .empty;
     for (clips) |clip| {
-        out.append(a, .{
-            .title = labels.firstLine(a, clip.head),
+        out.append(arena, .{
+            .title = labels.firstLine(arena, clip.head),
             .icon = .{ .tile = .{ .name = "edit-copy-symbolic", .color = .gray } },
             // The head only: the detail pane and the actions read the whole
             // entry (`clipContent`).
@@ -1294,20 +1311,20 @@ fn clipCandidates(self: *Ui, a: std.mem.Allocator) []Item {
     return out.items;
 }
 
-fn windowCandidates(self: *Ui, a: std.mem.Allocator) []Item {
+fn windowCandidates(self: *Ui, arena: std.mem.Allocator) []Item {
     var out: std.ArrayList(Item) = .empty;
-    for (hypr.clients(a)) |cl| {
+    for (hypr.clients(arena)) |cl| {
         if (!cl.mapped or cl.address.len == 0) continue;
         const icon: item_mod.Icon = if (self.apps.iconForClass(cl.class)) |g|
             .{ .gicon = g }
         else
             .{ .tile = .{ .name = "focus-windows-symbolic", .color = .blue } };
-        out.append(a, .{
-            .title = labels.displayText(a, if (cl.title.len > 0) cl.title else cl.class),
-            .subtitle = labels.displayText(a, cl.class),
-            .accessory = a.printSentinel("Workspace {s}", .{cl.workspace.name}, 0) catch "",
+        out.append(arena, .{
+            .title = labels.displayText(arena, if (cl.title.len > 0) cl.title else cl.class),
+            .subtitle = labels.displayText(arena, cl.class),
+            .accessory = arena.printSentinel("Workspace {s}", .{cl.workspace.name}, 0) catch "",
             .icon = icon,
-            .action = .{ .focus_window = a.dupeSentinel(u8, cl.address, 0) catch continue },
+            .action = .{ .focus_window = arena.dupeSentinel(u8, cl.address, 0) catch continue },
         }) catch break;
     }
     return out.items;
@@ -1341,13 +1358,13 @@ fn resetRows(self: *Ui) void {
 }
 
 pub fn refresh(self: *Ui) void {
-    const t0 = stats.now();
-    if (self.answerPending(t0)) return;
+    const start_ns = stats.now();
+    if (self.answerPending(start_ns)) return;
     self.search_ns = 0;
     defer {
-        const total = stats.now() - t0;
+        const total = stats.now() - start_ns;
         stats.pending = .{
-            .t0 = t0,
+            .t0 = start_ns,
             .view = self.view,
             .search = self.search_ns,
             .rows = total -| self.search_ns,
@@ -1362,91 +1379,95 @@ pub fn refresh(self: *Ui) void {
     for (self.icons.items) |icon| c.g_object_unref(icon);
     self.icons.clearRetainingCapacity();
 
-    const a = self.query_arena.allocator();
-    const q = std.mem.trim(u8, self.query(), " ");
-    self.fill(a, q, t0);
-    self.showEmptyOrResults(a, q);
+    const arena = self.query_arena.allocator();
+    const query_text = std.mem.trim(u8, self.query(), " ");
+    self.fill(arena, query_text, start_ns);
+    self.showEmptyOrResults(arena, query_text);
     self.selectAfterRefresh();
 }
 
 /// The rows on screen stay while the answer to a new query is on its way
 /// (it refreshes again when it comes): building them again cost a frame
 /// per keystroke. True when that is the case and the query was sent.
-fn answerPending(self: *Ui, t0: u64) bool {
-    const q = std.mem.trim(u8, self.query(), " ");
+fn answerPending(self: *Ui, start_ns: u64) bool {
+    const query_text = std.mem.trim(u8, self.query(), " ");
     // An extension's search command.
-    if (self.view == .ext and ext_view.waitingForSearch(self, q)) return true;
+    if (self.view == .ext and ext_view.waitingForSearch(self, query_text)) return true;
     // Contents: the rows on screen are the last result's.
     if (self.view != .contents) return false;
-    const cs = self.content_search orelse return false;
-    const r = self.content_result orelse return false;
-    if (q.len < 3) return false;
-    if (r != self.shown_content) return false;
-    if (std.mem.eql(u8, r.query, ContentSearch.clip(q))) return false;
-    self.content_gen = cs.submit(q, t0);
+    const content_search = self.content_search orelse return false;
+    const result = self.content_result orelse return false;
+    if (query_text.len < 3) return false;
+    if (result != self.shown_content) return false;
+    if (std.mem.eql(u8, result.query, ContentSearch.clip(query_text))) return false;
+    self.content_gen = content_search.submit(query_text, start_ns);
     self.content_pending = true;
     return true;
 }
 
 /// The current view's rows for `q`.
-fn fill(self: *Ui, a: std.mem.Allocator, q: []const u8, t0: u64) void {
+fn fill(self: *Ui, arena: std.mem.Allocator, query_text: []const u8, start_ns: u64) void {
     switch (self.view) {
-        .root => self.fillRoot(a, q),
-        .clipboard => self.fillFiltered(a, q, true),
-        .windows => self.fillFiltered(a, q, false),
-        .files => if (q.len > 0) {
+        .root => self.fillRoot(arena, query_text),
+        .clipboard => self.fillFiltered(arena, query_text, true),
+        .windows => self.fillFiltered(arena, query_text, false),
+        .files => if (query_text.len > 0) {
             self.addSection("Files");
-            for (file_results.fileItems(self, a, q, file_results_max)) |it| self.addItem(it);
+            for (file_results.fileItems(self, arena, query_text, file_results_max)) |item| {
+                self.addItem(item);
+            }
         },
-        .contents => if (q.len >= 3) self.fillContents(a, q, t0),
-        .settings, .themes, .default_apps, .choose => self.fillSectioned(a, q),
+        .contents => if (query_text.len >= 3) self.fillContents(arena, query_text, start_ns),
+        .settings, .themes, .default_apps, .choose => self.fillSectioned(arena, query_text),
         // A search command is asked for the query; a list command's rows are
         // filtered here.
         .ext => {
-            self.fillSectioned(a, if (ext_view.prepare(self, q)) q else "");
+            self.fillSectioned(arena, if (ext_view.prepare(self, query_text)) query_text else "");
             self.ext_shown = self.ext_result;
         },
-        .dmenu => dmenu.fill(self, a, q),
-        .prefs => self.fillSectioned(a, q),
+        .dmenu => dmenu.fill(self, arena, query_text),
+        .prefs => self.fillSectioned(arena, query_text),
         // In the input view the typed text is the value being edited, so it
         // does not filter the rows.
-        .input => self.fillSectioned(a, ""),
-        .form => self.fillSectioned(a, q),
+        .input => self.fillSectioned(arena, ""),
+        .form => self.fillSectioned(arena, query_text),
     }
 }
 
-fn fillContents(self: *Ui, a: std.mem.Allocator, q: []const u8, t0: u64) void {
-    const cs = self.content_search orelse {
+fn fillContents(self: *Ui, arena: std.mem.Allocator, query_text: []const u8, start_ns: u64) void {
+    const content_search = self.content_search orelse {
         self.addSection("Matches");
-        for (file_results.contentItems(self, a, q, content_results_max)) |it| self.addItem(it);
+        for (file_results.contentItems(self, arena, query_text, content_results_max)) |item| {
+            self.addItem(item);
+        }
         return;
     };
     // Ask the worker unless the result for this exact query is already
     // here; meanwhile keep showing the last result. The worker searches the
     // clipped query: compare with that, or a query longer than the clip
     // never counts as answered.
-    const fresh = if (self.content_result) |r| std.mem.eql(
+    const fresh = if (self.content_result) |result| std.mem.eql(
         u8,
-        r.query,
-        ContentSearch.clip(q),
+        result.query,
+        ContentSearch.clip(query_text),
     ) else false;
-    if (!fresh) self.content_gen = cs.submit(q, t0);
+    if (!fresh) self.content_gen = content_search.submit(query_text, start_ns);
     self.content_pending = !fresh;
-    if (self.content_result) |r| {
+    if (self.content_result) |result| {
         self.addSection("Matches");
-        for (file_results.itemsFromHits(self, a, r.hits)) |it| self.addItem(it);
-        self.shown_content = r;
+        for (file_results.itemsFromHits(self, arena, result.hits)) |item| self.addItem(item);
+        self.shown_content = result;
     }
 }
 
 /// "No Results" (or the view's empty text) when there is nothing to show,
 /// and which of the list, the grid and the results panel show.
-fn showEmptyOrResults(self: *Ui, a: std.mem.Allocator, q: []const u8) void {
+fn showEmptyOrResults(self: *Ui, arena: std.mem.Allocator, query_text: []const u8) void {
     const searching = self.view == .files or self.view == .contents;
     if (self.rows.items.len == 0 or (searching and self.items.items.len == 0)) {
         if (self.rows.items.len > 0) c.gtk_list_box_remove_all(@ptrCast(self.list));
         self.rows.clearRetainingCapacity();
-        const empty = self.emptyText(a);
+        const empty = self.emptyText(arena);
         const row = c.gtk_list_box_row_new();
         c.gtk_list_box_row_set_selectable(@ptrCast(row), 0);
         c.gtk_list_box_row_set_activatable(@ptrCast(row), 0);
@@ -1457,7 +1478,7 @@ fn showEmptyOrResults(self: *Ui, a: std.mem.Allocator, q: []const u8) void {
     c.gtk_widget_set_visible(self.grid, @intFromBool(self.grid_mode and self.items.items.len > 0));
     c.gtk_widget_set_visible(self.list, @intFromBool(!self.grid_mode or self.items.items.len == 0));
     // Nothing typed and nothing to suggest: only the search bar shows.
-    const alone = self.view == .root and q.len == 0 and self.items.items.len == 0;
+    const alone = self.view == .root and query_text.len == 0 and self.items.items.len == 0;
     c.gtk_widget_set_visible(self.results, @intFromBool(!alone));
     // One panel with only the search bar showing rounds all its corners.
     cssClass(self.column, "alone", alone);
@@ -1465,8 +1486,8 @@ fn showEmptyOrResults(self: *Ui, a: std.mem.Allocator, q: []const u8) void {
 
 /// Selects the first row, or the one asked for with `setReselect`.
 fn selectAfterRefresh(self: *Ui) void {
-    const adj = c.gtk_scrolled_window_get_vadjustment(@ptrCast(self.scroller));
-    c.gtk_adjustment_set_value(adj, 0);
+    const adjustment = c.gtk_scrolled_window_get_vadjustment(@ptrCast(self.scroller));
+    c.gtk_adjustment_set_value(adjustment, 0);
     var first = self.nextSelectable(null, 1);
     const top = first;
     if (self.reselect.len > 0) {
@@ -1477,8 +1498,8 @@ fn selectAfterRefresh(self: *Ui) void {
         self.reselect.clear();
         const want = pending.slice();
         for (self.rows.items, 0..) |row, i| {
-            const ii = row.item orelse continue;
-            if (std.mem.eql(u8, self.items.items[ii].key, want)) {
+            const item_index = row.item orelse continue;
+            if (std.mem.eql(u8, self.items.items[item_index].key, want)) {
                 first = i;
                 break;
             }
@@ -1492,110 +1513,115 @@ fn selectAfterRefresh(self: *Ui) void {
 }
 
 /// Settings-style lists: grouped by section, filtered by typing.
-fn fillSectioned(self: *Ui, a: std.mem.Allocator, q: []const u8) void {
-    if (q.len == 0) {
+fn fillSectioned(self: *Ui, arena: std.mem.Allocator, query_text: []const u8) void {
+    if (query_text.len == 0) {
         var last: ?[]const u8 = null;
-        for (self.base) |it| {
-            if (last == null or !std.mem.eql(u8, last.?, it.section)) {
-                if (it.section.len > 0) self.addSection(it.section);
-                last = it.section;
+        for (self.base) |item| {
+            if (last == null or !std.mem.eql(u8, last.?, item.section)) {
+                if (item.section.len > 0) self.addSection(item.section);
+                last = item.section;
             }
-            self.addItem(it);
+            self.addItem(item);
         }
         return;
     }
     var hits: std.ArrayList(Item) = .empty;
-    for (self.base) |it| {
-        const fields = [_][]const u8{ it.title, it.keywords, it.subtitle, it.accessory };
-        const sc = core.fuzzy.scoreFields(q, &fields);
-        if (sc == core.fuzzy.no_match) continue;
-        var copy = it;
-        copy.score = sc;
-        hits.append(a, copy) catch break;
+    for (self.base) |item| {
+        const fields = [_][]const u8{ item.title, item.keywords, item.subtitle, item.accessory };
+        const score = core.fuzzy.scoreFields(query_text, &fields);
+        if (score == core.fuzzy.no_match) continue;
+        var copy = item;
+        copy.score = score;
+        hits.append(arena, copy) catch break;
     }
     sortByScore(hits.items);
-    for (hits.items) |it| self.addItem(it);
+    for (hits.items) |item| self.addItem(item);
 }
 
 /// Nothing typed: what was used most, then every command.
-fn fillSuggestions(self: *Ui, a: std.mem.Allocator) void {
+fn fillSuggestions(self: *Ui, arena: std.mem.Allocator) void {
     var used: std.ArrayList(Item) = .empty;
-    for (self.base) |it| {
-        const v = self.frec.get(it.key) orelse continue;
-        var copy = it;
+    for (self.base) |item| {
+        const v = self.frec.get(item.key) orelse continue;
+        var copy = item;
         copy.score = std.math.lossyCast(i32, v * 1000);
-        used.append(a, copy) catch break;
+        used.append(arena, copy) catch break;
     }
     sortByScore(used.items);
     if (used.items.len > 0 and self.settings.suggestions) {
         self.addSection("Suggestions");
-        for (used.items[0..@min(used.items.len, 6)]) |it| self.addItem(it);
+        for (used.items[0..@min(used.items.len, 6)]) |item| self.addItem(item);
     }
     self.addSection("Commands");
-    for (self.base) |it| {
-        switch (it.action) {
-            .view, .script, .ext_command, .ext_problem => self.addItem(it),
+    for (self.base) |item| {
+        switch (item.action) {
+            .view, .script, .ext_command, .ext_problem => self.addItem(item),
             else => {},
         }
     }
 }
 
-fn fillRoot(self: *Ui, a: std.mem.Allocator, q: []const u8) void {
-    if (q.len == 0) return self.fillSuggestions(a);
+fn fillRoot(self: *Ui, arena: std.mem.Allocator, query_text: []const u8) void {
+    if (query_text.len == 0) return self.fillSuggestions(arena);
 
-    if (core.calc.evaluate(q)) |r| {
+    if (core.calc.evaluate(query_text)) |answer| {
         self.addSection("Calculator");
         var buf: [64]u8 = undefined;
-        const plain = a.dupe(u8, core.calc.formatPlain(&buf, r.value)) catch "";
+        const plain = arena.dupe(u8, core.calc.formatPlain(&buf, answer.value)) catch "";
         self.addItem(.{
-            .title = a.dupeSentinel(u8, q, 0) catch "",
-            .subtitle = a.dupeSentinel(u8, r.from_unit, 0) catch "",
-            .accessory = a.dupeSentinel(u8, r.unit, 0) catch "",
+            .title = arena.dupeSentinel(u8, query_text, 0) catch "",
+            .subtitle = arena.dupeSentinel(u8, answer.from_unit, 0) catch "",
+            .accessory = arena.dupeSentinel(u8, answer.unit, 0) catch "",
             .action = .calc,
             .detail = plain,
         });
     }
     // Extensions' answers (rows from `root = function(query)`).
-    ext_view.addRootSections(self, q);
+    ext_view.addRootSections(self, query_text);
 
     // Scoring and sorting only: rows are timed apart, and fileItems times
     // itself (a deferred timer here counted it twice).
     const t_search = stats.now();
     var hits: std.ArrayList(Item) = .empty;
-    for (self.base) |it| {
-        const fields = [_][]const u8{ it.title, it.keywords, it.subtitle };
-        const s = core.fuzzy.scoreFields(q, &fields);
-        if (s == core.fuzzy.no_match) continue;
-        var copy = it;
-        copy.score = s + core.frecency.boost(self.frec.get(it.key) orelse 0);
-        hits.append(a, copy) catch break;
+    for (self.base) |item| {
+        const fields = [_][]const u8{ item.title, item.keywords, item.subtitle };
+        const score = core.fuzzy.scoreFields(query_text, &fields);
+        if (score == core.fuzzy.no_match) continue;
+        var copy = item;
+        copy.score = score + core.frecency.boost(self.frec.get(item.key) orelse 0);
+        hits.append(arena, copy) catch break;
     }
     sortByScore(hits.items);
     self.search_ns += stats.now() - t_search;
     // Files from 3 letters on, right after the best few results so they are
     // visible without scrolling; the rest of the results follow.
-    const files_wanted = q.len >= 3 and self.settings.files_in_root;
-    const files = if (files_wanted) file_results.fileItems(self, a, q, root_files_max) else &.{};
+    const files_wanted = query_text.len >= 3 and self.settings.files_in_root;
+    const files = if (files_wanted) file_results.fileItems(
+        self,
+        arena,
+        query_text,
+        root_files_max,
+    ) else &.{};
     const shown = @min(hits.items.len, root_results_max);
     const head = if (files.len > 0) @min(shown, root_results_before_files_max) else shown;
-    for (hits.items[0..head]) |it| self.addItem(it);
+    for (hits.items[0..head]) |item| self.addItem(item);
     if (files.len > 0) {
         self.addSection("Files");
-        for (files) |it| self.addItem(it);
+        for (files) |item| self.addItem(item);
         if (shown > head) self.addSection("More Results");
-        for (hits.items[head..shown]) |it| self.addItem(it);
+        for (hits.items[head..shown]) |item| self.addItem(item);
     }
 }
 
-fn fillFiltered(self: *Ui, a: std.mem.Allocator, q: []const u8, by_day: bool) void {
-    if (q.len == 0) {
+fn fillFiltered(self: *Ui, arena: std.mem.Allocator, query_text: []const u8, by_day: bool) void {
+    if (query_text.len == 0) {
         if (by_day) {
             const today = labels.startOfToday();
             var last: ?[:0]const u8 = null;
-            for (self.base) |it| {
-                const section: [:0]const u8 = if (it.time_s >= today)
+            for (self.base) |item| {
+                const section: [:0]const u8 = if (item.time_s >= today)
                     "Today"
-                else if (it.time_s >= today - std.time.s_per_day)
+                else if (item.time_s >= today - std.time.s_per_day)
                     "Yesterday"
                 else
                     "Earlier";
@@ -1603,27 +1629,30 @@ fn fillFiltered(self: *Ui, a: std.mem.Allocator, q: []const u8, by_day: bool) vo
                     self.addSection(section);
                     last = section;
                 }
-                self.addItem(it);
+                self.addItem(item);
             }
         } else {
-            for (self.base) |it| self.addItem(it);
+            for (self.base) |item| self.addItem(item);
         }
         return;
     }
     const t_search = stats.now();
     var hits: std.ArrayList(Item) = .empty;
-    for (self.base) |it| {
-        const text = if (it.detail.len > 0) it.detail[0..@min(it.detail.len, 2000)] else it.title;
-        const fields = [_][]const u8{ text, it.subtitle };
-        const s = core.fuzzy.scoreFields(q, &fields);
-        if (s == core.fuzzy.no_match) continue;
-        var copy = it;
-        copy.score = s;
-        hits.append(a, copy) catch break;
+    for (self.base) |item| {
+        const text = if (item.detail.len > 0) item.detail[0..@min(
+            item.detail.len,
+            2000,
+        )] else item.title;
+        const fields = [_][]const u8{ text, item.subtitle };
+        const score = core.fuzzy.scoreFields(query_text, &fields);
+        if (score == core.fuzzy.no_match) continue;
+        var copy = item;
+        copy.score = score;
+        hits.append(arena, copy) catch break;
     }
     sortByScore(hits.items);
     self.search_ns += stats.now() - t_search;
-    for (hits.items[0..@min(hits.items.len, filtered_results_max)]) |it| self.addItem(it);
+    for (hits.items[0..@min(hits.items.len, filtered_results_max)]) |item| self.addItem(item);
 }
 
 /// Best first; equal scores by title, so the order never depends on the
@@ -1646,10 +1675,10 @@ pub fn addSection(self: *Ui, title: [:0]const u8) void {
 
 /// Queues the row and returns true when `eager_rows` rows are built already.
 /// Returns false when the caller must build it now.
-fn deferRow(self: *Ui, p: Pending) bool {
+fn deferRow(self: *Ui, pending_row: Pending) bool {
     if (self.grid_mode or
         (self.rows.items.len < eager_rows and self.pending.items.len == 0)) return false;
-    self.pending.append(self.query_arena.allocator(), p) catch return false;
+    self.pending.append(self.query_arena.allocator(), pending_row) catch return false;
     if (self.pending_idle == 0) {
         self.pending_idle = c.g_idle_add_full(c.G_PRIORITY_LOW, &onPendingRows, self, null);
     }
@@ -1673,15 +1702,18 @@ pub fn ensureRows(self: *Ui) void {
     self.buildPending(self.pending.items.len);
 }
 
-fn buildPending(self: *Ui, n: usize) void {
-    const k = @min(n, self.pending.items.len);
-    for (self.pending.items[0..k]) |p| switch (p) {
+fn buildPending(self: *Ui, count: usize) void {
+    const built_count = @min(count, self.pending.items.len);
+    for (self.pending.items[0..built_count]) |pending_row| switch (pending_row) {
         .item => |i| self.buildItemRow(i),
-        .section => |t| self.buildSection(t),
+        .section => |title| self.buildSection(title),
     };
     // What is left moves to the front.
-    @memmove(self.pending.items[0 .. self.pending.items.len - k], self.pending.items[k..]);
-    self.pending.items.len -= k;
+    @memmove(
+        self.pending.items[0 .. self.pending.items.len - built_count],
+        self.pending.items[built_count..],
+    );
+    self.pending.items.len -= built_count;
 }
 
 /// After the frame: the queued rows a few at a time, so a keystroke that
@@ -1707,12 +1739,12 @@ fn buildSection(self: *Ui, title: [:0]const u8) void {
     self.rows.appendAssumeCapacity(.{ .widget = row, .item = null, .section = title });
 }
 
-pub fn addItem(self: *Ui, it_in: Item) void {
-    var it = it_in;
-    if (self.keyIcon(it.key)) |icon| it.icon = icon;
-    const a = self.query_arena.allocator();
+pub fn addItem(self: *Ui, item_given: Item) void {
+    var item = item_given;
+    if (self.keyIcon(item.key)) |icon| item.icon = icon;
+    const arena = self.query_arena.allocator();
     const item_index = self.items.items.len;
-    self.items.append(a, it) catch return;
+    self.items.append(arena, item) catch return;
     if (self.deferRow(.{ .item = item_index })) return;
     self.buildItemRow(item_index);
 }
@@ -1724,14 +1756,14 @@ fn buildItemRow(self: *Ui, item_index: usize) void {
     if (self.lastItemRow()) |prev| assert(prev < item_index);
     // The grid has no section rows: a child's index is its item's.
     if (self.grid_mode) assert(self.rows.items.len == item_index);
-    const a = self.query_arena.allocator();
-    const it = self.items.items[item_index];
+    const arena = self.query_arena.allocator();
+    const item = self.items.items[item_index];
     // Room first: a widget without its `rows` entry would shift every later
     // row's index (and `onRowActivated` would select the wrong item).
-    self.rows.ensureUnusedCapacity(a, 1) catch return;
+    self.rows.ensureUnusedCapacity(arena, 1) catch return;
     if (self.grid_mode) {
         const gap = 6 * (self.grid_columns - 1) + 24;
-        const cell = widgets.gridCell(it, @divTrunc(self.panelW() - gap, self.grid_columns) - 12);
+        const cell = widgets.gridCell(item, @divTrunc(self.panelW() - gap, self.grid_columns) - 12);
         c.gtk_flow_box_append(@ptrCast(self.grid), cell);
         const child = c.gtk_flow_box_get_child_at_index(
             @ptrCast(self.grid),
@@ -1741,7 +1773,7 @@ fn buildItemRow(self: *Ui, item_index: usize) void {
         return;
     }
     var parts: widgets.RowParts = .{};
-    const row = if (it.action == .calc) widgets.calcRow(it) else widgets.itemRow(it, &parts);
+    const row = if (item.action == .calc) widgets.calcRow(item) else widgets.itemRow(item, &parts);
     c.g_object_set_data(@ptrCast(row), "lumen-row", @ptrFromInt(self.rows.items.len + 1));
     c.gtk_list_box_append(@ptrCast(self.list), row);
     self.rows.appendAssumeCapacity(.{
@@ -1759,13 +1791,13 @@ pub fn nextSelectable(self: *Ui, from: ?usize, dir: i32) ?usize {
     if (self.pending.items.len > 0 and
         ((from == null and dir < 0) or
             (from != null and dir > 0 and from.? + 1 >= self.rows.items.len))) self.ensureRows();
-    const n = self.rows.items.len;
-    if (n == 0) return null;
-    var i: i64 = if (from) |f| @as(
+    const row_count = self.rows.items.len;
+    if (row_count == 0) return null;
+    var i: i64 = if (from) |start| @as(
         i64,
-        @intCast(f),
-    ) + dir else if (dir > 0) 0 else @as(i64, @intCast(n)) - 1;
-    while (i >= 0 and i < n) : (i += dir) {
+        @intCast(start),
+    ) + dir else if (dir > 0) 0 else @as(i64, @intCast(row_count)) - 1;
+    while (i >= 0 and i < row_count) : (i += dir) {
         if (self.rows.items[@intCast(i)].item != null) return @intCast(i);
     }
     return from;
@@ -1773,21 +1805,21 @@ pub fn nextSelectable(self: *Ui, from: ?usize, dir: i32) ?usize {
 
 pub fn select(self: *Ui, row_index: ?usize) void {
     if (self.selected) |old| if (old < self.rows.items.len) {
-        const r = self.rows.items[old];
-        if (r.hint) |h| c.gtk_widget_set_visible(h, 0);
-        if (r.accessory) |acc| c.gtk_widget_set_visible(acc, 1);
+        const row_old = self.rows.items[old];
+        if (row_old.hint) |hint| c.gtk_widget_set_visible(hint, 0);
+        if (row_old.accessory) |acc| c.gtk_widget_set_visible(acc, 1);
     };
     self.selected = row_index;
     self.confirm_key = "";
     self.primary = "";
-    const ri = row_index orelse {
+    const selected_index = row_index orelse {
         self.setFooterAction("", false);
         c.gtk_list_box_unselect_all(@ptrCast(self.list));
         c.gtk_flow_box_unselect_all(@ptrCast(self.grid));
         detail_pane.showDetail(self, null);
         return;
     };
-    const row = self.rows.items[ri];
+    const row = self.rows.items[selected_index];
     // Section titles are never selected (keyboard.zig skips them).
     assert(row.item != null and row.item.? < self.items.items.len);
     if (self.grid_mode)
@@ -1795,23 +1827,23 @@ pub fn select(self: *Ui, row_index: ?usize) void {
     else
         c.gtk_list_box_select_row(@ptrCast(self.list), @ptrCast(row.widget));
     if (!self.no_scroll) self.scrollTo(row.widget);
-    const it = &self.items.items[row.item.?];
-    self.primary = item_mod.actionsFor(it)[0].label;
+    const item = &self.items.items[row.item.?];
+    self.primary = item_mod.actionsFor(item)[0].label;
     self.setHint(self.primary, false);
-    detail_pane.showDetail(self, it);
+    detail_pane.showDetail(self, item);
     // Change Theme shows each theme as the selection moves over it, and the
     // theme in use on a style.
-    if (self.view == .themes) self.applyAppearance(if (it.action == .setting and
-        it.action.setting == .theme)
-        themes.find(it.action.setting.theme, self.preferDark())
+    if (self.view == .themes) self.applyAppearance(if (item.action == .setting and
+        item.action.setting == .theme)
+        themes.find(item.action.setting.theme, self.preferDark())
     else
         null);
 }
 
 /// The footer's "what Enter does" (hidden with nothing selected).
 fn setFooterAction(self: *Ui, text: []const u8, warn: bool) void {
-    const z = self.query_arena.allocator().dupeSentinel(u8, text, 0) catch return;
-    c.gtk_label_set_text(@ptrCast(self.footer_action), z.ptr);
+    const text_z = self.query_arena.allocator().dupeSentinel(u8, text, 0) catch return;
+    c.gtk_label_set_text(@ptrCast(self.footer_action), text_z.ptr);
     cssClass(self.footer_action, "warn", warn);
     const any = text.len > 0;
     c.gtk_widget_set_visible(self.footer_action, @intFromBool(any));
@@ -1824,9 +1856,9 @@ fn setFooterAction(self: *Ui, text: []const u8, warn: bool) void {
 fn setHint(self: *Ui, text: []const u8, warn: bool) void {
     self.setFooterAction(text, warn);
     if (!self.layout.show.hints and !warn) return;
-    const ri = self.selected orelse return;
-    const row = self.rows.items[ri];
-    const h = row.hint orelse return;
+    const row_index = self.selected orelse return;
+    const row = self.rows.items[row_index];
+    const hint = row.hint orelse return;
     if (row.accessory) |acc| c.gtk_widget_set_visible(acc, 0);
     // Beside the detail pane the list is narrow: the action's name would
     // squeeze the title to a few letters, so only the key shows there.
@@ -1835,18 +1867,25 @@ fn setHint(self: *Ui, text: []const u8, warn: bool) void {
         "{s}  ↵",
         .{text},
     ) catch return;
-    const z = self.query_arena.allocator().dupeSentinel(u8, shown, 0) catch return;
-    c.gtk_label_set_text(@ptrCast(h), z.ptr);
-    if (warn) c.gtk_widget_add_css_class(h, "warn") else c.gtk_widget_remove_css_class(h, "warn");
-    c.gtk_widget_set_visible(h, 1);
+    const text_z = self.query_arena.allocator().dupeSentinel(u8, shown, 0) catch return;
+    c.gtk_label_set_text(@ptrCast(hint), text_z.ptr);
+    if (warn) c.gtk_widget_add_css_class(hint, "warn") else c.gtk_widget_remove_css_class(
+        hint,
+        "warn",
+    );
+    c.gtk_widget_set_visible(hint, 1);
 }
 
 fn scrollTo(self: *Ui, row: *c.GtkWidget) void {
-    var b: c.graphene_rect_t = undefined;
+    var bounds: c.graphene_rect_t = undefined;
     // A row just added has no place yet: it is scrolled to on a later frame,
     // once the list's layout is done.
     const container = if (self.grid_mode) self.grid else self.list;
-    const placed = c.gtk_widget_compute_bounds(row, container, &b) != 0 and b.size.height != 0;
+    const placed = c.gtk_widget_compute_bounds(
+        row,
+        container,
+        &bounds,
+    ) != 0 and bounds.size.height != 0;
     if (!placed) {
         if (self.scroll_tick == 0) {
             self.scroll_tries = 0;
@@ -1859,38 +1898,38 @@ fn scrollTo(self: *Ui, row: *c.GtkWidget) void {
         }
         return;
     }
-    const adj = c.gtk_scrolled_window_get_vadjustment(@ptrCast(self.scroller));
-    const value = c.gtk_adjustment_get_value(adj);
-    const page = c.gtk_adjustment_get_page_size(adj);
-    const top: f64 = b.origin.y;
-    const bottom: f64 = top + b.size.height;
+    const adjustment = c.gtk_scrolled_window_get_vadjustment(@ptrCast(self.scroller));
+    const value = c.gtk_adjustment_get_value(adjustment);
+    const page = c.gtk_adjustment_get_page_size(adjustment);
+    const top: f64 = bounds.origin.y;
+    const bottom: f64 = top + bounds.size.height;
     // Keep a section header above the first item visible, and the selection
     // clear of the fade at the bottom edge (style.css, undershoot).
     if (top < value + 4) {
-        c.gtk_adjustment_set_value(adj, @max(top - 30, 0));
+        c.gtk_adjustment_set_value(adjustment, @max(top - 30, 0));
     } else if (bottom > value + page - 20) {
-        c.gtk_adjustment_set_value(adj, bottom - page + 20);
+        c.gtk_adjustment_set_value(adjustment, bottom - page + 20);
     }
 }
 
 fn onScrollTick(_: ?*c.GtkWidget, _: ?*c.GdkFrameClock, data: ?*anyopaque) callconv(.c) c.gboolean {
     const self: *Ui = @ptrCast(@alignCast(data.?));
     self.scroll_tries += 1;
-    const ri = self.selected orelse {
+    const row_index = self.selected orelse {
         self.scroll_tick = 0;
         return 0;
     };
-    if (ri >= self.rows.items.len) {
+    if (row_index >= self.rows.items.len) {
         self.scroll_tick = 0;
         return 0;
     }
-    const row = self.rows.items[ri].widget;
-    var b: c.graphene_rect_t = undefined;
+    const row = self.rows.items[row_index].widget;
+    var bounds: c.graphene_rect_t = undefined;
     const placed = c.gtk_widget_compute_bounds(
         row,
         if (self.grid_mode) self.grid else self.list,
-        &b,
-    ) != 0 and b.size.height > 0;
+        &bounds,
+    ) != 0 and bounds.size.height > 0;
     if (!placed and self.scroll_tries < 10) return 1;
     self.scroll_tick = 0;
     if (placed) self.scrollTo(row);
@@ -1898,8 +1937,8 @@ fn onScrollTick(_: ?*c.GtkWidget, _: ?*c.GdkFrameClock, data: ?*anyopaque) callc
 }
 
 pub fn selectedItem(self: *Ui) ?*Item {
-    const ri = self.selected orelse return null;
-    return &self.items.items[self.rows.items[ri].item orelse return null];
+    const row_index = self.selected orelse return null;
+    return &self.items.items[self.rows.items[row_index].item orelse return null];
 }
 
 fn viewTitle(self: *Ui) [*:0]const u8 {
@@ -1924,22 +1963,22 @@ fn viewTitle(self: *Ui) [*:0]const u8 {
 // --------------------------------------------------------- action panel
 
 pub fn openPanel(self: *Ui) void {
-    const it = self.selectedItem() orelse return;
-    self.panel_entries = item_mod.actionsFor(it);
+    const item = self.selectedItem() orelse return;
+    self.panel_entries = item_mod.actionsFor(item);
     // Every item has a primary action: the panel is never empty, and the
     // keys that move in it count on that.
     assert(self.panel_entries.len > 0);
     c.gtk_list_box_remove_all(@ptrCast(self.panel_list));
-    for (self.panel_entries) |e| {
+    for (self.panel_entries) |entry| {
         const row = c.gtk_list_box_row_new();
         const box = widgets.hbox(8);
-        const l = widgets.label(e.label, null);
-        c.gtk_widget_set_hexpand(l, 1);
-        c.gtk_box_append(@ptrCast(box), l);
-        if (e.keys.len > 0) {
-            const k = widgets.label(e.keys, "kbd");
-            c.gtk_widget_set_valign(k, c.GTK_ALIGN_CENTER);
-            c.gtk_box_append(@ptrCast(box), k);
+        const label_widget = widgets.label(entry.label, null);
+        c.gtk_widget_set_hexpand(label_widget, 1);
+        c.gtk_box_append(@ptrCast(box), label_widget);
+        if (entry.keys.len > 0) {
+            const keys_label = widgets.label(entry.keys, "kbd");
+            c.gtk_widget_set_valign(keys_label, c.GTK_ALIGN_CENTER);
+            c.gtk_box_append(@ptrCast(box), keys_label);
         }
         c.gtk_list_box_row_set_child(@ptrCast(row), box);
         c.gtk_list_box_append(@ptrCast(self.panel_list), row);
@@ -1966,19 +2005,19 @@ pub fn selectPanel(self: *Ui, i: usize) void {
 
 /// Runs one of the selected row's actions (a row of the action panel, or
 /// what Enter and Ctrl+Enter do).
-pub fn performEntry(self: *Ui, e: item_mod.Entry) void {
-    if (e.op == .ext) return ext_view.perform(self, e.index);
-    self.perform(e.op);
+pub fn performEntry(self: *Ui, entry: item_mod.Entry) void {
+    if (entry.op == .ext) return ext_view.perform(self, entry.index);
+    self.perform(entry.op);
 }
 
 /// Destructive commands need a second Enter: true while waiting for it
 /// (the row says so).
-pub fn needsConfirm(self: *Ui, it: *const Item) bool {
-    if (std.mem.eql(u8, self.confirm_key, it.key)) return false;
-    self.confirm_key = it.key;
+pub fn needsConfirm(self: *Ui, item: *const Item) bool {
+    if (std.mem.eql(u8, self.confirm_key, item.key)) return false;
+    self.confirm_key = item.key;
     self.primary = self.query_arena.allocator().printSentinel(
         "Press ↵ again to {s}",
-        .{it.title},
+        .{item.title},
         0,
     ) catch return true;
     self.setHint(self.primary, true);
@@ -1998,32 +2037,32 @@ pub fn showRunning(self: *Ui) void {
 }
 
 pub fn perform(self: *Ui, op: item_mod.Op) void {
-    const it = self.selectedItem() orelse return;
-    if (it.confirm and (op == .run or op == .open) and self.needsConfirm(it)) return;
+    const item = self.selectedItem() orelse return;
+    if (item.confirm and (op == .run or op == .open) and self.needsConfirm(item)) return;
     self.closePanel();
     const primary = op == .run or op == .open;
     // Ranking only, and Db logs its own failures: the action goes ahead
     // whether or not the use was recorded.
-    if (primary and it.key.len > 0 and it.action != .setting) {
-        self.db.recordUse(it.key, labels.now()) catch {};
+    if (primary and item.key.len > 0 and item.action != .setting) {
+        self.db.recordUse(item.key, labels.now()) catch {};
     }
-    if (primary and it.action == .ext_command) {
-        return ext_view.activate(self, it.action.ext_command.index);
+    if (primary and item.action == .ext_command) {
+        return ext_view.activate(self, item.action.ext_command.index);
     }
-    if (it.action == .pick) {
+    if (item.action == .pick) {
         if (op == .pick_typed) return dmenu.chooseTyped(self);
-        return dmenu.choose(self, it.action.pick.index);
+        return dmenu.choose(self, item.action.pick.index);
     }
 
     // A clipboard row holds the head of its entry: what is pasted or copied
     // is all of it, read now.
-    var whole = it.*;
+    var whole = item.*;
     var clip_arena: std.heap.ArenaAllocator = .init(self.gpa);
     defer clip_arena.deinit();
-    if (it.action == .clip and (op == .run or op == .open or op == .clip_paste or
+    if (item.action == .clip and (op == .run or op == .open or op == .clip_paste or
         op == .clip_copy))
     {
-        const content = self.db.clipContent(clip_arena.allocator(), it.action.clip) catch null;
+        const content = self.db.clipContent(clip_arena.allocator(), item.action.clip) catch null;
         whole.detail = content orelse return self.showFailure("Could not read the entry");
     }
     const outcome = run.perform(self.actionCtx(), &whole, op);
@@ -2053,8 +2092,8 @@ fn onRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, data: ?*anyopaque) ca
     const tag = @intFromPtr(c.g_object_get_data(@ptrCast(row), "lumen-row"));
     if (tag == 0) return;
     self.select(tag - 1);
-    const it = self.selectedItem() orelse return;
-    self.performEntry(item_mod.actionsFor(it)[0]);
+    const item = self.selectedItem() orelse return;
+    self.performEntry(item_mod.actionsFor(item)[0]);
 }
 
 fn onGridActivated(
@@ -2066,8 +2105,8 @@ fn onGridActivated(
     const i = c.gtk_flow_box_child_get_index(child);
     if (i < 0 or i >= self.rows.items.len) return;
     self.select(@intCast(i));
-    const it = self.selectedItem() orelse return;
-    self.performEntry(item_mod.actionsFor(it)[0]);
+    const item = self.selectedItem() orelse return;
+    self.performEntry(item_mod.actionsFor(item)[0]);
 }
 
 fn onPanelRowActivated(
@@ -2155,8 +2194,8 @@ pub fn injectKey(self: *Ui, name: []const u8) bool {
         .{ "ctrl+o", c.GDK_KEY_o, c.GDK_CONTROL_MASK }, .{ "left", c.GDK_KEY_Left, 0 },
         .{ "right", c.GDK_KEY_Right, 0 },
     };
-    for (keys) |k| if (std.mem.eql(u8, k[0], name)) {
-        _ = keyboard.handleKey(self, k[1], k[2]);
+    for (keys) |key_name| if (std.mem.eql(u8, key_name[0], name)) {
+        _ = keyboard.handleKey(self, key_name[1], key_name[2]);
         return true;
     };
     // Anything else written like a keymap ("ctrl+g").
@@ -2173,19 +2212,22 @@ pub fn dump(
 ) (std.Io.Writer.Error || std.mem.Allocator.Error)![:0]u8 {
     var scratch_state: std.heap.ArenaAllocator = .init(gpa);
     defer scratch_state.deinit();
-    const a = scratch_state.allocator();
+    const arena = scratch_state.allocator();
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
-    const w = &out.writer;
-    try w.print("view: {t}\nvisible: {}\nquery: {s}\n", .{
+    const writer = &out.writer;
+    try writer.print("view: {t}\nvisible: {}\nquery: {s}\n", .{
         self.view,
         c.gtk_widget_get_visible(self.window) != 0,
         self.query(),
     });
-    try w.print("title: {s}\nprimary: {s}\n", .{ self.viewTitle(), self.primary });
+    try writer.print("title: {s}\nprimary: {s}\n", .{ self.viewTitle(), self.primary });
     const lay = self.layout;
-    try w.print("style: {s}\n", .{if (self.settings.style.len > 0) self.settings.style else "-"});
-    try w.print("layout: {d}x{d} panels={t} search={t} detail={t} rows={s} footer={}", .{
+    try writer.print(
+        "style: {s}\n",
+        .{if (self.settings.style.len > 0) self.settings.style else "-"},
+    );
+    try writer.print("layout: {d}x{d} panels={t} search={t} detail={t} rows={s} footer={}", .{
         self.panelW(),
         self.panelH(),
         lay.panels,
@@ -2194,53 +2236,65 @@ pub fn dump(
         if (lay.rows == .inline_) "inline" else "stacked",
         lay.footer,
     });
-    try w.writeAll(" bar=");
-    for (lay.searchbar.slice(), 0..) |p, i| try w.print("{s}{t}", .{ if (i > 0) "," else "", p });
-    try w.writeAll(" row=");
-    for (lay.row.slice(), 0..) |p, i| try w.print("{s}{t}", .{ if (i > 0) "," else "", p });
-    try w.print(" prompt={s} placeholder={s}\n", .{ lay.prompt, lay.placeholder });
-    if (lay.footer) try w.print("footer: {s} | {s}\n", .{
+    try writer.writeAll(" bar=");
+    for (lay.searchbar.slice(), 0..) |p, i| try writer.print(
+        "{s}{t}",
+        .{ if (i > 0) "," else "", p },
+    );
+    try writer.writeAll(" row=");
+    for (lay.row.slice(), 0..) |p, i| try writer.print("{s}{t}", .{ if (i > 0) "," else "", p });
+    try writer.print(" prompt={s} placeholder={s}\n", .{ lay.prompt, lay.placeholder });
+    if (lay.footer) try writer.print("footer: {s} | {s}\n", .{
         c.gtk_label_get_text(@ptrCast(self.footer_title)),
         c.gtk_label_get_text(@ptrCast(self.footer_action)),
     });
-    try w.print("rows:\n", .{});
+    try writer.print("rows:\n", .{});
     self.ensureRows();
-    if (self.rows.items.len == 0) try w.print("  (empty) {s}\n", .{self.emptyText(a)});
+    if (self.rows.items.len == 0) try writer.print("  (empty) {s}\n", .{self.emptyText(arena)});
     for (self.rows.items, 0..) |row, i| {
-        const it_index = row.item orelse {
-            try w.print("  # {s}\n", .{row.section});
+        const item_index = row.item orelse {
+            try writer.print("  # {s}\n", .{row.section});
             continue;
         };
-        const it = self.items.items[it_index];
+        const item = self.items.items[item_index];
         const mark: []const u8 = if (self.selected == i) ">" else " ";
-        try w.print("  {s} {s} | {s} | {s} | ", .{ mark, it.title, it.subtitle, it.accessory });
-        switch (it.icon) {
-            .logo => |l| try w.print("logo:{s}", .{l.name}),
-            .badge => |b| try w.print("badge:{s}", .{b.text}),
-            .tile => |t| try w.print("tile:{s}", .{t.name}),
-            .gicon => try w.print("gicon", .{}),
-            .emoji => |e| try w.print("emoji:{s}", .{e}),
-            .file => |f| try w.print("file:{s}", .{std.Io.Dir.path.basename(f)}),
-            .swatch => |sw| try w.print("swatch:{s}", .{sw.id}),
-            .named => |n| try w.print("icon:{s}", .{n}),
-            .none => try w.print("none", .{}),
+        try writer.print(
+            "  {s} {s} | {s} | {s} | ",
+            .{ mark, item.title, item.subtitle, item.accessory },
+        );
+        switch (item.icon) {
+            .logo => |logo| try writer.print("logo:{s}", .{logo.name}),
+            .badge => |badge| try writer.print("badge:{s}", .{badge.text}),
+            .tile => |tile| try writer.print("tile:{s}", .{tile.name}),
+            .gicon => try writer.print("gicon", .{}),
+            .emoji => |emoji| try writer.print("emoji:{s}", .{emoji}),
+            .file => |file_path| try writer.print(
+                "file:{s}",
+                .{std.Io.Dir.path.basename(file_path)},
+            ),
+            .swatch => |sw| try writer.print("swatch:{s}", .{sw.id}),
+            .named => |name| try writer.print("icon:{s}", .{name}),
+            .none => try writer.print("none", .{}),
         }
         // The key, for lumen.icons (empty for rows without one). A file's is
         // its path, which need not be UTF-8: the dump must stay text.
-        try w.print(" | {s}\n", .{if (std.unicode.utf8ValidateSlice(it.key)) it.key else "?"});
+        try writer.print(
+            " | {s}\n",
+            .{if (std.unicode.utf8ValidateSlice(item.key)) item.key else "?"},
+        );
     }
     if (c.gtk_widget_get_visible(self.detail) != 0) {
-        try w.print("detail:\n", .{});
+        try writer.print("detail:\n", .{});
         if (self.view == .ext) {
             const text = std.mem.span(c.gtk_label_get_text(@ptrCast(self.detail_text)));
-            try w.print("  text = {s}\n", .{
+            try writer.print("  text = {s}\n", .{
                 text[0 .. std.mem.findScalar(u8, text, '\n') orelse text.len],
             });
         }
         if (c.gtk_widget_get_visible(self.detail_meta) != 0) {
-            for (self.meta_lines, self.meta_keys, self.meta_values) |l, k, v| {
-                if (c.gtk_widget_get_visible(l) == 0) continue;
-                try w.print("  {s} = {s}\n", .{
+            for (self.meta_lines, self.meta_keys, self.meta_values) |logo, k, v| {
+                if (c.gtk_widget_get_visible(logo) == 0) continue;
+                try writer.print("  {s} = {s}\n", .{
                     c.gtk_label_get_text(@ptrCast(k)),
                     c.gtk_label_get_text(@ptrCast(v)),
                 });
@@ -2248,31 +2302,33 @@ pub fn dump(
         }
     }
     if (self.panel_open) {
-        try w.print("panel:\n", .{});
-        for (self.panel_entries, 0..) |e, i| try w.print("  {s} {s} [{s}]\n", .{
+        try writer.print("panel:\n", .{});
+        for (self.panel_entries, 0..) |emoji, i| try writer.print("  {s} {s} [{s}]\n", .{
             if (i == self.panel_selected) ">" else " ",
-            e.label,
-            e.keys,
+            emoji.label,
+            emoji.keys,
         });
     }
     return out.toOwnedSliceSentinel(0);
 }
 
 /// The placeholder row's text when nothing is listed.
-fn emptyText(self: *Ui, a: std.mem.Allocator) [:0]const u8 {
-    const q = std.mem.trim(u8, self.query(), " ");
-    if (self.view == .files and q.len == 0) return file_results.filesHint(self, a);
-    if (self.view == .contents and q.len < 3) return file_results.contentsHint(self, a, q.len);
+fn emptyText(self: *Ui, arena: std.mem.Allocator) [:0]const u8 {
+    const query_text = std.mem.trim(u8, self.query(), " ");
+    if (self.view == .files and query_text.len == 0) return file_results.filesHint(self, arena);
+    if (self.view == .contents and query_text.len < 3) {
+        return file_results.contentsHint(self, arena, query_text.len);
+    }
     if (self.view == .contents and self.content_pending) return "Searching...";
-    if (self.view == .contents) if (self.content_result) |r| if (r.err) |err|
-        return a.printSentinel(
+    if (self.view == .contents) if (self.content_result) |result| if (result.err) |err|
+        return arena.printSentinel(
             "Content search failed ({t})",
             .{err},
             0,
         ) catch "Content search failed";
-    if (self.view == .clipboard and q.len == 0 and
+    if (self.view == .clipboard and query_text.len == 0 and
         !self.settings.clipboard) return "Clipboard history is off: turn it on in Settings";
-    if (self.view == .ext) return ext_view.emptyText(self, a, q);
+    if (self.view == .ext) return ext_view.emptyText(self, arena, query_text);
     if (self.view == .dmenu) return dmenu.emptyText(self);
     return "No Results";
 }
@@ -2283,7 +2339,10 @@ test {
 
 test "Navigation forgets the oldest view when it is full" {
     var navigation: Navigation = .{};
-    const views = [_]View{ .settings, .themes, .files, .contents, .clipboard, .windows, .prefs, .form, .choose, .input };
+    const views = [_]View{
+        .settings, .themes, .files, .contents, .clipboard,
+        .windows,  .prefs,  .form,  .choose,   .input,
+    };
     for (views, 0..) |view, i| {
         var key_buffer: [8]u8 = undefined;
         navigation.push(view, try std.fmt.bufPrint(&key_buffer, "row{d}", .{i}));

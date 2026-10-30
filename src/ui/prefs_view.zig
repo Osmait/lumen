@@ -17,39 +17,45 @@ const log = std.log.scoped(.prefs);
 
 /// Settings > Extensions: every installed extension, those that failed to
 /// load too (to update or remove them).
-pub fn extensionRows(ui: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item)) void {
-    const reg = ui.ext_registry orelse return;
-    for (reg.extensions) |e| {
-        var n: usize = 0;
-        for (reg.prefs) |q| n += @intFromBool(std.mem.eql(u8, q.ext, e.id));
-        out.append(a, .{
-            .key = a.print("set:ext:{s}", .{e.id}) catch continue,
+pub fn extensionRows(ui: *Ui, arena: std.mem.Allocator, out: *std.ArrayList(Item)) void {
+    const registry = ui.ext_registry orelse return;
+    for (registry.extensions) |extension| {
+        var count: usize = 0;
+        for (registry.prefs) |query| {
+            count += @intFromBool(std.mem.eql(u8, query.ext, extension.id));
+        }
+        out.append(arena, .{
+            .key = arena.print("set:ext:{s}", .{extension.id}) catch continue,
             .section = "Extensions",
-            .title = e.title,
-            .subtitle = e.id,
-            .accessory = (if (n > 0)
-                a.printSentinel("{d} {s}", .{ n, if (n == 1) "setting" else "settings" }, 0)
-            else
-                a.printSentinel(
+            .title = extension.title,
+            .subtitle = extension.id,
+            .accessory = (if (count > 0)
+                arena.printSentinel(
                     "{d} {s}",
-                    .{ e.commands, if (e.commands == 1) "command" else "commands" },
+                    .{ count, if (count == 1) "setting" else "settings" },
+                    0,
+                )
+            else
+                arena.printSentinel(
+                    "{d} {s}",
+                    .{ extension.commands, if (extension.commands == 1) "command" else "commands" },
                     0,
                 )) catch "",
             .icon = .{ .tile = .{ .name = "application-x-addon-symbolic", .color = .purple } },
             .keywords = "extension preferences update uninstall",
-            .action = .{ .setting = .{ .ext_prefs = e.id } },
+            .action = .{ .setting = .{ .ext_prefs = extension.id } },
         }) catch return;
     }
-    for (reg.problems) |p| {
-        if (std.mem.eql(u8, p.ext, "config")) continue;
-        out.append(a, .{
-            .key = a.print("set:ext:{s}", .{p.ext}) catch continue,
+    for (registry.problems) |problem| {
+        if (std.mem.eql(u8, problem.ext, "config")) continue;
+        out.append(arena, .{
+            .key = arena.print("set:ext:{s}", .{problem.ext}) catch continue,
             .section = "Extensions",
-            .title = p.ext,
+            .title = problem.ext,
             .subtitle = "Failed to load",
             .icon = .{ .tile = .{ .name = "dialog-warning-symbolic", .color = .red } },
             .keywords = "extension error update uninstall",
-            .action = .{ .setting = .{ .ext_prefs = p.ext } },
+            .action = .{ .setting = .{ .ext_prefs = problem.ext } },
         }) catch return;
     }
 }
@@ -66,38 +72,42 @@ fn extId(ui: *Ui) []const u8 {
 }
 
 pub fn title(ui: *Ui) [*:0]const u8 {
-    const reg = ui.ext_registry orelse return "Extension";
-    for (reg.extensions) |e| if (std.mem.eql(u8, e.id, extId(ui))) return e.title.ptr;
-    for (reg.problems) |p| if (std.mem.eql(u8, p.ext, extId(ui))) return p.ext.ptr;
+    const registry = ui.ext_registry orelse return "Extension";
+    for (registry.extensions) |extension| {
+        if (std.mem.eql(u8, extension.id, extId(ui))) return extension.title.ptr;
+    }
+    for (registry.problems) |problem| {
+        if (std.mem.eql(u8, problem.ext, extId(ui))) return problem.ext.ptr;
+    }
     return "Extension";
 }
 
 /// The open extension's preferences.
-pub fn candidates(ui: *Ui, a: std.mem.Allocator) []Item {
-    const reg = ui.ext_registry orelse return &.{};
+pub fn candidates(ui: *Ui, arena: std.mem.Allocator) []Item {
+    const registry = ui.ext_registry orelse return &.{};
     var out: std.ArrayList(Item) = .empty;
-    for (reg.prefs, 0..) |p, i| {
-        if (!std.mem.eql(u8, p.ext, extId(ui))) continue;
-        out.append(a, .{
-            .key = a.print("pref:{s}", .{p.name}) catch continue,
+    for (registry.prefs, 0..) |preference, i| {
+        if (!std.mem.eql(u8, preference.ext, extId(ui))) continue;
+        out.append(arena, .{
+            .key = arena.print("pref:{s}", .{preference.name}) catch continue,
             .section = "Preferences",
-            .title = p.title,
-            .subtitle = p.description,
-            .accessory = display(a, &p, current(a, &p)),
-            .icon = iconOf(p.kind),
+            .title = preference.title,
+            .subtitle = preference.description,
+            .accessory = display(arena, &preference, current(arena, &preference)),
+            .icon = iconOf(preference.kind),
             .action = .{ .setting = .{ .pref = @intCast(i) } },
         }) catch break;
     }
-    manageRows(ui, a, &out);
+    manageRows(ui, arena, &out);
     return out.items;
 }
 
 /// The extension's folder, git pull when it is a checkout, removal.
-fn manageRows(ui: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item)) void {
-    const id = a.dupeSentinel(u8, extId(ui), 0) catch return;
-    const dir = a.printSentinel("{s}/extensions/{s}", .{ ui.config_dir, id }, 0) catch return;
-    const git = a.printSentinel("{s}/.git", .{dir}, 0) catch return;
-    out.append(a, .{
+fn manageRows(ui: *Ui, arena: std.mem.Allocator, out: *std.ArrayList(Item)) void {
+    const id = arena.dupeSentinel(u8, extId(ui), 0) catch return;
+    const dir = arena.printSentinel("{s}/extensions/{s}", .{ ui.config_dir, id }, 0) catch return;
+    const git = arena.printSentinel("{s}/.git", .{dir}, 0) catch return;
+    out.append(arena, .{
         .key = "manage:open",
         .section = "Manage",
         .title = "Open Folder",
@@ -105,7 +115,7 @@ fn manageRows(ui: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item)) void {
         .icon = .{ .tile = .{ .name = "folder-open-symbolic", .color = .blue } },
         .action = .{ .setting = .{ .ext_open = dir } },
     }) catch return;
-    if (os.info(git) != null) out.append(a, .{
+    if (os.info(git) != null) out.append(arena, .{
         .key = "manage:update",
         .section = "Manage",
         .title = "Update",
@@ -113,7 +123,7 @@ fn manageRows(ui: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item)) void {
         .icon = .{ .tile = .{ .name = "view-refresh-symbolic", .color = .green } },
         .action = .{ .setting = .{ .ext_update = id } },
     }) catch return;
-    out.append(a, .{
+    out.append(arena, .{
         .key = "manage:uninstall",
         .section = "Manage",
         .title = "Uninstall",
@@ -134,13 +144,17 @@ pub fn iconOf(kind: Host.PrefKind) item_mod.Icon {
 }
 
 /// How a value shows on the right of its row.
-pub fn display(a: std.mem.Allocator, p: *const Host.Pref, value: []const u8) [:0]const u8 {
-    return switch (p.kind) {
+pub fn display(
+    arena: std.mem.Allocator,
+    preference: *const Host.Pref,
+    value: []const u8,
+) [:0]const u8 {
+    return switch (preference.kind) {
         .toggle => if (std.mem.eql(u8, value, "true")) "On" else "Off",
-        .choice => for (p.choices) |ch| {
-            if (std.mem.eql(u8, ch.value, value)) break ch.label;
-        } else a.dupeSentinel(u8, value, 0) catch "",
-        .text => if (value.len == 0) "Not set" else a.dupeSentinel(
+        .choice => for (preference.choices) |choice| {
+            if (std.mem.eql(u8, choice.value, value)) break choice.label;
+        } else arena.dupeSentinel(u8, value, 0) catch "",
+        .text => if (value.len == 0) "Not set" else arena.dupeSentinel(
             u8,
             value[0..@min(value.len, 40)],
             0,
@@ -168,52 +182,52 @@ fn readStored(arena: std.mem.Allocator, file: [:0]const u8) Stored {
     if (len > prefs_bytes_max) return .unreadable;
     const text = contents.?[0..len];
     if (std.mem.trim(u8, text, " \t\r\n").len == 0) return .absent;
-    const v = std.json.parseFromSliceLeaky(
+    const parsed = std.json.parseFromSliceLeaky(
         std.json.Value,
         arena,
         text,
         .{ .allocate = .alloc_always },
     ) catch return .unreadable;
-    return if (v == .object) .{ .values = v.object } else .unreadable;
+    return if (parsed == .object) .{ .values = parsed.object } else .unreadable;
 }
 
-pub fn current(a: std.mem.Allocator, p: *const Host.Pref) []const u8 {
-    const stored = switch (readStored(a, p.file)) {
-        .values => |o| o,
-        .absent, .unreadable => return p.default,
+pub fn current(arena: std.mem.Allocator, preference: *const Host.Pref) []const u8 {
+    const stored = switch (readStored(arena, preference.file)) {
+        .values => |values| values,
+        .absent, .unreadable => return preference.default,
     };
-    const v = stored.get(p.name) orelse return p.default;
-    return switch (v) {
-        .bool => |b| if (b) "true" else "false",
-        .string => |s| s,
-        else => p.default,
+    const stored_value = stored.get(preference.name) orelse return preference.default;
+    return switch (stored_value) {
+        .bool => |flag| if (flag) "true" else "false",
+        .string => |text| text,
+        else => preference.default,
     };
 }
 
 /// Enter on a preference: flips a toggle, lists a choice's values, or
 /// opens the input view for text.
 pub fn edit(ui: *Ui, i: u16) void {
-    const reg = ui.ext_registry orelse return;
-    if (i >= reg.prefs.len) return;
-    const p = &reg.prefs[i];
+    const registry = ui.ext_registry orelse return;
+    if (i >= registry.prefs.len) return;
+    const preference = &registry.prefs[i];
     var arena: std.heap.ArenaAllocator = .init(ui.gpa);
     defer arena.deinit();
-    editValue(ui, .{ .pref = i }, p, current(arena.allocator(), p));
+    editValue(ui, .{ .pref = i }, preference, current(arena.allocator(), preference));
 }
 
 /// Enter on a preference or a form field whose value is `value`: flips a
 /// toggle, lists a choice's values, or opens the input view for text.
-pub fn editValue(ui: *Ui, target: Ui.Edited, p: *const Host.Pref, value: []const u8) void {
-    switch (p.kind) {
+pub fn editValue(ui: *Ui, target: Ui.Edited, preference: *const Host.Pref, value: []const u8) void {
+    switch (preference.kind) {
         .toggle => {
             const on = !std.mem.eql(u8, value, "true");
             switch (target) {
                 // The value was not saved; the row's hint already says why.
-                .pref => if (!save(ui, p, .{ .bool = on })) return,
+                .pref => if (!save(ui, preference, .{ .bool = on })) return,
                 .field => |i| form_view.setValue(ui, i, if (on) "true" else "false"),
             }
             // Row keys are "pref:<name>" and "field:<name>".
-            ui.setReselect("{t}:{s}", .{ target, p.name });
+            ui.setReselect("{t}:{s}", .{ target, preference.name });
             ui.rebuild();
         },
         .choice => {
@@ -228,76 +242,79 @@ pub fn editValue(ui: *Ui, target: Ui.Edited, p: *const Host.Pref, value: []const
             ui.input = target;
             ui.navigate(.input);
             // After the view change, which clears the search bar.
-            const z = ui.gpa.dupeSentinel(u8, value, 0) catch return;
-            defer ui.gpa.free(z);
-            c.gtk_editable_set_text(@ptrCast(ui.entry), z.ptr);
+            const value_z = ui.gpa.dupeSentinel(u8, value, 0) catch return;
+            defer ui.gpa.free(value_z);
+            c.gtk_editable_set_text(@ptrCast(ui.entry), value_z.ptr);
             c.gtk_editable_set_position(@ptrCast(ui.entry), -1);
         },
     }
 }
 
 /// The values of a choice preference, for the choose view.
-pub fn choiceCandidates(ui: *Ui, a: std.mem.Allocator, out: *std.ArrayList(Item), i: u16) void {
-    const reg = ui.ext_registry orelse return;
-    if (i >= reg.prefs.len) return;
-    const p = &reg.prefs[i];
-    const value = current(a, p);
-    for (p.choices) |ch| out.append(
-        a,
-        settings_view.pickRow(a, ch, value) catch return,
+pub fn choiceCandidates(ui: *Ui, arena: std.mem.Allocator, out: *std.ArrayList(Item), i: u16) void {
+    const registry = ui.ext_registry orelse return;
+    if (i >= registry.prefs.len) return;
+    const preference = &registry.prefs[i];
+    const value = current(arena, preference);
+    for (preference.choices) |choice| out.append(
+        arena,
+        settings_view.pickRow(arena, choice, value) catch return,
     ) catch return;
 }
 
 /// A value picked in the choose view.
 pub fn pick(ui: *Ui, i: u16, value: []const u8) void {
-    const reg = ui.ext_registry orelse return;
-    if (i >= reg.prefs.len) return;
-    if (!save(ui, &reg.prefs[i], .{ .string = value })) return;
+    const registry = ui.ext_registry orelse return;
+    if (i >= registry.prefs.len) return;
+    if (!save(ui, &registry.prefs[i], .{ .string = value })) return;
     ui.goBack();
 }
 
 pub fn inputTitle(ui: *Ui) [*:0]const u8 {
-    const p = inputPref(ui) orelse return "Value";
-    return p.title.ptr;
+    const preference = inputPref(ui) orelse return "Value";
+    return preference.title.ptr;
 }
 
 /// What the input view edits: a preference, or a field of the open form.
 fn inputPref(ui: *Ui) ?*const Host.Pref {
     switch (ui.input) {
         .pref => |i| {
-            const reg = ui.ext_registry orelse return null;
-            return if (i < reg.prefs.len) &reg.prefs[i] else null;
+            const registry = ui.ext_registry orelse return null;
+            return if (i < registry.prefs.len) &registry.prefs[i] else null;
         },
         .field => |i| return form_view.field(ui, i),
     }
 }
 
 pub fn isPassword(ui: *Ui) bool {
-    const p = inputPref(ui) orelse return false;
-    return p.kind == .password;
+    const preference = inputPref(ui) orelse return false;
+    return preference.kind == .password;
 }
 
 /// The input view's one row: Enter saves what is typed.
-pub fn inputCandidates(ui: *Ui, a: std.mem.Allocator) []Item {
-    const p = inputPref(ui) orelse return &.{};
-    const row = a.alloc(Item, 1) catch return &.{};
+pub fn inputCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
+    const preference = inputPref(ui) orelse return &.{};
+    const row = arena.alloc(Item, 1) catch return &.{};
     // A form's field is only set until the form is submitted; a
     // preference is saved at once.
     const verb: [:0]const u8 = if (ui.input == .field) "Set" else "Save";
     row[0] = .{
         .key = "input:save",
-        .title = a.printSentinel("{s} {s}", .{ verb, p.title }, 0) catch verb,
-        .subtitle = if (p.description.len > 0) p.description else "Type the value above",
-        .icon = iconOf(p.kind),
+        .title = arena.printSentinel("{s} {s}", .{ verb, preference.title }, 0) catch verb,
+        .subtitle = if (preference.description.len > 0)
+            preference.description
+        else
+            "Type the value above",
+        .icon = iconOf(preference.kind),
         .action = .{ .setting = .save_input },
     };
     return row;
 }
 
 pub fn saveInput(ui: *Ui) void {
-    const p = inputPref(ui) orelse return;
+    const preference = inputPref(ui) orelse return;
     switch (ui.input) {
-        .pref => if (!save(ui, p, .{ .string = ui.query() })) return,
+        .pref => if (!save(ui, preference, .{ .string = ui.query() })) return,
         .field => |i| form_view.setValue(ui, i, ui.query()),
     }
     ui.goBack();
@@ -306,37 +323,39 @@ pub fn saveInput(ui: *Ui) void {
 /// Writes one value into the extension's preferences.json (atomically,
 /// owner-only), then reloads the extensions so Lua sees it. False when it
 /// was not saved; the selected row says why.
-fn save(ui: *Ui, p: *const Host.Pref, value: std.json.Value) bool {
-    var arena: std.heap.ArenaAllocator = .init(ui.gpa);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var obj: std.json.ObjectMap = switch (readStored(a, p.file)) {
+fn save(ui: *Ui, preference: *const Host.Pref, value: std.json.Value) bool {
+    var arena_instance: std.heap.ArenaAllocator = .init(ui.gpa);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var obj: std.json.ObjectMap = switch (readStored(arena, preference.file)) {
         .absent => .empty,
-        .values => |o| o,
+        .values => |values| values,
         .unreadable => {
-            log.warn("{s}: not a JSON object Lumen can read; not overwritten", .{p.file});
+            log.warn("{s}: not a JSON object Lumen can read; not overwritten", .{preference.file});
             ui.showFailure("Could not read the preferences file");
             return false;
         },
     };
-    obj.put(a, p.name, value) catch {
+    obj.put(arena, preference.name, value) catch {
         ui.showFailure("Could not save the setting");
         return false;
     };
     const json = std.json.Stringify.valueAlloc(
-        a,
+        arena,
         std.json.Value{ .object = obj },
         .{ .whitespace = .indent_2 },
     ) catch {
         ui.showFailure("Could not save the setting");
         return false;
     };
-    if (std.mem.findScalarLast(u8, p.file, '/')) |s| os.mkdirP(p.file[0..s]);
-    os.writeFileAtomic(p.file, json) catch |err| {
-        log.warn("{s}: {t}", .{ p.file, err });
+    if (std.mem.findScalarLast(u8, preference.file, '/')) |slash| {
+        os.mkdirP(preference.file[0..slash]);
+    }
+    os.writeFileAtomic(preference.file, json) catch |err| {
+        log.warn("{s}: {t}", .{ preference.file, err });
         ui.showFailure("Could not save the setting");
         return false;
     };
-    if (ui.ext_host) |h| h.reload();
+    if (ui.ext_host) |host| host.reload();
     return true;
 }

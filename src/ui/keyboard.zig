@@ -92,8 +92,8 @@ fn move(ui: *Ui, keyval: c_uint, down: bool, up: bool) bool {
     if (ui.grid_mode and ui.rows.items.len > 0 and
         (down or up or keyval == c.GDK_KEY_Left or keyval == c.GDK_KEY_Right))
     {
-        const n: i64 = @intCast(ui.rows.items.len);
-        const cur: i64 = if (ui.selected) |s| @intCast(s) else 0;
+        const cell_count: i64 = @intCast(ui.rows.items.len);
+        const current: i64 = if (ui.selected) |selected| @intCast(selected) else 0;
         const step: i64 = if (down)
             ui.grid_columns
         else if (up)
@@ -102,8 +102,8 @@ fn move(ui: *Ui, keyval: c_uint, down: bool, up: bool) bool {
             1
         else
             -1;
-        const next = cur + step;
-        if (next >= 0 and next < n) ui.select(@intCast(next));
+        const next = current + step;
+        if (next >= 0 and next < cell_count) ui.select(@intCast(next));
         return true;
     }
     if (down or up) {
@@ -131,9 +131,9 @@ fn itemShortcut(ui: *Ui, keyval: c_uint, ctrl: bool, shift: bool) bool {
         if (shift) "Shift " else "",
         letter,
     }) catch return false;
-    const it = ui.selectedItem() orelse return false;
-    for (item_mod.actionsFor(it)) |e| if (std.mem.eql(u8, e.keys, chord)) {
-        ui.performEntry(e);
+    const item = ui.selectedItem() orelse return false;
+    for (item_mod.actionsFor(item)) |entry| if (std.mem.eql(u8, entry.keys, chord)) {
+        ui.performEntry(entry);
         return true;
     };
     return false;

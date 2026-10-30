@@ -176,9 +176,9 @@ pub fn find(id: []const u8, prefer_dark: bool) *const Theme {
 }
 
 /// The name shown for a theme setting value ("Auto (Lumen Dark)").
-pub fn displayName(a: std.mem.Allocator, id: []const u8, prefer_dark: bool) [:0]const u8 {
+pub fn displayName(arena: std.mem.Allocator, id: []const u8, prefer_dark: bool) [:0]const u8 {
     if (std.mem.eql(u8, id, auto_id))
-        return a.printSentinel(
+        return arena.printSentinel(
             "Automatic ({s})",
             .{find(id, prefer_dark).name},
             0,
@@ -225,13 +225,13 @@ pub fn css(
     try w.writeAll("}\n");
 }
 
-fn rgba(w: *std.Io.Writer, name: []const u8, color: u24, a: f32) !void {
+fn rgba(w: *std.Io.Writer, name: []const u8, color: u24, alpha: f32) !void {
     try w.print("  --{s}: rgba({d}, {d}, {d}, {d:.2});\n", .{
         name,
         color >> 16,
         (color >> 8) & 0xff,
         color & 0xff,
-        a,
+        alpha,
     });
 }
 
@@ -280,13 +280,13 @@ test "every theme is readable" {
     }
 }
 
-fn mix(top: u24, under: u24, a: f64) u24 {
+fn mix(top: u24, under: u24, alpha: f64) u24 {
     var out: u24 = 0;
     for (0..3) |i| {
         const shift: u5 = @intCast(16 - 8 * i);
         const x: f64 = @floatFromInt((top >> shift) & 0xff);
         const y: f64 = @floatFromInt((under >> shift) & 0xff);
-        out |= @as(u24, @intFromFloat(@round(x * a + y * (1 - a)))) << shift;
+        out |= @as(u24, @intFromFloat(@round(x * alpha + y * (1 - alpha)))) << shift;
     }
     return out;
 }

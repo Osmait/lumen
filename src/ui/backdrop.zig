@@ -10,20 +10,20 @@ pub fn makeBackdrop(ui: *Ui) *c.GtkWidget {
     const win = c.gtk_window_new();
     c.gtk_widget_add_css_class(win, "lumen-backdrop");
     c.gtk_window_set_decorated(@ptrCast(win), 0);
-    const w: *c.GtkWindow = @ptrCast(win);
-    c.gtk_layer_init_for_window(w);
-    c.gtk_layer_set_layer(w, c.GTK_LAYER_SHELL_LAYER_OVERLAY);
-    c.gtk_layer_set_keyboard_mode(w, c.GTK_LAYER_SHELL_KEYBOARD_MODE_NONE);
-    c.gtk_layer_set_namespace(w, "lumen-backdrop");
+    const window: *c.GtkWindow = @ptrCast(win);
+    c.gtk_layer_init_for_window(window);
+    c.gtk_layer_set_layer(window, c.GTK_LAYER_SHELL_LAYER_OVERLAY);
+    c.gtk_layer_set_keyboard_mode(window, c.GTK_LAYER_SHELL_KEYBOARD_MODE_NONE);
+    c.gtk_layer_set_namespace(window, "lumen-backdrop");
     const edges = [_]c_int{
         c.GTK_LAYER_SHELL_EDGE_LEFT,
         c.GTK_LAYER_SHELL_EDGE_RIGHT,
         c.GTK_LAYER_SHELL_EDGE_TOP,
         c.GTK_LAYER_SHELL_EDGE_BOTTOM,
     };
-    for (edges) |edge| c.gtk_layer_set_anchor(w, edge, 1);
+    for (edges) |edge| c.gtk_layer_set_anchor(window, edge, 1);
     // Over the bars too: a click on them closes Lumen as well.
-    c.gtk_layer_set_exclusive_zone(w, -1);
+    c.gtk_layer_set_exclusive_zone(window, -1);
     const click = c.gtk_gesture_click_new();
     widgets.connect(click, "pressed", &onBackdropPressed, ui);
     c.gtk_widget_add_controller(win, click);
@@ -36,47 +36,48 @@ pub fn makeBackdrop(ui: *Ui) *c.GtkWidget {
 pub fn prewarmBackdrops(ui: *Ui) void {
     if (Ui.testMode()) return;
     const monitors = c.gdk_display_get_monitors(c.gdk_display_get_default() orelse return);
-    const n = @min(c.g_list_model_get_n_items(monitors), ui.backdrops.len);
-    for (ui.backdrops[0..n], 0..) |*slot, i| {
+    const monitor_count = @min(c.g_list_model_get_n_items(monitors), ui.backdrops.len);
+    for (ui.backdrops[0..monitor_count], 0..) |*slot, i| {
         if (slot.* != null) continue;
         const obj = c.g_list_model_get_item(monitors, @intCast(i)) orelse continue;
         defer c.g_object_unref(obj);
-        const b = makeBackdrop(ui);
-        slot.* = b;
-        c.gtk_layer_set_monitor(@ptrCast(b), @ptrCast(obj));
-        c.gtk_widget_realize(b);
+        const backdrop = makeBackdrop(ui);
+        slot.* = backdrop;
+        c.gtk_layer_set_monitor(@ptrCast(backdrop), @ptrCast(obj));
+        c.gtk_widget_realize(backdrop);
     }
 }
 
 pub fn showBackdrops(ui: *Ui) void {
     if (Ui.testMode()) return;
     const monitors = c.gdk_display_get_monitors(c.gdk_display_get_default() orelse return);
-    const n = @min(c.g_list_model_get_n_items(monitors), ui.backdrops.len);
+    const monitor_count = @min(c.g_list_model_get_n_items(monitors), ui.backdrops.len);
     for (&ui.backdrops, 0..) |*slot, i| {
-        if (i >= n) {
-            if (slot.*) |b| c.gtk_widget_set_visible(b, 0);
+        if (i >= monitor_count) {
+            if (slot.*) |backdrop| c.gtk_widget_set_visible(backdrop, 0);
             continue;
         }
         const obj = c.g_list_model_get_item(monitors, @intCast(i)) orelse continue;
         defer c.g_object_unref(obj);
-        const b = slot.* orelse makeBackdrop(ui);
-        slot.* = b;
-        c.gtk_layer_set_monitor(@ptrCast(b), @ptrCast(obj));
-        c.gtk_widget_set_visible(b, 1);
+        const backdrop = slot.* orelse makeBackdrop(ui);
+        slot.* = backdrop;
+        c.gtk_layer_set_monitor(@ptrCast(backdrop), @ptrCast(obj));
+        c.gtk_widget_set_visible(backdrop, 1);
     }
 }
 
 pub fn hideBackdrops(ui: *Ui) void {
-    for (ui.backdrops) |slot| if (slot) |b| c.gtk_widget_set_visible(b, 0);
+    for (ui.backdrops) |slot| if (slot) |backdrop| c.gtk_widget_set_visible(backdrop, 0);
 }
 
 /// Whether the window point (x, y) falls on `w` (shown).
-pub fn isOn(ui: *Ui, w: *c.GtkWidget, x: f64, y: f64) bool {
-    if (c.gtk_widget_get_visible(w) == 0) return false;
-    var b: c.graphene_rect_t = undefined;
-    if (c.gtk_widget_compute_bounds(w, ui.window, &b) == 0) return false;
-    return x >= b.origin.x and x < b.origin.x + b.size.width and y >= b.origin.y and
-        y < b.origin.y + b.size.height;
+pub fn isOn(ui: *Ui, widget: *c.GtkWidget, x: f64, y: f64) bool {
+    if (c.gtk_widget_get_visible(widget) == 0) return false;
+    var bounds: c.graphene_rect_t = undefined;
+    if (c.gtk_widget_compute_bounds(widget, ui.window, &bounds) == 0) return false;
+    const inside_x = x >= bounds.origin.x and x < bounds.origin.x + bounds.size.width;
+    const inside_y = y >= bounds.origin.y and y < bounds.origin.y + bounds.size.height;
+    return inside_x and inside_y;
 }
 
 pub fn onWindowPressed(
