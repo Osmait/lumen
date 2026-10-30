@@ -23,36 +23,37 @@ pub fn evaluate(input: []const u8) ?Result {
 
     if (splitConversion(text)) |conv| return conv;
 
-    var p: Parser = .{ .src = text };
-    const v = p.parseExpr() catch return null;
+    var parser: Parser = .{ .source = text };
+    const value = parser.parseExpr() catch return null;
     // Every level parseUnary entered, it left.
-    assert(p.depth == 0);
-    p.skipSpaces();
-    if (p.pos != text.len) return null;
-    if (!p.saw_operator) return null;
-    if (std.math.isNan(v) or std.math.isInf(v)) return null;
-    return .{ .value = v };
+    assert(parser.depth == 0);
+    parser.skipSpaces();
+    if (parser.pos != text.len) return null;
+    if (!parser.saw_operator) return null;
+    if (!std.math.isFinite(value)) return null;
+    return .{ .value = value };
 }
 
 /// Formats for display: thousands separators and at most 4 decimals
 /// ("1,234.5", "6.2137"). Copying uses `formatPlain`, at full precision.
 /// Never writes past `buf` (32 bytes always suffice; a shorter one may get
 /// a truncated result).
-pub fn formatDisplay(buf: []u8, v: f64) []const u8 {
+pub fn formatDisplay(buf: []u8, value: f64) []const u8 {
     var raw: [64]u8 = undefined;
     // Below 1e15 (where formatPlain switches to exponents) and above 1e-4,
     // fixed point with 4 decimals, rounded from the exact value.
-    const plain = if (@abs(v) >= 1e-4 and @abs(v) < 1e15) fixed4(&raw, v) else formatPlain(&raw, v);
+    const fixed_point = @abs(value) >= 1e-4 and @abs(value) < 1e15;
+    const plain = if (fixed_point) fixed4(&raw, value) else formatPlain(&raw, value);
     // Exponents, inf and nan are left alone.
     if (std.mem.findAny(u8, plain, "ein") != null) return copyInto(buf, plain);
-    const neg = plain.len > 0 and plain[0] == '-';
-    const digits = if (neg) plain[1..] else plain;
+    const negative = plain.len > 0 and plain[0] == '-';
+    const digits = if (negative) plain[1..] else plain;
     const dot = std.mem.findScalar(u8, digits, '.') orelse digits.len;
     const commas = if (dot > 0) (dot - 1) / 3 else 0;
     if (plain.len + commas > buf.len) return copyInto(buf, plain);
 
     var out: usize = 0;
-    if (neg) {
+    if (negative) {
         buf[out] = '-';
         out += 1;
     }
@@ -70,42 +71,45 @@ pub fn formatDisplay(buf: []u8, v: f64) []const u8 {
 }
 
 /// "{d:.4}" without trailing zeros: "1234.5", "6.2137", "-3".
-fn fixed4(buf: []u8, v: f64) []const u8 {
-    const s = std.mem.print(buf, "{d:.4}", .{v}) catch return "?";
-    var end = s.len;
-    if (std.mem.findScalar(u8, s, '.') != null) {
-        while (s[end - 1] == '0') end -= 1;
-        if (s[end - 1] == '.') end -= 1;
+fn fixed4(buf: []u8, value: f64) []const u8 {
+    const text = std.mem.print(buf, "{d:.4}", .{value}) catch return "?";
+    var end = text.len;
+    if (std.mem.findScalar(u8, text, '.') != null) {
+        while (text[end - 1] == '0') end -= 1;
+        if (text[end - 1] == '.') end -= 1;
     }
     // -0.00004 rounds to "-0".
-    if (std.mem.eql(u8, s[0..end], "-0")) return "0";
-    return s[0..end];
+    if (std.mem.eql(u8, text[0..end], "-0")) return "0";
+    return text[0..end];
 }
 
 /// Formats for copying: no separators, no trailing zeros: "1234.5".
-pub fn formatPlain(buf: []u8, v: f64) []const u8 {
-    const r = if (@abs(v) < 1e-12) 0 else v;
-    if (r == @trunc(r) and @abs(r) < 1e15) {
-        return std.mem.print(buf, "{d}", .{@as(i64, @intFromFloat(r))}) catch "?";
+pub fn formatPlain(buf: []u8, value: f64) []const u8 {
+    // Below 1e-12 is a zero the arithmetic did not reach exactly.
+    const rounded = if (@abs(value) < 1e-12) 0 else value;
+    if (rounded == @trunc(rounded) and @abs(rounded) < 1e15) {
+        return std.mem.print(buf, "{d}", .{@as(i64, @intFromFloat(rounded))}) catch "?";
     }
-    if (@abs(r) >= 1e15 or @abs(r) < 1e-6) {
-        return std.mem.print(buf, "{e:.6}", .{r}) catch "?";
+    if (@abs(rounded) >= 1e15 or @abs(rounded) < 1e-6) {
+        return std.mem.print(buf, "{e:.6}", .{rounded}) catch "?";
     }
-    const s = std.mem.print(buf, "{d:.10}", .{r}) catch return "?";
-    var end = s.len;
-    while (end > 0 and s[end - 1] == '0') end -= 1;
-    if (end > 0 and s[end - 1] == '.') end -= 1;
-    return s[0..end];
+    const text = std.mem.print(buf, "{d:.10}", .{rounded}) catch return "?";
+    var end = text.len;
+    while (end > 0 and text[end - 1] == '0') end -= 1;
+    if (end > 0 and text[end - 1] == '.') end -= 1;
+    return text[0..end];
 }
 
-fn copyInto(buf: []u8, s: []const u8) []const u8 {
-    const n = @min(s.len, buf.len);
-    @memcpy(buf[0..n], s[0..n]);
-    return buf[0..n];
+fn copyInto(buf: []u8, text: []const u8) []const u8 {
+    const copied = @min(text.len, buf.len);
+    @memcpy(buf[0..copied], text[0..copied]);
+    return buf[0..copied];
 }
 
-fn hasDigit(s: []const u8) bool {
-    for (s) |c| if (std.ascii.isDigit(c)) return true;
+fn hasDigit(text: []const u8) bool {
+    for (text) |char| {
+        if (std.ascii.isDigit(char)) return true;
+    }
     return false;
 }
 
@@ -206,36 +210,38 @@ const units = [_]Unit{
 };
 
 fn findUnit(name: []const u8) ?*const Unit {
-    for (&units) |*u| {
-        for (u.names) |n| if (std.ascii.eqlIgnoreCase(n, name)) return u;
+    for (&units) |*unit| {
+        for (unit.names) |unit_name| {
+            if (std.ascii.eqlIgnoreCase(unit_name, name)) return unit;
+        }
     }
     return null;
 }
 
-/// "<expr> <unit> to|in <unit>"
+/// "<expr> <unit> to|in|as <unit>"
 fn splitConversion(text: []const u8) ?Result {
-    const seps = [_][]const u8{ " to ", " in ", " as " };
-    for (seps) |sep| {
-        const at = lastIndexOfIgnoreCase(text, sep) orelse continue;
+    const separators = [_][]const u8{ " to ", " in ", " as " };
+    for (separators) |separator| {
+        const at = lastIndexOfIgnoreCase(text, separator) orelse continue;
         const left = std.mem.trim(u8, text[0..at], " ");
-        const target_name = std.mem.trim(u8, text[at + sep.len ..], " ");
+        const target_name = std.mem.trim(u8, text[at + separator.len ..], " ");
         const target = findUnit(target_name) orelse continue;
 
         // The source unit is the trailing word of the left side; it may be
         // glued to the number ("10km").
         var split = left.len;
-        while (split > 0 and !std.ascii.isDigit(
-            left[split - 1],
-        ) and left[split - 1] != ' ' and left[split - 1] != ')') split -= 1;
+        while (split > 0 and !endsAmount(left[split - 1])) {
+            split -= 1;
+        }
         const source_name = std.mem.trim(u8, left[split..], " ");
         const source = findUnit(source_name) orelse continue;
         if (source.dim != target.dim) continue;
 
         const expr = std.mem.trim(u8, left[0..split], " ");
-        var p: Parser = .{ .src = expr };
-        const amount = p.parseExpr() catch continue;
-        p.skipSpaces();
-        if (p.pos != expr.len) continue;
+        var parser: Parser = .{ .source = expr };
+        const amount = parser.parseExpr() catch continue;
+        parser.skipSpaces();
+        if (parser.pos != expr.len) continue;
 
         const base = amount * source.factor + source.offset;
         const converted = (base - target.offset) / target.factor;
@@ -244,6 +250,12 @@ fn splitConversion(text: []const u8) ?Result {
         return .{ .value = converted, .unit = target.names[0], .from_unit = source.names[0] };
     }
     return null;
+}
+
+/// A character that ends the amount before a unit name: "10 km", "10km",
+/// "(5 + 5) km".
+fn endsAmount(char: u8) bool {
+    return std.ascii.isDigit(char) or char == ' ' or char == ')';
 }
 
 fn lastIndexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
@@ -262,221 +274,262 @@ const Error = error{ Syntax, Domain, TooDeep };
 
 /// Nesting allowed (parentheses, signs, exponents): the parser recurses, and
 /// pasting 100k "(" must not overflow the stack.
-const max_depth = 64;
+const depth_max = 64;
+
+/// The largest n whose n! fits an f64 (171! is inf).
+const factorial_argument_max = 170;
 
 const Parser = struct {
-    src: []const u8,
+    source: []const u8,
     pos: usize = 0,
     saw_operator: bool = false,
     depth: u32 = 0,
 
-    fn skipSpaces(p: *Parser) void {
-        while (p.pos < p.src.len and p.src[p.pos] == ' ') p.pos += 1;
+    fn skipSpaces(parser: *Parser) void {
+        while (parser.pos < parser.source.len and parser.source[parser.pos] == ' ') parser.pos += 1;
     }
 
-    fn peek(p: *Parser) u8 {
-        p.skipSpaces();
-        return if (p.pos < p.src.len) p.src[p.pos] else 0;
+    fn peek(parser: *Parser) u8 {
+        parser.skipSpaces();
+        return if (parser.pos < parser.source.len) parser.source[parser.pos] else 0;
     }
 
-    fn eatWord(p: *Parser, word: []const u8) bool {
-        p.skipSpaces();
-        const end = p.pos + word.len;
-        if (end > p.src.len) return false;
-        if (!std.ascii.eqlIgnoreCase(p.src[p.pos..end], word)) return false;
-        if (end < p.src.len and std.ascii.isAlphabetic(p.src[end])) return false;
-        p.pos = end;
+    fn eatWord(parser: *Parser, word: []const u8) bool {
+        parser.skipSpaces();
+        const end = parser.pos + word.len;
+        if (end > parser.source.len) return false;
+        if (!std.ascii.eqlIgnoreCase(parser.source[parser.pos..end], word)) return false;
+        if (end < parser.source.len and std.ascii.isAlphabetic(parser.source[end])) return false;
+        parser.pos = end;
         return true;
     }
 
     // expr := term (('+' | '-') term)*
-    fn parseExpr(p: *Parser) Error!f64 {
-        var v = try p.parseTerm();
+    fn parseExpr(parser: *Parser) Error!f64 {
+        var value = try parser.parseTerm();
         while (true) {
-            switch (p.peek()) {
+            switch (parser.peek()) {
                 '+' => {
-                    p.pos += 1;
-                    p.saw_operator = true;
-                    v += try p.parseTerm();
+                    parser.pos += 1;
+                    parser.saw_operator = true;
+                    value += try parser.parseTerm();
                 },
                 '-' => {
-                    p.pos += 1;
-                    p.saw_operator = true;
-                    v -= try p.parseTerm();
+                    parser.pos += 1;
+                    parser.saw_operator = true;
+                    value -= try parser.parseTerm();
                 },
-                else => return v,
+                else => return value,
             }
         }
     }
 
     // term := power (('*' | '/' | 'x' | 'mod' | 'of' | implicit) power)*
-    fn parseTerm(p: *Parser) Error!f64 {
-        var v = try p.parseUnary();
+    fn parseTerm(parser: *Parser) Error!f64 {
+        var value = try parser.parseUnary();
         while (true) {
-            const c = p.peek();
-            if (c == '*' or c == '/') {
-                p.pos += 1;
-                p.saw_operator = true;
-                const r = try p.parseUnary();
-                if (c == '*') v *= r else {
-                    if (r == 0) return error.Domain;
-                    v /= r;
+            const next = parser.peek();
+            if (next == '*' or next == '/') {
+                parser.pos += 1;
+                parser.saw_operator = true;
+                const rhs = try parser.parseUnary();
+                if (next == '*') {
+                    value *= rhs;
+                } else {
+                    if (rhs == 0) return error.Domain;
+                    value /= rhs;
                 }
-            } else if (p.eatWord("mod")) {
-                p.saw_operator = true;
-                const r = try p.parseUnary();
-                if (r == 0) return error.Domain;
-                v = @mod(v, r);
-            } else if (p.eatWord("of")) {
-                p.saw_operator = true;
-                v *= try p.parseUnary();
-            } else if (c == '(' or (std.ascii.isAlphabetic(c) and p.startsFunctionOrConstant())) {
+            } else if (parser.eatWord("mod")) {
+                parser.saw_operator = true;
+                const rhs = try parser.parseUnary();
+                if (rhs == 0) return error.Domain;
+                value = @mod(value, rhs);
+            } else if (parser.eatWord("of")) {
+                parser.saw_operator = true;
+                value *= try parser.parseUnary();
+            } else if (parser.startsImplicitProduct(next)) {
                 // Implicit multiplication: 2(3+1), 2pi
-                p.saw_operator = true;
-                v *= try p.parseUnary();
-            } else return v;
+                parser.saw_operator = true;
+                value *= try parser.parseUnary();
+            } else {
+                return value;
+            }
         }
+    }
+
+    /// A factor right after another with no operator between: "(" or the
+    /// name of a function or a constant.
+    fn startsImplicitProduct(parser: *Parser, next: u8) bool {
+        if (next == '(') return true;
+        return std.ascii.isAlphabetic(next) and parser.startsFunctionOrConstant();
     }
 
     /// Every recursive path (parentheses, function arguments, signs,
     /// exponents) goes through here, so the depth is counted here.
-    fn parseUnary(p: *Parser) Error!f64 {
-        if (p.depth == max_depth) return error.TooDeep;
-        assert(p.depth < max_depth);
-        p.depth += 1;
+    fn parseUnary(parser: *Parser) Error!f64 {
+        if (parser.depth == depth_max) return error.TooDeep;
+        assert(parser.depth < depth_max);
+        parser.depth += 1;
         defer {
-            assert(p.depth > 0);
-            p.depth -= 1;
+            assert(parser.depth > 0);
+            parser.depth -= 1;
         }
-        const c = p.peek();
-        if (c == '-') {
-            p.pos += 1;
-            return -(try p.parseUnary());
+        const sign = parser.peek();
+        if (sign == '-') {
+            parser.pos += 1;
+            return -(try parser.parseUnary());
         }
-        if (c == '+') {
-            p.pos += 1;
-            return p.parseUnary();
+        if (sign == '+') {
+            parser.pos += 1;
+            return parser.parseUnary();
         }
-        return p.parsePower();
+        return parser.parsePower();
     }
 
     // power := postfix ('^' unary)?   (right associative)
-    fn parsePower(p: *Parser) Error!f64 {
-        const base = try p.parsePostfix();
-        if (p.peek() == '^' or
-            (p.peek() == '*' and p.pos + 1 < p.src.len and p.src[p.pos + 1] == '*'))
-        {
-            p.pos += if (p.src[p.pos] == '^') 1 else 2;
-            p.saw_operator = true;
-            const exp = try p.parseUnary();
-            return std.math.pow(f64, base, exp);
-        }
-        return base;
+    fn parsePower(parser: *Parser) Error!f64 {
+        const base = try parser.parsePostfix();
+        const operator_len = parser.powerOperatorLen();
+        if (operator_len == 0) return base;
+        parser.pos += operator_len;
+        parser.saw_operator = true;
+        const exponent = try parser.parseUnary();
+        return std.math.pow(f64, base, exponent);
     }
 
-    fn parsePostfix(p: *Parser) Error!f64 {
-        var v = try p.parsePrimary();
+    /// 1 for "^", 2 for "**", 0 when the next token is neither.
+    fn powerOperatorLen(parser: *Parser) usize {
+        const next = parser.peek();
+        if (next == '^') return 1;
+        if (next != '*') return 0;
+        const after = parser.pos + 1;
+        if (after < parser.source.len and parser.source[after] == '*') return 2;
+        return 0;
+    }
+
+    fn parsePostfix(parser: *Parser) Error!f64 {
+        var value = try parser.parsePrimary();
         while (true) {
-            const c = p.peek();
-            if (c == '!') {
-                p.pos += 1;
-                p.saw_operator = true;
-                v = try factorial(v);
-            } else if (c == '%') {
-                p.pos += 1;
-                p.saw_operator = true;
-                v /= 100;
-            } else return v;
+            switch (parser.peek()) {
+                '!' => {
+                    parser.pos += 1;
+                    parser.saw_operator = true;
+                    value = try factorial(value);
+                },
+                '%' => {
+                    parser.pos += 1;
+                    parser.saw_operator = true;
+                    value /= 100;
+                },
+                else => return value,
+            }
         }
     }
 
-    fn parsePrimary(p: *Parser) Error!f64 {
-        const c = p.peek();
-        if (c == '(') {
-            p.pos += 1;
-            const v = try p.parseExpr();
-            if (p.peek() != ')') return error.Syntax;
-            p.pos += 1;
-            return v;
+    fn parsePrimary(parser: *Parser) Error!f64 {
+        const next = parser.peek();
+        if (next == '(') {
+            parser.pos += 1;
+            const value = try parser.parseExpr();
+            if (parser.peek() != ')') return error.Syntax;
+            parser.pos += 1;
+            return value;
         }
-        if (std.ascii.isDigit(c) or c == '.') return p.parseNumber();
-        if (std.ascii.isAlphabetic(c)) return p.parseIdent();
+        if (std.ascii.isDigit(next) or next == '.') return parser.parseNumber();
+        if (std.ascii.isAlphabetic(next)) return parser.parseIdent();
         return error.Syntax;
     }
 
-    fn parseNumber(p: *Parser) Error!f64 {
-        const start = p.pos;
-        if (p.pos + 1 < p.src.len and p.src[p.pos] == '0' and
-            (p.src[p.pos + 1] == 'x' or p.src[p.pos + 1] == 'b'))
+    fn parseNumber(parser: *Parser) Error!f64 {
+        const start = parser.pos;
+        if (parser.pos + 1 < parser.source.len and parser.source[parser.pos] == '0' and
+            (parser.source[parser.pos + 1] == 'x' or parser.source[parser.pos + 1] == 'b'))
         {
-            const radix: u8 = if (p.src[p.pos + 1] == 'x') 16 else 2;
-            p.pos += 2;
-            const ds = p.pos;
-            while (p.pos < p.src.len and std.ascii.isAlphanumeric(p.src[p.pos])) p.pos += 1;
-            const n = std.fmt.parseInt(i64, p.src[ds..p.pos], radix) catch return error.Syntax;
-            return @floatFromInt(n);
+            const radix: u8 = if (parser.source[parser.pos + 1] == 'x') 16 else 2;
+            parser.pos += 2;
+            const digits_start = parser.pos;
+            parser.skipWhile(std.ascii.isAlphanumeric);
+            const digits = parser.source[digits_start..parser.pos];
+            const integer = std.fmt.parseInt(i64, digits, radix) catch return error.Syntax;
+            return @floatFromInt(integer);
         }
-        while (p.pos < p.src.len) : (p.pos += 1) {
-            const ch = p.src[p.pos];
-            if (std.ascii.isDigit(ch) or ch == '.' or ch == '_') continue;
+        while (parser.pos < parser.source.len) : (parser.pos += 1) {
+            const char = parser.source[parser.pos];
+            if (std.ascii.isDigit(char) or char == '.' or char == '_') continue;
             // Thousands separator only when followed by exactly three digits.
-            if (ch == ',' and p.pos + 3 < p.src.len + 1 and isThreeDigits(
-                p.src[p.pos + 1 ..],
-            )) continue;
-            if ((ch == 'e' or ch == 'E') and p.pos + 1 < p.src.len and
-                (std.ascii.isDigit(p.src[p.pos + 1]) or p.src[p.pos + 1] == '-'))
-            {
-                p.pos += 1;
+            if (char == ',' and isThreeDigits(parser.source[parser.pos + 1 ..])) continue;
+            if ((char == 'e' or char == 'E') and parser.startsExponent()) {
+                parser.pos += 1;
                 continue;
             }
             break;
         }
-        var buf: [64]u8 = undefined;
-        var n: usize = 0;
-        for (p.src[start..p.pos]) |ch| {
-            if (ch == ',' or ch == '_') continue;
-            if (n == buf.len) return error.Syntax;
-            buf[n] = ch;
-            n += 1;
+        var digits_buffer: [64]u8 = undefined;
+        var digits_len: usize = 0;
+        for (parser.source[start..parser.pos]) |char| {
+            if (char == ',' or char == '_') continue;
+            if (digits_len == digits_buffer.len) return error.Syntax;
+            digits_buffer[digits_len] = char;
+            digits_len += 1;
         }
-        return std.fmt.parseFloat(f64, buf[0..n]) catch error.Syntax;
+        return std.fmt.parseFloat(f64, digits_buffer[0..digits_len]) catch error.Syntax;
     }
 
-    fn startsFunctionOrConstant(p: *Parser) bool {
-        var end = p.pos;
-        while (end < p.src.len and std.ascii.isAlphabetic(p.src[end])) end += 1;
-        const name = p.src[p.pos..end];
+    /// After an "e" at `pos`: a digit or a minus sign, as in "1e3" or "1e-3".
+    fn startsExponent(parser: *Parser) bool {
+        const after = parser.pos + 1;
+        if (after == parser.source.len) return false;
+        const char = parser.source[after];
+        return std.ascii.isDigit(char) or char == '-';
+    }
+
+    fn skipWhile(parser: *Parser, comptime accept: fn (u8) bool) void {
+        while (parser.pos < parser.source.len and accept(parser.source[parser.pos])) {
+            parser.pos += 1;
+        }
+    }
+
+    fn startsFunctionOrConstant(parser: *Parser) bool {
+        var end = parser.pos;
+        while (end < parser.source.len and std.ascii.isAlphabetic(parser.source[end])) end += 1;
+        const name = parser.source[parser.pos..end];
         return constant(name) != null or function(name) != null;
     }
 
-    fn parseIdent(p: *Parser) Error!f64 {
-        const start = p.pos;
-        while (p.pos < p.src.len and std.ascii.isAlphanumeric(p.src[p.pos])) p.pos += 1;
-        const name = p.src[start..p.pos];
-        if (constant(name)) |v| return v;
-        const f = function(name) orelse return error.Syntax;
-        if (p.peek() != '(') return error.Syntax;
-        p.pos += 1;
-        const arg = try p.parseExpr();
-        if (p.peek() != ')') return error.Syntax;
-        p.pos += 1;
-        p.saw_operator = true;
-        return f(arg);
+    fn parseIdent(parser: *Parser) Error!f64 {
+        const start = parser.pos;
+        parser.skipWhile(std.ascii.isAlphanumeric);
+        const name = parser.source[start..parser.pos];
+        if (constant(name)) |value| return value;
+        const apply = function(name) orelse return error.Syntax;
+        if (parser.peek() != '(') return error.Syntax;
+        parser.pos += 1;
+        const arg = try parser.parseExpr();
+        if (parser.peek() != ')') return error.Syntax;
+        parser.pos += 1;
+        parser.saw_operator = true;
+        return apply(arg);
     }
 };
 
-fn isThreeDigits(s: []const u8) bool {
-    if (s.len < 3) return false;
-    for (s[0..3]) |c| if (!std.ascii.isDigit(c)) return false;
-    return s.len == 3 or !std.ascii.isDigit(s[3]);
+/// Exactly three digits at the start of `text`, and no fourth.
+fn isThreeDigits(text: []const u8) bool {
+    if (text.len < 3) return false;
+    for (text[0..3]) |char| {
+        if (!std.ascii.isDigit(char)) return false;
+    }
+    return text.len == 3 or !std.ascii.isDigit(text[3]);
 }
 
-fn factorial(v: f64) Error!f64 {
-    if (v < 0 or v != @trunc(v) or v > 170) return error.Domain;
-    var r: f64 = 1;
-    var i: f64 = 2;
-    while (i <= v) : (i += 1) r *= i;
-    return r;
+fn factorial(argument: f64) Error!f64 {
+    if (argument < 0) return error.Domain;
+    if (argument != @trunc(argument)) return error.Domain;
+    if (argument > factorial_argument_max) return error.Domain;
+    var product: f64 = 1;
+    var factor: f64 = 2;
+    while (factor <= argument) : (factor += 1) product *= factor;
+    assert(std.math.isFinite(product));
+    return product;
 }
 
 fn constant(name: []const u8) ?f64 {
@@ -545,11 +598,11 @@ fn fnExp(x: f64) Error!f64 {
 // ---------------------------------------------------------------- tests
 
 fn expectValue(input: []const u8, want: f64) !void {
-    const r = evaluate(input) orelse {
+    const result = evaluate(input) orelse {
         std.debug.print("no result for '{s}'\n", .{input});
         return error.TestUnexpectedResult;
     };
-    try std.testing.expectApproxEqRel(want, r.value, 1e-9);
+    try std.testing.expectApproxEqRel(want, result.value, 1e-9);
 }
 
 test "arithmetic and precedence" {
@@ -599,12 +652,12 @@ test "formatting" {
     try std.testing.expectEqualStrings("42", formatPlain(&buf, 42));
 }
 
-/// `s` repeated `n` times, at comptime (Zig 0.17 has no `**`).
-fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+/// `text` repeated `count` times, at comptime (Zig 0.17 has no `**`).
+fn repeat(comptime text: []const u8, comptime count: usize) *const [text.len * count]u8 {
     const done = comptime blk: {
-        @setEvalBranchQuota(n * 10 + 1000);
-        var out: [s.len * n]u8 = undefined;
-        for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
+        @setEvalBranchQuota(count * 10 + 1000);
+        var out: [text.len * count]u8 = undefined;
+        for (0..count) |i| @memcpy(out[i * text.len ..][0..text.len], text);
         break :blk out;
     };
     return &done;
@@ -646,80 +699,90 @@ test "hostile input: deep nesting, overflowing conversions, huge values" {
 
 fn fuzzEvaluate(_: void, smith: *std.testing.Smith) anyerror!void {
     // Mostly the calculator's own alphabet, so the fuzzer forms expressions.
-    const w: []const std.testing.Smith.Weight = &.{
-        .rangeAtMost(u8, '0', '9', 8), .value(u8, '+', 4), .value(u8, '-', 4), .value(u8, '*', 4),
-        .value(u8, '/', 4),            .value(u8, '^', 4), .value(u8, '(', 4), .value(u8, ')', 4),
-        .value(u8, '!', 3),            .value(u8, '%', 3), .value(u8, '.', 3), .value(u8, ',', 3),
-        .value(u8, ' ', 4),            .value(u8, 'e', 3), .value(u8, 'x', 2),
-        .rangeAtMost(
-            u8,
-            'a',
-            'z',
-            1,
-        ),
+    const weights: []const std.testing.Smith.Weight = &.{
+        .rangeAtMost(u8, '0', '9', 8),
+        .value(u8, '+', 4),
+        .value(u8, '-', 4),
+        .value(u8, '*', 4),
+        .value(u8, '/', 4),
+        .value(u8, '^', 4),
+        .value(u8, '(', 4),
+        .value(u8, ')', 4),
+        .value(u8, '!', 3),
+        .value(u8, '%', 3),
+        .value(u8, '.', 3),
+        .value(u8, ',', 3),
+        .value(u8, ' ', 4),
+        .value(u8, 'e', 3),
+        .value(u8, 'x', 2),
+        .rangeAtMost(u8, 'a', 'z', 1),
         .rangeAtMost(u8, 0, 255, 1),
     };
-    var in: [200]u8 = undefined;
-    const s = in[0..smith.sliceWeightedBytes(&in, w)];
-    if (evaluate(s)) |r| {
-        try std.testing.expect(std.math.isFinite(r.value));
+    var input_buffer: [200]u8 = undefined;
+    const input = input_buffer[0..smith.sliceWeightedBytes(&input_buffer, weights)];
+    if (evaluate(input)) |result| {
+        try std.testing.expect(std.math.isFinite(result.value));
         var buf: [32]u8 = undefined;
-        _ = formatDisplay(&buf, r.value);
-        _ = formatPlain(&buf, r.value);
+        _ = formatDisplay(&buf, result.value);
+        _ = formatPlain(&buf, result.value);
     }
 }
 
 test "fuzz: evaluate never crashes and only returns finite values" {
-    const P = struct {
-        fn lp(comptime s: []const u8) []const u8 {
-            const len: [4]u8 = @bitCast(std.mem.nativeToLittle(u32, s.len));
-            return &len ++ s;
-        }
+    const seeds = [_][]const u8{
+        "2 + 3 * 4",
+        "(1 + 2)^3",
+        "sqrt(16) + 2!",
+        "20% of 80",
+        "0xff + 0b101",
+        "10 km to mi",
+        "100 f in c",
+        "1,000.5e3 mod 7",
+        "2pi - ln(e)",
+        "1e308 * 10 kg to lb",
     };
-    try std.testing.fuzz({}, fuzzEvaluate, .{ .corpus = &.{
-        comptime P.lp("2 + 3 * 4"),   comptime P.lp("(1 + 2)^3"),
-        comptime P.lp(
-            "sqrt(16) + 2!",
-        ),
-        comptime P.lp("20% of 80"),
-        comptime P.lp(
-            "0xff + 0b101",
-        ),
-        comptime P.lp("10 km to mi"), comptime P.lp("100 f in c"),
-        comptime P.lp(
-            "1,000.5e3 mod 7",
-        ),
-        comptime P.lp("2pi - ln(e)"), comptime P.lp("1e308 * 10 kg to lb"),
-    } });
+    // The fuzzer reads each corpus entry as a u32 length and the bytes.
+    const corpus = comptime blk: {
+        var entries: [seeds.len][]const u8 = undefined;
+        for (seeds, &entries) |seed, *entry| {
+            const len: [4]u8 = @bitCast(std.mem.nativeToLittle(u32, seed.len));
+            entry.* = &len ++ seed;
+        }
+        break :blk entries;
+    };
+    try std.testing.fuzz({}, fuzzEvaluate, .{ .corpus = &corpus });
 }
 
 fn fuzzFormat(_: void, smith: *std.testing.Smith) anyerror!void {
-    const v: f64 = switch (smith.valueRangeAtMost(u8, 0, 3)) {
+    const value: f64 = switch (smith.valueRangeAtMost(u8, 0, 3)) {
         0 => smith.value(f64), // any bit pattern: nan, inf, subnormals, -0
         1 => @floatFromInt(smith.value(i64)),
         2 => @as(f64, @floatFromInt(smith.value(i32))) / 10000.0,
-        else => std.math.pow(f64, 10, @floatFromInt(
-            smith.valueRangeAtMost(i16, -330, 330),
-        )) * if (smith.value(bool)) @as(f64, -1) else 1,
+        else => blk: {
+            const exponent: f64 = @floatFromInt(smith.valueRangeAtMost(i16, -330, 330));
+            const sign: f64 = if (smith.value(bool)) -1 else 1;
+            break :blk sign * std.math.pow(f64, 10, exponent);
+        },
     };
     // Every buffer size, down to none: never a write past the end.
     var big: [64]u8 = undefined;
-    const n = smith.valueRangeAtMost(u8, 0, 64);
-    const d = formatDisplay(big[0..n], v);
-    const p = formatPlain(big[0..n], v);
-    try std.testing.expect(d.len <= @max(n, 1) and p.len <= @max(n, 1));
+    const size = smith.valueRangeAtMost(u8, 0, 64);
+    const display_short = formatDisplay(big[0..size], value);
+    const plain_short = formatPlain(big[0..size], value);
+    try std.testing.expect(display_short.len <= @max(size, 1));
+    try std.testing.expect(plain_short.len <= @max(size, 1));
     // The buffers the UI uses always hold the whole number.
-    var b32: [32]u8 = undefined;
-    const full = formatDisplay(&b32, v);
-    var raw: [64]u8 = undefined;
-    const plain = formatPlain(&raw, v);
-    try std.testing.expect(
-        full.len < b32.len and plain.len < raw.len and !std.mem.eql(u8, plain, "?"),
-    );
+    var display_buffer: [32]u8 = undefined;
+    const display = formatDisplay(&display_buffer, value);
+    var plain_buffer: [64]u8 = undefined;
+    const plain = formatPlain(&plain_buffer, value);
+    try std.testing.expect(display.len < display_buffer.len);
+    try std.testing.expect(plain.len < plain_buffer.len);
+    try std.testing.expect(!std.mem.eql(u8, plain, "?"));
     // What is copied reads back as the value.
-    if (std.math.isFinite(v)) {
+    if (std.math.isFinite(value)) {
         const back = try std.fmt.parseFloat(f64, plain);
-        try std.testing.expect(@abs(back - v) <= @max(@abs(v) * 1e-6, 1e-10));
+        try std.testing.expect(@abs(back - value) <= @max(@abs(value) * 1e-6, 1e-10));
     }
 }
 

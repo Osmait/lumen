@@ -157,28 +157,27 @@ pub fn monitor(arena: std.mem.Allocator, id: i64) ?geometry.Monitor {
 }
 
 pub fn findMonitor(all: []const MonitorJson, id: i64) ?geometry.Monitor {
-    for (all) |m| {
+    for (all) |monitor_json| {
+        if (monitor_json.id != id) continue;
+        const found = monitorFromJson(monitor_json);
         // The geometry runs without overflow checks (core is ReleaseFast):
         // a broken reply stops here, never reaching its arithmetic.
-        if (m.id == id and !geometry.Monitor.plausible(
-            m.x,
-            m.y,
-            m.width,
-            m.height,
-            m.scale,
-            m.reserved,
-        )) return null;
-        if (m.id == id) return .{
-            .x = m.x,
-            .y = m.y,
-            .width = m.width,
-            .height = m.height,
-            .scale = m.scale,
-            .transform = m.transform,
-            .reserved = m.reserved,
-        };
+        if (!found.plausible()) return null;
+        return found;
     }
     return null;
+}
+
+fn monitorFromJson(monitor_json: MonitorJson) geometry.Monitor {
+    return .{
+        .x = monitor_json.x,
+        .y = monitor_json.y,
+        .width = monitor_json.width,
+        .height = monitor_json.height,
+        .scale = monitor_json.scale,
+        .transform = monitor_json.transform,
+        .reserved = monitor_json.reserved,
+    };
 }
 
 /// Connector name of the focused monitor ("DP-1").
@@ -370,7 +369,7 @@ pub fn layoutCommands(
     mon: geometry.Monitor,
     layout: geometry.Layout,
 ) std.mem.Allocator.Error![]const []const u8 {
-    const r = geometry.place(layout, mon.usable(), win.size[0], win.size[1], 8);
+    const r = geometry.place(layout, mon.usable(), .{ .w = win.size[0], .h = win.size[1] }, 8);
     var cmds: std.ArrayList([]const u8) = .empty;
     if (win.fullscreen != 0) try cmds.append(arena, "fullscreen 0");
     if (!win.floating) try cmds.append(arena, try arena.print(

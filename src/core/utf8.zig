@@ -1,47 +1,58 @@
 //! Cutting text that should be UTF-8 without splitting a character.
 
 const std = @import("std");
+const assert = std.debug.assert;
 
-/// Longest prefix of `s` that is valid UTF-8: everything before the first
-/// sequence that is not. One pass (trying shorter and shorter prefixes
-/// was quadratic: ~4M steps for a 4 KB preview with a stray byte midway).
-pub fn validPrefix(s: []const u8) []const u8 {
-    var i: usize = 0;
-    while (i < s.len) {
-        const n = std.unicode.utf8ByteSequenceLength(s[i]) catch break;
-        if (i + n > s.len or !std.unicode.utf8ValidateSlice(s[i..][0..n])) break;
-        i += n;
+/// Longest prefix of `text` that is valid UTF-8: everything before the
+/// first sequence that is not. One pass (trying shorter and shorter
+/// prefixes was quadratic: ~4M steps for a 4 KB preview with a stray byte
+/// midway).
+pub fn validPrefix(text: []const u8) []const u8 {
+    var end: usize = 0;
+    while (end < text.len) {
+        const sequence_len = std.unicode.utf8ByteSequenceLength(text[end]) catch break;
+        if (end + sequence_len > text.len) break;
+        if (!std.unicode.utf8ValidateSlice(text[end..][0..sequence_len])) break;
+        end += sequence_len;
     }
-    return s[0..i];
+    return text[0..end];
 }
+
+/// A UTF-8 character is at most four bytes: a window cut inside one starts
+/// with at most three of its continuation bytes.
+const continuation_bytes_max = 3;
 
 /// A window cut out of UTF-8 text at arbitrary bytes, made valid: without
-/// the continuation bytes of a character cut at its start (at most three),
-/// then its valid prefix.
-pub fn validWindow(s: []const u8) []const u8 {
-    var lo: usize = 0;
-    while (lo < s.len and lo < 3 and isContinuation(s[lo])) lo += 1;
-    return validPrefix(s[lo..]);
+/// the continuation bytes of a character cut at its start, then its valid
+/// prefix.
+pub fn validWindow(text: []const u8) []const u8 {
+    var skip: usize = 0;
+    while (skip < text.len and skip < continuation_bytes_max and isContinuation(text[skip])) {
+        skip += 1;
+    }
+    return validPrefix(text[skip..]);
 }
 
-/// The longest length up to `max` that ends `s` between characters.
-pub fn floorBoundary(s: []const u8, max: usize) usize {
-    if (max >= s.len) return s.len;
-    var n = max;
+/// The longest length up to `max` that ends `text` between characters.
+pub fn floorBoundary(text: []const u8, max: usize) usize {
+    if (max >= text.len) return text.len;
+    var end = max;
     // Cut before the lead byte of the character `max` falls in.
-    while (n > 0 and isContinuation(s[n])) n -= 1;
-    return n;
+    while (end > 0 and isContinuation(text[end])) end -= 1;
+    assert(end <= max);
+    assert(!isContinuation(text[end]));
+    return end;
 }
 
-fn isContinuation(b: u8) bool {
-    return b & 0xC0 == 0x80;
+fn isContinuation(byte: u8) bool {
+    return byte & 0xC0 == 0x80;
 }
 
 /// What validPrefix replaced, kept as the reference it must agree with.
-fn validPrefixNaive(s: []const u8) []const u8 {
-    var end = s.len;
-    while (end > 0 and !std.unicode.utf8ValidateSlice(s[0..end])) end -= 1;
-    return s[0..end];
+fn validPrefixNaive(text: []const u8) []const u8 {
+    var end = text.len;
+    while (end > 0 and !std.unicode.utf8ValidateSlice(text[0..end])) end -= 1;
+    return text[0..end];
 }
 
 test "validPrefix stops at the first invalid sequence" {
@@ -56,30 +67,20 @@ test "validPrefix stops at the first invalid sequence" {
 
 test "validPrefix agrees with the longest valid prefix on random bytes" {
     var prng: std.Random.DefaultPrng = .init(0x7e57);
-    const r = prng.random();
-    const pieces = [_][]const u8{
-        "a",
-        "é",
-        "€",
-        "😀",
-        "\x80",
-        "\xc3",
-        "\xe2\x82",
-        "\xff",
-        "\xed\xa0\x80",
-    };
+    const random = prng.random();
+    const pieces = [_][]const u8{ "a", "é", "€", "😀", "\x80", "\xc3", "\xe2\x82", "\xff", "\xed\xa0\x80" };
     var buf: [64]u8 = undefined;
     for (0..5000) |_| {
         var len: usize = 0;
         while (true) {
-            const p = pieces[r.uintLessThan(usize, pieces.len)];
-            if (len + p.len > buf.len) break;
-            @memcpy(buf[len..][0..p.len], p);
-            len += p.len;
-            if (r.uintLessThan(u8, 8) == 0) break;
+            const piece = pieces[random.uintLessThan(usize, pieces.len)];
+            if (len + piece.len > buf.len) break;
+            @memcpy(buf[len..][0..piece.len], piece);
+            len += piece.len;
+            if (random.uintLessThan(u8, 8) == 0) break;
         }
-        const s = buf[0..len];
-        try std.testing.expectEqualStrings(validPrefixNaive(s), validPrefix(s));
+        const text = buf[0..len];
+        try std.testing.expectEqualStrings(validPrefixNaive(text), validPrefix(text));
     }
 }
 
