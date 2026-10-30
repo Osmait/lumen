@@ -2,6 +2,7 @@
 //! command shows, its actions, keymaps, and reloading edited files.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const c = @import("c");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
@@ -135,6 +136,8 @@ fn onRoot(answer: *Host.RootResult, ctx: ?*anyopaque) void {
         answer.destroy(ui.gpa);
         return;
     }
+    // Each answer is delivered once: the one shown is never handed back.
+    assert(answer != ui.ext_root);
     const registry = ui.ext_registry orelse {
         answer.destroy(ui.gpa);
         return;
@@ -223,6 +226,7 @@ fn onList(answer: *Host.ListResult, ctx: ?*anyopaque) void {
         answer.destroy(ui.gpa);
         return;
     }
+    assert(answer != ui.ext_result);
     if (answer.err) |e| log.warn("{s}: {s}", .{ if (command(ui)) |cmd| cmd.id else "?", e });
     // Rows without an icon take their command's. The icon points into the
     // registry, which outlives the result: a reload destroys results first.

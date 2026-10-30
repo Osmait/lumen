@@ -1,6 +1,7 @@
 //! Rows for the file and file-content searches.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const c = @import("c");
 const core = @import("core");
 const item_mod = @import("../item.zig");
@@ -31,6 +32,8 @@ pub fn onContentResult(result: *Ui.ContentSearch.Result, ctx: ?*anyopaque) void 
         result.destroy(self.gpa);
         return;
     }
+    // Each answer is delivered once: the one shown is never handed back.
+    assert(result != self.content_result);
     if (result.err) |err| log.warn("content search for \"{s}\": {t}", .{ result.query, err });
     const old = self.content_result;
     self.content_result = result;

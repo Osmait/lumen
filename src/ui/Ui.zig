@@ -349,6 +349,15 @@ const Navigation = struct {
 /// the view's 23 ms, because GTK laid out every one.
 const eager_rows = 14;
 
+comptime {
+    // The first screen of every search is built in the keystroke's frame.
+    assert(eager_rows > 0);
+    assert(eager_rows <= content_results_max);
+    assert(root_results_before_files_max <= root_results_max);
+    assert(root_files_max <= file_results_max);
+    assert(Navigation.capacity > 0);
+}
+
 /// What the view and query arenas keep for next time when reset. They kept
 /// all they had ever held: a view that once needed hundreds of MB (the
 /// clipboard history loaded whole) held on to them while hidden.
@@ -1384,6 +1393,9 @@ pub fn refresh(self: *Ui) void {
     self.fill(arena, query_text, start_ns);
     self.showEmptyOrResults(arena, query_text);
     self.selectAfterRefresh();
+    // The grid builds every cell at once: nothing of it waits in `pending`.
+    if (self.grid_mode) assert(self.pending.items.len == 0);
+    if (self.selected) |row_selected| assert(row_selected < self.rows.items.len);
 }
 
 /// The rows on screen stay while the answer to a new query is on its way
@@ -1505,6 +1517,8 @@ fn selectAfterRefresh(self: *Ui) void {
             }
         }
     }
+    assert(self.reselect.len == 0);
+    if (first) |row_first| assert(self.rows.items[row_first].item != null);
     // The list was just scrolled to the top, where the first row is: no
     // need to wait a frame for its place to scroll to it.
     self.no_scroll = first == top;
@@ -1786,24 +1800,38 @@ fn buildItemRow(self: *Ui, item_index: usize) void {
 
 // ----------------------------------------------------------- selection
 
-pub fn nextSelectable(self: *Ui, from: ?usize, dir: i32) ?usize {
-    // Past the rows built so far, or from the end: build the rest first.
-    if (self.pending.items.len > 0 and
-        ((from == null and dir < 0) or
-            (from != null and dir > 0 and from.? + 1 >= self.rows.items.len))) self.ensureRows();
+/// The first row after `from` (or from either end, when null) in
+/// `direction` that shows an item; `from` when there is none.
+pub fn nextSelectable(self: *Ui, from: ?usize, direction: i32) ?usize {
+    assert(direction == 1 or direction == -1);
+    if (from) |start| assert(start < self.rows.items.len);
+    // Moving up from the end, or down past the last row built so far, needs
+    // the rows that are still queued.
+    if (self.pending.items.len > 0) {
+        const up_from_end = from == null and direction < 0;
+        const down_past_built = if (from) |start|
+            direction > 0 and start + 1 >= self.rows.items.len
+        else
+            false;
+        if (up_from_end or down_past_built) self.ensureRows();
+    }
     const row_count = self.rows.items.len;
     if (row_count == 0) return null;
-    var i: i64 = if (from) |start| @as(
-        i64,
-        @intCast(start),
-    ) + dir else if (dir > 0) 0 else @as(i64, @intCast(row_count)) - 1;
-    while (i >= 0 and i < row_count) : (i += dir) {
+    var i: i64 = if (from) |start|
+        @as(i64, @intCast(start)) + direction
+    else if (direction > 0)
+        0
+    else
+        @as(i64, @intCast(row_count)) - 1;
+    while (i >= 0 and i < row_count) : (i += direction) {
         if (self.rows.items[@intCast(i)].item != null) return @intCast(i);
     }
     return from;
 }
 
 pub fn select(self: *Ui, row_index: ?usize) void {
+    if (row_index) |row_given| assert(row_given < self.rows.items.len);
+    defer assert(self.selected == row_index);
     if (self.selected) |old| if (old < self.rows.items.len) {
         const row_old = self.rows.items[old];
         if (row_old.hint) |hint| c.gtk_widget_set_visible(hint, 0);
@@ -1820,8 +1848,9 @@ pub fn select(self: *Ui, row_index: ?usize) void {
         return;
     };
     const row = self.rows.items[selected_index];
-    // Section titles are never selected (keyboard.zig skips them).
-    assert(row.item != null and row.item.? < self.items.items.len);
+    // Section titles are never selected (nextSelectable skips them).
+    assert(row.item != null);
+    assert(row.item.? < self.items.items.len);
     if (self.grid_mode)
         c.gtk_flow_box_select_child(@ptrCast(self.grid), @ptrCast(row.widget))
     else
