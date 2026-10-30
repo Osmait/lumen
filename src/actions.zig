@@ -50,7 +50,7 @@ pub fn perform(ctx: Ctx, it: *const Item, op: item_mod.Op) Outcome {
             .file => |f| copy(f.path),
             else => {},
         },
-        .show_in_folder => if (it.action == .file) showInFolder(ctx, it.action.file.path),
+        .show_in_folder => if (it.action == .file) showInFolder(it.action.file.path),
         .open_at_line => if (it.action == .file) openAtLine(
             ctx,
             it.action.file.path,
@@ -185,15 +185,29 @@ fn openAtLine(ctx: Ctx, path: [:0]const u8, line: u32) void {
     var arena_state: std.heap.ArenaAllocator = .init(ctx.gpa);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const editor = a.dupeSentinel(u8, resolveEditor(ctx.settings), 0) catch return;
+    const editor = words(a, resolveEditor(ctx.settings)) catch return;
     var argv: std.ArrayList([:0]const u8) = .empty;
     const cmd = editorCommand(a, editor, path, line) catch return;
     if (cmd.in_terminal) argv.appendSlice(
         a,
-        terminalPrefix(a, resolveTerminal(ctx.settings)) catch return,
+        terminalPrefix(a, words(a, resolveTerminal(ctx.settings)) catch return) catch return,
     ) catch return;
     argv.appendSlice(a, cmd.argv) catch return;
     proc.spawn(argv.items);
+}
+
+/// A command's words, split as a shell would (quotes, backslashes) though
+/// no shell runs it: $EDITOR is often `code --wait` or `emacsclient -t`.
+/// Text that does not split (an open quote) is one word, as before. In `a`.
+pub fn words(a: std.mem.Allocator, cmd: []const u8) std.mem.Allocator.Error![]const [:0]const u8 {
+    const z = try a.dupeSentinel(u8, cmd, 0);
+    var argv: ?[*]?[*:0]u8 = null;
+    if (c.g_shell_parse_argv(z, null, &argv, null) == 0) return a.dupe([:0]const u8, &.{z});
+    defer c.g_strfreev(argv);
+    var list: std.ArrayList([:0]const u8) = .empty;
+    var i: usize = 0;
+    while (argv.?[i]) |w| : (i += 1) try list.append(a, try a.dupeSentinel(u8, std.mem.span(w), 0));
+    return list.items;
 }
 
 fn resolveEditor(s: *const Settings) []const u8 {
@@ -221,14 +235,15 @@ pub fn autoTerminal() [:0]const u8 {
 
 pub const EditorCommand = struct { argv: []const [:0]const u8, in_terminal: bool };
 
-/// How each editor is told to open a file at a line.
+/// How each editor is told to open a file at a line. `editor` is the
+/// command's words (the program and its own arguments).
 pub fn editorCommand(
     a: std.mem.Allocator,
-    editor: [:0]const u8,
+    editor: []const [:0]const u8,
     path: [:0]const u8,
     line: u32,
 ) std.mem.Allocator.Error!EditorCommand {
-    const base = if (std.mem.findScalarLast(u8, editor, '/')) |s| editor[s + 1 ..] else editor;
+    const base = baseName(editor[0]);
     const at = try a.printSentinel("{s}:{d}", .{ path, line }, 0);
     const plus = try a.printSentinel("+{d}", .{line}, 0);
     const n = try a.printSentinel("{d}", .{line}, 0);
@@ -239,64 +254,97 @@ pub fn editorCommand(
         }
     }.any;
     if (is(base, &.{ "code", "codium", "code-oss" })) return .{
-        .argv = try a.dupe([:0]const u8, &.{ editor, "-g", at }),
+        .argv = try std.mem.concat(a, [:0]const u8, &.{ editor, &.{ "-g", at } }),
         .in_terminal = false,
     };
     if (is(base, &.{ "zed", "zeditor", "subl" })) return .{
-        .argv = try a.dupe([:0]const u8, &.{ editor, at }),
+        .argv = try std.mem.concat(a, [:0]const u8, &.{ editor, &.{at} }),
         .in_terminal = false,
     };
     if (is(base, &.{"kate"})) return .{
-        .argv = try a.dupe([:0]const u8, &.{ editor, "-l", n, path }),
+        .argv = try std.mem.concat(a, [:0]const u8, &.{ editor, &.{ "-l", n, path } }),
         .in_terminal = false,
     };
     if (is(base, &.{ "gedit", "gnome-text-editor", "emacs" })) return .{
-        .argv = try a.dupe([:0]const u8, &.{ editor, plus, path }),
+        .argv = try std.mem.concat(a, [:0]const u8, &.{ editor, &.{ plus, path } }),
         .in_terminal = false,
     };
     if (is(base, &.{ "hx", "helix", "micro" })) return .{
-        .argv = try a.dupe([:0]const u8, &.{ editor, at }),
+        .argv = try std.mem.concat(a, [:0]const u8, &.{ editor, &.{at} }),
         .in_terminal = true,
     };
     // vi, vim, nvim, nano, and anything unknown: `+LINE path` in a terminal.
-    return .{ .argv = try a.dupe([:0]const u8, &.{ editor, plus, path }), .in_terminal = true };
+    return .{
+        .argv = try std.mem.concat(a, [:0]const u8, &.{ editor, &.{ plus, path } }),
+        .in_terminal = true,
+    };
 }
 
 /// The words that make a terminal run a command (most take `-e`), in `a`.
+/// `term` is the terminal command's words.
 pub fn terminalPrefix(
     a: std.mem.Allocator,
-    term: [:0]const u8,
+    term: []const [:0]const u8,
 ) std.mem.Allocator.Error![]const [:0]const u8 {
-    const base = if (std.mem.findScalarLast(u8, term, '/')) |s| term[s + 1 ..] else term;
-    if (std.mem.eql(u8, base, "kitty") or std.mem.eql(u8, base, "foot")) return a.dupe(
-        [:0]const u8,
-        &.{term},
-    );
-    if (std.mem.eql(u8, base, "wezterm")) return a.dupe([:0]const u8, &.{ term, "start", "--" });
-    if (std.mem.eql(u8, base, "gnome-terminal")) return a.dupe([:0]const u8, &.{ term, "--" });
-    return a.dupe([:0]const u8, &.{ term, "-e" });
+    const base = baseName(term[0]);
+    const more: []const [:0]const u8 = if (std.mem.eql(u8, base, "kitty") or
+        std.mem.eql(u8, base, "foot"))
+        &.{}
+    else if (std.mem.eql(u8, base, "wezterm"))
+        &.{ "start", "--" }
+    else if (std.mem.eql(u8, base, "gnome-terminal"))
+        &.{"--"}
+    else
+        &.{"-e"};
+    return std.mem.concat(a, [:0]const u8, &.{ term, more });
+}
+
+/// What follows the last slash of a program's path.
+fn baseName(prog: []const u8) []const u8 {
+    return if (std.mem.findScalarLast(u8, prog, '/')) |s| prog[s + 1 ..] else prog;
 }
 
 /// The file manager, with the file selected (org.freedesktop.FileManager1,
-/// spoken by Dolphin, Nautilus, Thunar...).
-fn showInFolder(ctx: Ctx, path: [:0]const u8) void {
+/// spoken by Dolphin, Nautilus, Thunar...). The URI goes as a D-Bus value,
+/// never through text a parser reads (a quote in a file name broke that).
+fn showInFolder(path: [:0]const u8) void {
     const uri = c.g_filename_to_uri(path, null, null) orelse return;
     defer c.g_free(uri);
-    const arg = ctx.gpa.printSentinel("['{s}']", .{uri}, 0) catch return;
-    defer ctx.gpa.free(arg);
-    proc.spawn(&.{
-        "gdbus",
-        "call",
-        "--session",
-        "--dest",
+    const uris = [_][*:0]const u8{uri};
+    const args = [_]*c.GVariant{ c.g_variant_new_strv(&uris, 1), c.g_variant_new_string("") };
+    // Kept until the bus is there: the call takes it then.
+    const params = c.g_variant_ref_sink(c.g_variant_new_tuple(&args, args.len));
+    c.g_bus_get(c.G_BUS_TYPE_SESSION, null, &onSessionBus, params);
+}
+
+fn onSessionBus(_: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) void {
+    const params: *c.GVariant = @ptrCast(data.?);
+    defer c.g_variant_unref(params);
+    var err: ?*c.GError = null;
+    const bus = c.g_bus_get_finish(res, &err) orelse
+        return proc.warnError(.actions, err, "show in folder", .{});
+    defer c.g_object_unref(bus);
+    c.g_dbus_connection_call(
+        bus,
         "org.freedesktop.FileManager1",
-        "--object-path",
         "/org/freedesktop/FileManager1",
-        "--method",
-        "org.freedesktop.FileManager1.ShowItems",
-        arg,
-        "",
-    });
+        "org.freedesktop.FileManager1",
+        "ShowItems",
+        params,
+        null,
+        c.G_DBUS_CALL_FLAGS_NONE,
+        -1,
+        null,
+        &onShown,
+        null,
+    );
+}
+
+fn onShown(source: ?*c.GObject, res: *c.GAsyncResult, _: ?*anyopaque) callconv(.c) void {
+    var err: ?*c.GError = null;
+    const reply = c.g_dbus_connection_call_finish(@ptrCast(source.?), res, &err) orelse
+        return proc.warnError(.actions, err, "show in folder", .{});
+    c.g_variant_unref(reply);
 }
 
 /// Puts the file itself on the clipboard (paste it in a file manager or a
@@ -387,11 +435,13 @@ fn runScript(path: [:0]const u8, mode: @import("core").script_meta.Mode, title: 
         return;
     }
     // Other modes show the output: last lines as a desktop notification.
+    // After `--`, a title or an output line starting with "-" is text, not
+    // an option of notify-send's.
     var buf: [512:0]u8 = undefined;
     const t = std.mem.printSentinel(&buf, "{s}", .{title}, 0) catch "Script";
     proc.spawn(&.{
         "sh",           "-c",
-        \\out=$("$1" 2>&1); notify-send -a Lumen "$2" "$(printf '%s' "$out" | tail -n 5)"
+        \\out=$("$1" 2>&1); notify-send -a Lumen -- "$2" "$(printf '%s' "$out" | tail -n 5)"
         ,
         "lumen-script", path,
         t,
@@ -484,17 +534,25 @@ test "editors open at a line, terminal ones inside a terminal" {
         .{ "zed", &.{ "zed", "/x/a.zig:12" }, false },
         .{ "kate", &.{ "kate", "-l", "12", "/x/a.zig" }, false },
         .{ "gnome-text-editor", &.{ "gnome-text-editor", "+12", "/x/a.zig" }, false },
+        // $EDITOR with its own arguments, or a path with a space.
+        .{ "code --wait", &.{ "code", "--wait", "-g", "/x/a.zig:12" }, false },
+        .{ "emacsclient -t", &.{ "emacsclient", "-t", "+12", "/x/a.zig" }, true },
+        .{ "'/opt/my vim/vim'", &.{ "/opt/my vim/vim", "+12", "/x/a.zig" }, true },
+        // Does not split: one word, as it is.
+        .{ "vim 'x", &.{ "vim 'x", "+12", "/x/a.zig" }, true },
     };
     for (cases) |case| {
-        const ed = try a.dupeSentinel(u8, case[0], 0);
-        const cmd = try editorCommand(a, ed, "/x/a.zig", 12);
+        const cmd = try editorCommand(a, try words(a, case[0]), "/x/a.zig", 12);
         try std.testing.expectEqual(case[2], cmd.in_terminal);
         try std.testing.expectEqual(case[1].len, cmd.argv.len);
         for (case[1], cmd.argv) |want, got| try std.testing.expectEqualStrings(want, got);
     }
-    try std.testing.expectEqualStrings("start", (try terminalPrefix(a, "wezterm"))[1]);
-    try std.testing.expectEqual(@as(usize, 1), (try terminalPrefix(a, "kitty")).len);
-    try std.testing.expectEqualStrings("-e", (try terminalPrefix(a, "ghostty"))[1]);
+    try std.testing.expectEqualStrings("start", (try terminalPrefix(a, &.{"wezterm"}))[1]);
+    try std.testing.expectEqual(@as(usize, 1), (try terminalPrefix(a, &.{"kitty"})).len);
+    try std.testing.expectEqualStrings("-e", (try terminalPrefix(a, &.{"ghostty"}))[1]);
+    const kitty = try terminalPrefix(a, try words(a, "/usr/bin/kitty --single-instance"));
+    try std.testing.expectEqual(@as(usize, 2), kitty.len);
+    try std.testing.expectEqualStrings("--single-instance", kitty[1]);
 }
 
 test "terminals get Ctrl+Shift+V, everything else Ctrl+V" {

@@ -38,6 +38,40 @@ pub fn writeAll(fd: linux.fd_t, bytes: []const u8) bool {
     return true;
 }
 
+/// One write to a socket, as a raw syscall result: a peer that has gone is
+/// EPIPE, not the SIGPIPE that kills the process (Zig's start code no longer
+/// ignores it).
+pub fn send(fd: linux.fd_t, bytes: []const u8) usize {
+    return linux.sendto(fd, bytes.ptr, bytes.len, linux.MSG.NOSIGNAL, null, 0);
+}
+
+/// Sends all of `bytes` on a blocking socket; false when the peer went first.
+pub fn sendAll(fd: linux.fd_t, bytes: []const u8) bool {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = send(fd, bytes[off..]);
+        if (failed(n)) |e| switch (e) {
+            .INTR => continue,
+            else => return false,
+        };
+        off += n;
+    }
+    return true;
+}
+
+/// struct ucred (SO_PEERCRED).
+const Ucred = extern struct { pid: i32, uid: u32, gid: u32 };
+
+/// The user on the other end of a connected Unix socket, as the kernel saw
+/// it connect (or listen); null when it cannot tell.
+pub fn peerUid(fd: linux.fd_t) ?u32 {
+    var cred: Ucred = undefined;
+    var len: linux.socklen_t = @sizeOf(Ucred);
+    const rc = linux.getsockopt(fd, linux.SOL.SOCKET, linux.SO.PEERCRED, @ptrCast(&cred), &len);
+    if (failed(rc) != null or len != @sizeOf(Ucred)) return null;
+    return cred.uid;
+}
+
 pub const ReadError = error{ Timeout, Syscall };
 
 /// No deadline: wait as long as the peer takes.
@@ -58,7 +92,13 @@ pub fn readSome(fd: linux.fd_t, buf: []u8, deadline_ns: u64) ReadError!usize {
         }
         const n = linux.read(fd, buf.ptr, buf.len);
         if (failed(n)) |e| switch (e) {
-            .INTR, .AGAIN => continue,
+            .INTR => continue,
+            // A non-blocking descriptor with nothing yet (a stdin left
+            // O_NONBLOCK): wait for it rather than spin on read.
+            .AGAIN => {
+                if (deadline_ns == no_deadline) _ = os.waitReadable(fd, -1);
+                continue;
+            },
             else => return error.Syscall,
         };
         return n;
@@ -100,4 +140,39 @@ test "whole reads and writes over a socket pair" {
     try std.testing.expect(os.monotonicNs() - t0 < std.time.ns_per_s);
 
     try std.testing.expect(connect("/nonexistent/lumen.sock", .{}) == null);
+}
+
+test "a non-blocking descriptor is waited on, without a deadline too" {
+    var fds: [2]i32 = undefined;
+    try std.testing.expect(failed(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.NONBLOCK,
+        0,
+        &fds,
+    )) == null);
+    defer _ = linux.close(fds[0]);
+    // Written later, from another thread: until then each read is EAGAIN.
+    const Late = struct {
+        fn write(fd: i32) void {
+            os.sleepUs(50 * std.time.us_per_ms);
+            _ = writeAll(fd, "late");
+            _ = linux.close(fd);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Late.write, .{fds[1]});
+    defer t.join();
+    var buf: [16]u8 = undefined;
+    const n = try readAll(fds[0], &buf, no_deadline);
+    try std.testing.expectEqualStrings("late", buf[0..n]);
+}
+
+test "a send to a peer that has gone fails, the process lives" {
+    var fds: [2]i32 = undefined;
+    try std.testing.expect(
+        failed(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &fds)) == null,
+    );
+    defer _ = linux.close(fds[1]);
+    try std.testing.expectEqual(linux.getuid(), peerUid(fds[1]).?);
+    _ = linux.close(fds[0]);
+    try std.testing.expect(!sendAll(fds[1], "anyone there"));
 }

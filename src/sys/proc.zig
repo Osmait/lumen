@@ -1,7 +1,9 @@
 //! Running other programs, through GLib so the GTK main loop stays in charge.
 
 const std = @import("std");
+const linux = std.os.linux;
 const c = @import("c");
+const os = @import("os");
 
 const log = std.log.scoped(.proc);
 
@@ -40,39 +42,71 @@ pub fn shell(cmd: [:0]const u8) void {
     spawn(&.{ "sh", "-c", cmd });
 }
 
-/// Runs to completion and returns stdout, or null when it could not run.
-/// Caller owns the result and frees it with `free`.
+/// How long `output` waits for a program's output: it runs on the main loop.
+const output_ms = 2000;
+
+/// What `output` allocates with.
+const alloc = std.heap.c_allocator;
+
+/// Runs to completion and returns stdout, or null when it could not run or
+/// was still writing after `output_ms` (then it is killed). Caller owns the
+/// result and frees it with `free`.
 pub fn output(argv: []const [:0]const u8) ?[:0]u8 {
+    return outputWithin(argv, output_ms);
+}
+
+fn outputWithin(argv: []const [:0]const u8, limit_ms: u64) ?[:0]u8 {
     var buf: Argv = undefined;
     const ptr = buf.of(argv) orelse return null;
-    var out: ?[*:0]u8 = null;
-    var status: c_int = 0;
+    var pid: c.GPid = 0;
+    var out_fd: c_int = -1;
     var err: ?*c.GError = null;
-    const ok = c.g_spawn_sync(
+    if (c.g_spawn_async_with_pipes(
         null,
         ptr,
         null,
-        c.G_SPAWN_SEARCH_PATH | c.G_SPAWN_STDERR_TO_DEV_NULL,
+        c.G_SPAWN_SEARCH_PATH | c.G_SPAWN_STDERR_TO_DEV_NULL | c.G_SPAWN_DO_NOT_REAP_CHILD,
         null,
         null,
-        &out,
+        &pid,
         null,
-        &status,
+        &out_fd,
+        null,
         &err,
-    );
-    if (ok == 0) {
+    ) == 0) {
         logError("run", argv[0], err);
         return null;
     }
-    return std.mem.span(out orelse return null);
+    // Reaped whenever it exits: until then its pid is not reused, so the
+    // kill below cannot hit another process.
+    _ = c.g_child_watch_add(pid, &reap, null);
+    defer _ = linux.close(out_fd);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    const deadline_ns = os.monotonicNs() + limit_ms * std.time.ns_per_ms;
+    while (true) {
+        var chunk: [16 * 1024]u8 = undefined;
+        const n = os.unix.readSome(out_fd, &chunk, deadline_ns) catch |e| {
+            if (e == error.Timeout) {
+                log.warn("{s}: no answer in {d} ms, stopped", .{ argv[0], limit_ms });
+                _ = linux.kill(pid, .KILL);
+            }
+            return null;
+        };
+        if (n == 0) break;
+        out.appendSlice(alloc, chunk[0..n]) catch return null;
+    }
+    return out.toOwnedSliceSentinel(alloc, 0) catch null;
 }
 
 pub fn free(s: [:0]u8) void {
-    c.g_free(s.ptr);
+    alloc.free(s);
 }
 
 /// Runs `argv` with `input` on its stdin, without waiting for it to exit
-/// (wl-copy keeps serving the selection in the background).
+/// (wl-copy keeps serving the selection in the background). The input is
+/// written from the main loop as the program reads it, so one that does not
+/// read cannot hold the window.
 pub fn pipeTo(argv: []const [:0]const u8, input: []const u8) void {
     var buf: Argv = undefined;
     const ptr = buf.of(argv) orelse return;
@@ -81,19 +115,19 @@ pub fn pipeTo(argv: []const [:0]const u8, input: []const u8) void {
         logError("pipe", argv[0], err);
         return;
     };
+    // A copy: `input` is the caller's only until this returns.
+    const bytes = c.g_bytes_new(input.ptr, input.len);
+    defer c.g_bytes_unref(bytes);
+    // `sp` is released once the program has its input and has exited.
+    c.g_subprocess_communicate_async(sp, bytes, null, &onPiped, null);
+}
+
+fn onPiped(source: ?*c.GObject, res: *c.GAsyncResult, _: ?*anyopaque) callconv(.c) void {
+    const sp: *c.GSubprocess = @ptrCast(source.?);
     defer c.g_object_unref(sp);
-    // Not null: the process was started with a stdin pipe.
-    const stdin = c.g_subprocess_get_stdin_pipe(sp);
-    var written: usize = 0;
-    if (c.g_output_stream_write_all(
-        stdin,
-        input.ptr,
-        input.len,
-        &written,
-        null,
-        &err,
-    ) == 0) logError("write to", argv[0], err);
-    _ = c.g_output_stream_close(stdin, null, null);
+    var err: ?*c.GError = null;
+    if (c.g_subprocess_communicate_finish(sp, res, null, null, &err) == 0)
+        warnError(.proc, err, "write to a program", .{});
 }
 
 /// Whether `name` is on PATH.
@@ -150,4 +184,14 @@ test "argv longer than the buffer is refused, not overflowed" {
     const ok = buf.of(long[0..max_args]) orelse return error.TestUnexpectedResult;
     try std.testing.expect(ok[max_args] == null);
     try std.testing.expect(buf.of(&.{}) == null);
+}
+
+test "output: what a program prints, or nothing once it takes too long" {
+    const out = output(&.{ "sh", "-c", "echo hi" }) orelse return error.TestUnexpectedResult;
+    defer free(out);
+    try std.testing.expectEqualStrings("hi\n", out);
+
+    const t0 = os.monotonicNs();
+    try std.testing.expect(outputWithin(&.{ "sh", "-c", "echo partial; exec sleep 30" }, 100) == null);
+    try std.testing.expect(os.monotonicNs() - t0 < std.time.ns_per_s);
 }

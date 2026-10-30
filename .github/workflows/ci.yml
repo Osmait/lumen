@@ -19,10 +19,13 @@ jobs:
           pacman -Syu --noconfirm --needed git gtk4 gtk4-layer-shell \
             ripgrep poppler unzip zip pkgconf gcc binutils shellcheck
 
-      - uses: actions/checkout@v4
+      # Actions are pinned to a commit (a tag can be moved), its tag beside.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       # The version build.zig.zon asks for (minimum_zig_version).
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
 
       - name: Format
         run: zig fmt --check src build.zig

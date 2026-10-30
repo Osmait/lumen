@@ -26,12 +26,15 @@ die() {
 has() { command -v "$1" >/dev/null 2>&1; }
 
 # The daemon running from `dir`, if any: another installation's is left alone.
+# One whose file was replaced since it started reads "... (deleted)".
 our_daemon() {
     for pid in $(pgrep -x lumen-gtk 2>/dev/null || true); do
-        if [ "$(readlink "/proc/$pid/exe" 2>/dev/null)" = "$dir/lumen-gtk" ]; then
-            say "$pid"
-            return
-        fi
+        case $(readlink "/proc/$pid/exe" 2>/dev/null) in
+            "$dir/lumen-gtk" | "$dir/lumen-gtk (deleted)")
+                say "$pid"
+                return
+                ;;
+        esac
     done
 }
 

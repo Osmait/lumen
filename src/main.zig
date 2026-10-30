@@ -589,6 +589,7 @@ test {
     _ = @import("ipc.zig");
     _ = @import("sys/Db.zig");
     _ = @import("sys/proc.zig");
+    _ = @import("sys/ipc_server.zig");
     _ = @import("sys/hypr.zig");
     _ = @import("ui/Ui.zig");
     _ = @import("ui/labels.zig");

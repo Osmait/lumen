@@ -39,12 +39,54 @@ pub fn main(init: std.process.Init.Minimal) void {
             // wl-clipboard says when a copy is a password manager's or a clear.
             if (std.process.Environ.getPosix(init.environ, "CLIPBOARD_STATE")) |state|
                 if (!std.mem.eql(u8, state, "data")) linux.exit_group(0);
-            if (ask(rt, app_id, args, true)) |status| linux.exit_group(status);
+            storeCopy(rt, app_id, argv, envp);
         } else if (passable(args)) {
-            if (ask(rt, app_id, args, false)) |status| linux.exit_group(status);
+            if (encodeArgs(args)) |req|
+                if (ask(rt, app_id, req)) |status| linux.exit_group(status);
         }
     }
     runFull(argv, envp);
+}
+
+/// `--clip-store`: the copy is read whole before the daemon is asked, so an
+/// app slow to hand it over keeps this process waiting, not the daemon's
+/// main loop. With no daemon to take it, lumen-gtk gets it as its stdin.
+fn storeCopy(
+    runtime_dir: []const u8,
+    app_id: []const u8,
+    argv: []const [*:0]const u8,
+    envp: [*:null]const ?[*:0]const u8,
+) noreturn {
+    const head = encodeArgs(argv[1..]) orelse runFull(argv, envp);
+    const len = head.len + (unix.readAll(0, request[head.len..], unix.no_deadline) catch
+        linux.exit_group(1));
+    // A copy too large to keep is dropped here, as lumen-gtk would.
+    if (len == request.len) linux.exit_group(0);
+    if (ask(runtime_dir, app_id, request[0..len])) |status| linux.exit_group(status);
+    stdinFrom(request[head.len..len]);
+    runFull(argv, envp);
+}
+
+/// Makes `bytes` this process's stdin (a memfd: a pipe would need a reader
+/// before it could hold them all), for the program it execs next.
+fn stdinFrom(bytes: []const u8) void {
+    const rc = linux.memfd_create("lumen-copy", linux.MFD.CLOEXEC);
+    if (failed(rc) == null) {
+        const fd: linux.fd_t = @intCast(rc);
+        if (writeAll(fd, bytes) and
+            failed(linux.lseek(fd, 0, linux.SEEK.SET)) == null and
+            failed(linux.dup2(fd, 0)) == null) return;
+    }
+    _ = writeAll(2, "lumen: cannot hand the copy over to lumen-gtk\n");
+    linux.exit_group(1);
+}
+
+/// The request head for `args`, in `request`; null when they do not fit.
+fn encodeArgs(args: []const [*:0]const u8) ?[]const u8 {
+    var spans: [ipc.max_args][]const u8 = undefined;
+    if (args.len > spans.len) return null;
+    for (args, 0..) |a, i| spans[i] = std.mem.span(a);
+    return ipc.encode(&request, spans[0..args.len]);
 }
 
 fn clipStore(args: []const [*:0]const u8) bool {
@@ -72,8 +114,8 @@ fn printVersion(environ: std.process.Environ) noreturn {
     _ = writeAll(1, "lumen " ++ version ++ "\n");
     const rt = std.process.Environ.getPosix(environ, "XDG_RUNTIME_DIR") orelse linux.exit_group(0);
     const app_id = std.process.Environ.getPosix(environ, "LUMEN_APP_ID") orelse ipc.default_app_id;
-    const args = [_][*:0]const u8{"--version"};
-    const a = exchange(rt, app_id, &args, false) orelse linux.exit_group(0);
+    const req = encodeArgs(&.{"--version"}) orelse linux.exit_group(0);
+    const a = exchange(rt, app_id, req) orelse linux.exit_group(0);
     const theirs = std.mem.trim(u8, a.out, " \n");
     if (a.status != 0) {
         // A daemon from before 0.1.0 does not know the option.
@@ -89,13 +131,8 @@ fn printVersion(environ: std.process.Environ) noreturn {
 }
 
 /// The daemon's exit status, or null when there is no daemon to ask.
-fn ask(
-    runtime_dir: []const u8,
-    app_id: []const u8,
-    args: []const [*:0]const u8,
-    with_stdin: bool,
-) ?u8 {
-    const a = exchange(runtime_dir, app_id, args, with_stdin) orelse return null;
+fn ask(runtime_dir: []const u8, app_id: []const u8, req: []const u8) ?u8 {
+    const a = exchange(runtime_dir, app_id, req) orelse return null;
     _ = writeAll(1, a.out);
     _ = writeAll(2, a.err);
     return a.status;
@@ -103,31 +140,22 @@ fn ask(
 
 const Answer = struct { status: u8, out: []const u8, err: []const u8 };
 
-/// Sends `args` (and stdin, `with_stdin`) to the daemon and returns its
-/// answer, in `answer`; null when there is no daemon to ask.
-fn exchange(
-    runtime_dir: []const u8,
-    app_id: []const u8,
-    args: []const [*:0]const u8,
-    with_stdin: bool,
-) ?Answer {
+/// Sends a request (src/ipc.zig) to the daemon and returns its answer, in
+/// `answer`; null when there is no daemon of ours to ask.
+fn exchange(runtime_dir: []const u8, app_id: []const u8, req: []const u8) ?Answer {
     var path_buf: [256]u8 = undefined;
     const path = ipc.socketPath(&path_buf, runtime_dir, app_id) orelse return null;
-    var spans: [ipc.max_args][]const u8 = undefined;
-    if (args.len > spans.len) return null;
-    for (args, 0..) |a, i| spans[i] = std.mem.span(a);
-    const head = ipc.encode(&request, spans[0..args.len]) orelse return null;
-    var len = head.len;
-
     const fd = unix.connect(path, .{}) orelse return null;
-    // From here on there is no going back to lumen-gtk: stdin is read, and
-    // the daemon may have acted.
-    if (with_stdin) {
-        len += unix.readAll(0, request[len..], unix.no_deadline) catch linux.exit_group(1);
-        // A copy too large to keep is dropped here, as lumen-gtk would.
-        if (len == request.len) linux.exit_group(0);
+    // Our own daemon only: in a runtime folder others can write to, someone
+    // else's socket would get the arguments and the copy.
+    if (unix.peerUid(fd) != linux.getuid()) {
+        _ = linux.close(fd);
+        _ = writeAll(2, "lumen: the daemon's socket belongs to another user; not using it\n");
+        return null;
     }
-    if (!writeAll(fd, request[0..len])) return failedAnswer("lumen: the daemon closed the connection\n");
+    // From here on there is no going back to lumen-gtk: the daemon may act
+    // on what it gets.
+    if (!unix.sendAll(fd, req)) return failedAnswer("lumen: the daemon closed the connection\n");
     _ = linux.shutdown(fd, linux.SHUT.WR);
     // The daemon answers when it is done, however long that takes.
     const got = unix.readAll(fd, &answer, unix.no_deadline) catch 0;

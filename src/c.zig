@@ -402,6 +402,77 @@ pub extern fn g_output_stream_close(
     err: ?*?*GError,
 ) gboolean;
 
+// D-Bus calls, a subprocess fed without blocking, shell words, programs
+// read to a deadline (actions.zig, sys/proc.zig).
+pub const GDBusConnection = opaque {};
+pub const GVariant = opaque {};
+pub const G_BUS_TYPE_SESSION: c_int = 2;
+pub const G_DBUS_CALL_FLAGS_NONE: c_int = 0;
+pub extern fn g_bus_get(
+    bus_type: c_int,
+    cancellable: ?*GCancellable,
+    callback: GAsyncReadyCallback,
+    data: ?*anyopaque,
+) void;
+pub extern fn g_bus_get_finish(res: *GAsyncResult, err: ?*?*GError) ?*GDBusConnection;
+pub extern fn g_dbus_connection_call(
+    conn: *GDBusConnection,
+    bus_name: ?[*:0]const u8,
+    object_path: [*:0]const u8,
+    interface_name: ?[*:0]const u8,
+    method_name: [*:0]const u8,
+    parameters: ?*GVariant,
+    reply_type: ?*const anyopaque,
+    flags: c_int,
+    timeout_msec: c_int,
+    cancellable: ?*GCancellable,
+    callback: ?GAsyncReadyCallback,
+    data: ?*anyopaque,
+) void;
+pub extern fn g_dbus_connection_call_finish(
+    conn: *GDBusConnection,
+    res: *GAsyncResult,
+    err: ?*?*GError,
+) ?*GVariant;
+pub extern fn g_variant_new_strv(strv: [*]const [*:0]const u8, length: isize) *GVariant;
+pub extern fn g_variant_new_string(s: [*:0]const u8) *GVariant;
+pub extern fn g_variant_new_tuple(children: [*]const *GVariant, n_children: usize) *GVariant;
+pub extern fn g_variant_ref_sink(v: *GVariant) *GVariant;
+pub extern fn g_variant_unref(v: *GVariant) void;
+pub extern fn g_subprocess_communicate_async(
+    sp: *GSubprocess,
+    stdin_buf: ?*GBytes,
+    cancellable: ?*GCancellable,
+    callback: GAsyncReadyCallback,
+    data: ?*anyopaque,
+) void;
+pub extern fn g_subprocess_communicate_finish(
+    sp: *GSubprocess,
+    res: *GAsyncResult,
+    stdout_buf: ?*?*GBytes,
+    stderr_buf: ?*?*GBytes,
+    err: ?*?*GError,
+) gboolean;
+pub extern fn g_shell_parse_argv(
+    command_line: [*:0]const u8,
+    argcp: ?*c_int,
+    argvp: *?[*]?[*:0]u8,
+    err: ?*?*GError,
+) gboolean;
+pub extern fn g_spawn_async_with_pipes(
+    working_directory: ?[*:0]const u8,
+    argv: [*:null]const ?[*:0]const u8,
+    envp: ?[*:null]const ?[*:0]const u8,
+    flags: c_int,
+    child_setup: ?GSpawnChildSetupFunc,
+    user_data: ?*anyopaque,
+    child_pid: ?*GPid,
+    standard_input: ?*c_int,
+    standard_output: ?*c_int,
+    standard_error: ?*c_int,
+    err: ?*?*GError,
+) gboolean;
+
 // ------------------------------------------------------------------- gdk
 
 /// Null before GTK opens a display (never once the app has started).
@@ -605,6 +676,7 @@ pub extern fn gtk_layer_set_exclusive_zone(w: *GtkWindow, zone: c_int) void;
 // ---------------------------------------------------------------- glib-unix
 
 pub const G_IO_IN: c_uint = 1;
+pub const G_IO_OUT: c_uint = 4;
 pub const GUnixFDSourceFunc = *const fn (
     fd: c_int,
     condition: c_uint,
