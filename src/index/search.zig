@@ -14,6 +14,7 @@
 //!   + Recency: mtime of the head of the list breaks ties among equals.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const store_mod = @import("store.zig");
 const Store = store_mod.Store;
 const Pool = @import("Pool.zig");
@@ -41,7 +42,13 @@ const cache_max = 100_000;
 /// Ceiling of the recency bonus; bounds how many results need a `stat`.
 pub const recency_max = 300;
 /// Longest query, in bytes once spaces are dropped: the longest file name.
-pub const max_query = 255;
+pub const query_bytes_max = 255;
+
+comptime {
+    // Two limits, not one: the fine scorer's is the smaller, and a query
+    // between the two is still searched, ranked by its cheap score alone.
+    assert(fine.query_letters_max <= query_bytes_max);
+}
 
 pub const Hit = struct { id: u32, score: i32 };
 
@@ -102,14 +109,14 @@ pub const Engine = struct {
     ) std.mem.Allocator.Error!void {
         const limit = opts.limit;
         out.clearRetainingCapacity();
-        var packed_buf: [max_query]u8 = undefined;
+        var packed_buf: [query_bytes_max]u8 = undefined;
         const query = packQuery(query_in, &packed_buf);
         if (query.len == 0 or limit == 0 or store.len() == 0) {
             e.reset();
             return;
         }
         // Everything below compares folded bytes: "Español" -> "espanol".
-        var qbuf: [max_query]u8 = undefined;
+        var qbuf: [query_bytes_max]u8 = undefined;
         const ql = fold.foldInto(&qbuf, query);
         const qmask = store_mod.charMask(ql);
         // With 1-2 letters almost everything matches: caching half a million
@@ -226,8 +233,8 @@ pub const Engine = struct {
 /// Spaces separate words but are not part of what is matched: "cargo toml"
 /// becomes "cargotoml", a subsequence of "Cargo.toml" (the Rust version
 /// matched the space literally, so multi-word queries found nothing).
-/// Longer than `max_query`: nothing (no name can match it).
-fn packQuery(q: []const u8, buf: *[max_query]u8) []const u8 {
+/// Longer than `query_bytes_max`: nothing (no name can match it).
+fn packQuery(q: []const u8, buf: *[query_bytes_max]u8) []const u8 {
     var n: usize = 0;
     for (q) |ch| {
         if (ch == ' ' or ch == '\t') continue;
@@ -388,8 +395,8 @@ pub fn cheapScoreMasked(name: []const u8, q: []const u8, mask: u64) ?i32 {
 
 // Out of line: its 2 KB of buffers stay off the hot loop's stack frame.
 noinline fn cheapFolded(name: []const u8, q: []const u8) ?i32 {
-    var buf: [max_folded]u8 = undefined;
-    var upper: [max_folded]bool = undefined;
+    var buf: [folded_bytes_max]u8 = undefined;
+    var upper: [folded_bytes_max]bool = undefined;
     const n = fold.foldCase(&buf, &upper, name);
     return cheapCore(
         .folded,
@@ -400,8 +407,8 @@ noinline fn cheapFolded(name: []const u8, q: []const u8) ?i32 {
 }
 
 /// Longest name folded for `cheapScore`; a longer non-ASCII name is scored
-/// on its first `max_folded` characters (Linux names stop at 255 bytes).
-const max_folded = 1024;
+/// on its first `folded_bytes_max` characters (Linux names stop at 255 bytes).
+const folded_bytes_max = 1024;
 
 const CheapMode = enum {
     /// `name` is the original, known to be ASCII (its mask says so):
@@ -571,10 +578,10 @@ pub fn searchExhaustive(
     out: *std.ArrayList(Hit),
 ) std.mem.Allocator.Error!void {
     out.clearRetainingCapacity();
-    var packed_buf: [max_query]u8 = undefined;
+    var packed_buf: [query_bytes_max]u8 = undefined;
     const query = packQuery(query_in, &packed_buf);
     if (query.len == 0) return;
-    var qbuf: [max_query]u8 = undefined;
+    var qbuf: [query_bytes_max]u8 = undefined;
     const ql = fold.foldInto(&qbuf, query);
     const qmask = store_mod.charMask(ql);
     var all: std.ArrayList(Pair) = .empty;

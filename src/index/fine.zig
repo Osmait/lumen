@@ -20,8 +20,10 @@ const bonus_boundary_white = bonus_boundary + 2;
 const bonus_boundary_delimiter = bonus_boundary + 1;
 const first_char_multiplier = 2;
 
-const max_name = 256;
-const max_query = 64;
+/// Longer names are not scored (Linux names stop at 255 bytes).
+const name_bytes_max = 256;
+/// Longer queries get no fine score (null): the cheap score alone ranks them.
+pub const query_letters_max = 64;
 const neg: i32 = std.math.minInt(i32) / 2;
 
 const Class = enum(u3) { white, non_word, delimiter, lower, upper, number };
@@ -66,15 +68,15 @@ fn bonusFor(prev: Class, cur: Class) i32 {
 /// capital is still a camelCase boundary.
 pub fn score(name_in: []const u8, q: []const u8) ?i32 {
     const m = q.len;
-    if (m == 0 or m > max_query or name_in.len < m) return null;
-    // One more than fits, to tell "too long" from "exactly max_name".
-    var name_buf: [max_name + 1]u8 = undefined;
-    var upper: [max_name + 1]bool = undefined;
+    if (m == 0 or m > query_letters_max or name_in.len < m) return null;
+    // One more than fits, to tell "too long" from "exactly name_bytes_max".
+    var name_buf: [name_bytes_max + 1]u8 = undefined;
+    var upper: [name_bytes_max + 1]bool = undefined;
     const n = fold.foldCase(&name_buf, &upper, name_in);
-    if (n < m or n > max_name) return null;
+    if (n < m or n > name_bytes_max) return null;
     const name = name_buf[0..n];
 
-    var bonus: [max_name]i32 = undefined;
+    var bonus: [name_bytes_max]i32 = undefined;
     var prev_class: Class = .white;
     for (name, 0..) |ch, j| {
         const cl: Class = if (upper[j]) .upper else classOf(ch);
@@ -85,12 +87,12 @@ pub fn score(name_in: []const u8, q: []const u8) ?i32 {
     // Rows for the previous query letter: best score with it matched exactly
     // at j (`m_prev`), best with it matched at or before j minus the gap since
     // (`p_prev`), and the bonus of the run's first letter (`rb_prev`).
-    var m_prev: [max_name]i32 = undefined;
-    var p_prev: [max_name]i32 = undefined;
-    var rb_prev: [max_name]i32 = undefined;
-    var m_cur: [max_name]i32 = undefined;
-    var p_cur: [max_name]i32 = undefined;
-    var rb_cur: [max_name]i32 = undefined;
+    var m_prev: [name_bytes_max]i32 = undefined;
+    var p_prev: [name_bytes_max]i32 = undefined;
+    var rb_prev: [name_bytes_max]i32 = undefined;
+    var m_cur: [name_bytes_max]i32 = undefined;
+    var p_cur: [name_bytes_max]i32 = undefined;
+    var rb_cur: [name_bytes_max]i32 = undefined;
 
     for (0..m) |i| {
         var p_row: i32 = neg;

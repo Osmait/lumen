@@ -91,7 +91,35 @@ pub fn watchRoot(
     return w.add(gpa, path, id, mask & ~@as(u32, linux.IN.DONT_FOLLOW));
 }
 
+/// Where a directory is in the tree: `watchBestEffort` follows a link only
+/// for a root.
+pub const Placement = enum { root, below_root };
+
+/// `watch` or `watchRoot` for a caller to whom a directory that cannot be
+/// watched is not an error: one that is gone, not ours to read or past the
+/// kernel's limit stays unwatched until the next rescan. Only running out of
+/// memory is returned, so that the caller can try again or give up loudly.
+pub fn watchBestEffort(
+    w: *Watcher,
+    gpa: std.mem.Allocator,
+    path: [*:0]const u8,
+    id: u32,
+    placement: Placement,
+) std.mem.Allocator.Error!void {
+    const result = switch (placement) {
+        .root => w.watchRoot(gpa, path, id),
+        .below_root => w.watch(gpa, path, id),
+    };
+    result catch |err| switch (err) {
+        error.WatchLimit, error.Watch => {},
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+}
+
 fn add(w: *Watcher, gpa: std.mem.Allocator, path: [*:0]const u8, id: u32, m: u32) WatchError!void {
+    // Room first: a watch the kernel made but the map could not hold would
+    // report events nobody can attribute.
+    try w.wd_to_id.ensureUnusedCapacity(gpa, 1);
     const rc = linux.inotify_add_watch(w.fd, path, m);
     switch (linux.errno(rc)) {
         .SUCCESS => {},
@@ -106,7 +134,7 @@ fn add(w: *Watcher, gpa: std.mem.Allocator, path: [*:0]const u8, id: u32, m: u32
         // Gone since it was listed, or not ours to read: nothing to watch.
         else => return error.Watch,
     }
-    try w.wd_to_id.put(gpa, @intCast(rc), id);
+    w.wd_to_id.putAssumeCapacity(@intCast(rc), id);
 }
 
 /// Stops watching every directory whose entry `alive` rejects. A directory
@@ -301,6 +329,36 @@ test "watcher: links are never followed below a root, and prune drops watches" {
     var changes: std.ArrayList(Change) = .empty;
     try w.drain(arena_state.allocator(), &changes);
     try testing.expectEqual(0, changes.items.len);
+}
+
+test "watcher: best effort skips what cannot be watched and reports only running out of memory" {
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buffer: [4096]u8 = undefined;
+    const dir = try tmpAbs(&tmp, &dir_buffer);
+    var dir_z_buffer: [4096]u8 = undefined;
+    const dir_z = try std.mem.printSentinel(&dir_z_buffer, "{s}", .{dir}, 0);
+    var gone_buffer: [4096]u8 = undefined;
+    const gone = try std.mem.printSentinel(&gone_buffer, "{s}/gone", .{dir}, 0);
+    const watcher = try create(gpa);
+    defer watcher.destroy(gpa);
+
+    // Out of memory before the kernel is asked: nothing half made, and the
+    // caller hears of it.
+    var failing: std.testing.FailingAllocator = .init(gpa, .{ .fail_index = 0 });
+    try testing.expectError(
+        error.OutOfMemory,
+        watcher.watchBestEffort(failing.allocator(), dir_z, 2, .root),
+    );
+    try testing.expectEqual(0, watcher.count());
+
+    // Gone since it was listed: skipped, not an error.
+    try watcher.watchBestEffort(gpa, gone, 1, .below_root);
+    try testing.expectEqual(0, watcher.count());
+
+    try watcher.watchBestEffort(gpa, dir_z, 3, .root);
+    try testing.expectEqual(1, watcher.count());
 }
 
 test "watcher: a flooded queue reports the overflow in one drain" {

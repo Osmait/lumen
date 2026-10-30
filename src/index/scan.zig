@@ -89,10 +89,6 @@ const LevelCtx = struct {
     follow: bool,
 };
 
-/// Scans `cfg.roots`. With a watcher, each directory is watched *before* it
-/// is read: a change is then either in the read or arrives as an event,
-/// never lost in between (scanning first and arming later leaves a blind
-/// window as long as the arming).
 /// Adds what one level's folders hold to the index, and the folders among
 /// it to `next` (when the walk goes `deeper`).
 fn addLevel(
@@ -133,6 +129,10 @@ fn addLevel(
     }
 }
 
+/// Scans `cfg.roots`. With a watcher, each directory is watched *before* it
+/// is read: a change is then either in the read or arrives as an event,
+/// never lost in between (scanning first and arming later leaves a blind
+/// window as long as the arming).
 pub fn scan(
     gpa: std.mem.Allocator,
     pool: *Pool,
@@ -164,9 +164,12 @@ pub fn scan(
     var depth: u16 = 1;
     while (frontier.items.len > 0 and depth <= cfg.max_depth) : (depth +|= 1) {
         const follow = depth == 1 and cfg.follow_roots;
-        if (watcher) |w| for (frontier.items) |f| {
-            (if (follow) w.watchRoot(gpa, f.path, f.id) else w.watch(gpa, f.path, f.id)) catch {};
-        };
+        if (watcher) |w| {
+            const placement: Watcher.Placement = if (follow) .root else .below_root;
+            for (frontier.items) |folder| {
+                try w.watchBestEffort(gpa, folder.path, folder.id, placement);
+            }
+        }
 
         const batches = try gpa.alloc(Batch, frontier.items.len);
         defer {

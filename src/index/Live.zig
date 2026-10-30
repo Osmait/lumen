@@ -177,9 +177,12 @@ pub fn armProgress(l: *Live, budget: usize) bool {
     while (id < n and done < budget) : (id += 1) {
         if (fl[id] & store_mod.flag_dir == 0 or l.base.isTombstoned(id)) continue;
         if (pathZ(&l.base, id, &buf)) |p| {
-            const w = l.watcher;
-            const root = ps[id] == store_mod.no_parent;
-            (if (root) w.watchRoot(l.gpa, p, id) else w.watch(l.gpa, p, id)) catch {};
+            const placement: Watcher.Placement =
+                if (ps[id] == store_mod.no_parent) .root else .below_root;
+            l.watcher.watchBestEffort(l.gpa, p, id, placement) catch {
+                // Out of memory: this directory is armed on the next call.
+                break;
+            };
         }
         done += 1;
     }
@@ -569,7 +572,8 @@ pub fn addScans(l: *Live, scans: *Scans) std.mem.Allocator.Error!void {
         for (0..sub.len()) |i| {
             const id: u32 = @intCast(i);
             if (!sub.isDir(id)) continue;
-            if (pathZ(sub, id, &buf)) |p| l.watcher.watch(l.gpa, p, delta_bit | map[i]) catch {};
+            const path = pathZ(sub, id, &buf) orelse continue;
+            try l.watcher.watchBestEffort(l.gpa, path, delta_bit | map[i], .below_root);
         }
         l.stats.added += sub.len() - 1;
         added = true;

@@ -690,6 +690,11 @@ fn buildNext(s: *ContentService, all: ?[]const content.DocIn, d: Diff) ?content.
             log.warn("building the content index: out of memory", .{});
             return null;
         }
+        // Building it in memory instead would not make it smaller.
+        if (file_err == error.IndexTooLarge) {
+            log.err("building the content index: too many documents or paths for u32 ids", .{});
+            return null;
+        }
         // Not written (a full disk, a read-only cache): built in memory and
         // served from there; saving is retried on the next check.
         log.warn("writing the content index: {t}", .{file_err});

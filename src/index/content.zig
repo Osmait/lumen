@@ -23,6 +23,7 @@
 //! lists in segment order.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const linux = std.os.linux;
 const Pool = @import("Pool.zig");
 const sys = @import("os");
@@ -56,11 +57,15 @@ const batch_docs = 1024;
 /// per ~9 bytes, so a round still reads hundreds of files.
 const round_pairs = segment_pairs;
 
+/// The doc table stores each path's length as a u16.
+pub const path_bytes_max = std.math.maxInt(u16);
+
 /// Where a document's text comes from: the file itself, or text extracted
 /// from it (PDF, Office) and cached on disk.
 pub const Source = enum(u8) { plain = 0, extracted = 1 };
 
 pub const DocIn = struct {
+    /// At most `path_bytes_max` bytes (Linux paths stop at 4096).
     path: []const u8,
     mtime: i64,
     size: u64,
@@ -624,7 +629,12 @@ pub const BuildStats = struct {
     ns: u64 = 0,
 };
 
-pub const BuildError = std.mem.Allocator.Error || error{BadIndex};
+pub const BuildError = std.mem.Allocator.Error || error{
+    BadIndex,
+    /// More documents than u32 doc ids can number, or a doc table and its
+    /// paths that end past what u32 path offsets reach (4 GiB).
+    IndexTooLarge,
+};
 pub const FileError = BuildError || sys.Error;
 
 /// Builds the index of `docs` (their order defines doc ids). `text` gives
@@ -759,10 +769,10 @@ fn mergeDocs(
     old: *const Index,
     gone: []const u32,
     added: []const DocIn,
-) std.mem.Allocator.Error!Merged {
+) (std.mem.Allocator.Error || error{IndexTooLarge})!Merged {
     const n = old.n_docs + added.len;
-    // Doc ids are u32.
-    if (n > std.math.maxInt(u32)) return error.OutOfMemory;
+    // Doc ids are u32 in posting lists and results.
+    if (n > std.math.maxInt(u32)) return error.IndexTooLarge;
     const docs = try gpa.alloc(DocIn, n);
     errdefer gpa.free(docs);
     for (docs[0..old.n_docs], 0..) |*d, i| d.* = old.docIn(@intCast(i));
@@ -908,7 +918,7 @@ fn headerBytes(h: Header) [header_len]u8 {
 /// A sink without a file never fails to write one.
 fn memoryOnly(err: FileError) BuildError {
     return switch (err) {
-        error.OutOfMemory, error.BadIndex => |e| e,
+        error.OutOfMemory, error.BadIndex, error.IndexTooLarge => |e| e,
         else => unreachable,
     };
 }
@@ -987,10 +997,13 @@ fn writeDocs(
     try sink.pad8();
     var paths_len: usize = 0;
     for (docs[reuse.len..]) |d| paths_len += d.path.len;
+    // The path length column is u16; `DocIn.path` promises that it fits.
+    for (docs) |d| assert(d.path.len <= path_bytes_max);
     const docs_off = sink.pos();
     const paths_at = docs_off + docs.len * doc_bytes;
-    // Offsets are u32.
-    if (paths_at + paths_len > std.math.maxInt(u32)) return error.OutOfMemory;
+    // Path offsets are stored as u32, so the doc table and its paths must
+    // end below 4 GiB.
+    if (paths_at + paths_len > std.math.maxInt(u32)) return error.IndexTooLarge;
     // Built in the buffer: nothing is written before the doc table is done.
     const at = sink.buf.items.len;
     try sink.zeros(align8(docs.len * doc_bytes + paths_len));
@@ -1015,12 +1028,7 @@ fn writeDocs(
         o += 4;
     }
     for (docs) |d| {
-        std.mem.writeInt(
-            u16,
-            b[o..][0..2],
-            @intCast(@min(d.path.len, std.math.maxInt(u16))),
-            .little,
-        );
+        std.mem.writeInt(u16, b[o..][0..2], @intCast(d.path.len), .little);
         o += 2;
     }
     for (docs) |d| {
@@ -2007,8 +2015,6 @@ fn staticScore(d: DocIn, words: []const []const u8, now: i64) i32 {
 
 pub const max_candidates = 4000;
 
-/// Full query: candidates from the trigram lists, verified in parallel by
-/// reading each file, ranked. Snippets live in `arena`; at most `limit`.
 /// The candidates, best bound first: what is known without reading them
 /// (recency, depth, name) plus the most reading can add, so verification
 /// stops as soon as the next one cannot beat the `limit`-th match. Owned
@@ -2054,6 +2060,8 @@ fn orderCandidates(
     return ordered;
 }
 
+/// Full query: candidates from the trigram lists, verified in parallel by
+/// reading each file, ranked. Snippets live in `arena`; at most `limit`.
 pub fn search(
     ix: *const Index,
     gpa: std.mem.Allocator,
