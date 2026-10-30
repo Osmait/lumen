@@ -232,7 +232,7 @@ pub const Callbacks = struct {
 
 /// One loaded file and its Lua state. Worker thread only.
 pub const Ext = struct {
-    budget: lua.Budget = .{ .max = memory_limit_bytes },
+    budget: lua.Budget = .{ .bytes_max = memory_limit_bytes },
     L: *lua.State = undefined,
     host: *Host,
     id: [:0]const u8,
@@ -1248,7 +1248,7 @@ fn doList(h: *Host, req: ListReq, query: []const u8) void {
         return;
     };
     const e = h.exts.items[wc.ext];
-    var rows: lua.Capped = .{ .child = a, .max = max_rows_bytes };
+    var rows: lua.Capped = .{ .child = a, .bytes_max = max_rows_bytes };
     var ctx: ListCtx = .{
         .e = e,
         .wc = wc,
@@ -1618,7 +1618,7 @@ fn doRoot(h: *Host, req: RootReq, query: []const u8) void {
     if (req.registry != h.registry_gen) return;
     var sections: std.ArrayList(RootSection) = .empty;
     // Every provider's rows together.
-    var rows: lua.Capped = .{ .child = a, .max = max_rows_bytes };
+    var rows: lua.Capped = .{ .child = a, .bytes_max = max_rows_bytes };
     for (h.wcmds, 0..) |*wc, i| {
         if (!wc.root) continue;
         // A newer query came in: this one is already stale.

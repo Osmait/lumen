@@ -18,6 +18,7 @@
 const std = @import("std");
 pub const c = @import("lua");
 const os = @import("os");
+const assert = std.debug.assert;
 
 comptime {
     if (c.LUA_VERSION_NUM != 504) @compileError("Lumen needs Lua 5.4");
@@ -27,16 +28,17 @@ pub const State = c.lua_State;
 
 /// A state's limits; it is the state's allocator data, so it outlives it.
 pub const Budget = struct {
-    used: usize = 0,
-    max: usize,
+    used_bytes: usize = 0,
+    bytes_max: usize,
     /// Monotonic ns; code still running then is stopped with an error.
     deadline_ns: u64 = std.math.maxInt(u64),
 };
 
+/// The budget a state was made with (its allocator's user data).
 pub fn budgetOf(L: *State) *Budget {
-    var ud: ?*anyopaque = null;
-    _ = c.lua_getallocf(L, &ud);
-    return @ptrCast(@alignCast(ud.?));
+    var user_data: ?*anyopaque = null;
+    _ = c.lua_getallocf(L, &user_data);
+    return @ptrCast(@alignCast(user_data.?));
 }
 
 /// A new state with the standard libraries minus what could take the
@@ -136,19 +138,28 @@ fn opensSafely(path: [*:0]const u8) bool {
     };
 }
 
-fn alloc(ud: ?*anyopaque, ptr: ?*anyopaque, osize: usize, nsize: usize) callconv(.c) ?*anyopaque {
-    const b: *Budget = @ptrCast(@alignCast(ud.?));
+/// Lua's allocator (`lua_Alloc`; `osize` and `nsize` are its manual's
+/// names): realloc, under the state's memory cap.
+fn alloc(
+    user_data: ?*anyopaque,
+    ptr: ?*anyopaque,
+    osize: usize,
+    nsize: usize,
+) callconv(.c) ?*anyopaque {
+    const budget: *Budget = @ptrCast(@alignCast(user_data.?));
     // Without a block, osize is the kind of object being made, not a size.
-    const old = if (ptr != null) osize else 0;
+    const old_bytes = if (ptr != null) osize else 0;
+    assert(budget.used_bytes >= old_bytes);
     if (nsize == 0) {
         std.c.free(ptr);
-        b.used -= old;
+        budget.used_bytes -= old_bytes;
         return null;
     }
-    if (nsize > old and b.used - old + nsize > b.max) return null;
-    const p = std.c.realloc(ptr, nsize) orelse return null;
-    b.used = b.used - old + nsize;
-    return p;
+    const used_bytes_after = budget.used_bytes - old_bytes + nsize;
+    if (nsize > old_bytes and used_bytes_after > budget.bytes_max) return null;
+    const block = std.c.realloc(ptr, nsize) orelse return null;
+    budget.used_bytes = used_bytes_after;
+    return block;
 }
 
 fn hook(L: ?*State, _: ?*c.lua_Debug) callconv(.c) void {
@@ -161,21 +172,21 @@ pub fn pastDeadline(L: *State) bool {
     return os.monotonicNs() > budgetOf(L).deadline_ns;
 }
 
-/// An allocator over `child` that holds at most `max` bytes at once: for
-/// Zig memory a state's work takes outside the state's own cap (JSON text
-/// and trees, the rows a list returns).
+/// An allocator over `child` that holds at most `bytes_max` bytes at once:
+/// for Zig memory a state's work takes outside the state's own cap (JSON
+/// text and trees, the rows a list returns).
 pub const Capped = struct {
     child: std.mem.Allocator,
-    max: usize,
-    used: usize = 0,
-    /// An allocation was refused for going over `max`.
+    bytes_max: usize,
+    used_bytes: usize = 0,
+    /// An allocation was refused for going over `bytes_max`.
     refused: bool = false,
 
     /// What is left under the state's own cap: whatever the work makes has
     /// to fit in there in the end.
     pub fn leftIn(L: *State, child: std.mem.Allocator) Capped {
-        const b = budgetOf(L);
-        return .{ .child = child, .max = b.max -| b.used };
+        const budget = budgetOf(L);
+        return .{ .child = child, .bytes_max = budget.bytes_max -| budget.used_bytes };
     }
 
     pub fn allocator(self: *Capped) std.mem.Allocator {
@@ -187,9 +198,11 @@ pub const Capped = struct {
         } };
     }
 
-    /// Whether a block may go from `old` to `new` bytes.
-    fn fits(self: *Capped, old: usize, new: usize) bool {
-        if (new <= old or self.used - old + new <= self.max) return true;
+    /// Whether a block may go from `old_bytes` to `new_bytes`.
+    fn fits(self: *Capped, old_bytes: usize, new_bytes: usize) bool {
+        assert(self.used_bytes >= old_bytes);
+        if (new_bytes <= old_bytes) return true;
+        if (self.used_bytes - old_bytes + new_bytes <= self.bytes_max) return true;
         self.refused = true;
         return false;
     }
@@ -197,63 +210,70 @@ pub const Capped = struct {
     fn cappedAlloc(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
         const self: *Capped = @ptrCast(@alignCast(ctx));
         if (!self.fits(0, len)) return null;
-        const p = self.child.rawAlloc(len, al, ra) orelse return null;
-        self.used += len;
-        return p;
+        const block = self.child.rawAlloc(len, al, ra) orelse return null;
+        self.used_bytes += len;
+        return block;
     }
 
     fn cappedResize(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, len: usize, ra: usize) bool {
         const self: *Capped = @ptrCast(@alignCast(ctx));
-        if (!self.fits(m.len, len) or !self.child.rawResize(m, al, len, ra)) return false;
-        self.used = self.used - m.len + len;
+        if (!self.fits(m.len, len)) return false;
+        if (!self.child.rawResize(m, al, len, ra)) return false;
+        self.used_bytes = self.used_bytes - m.len + len;
         return true;
     }
 
     fn cappedRemap(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
         const self: *Capped = @ptrCast(@alignCast(ctx));
         if (!self.fits(m.len, len)) return null;
-        const p = self.child.rawRemap(m, al, len, ra) orelse return null;
-        self.used = self.used - m.len + len;
-        return p;
+        const block = self.child.rawRemap(m, al, len, ra) orelse return null;
+        self.used_bytes = self.used_bytes - m.len + len;
+        return block;
     }
 
     fn cappedFree(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, ra: usize) void {
         const self: *Capped = @ptrCast(@alignCast(ctx));
+        assert(self.used_bytes >= m.len);
         self.child.rawFree(m, al, ra);
-        self.used -= m.len;
+        self.used_bytes -= m.len;
     }
 };
 
 /// Only reached by a Lua error outside every protected call: a bug here.
 fn panic(L: ?*State) callconv(.c) c_int {
-    const msg = toSlice(L.?, -1) orelse "?";
-    std.debug.panic("Lua error outside a protected call: {s}", .{msg});
+    const message = toSlice(L.?, -1) orelse "?";
+    std.debug.panic("Lua error outside a protected call: {s}", .{message});
 }
 
 // ------------------------------------------------------------ protected
 
-/// Runs `handler(L, ctx)` in protected mode. Returns null on success, else
-/// the error message with a traceback, in `a`. The stack is left as found.
+/// Runs `handler(L, context)` in protected mode. Returns null on success,
+/// else the error message with a traceback, in `arena`. The stack is left
+/// as found, also when the handler raised: that is what lets handlers pop
+/// with `defer` and `StackMark` (a raise skips their defers; this restores
+/// the stack in their place).
 pub fn protect(
     L: *State,
-    a: std.mem.Allocator,
-    comptime T: type,
-    ctx: *T,
-    comptime handler: fn (*State, *T) void,
+    arena: std.mem.Allocator,
+    comptime Context: type,
+    context: *Context,
+    comptime handler: fn (*State, *Context) void,
 ) ?[:0]const u8 {
     const top = c.lua_gettop(L);
     defer c.lua_settop(L, top);
     if (c.lua_checkstack(L, 3) == 0) return "Lua stack overflow";
     c.lua_pushcclosure(L, &traceback, 0);
-    c.lua_pushcclosure(L, &Trampoline(T, handler).call, 0);
-    c.lua_pushlightuserdata(L, ctx);
+    c.lua_pushcclosure(L, &Trampoline(Context, handler).call, 0);
+    c.lua_pushlightuserdata(L, context);
     if (c.lua_pcallk(L, 1, 0, top + 1, 0, null) == c.LUA_OK) return null;
-    var msg: []const u8 = toSlice(L, -1) orelse "error (not a string)";
+    var message: []const u8 = toSlice(L, -1) orelse "error (not a string)";
     // Raised by Lumen's own checks, with no Lua code on the way: the
     // traceback says nothing.
     const empty_trace = "\nstack traceback:\n\t[C]: in ?";
-    if (std.mem.endsWith(u8, msg, empty_trace)) msg = msg[0 .. msg.len - empty_trace.len];
-    return a.dupeSentinel(u8, msg, 0) catch "error (out of memory)";
+    if (std.mem.endsWith(u8, message, empty_trace)) {
+        message = message[0 .. message.len - empty_trace.len];
+    }
+    return arena.dupeSentinel(u8, message, 0) catch "error (out of memory)";
 }
 
 /// Calls `f(L, ctx)` in protected mode with the top `nargs` values as its
@@ -263,44 +283,53 @@ pub fn protect(
 /// raise the error (`return error.Raise`).
 pub fn tryCall(
     L: *State,
-    comptime T: type,
-    ctx: *T,
-    comptime f: fn (*State, *T) void,
+    comptime Context: type,
+    context: *Context,
+    comptime f: fn (*State, *Context) void,
     nargs: c_int,
     nresults: c_int,
 ) bool {
-    std.debug.assert(nargs >= 0 and nargs <= c.lua_gettop(L));
+    assert(nargs >= 0);
+    assert(nargs <= c.lua_gettop(L));
+    assert(nresults >= 0);
     if (c.lua_checkstack(L, 2) == 0) {
         c.lua_settop(L, -nargs - 1);
         _ = c.lua_pushstring(L, "Lua stack overflow");
         return false;
     }
-    c.lua_pushcclosure(L, &Trampoline(T, f).call, 0);
-    c.lua_pushlightuserdata(L, ctx);
+    c.lua_pushcclosure(L, &Trampoline(Context, f).call, 0);
+    c.lua_pushlightuserdata(L, context);
     // The function and its context go under the arguments.
     c.lua_rotate(L, -nargs - 2, 2);
     return c.lua_pcallk(L, nargs + 1, nresults, 0, 0, null) == c.LUA_OK;
 }
 
-fn Trampoline(comptime T: type, comptime f: fn (*State, *T) void) type {
+/// The C function `protect` and `tryCall` call. Its context is its first
+/// argument, so the caller's arguments start at `trampoline_first_argument`.
+fn Trampoline(comptime Context: type, comptime f: fn (*State, *Context) void) type {
     return struct {
         fn call(L: ?*State) callconv(.c) c_int {
-            const ctx: *T = @ptrCast(@alignCast(c.lua_touserdata(L, 1)));
-            const before = c.lua_gettop(L);
-            f(L.?, ctx);
+            const context: *Context = @ptrCast(@alignCast(c.lua_touserdata(L, 1)));
+            const top_before = c.lua_gettop(L);
+            f(L.?, context);
             // Results are whatever `f` left above its arguments.
-            return c.lua_gettop(L) - before;
+            assert(c.lua_gettop(L) >= top_before);
+            return c.lua_gettop(L) - top_before;
         }
     };
 }
 
+/// The stack index of the first argument a `tryCall` handler gets: index 1
+/// holds the trampoline's context.
+pub const trampoline_first_argument = 2;
+
 fn traceback(L: ?*State) callconv(.c) c_int {
-    const msg = c.lua_tolstring(L, 1, null);
-    if (msg == null) {
+    const message = c.lua_tolstring(L, 1, null);
+    if (message == null) {
         _ = c.lua_pushstring(L, "error (not a string)");
         return 1;
     }
-    c.luaL_traceback(L, L, msg, 1);
+    c.luaL_traceback(L, L, message, 1);
     return 1;
 }
 
@@ -314,15 +343,16 @@ pub const Error = error{Raise};
 pub fn wrap(comptime f: fn (*State) Error!c_int) c.lua_CFunction {
     return &struct {
         fn call(L: ?*State) callconv(.c) c_int {
-            const n = f(L.?) catch {
+            const results_count = f(L.?) catch {
                 // `fail` pushed the message raised.
-                std.debug.assert(c.lua_gettop(L) >= 1);
+                assert(c.lua_gettop(L) >= 1);
                 return c.lua_error(L);
             };
-            // Lua takes the top `n` values as the results, unchecked in
-            // distribution builds: they must be there.
-            std.debug.assert(n >= 0 and n <= c.lua_gettop(L));
-            return n;
+            // Lua takes the top `results_count` values as the results,
+            // unchecked in distribution builds: they must be there.
+            assert(results_count >= 0);
+            assert(results_count <= c.lua_gettop(L));
+            return results_count;
         }
     }.call;
 }
@@ -336,9 +366,9 @@ pub fn fail(L: *State, comptime fmt: []const u8, args: anytype) Error {
 
 /// Pushes a formatted string (cut at 512 bytes).
 pub fn pushFmt(L: *State, comptime fmt: []const u8, args: anytype) void {
-    var buf: [512]u8 = undefined;
-    const msg = std.mem.print(&buf, fmt, args) catch buf[0..];
-    _ = c.lua_pushlstring(L, msg.ptr, msg.len);
+    var buffer: [512]u8 = undefined;
+    const message = std.mem.print(&buffer, fmt, args) catch buffer[0..];
+    _ = c.lua_pushlstring(L, message.ptr, message.len);
 }
 
 /// Raises a formatted error now. Only inside `protect` handlers and from
@@ -359,11 +389,12 @@ pub fn setFuncs(L: *State, comptime fns: []const Fn) void {
     }
 }
 
-/// Pushes element `i` (1-based) of the list at `list` and returns its
+/// Pushes element `number` (1-based) of the list at `list` and returns its
 /// absolute index; raises unless it is a table (`where` names it).
-pub fn tableAt(L: *State, list: c_int, i: usize, where: []const u8) c_int {
-    if (c.lua_rawgeti(L, list, @intCast(i)) != c.LUA_TTABLE)
+pub fn tableAt(L: *State, list: c_int, number: usize, where: []const u8) c_int {
+    if (c.lua_rawgeti(L, list, @intCast(number)) != c.LUA_TTABLE) {
         raise(L, "{s}: table expected, got {s}", .{ where, typeName(L, -1) });
+    }
     return c.lua_gettop(L);
 }
 
@@ -378,17 +409,23 @@ pub fn failOom(L: *State) Error {
     return fail(L, "not enough memory", .{});
 }
 
-pub fn typeName(L: *State, idx: c_int) []const u8 {
-    return std.mem.span(c.lua_typename(L, c.lua_type(L, idx)));
+pub fn typeName(L: *State, index: c_int) []const u8 {
+    return std.mem.span(c.lua_typename(L, c.lua_type(L, index)));
 }
 
-/// The string at `idx` (not converted from a number), valid while the
+/// Whether nothing, or nil, is at `index` (Lua's `lua_isnoneornil`): an
+/// optional argument left out.
+pub fn isNoneOrNil(L: *State, index: c_int) bool {
+    return c.lua_type(L, index) <= c.LUA_TNIL;
+}
+
+/// The string at `index` (not converted from a number), valid while the
 /// value stays reachable.
-pub fn toSlice(L: *State, idx: c_int) ?[:0]const u8 {
-    if (c.lua_type(L, idx) != c.LUA_TSTRING) return null;
+pub fn toSlice(L: *State, index: c_int) ?[:0]const u8 {
+    if (c.lua_type(L, index) != c.LUA_TSTRING) return null;
     var len: usize = 0;
-    const p = c.lua_tolstring(L, idx, &len) orelse return null;
-    return p[0..len :0];
+    const bytes = c.lua_tolstring(L, index, &len) orelse return null;
+    return bytes[0..len :0];
 }
 
 pub fn argString(L: *State, arg: c_int, func: []const u8) Error![:0]const u8 {
@@ -400,103 +437,181 @@ pub fn argString(L: *State, arg: c_int, func: []const u8) Error![:0]const u8 {
 }
 
 pub fn argTable(L: *State, arg: c_int, func: []const u8) Error!void {
-    if (c.lua_type(L, arg) != c.LUA_TTABLE)
-        return fail(L, "bad argument #{d} to '{s}' (table expected, got {s})", .{
-            arg,
-            func,
-            typeName(L, arg),
-        });
+    if (c.lua_type(L, arg) == c.LUA_TTABLE) return;
+    const type_name = typeName(L, arg);
+    return fail(L, "bad argument #{d} to '{s}' (table expected, got {s})", .{ arg, func, type_name });
 }
 
-pub fn pushString(L: *State, s: []const u8) void {
-    _ = c.lua_pushlstring(L, s.ptr, s.len);
+pub fn pushString(L: *State, text: []const u8) void {
+    _ = c.lua_pushlstring(L, text.ptr, text.len);
 }
 
 // ------------------------------------------------- reading Lua tables
 // For `protect` handlers: these raise on a value of the wrong type, with
-// `where` ("items[3]") in the message.
+// `where` ("items[3]") in the message. Each one's doc comment says what it
+// leaves on the stack: `getField`, `fieldList`, `tableAt` and `pushRef`
+// push one value (`fieldList` none for nil); the readers of plain values
+// (`fieldString`, `fieldBool`, `fieldNumber`) leave the stack as they
+// found it.
 
-/// Pushes `t[name]` and returns its type.
-pub fn getField(L: *State, t: c_int, name: [:0]const u8) c_int {
-    return c.lua_getfield(L, t, name.ptr);
+/// The stack's height when a function started. A function that reads Lua
+/// tables takes a mark first, then gives the stack back as it found it
+/// (`defer mark.restore(L)`) or checks that it leaves what its caller
+/// expects (`mark.expectPushed(L, count)`), instead of popping values one
+/// by one with counts that are right only if every helper pushed what it
+/// seemed to.
+///
+/// A `raise` (longjmp) skips the defers, `restore` included. That is safe
+/// inside `protect`: it sets the stack back to its own entry height, which
+/// is below every mark taken in the handler.
+pub const StackMark = struct {
+    top: c_int,
+
+    pub fn init(L: *State) StackMark {
+        return .{ .top = c.lua_gettop(L) };
+    }
+
+    /// Pops what was pushed since the mark. Never pops below it.
+    pub fn restore(mark: StackMark, L: *State) void {
+        assert(c.lua_gettop(L) >= mark.top);
+        c.lua_settop(L, mark.top);
+    }
+
+    /// For a function whose contract is to leave `count` values pushed.
+    pub fn expectPushed(mark: StackMark, L: *State, count: c_int) void {
+        assert(c.lua_gettop(L) == mark.top + count);
+    }
+};
+
+/// Pushes `table[name]` and returns its type.
+pub fn getField(L: *State, table: c_int, name: [:0]const u8) c_int {
+    return c.lua_getfield(L, table, name.ptr);
 }
 
-/// `t[name]` as a string copied into `a`, or null when nil.
+/// Pushes `table[name]` when it is a table and returns its absolute index;
+/// null, with nothing pushed, when it is nil. Raises on any other type.
+pub fn fieldList(L: *State, table: c_int, name: [:0]const u8, where: []const u8) ?c_int {
+    switch (getField(L, table, name)) {
+        c.LUA_TTABLE => return c.lua_gettop(L),
+        c.LUA_TNIL => {
+            c.lua_settop(L, -2);
+            return null;
+        },
+        else => raise(L, "{s}.{s}: a list expected, got {s}", .{ where, name, typeName(L, -1) }),
+    }
+}
+
+/// `table[name]` as a string copied into `arena`, or null when nil.
 pub fn fieldString(
     L: *State,
-    a: std.mem.Allocator,
-    t: c_int,
+    arena: std.mem.Allocator,
+    table: c_int,
     name: [:0]const u8,
     where: []const u8,
 ) ?[:0]const u8 {
-    return fieldStringMax(L, a, t, name, where, std.math.maxInt(usize));
+    return fieldStringMax(L, arena, table, name, where, std.math.maxInt(usize));
 }
 
-/// `fieldString` cut to at most `max` bytes, between UTF-8 characters.
+/// `fieldString` cut to at most `bytes_max` bytes, between UTF-8
+/// characters.
 pub fn fieldStringMax(
     L: *State,
-    a: std.mem.Allocator,
-    t: c_int,
+    arena: std.mem.Allocator,
+    table: c_int,
     name: [:0]const u8,
     where: []const u8,
-    max: usize,
+    bytes_max: usize,
 ) ?[:0]const u8 {
-    defer c.lua_settop(L, -2);
-    switch (getField(L, t, name)) {
+    const mark: StackMark = .init(L);
+    defer mark.restore(L);
+    switch (getField(L, table, name)) {
         c.LUA_TNIL => return null,
         // A number reads as text: `subtitle = 42` is fine.
         c.LUA_TSTRING, c.LUA_TNUMBER => {},
         else => raise(L, "{s}.{s}: string expected, got {s}", .{ where, name, typeName(L, -1) }),
     }
     var len: usize = 0;
-    const p = c.lua_tolstring(L, -1, &len);
-    return a.dupeSentinel(u8, cut(p[0..len], max), 0) catch oom(L);
+    const bytes = c.lua_tolstring(L, -1, &len);
+    return arena.dupeSentinel(u8, cut(bytes[0..len], bytes_max), 0) catch oom(L);
 }
 
-/// `s` cut to at most `max` bytes, before the UTF-8 character `max` falls
-/// in.
-pub fn cut(s: []const u8, max: usize) []const u8 {
-    if (s.len <= max) return s;
-    var n = max;
-    while (n > 0 and s[n] & 0xC0 == 0x80) n -= 1;
-    return s[0..n];
+/// `text` cut to at most `bytes_max` bytes, before the UTF-8 character
+/// `bytes_max` falls in.
+pub fn cut(text: []const u8, bytes_max: usize) []const u8 {
+    if (text.len <= bytes_max) return text;
+    var len = bytes_max;
+    while (len > 0 and text[len] & 0xC0 == 0x80) len -= 1;
+    return text[0..len];
 }
 
-/// `t[name]` as a boolean (nil is `default`).
-pub fn fieldBool(L: *State, t: c_int, name: [:0]const u8, default: bool, where: []const u8) bool {
-    defer c.lua_settop(L, -2);
-    return switch (getField(L, t, name)) {
+/// `table[name]` as a boolean (nil is `default`).
+pub fn fieldBool(
+    L: *State,
+    table: c_int,
+    name: [:0]const u8,
+    default: bool,
+    where: []const u8,
+) bool {
+    const mark: StackMark = .init(L);
+    defer mark.restore(L);
+    return switch (getField(L, table, name)) {
         c.LUA_TNIL => default,
         c.LUA_TBOOLEAN => c.lua_toboolean(L, -1) != 0,
         else => raise(L, "{s}.{s}: boolean expected, got {s}", .{ where, name, typeName(L, -1) }),
     };
 }
 
-/// `t[name]` as a number (nil is null).
-pub fn fieldNumber(L: *State, t: c_int, name: [:0]const u8, where: []const u8) ?f64 {
-    defer c.lua_settop(L, -2);
-    return switch (getField(L, t, name)) {
+/// `table[name]` as a number (nil is null).
+pub fn fieldNumber(L: *State, table: c_int, name: [:0]const u8, where: []const u8) ?f64 {
+    const mark: StackMark = .init(L);
+    defer mark.restore(L);
+    return switch (getField(L, table, name)) {
         c.LUA_TNIL => null,
         c.LUA_TNUMBER => c.lua_tonumberx(L, -1, null),
         else => raise(L, "{s}.{s}: number expected, got {s}", .{ where, name, typeName(L, -1) }),
     };
 }
 
-pub fn absIndex(L: *State, idx: c_int) c_int {
-    return c.lua_absindex(L, idx);
+/// `table[name]` as a number from `range.min` to `range.max` (inclusive),
+/// or null when nil; raises otherwise.
+pub fn fieldNumberIn(
+    L: *State,
+    table: c_int,
+    name: [:0]const u8,
+    where: []const u8,
+    range: struct { min: f64, max: f64 },
+) ?f64 {
+    const number = fieldNumber(L, table, name, where) orelse return null;
+    if (!inRange(number, range.min, range.max)) {
+        raise(L, "{s}.{s}: {d} to {d}", .{ where, name, range.min, range.max });
+    }
+    return number;
 }
 
-/// A reference to the value on top (popped), for `c.lua_rawgeti` later.
+/// Whether `number` is from `min` to `max`. False for NaN, which Lua
+/// numbers may be (0/0): written the other way round, `number < min or
+/// number > max` lets NaN through, and turning it into an integer is then
+/// illegal behaviour.
+pub fn inRange(number: f64, min: f64, max: f64) bool {
+    return number >= min and number <= max;
+}
+
+pub fn absIndex(L: *State, index: c_int) c_int {
+    return c.lua_absindex(L, index);
+}
+
+/// A reference to the value on top (popped), for `pushRef` later.
 pub fn ref(L: *State) c_int {
     return c.luaL_ref(L, c.LUA_REGISTRYINDEX);
 }
 
-pub fn unref(L: *State, r: c_int) void {
-    c.luaL_unref(L, c.LUA_REGISTRYINDEX, r);
+pub fn unref(L: *State, reference: c_int) void {
+    c.luaL_unref(L, c.LUA_REGISTRYINDEX, reference);
 }
 
-pub fn pushRef(L: *State, r: c_int) c_int {
-    return c.lua_rawgeti(L, c.LUA_REGISTRYINDEX, r);
+/// Pushes the value `reference` names and returns its type.
+pub fn pushRef(L: *State, reference: c_int) c_int {
+    return c.lua_rawgeti(L, c.LUA_REGISTRYINDEX, reference);
 }
 
 // ---------------------------------------------------------------- tests
@@ -534,7 +649,7 @@ fn runCode(L: *State, a: std.mem.Allocator, code: [:0]const u8) ?[:0]const u8 {
 }
 
 test "errors come back as messages, and the sandbox holds" {
-    var budget: Budget = .{ .max = 8 << 20 };
+    var budget: Budget = .{ .bytes_max = 8 << 20 };
     const L = try testState(&budget);
     defer c.lua_close(L);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -563,7 +678,7 @@ test "errors come back as messages, and the sandbox holds" {
 }
 
 test "a runaway loop stops at its deadline" {
-    var budget: Budget = .{ .max = 8 << 20 };
+    var budget: Budget = .{ .bytes_max = 8 << 20 };
     const L = try testState(&budget);
     defer c.lua_close(L);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -576,7 +691,7 @@ test "a runaway loop stops at its deadline" {
 }
 
 test "memory is capped per state" {
-    var budget: Budget = .{ .max = 4 << 20 };
+    var budget: Budget = .{ .bytes_max = 4 << 20 };
     const L = try testState(&budget);
     defer c.lua_close(L);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -587,13 +702,13 @@ test "memory is capped per state" {
         "local t = {} for i = 1, 1e8 do t[i] = ('x'):rep(100) .. i end",
     ).?;
     try testing.expect(std.mem.find(u8, msg, "memory") != null);
-    try testing.expect(budget.used <= budget.max);
+    try testing.expect(budget.used_bytes <= budget.bytes_max);
     // Still usable afterwards.
     try testing.expect(runCode(L, arena.allocator(), "x = 1") == null);
 }
 
 test "what the time limit cannot stop is out of reach" {
-    var budget: Budget = .{ .max = 8 << 20 };
+    var budget: Budget = .{ .bytes_max = 8 << 20 };
     const L = try testState(&budget);
     defer c.lua_close(L);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -648,20 +763,26 @@ test "what the time limit cannot stop is out of reach" {
 }
 
 test "a capped allocator holds no more than its cap" {
-    var capped: Capped = .{ .child = testing.allocator, .max = 1000 };
+    var capped: Capped = .{ .child = testing.allocator, .bytes_max = 1000 };
     const a = capped.allocator();
     const x = try a.alloc(u8, 600);
     try testing.expectError(error.OutOfMemory, a.alloc(u8, 600));
     try testing.expect(capped.refused);
     a.free(x);
-    try testing.expectEqual(@as(usize, 0), capped.used);
+    try testing.expectEqual(@as(usize, 0), capped.used_bytes);
     // Growing counts too.
     var y = try a.alloc(u8, 900);
     try testing.expectError(error.OutOfMemory, a.realloc(y, 1200));
     y = try a.realloc(y, 1000);
-    try testing.expectEqual(@as(usize, 1000), capped.used);
+    try testing.expectEqual(@as(usize, 1000), capped.used_bytes);
     a.free(y);
-    try testing.expectEqual(@as(usize, 0), capped.used);
+    try testing.expectEqual(@as(usize, 0), capped.used_bytes);
+}
+
+test "NaN is in no range" {
+    try testing.expect(inRange(2, 2, 10));
+    try testing.expect(!inRange(11, 2, 10));
+    try testing.expect(!inRange(std.math.nan(f64), 2, 10));
 }
 
 test "strings are cut between characters" {
