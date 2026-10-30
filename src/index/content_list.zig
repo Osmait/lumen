@@ -7,6 +7,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const content = @import("content.zig");
 const extract = @import("extract.zig");
+const sys = @import("os");
 
 /// Package caches and build output: other people's code, or generated.
 /// Globs with a slash need `**/` to match below the search root.
@@ -19,6 +20,10 @@ const excludes = [_][]const u8{
 
 pub const ListError = std.process.RunError || std.mem.Allocator.Error;
 
+/// A hung network or FUSE mount under the root must not hang the content
+/// service forever: ripgrep gets this long, then the current index stays.
+const list_timeout_ns = 60 * std.time.ns_per_s;
+
 /// Documents to index, sorted by path (stable doc ids between builds).
 /// Paths are owned by `arena`.
 pub fn list(
@@ -27,6 +32,19 @@ pub fn list(
     io: std.Io,
     root: []const u8,
     with_documents: bool,
+) ListError![]content.DocIn {
+    return listUntil(arena, gpa, io, root, with_documents, null);
+}
+
+/// `list`, given up (error.Canceled) within ~0.1 s of `stop` being set:
+/// shutting down waited for ripgrep, up to its minute.
+pub fn listUntil(
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    with_documents: bool,
+    stop: ?*const std.atomic.Value(bool),
 ) ListError![]content.DocIn {
     var argv: std.ArrayList([]const u8) = .empty;
     // --no-ignore-parent: ignore files above the root are not about it (and
@@ -46,20 +64,12 @@ pub fn list(
     // prints, so with the root as argument a root below any excluded name
     // (a home in /srv/build, the tests' .zig-cache/tmp) listed nothing.
     try argv.append(arena, ".");
-    // A hung network or FUSE mount under the root must not hang the content
-    // service forever: give up after a minute and keep the current index.
-    const res = try std.process.run(gpa, io, .{
-        .argv = argv.items,
-        .cwd = .{ .path = root },
-        .stdout_limit = .limited(256 << 20),
-        .timeout = .{ .duration = .{ .raw = .fromSeconds(60), .clock = .awake } },
-    });
-    defer gpa.free(res.stdout);
-    defer gpa.free(res.stderr);
+    const out = try runLister(gpa, io, argv.items, root, stop);
+    defer gpa.free(out);
 
     const sep: []const u8 = if (std.mem.endsWith(u8, root, "/")) "" else "/";
     var docs: std.ArrayList(content.DocIn) = .empty;
-    var it = std.mem.tokenizeScalar(u8, res.stdout, 0);
+    var it = std.mem.tokenizeScalar(u8, out, 0);
     var zbuf: [4096]u8 = undefined;
     while (it.next()) |line| {
         const rel = if (std.mem.startsWith(u8, line, "./")) line[2..] else line;
@@ -82,6 +92,46 @@ pub fn list(
         }
     }.lt);
     return docs.items;
+}
+
+/// What `argv` (ripgrep, run in `root`) prints, read in slices of 100 ms so
+/// that `stop` and the deadline are looked at while it runs.
+fn runLister(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    root: []const u8,
+    stop: ?*const std.atomic.Value(bool),
+) ListError![]u8 {
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = .{ .path = root },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
+    defer child.kill(io);
+    var streams: std.Io.File.MultiReader.Buffer(1) = undefined;
+    var reader: std.Io.File.MultiReader = undefined;
+    reader.init(gpa, io, streams.toStreams(), &.{child.stdout.?});
+    defer reader.deinit();
+    const deadline = sys.monotonicNs() + list_timeout_ns;
+    const slice: std.Io.Timeout = .{
+        .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake },
+    };
+    while (true) {
+        reader.fill(64, slice) catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.Timeout => {},
+            else => |e| return e,
+        };
+        if (stop) |s| if (s.load(.acquire)) return error.Canceled;
+        if (sys.monotonicNs() >= deadline) return error.Timeout;
+        if (reader.reader(0).buffered().len > 256 << 20) return error.StreamTooLong;
+    }
+    try reader.checkAnyError();
+    _ = try child.wait(io);
+    return reader.toOwnedSlice(0);
 }
 
 pub const Stat = struct { mtime: i64, size: u64 };
@@ -165,7 +215,6 @@ fn binaryByName(path: []const u8) bool {
 // ---------------------------------------------------------------- tests
 
 const testing = std.testing;
-const sys = @import("os");
 
 const TestTree = sys.TestDir;
 
@@ -341,6 +390,29 @@ test "list: file names with newlines and invalid UTF-8 come back whole" {
     try testing.expectEqual(@as(usize, 2), got.len);
     try testing.expect(std.mem.endsWith(u8, got[0].path, "/bad-\xff\xfe.txt"));
     try testing.expect(std.mem.endsWith(u8, got[1].path, "/line1\nline2.txt"));
+}
+
+test "listing gives up soon after stop is set" {
+    var t = try TestTree.init();
+    defer t.deinit();
+    var stop: std.atomic.Value(bool) = .init(false);
+    const setter = try std.Thread.spawn(.{}, struct {
+        fn later(s: *std.atomic.Value(bool)) void {
+            sys.sleepUs(100_000);
+            s.store(true, .release);
+        }
+    }.later, .{&stop});
+    defer setter.join();
+    // A lister stuck on a hung mount: silent, alive.
+    const t0 = sys.monotonicNs();
+    try testing.expectError(error.Canceled, runLister(
+        testing.allocator,
+        testing.io,
+        &.{ "sh", "-c", "exec sleep 30" },
+        t.abs,
+        &stop,
+    ));
+    try testing.expect(sys.monotonicNs() - t0 < 5 * std.time.ns_per_s);
 }
 
 test "documentKind" {

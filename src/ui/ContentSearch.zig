@@ -5,7 +5,9 @@
 //! blocked forever), and on the UI thread every keystroke waited for it.
 //! Here the UI posts the latest query and keeps typing; one worker runs the
 //! newest query (stale ones in between are skipped) and hands the result
-//! back on the GTK main loop with g_idle_add, which is thread-safe.
+//! back on the GTK main loop with g_idle_add, which is thread-safe. A query
+//! still verifying when a newer one comes stops at its next file: it held
+//! the search threads and the index for an answer nobody would see.
 
 const std = @import("std");
 const c = @import("c");
@@ -56,6 +58,9 @@ thread: std.Thread = undefined,
 lock: std.Io.Mutex = .init,
 /// Bumped by every `submit`; the worker sleeps on it.
 gen: std.atomic.Value(u32) = .init(0),
+/// Set by `submit` (and `shutdown`), cleared by the worker when it takes
+/// the query: the query running is stale.
+newer: std.atomic.Value(bool) = .init(false),
 stop: std.atomic.Value(bool) = .init(false),
 query: core.FixedStr(max_query) = .{},
 query_t0: u64 = 0,
@@ -90,6 +95,7 @@ pub fn start(
 /// a result still queued with g_idle_add would otherwise reach a freed `cs`.
 pub fn shutdown(cs: *ContentSearch) void {
     cs.stop.store(true, .release);
+    cs.newer.store(true, .release);
     _ = cs.gen.fetchAdd(1, .release);
     cs.io.futexWake(u32, &cs.gen.raw, 1);
     cs.thread.join();
@@ -106,6 +112,7 @@ pub fn submit(cs: *ContentSearch, query: []const u8, t0: u64) u32 {
         defer cs.lock.unlock(cs.io);
         cs.query.set(q);
         cs.query_t0 = t0;
+        cs.newer.store(true, .release);
         break :blk cs.gen.fetchAdd(1, .release) + 1;
     };
     cs.io.futexWake(u32, &cs.gen.raw, 1);
@@ -140,6 +147,8 @@ fn run(cs: *ContentSearch) void {
             cs.lock.lockUncancelable(cs.io);
             defer cs.lock.unlock(cs.io);
             seen = cs.gen.load(.acquire);
+            // Unless shutting down, which may have set it just before.
+            cs.newer.store(cs.stop.load(.acquire), .release);
             r.gen = seen;
             r.t0 = cs.query_t0;
             r.query = a.dupe(u8, cs.query.slice()) catch |err| blk: {
@@ -150,9 +159,11 @@ fn run(cs: *ContentSearch) void {
 
         const t = os.monotonicNs();
         var hits: std.ArrayList(index.ContentService.Hit) = .empty;
-        if (r.err == null) cs.service.search(a, r.query, cs.limit, &hits) catch |err| {
-            r.err = err;
-        };
+        if (r.err == null) {
+            cs.service.searchUntil(a, r.query, cs.limit, &cs.newer, &hits) catch |err| {
+                r.err = err;
+            };
+        }
         r.search_ns = os.monotonicNs() - t;
         r.hits = hits.items;
         // A newer query arrived meanwhile: this answer is already stale.

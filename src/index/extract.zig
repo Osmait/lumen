@@ -8,9 +8,13 @@
 //!     treats `*?[` in an archive name as a wildcard (`a*.docx` would also read
 //!     `ab.docx`), and no file name can be mistaken for an option.
 //!   - A pathological file must not stall the indexer: output is read up to a
-//!     cap, then the tool is SIGKILLed; past `timeout_ms` likewise. What was
-//!     read by then is kept (truncated text still indexes).
-//!   - The tools get an empty environment (`UNZIP=-a` and friends stay out).
+//!     cap, then the tool is SIGKILLed, and what was read is kept (truncated
+//!     text still indexes). Past `timeout_ms` likewise, but that is an error
+//!     (`Timeout`): text cut short by a busy machine would be cached as the
+//!     document's whole text for good.
+//!   - The tools get an empty environment (`UNZIP=-a` and friends stay out),
+//!     and unzip an empty password: an encrypted document made it ask for
+//!     one on the terminal the daemon was started from, and wait for it.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -36,13 +40,15 @@ pub const ExtractError = Error || std.mem.Allocator.Error || sys.child.Error;
 /// Extracted UTF-8 text of the document at `path` (absolute), owned by
 /// `gpa`, at most `max_bytes` long (truncated, never failing for size).
 /// An error for unreadable or corrupt files, which callers skip;
-/// error.ToolMissing when pdftotext or unzip is not installed.
+/// error.ToolMissing when pdftotext or unzip is not installed. Setting
+/// `cancel` kills the tool: error.Timeout.
 pub fn extractText(
     gpa: std.mem.Allocator,
     io: std.Io,
     path: [:0]const u8,
     kind: Kind,
     max_bytes: usize,
+    cancel: ?*const std.atomic.Value(bool),
 ) ExtractError![]u8 {
     const fd = try sys.openRegular(path);
     defer sys.close(fd);
@@ -56,6 +62,7 @@ pub fn extractText(
             max_bytes,
             &.{0},
             timeout_ms,
+            cancel,
         );
         // Pages are separated by form feeds.
         std.mem.replaceScalar(u8, raw, '\x0c', '\n');
@@ -70,23 +77,24 @@ pub fn extractText(
         .odt, .ods, .odp => &.{"content.xml"},
     };
     var argv: [8][]const u8 = undefined;
-    argv[0] = "unzip";
-    argv[1] = "-p";
-    argv[2] = "/dev/stdin";
-    @memcpy(argv[3..][0..members.len], members);
+    // An encrypted member fails (exit 82) instead of prompting.
+    const head = [_][]const u8{ "unzip", "-P", "", "-p", "/dev/stdin" };
+    @memcpy(argv[0..head.len], &head);
+    @memcpy(argv[head.len..][0..members.len], members);
 
     // Markup outweighs text several times over; the cap only guards memory.
     const xml_cap = @max(max_bytes, @min(max_bytes *| 8, 256 << 20));
     // unzip: 11 = some member not found (optional ones, or an xlsx without
-    // strings); a corrupt archive is 9.
+    // strings); a corrupt archive is 9, a password-protected one 82.
     const xml = try runTool(
         gpa,
         io,
-        argv[0 .. 3 + members.len],
+        argv[0 .. head.len + members.len],
         fd,
         xml_cap,
         &.{ 0, 11 },
         timeout_ms,
+        cancel,
     );
     defer gpa.free(xml);
     return shrink(gpa, try xmlToText(gpa, xml), max_bytes);
@@ -95,8 +103,9 @@ pub fn extractText(
 pub const Error = sys.Error || error{ ToolMissing, ToolFailed, Timeout };
 
 /// Runs `argv` with `input` as stdin and returns at most `cap` bytes of its
-/// stdout. Reaching the cap or the timeout kills the tool and keeps what was
-/// read; otherwise its exit code must be in `ok_codes`.
+/// stdout. Reaching the cap kills the tool and keeps what was read; the
+/// timeout kills it and fails (what it printed may be any part of the
+/// text); otherwise its exit code must be in `ok_codes`.
 fn runTool(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -105,6 +114,7 @@ fn runTool(
     cap: usize,
     ok_codes: []const u8,
     limit_ms: u64,
+    cancel: ?*const std.atomic.Value(bool),
 ) ExtractError![]u8 {
     const r = sys.child.run(gpa, io, argv, .{
         .stdin = .{ .fd = input },
@@ -113,16 +123,15 @@ fn runTool(
         .max_output_bytes = cap,
         .at_cap = .kill,
         .deadline_ns = sys.monotonicNs() + limit_ms * std.time.ns_per_ms,
+        .cancel = cancel,
     }) catch |err| return switch (err) {
         error.FileNotFound => error.ToolMissing,
         else => |e| e,
     };
     gpa.free(r.stderr);
     errdefer gpa.free(r.stdout);
-    if (r.timed_out or r.capped) {
-        if (r.stdout.len == 0) return error.Timeout;
-        return r.stdout;
-    }
+    if (r.timed_out) return error.Timeout;
+    if (r.capped) return r.stdout;
     const code = r.code orelse return error.ToolFailed;
     if (std.mem.findScalar(u8, ok_codes, code) == null) return error.ToolFailed;
     return r.stdout;
@@ -515,6 +524,7 @@ const TestDir = struct {
             p,
             kindOf(name).?,
             max,
+            null,
         ) catch |err| switch (err) {
             error.ToolMissing => error.SkipZigTest,
             else => err,
@@ -587,13 +597,18 @@ test "extract docx, xlsx, pptx (OOXML)" {
 /// archive order, and `zip -r` would follow readdir's order, which differs
 /// between file systems (Office writes the body first; sorted names do too).
 fn zipInto(td: *TestDir, dir: []const u8, name: []const u8) !void {
+    return zipWith(td, dir, name, "");
+}
+
+/// `zipInto` with more options for zip.
+fn zipWith(td: *TestDir, dir: []const u8, name: []const u8, options: []const u8) !void {
     var buf: [256]u8 = undefined;
     const rel = try std.mem.print(&buf, "{s}/{s}", .{ td.abs, dir });
     var cmd_buf: [256]u8 = undefined;
     const cmd = try std.mem.print(
         &cmd_buf,
-        "find . -type f | LC_ALL=C sort | zip -q -X -@ '../{s}'",
-        .{name},
+        "find . -type f | LC_ALL=C sort | zip -q -X {s} -@ '../{s}'",
+        .{ options, name },
     );
     const r = try std.process.run(testing.allocator, testing.io, .{
         .argv = &.{ "sh", "-c", cmd },
@@ -698,6 +713,26 @@ test "extract errors: missing, corrupt, not a regular file" {
     try testing.expectError(error.NotRegular, td.extract("dir.odt", 1024));
 }
 
+test "extract: a password-protected document fails at once, asking nobody" {
+    var td: TestDir = undefined;
+    try td.init();
+    defer td.deinit();
+    try td.write("e/word/document.xml", "<w:p><w:t>secret</w:t></w:p>");
+    try zipWith(&td, "e", "locked.docx", "-P hunter2");
+    try td.write("x/xl/sharedStrings.xml", "<sst><si><t>secret</t></si></sst>");
+    try zipWith(&td, "x", "locked.xlsx", "-P hunter2");
+    // unzip asked for the password on /dev/tty (the terminal the daemon was
+    // started from, or this test) and waited out the timeout.
+    const t0 = sys.monotonicNs();
+    // Bad password (82); with members missing too, unzip says 11 instead:
+    // no text, which is what there is to index.
+    try testing.expectError(error.ToolFailed, td.extract("locked.xlsx", 1024));
+    const none = try td.extract("locked.docx", 1024);
+    defer testing.allocator.free(none);
+    try testing.expectEqualStrings("", none);
+    try testing.expect(sys.monotonicNs() - t0 < 5 * std.time.ns_per_s);
+}
+
 test "extract truncates xml documents at a UTF-8 boundary" {
     var td: TestDir = undefined;
     try td.init();
@@ -723,7 +758,7 @@ test "runTool: size cap and timeout kill the tool" {
     defer sys.close(in);
 
     // Endless output: cut at the cap, the tool killed and reaped.
-    const yes = try runTool(gpa, testing.io, &.{ "sh", "-c", "exec yes" }, in, 1000, &.{0}, 10_000);
+    const yes = try runTool(gpa, testing.io, &.{ "sh", "-c", "exec yes" }, in, 1000, &.{0}, 10_000, null);
     defer gpa.free(yes);
     try testing.expectEqual(@as(usize, 1000), yes.len);
 
@@ -737,6 +772,7 @@ test "runTool: size cap and timeout kill the tool" {
         1000,
         &.{0},
         200,
+        null,
     ));
     try testing.expect(sys.monotonicNs() - t0 < 5 * std.time.ns_per_s);
 
@@ -750,11 +786,13 @@ test "runTool: size cap and timeout kill the tool" {
         1000,
         &.{0},
         200,
+        null,
     ));
     try testing.expect(sys.monotonicNs() - t1 < 5 * std.time.ns_per_s);
 
-    // Output, then stuck: what came out is kept.
-    const partial = try runTool(
+    // Output, then stuck: a timeout too. What came out was cached as the
+    // whole text of the document, for good.
+    try testing.expectError(error.Timeout, runTool(
         gpa,
         testing.io,
         &.{ "sh", "-c", "echo hi; exec sleep 30" },
@@ -762,9 +800,8 @@ test "runTool: size cap and timeout kill the tool" {
         1000,
         &.{0},
         200,
-    );
-    defer gpa.free(partial);
-    try testing.expectEqualStrings("hi\n", partial);
+        null,
+    ));
 
     // Exit codes.
     try testing.expectError(error.ToolFailed, runTool(
@@ -775,6 +812,7 @@ test "runTool: size cap and timeout kill the tool" {
         1000,
         &.{0},
         10_000,
+        null,
     ));
     const ok = try runTool(
         gpa,
@@ -784,6 +822,7 @@ test "runTool: size cap and timeout kill the tool" {
         1000,
         &.{ 0, 11 },
         10_000,
+        null,
     );
     defer gpa.free(ok);
     try testing.expectError(error.ToolMissing, runTool(
@@ -794,7 +833,26 @@ test "runTool: size cap and timeout kill the tool" {
         1000,
         &.{0},
         10_000,
+        null,
     ));
+
+    // Cancelled (the service is stopping): killed at once, running or with
+    // its output closed, long before its own limit.
+    var cancel: std.atomic.Value(bool) = .init(true);
+    for ([_][]const u8{ "exec sleep 30", "exec >&-; exec sleep 30" }) |script| {
+        const t2 = sys.monotonicNs();
+        try testing.expectError(error.Timeout, runTool(
+            gpa,
+            testing.io,
+            &.{ "sh", "-c", script },
+            in,
+            1000,
+            &.{0},
+            60_000,
+            &cancel,
+        ));
+        try testing.expect(sys.monotonicNs() - t2 < 2 * std.time.ns_per_s);
+    }
 }
 
 fn fuzzXml(_: void, smith: *testing.Smith) anyerror!void {

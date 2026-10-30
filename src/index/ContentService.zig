@@ -10,8 +10,8 @@
 //! millisecond.
 //!
 //! PDFs and Office documents are indexed through their extracted text,
-//! cached in `text_dir` as `<hash of path>-<mtime>.txt`: extraction (a child
-//! process per file) happens once per version of a document.
+//! cached in `text_dir` as `<hash of path>-<mtime>-<size>.txt`: extraction
+//! (a child process per file) happens once per version of a document.
 
 const std = @import("std");
 const Io = std.Io;
@@ -43,8 +43,7 @@ pub const Options = struct {
     /// changes what is listed without a name change).
     list_every_ns: u64 = 30 * 60 * std.time.ns_per_s,
 };
-/// Extracted text kept per document.
-const max_extracted = 4 << 20;
+const max_extracted = content.max_extracted;
 
 gpa: std.mem.Allocator,
 io: Io,
@@ -81,6 +80,12 @@ last_extract_ns: std.atomic.Value(u64) = .init(0),
 /// The index in use could not be saved: retried on the next check even if
 /// nothing changed. Service thread only.
 unsaved: bool = false,
+/// Documents whose extraction failed in passing (a timeout, a missing tool,
+/// memory): kept out of the index, which would remember them as textless
+/// for as long as they do not change, and tried again by the next check.
+/// In `retry_arena`. Service thread only.
+retry: []const content.DocIn = &.{},
+retry_arena: std.heap.ArenaAllocator,
 
 /// The thread pools it borrows: they must outlive the service.
 pub const Pools = struct { search: *Pool, build: *Pool };
@@ -124,6 +129,7 @@ pub fn startWith(
         .search_pool = pools.search,
         .build_pool = pools.build,
         .opts = opts,
+        .retry_arena = .init(gpa),
     };
     sys.mkdirP(s.text_dir);
     // Older versions made these 0755: the cache holds the text of the
@@ -143,6 +149,7 @@ pub fn shutdown(s: *ContentService) void {
     s.poke();
     if (s.thread) |t| t.join();
     if (s.index) |*ix| ix.deinit(s.gpa);
+    s.retry_arena.deinit();
     s.gpa.free(s.root);
     s.gpa.free(s.cache_path);
     s.gpa.free(s.text_dir);
@@ -221,6 +228,20 @@ pub fn search(
     limit: usize,
     out: *std.ArrayList(Hit),
 ) std.mem.Allocator.Error!void {
+    return s.searchUntil(arena, query, limit, null, out);
+}
+
+/// `search`, cut short once `stop` is set (a newer query waits): reading
+/// files to verify them stops at the next one, and the hits found so far
+/// are returned. Until then it holds the search pool and the index.
+pub fn searchUntil(
+    s: *ContentService,
+    arena: std.mem.Allocator,
+    query: []const u8,
+    limit: usize,
+    stop: ?*const std.atomic.Value(bool),
+    out: *std.ArrayList(Hit),
+) std.mem.Allocator.Error!void {
     out.clearRetainingCapacity();
     s.lock.lockSharedUncancelable(s.io);
     defer s.lock.unlockShared(s.io);
@@ -232,7 +253,7 @@ pub fn search(
         arena,
         s.search_pool,
         query,
-        .{ .limit = limit, .text_path = pathOf, .text_ctx = s },
+        .{ .limit = limit, .text_path = pathOf, .text_ctx = s, .stop = stop },
         &matches,
     );
     for (matches.items) |m| try out.append(arena, .{
@@ -256,7 +277,8 @@ fn pathOf(ctx: *anyopaque, d: content.DocIn, buf: []u8) ?[:0]const u8 {
 /// The first `lines` lines of a hit's text (for the preview), in `arena`;
 /// null if it cannot be read. Reads no further than that: the preview runs
 /// on the UI thread, and a match near the top of a 4 MB extraction needs a
-/// few KB of it.
+/// few KB of it. `mtime` is the document's as it is now; so is its size,
+/// which keys the text cache too.
 pub fn readText(
     s: *ContentService,
     arena: std.mem.Allocator,
@@ -266,15 +288,17 @@ pub fn readText(
     lines: u32,
 ) ?[]const u8 {
     var pbuf: [4096]u8 = undefined;
-    const p: [:0]const u8 = if (extracted)
-        s.textPath(&pbuf, .{
+    const doc = std.mem.printSentinel(&pbuf, "{s}", .{path}, 0) catch return null;
+    var tbuf: [4096]u8 = undefined;
+    const p: [:0]const u8 = if (extracted) blk: {
+        const st = content_list.stat(doc, true) orelse return null;
+        break :blk s.textPath(&tbuf, .{
             .path = path,
             .mtime = mtime,
-            .size = 0,
+            .size = st.size,
             .source = .extracted,
-        }) orelse return null
-    else
-        std.mem.printSentinel(&pbuf, "{s}", .{path}, 0) catch return null;
+        }) orelse return null;
+    } else doc;
     const fd = sys.openRegular(p) catch return null;
     defer sys.close(fd);
     const cap: usize = if (extracted) max_extracted else content.max_text;
@@ -309,37 +333,65 @@ fn textOf(
     return buf.items.len > 0;
 }
 
+/// How long the cached text of an extracted document is (0: none yet), so
+/// that building reads no more of them at once than memory allows.
+fn textLen(ctx: *anyopaque, d: content.DocIn) u64 {
+    const s: *ContentService = @ptrCast(@alignCast(ctx));
+    var pbuf: [4096]u8 = undefined;
+    const p = s.textPath(&pbuf, d) orelse return 0;
+    return if (sys.info(p)) |i| i.size else 0;
+}
+
+/// Where a document version's extracted text is cached. Keyed by size as
+/// well as mtime (whole seconds): an edit within the same second reused
+/// the old text, and dropping the old version's text then deleted it.
 fn textPath(s: *ContentService, buf: []u8, d: content.DocIn) ?[:0]const u8 {
-    return std.mem.printSentinel(
+    var nbuf: [64]u8 = undefined;
+    return std.mem.printSentinel(buf, "{s}/{s}", .{ s.text_dir, textName(&nbuf, d) }, 0) catch null;
+}
+
+fn textName(buf: *[64]u8, d: content.DocIn) []const u8 {
+    // 16 + 1 + 20 + 1 + 20 + 4 bytes at most: always fits.
+    return std.mem.print(
         buf,
-        "{s}/{x:0>16}-{d}.txt",
-        .{ s.text_dir, std.hash.Wyhash.hash(0, d.path), d.mtime },
-        0,
-    ) catch null;
+        "{x:0>16}-{d}-{d}.txt",
+        .{ std.hash.Wyhash.hash(0, d.path), d.mtime, d.size },
+    ) catch unreachable;
 }
 
 /// Extracts what is missing from the text cache, on the background pool
 /// (a PDF takes 10-40 ms, a whole book up to ~0.7 s). Documents that cannot
 /// be extracted (a corrupt file, a tool error) get an empty file, so they
-/// are not retried every refresh; passing failures (out of memory, a
-/// timeout, a missing tool) leave nothing, so the next refresh tries again.
-fn extractMissing(s: *ContentService, docs: []const content.DocIn) void {
-    var missing: std.ArrayList(content.DocIn) = .empty;
-    defer missing.deinit(s.gpa);
+/// are not retried every refresh. Passing failures (out of memory, a
+/// timeout, a missing tool) leave nothing: those documents are taken out
+/// of `docs` (what is left is returned) and into `retry`, so that the index
+/// does not remember them as textless and the next check tries again.
+/// Null when out of memory: nothing is to be indexed then.
+fn extractMissing(
+    s: *ContentService,
+    arena: std.mem.Allocator,
+    docs: []content.DocIn,
+) ?[]content.DocIn {
+    var missing: std.ArrayList(usize) = .empty;
     var pbuf: [4096]u8 = undefined;
-    for (docs) |d| {
+    for (docs, 0..) |d, i| {
         if (d.source != .extracted) continue;
         const tp = s.textPath(&pbuf, d) orelse continue;
-        if (!sys.exists(tp)) missing.append(s.gpa, d) catch return;
+        if (!sys.exists(tp)) missing.append(arena, i) catch return null;
     }
-    if (missing.items.len == 0) return;
+    // Nothing to extract: nothing to retry either.
+    if (missing.items.len == 0) return s.leaveOut(arena, docs, &.{}, &.{});
+    const failed = arena.alloc(?anyerror, missing.items.len) catch return null;
+    @memset(failed, null);
     const Ctx = struct {
         s: *ContentService,
         docs: []const content.DocIn,
+        missing: []const usize,
+        failed: []?anyerror,
         fn one(ctx: *@This(), i: usize) void {
             const svc = ctx.s;
             if (svc.stop.load(.acquire)) return;
-            const d = ctx.docs[i];
+            const d = ctx.docs[ctx.missing[i]];
             var tbuf: [4096]u8 = undefined;
             var zbuf: [4096]u8 = undefined;
             const tp = svc.textPath(&tbuf, d) orelse return;
@@ -351,10 +403,11 @@ fn extractMissing(s: *ContentService, docs: []const content.DocIn) void {
                 src,
                 kind,
                 max_extracted,
+                &svc.stop,
             ) catch |err| switch (err) {
                 error.ToolFailed, error.NotRegular, error.Access, error.NotFound => "",
                 else => {
-                    log.warn("extracting {s}: {t}, will retry", .{ d.path, err });
+                    ctx.failed[i] = err;
                     return;
                 },
             };
@@ -366,8 +419,54 @@ fn extractMissing(s: *ContentService, docs: []const content.DocIn) void {
             _ = svc.extractions.fetchAdd(1, .release);
         }
     };
-    var ctx: Ctx = .{ .s = s, .docs = missing.items };
+    var ctx: Ctx = .{ .s = s, .docs = docs, .missing = missing.items, .failed = failed };
     s.build_pool.run(missing.items.len, &ctx, Ctx.one);
+    return s.leaveOut(arena, docs, missing.items, failed);
+}
+
+/// `docs` without those whose extraction `failed` (`missing` says which),
+/// which become the documents to retry. Logged when that list changes, not
+/// on every check while a tool stays missing.
+fn leaveOut(
+    s: *ContentService,
+    arena: std.mem.Allocator,
+    docs: []content.DocIn,
+    missing: []const usize,
+    failed: []const ?anyerror,
+) ?[]content.DocIn {
+    var n_failed: usize = 0;
+    var first: ?usize = null;
+    for (failed, 0..) |f, i| if (f != null) {
+        n_failed += 1;
+        if (first == null) first = i;
+    };
+    const was = s.retry.len;
+    _ = s.retry_arena.reset(.retain_capacity);
+    s.retry = &.{};
+    if (n_failed == 0) return docs;
+    const fi = first.?;
+    if (n_failed != was) log.warn(
+        "extracting {d} documents failed for now ({s}: {t}), will retry",
+        .{ n_failed, docs[missing[fi]].path, failed[fi].? },
+    );
+    const ra = s.retry_arena.allocator();
+    const retry = ra.alloc(content.DocIn, n_failed) catch return null;
+    const drop = arena.alloc(bool, docs.len) catch return null;
+    @memset(drop, false);
+    var r: usize = 0;
+    for (failed, missing) |f, at| if (f != null) {
+        drop[at] = true;
+        retry[r] = docs[at];
+        retry[r].path = ra.dupe(u8, docs[at].path) catch return null;
+        r += 1;
+    };
+    s.retry = retry;
+    var w: usize = 0;
+    for (docs, drop) |d, dropped| if (!dropped) {
+        docs[w] = d;
+        w += 1;
+    };
+    return docs[0..w];
 }
 
 /// How the listed documents differ from the index: ids whose document
@@ -414,8 +513,8 @@ fn diff(
 /// said before listing, so a change during the listing lists again next time.
 fn listAll(s: *ContentService, arena: std.mem.Allocator, names: ?u64) ?[]content.DocIn {
     const t = sys.monotonicNs();
-    const docs = content_list.list(arena, s.gpa, s.io, s.root, true) catch |err| {
-        log.warn("listing files: {t}", .{err});
+    const docs = content_list.listUntil(arena, s.gpa, s.io, s.root, true, &s.stop) catch |err| {
+        if (err != error.Canceled) log.warn("listing files: {t}", .{err});
         return null;
     };
     s.last_list_ns.store(sys.monotonicNs() - t, .monotonic);
@@ -426,9 +525,9 @@ fn listAll(s: *ContentService, arena: std.mem.Allocator, names: ?u64) ?[]content
 }
 
 /// Changes to the files already indexed, without listing: edits in place
-/// (mtime, size), and files gone or out of bounds. New files need a name
-/// change, which makes the next check list. Paths point into the index,
-/// which outlives the refresh.
+/// (mtime, size), and files gone or out of bounds; and the documents to
+/// retry. New files need a name change, which makes the next check list.
+/// Paths point into the index, which outlives the refresh, or `arena`.
 fn indexedChanges(s: *ContentService, arena: std.mem.Allocator) std.mem.Allocator.Error!Diff {
     const ix = &s.index.?;
     var gone: std.ArrayList(u32) = .empty;
@@ -449,6 +548,17 @@ fn indexedChanges(s: *ContentService, arena: std.mem.Allocator) std.mem.Allocato
             .source = d.source,
         });
     }
+    // Not in the index (`extractMissing` left them out): as they are now.
+    for (s.retry) |d| {
+        const z = std.mem.printSentinel(&zbuf, "{s}", .{d.path}, 0) catch continue;
+        const st = content_list.stat(z, true) orelse continue;
+        try added.append(arena, .{
+            .path = try arena.dupe(u8, d.path),
+            .mtime = st.mtime,
+            .size = st.size,
+            .source = .extracted,
+        });
+    }
     return .{ .gone = gone.items, .added = added.items };
 }
 
@@ -462,6 +572,7 @@ fn refresh(s: *ContentService) void {
     const names = if (s.opts.names) |n| n.nameChanges() else null;
     var docs: ?[]content.DocIn = null;
     var d = s.changes(arena, names, &docs) orelse return;
+    if (s.stop.load(.acquire)) return;
     if (s.index != null and d.gone.len == 0 and d.added.len == 0) {
         if (s.unsaved) s.retrySave();
         return;
@@ -477,9 +588,15 @@ fn refresh(s: *ContentService) void {
         d = s.diff(arena, docs.?) catch return;
     }
     var t = sys.monotonicNs();
-    s.extractMissing(if (whole) docs.? else d.added);
+    if (whole) {
+        docs = s.extractMissing(arena, docs.?) orelse return;
+    } else {
+        d.added = s.extractMissing(arena, d.added) orelse return;
+    }
     s.last_extract_ns.store(sys.monotonicNs() - t, .monotonic);
     if (s.stop.load(.acquire)) return;
+    // Only documents to retry, which failed again.
+    if (!whole and d.gone.len == 0 and d.added.len == 0) return;
     t = sys.monotonicNs();
     const fresh = s.buildNext(if (whole) docs.? else null, d) orelse return;
     s.last_build_ns.store(sys.monotonicNs() - t, .monotonic);
@@ -497,6 +614,7 @@ fn refresh(s: *ContentService) void {
         s.dropStaleText(o, d.gone);
         o.deinit(s.gpa);
     }
+    if (whole) s.sweepText();
 }
 
 /// What changed since the index was built: every file listed again (no
@@ -538,7 +656,7 @@ fn wantsWhole(s: *const ContentService, d: Diff) bool {
 /// appended to the file the index is mapped from, or the file rewritten if
 /// it is not that one any more. Null (logged) when out of memory.
 fn buildNext(s: *ContentService, all: ?[]const content.DocIn, d: Diff) ?content.Index {
-    const reader: content.TextReader = .{ .read = textOf, .ctx = s };
+    const reader: content.TextReader = .{ .read = textOf, .ctx = s, .extracted_len = textLen };
     if (std.mem.findScalarLast(u8, s.cache_path, '/')) |slash| sys.mkdirP(s.cache_path[0..slash]);
     const appended: ?content.FileError!content.Index = if (all == null and s.index.?.mapped and
         !s.unsaved)
@@ -614,13 +732,55 @@ fn dropStaleText(s: *ContentService, old: *const content.Index, gone: []const u3
     var pbuf: [4096]u8 = undefined;
     for (gone) |id| {
         if (old.sources[id] != @backingInt(content.Source.extracted)) continue;
-        const tp = s.textPath(&pbuf, .{
-            .path = old.path(id),
-            .mtime = old.mtimes[id],
-            .size = 0,
-            .source = .extracted,
-        }) orelse continue;
+        const tp = s.textPath(&pbuf, old.docIn(id)) orelse continue;
         _ = std.os.linux.unlink(tp);
+    }
+}
+
+/// Deletes the cached texts no live document of the index refers to: what
+/// `dropStaleText` cannot know of, versions extracted and never indexed
+/// (out of memory, a shutdown or a crash in between), half-written ones.
+/// A text cached under the name used before sizes were part of it
+/// (`<hash>-<mtime>.txt`) is renamed instead, not extracted again. On
+/// start and after a whole build, on the service thread: the one that
+/// writes them.
+fn sweepText(s: *ContentService) void {
+    const ix = &(s.index orelse return);
+    var arena_state: std.heap.ArenaAllocator = .init(s.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A name in the cache -> the name it should have.
+    var keep: std.StringHashMapUnmanaged([]const u8) = .empty;
+    for (0..ix.n_docs) |i| {
+        const id: u32 = @intCast(i);
+        if (ix.removed(id) or ix.sources[id] != @backingInt(content.Source.extracted)) continue;
+        const d = ix.docIn(id);
+        var nbuf: [64]u8 = undefined;
+        const name = arena.dupe(u8, textName(&nbuf, d)) catch return;
+        keep.put(arena, name, name) catch return;
+        const old = arena.print("{x:0>16}-{d}.txt", .{
+            std.hash.Wyhash.hash(0, d.path),
+            d.mtime,
+        }) catch return;
+        keep.put(arena, old, name) catch return;
+    }
+    var dbuf: [4096]u8 = undefined;
+    const dir = std.mem.printSentinel(&dbuf, "{s}", .{s.text_dir}, 0) catch return;
+    const fd = sys.openDir(dir) catch return;
+    defer sys.close(fd);
+    var it: sys.DirIter = .{ .fd = fd };
+    while (it.next() catch return) |e| {
+        if (e.kind == std.os.linux.DT.DIR) continue;
+        var nbuf: [256]u8 = undefined;
+        const name = std.mem.printSentinel(&nbuf, "{s}", .{e.name}, 0) catch continue;
+        const want = keep.get(e.name) orelse {
+            _ = std.os.linux.unlinkat(fd, name, 0);
+            continue;
+        };
+        if (std.mem.eql(u8, want, e.name)) continue;
+        var wbuf: [64]u8 = undefined;
+        const to = std.mem.printSentinel(&wbuf, "{s}", .{want}, 0) catch continue;
+        _ = std.os.linux.renameat(fd, name, fd, to);
     }
 }
 
@@ -629,6 +789,9 @@ fn run(s: *ContentService) void {
     // `seen` is read before refreshing: a poke that lands during a refresh
     // still counts afterwards (it may come after the listing).
     var seen = s.wake.load(.acquire);
+    // Before the check, which would extract again what is cached under the
+    // older naming.
+    s.sweepText();
     s.refresh();
     while (!s.stop.load(.acquire)) {
         // Sleep until poked or until the next periodic check.
@@ -971,6 +1134,7 @@ test "content service: Office documents are extracted once per version" {
 
     var hash_buf: [32]u8 = undefined;
     const prefix = try std.mem.print(&hash_buf, "{x:0>16}-", .{std.hash.Wyhash.hash(0, report)});
+    const v2 = sys.nowSeconds() - 100;
 
     {
         const s = try f.start();
@@ -1014,7 +1178,6 @@ test "content service: Office documents are extracted once per version" {
 
         // A new version: extracted once more, the old version's text dropped.
         try zipDoc(&stage, report, "platypus");
-        const v2 = sys.nowSeconds() - 100;
         try setMtime(report, v2);
         try pokeAndWait(s);
         st = s.status();
@@ -1022,25 +1185,119 @@ test "content service: Office documents are extracted once per version" {
         try testing.expectEqual(@as(u32, 2), st.builds);
         try testing.expectEqual(@as(usize, 1), try countText(s, prefix));
         var nbuf: [64]u8 = undefined;
-        const name = try std.mem.print(&nbuf, "{s}{d}.txt", .{ prefix, v2 });
+        const name = try std.mem.print(&nbuf, "{s}{d}-", .{ prefix, v2 });
         try testing.expectEqual(@as(usize, 1), try countText(s, name));
         try testing.expectEqual(@as(usize, 0), (try f.find(s, "wombat")).len);
         hits = try f.find(s, "platypus");
         try testing.expectEqual(@as(usize, 1), hits.len);
         try testing.expect(hits[0].extracted);
+
+        // Edited again within the same second (the same mtime, another
+        // size): the old text was reused, then the current one deleted as
+        // the old version's.
+        try zipDoc(&stage, report, "echidna, and a much longer sentence");
+        try setMtime(report, v2);
+        try pokeAndWait(s);
+        try testing.expectEqual(@as(u32, 4), s.status().extractions);
+        try testing.expectEqual(@as(usize, 0), (try f.find(s, "platypus")).len);
+        try testing.expectEqual(@as(usize, 1), (try f.find(s, "echidna")).len);
+        try testing.expectEqual(@as(usize, 1), try countText(s, prefix));
     }
 
+    // Texts no document refers to: a version never indexed (a crash in
+    // between), the old naming, a write cut short. Swept on start.
+    try f.cache.write("text/0123456789abcdef-1700000000-99.txt", "stale");
+    try f.cache.write("text/0123456789abcdef-1700000000.txt", "old name");
+    try f.cache.write("text/0123456789abcdef-1-2.txt.tmp", "half");
+    // And the current version's text under the naming before sizes: renamed
+    // on start, not extracted again.
+    var nbuf: [4096]u8 = undefined;
+    var obuf: [4096]u8 = undefined;
+    const size = sys.info(report).?.size;
+    const now_name = try std.mem.printSentinel(&nbuf, "{s}/text/{s}{d}-{d}.txt", .{
+        f.cache.abs,
+        prefix,
+        v2,
+        size,
+    }, 0);
+    const old_name = try std.mem.printSentinel(&obuf, "{s}/text/{s}{d}.txt", .{
+        f.cache.abs,
+        prefix,
+        v2,
+    }, 0);
+    try sys.rename(now_name, old_name);
+
     // Restarted: the extracted text is reused, nothing is extracted again.
+    // (Its text is found once renamed: the start's sweep, then the check.)
     const s = try f.start();
     defer s.shutdown();
-    try testing.expectEqual(@as(usize, 1), (try f.find(s, "platypus")).len);
     try waitChecks(s, 1);
     try testing.expectEqual(@as(u32, 0), s.status().extractions);
     try testing.expectEqual(@as(u32, 0), s.status().builds);
+    try testing.expectEqual(@as(usize, 0), try countText(s, "0123456789abcdef-"));
+    // Both documents' texts stay (the broken one's is empty).
+    try testing.expectEqual(@as(usize, 2), try countText(s, ""));
+    try testing.expect(sys.exists(now_name));
+    try testing.expectEqual(@as(usize, 1), (try f.find(s, "echidna")).len);
 
     // Deleted: its text goes with it.
     _ = linux.unlink(report);
     try pokeAndWait(s);
     try testing.expectEqual(@as(usize, 0), try countText(s, prefix));
     try testing.expectEqual(@as(usize, 1), s.status().docs);
+}
+
+test "content service: a document whose extraction failed in passing is left out, and retried" {
+    var t = try TestTree.init();
+    defer t.deinit();
+    try t.write("a.pdf", "not really a pdf");
+    try t.write("b.txt", "plain words here");
+    var pbuf: [4096]u8 = undefined;
+    const pdf = try t.path(&pbuf, "a.pdf");
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const pool = try Pool.create(testing.allocator, testing.io, 0);
+    defer pool.destroy();
+    // Only what retrying touches: no thread, no cache.
+    var s: ContentService = .{
+        .gpa = testing.allocator,
+        .io = testing.io,
+        .root = t.abs,
+        .cache_path = undefined,
+        .text_dir = undefined,
+        .search_pool = pool,
+        .build_pool = pool,
+        .opts = .{},
+        .retry_arena = .init(testing.allocator),
+    };
+    defer s.retry_arena.deinit();
+    const docs = content_list.list(arena, testing.allocator, testing.io, t.abs, true) catch |err|
+        return switch (err) {
+            error.FileNotFound => error.SkipZigTest, // no ripgrep
+            else => err,
+        };
+    try testing.expectEqual(@as(usize, 2), docs.len);
+    try testing.expectEqualStrings(pdf, docs[0].path);
+
+    // Timed out: left out (indexed, it stayed textless until it changed).
+    const kept = s.leaveOut(arena, docs, &.{0}, &[_]?anyerror{error.Timeout}).?;
+    try testing.expectEqual(@as(usize, 1), kept.len);
+    try testing.expect(std.mem.endsWith(u8, kept[0].path, "/b.txt"));
+    try testing.expectEqual(@as(usize, 1), s.retry.len);
+    try testing.expectEqualStrings(pdf, s.retry[0].path);
+    const reader: content.TextReader = .{ .read = textOf, .ctx = &s };
+    s.index = try content.build(testing.allocator, pool, kept, reader, null);
+    defer s.index.?.deinit(testing.allocator);
+
+    // The next check, though it lists nothing, tries it again.
+    const d = try s.indexedChanges(arena);
+    try testing.expectEqual(@as(usize, 0), d.gone.len);
+    try testing.expectEqual(@as(usize, 1), d.added.len);
+    try testing.expectEqualStrings(pdf, d.added[0].path);
+    try testing.expectEqual(content.Source.extracted, d.added[0].source);
+    // Extracted this time: indexed, nothing left to retry.
+    const all = s.leaveOut(arena, d.added, &.{0}, &[_]?anyerror{null}).?;
+    try testing.expectEqual(@as(usize, 1), all.len);
+    try testing.expectEqual(@as(usize, 0), s.retry.len);
 }

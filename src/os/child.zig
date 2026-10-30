@@ -27,6 +27,9 @@ pub const Options = struct {
     /// Lumen's environment, or none (what a tool prints must not depend
     /// on the user's locale or settings).
     environ: enum { inherit, empty } = .inherit,
+    /// Set: the program is killed as if past its deadline, within 100 ms
+    /// (a service shutting down does not wait for its tools).
+    cancel: ?*const std.atomic.Value(bool) = null,
 };
 
 /// Owned by the caller: free with `deinit`.
@@ -92,7 +95,7 @@ pub fn run(
     // Both outputs closed, but the program may live on (it closed them, or
     // a background child holds them): wait for its exit up to the deadline.
     const timed_out = end == .timed_out or
-        (end == .closed and !os.waitExit(child.id.?, opts.deadline_ns));
+        (end == .closed and !waitExit(child.id.?, &opts));
     var code: ?u8 = null;
     if (end == .closed and !timed_out) {
         if (child.wait(io)) |term| switch (term) {
@@ -107,6 +110,19 @@ pub fn run(
         .timed_out = timed_out,
         .capped = end == .capped,
     };
+}
+
+/// Whether the program exited before its deadline, looked at every 100 ms
+/// when it can be cancelled.
+fn waitExit(pid: linux.pid_t, opts: *const Options) bool {
+    const cancel = opts.cancel orelse return os.waitExit(pid, opts.deadline_ns);
+    while (!cancel.load(.acquire)) {
+        const now_ns = os.monotonicNs();
+        if (now_ns >= opts.deadline_ns) return false;
+        const slice_end = @min(opts.deadline_ns, now_ns + 100 * std.time.ns_per_ms);
+        if (os.waitExit(pid, slice_end)) return true;
+    }
+    return false;
 }
 
 /// A running program's pipes: stdin written and both outputs read in one
@@ -138,6 +154,8 @@ const Pump = struct {
         while (p.out_open or p.err_open) {
             const now_ns = os.monotonicNs();
             if (now_ns >= p.opts.deadline_ns) return .timed_out;
+            const cancel = p.opts.cancel;
+            if (cancel != null and cancel.?.load(.acquire)) return .timed_out;
             var fds: [3]linux.pollfd = undefined;
             var n: usize = 0;
             if (p.out_open) {
@@ -154,7 +172,7 @@ const Pump = struct {
             }
             const left_ms: i32 = @intCast(@min(
                 (p.opts.deadline_ns - now_ns) / std.time.ns_per_ms + 1,
-                std.math.maxInt(i32),
+                @as(u64, if (cancel != null) 100 else std.math.maxInt(i32)),
             ));
             switch (linux.errno(linux.poll(&fds, n, left_ms))) {
                 .SUCCESS => {},

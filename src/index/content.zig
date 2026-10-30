@@ -41,13 +41,20 @@ const header_len = 64;
 
 /// Plain text files above this are not indexed (logs, dumps, data).
 pub const max_text = 1 << 20;
+/// Extracted text kept per document (PDF, Office).
+pub const max_extracted = 4 << 20;
 /// A segment is closed past this many (trigram, doc) pairs: 32 MB of pairs
 /// and as much again to sort them. 16 M pairs made the build peak at 585 MB
 /// (49 k documents) for no faster queries; 4 M peaks at ~346 MB, for 12
 /// segments instead of 4 and an index 8 % larger.
 const segment_pairs = 4 << 20;
-/// Documents read in parallel per round.
+/// Documents read in parallel per round, at most.
 const batch_docs = 1024;
+/// And at most as many as could give this many pairs (one per byte of
+/// text): a round of 1024 high-entropy 1 MB files once held a billion
+/// pairs, 8 GB, and as much again to sort them. Ordinary text gives a pair
+/// per ~9 bytes, so a round still reads hundreds of files.
+const round_pairs = segment_pairs;
 
 /// Where a document's text comes from: the file itself, or text extracted
 /// from it (PDF, Office) and cached on disk.
@@ -185,7 +192,13 @@ pub const Index = struct {
     /// is decoded; the decoders are bounds-safe instead): header offsets in
     /// bounds and aligned, every path inside the file, every source a
     /// known kind, every segment's arrays in bounds, keys strictly ascending
-    /// (binary search), offsets non-decreasing and within the postings.
+    /// (binary search) and trigrams (24 bits), offsets non-decreasing and
+    /// within the postings.
+    ///
+    /// That doc ids rise from one segment to the next is not checked: it
+    /// would mean decoding every list on open. Whatever reads lists across
+    /// segments copes with ids that repeat or go back instead (`candidates`,
+    /// `closeSegment`).
     pub fn parse(whole: []align(8) u8, mapped: bool) error{BadIndex}!Index {
         if (whole.len < header_len or !std.mem.eql(u8, whole[0..8], magic)) return error.BadIndex;
         const rd = struct {
@@ -285,7 +298,7 @@ pub const Index = struct {
         }
         if (keys.items.len == 0) return;
         std.mem.sort(u32, keys.items, {}, std.sort.asc(u32));
-        const uniq = dedupSorted(keys.items);
+        const uniq = dedupSorted(u32, keys.items);
 
         var lists = try gpa.alloc([]const u8, uniq.len);
         defer gpa.free(lists);
@@ -316,6 +329,13 @@ pub const Index = struct {
                 std.mem.swap(std.ArrayList(u32), &cur, &next);
             }
             for (cur.items) |d| if (!ix.removed(d)) try out.append(gpa, d);
+        }
+        // Ids rise across the segments of an index this code wrote; a
+        // damaged one may repeat or reorder them, and callers count on ids
+        // ascending.
+        if (!strictlyAscending(u32, out.items)) {
+            std.mem.sort(u32, out.items, {}, std.sort.asc(u32));
+            out.shrinkRetainingCapacity(dedupSorted(u32, out.items).len);
         }
     }
 
@@ -354,6 +374,8 @@ fn checkSegment(buf: []align(8) const u8, seg: SegEntry) error{BadIndex}!void {
     if (n_keys > 1) {
         for (keys[0 .. n_keys - 1], keys[1..]) |a, b| if (a >= b) return error.BadIndex;
     }
+    // Ascending: the last key is the largest.
+    if (n_keys > 0 and keys[n_keys - 1] > 0xff_ffff) return error.BadIndex;
     var prev: u32 = 0;
     for (offs) |x| {
         if (x < prev) return error.BadIndex;
@@ -367,7 +389,7 @@ fn sliceAt(comptime T: type, buf: []align(8) u8, off: usize, n: usize) []T {
     return p[0..n];
 }
 
-fn dedupSorted(xs: []u32) []u32 {
+fn dedupSorted(comptime T: type, xs: []T) []T {
     if (xs.len == 0) return xs;
     var w: usize = 1;
     for (xs[1..]) |x| {
@@ -377,6 +399,12 @@ fn dedupSorted(xs: []u32) []u32 {
         }
     }
     return xs[0..w];
+}
+
+fn strictlyAscending(comptime T: type, xs: []const T) bool {
+    if (xs.len < 2) return true;
+    for (xs[0 .. xs.len - 1], xs[1..]) |a, b| if (a >= b) return false;
+    return true;
 }
 
 /// Next varint of `b` from `pos`, or null at the end of the list or on a
@@ -488,7 +516,26 @@ pub const TextFn = *const fn (
 ) std.mem.Allocator.Error!bool;
 
 /// A `TextFn` and the context it is called with.
-pub const TextReader = struct { read: TextFn, ctx: *anyopaque };
+pub const TextReader = struct {
+    read: TextFn,
+    ctx: *anyopaque,
+    /// Most bytes of text `read` gives for an extracted document (its text
+    /// is not the size of the file, the size of the cached text is); null:
+    /// `max_extracted`.
+    extracted_len: ?*const fn (ctx: *anyopaque, doc: DocIn) u64 = null,
+
+    /// Most (trigram, doc) pairs reading `d` can give: one per byte of text.
+    fn mostPairs(r: TextReader, d: DocIn) usize {
+        const len = switch (d.source) {
+            .plain => @min(d.size, max_text),
+            .extracted => if (r.extracted_len) |f|
+                @min(f(r.ctx, d), max_extracted)
+            else
+                max_extracted,
+        };
+        return @intCast(@min(len, 1 << 24));
+    }
+};
 
 /// Plain text of a file: up to `max_text` bytes, rejected if binary (a NUL in
 /// the first 8 KB, git's rule).
@@ -510,20 +557,26 @@ pub fn readPlain(
     return std.mem.findScalar(u8, head, 0) == null;
 }
 
+/// One round of reading: documents `lo..hi`, each taken by the next free
+/// task (no fixed shares, so nobody waits for the slowest file of a share).
 const ExtractCtx = struct {
     gpa: std.mem.Allocator,
     docs: []const DocIn,
     lo: usize,
-    text: TextFn,
-    text_ctx: *anyopaque,
-    /// Per task: trigram keys of each of its documents, concatenated.
+    hi: usize,
+    text: TextReader,
+    /// Per task: trigram keys of the documents it read, in the order read.
     out: []std.ArrayList(u64),
-    tasks: usize,
-    batch_hi: usize,
+    /// Per document of the round: where its pairs are in `out`.
+    spans: []Pairs,
+    next: std.atomic.Value(usize),
     /// Set by a task that ran out of memory: the build fails (and is retried
     /// later) instead of indexing its documents as empty.
     oom: std.atomic.Value(bool) = .init(false),
 };
+
+/// Where one document's pairs are: `out[task][start..][0..len]`.
+const Pairs = struct { task: usize, start: usize, len: usize };
 
 fn extractTask(ctx: *ExtractCtx, t: usize) void {
     extractTaskOrFail(ctx, t) catch ctx.oom.store(true, .release);
@@ -531,21 +584,24 @@ fn extractTask(ctx: *ExtractCtx, t: usize) void {
 
 fn extractTaskOrFail(ctx: *ExtractCtx, t: usize) std.mem.Allocator.Error!void {
     const gpa = ctx.gpa;
-    const n = ctx.batch_hi - ctx.lo;
-    const per = std.math.divCeil(usize, n, ctx.tasks) catch unreachable; // tasks > 0
-    const from = ctx.lo + t * per;
-    const to = @min(from + per, ctx.batch_hi);
-    if (from >= to) return;
     // One bit per possible trigram: dedup in O(n) without sorting.
-    const seen = try gpa.alloc(u64, (1 << 24) / 64);
+    var seen: []u64 = &.{};
     defer gpa.free(seen);
-    @memset(seen, 0);
     var keys: std.ArrayList(u32) = .empty;
     defer keys.deinit(gpa);
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(gpa);
-    for (from..to) |d| {
-        if (!try ctx.text(ctx.text_ctx, ctx.docs[d], &text, gpa)) continue;
+    const out = &ctx.out[t];
+    while (true) {
+        const d = ctx.next.fetchAdd(1, .monotonic);
+        if (d >= ctx.hi) return;
+        const start = out.items.len;
+        defer ctx.spans[d - ctx.lo] = .{ .task = t, .start = start, .len = out.items.len - start };
+        if (!try ctx.text.read(ctx.text.ctx, ctx.docs[d], &text, gpa)) continue;
+        if (seen.len == 0) {
+            seen = try gpa.alloc(u64, (1 << 24) / 64);
+            @memset(seen, 0);
+        }
         keys.clearRetainingCapacity();
         var it: Trigrams = .{ .s = text.items };
         while (it.next()) |k| {
@@ -556,8 +612,8 @@ fn extractTaskOrFail(ctx: *ExtractCtx, t: usize) std.mem.Allocator.Error!void {
             try keys.append(gpa, k);
         }
         for (keys.items) |k| seen[k >> 6] &= ~(@as(u64, 1) << @intCast(k & 63));
-        try ctx.out[t].ensureUnusedCapacity(gpa, keys.items.len);
-        for (keys.items) |k| ctx.out[t].appendAssumeCapacity(@as(u64, k) << 32 | d);
+        try out.ensureUnusedCapacity(gpa, keys.items.len);
+        for (keys.items) |k| out.appendAssumeCapacity(@as(u64, k) << 32 | d);
     }
 }
 
@@ -983,6 +1039,12 @@ fn writeDocs(
 /// Indexes `docs[from..]` (ids are positions in `docs`), closing segments as
 /// they fill; `initial` pairs (decoded from segments being merged, lower
 /// ids) go first.
+///
+/// Memory stays bounded whatever the text: a round reads no more documents
+/// than could give `round_pairs` pairs, and its pairs join the segment one
+/// document at a time, closing it as soon as it is full. Pairs held: the
+/// round's, the segment's (`segment_pairs` and one document's at most) and
+/// as many to sort them.
 fn indexDocs(
     sink: *Sink,
     pool: *Pool,
@@ -1006,33 +1068,51 @@ fn indexDocs(
         gpa.free(task_out);
     }
     for (task_out) |*t| t.* = .empty;
+    const spans = try gpa.alloc(Pairs, batch_docs);
+    defer gpa.free(spans);
 
-    const n = docs.len;
     var lo = from;
-    while (lo < n) {
-        const hi = @min(lo + batch_docs, n);
+    while (lo < docs.len) {
+        const hi = roundEnd(docs, lo, text);
         var ctx: ExtractCtx = .{
             .gpa = gpa,
             .docs = docs,
             .lo = lo,
-            .text = text.read,
-            .text_ctx = text.ctx,
+            .hi = hi,
+            .text = text,
             .out = task_out,
-            .tasks = tasks,
-            .batch_hi = hi,
+            .spans = spans,
+            .next = .init(lo),
         };
-        pool.run(tasks, &ctx, extractTask);
+        pool.run(@min(tasks, hi - lo), &ctx, extractTask);
         if (ctx.oom.load(.acquire)) return error.OutOfMemory;
-        // Task ranges are contiguous and in order: concatenating keeps pairs
-        // in doc order, which the stable radix sort turns into (key, doc).
+        // In doc order, which the stable radix sort turns into (key, doc).
+        for (spans[0 .. hi - lo]) |s| {
+            try pairs.appendSlice(gpa, task_out[s.task].items[s.start..][0..s.len]);
+            if (pairs.items.len >= segment_pairs) try closePairs(sink, dir, &pairs, &scratch, st);
+        }
+        // What a task kept from a large round would add up across rounds.
         for (task_out) |*t| {
-            try pairs.appendSlice(gpa, t.items);
-            t.clearRetainingCapacity();
+            if (t.capacity > round_pairs / tasks) {
+                t.clearAndFree(gpa);
+            } else t.clearRetainingCapacity();
         }
         lo = hi;
-        if (pairs.items.len >= segment_pairs) try closePairs(sink, dir, &pairs, &scratch, st);
     }
     if (pairs.items.len > 0) try closePairs(sink, dir, &pairs, &scratch, st);
+}
+
+/// Where the round of documents from `lo` ends: `batch_docs` documents, or
+/// fewer when their text could give more than `round_pairs` pairs (one
+/// document at least).
+fn roundEnd(docs: []const DocIn, lo: usize, text: TextReader) usize {
+    var hi = lo;
+    var most: usize = 0;
+    while (hi < docs.len and hi - lo < batch_docs) : (hi += 1) {
+        most += text.mostPairs(docs[hi]);
+        if (hi > lo and most > round_pairs) break;
+    }
+    return hi;
 }
 
 fn closePairs(
@@ -1103,6 +1183,11 @@ const Out = std.array_list.Aligned(u8, .@"8");
 
 /// Sorts a segment's pairs by trigram (stable, so docs stay ascending) and
 /// appends keys, offsets and varint-delta lists.
+///
+/// Pairs decoded from a file (`appendFile` merges its last segments) are
+/// not trusted to be in order: in a damaged file a later segment may list
+/// a document again, or one lower than an earlier segment did. Those are
+/// sorted whole and deduplicated, never encoded as wrapped deltas.
 fn closeSegment(
     sink: *Sink,
     dir: *std.ArrayList(SegEntry),
@@ -1113,48 +1198,75 @@ fn closeSegment(
     try scratch.resize(gpa, pairs.len);
     radixByKey(pairs, scratch.items);
 
-    var keys: std.ArrayList(u32) = .empty;
-    defer keys.deinit(gpa);
-    var offs: std.ArrayList(u32) = .empty;
-    defer offs.deinit(gpa);
-    var post: std.ArrayList(u8) = .empty;
-    defer post.deinit(gpa);
-    // What `validate` checks on open, made sure of here: keys strictly
-    // ascending (binary search), each list's docs too (deltas never wrap).
-    var i: usize = 0;
-    while (i < pairs.len) {
-        const k: u32 = @intCast(pairs[i] >> 32);
-        if (keys.items.len > 0) std.debug.assert(keys.items[keys.items.len - 1] < k);
-        try keys.append(gpa, k);
-        try offs.append(gpa, @intCast(post.items.len));
-        var prev: u32 = 0;
-        var first = true;
-        while (i < pairs.len and pairs[i] >> 32 == k) : (i += 1) {
-            const d: u32 = @truncate(pairs[i]);
-            std.debug.assert(first or d > prev);
-            first = false;
-            try writeVarint(gpa, &post, d - prev);
-            prev = d;
-        }
+    var lists: Lists = .{};
+    defer lists.deinit(gpa);
+    if (!try lists.encode(gpa, pairs)) {
+        // A pair is its key then its doc, so a plain sort orders both.
+        std.mem.sort(u64, pairs, {}, std.sort.asc(u64));
+        lists.clear();
+        const ok = try lists.encode(gpa, dedupSorted(u64, pairs));
+        std.debug.assert(ok);
     }
-    try offs.append(gpa, @intCast(post.items.len));
 
     try sink.pad8();
     const keys_off = sink.pos();
-    try sink.append(std.mem.sliceAsBytes(keys.items));
+    try sink.append(std.mem.sliceAsBytes(lists.keys.items));
     try sink.pad8();
     const offs_off = sink.pos();
-    try sink.append(std.mem.sliceAsBytes(offs.items));
+    try sink.append(std.mem.sliceAsBytes(lists.offs.items));
     const post_off = sink.pos();
-    try sink.append(post.items);
+    try sink.append(lists.post.items);
     try dir.append(gpa, .{
-        .n_keys = keys.items.len,
+        .n_keys = lists.keys.items.len,
         .keys_off = keys_off,
         .offs_off = offs_off,
         .post_off = post_off,
-        .post_len = post.items.len,
+        .post_len = lists.post.items.len,
     });
 }
+
+/// A segment's keys, list offsets and posting lists, as they are written.
+const Lists = struct {
+    keys: std.ArrayList(u32) = .empty,
+    offs: std.ArrayList(u32) = .empty,
+    post: std.ArrayList(u8) = .empty,
+
+    fn deinit(l: *Lists, gpa: std.mem.Allocator) void {
+        l.keys.deinit(gpa);
+        l.offs.deinit(gpa);
+        l.post.deinit(gpa);
+    }
+
+    fn clear(l: *Lists) void {
+        l.keys.clearRetainingCapacity();
+        l.offs.clearRetainingCapacity();
+        l.post.clearRetainingCapacity();
+    }
+
+    /// Encodes `pairs`, sorted by key. What `parse` checks on open is made
+    /// sure of here: keys strictly ascending (binary search), each list's
+    /// docs too (deltas never wrap). False, half done, when they are not.
+    fn encode(l: *Lists, gpa: std.mem.Allocator, pairs: []const u64) std.mem.Allocator.Error!bool {
+        var i: usize = 0;
+        while (i < pairs.len) {
+            const k: u32 = @intCast(pairs[i] >> 32);
+            if (l.keys.items.len > 0 and l.keys.items[l.keys.items.len - 1] >= k) return false;
+            try l.keys.append(gpa, k);
+            try l.offs.append(gpa, @intCast(l.post.items.len));
+            var prev: u32 = 0;
+            var first = true;
+            while (i < pairs.len and pairs[i] >> 32 == k) : (i += 1) {
+                const d: u32 = @truncate(pairs[i]);
+                if (!first and d <= prev) return false;
+                first = false;
+                try writeVarint(gpa, &l.post, d - prev);
+                prev = d;
+            }
+        }
+        try l.offs.append(gpa, @intCast(l.post.items.len));
+        return true;
+    }
+};
 
 /// LSD radix sort on bits 32..55 (the trigram), two stable passes of 12 bits.
 fn radixByKey(a: []u64, tmp: []u64) void {
@@ -1741,6 +1853,10 @@ pub const SearchOptions = struct {
     /// Where each document's text is read from, and its context.
     text_path: PathFn,
     text_ctx: *anyopaque,
+    /// Set by another thread once the answer is not wanted any more (a
+    /// newer query waits): verification stops at the next candidate, and
+    /// the matches so far are returned.
+    stop: ?*const std.atomic.Value(bool) = null,
 };
 
 /// For plain documents only (benchmarks, tests).
@@ -1765,6 +1881,7 @@ const VerifyCtx = struct {
     cands: []const Cand,
     text_path: PathFn,
     text_ctx: *anyopaque,
+    stop: ?*const std.atomic.Value(bool),
     arenas: []std.heap.ArenaAllocator,
     now: i64,
     next: std.atomic.Value(usize) = .init(0),
@@ -1815,6 +1932,7 @@ fn verifyTask(ctx: *VerifyCtx, t: usize) void {
     defer buf.deinit(ctx.gpa);
     const a = ctx.arenas[t].allocator();
     while (true) {
+        if (ctx.stop) |s| if (s.load(.acquire)) return;
         const i = ctx.next.fetchAdd(1, .monotonic);
         if (i >= ctx.cands.len) return;
         const cand = ctx.cands[i];
@@ -1982,6 +2100,7 @@ pub fn search(
         .cands = ordered[0..@min(ordered.len, max_candidates)],
         .text_path = text_path,
         .text_ctx = text_ctx,
+        .stop = opts.stop,
         .arenas = arenas,
         .now = now,
         .top = top,
@@ -2293,6 +2412,18 @@ test "search: unaccented and capital queries find accented text" {
         &out,
     );
     try testing.expectEqual(@as(usize, 0), out.items.len);
+    // Not wanted any more (a newer query waits): no file is read.
+    var stop: std.atomic.Value(bool) = .init(true);
+    try search(
+        &ix,
+        gpa,
+        arena.allocator(),
+        pool,
+        "accion",
+        .{ .limit = 10, .text_path = plainPath, .text_ctx = &dummy, .stop = &stop },
+        &out,
+    );
+    try testing.expectEqual(@as(usize, 0), out.items.len);
 }
 
 // ------------------------------------------------- corrupt indexes, fuzzing
@@ -2353,6 +2484,7 @@ fn exerciseIndex(ix: *const Index, gpa: std.mem.Allocator) !void {
     var sum: usize = ix.postingBytes();
     for (queries) |q| {
         try ix.candidates(gpa, q, &got);
+        try testing.expect(strictlyAscending(u32, got.items));
         for (got.items) |d| {
             try testing.expect(d < ix.n_docs);
             const src: Source = @fromBackingInt(@intCast(ix.sources[d]));
@@ -2497,9 +2629,262 @@ test "malformed posting lists end, never over-read" {
     try exerciseIndex(&ix, gpa);
 }
 
-test "random byte flips in a content index never crash" {
-    const gpa = testing.allocator;
+/// Texts of the documents tests add by updates: they share words with
+/// `smallIndex`'s and with each other.
+const update_texts = [_][]const u8{
+    "arena zig élan",
+    "token arena parser",
+    "zig lumen posting",
+    "config arena zig",
+};
+
+/// `smallIndex` (60 documents) updated four times, a document each (ids
+/// 60-63): five segments, the last four small, which the next append
+/// merges.
+fn segmentedIndex(gpa: std.mem.Allocator, pool: *Pool) !Index {
     var ix = try smallIndex(gpa);
+    errdefer ix.deinit(gpa);
+    var td: TestDocs = .{ .texts = &update_texts };
+    for (0..merge_small) |i| {
+        var nbuf: [8]u8 = undefined;
+        const added = [_]DocIn{.{
+            .path = try std.mem.print(&nbuf, "{d}", .{i}),
+            .mtime = 100,
+            .size = 1,
+        }};
+        const next = try update(gpa, pool, &ix, &.{}, &added, .{
+            .read = TestDocs.text,
+            .ctx = &td,
+        }, null);
+        ix.deinit(gpa);
+        ix = next;
+    }
+    return ix;
+}
+
+/// `appendFile` without the file: `old`'s bytes, then what it appends.
+fn appendMemory(
+    gpa: std.mem.Allocator,
+    pool: *Pool,
+    old: *const Index,
+    gone: []const u32,
+    added: []const DocIn,
+    text: TextReader,
+) !Index {
+    var sink: Sink = .{ .gpa = gpa, .written = old.buf.len };
+    defer sink.deinit();
+    const h = appendInto(&sink, pool, old, gone, added, text, null) catch |err|
+        return memoryOnly(err);
+    const buf = try gpa.alignedAlloc(u8, .@"8", old.buf.len + sink.buf.items.len);
+    errdefer gpa.free(buf);
+    @memcpy(buf[0..old.buf.len], old.buf);
+    @memcpy(buf[old.buf.len..], sink.buf.items);
+    @memcpy(buf[0..header_len], &headerBytes(h));
+    return Index.parse(buf, false);
+}
+
+/// What the service does with the index it mapped: updates it and appends
+/// to it. Must never crash on an index that `parse` accepted, and must give
+/// one that parses and answers.
+fn exerciseUpdates(ix: *const Index, gpa: std.mem.Allocator, pool: *Pool) !void {
+    var td: TestDocs = .{ .texts = &update_texts };
+    const reader: TextReader = .{ .read = TestDocs.text, .ctx = &td };
+    const added = [_]DocIn{
+        .{ .path = "0", .mtime = 200, .size = 1 },
+        .{ .path = "3", .mtime = 200, .size = 1 },
+    };
+    const gone: []const u32 = if (ix.n_docs > 0) &.{0} else &.{};
+    var up = try update(gpa, pool, ix, gone, &added, reader, null);
+    defer up.deinit(gpa);
+    try exerciseIndex(&up, gpa);
+    var app = try appendMemory(gpa, pool, ix, gone, &added, reader);
+    defer app.deinit(gpa);
+    try exerciseIndex(&app, gpa);
+}
+
+test "segments that repeat or reorder doc ids (a damaged file): queries, updates and appends cope" {
+    const gpa = testing.allocator;
+    const pool = try Pool.create(gpa, testing.io, 1);
+    defer pool.destroy();
+    var ix = try segmentedIndex(gpa, pool);
+    defer ix.deinit(gpa);
+    try testing.expectEqual(@as(usize, 5), ix.n_segs);
+    // The last segment holds document 63 ("config arena zig") alone: each
+    // of its lists is that id, one byte. Make it 61 ("token arena
+    // parser"): "arena" lists 61 in segment 2 and again in segment 4, and
+    // "zig" lists 62 in segment 3, then 61. Nothing `parse` checks.
+    const last = ix.segs[4];
+    @memset(ix.buf[@intCast(last.post_off)..][0..@intCast(last.post_len)], 61);
+    _ = try Index.parse(ix.buf, false);
+
+    var got: std.ArrayList(u32) = .empty;
+    defer got.deinit(gpa);
+    try ix.candidates(gpa, &.{"arena"}, &got);
+    try testing.expect(strictlyAscending(u32, got.items));
+    try testing.expect(std.mem.findScalar(u32, got.items, 61) != null);
+    try ix.candidates(gpa, &.{"zig"}, &got);
+    try testing.expect(strictlyAscending(u32, got.items));
+
+    // Appended: the small segments (all five) are decoded and merged. That
+    // asserted (a crash loop with safety checks, a wrapped delta and lost
+    // results without).
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dbuf: [4096]u8 = undefined;
+    const dir = try sys.tmpDirPath(&tmp, &dbuf);
+    var pbuf: [4096]u8 = undefined;
+    const p = try std.mem.printSentinel(&pbuf, "{s}/content.idx", .{dir}, 0);
+    try ix.save(p);
+    var mapped = try Index.open(p);
+    defer mapped.deinit(gpa);
+    var td: TestDocs = .{ .texts = &update_texts };
+    const added = [_]DocIn{.{ .path = "0", .mtime = 300, .size = 1 }};
+    var app = (try appendFile(
+        gpa,
+        pool,
+        &mapped,
+        &.{},
+        &added,
+        .{ .read = TestDocs.text, .ctx = &td },
+        p,
+        null,
+    )).?;
+    defer app.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), app.n_segs);
+    try app.candidates(gpa, &.{"zig"}, &got);
+    try testing.expect(strictlyAscending(u32, got.items));
+    // 61 by the damage, 62, and 64 (the new "arena zig élan").
+    for ([_]u32{ 61, 62, 64 }) |d| {
+        try testing.expect(std.mem.findScalar(u32, got.items, d) != null);
+    }
+    try exerciseUpdates(&ix, gpa, pool);
+}
+
+/// Counts the bytes it holds and the most it held at once. Thread-safe.
+const PeakAllocator = struct {
+    child: std.mem.Allocator,
+    lock: std.Io.Mutex = .init,
+    held: usize = 0,
+    peak: usize = 0,
+
+    fn allocator(pa: *PeakAllocator) std.mem.Allocator {
+        return .{ .ptr = pa, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn count(pa: *PeakAllocator, add: usize, sub: usize) void {
+        pa.lock.lockUncancelable(testing.io);
+        defer pa.lock.unlock(testing.io);
+        pa.held = pa.held + add - sub;
+        pa.peak = @max(pa.peak, pa.held);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const pa: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        const p = pa.child.rawAlloc(len, a, ra) orelse return null;
+        pa.count(len, 0);
+        return p;
+    }
+
+    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const pa: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        if (!pa.child.rawResize(m, a, n, ra)) return false;
+        pa.count(n, m.len);
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const pa: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        const p = pa.child.rawRemap(m, a, n, ra) orelse return null;
+        pa.count(n, m.len);
+        return p;
+    }
+
+    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const pa: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        pa.child.rawFree(m, a, ra);
+        pa.count(0, m.len);
+    }
+};
+
+test "a round reads no more than round_pairs of possible text, one document at least" {
+    var dummy: u8 = 0;
+    const reader: TextReader = .{ .read = TestDocs.text, .ctx = &dummy };
+    var docs: [2000]DocIn = undefined;
+    for (&docs) |*d| d.* = .{ .path = "", .mtime = 0, .size = 4096 };
+    // Small files: `batch_docs` a round, and what is left at the end.
+    try testing.expectEqual(@as(usize, batch_docs), roundEnd(&docs, 0, reader));
+    try testing.expectEqual(docs.len, roundEnd(&docs, docs.len - 5, reader));
+    // Files of `max_text` or more (no more than that is read).
+    for (&docs) |*d| d.size = 1 << 30;
+    try testing.expectEqual(@as(usize, round_pairs / max_text), roundEnd(&docs, 0, reader));
+    // Extracted text: as long as the reader says, else the most kept.
+    for (&docs) |*d| d.source = .extracted;
+    try testing.expectEqual(@as(usize, 1), roundEnd(&docs, 0, reader));
+    const Len = struct {
+        fn small(_: *anyopaque, _: DocIn) u64 {
+            return 1000;
+        }
+    };
+    var known = reader;
+    known.extracted_len = Len.small;
+    try testing.expectEqual(@as(usize, batch_docs), roundEnd(&docs, 0, known));
+}
+
+test "building high-entropy text: memory stays bounded by rounds and segments" {
+    // 24 files of 1 MB of random bytes: ~1 M distinct trigrams each, 24 M
+    // pairs. Read in one round, they were all held three times at once
+    // (per task, gathered, sorting); with rounds of 1024 files, any number
+    // of such files was. Rounds bounded by documents only peak at ~380 MB
+    // here (twice as much with twice the files), bounded by pairs ~200 MB,
+    // whatever the number of files.
+    const n = 24;
+    var prng = std.Random.DefaultPrng.init(77);
+    var texts: [n][]const u8 = undefined;
+    var made: usize = 0;
+    defer for (texts[0..made]) |t| testing.allocator.free(t);
+    var docs: [n]DocIn = undefined;
+    var names: [n][8]u8 = undefined;
+    for (&texts, &docs, &names, 0..) |*t, *d, *name, i| {
+        const b = try testing.allocator.alloc(u8, max_text);
+        prng.random().bytes(b);
+        t.* = b;
+        made += 1;
+        d.* = .{ .path = try std.mem.print(name, "{d}", .{i}), .mtime = 0, .size = max_text };
+    }
+    var pa: PeakAllocator = .{ .child = testing.allocator };
+    const gpa = pa.allocator();
+    const pool = try Pool.create(testing.allocator, testing.io, 3);
+    defer pool.destroy();
+    var td: TestDocs = .{ .texts = &texts };
+    var st: BuildStats = .{};
+    // Written as it grows, like the service does: the index is not held.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dbuf: [4096]u8 = undefined;
+    const dir = try sys.tmpDirPath(&tmp, &dbuf);
+    var pbuf: [4096]u8 = undefined;
+    const p = try std.mem.printSentinel(&pbuf, "{s}/content.idx", .{dir}, 0);
+    const reader: TextReader = .{ .read = TestDocs.text, .ctx = &td };
+    var ix = try buildFile(gpa, pool, &docs, reader, p, &st);
+    defer ix.deinit(gpa);
+    try testing.expect(st.pairs > 20 << 20);
+    try testing.expect(st.segments >= 5);
+    // A round (4 M pairs, plus growth), a segment (4 M and a document's
+    // 1 M) and the sort's scratch, at 8 bytes a pair; the encoded segment
+    // before it is written; per task a 2 MB trigram map and a text.
+    try testing.expect(pa.peak < 250 << 20);
+}
+
+test "random byte flips in a content index never crash, nor updating it" {
+    const gpa = testing.allocator;
+    const pool = try Pool.create(gpa, testing.io, 1);
+    defer pool.destroy();
+    var ix = try segmentedIndex(gpa, pool);
     defer ix.deinit(gpa);
     const bad = try gpa.alignedAlloc(u8, .@"8", ix.buf.len);
     defer gpa.free(bad);
@@ -2511,6 +2896,7 @@ test "random byte flips in a content index never crash" {
         for (0..r.intRangeAtMost(usize, 1, 4)) |_| bad[r.uintLessThan(usize, bad.len)] = r.int(u8);
         if (Index.parse(bad, false)) |m| {
             try exerciseIndex(&m, gpa);
+            try exerciseUpdates(&m, gpa, pool);
             accepted += 1;
         } else |_| {}
     }
@@ -2549,8 +2935,11 @@ test "fuzz: parsing arbitrary bytes as a content index never crashes" {
     try testing.fuzz({}, fuzzParseBytes, .{ .corpus = &.{seed} });
 }
 
-fn fuzzFlips(good: []const u8, smith: *testing.Smith) anyerror!void {
+const FlipsCtx = struct { good: []const u8, pool: *Pool };
+
+fn fuzzFlips(ctx: FlipsCtx, smith: *testing.Smith) anyerror!void {
     const gpa = testing.allocator;
+    const good = ctx.good;
     const buf = try gpa.alignedAlloc(u8, .@"8", good.len);
     defer gpa.free(buf);
     @memcpy(buf, good);
@@ -2562,14 +2951,18 @@ fn fuzzFlips(good: []const u8, smith: *testing.Smith) anyerror!void {
         std.mem.writeInt(u32, buf[at..][0..4], smith.value(u32), .little);
     }
     const cut = if (smith.boolWeighted(7, 1)) smith.index(buf.len + 1) else buf.len;
-    if (Index.parse(buf[0..cut], false)) |ix| try exerciseIndex(&ix, gpa) else |_| {}
+    const ix = Index.parse(buf[0..cut], false) catch return;
+    try exerciseIndex(&ix, gpa);
+    try exerciseUpdates(&ix, gpa, ctx.pool);
 }
 
-test "fuzz: a real content index with random damage never crashes" {
+test "fuzz: a real content index with random damage never crashes, nor updating it" {
     const gpa = testing.allocator;
-    var ix = try smallIndex(gpa);
+    const pool = try Pool.create(gpa, testing.io, 1);
+    defer pool.destroy();
+    var ix = try segmentedIndex(gpa, pool);
     defer ix.deinit(gpa);
-    try testing.fuzz(@as([]const u8, ix.buf), fuzzFlips, .{});
+    try testing.fuzz(FlipsCtx{ .good = ix.buf, .pool = pool }, fuzzFlips, .{});
 }
 
 fn fuzzFindFold(_: void, smith: *testing.Smith) anyerror!void {
