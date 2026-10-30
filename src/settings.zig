@@ -214,17 +214,14 @@ pub const Settings = struct {
                 if (v < 10 or v > 100_000) return false;
                 s.clipboard_keep = v;
             },
-            .terminal, .editor, .icon_theme => {
+            // The tag names the field, as in `get` and `setToggle`: a text
+            // choice added here can never write another one's field.
+            inline .terminal, .editor, .icon_theme => |tag| {
                 if (value.len > 0 and !isToken(value)) return false;
-                const owned = s.alloc().dupe(u8, value) catch {
+                @field(s, @tagName(tag)) = s.alloc().dupe(u8, value) catch {
                     s.incomplete = true;
                     return false;
                 };
-                switch (ch) {
-                    .terminal => s.terminal = owned,
-                    .editor => s.editor = owned,
-                    else => s.icon_theme = owned,
-                }
             },
         }
         return true;
@@ -580,6 +577,19 @@ test "save is atomic and owner-only; load survives a missing file" {
     defer kept.deinit();
     try testing.expectEqual(Width.default, kept.width);
     try testing.expectEqual(TextSize.small, kept.text_size);
+}
+
+test "each text choice sets its own field" {
+    var s = Settings.init(testing.allocator);
+    defer s.deinit();
+    try testing.expect(s.setChoice(.terminal, "kitty"));
+    try testing.expect(s.setChoice(.editor, "hx"));
+    try testing.expect(s.setChoice(.icon_theme, "Papirus"));
+    try testing.expectEqualStrings("kitty", s.terminal);
+    try testing.expectEqualStrings("hx", s.editor);
+    try testing.expectEqualStrings("Papirus", s.icon_theme);
+    try testing.expect(!s.setChoice(.editor, "rm -rf"));
+    try testing.expectEqualStrings("hx", s.editor);
 }
 
 test "check tells unknown keys from bad values" {

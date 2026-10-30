@@ -473,8 +473,8 @@ pub fn list(h: *Host, registry: u32, command: u16, query: []const u8) u32 {
     return h.next_gen;
 }
 
-/// Calls form `command`'s submit with `values` (copied). Its answer comes
-/// like an action's.
+/// Frees a submit request whose values could not all be copied, and logs
+/// that it was not sent.
 fn dropSubmit(h: *Host, req: *SubmitReq) u32 {
     log.warn("submit: out of memory, not sent", .{});
     req.arena.deinit();
@@ -482,6 +482,8 @@ fn dropSubmit(h: *Host, req: *SubmitReq) u32 {
     return h.next_gen;
 }
 
+/// Calls form `command`'s submit with `values` (copied). Its answer comes
+/// like an action's.
 pub fn submit(h: *Host, registry: u32, command: u16, values: []const FormValue) u32 {
     h.next_gen +%= 1;
     const req = h.gpa.create(SubmitReq) catch return h.next_gen;
@@ -720,11 +722,41 @@ pub fn reservedId(id: []const u8) bool {
     return std.mem.eql(u8, id, "config") or std.mem.eql(u8, id, "style");
 }
 
+/// Reports what went wrong with a file in Settings > Extensions. Out of
+/// memory, the report goes to the log instead, so it is never lost.
 fn problem(load: *Load, ext: []const u8, message: []const u8) void {
-    load.problems.append(load.a, .{
-        .ext = load.a.dupeSentinel(u8, ext, 0) catch return,
-        .message = load.a.dupeSentinel(u8, message, 0) catch return,
-    }) catch {};
+    problemAppend(load, ext, message) catch {
+        log.warn("{s}: {s} (not shown in Settings: out of memory)", .{ ext, message });
+    };
+}
+
+fn problemAppend(load: *Load, ext: []const u8, message: []const u8) error{OutOfMemory}!void {
+    const ext_copy = try load.a.dupeSentinel(u8, ext, 0);
+    const message_copy = try load.a.dupeSentinel(u8, message, 0);
+    try load.problems.append(load.a, .{ .ext = ext_copy, .message = message_copy });
+}
+
+/// Lists an extension that loaded in Settings > Extensions. Out of memory,
+/// it is reported as a problem instead: an entry with an empty id would
+/// reach the views that act on an extension by its id.
+fn extensionLoaded(load: *Load, id: []const u8, title: [:0]const u8, commands_count: usize) void {
+    extensionLoadedAppend(load, id, title, commands_count) catch {
+        problem(load, id, "loaded, but out of memory to list it");
+    };
+}
+
+fn extensionLoadedAppend(
+    load: *Load,
+    id: []const u8,
+    title: [:0]const u8,
+    commands_count: usize,
+) error{OutOfMemory}!void {
+    const id_copy = try load.a.dupeSentinel(u8, id, 0);
+    try load.extensions.append(load.a, .{
+        .id = id_copy,
+        .title = if (title.len > 0) title else id_copy,
+        .commands = @intCast(commands_count),
+    });
 }
 
 /// A style: <config>/styles/<name>/init.lua, else the built-in one. Its
@@ -780,18 +812,18 @@ fn loadSource(
     };
     const err = e.run(load.a, load_budget_ns, LoadCtx, &ctx, LoadCtx.run);
     e.load = null;
-    if (err == null) if (h.exts.append(h.gpa, e)) {
-        if (!std.mem.eql(
-            u8,
-            id,
-            "config",
-        ) and !std.mem.eql(u8, id, "style")) load.extensions.append(load.a, .{
-            .id = load.a.dupeSentinel(u8, id, 0) catch "",
-            .title = if (ctx.title.len > 0) ctx.title else load.a.dupeSentinel(u8, id, 0) catch "",
-            .commands = @intCast(load.commands.items.len - before.lens[0]),
-        }) catch {};
-        return;
-    } else |_| {};
+    if (err == null) {
+        if (h.exts.append(h.gpa, e)) {
+            // init.lua and the style are not extensions to list.
+            if (!reservedId(id)) {
+                const commands_count = load.commands.items.len - before.lens[0];
+                extensionLoaded(load, id, ctx.title, commands_count);
+            }
+            return;
+        } else |_| {
+            // Out of memory: undone below, like a file that failed.
+        }
+    }
     load.rollback(before);
     problem(load, id, err orelse "out of memory");
     e.close();
@@ -884,7 +916,6 @@ fn parseExtension(L: *lua.State, ctx: *LoadCtx, t: c_int) void {
     lua.c.lua_settop(L, -2);
 }
 
-/// A preference, or a form field: the same fields.
 /// A command's or a field's `name`: present, and a-z, 0-9, - and _ only.
 fn fieldName(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8) [:0]const u8 {
     const name = lua.fieldString(L, a, t, "name", where) orelse
@@ -918,6 +949,7 @@ fn prefChoices(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8)
     return choices;
 }
 
+/// A preference, or a form field: the two take the same fields.
 fn parseField(
     L: *lua.State,
     ctx: *LoadCtx,
@@ -1553,7 +1585,9 @@ fn parseAction(L: *lua.State, a: std.mem.Allocator, t: c_int, where: []const u8)
         );
         defer lua.c.lua_settop(L, -2);
         const n = lua.c.lua_rawlen(L, -1);
-        if (n == 0 or n > 32) lua.raise(L, "{s}.argv: 1 to 32 strings expected", .{where});
+        if (n == 0 or n > api.argv_max) {
+            lua.raise(L, "{s}.argv: 1 to {d} strings expected", .{ where, api.argv_max });
+        }
         const argv = a.alloc([:0]const u8, n) catch lua.oom(L);
         for (argv, 1..) |*arg, i| {
             _ = lua.c.lua_rawgeti(L, -1, @intCast(i));
@@ -1845,12 +1879,20 @@ pub fn stamp(config_dir: []const u8, style: []const u8) u64 {
     return hasher.final();
 }
 
+/// The most entries `stamp` reads from one folder. It runs each time the
+/// window opens, on the main thread: a folder of a million files (a
+/// mistaken copy into extensions/) must not hold the window that long.
+/// Past it, edits to the files left out do not reload anything.
+const stamp_entries_max = 1024;
+
 /// The .lua files directly in `dir`.
 fn hashLua(hasher: *std.hash.Wyhash, dir: [:0]const u8) void {
     hasher.update(dir);
     const d = c.g_dir_open(dir.ptr, 0, null) orelse return;
     defer c.g_dir_close(d);
-    while (c.g_dir_read_name(d)) |fname| {
+    var entries_count: usize = 0;
+    while (c.g_dir_read_name(d)) |fname| : (entries_count += 1) {
+        if (entries_count == stamp_entries_max) break;
         const f = std.mem.span(fname);
         if (!std.mem.endsWith(u8, f, ".lua")) continue;
         var fbuf: [4096]u8 = undefined;
@@ -1865,7 +1907,9 @@ fn hashFolders(hasher: *std.hash.Wyhash, config_dir: []const u8, kind: []const u
     const top = std.mem.printSentinel(&buf, "{s}/{s}", .{ config_dir, kind }, 0) catch return;
     const d = c.g_dir_open(top.ptr, 0, null) orelse return;
     defer c.g_dir_close(d);
-    while (c.g_dir_read_name(d)) |n| {
+    var entries_count: usize = 0;
+    while (c.g_dir_read_name(d)) |n| : (entries_count += 1) {
+        if (entries_count == stamp_entries_max) break;
         var sub_buf: [4096]u8 = undefined;
         const sub = std.mem.printSentinel(
             &sub_buf,

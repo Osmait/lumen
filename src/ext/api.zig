@@ -190,16 +190,18 @@ const prelude =
     \\lumen.storage = storage
 ;
 
-/// `lumen.exec(argv [, { stdin = "", timeout = seconds }])` returns
-/// stdout, exit code (nil when killed) and stderr; or nil and a message
-/// when it cannot run or times out.
+/// The most words a program's argv takes, in `lumen.exec` and in
+/// `lumen.action.exec`.
+pub const argv_max = 64;
+
+/// lumen.exec's arguments, checked.
 const ExecArgs = struct { argc: usize, stdin: []const u8, timeout_ns: u64 };
 
 /// lumen.exec's arguments: the argv list (into `argv`) and the options
 /// table. The strings stay on the stack, so they live until lumen.exec
 /// returns: reading the options can run Lua code (an `__index`), which may
 /// empty the argv table and let the collector free strings still in use.
-fn execArgs(L: *lua.State, argv: *[64][]const u8) lua.Error!ExecArgs {
+fn execArgs(L: *lua.State, argv: *[argv_max][]const u8) lua.Error!ExecArgs {
     const n = c.lua_rawlen(L, 1);
     if (n == 0 or n > argv.len) return lua.fail(
         L,
@@ -249,9 +251,12 @@ fn execArgs(L: *lua.State, argv: *[64][]const u8) lua.Error!ExecArgs {
     return .{ .argc = n, .stdin = stdin, .timeout_ns = timeout_ns };
 }
 
+/// `lumen.exec(argv [, { stdin = "", timeout = seconds }])` returns
+/// stdout, exit code (nil when killed) and stderr; or nil and a message
+/// when it cannot run or times out.
 fn execFn(L: *lua.State) lua.Error!c_int {
     try lua.argTable(L, 1, "lumen.exec");
-    var argv: [64][]const u8 = undefined;
+    var argv: [argv_max][]const u8 = undefined;
     const req = try execArgs(L, &argv);
     const n = req.argc;
     const stdin = req.stdin;
@@ -558,9 +563,13 @@ fn layoutParts(L: *lua.State, l: *layout_mod.Layout, key: []const u8) lua.Error!
         "lumen.layout: {s} is a list of part names",
         .{key},
     );
-    var names: [8][]const u8 = undefined;
+    // The longer of the two orders: a part may appear at most once.
+    var names: [@typeInfo(layout_mod.BarPart).@"enum".field_names.len][]const u8 = undefined;
+    comptime std.debug.assert(names.len >= @typeInfo(layout_mod.RowPart).@"enum".field_names.len);
     const n = c.lua_rawlen(L, -1);
-    if (n == 0 or n > names.len) return lua.fail(L, "lumen.layout: {s} lists 1 to 6 parts", .{key});
+    if (n == 0 or n > names.len) {
+        return lua.fail(L, "lumen.layout: {s} lists 1 to {d} parts", .{ key, names.len });
+    }
     for (names[0..n], 1..) |*name, i| {
         _ = c.lua_rawgeti(L, -1, @intCast(i));
         name.* = lua.toSlice(L, -1) orelse return lua.fail(

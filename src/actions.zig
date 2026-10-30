@@ -13,6 +13,7 @@ const settings_mod = @import("settings.zig");
 const Settings = settings_mod.Settings;
 
 const log = std.log.scoped(.actions);
+const assert = std.debug.assert;
 
 pub const Outcome = union(enum) {
     hide,
@@ -33,14 +34,17 @@ pub const Ctx = struct {
     settings: *const Settings,
 };
 
+/// Runs `op` on `it`. `item.actionsFor` offers each operation only on the
+/// rows it applies to (file operations on files, clipboard ones on
+/// clipboard entries): an operation on another row is a bug, asserted.
 pub fn perform(ctx: Ctx, it: *const Item, op: item_mod.Op) Outcome {
     switch (op) {
         .open, .run => return primary(ctx, it),
-        .open_with => if (it.action == .file) return .{ .choose_app = it.action.file.path },
-        .always_use => if (it.action == .setting) return .{ .setting = .{
-            .setting = it.action.setting,
-            .op = op,
-        } },
+        .open_with => return .{ .choose_app = fileOf(it).path },
+        .always_use => {
+            assert(it.action == .setting);
+            return .{ .setting = .{ .setting = it.action.setting, .op = op } };
+        },
         .copy_name => copy(it.title),
         .copy_path => switch (it.action) {
             .app => |info| {
@@ -50,50 +54,34 @@ pub fn perform(ctx: Ctx, it: *const Item, op: item_mod.Op) Outcome {
             .file => |f| copy(f.path),
             else => {},
         },
-        .show_in_folder => if (it.action == .file) showInFolder(it.action.file.path),
-        .open_at_line => if (it.action == .file) openAtLine(
-            ctx,
-            it.action.file.path,
-            it.action.file.line,
-        ),
-        .copy_file => if (it.action == .file) copyFile(ctx, it.action.file.path),
-        .trash => if (it.action == .file) {
-            const f = c.g_file_new_for_path(it.action.file.path);
-            defer c.g_object_unref(f);
-            var err: ?*c.GError = null;
-            if (c.g_file_trash(f, null, &err) == 0) {
-                proc.warnError(.actions, err, "trash {s}", .{it.action.file.path});
-                return .{ .failed = "Could not move it to the trash" };
-            }
-            return .refresh_view;
-        },
+        .show_in_folder => showInFolder(fileOf(it).path),
+        .open_at_line => openAtLine(ctx, fileOf(it).path, fileOf(it).line),
+        .copy_file => copyFile(ctx, fileOf(it).path),
+        .trash => return trash(fileOf(it).path),
         .reset_ranking => {
             ctx.db.forget(it.key) catch return .{ .failed = "Could not reset the ranking" };
             return .stay;
         },
         .focus => focusWindow(ctx, it),
         .close_window => {
-            if (it.action == .focus_window) {
-                var buf: [64]u8 = undefined;
-                const cmd = std.mem.print(
-                    &buf,
-                    "closewindow address:{s}",
-                    .{it.action.focus_window},
-                ) catch return .stay;
-                hypr.dispatch(ctx.gpa, cmd);
-            }
+            assert(it.action == .focus_window);
+            const address = it.action.focus_window;
+            var buf: [64]u8 = undefined;
+            const cmd = std.mem.print(&buf, "closewindow address:{s}", .{address}) catch
+                return .stay;
+            hypr.dispatch(ctx.gpa, cmd);
             return .refresh_view;
         },
         .clip_paste => {
-            // Recency only: the paste goes ahead even if this fails.
-            ctx.db.touchClip(it.action.clip, now()) catch {};
+            touchClip(ctx, it);
             pasteText(it.detail);
         },
         .clip_copy => {
-            ctx.db.touchClip(it.action.clip, now()) catch {};
+            touchClip(ctx, it);
             copy(it.detail);
         },
         .clip_delete => {
+            assert(it.action == .clip);
             ctx.db.deleteClip(it.action.clip) catch return .{
                 .failed = "Could not delete the entry",
             };
@@ -120,7 +108,7 @@ fn primary(ctx: Ctx, it: *const Item) Outcome {
         .window_op => |w| windowOp(ctx, w),
         .focus_window => focusWindow(ctx, it),
         .clip => {
-            ctx.db.touchClip(it.action.clip, now()) catch {};
+            touchClip(ctx, it);
             pasteText(it.detail);
         },
         .script => |s| runScript(s.path, s.mode, it.title),
@@ -132,6 +120,30 @@ fn primary(ctx: Ctx, it: *const Item) Outcome {
         .ext_problem => copy(it.detail),
     }
     return .hide;
+}
+
+/// The file a file operation acts on.
+fn fileOf(it: *const Item) @FieldType(item_mod.Action, "file") {
+    assert(it.action == .file);
+    return it.action.file;
+}
+
+/// Marks a clipboard entry as just used. Recency only: the paste or copy
+/// goes ahead even if this fails, and Db logs the failure.
+fn touchClip(ctx: Ctx, it: *const Item) void {
+    assert(it.action == .clip);
+    ctx.db.touchClip(it.action.clip, now()) catch {};
+}
+
+fn trash(path: [:0]const u8) Outcome {
+    const file = c.g_file_new_for_path(path);
+    defer c.g_object_unref(file);
+    var err: ?*c.GError = null;
+    if (c.g_file_trash(file, null, &err) == 0) {
+        proc.warnError(.actions, err, "trash {s}", .{path});
+        return .{ .failed = "Could not move it to the trash" };
+    }
+    return .refresh_view;
 }
 
 /// Opens with the app chosen in Settings > Default Apps for the file's
@@ -370,6 +382,7 @@ fn launch(info: *c.GAppInfo) void {
 }
 
 fn focusWindow(ctx: Ctx, it: *const Item) void {
+    assert(it.action == .focus_window);
     var buf: [64]u8 = undefined;
     const cmd = std.mem.print(
         &buf,
