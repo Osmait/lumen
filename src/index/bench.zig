@@ -201,16 +201,16 @@ const TempDir = struct {
     }
 
     /// `name` inside it, removed with it.
-    fn file(d: *TempDir, buf: []u8, name: []const u8) ![:0]const u8 {
-        const p = try std.mem.printSentinel(buf, "{s}/{s}", .{ d.buf[0..d.len], name }, 0);
-        d.files[d.n_files] = p;
-        d.n_files += 1;
+    fn file(temp_dir: *TempDir, buf: []u8, name: []const u8) ![:0]const u8 {
+        const p = try std.mem.printSentinel(buf, "{s}/{s}", .{ temp_dir.buf[0..temp_dir.len], name }, 0);
+        temp_dir.files[temp_dir.n_files] = p;
+        temp_dir.n_files += 1;
         return p;
     }
 
-    fn remove(d: *TempDir) void {
-        for (d.files[0..d.n_files]) |f| _ = std.os.linux.unlink(f);
-        _ = std.os.linux.rmdir(d.buf[0..d.len :0]);
+    fn remove(temp_dir: *TempDir) void {
+        for (temp_dir.files[0..temp_dir.n_files]) |f| _ = std.os.linux.unlink(f);
+        _ = std.os.linux.rmdir(temp_dir.buf[0..temp_dir.len :0]);
     }
 };
 

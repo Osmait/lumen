@@ -85,21 +85,21 @@ pub const Engine = struct {
     last_candidates: std.ArrayList(u32) = .empty,
     cache_valid: bool = false,
 
-    pub fn deinit(e: *Engine, gpa: std.mem.Allocator) void {
-        e.last_query.deinit(gpa);
-        e.last_candidates.deinit(gpa);
-        e.* = undefined;
+    pub fn deinit(engine: *Engine, gpa: std.mem.Allocator) void {
+        engine.last_query.deinit(gpa);
+        engine.last_candidates.deinit(gpa);
+        engine.* = undefined;
     }
 
-    pub fn reset(e: *Engine) void {
-        e.last_query.clearRetainingCapacity();
-        e.last_candidates.clearRetainingCapacity();
-        e.cache_valid = false;
+    pub fn reset(engine: *Engine) void {
+        engine.last_query.clearRetainingCapacity();
+        engine.last_candidates.clearRetainingCapacity();
+        engine.cache_valid = false;
     }
 
     /// Top `limit` hits for `query`, appended to `out` (cleared first).
     pub fn search(
-        e: *Engine,
+        engine: *Engine,
         gpa: std.mem.Allocator,
         pool: *Pool,
         store: *const Store,
@@ -112,7 +112,7 @@ pub const Engine = struct {
         var packed_buf: [query_bytes_max]u8 = undefined;
         const query = packQuery(query_in, &packed_buf);
         if (query.len == 0 or limit == 0 or store.len() == 0) {
-            e.reset();
+            engine.reset();
             return;
         }
         // Everything below compares folded bytes: "Español" -> "espanol".
@@ -125,10 +125,10 @@ pub const Engine = struct {
 
         // On folded queries: "espa" -> "españ" refines ("espan" extends
         // "espa"), and so does "Carg" -> "cargo".
-        const refine = e.cache_valid and e.last_query.items.len > 0 and
-            ql.len > e.last_query.items.len and std.mem.startsWith(u8, ql, e.last_query.items);
+        const refine = engine.cache_valid and engine.last_query.items.len > 0 and
+            ql.len > engine.last_query.items.len and std.mem.startsWith(u8, ql, engine.last_query.items);
 
-        var sifted = try e.sift(gpa, pool, store, ql, qmask, limit, refine, cacheable);
+        var sifted = try engine.sift(gpa, pool, store, ql, qmask, limit, refine, cacheable);
         defer sifted.deinit(gpa);
         const finalists = &sifted.finalists;
 
@@ -149,12 +149,12 @@ pub const Engine = struct {
         for (hits.items[0..take]) |h| out.appendAssumeCapacity(.{ .id = h.id, .score = h.score });
 
         if (cacheable and !sifted.overflow and sifted.cands.items.len <= cache_max) {
-            e.last_query.clearRetainingCapacity();
-            try e.last_query.appendSlice(gpa, ql);
-            e.last_candidates.clearRetainingCapacity();
-            try e.last_candidates.appendSlice(gpa, sifted.cands.items);
-            e.cache_valid = true;
-        } else e.cache_valid = false;
+            engine.last_query.clearRetainingCapacity();
+            try engine.last_query.appendSlice(gpa, ql);
+            engine.last_candidates.clearRetainingCapacity();
+            try engine.last_candidates.appendSlice(gpa, sifted.cands.items);
+            engine.cache_valid = true;
+        } else engine.cache_valid = false;
     }
 
     const Sifted = struct {
@@ -165,16 +165,16 @@ pub const Engine = struct {
         /// Some chunk ran out of memory: `cands` is incomplete.
         overflow: bool = false,
 
-        fn deinit(f: *Sifted, gpa: std.mem.Allocator) void {
-            f.finalists.deinit(gpa);
-            f.cands.deinit(gpa);
+        fn deinit(sifted: *Sifted, gpa: std.mem.Allocator) void {
+            sifted.finalists.deinit(gpa);
+            sifted.cands.deinit(gpa);
         }
     };
 
     /// Layers 2 and 3 over the index (or the last query's candidates when
     /// refining), chunk by chunk on the pool, then the chunks' tops merged.
     fn sift(
-        e: *const Engine,
+        engine: *const Engine,
         gpa: std.mem.Allocator,
         pool: *Pool,
         store: *const Store,
@@ -185,7 +185,7 @@ pub const Engine = struct {
         cacheable: bool,
     ) std.mem.Allocator.Error!Sifted {
         const keep = limit * finalist_mul;
-        const source_len: usize = if (refine) e.last_candidates.items.len else store.len();
+        const source_len: usize = if (refine) engine.last_candidates.items.len else store.len();
         // Fewer chunks when refining: split the finalist budget among them,
         // or the incremental case runs short of finalists (recall fell to
         // 52% with a fixed K in the Rust version).
@@ -203,7 +203,7 @@ pub const Engine = struct {
         var ctx: SiftCtx = .{
             .gpa = gpa,
             .store = store,
-            .ids = if (refine) e.last_candidates.items else null,
+            .ids = if (refine) engine.last_candidates.items else null,
             .source_len = source_len,
             .qmask = qmask,
             .q = ql,
@@ -254,9 +254,9 @@ const Partial = struct {
     cands: std.ArrayList(u32) = .empty,
     overflow: bool = false,
 
-    fn deinit(p: *Partial, gpa: std.mem.Allocator) void {
-        p.top.deinit(gpa);
-        p.cands.deinit(gpa);
+    fn deinit(partial: *Partial, gpa: std.mem.Allocator) void {
+        partial.top.deinit(gpa);
+        partial.cands.deinit(gpa);
     }
 };
 

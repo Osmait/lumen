@@ -122,46 +122,46 @@ pub const Store = struct {
     mapped: bool,
     lay: Layout,
 
-    pub fn deinit(s: *Store, gpa: std.mem.Allocator) void {
-        format.release(s.buf, s.mapped, gpa);
-        s.* = undefined;
+    pub fn deinit(store: *Store, gpa: std.mem.Allocator) void {
+        format.release(store.buf, store.mapped, gpa);
+        store.* = undefined;
     }
 
-    pub fn len(s: *const Store) u32 {
-        return @intCast(s.lay.n);
+    pub fn len(store: *const Store) u32 {
+        return @intCast(store.lay.n);
     }
 
-    fn arr(s: *const Store, comptime T: type, off: usize) []T {
-        const p: [*]T = @ptrCast(@alignCast(s.buf.ptr + off));
-        return p[0..s.lay.n];
+    fn arr(store: *const Store, comptime T: type, off: usize) []T {
+        const p: [*]T = @ptrCast(@alignCast(store.buf.ptr + off));
+        return p[0..store.lay.n];
     }
 
-    pub fn masks(s: *const Store) []u64 {
-        return s.arr(u64, s.lay.masks);
+    pub fn masks(store: *const Store) []u64 {
+        return store.arr(u64, store.lay.masks);
     }
-    pub fn parents(s: *const Store) []u32 {
-        return s.arr(u32, s.lay.parent);
+    pub fn parents(store: *const Store) []u32 {
+        return store.arr(u32, store.lay.parent);
     }
-    pub fn depths(s: *const Store) []u16 {
-        return s.arr(u16, s.lay.depth);
+    pub fn depths(store: *const Store) []u16 {
+        return store.arr(u16, store.lay.depth);
     }
-    pub fn flags(s: *const Store) []u8 {
-        return s.arr(u8, s.lay.flags);
+    pub fn flags(store: *const Store) []u8 {
+        return store.arr(u8, store.lay.flags);
     }
 
     /// Checked again on every use, not only by `validate`: a private mapping
     /// still shows what others write to the file afterwards (pages not yet
     /// copied), and a bad offset read past the buffer.
-    pub fn name(s: *const Store, id: u32) []const u8 {
-        const off = s.arr(u32, s.lay.name_off)[id];
-        const n = s.arr(u16, s.lay.name_len)[id];
-        if (@as(usize, off) + n > s.lay.names_len) return "";
-        const start = s.lay.names + off;
-        return s.buf[start .. start + n];
+    pub fn name(store: *const Store, id: u32) []const u8 {
+        const off = store.arr(u32, store.lay.name_off)[id];
+        const n = store.arr(u16, store.lay.name_len)[id];
+        if (@as(usize, off) + n > store.lay.names_len) return "";
+        const start = store.lay.names + off;
+        return store.buf[start .. start + n];
     }
 
-    pub fn isDir(s: *const Store, id: u32) bool {
-        return s.flags()[id] & flag_dir != 0;
+    pub fn isDir(store: *const Store, id: u32) bool {
+        return store.flags()[id] & flag_dir != 0;
     }
 
     /// Absolute path of `id`, written into `out`; null if it does not fit
@@ -170,19 +170,19 @@ pub const Store = struct {
     /// to fill from the end. Both are bounded, for the same reason as
     /// `name`: a parent cycle written to the file after it was checked
     /// made the first one spin forever.
-    pub fn path(s: *const Store, id: u32, out: []u8) ?[]const u8 {
-        const ps = s.parents();
-        const n_all = s.lay.n;
+    pub fn path(store: *const Store, id: u32, out: []u8) ?[]const u8 {
+        const ps = store.parents();
+        const n_all = store.lay.n;
         var total: usize = 0;
         var cur = id;
         var steps: usize = 0;
         while (true) : (steps += 1) {
             if (cur >= n_all or steps >= n_all) return null;
-            total += s.name(cur).len;
+            total += store.name(cur).len;
             const p = ps[cur];
             if (p == no_parent) break;
             if (p >= n_all) return null;
-            if (!std.mem.endsWith(u8, s.name(p), "/")) total += 1;
+            if (!std.mem.endsWith(u8, store.name(p), "/")) total += 1;
             if (total > out.len) return null;
             cur = p;
         }
@@ -190,14 +190,14 @@ pub const Store = struct {
         var end = total;
         cur = id;
         for (0..steps + 1) |_| {
-            const n = s.name(cur);
+            const n = store.name(cur);
             if (n.len > end) return null;
             @memcpy(out[end - n.len .. end], n);
             end -= n.len;
             const p = ps[cur];
             if (p == no_parent) return if (end == 0) out[0..total] else null;
             if (p >= n_all) return null;
-            if (!std.mem.endsWith(u8, s.name(p), "/")) {
+            if (!std.mem.endsWith(u8, store.name(p), "/")) {
                 if (end == 0) return null;
                 end -= 1;
                 out[end] = '/';
@@ -211,18 +211,18 @@ pub const Store = struct {
     /// non-empty query (at least one bit) can never pass `mask & q == q`.
     /// Free on the hot path. On a mapping this writes copy-on-write pages;
     /// the file on disk is untouched.
-    pub fn tombstone(s: *Store, id: u32) void {
-        s.masks()[id] = 0;
+    pub fn tombstone(store: *Store, id: u32) void {
+        store.masks()[id] = 0;
     }
 
-    pub fn isTombstoned(s: *const Store, id: u32) bool {
-        return s.masks()[id] == 0;
+    pub fn isTombstoned(store: *const Store, id: u32) bool {
+        return store.masks()[id] == 0;
     }
 
     /// Roots come first, with `no_parent`.
-    pub fn nRoots(s: *const Store) u32 {
+    pub fn nRoots(store: *const Store) u32 {
         var n: u32 = 0;
-        for (s.parents()) |p| {
+        for (store.parents()) |p| {
             if (p != no_parent) break;
             n += 1;
         }
@@ -233,9 +233,9 @@ pub const Store = struct {
     /// the parent array non-decreasing, so children are contiguous and a
     /// binary search finds them with zero extra memory. Valid only for
     /// stores built by `scan`.
-    pub fn children(s: *const Store, dir: u32) struct { lo: u32, hi: u32 } {
-        const from = s.nRoots();
-        const tail = s.parents()[from..];
+    pub fn children(store: *const Store, dir: u32) struct { lo: u32, hi: u32 } {
+        const from = store.nRoots();
+        const tail = store.parents()[from..];
         const lo = from + lowerBound(tail, dir);
         const hi = from + upperBound(tail, dir);
         return .{ .lo = @intCast(lo), .hi = @intCast(hi) };
@@ -244,48 +244,48 @@ pub const Store = struct {
     /// Child of `dir` named `n`: two binary searches, one for the children
     /// and one among them by name (scan-built stores only: the scan sorts
     /// each directory's entries).
-    pub fn findChild(s: *const Store, dir: u32, n: []const u8) ?u32 {
-        const r = s.children(dir);
+    pub fn findChild(store: *const Store, dir: u32, n: []const u8) ?u32 {
+        const r = store.children(dir);
         var lo = r.lo;
         var hi = r.hi;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            switch (std.mem.order(u8, s.name(mid), n)) {
+            switch (std.mem.order(u8, store.name(mid), n)) {
                 .lt => lo = mid + 1,
                 .gt => hi = mid,
-                .eq => return if (s.isTombstoned(mid)) null else mid,
+                .eq => return if (store.isTombstoned(mid)) null else mid,
             }
         }
         return null;
     }
 
     /// Same by linear scan: for stores not built level by level (the delta).
-    pub fn findChildScan(s: *const Store, dir: u32, n: []const u8) ?u32 {
-        const ps = s.parents();
-        for (0..s.len()) |i| {
+    pub fn findChildScan(store: *const Store, dir: u32, n: []const u8) ?u32 {
+        const ps = store.parents();
+        for (0..store.len()) |i| {
             const id: u32 = @intCast(i);
-            if (ps[i] == dir and !s.isTombstoned(id) and std.mem.eql(u8, s.name(id), n)) return id;
+            if (ps[i] == dir and !store.isTombstoned(id) and std.mem.eql(u8, store.name(id), n)) return id;
         }
         return null;
     }
 
-    pub fn parentsSorted(s: *const Store) bool {
-        const tail = s.parents()[s.nRoots()..];
+    pub fn parentsSorted(store: *const Store) bool {
+        const tail = store.parents()[store.nRoots()..];
         if (tail.len < 2) return true;
         for (tail[0 .. tail.len - 1], tail[1..]) |a, b| if (a > b) return false;
         return true;
     }
 
-    pub fn liveLen(s: *const Store) usize {
+    pub fn liveLen(store: *const Store) usize {
         var n: usize = 0;
-        for (s.masks()) |m| n += @intFromBool(m != 0);
+        for (store.masks()) |m| n += @intFromBool(m != 0);
         return n;
     }
 
     /// Writes the buffer as is to `path_z`, atomically (a temporary file,
     /// then rename: a crash midway never leaves a corrupt index in place).
-    pub fn save(s: *const Store, path_z: [:0]const u8) sys.Error!void {
-        try sys.writeFileAtomic(path_z, s.buf);
+    pub fn save(store: *const Store, path_z: [:0]const u8) sys.Error!void {
+        try sys.writeFileAtomic(path_z, store.buf);
     }
 
     /// Maps an index file. PROT_WRITE with MAP_PRIVATE is copy-on-write, so
@@ -378,7 +378,7 @@ pub const Builder = struct {
     masks: std.ArrayList(u64) = .empty,
     depth: std.ArrayList(u16) = .empty,
 
-    pub fn deinit(b: *Builder, gpa: std.mem.Allocator) void {
+    pub fn deinit(builder: *Builder, gpa: std.mem.Allocator) void {
         inline for (.{
             "names",
             "name_off",
@@ -387,70 +387,70 @@ pub const Builder = struct {
             "flags",
             "masks",
             "depth",
-        }) |f| @field(b, f).deinit(gpa);
-        b.* = .empty; // reusable: `finish` leaves an empty builder
+        }) |f| @field(builder, f).deinit(gpa);
+        builder.* = .empty; // reusable: `finish` leaves an empty builder
     }
 
-    pub fn len(b: *const Builder) u32 {
-        return @intCast(b.name_off.items.len);
+    pub fn len(builder: *const Builder) u32 {
+        return @intCast(builder.name_off.items.len);
     }
 
     pub fn push(
-        b: *Builder,
+        builder: *Builder,
         gpa: std.mem.Allocator,
         n: []const u8,
         parent: u32,
         fl: u8,
         depth: u16,
     ) std.mem.Allocator.Error!u32 {
-        const id = b.len();
+        const id = builder.len();
         const short = n[0..@min(n.len, std.math.maxInt(u16))];
-        try b.name_off.append(gpa, @intCast(b.names.items.len));
-        try b.names.appendSlice(gpa, short);
-        try b.name_len.append(gpa, @intCast(short.len));
-        try b.parent.append(gpa, parent);
-        try b.flags.append(gpa, fl);
-        try b.masks.append(gpa, charMask(short));
-        try b.depth.append(gpa, depth);
+        try builder.name_off.append(gpa, @intCast(builder.names.items.len));
+        try builder.names.appendSlice(gpa, short);
+        try builder.name_len.append(gpa, @intCast(short.len));
+        try builder.parent.append(gpa, parent);
+        try builder.flags.append(gpa, fl);
+        try builder.masks.append(gpa, charMask(short));
+        try builder.depth.append(gpa, depth);
         return id;
     }
 
     /// Scaffolding: rebuilds paths but never shows up (mask 0, like a
     /// tombstone; `path()` does not look at masks).
     pub fn pushStructural(
-        b: *Builder,
+        builder: *Builder,
         gpa: std.mem.Allocator,
         n: []const u8,
         parent: u32,
         fl: u8,
         depth: u16,
     ) std.mem.Allocator.Error!u32 {
-        const id = try b.push(gpa, n, parent, fl, depth);
-        b.masks.items[id] = 0;
+        const id = try builder.push(gpa, n, parent, fl, depth);
+        builder.masks.items[id] = 0;
         return id;
     }
 
-    pub fn tombstone(b: *Builder, id: u32) void {
-        b.masks.items[id] = 0;
+    pub fn tombstone(builder: *Builder, id: u32) void {
+        builder.masks.items[id] = 0;
     }
 
     /// Builds the store and empties the builder. On error the builder is
     /// left as it was.
-    pub fn finish(b: *Builder, gpa: std.mem.Allocator) std.mem.Allocator.Error!Store {
-        const lay = Layout.init(b.len(), b.names.items.len);
+    pub fn finish(builder: *Builder, gpa: std.mem.Allocator) std.mem.Allocator.Error!Store {
+        const lay = Layout.init(builder.len(), builder.names.items.len);
         const buf = try gpa.alignedAlloc(u8, .@"8", lay.total);
-        defer b.deinit(gpa);
+        defer builder.deinit(gpa);
         @memset(buf, 0);
         @memcpy(buf[0..8], magic);
         std.mem.writeInt(u64, buf[8..16], lay.n, .little);
         std.mem.writeInt(u64, buf[16..24], lay.names_len, .little);
-        put(buf, lay.masks, b.masks.items);
-        put(buf, lay.name_off, b.name_off.items);
-        put(buf, lay.parent, b.parent.items);
-        put(buf, lay.depth, b.depth.items);
-        put(buf, lay.name_len, b.name_len.items);
-        put(buf, lay.flags, b.flags.items);
-        put(buf, lay.names, b.names.items);
+        put(buf, lay.masks, builder.masks.items);
+        put(buf, lay.name_off, builder.name_off.items);
+        put(buf, lay.parent, builder.parent.items);
+        put(buf, lay.depth, builder.depth.items);
+        put(buf, lay.name_len, builder.name_len.items);
+        put(buf, lay.flags, builder.flags.items);
+        put(buf, lay.names, builder.names.items);
         return .{ .buf = buf, .mapped = false, .lay = lay };
     }
 };
@@ -586,17 +586,17 @@ test "mask prefilter folds accents and case, both ways" {
 
 /// Touches everything a reader of a store may touch: must never crash on a
 /// store that `parse` accepted.
-fn exercise(s: *const Store) void {
+fn exercise(store: *const Store) void {
     var buf: [512]u8 = undefined;
-    var sum: usize = s.nRoots() + @intFromBool(s.parentsSorted()) + s.liveLen();
-    for (0..s.len()) |i| {
+    var sum: usize = store.nRoots() + @intFromBool(store.parentsSorted()) + store.liveLen();
+    for (0..store.len()) |i| {
         const id: u32 = @intCast(i);
-        const plen = if (s.path(id, &buf)) |p| p.len else 0;
-        sum +%= s.name(id).len + plen + @intFromBool(s.isDir(id));
-        const r = s.children(id);
-        std.debug.assert(r.lo <= r.hi and r.hi <= s.len());
-        if (s.findChild(id, "x")) |c| sum +%= c;
-        if (s.findChildScan(id, "x")) |c| sum +%= c;
+        const plen = if (store.path(id, &buf)) |p| p.len else 0;
+        sum +%= store.name(id).len + plen + @intFromBool(store.isDir(id));
+        const r = store.children(id);
+        std.debug.assert(r.lo <= r.hi and r.hi <= store.len());
+        if (store.findChild(id, "x")) |c| sum +%= c;
+        if (store.findChildScan(id, "x")) |c| sum +%= c;
     }
     std.mem.doNotOptimizeAway(sum);
 }

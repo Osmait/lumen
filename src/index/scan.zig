@@ -73,10 +73,10 @@ const Batch = struct {
     flags: std.ArrayList(u8) = .empty,
     errors: u64 = 0,
 
-    fn deinit(b: *Batch, gpa: std.mem.Allocator) void {
-        b.names.deinit(gpa);
-        b.ends.deinit(gpa);
-        b.flags.deinit(gpa);
+    fn deinit(batch: *Batch, gpa: std.mem.Allocator) void {
+        batch.names.deinit(gpa);
+        batch.ends.deinit(gpa);
+        batch.flags.deinit(gpa);
     }
 };
 
@@ -341,32 +341,32 @@ const ScanTree = struct {
         return t;
     }
 
-    fn path(t: *const ScanTree, buf: []u8, rel: []const u8) [:0]const u8 {
-        const dir = t.buf[0..t.len];
+    fn path(tree: *const ScanTree, buf: []u8, rel: []const u8) [:0]const u8 {
+        const dir = tree.buf[0..tree.len];
         return std.mem.printSentinel(buf, "{s}/{s}", .{ dir, rel }, 0) catch unreachable;
     }
 
-    fn file(t: *const ScanTree, rel: []const u8) void {
+    fn file(tree: *const ScanTree, rel: []const u8) void {
         var buf: [4096]u8 = undefined;
-        const p = t.path(&buf, rel);
+        const p = tree.path(&buf, rel);
         sys.mkdirP(p[0 .. std.mem.findScalarLast(u8, p, '/') orelse 0]);
         sys.writeFile(p, "x") catch unreachable;
     }
 
-    fn scanOf(t: *const ScanTree, root: []const u8, cfg_in: Config, st: ?*Stats) !Store {
+    fn scanOf(tree: *const ScanTree, root: []const u8, cfg_in: Config, st: ?*Stats) !Store {
         const pool = try Pool.create(testing.allocator, testing.io, 2);
         defer pool.destroy();
         var buf: [4096]u8 = undefined;
-        const roots = [_][]const u8{t.path(&buf, root)};
+        const roots = [_][]const u8{tree.path(&buf, root)};
         var cfg = cfg_in;
         cfg.roots = &roots;
         return scan(testing.allocator, pool, &cfg, null, st);
     }
 
     /// Entries named `name` anywhere in `s`.
-    fn named(s: *const Store, name: []const u8) usize {
+    fn named(store: *const Store, name: []const u8) usize {
         var n: usize = 0;
-        for (0..s.len()) |i| n += @intFromBool(std.mem.eql(u8, s.name(@intCast(i)), name));
+        for (0..store.len()) |i| n += @intFromBool(std.mem.eql(u8, store.name(@intCast(i)), name));
         return n;
     }
 };

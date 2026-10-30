@@ -81,11 +81,11 @@ const Trigrams = struct {
     window: u32 = 0,
     seen: u2 = 0,
 
-    fn next(t: *Trigrams) ?u32 {
-        while (t.i < t.s.len) {
-            t.window = (t.window << 8 | fold.step(t.s, &t.i)) & 0xff_ffff;
-            if (t.seen == 2) return t.window;
-            t.seen += 1;
+    fn next(trigrams: *Trigrams) ?u32 {
+        while (trigrams.i < trigrams.s.len) {
+            trigrams.window = (trigrams.window << 8 | fold.step(trigrams.s, &trigrams.i)) & 0xff_ffff;
+            if (trigrams.seen == 2) return trigrams.window;
+            trigrams.seen += 1;
         }
         return null;
     }
@@ -161,30 +161,30 @@ pub const Index = struct {
     /// left behind (old doc tables, merged segments).
     live_bytes: usize,
 
-    pub fn deinit(ix: *Index, gpa: std.mem.Allocator) void {
-        format.release(ix.buf, ix.mapped, gpa);
-        ix.* = undefined;
+    pub fn deinit(index: *Index, gpa: std.mem.Allocator) void {
+        format.release(index.buf, index.mapped, gpa);
+        index.* = undefined;
     }
 
-    pub fn path(ix: *const Index, doc: u32) []const u8 {
-        return ix.file[ix.path_off[doc]..][0..ix.path_len[doc]];
+    pub fn path(index: *const Index, doc: u32) []const u8 {
+        return index.file[index.path_off[doc]..][0..index.path_len[doc]];
     }
 
-    pub fn removed(ix: *const Index, doc: u32) bool {
-        return ix.flags[doc] & flag_removed != 0;
+    pub fn removed(index: *const Index, doc: u32) bool {
+        return index.flags[doc] & flag_removed != 0;
     }
 
     /// Documents a query can find.
-    pub fn live(ix: *const Index) usize {
-        return ix.n_docs - ix.n_removed;
+    pub fn live(index: *const Index) usize {
+        return index.n_docs - index.n_removed;
     }
 
-    pub fn docIn(ix: *const Index, d: u32) DocIn {
+    pub fn docIn(index: *const Index, d: u32) DocIn {
         return .{
-            .path = ix.path(d),
-            .mtime = ix.mtimes[d],
-            .size = ix.sizes[d],
-            .source = @fromBackingInt(@intCast(ix.sources[d])),
+            .path = index.path(d),
+            .mtime = index.mtimes[d],
+            .size = index.sizes[d],
+            .source = @fromBackingInt(@intCast(index.sources[d])),
         };
     }
 
@@ -259,8 +259,8 @@ pub const Index = struct {
     }
 
     /// Writes the index to `path_z` atomically (see `sys.writeFileAtomic`).
-    pub fn save(ix: *const Index, path_z: [:0]const u8) sys.Error!void {
-        try sys.writeFileAtomic(path_z, ix.buf);
+    pub fn save(index: *const Index, path_z: [:0]const u8) sys.Error!void {
+        try sys.writeFileAtomic(path_z, index.buf);
     }
 
     pub fn open(path_z: [:0]const u8) (sys.Error || error{BadIndex})!Index {
@@ -270,9 +270,9 @@ pub const Index = struct {
     }
 
     /// Posting list bytes of `key` in segment `s` (empty if absent).
-    fn list(ix: *const Index, s: usize, key: u32) []const u8 {
-        const seg = ix.segs[s];
-        const keys = sliceAt(u32, ix.buf, seg.keys_off, seg.n_keys);
+    fn list(index: *const Index, s: usize, key: u32) []const u8 {
+        const seg = index.segs[s];
+        const keys = sliceAt(u32, index.buf, seg.keys_off, seg.n_keys);
         var lo: usize = 0;
         var hi: usize = keys.len;
         while (lo < hi) {
@@ -280,8 +280,8 @@ pub const Index = struct {
             if (keys[mid] < key) lo = mid + 1 else hi = mid;
         }
         if (lo == keys.len or keys[lo] != key) return &.{};
-        const offs = sliceAt(u32, ix.buf, seg.offs_off, seg.n_keys + 1);
-        return ix.buf[seg.post_off + offs[lo] .. seg.post_off + offs[lo + 1]];
+        const offs = sliceAt(u32, index.buf, seg.offs_off, seg.n_keys + 1);
+        return index.buf[seg.post_off + offs[lo] .. seg.post_off + offs[lo + 1]];
     }
 
     /// Documents containing every trigram of every word, folded (words of 3+
@@ -289,7 +289,7 @@ pub const Index = struct {
     /// on verify).
     /// Appends doc ids, ascending, to `out`.
     pub fn candidates(
-        ix: *const Index,
+        index: *const Index,
         gpa: std.mem.Allocator,
         words: []const []const u8,
         out: *std.ArrayList(u32),
@@ -312,10 +312,10 @@ pub const Index = struct {
         var next: std.ArrayList(u32) = .empty;
         defer next.deinit(gpa);
 
-        for (0..ix.n_segs) |s| {
+        for (0..index.n_segs) |s| {
             var empty = false;
             for (uniq, 0..) |k, i| {
-                lists[i] = ix.list(s, k);
+                lists[i] = index.list(s, k);
                 if (lists[i].len == 0) empty = true;
             }
             if (empty) continue;
@@ -326,14 +326,14 @@ pub const Index = struct {
                 }
             }.lt);
             cur.clearRetainingCapacity();
-            try decodeAll(gpa, lists[0], ix.n_docs, &cur);
+            try decodeAll(gpa, lists[0], index.n_docs, &cur);
             for (lists[1..]) |l| {
                 if (cur.items.len == 0) break;
                 next.clearRetainingCapacity();
-                try intersect(gpa, cur.items, l, ix.n_docs, &next);
+                try intersect(gpa, cur.items, l, index.n_docs, &next);
                 std.mem.swap(std.ArrayList(u32), &cur, &next);
             }
-            for (cur.items) |d| if (!ix.removed(d)) try out.append(gpa, d);
+            for (cur.items) |d| if (!index.removed(d)) try out.append(gpa, d);
         }
         // Ids rise across the segments of an index this code wrote; a
         // damaged one may repeat or reorder them, and callers count on ids
@@ -344,9 +344,9 @@ pub const Index = struct {
         }
     }
 
-    pub fn postingBytes(ix: *const Index) usize {
+    pub fn postingBytes(index: *const Index) usize {
         var n: usize = 0;
-        for (ix.segs) |s| n += s.post_len;
+        for (index.segs) |s| n += s.post_len;
         return n;
     }
 };
@@ -444,21 +444,21 @@ const ListReader = struct {
     doc: u32 = 0,
     started: bool = false,
 
-    fn next(r: *ListReader) ?u32 {
-        const d = readVarint(r.b, &r.pos) orelse return r.stop();
-        if (r.started) {
-            if (d == 0) return r.stop();
-            r.doc = std.math.add(u32, r.doc, d) catch return r.stop();
+    fn next(reader: *ListReader) ?u32 {
+        const d = readVarint(reader.b, &reader.pos) orelse return reader.stop();
+        if (reader.started) {
+            if (d == 0) return reader.stop();
+            reader.doc = std.math.add(u32, reader.doc, d) catch return reader.stop();
         } else {
-            r.doc = d;
-            r.started = true;
+            reader.doc = d;
+            reader.started = true;
         }
-        if (r.doc >= r.n_docs) return r.stop();
-        return r.doc;
+        if (reader.doc >= reader.n_docs) return reader.stop();
+        return reader.doc;
     }
 
-    fn stop(r: *ListReader) ?u32 {
-        r.pos = r.b.len;
+    fn stop(reader: *ListReader) ?u32 {
+        reader.pos = reader.b.len;
         return null;
     }
 };
@@ -758,9 +758,9 @@ const Merged = struct {
     docs: []DocIn,
     flags: []u8,
 
-    fn deinit(m: Merged, gpa: std.mem.Allocator) void {
-        gpa.free(m.docs);
-        gpa.free(m.flags);
+    fn deinit(merged: Merged, gpa: std.mem.Allocator) void {
+        gpa.free(merged.docs);
+        gpa.free(merged.flags);
     }
 };
 
@@ -821,17 +821,17 @@ fn appendInto(
 /// documents `flags` mark removed.
 fn segmentPairs(
     gpa: std.mem.Allocator,
-    ix: *const Index,
+    index: *const Index,
     seg: SegEntry,
     flags: []const u8,
     out: *std.ArrayList(u64),
 ) std.mem.Allocator.Error!void {
     const n_keys: usize = @intCast(seg.n_keys);
-    const keys = sliceAt(u32, ix.buf, @intCast(seg.keys_off), n_keys);
-    const offs = sliceAt(u32, ix.buf, @intCast(seg.offs_off), n_keys + 1);
-    const post = ix.buf[@intCast(seg.post_off)..][0..@intCast(seg.post_len)];
+    const keys = sliceAt(u32, index.buf, @intCast(seg.keys_off), n_keys);
+    const offs = sliceAt(u32, index.buf, @intCast(seg.offs_off), n_keys + 1);
+    const post = index.buf[@intCast(seg.post_off)..][0..@intCast(seg.post_len)];
     for (keys, 0..) |k, i| {
-        var r: ListReader = .{ .b = post[offs[i]..offs[i + 1]], .n_docs = ix.n_docs };
+        var r: ListReader = .{ .b = post[offs[i]..offs[i + 1]], .n_docs = index.n_docs };
         while (r.next()) |doc| if (flags[doc] & flag_removed == 0) try out.append(
             gpa,
             @as(u64, k) << 32 | doc,
@@ -853,43 +853,43 @@ const Sink = struct {
     /// Larger pieces go to the file directly instead of through `buf`.
     const direct = 64 * 1024;
 
-    fn deinit(k: *Sink) void {
-        k.buf.deinit(k.gpa);
+    fn deinit(sink: *Sink) void {
+        sink.buf.deinit(sink.gpa);
     }
 
-    fn pos(k: *const Sink) usize {
-        return k.written + k.buf.items.len;
+    fn pos(sink: *const Sink) usize {
+        return sink.written + sink.buf.items.len;
     }
 
-    fn append(k: *Sink, bytes: []const u8) FileError!void {
-        if ((k.file != null or k.app != null) and bytes.len >= direct) {
-            try k.flush();
-            try k.put(bytes);
-            k.written += bytes.len;
+    fn append(sink: *Sink, bytes: []const u8) FileError!void {
+        if ((sink.file != null or sink.app != null) and bytes.len >= direct) {
+            try sink.flush();
+            try sink.put(bytes);
+            sink.written += bytes.len;
             return;
         }
-        try k.buf.appendSlice(k.gpa, bytes);
+        try sink.buf.appendSlice(sink.gpa, bytes);
     }
 
-    fn put(k: *Sink, bytes: []const u8) FileError!void {
-        if (k.file) |f| return f.write(bytes);
-        if (k.app) |f| return f.write(bytes);
+    fn put(sink: *Sink, bytes: []const u8) FileError!void {
+        if (sink.file) |f| return f.write(bytes);
+        if (sink.app) |f| return f.write(bytes);
     }
 
-    fn zeros(k: *Sink, n: usize) FileError!void {
-        try k.buf.appendNTimes(k.gpa, 0, n);
+    fn zeros(sink: *Sink, n: usize) FileError!void {
+        try sink.buf.appendNTimes(sink.gpa, 0, n);
     }
 
-    fn pad8(k: *Sink) FileError!void {
-        while (k.pos() % 8 != 0) try k.buf.append(k.gpa, 0);
+    fn pad8(sink: *Sink) FileError!void {
+        while (sink.pos() % 8 != 0) try sink.buf.append(sink.gpa, 0);
     }
 
     /// Writes what is buffered (file mode only).
-    fn flush(k: *Sink) FileError!void {
-        if (k.file == null and k.app == null) return;
-        try k.put(k.buf.items);
-        k.written += k.buf.items.len;
-        k.buf.clearRetainingCapacity();
+    fn flush(sink: *Sink) FileError!void {
+        if (sink.file == null and sink.app == null) return;
+        try sink.put(sink.buf.items);
+        sink.written += sink.buf.items.len;
+        sink.buf.clearRetainingCapacity();
     }
 };
 
@@ -903,15 +903,15 @@ const Header = struct {
     total: usize,
 };
 
-fn headerBytes(h: Header) [header_len]u8 {
+fn headerBytes(header: Header) [header_len]u8 {
     var b: [header_len]u8 = @splat(0);
     @memcpy(b[0..8], magic);
-    std.mem.writeInt(u64, b[8..16], h.n, .little);
-    std.mem.writeInt(u64, b[16..24], h.n_segs, .little);
-    std.mem.writeInt(u64, b[24..32], h.paths_len, .little);
-    std.mem.writeInt(u64, b[32..40], h.docs_off, .little);
-    std.mem.writeInt(u64, b[40..48], h.dir_off, .little);
-    std.mem.writeInt(u64, b[48..56], h.total, .little);
+    std.mem.writeInt(u64, b[8..16], header.n, .little);
+    std.mem.writeInt(u64, b[16..24], header.n_segs, .little);
+    std.mem.writeInt(u64, b[24..32], header.paths_len, .little);
+    std.mem.writeInt(u64, b[32..40], header.docs_off, .little);
+    std.mem.writeInt(u64, b[40..48], header.dir_off, .little);
+    std.mem.writeInt(u64, b[48..56], header.total, .little);
     return b;
 }
 
@@ -923,17 +923,17 @@ fn memoryOnly(err: FileError) BuildError {
     };
 }
 
-fn toMemory(sink: *Sink, h: Header) BuildError!Index {
-    @memcpy(sink.buf.items[0..header_len], &headerBytes(h));
+fn toMemory(sink: *Sink, header: Header) BuildError!Index {
+    @memcpy(sink.buf.items[0..header_len], &headerBytes(header));
     const buf = try sink.buf.toOwnedSlice(sink.gpa);
     errdefer sink.gpa.free(buf);
     return Index.parse(buf, false);
 }
 
-fn toFile(sink: *Sink, h: Header, path_z: [:0]const u8) FileError!Index {
+fn toFile(sink: *Sink, header: Header, path_z: [:0]const u8) FileError!Index {
     try sink.flush();
     const f = sink.file.?;
-    try f.writeAt(&headerBytes(h), 0);
+    try f.writeAt(&headerBytes(header), 0);
     try f.commit();
     return Index.open(path_z);
 }
@@ -1239,39 +1239,39 @@ const Lists = struct {
     offs: std.ArrayList(u32) = .empty,
     post: std.ArrayList(u8) = .empty,
 
-    fn deinit(l: *Lists, gpa: std.mem.Allocator) void {
-        l.keys.deinit(gpa);
-        l.offs.deinit(gpa);
-        l.post.deinit(gpa);
+    fn deinit(lists: *Lists, gpa: std.mem.Allocator) void {
+        lists.keys.deinit(gpa);
+        lists.offs.deinit(gpa);
+        lists.post.deinit(gpa);
     }
 
-    fn clear(l: *Lists) void {
-        l.keys.clearRetainingCapacity();
-        l.offs.clearRetainingCapacity();
-        l.post.clearRetainingCapacity();
+    fn clear(lists: *Lists) void {
+        lists.keys.clearRetainingCapacity();
+        lists.offs.clearRetainingCapacity();
+        lists.post.clearRetainingCapacity();
     }
 
     /// Encodes `pairs`, sorted by key. What `parse` checks on open is made
     /// sure of here: keys strictly ascending (binary search), each list's
     /// docs too (deltas never wrap). False, half done, when they are not.
-    fn encode(l: *Lists, gpa: std.mem.Allocator, pairs: []const u64) std.mem.Allocator.Error!bool {
+    fn encode(lists: *Lists, gpa: std.mem.Allocator, pairs: []const u64) std.mem.Allocator.Error!bool {
         var i: usize = 0;
         while (i < pairs.len) {
             const k: u32 = @intCast(pairs[i] >> 32);
-            if (l.keys.items.len > 0 and l.keys.items[l.keys.items.len - 1] >= k) return false;
-            try l.keys.append(gpa, k);
-            try l.offs.append(gpa, @intCast(l.post.items.len));
+            if (lists.keys.items.len > 0 and lists.keys.items[lists.keys.items.len - 1] >= k) return false;
+            try lists.keys.append(gpa, k);
+            try lists.offs.append(gpa, @intCast(lists.post.items.len));
             var prev: u32 = 0;
             var first = true;
             while (i < pairs.len and pairs[i] >> 32 == k) : (i += 1) {
                 const d: u32 = @truncate(pairs[i]);
                 if (!first and d <= prev) return false;
                 first = false;
-                try writeVarint(gpa, &l.post, d - prev);
+                try writeVarint(gpa, &lists.post, d - prev);
                 prev = d;
             }
         }
-        try l.offs.append(gpa, @intCast(l.post.items.len));
+        try lists.offs.append(gpa, @intCast(lists.post.items.len));
         return true;
     }
 };
@@ -2020,7 +2020,7 @@ pub const max_candidates = 4000;
 /// stops as soon as the next one cannot beat the `limit`-th match. Owned
 /// by `gpa`.
 fn orderCandidates(
-    ix: *const Index,
+    index: *const Index,
     gpa: std.mem.Allocator,
     words: []const []const u8,
     phrase: []const u8,
@@ -2035,7 +2035,7 @@ fn orderCandidates(
     var phrase_docs: std.ArrayList(u32) = .empty;
     defer phrase_docs.deinit(gpa);
     const phrase_known = several and phrase.len >= 3;
-    if (phrase_known) try ix.candidates(gpa, &.{phrase}, &phrase_docs);
+    if (phrase_known) try index.candidates(gpa, &.{phrase}, &phrase_docs);
 
     const ordered = try gpa.alloc(Cand, cands.len);
     errdefer gpa.free(ordered);
@@ -2045,7 +2045,7 @@ fn orderCandidates(
         while (pi < phrase_docs.items.len and phrase_docs.items[pi] < doc) pi += 1;
         const maybe_phrase = several and
             (!phrase_known or (pi < phrase_docs.items.len and phrase_docs.items[pi] == doc));
-        const d: DocIn = .{ .path = ix.path(doc), .mtime = ix.mtimes[doc], .size = ix.sizes[doc] };
+        const d: DocIn = .{ .path = index.path(doc), .mtime = index.mtimes[doc], .size = index.sizes[doc] };
         o.* = .{
             .doc = doc,
             .maybe_phrase = maybe_phrase,
@@ -2063,7 +2063,7 @@ fn orderCandidates(
 /// Full query: candidates from the trigram lists, verified in parallel by
 /// reading each file, ranked. Snippets live in `arena`; at most `limit`.
 pub fn search(
-    ix: *const Index,
+    index: *const Index,
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     pool: *Pool,
@@ -2083,11 +2083,11 @@ pub fn search(
     if (longest < 3) return; // nothing a trigram can narrow
     var cands: std.ArrayList(u32) = .empty;
     defer cands.deinit(gpa);
-    try ix.candidates(gpa, words, &cands);
+    try index.candidates(gpa, words, &cands);
     if (cands.items.len == 0) return;
     const now = sys.nowSeconds();
 
-    const ordered = try orderCandidates(ix, gpa, words, phrase, cands.items, now);
+    const ordered = try orderCandidates(index, gpa, words, phrase, cands.items, now);
     defer gpa.free(ordered);
 
     const tasks = pool.threads.len + 1;
@@ -2102,7 +2102,7 @@ pub fn search(
     var ctx: VerifyCtx = .{
         .gpa = gpa,
         .io = pool.io,
-        .ix = ix,
+        .ix = index,
         .words = words,
         .phrase = phrase,
         .cands = ordered[0..@min(ordered.len, max_candidates)],
@@ -2481,7 +2481,7 @@ fn smallIndex(gpa: std.mem.Allocator) !Index {
 
 /// Touches everything a reader of an index may touch: must never crash on
 /// an index that `parse` accepted.
-fn exerciseIndex(ix: *const Index, gpa: std.mem.Allocator) !void {
+fn exerciseIndex(index: *const Index, gpa: std.mem.Allocator) !void {
     const queries = [_][]const []const u8{
         &.{"arena"}, &.{ "zig", "token" }, &.{"lumen config"},
         &.{"élan"},
@@ -2489,20 +2489,20 @@ fn exerciseIndex(ix: *const Index, gpa: std.mem.Allocator) !void {
     };
     var got: std.ArrayList(u32) = .empty;
     defer got.deinit(gpa);
-    var sum: usize = ix.postingBytes();
+    var sum: usize = index.postingBytes();
     for (queries) |q| {
-        try ix.candidates(gpa, q, &got);
+        try index.candidates(gpa, q, &got);
         try testing.expect(strictlyAscending(u32, got.items));
         for (got.items) |d| {
-            try testing.expect(d < ix.n_docs);
-            const src: Source = @fromBackingInt(@intCast(ix.sources[d]));
-            sum +%= ix.path(d).len +% @as(
+            try testing.expect(d < index.n_docs);
+            const src: Source = @fromBackingInt(@intCast(index.sources[d]));
+            sum +%= index.path(d).len +% @as(
                 usize,
-                @bitCast(ix.mtimes[d]),
-            ) +% ix.sizes[d] +% @backingInt(src);
+                @bitCast(index.mtimes[d]),
+            ) +% index.sizes[d] +% @backingInt(src);
         }
     }
-    for (0..ix.n_docs) |d| sum +%= ix.path(@intCast(d)).len;
+    for (0..index.n_docs) |d| sum +%= index.path(@intCast(d)).len;
     std.mem.doNotOptimizeAway(sum);
 }
 
@@ -2694,18 +2694,18 @@ fn appendMemory(
 /// What the service does with the index it mapped: updates it and appends
 /// to it. Must never crash on an index that `parse` accepted, and must give
 /// one that parses and answers.
-fn exerciseUpdates(ix: *const Index, gpa: std.mem.Allocator, pool: *Pool) !void {
+fn exerciseUpdates(index: *const Index, gpa: std.mem.Allocator, pool: *Pool) !void {
     var td: TestDocs = .{ .texts = &update_texts };
     const reader: TextReader = .{ .read = TestDocs.text, .ctx = &td };
     const added = [_]DocIn{
         .{ .path = "0", .mtime = 200, .size = 1 },
         .{ .path = "3", .mtime = 200, .size = 1 },
     };
-    const gone: []const u32 = if (ix.n_docs > 0) &.{0} else &.{};
-    var up = try update(gpa, pool, ix, gone, &added, reader, null);
+    const gone: []const u32 = if (index.n_docs > 0) &.{0} else &.{};
+    var up = try update(gpa, pool, index, gone, &added, reader, null);
     defer up.deinit(gpa);
     try exerciseIndex(&up, gpa);
-    var app = try appendMemory(gpa, pool, ix, gone, &added, reader);
+    var app = try appendMemory(gpa, pool, index, gone, &added, reader);
     defer app.deinit(gpa);
     try exerciseIndex(&app, gpa);
 }
@@ -2775,8 +2775,8 @@ const PeakAllocator = struct {
     held: usize = 0,
     peak: usize = 0,
 
-    fn allocator(pa: *PeakAllocator) std.mem.Allocator {
-        return .{ .ptr = pa, .vtable = &.{
+    fn allocator(peak: *PeakAllocator) std.mem.Allocator {
+        return .{ .ptr = peak, .vtable = &.{
             .alloc = alloc,
             .resize = resize,
             .remap = remap,
@@ -2784,11 +2784,11 @@ const PeakAllocator = struct {
         } };
     }
 
-    fn count(pa: *PeakAllocator, add: usize, sub: usize) void {
-        pa.lock.lockUncancelable(testing.io);
-        defer pa.lock.unlock(testing.io);
-        pa.held = pa.held + add - sub;
-        pa.peak = @max(pa.peak, pa.held);
+    fn count(peak: *PeakAllocator, add: usize, sub: usize) void {
+        peak.lock.lockUncancelable(testing.io);
+        defer peak.lock.unlock(testing.io);
+        peak.held = peak.held + add - sub;
+        peak.peak = @max(peak.peak, peak.held);
     }
 
     fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {

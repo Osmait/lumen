@@ -139,130 +139,130 @@ pub fn initUnarmed(
     };
 }
 
-pub fn deinit(l: *Live) void {
-    l.base.deinit(l.gpa);
-    l.delta.deinit(l.gpa);
-    l.delta_b.deinit(l.gpa);
-    l.freeRoots();
-    freeScans(l.gpa, &l.scans);
-    sys.freeList(l.gpa, l.slow_mounts);
-    l.watcher.destroy(l.gpa);
-    l.engine_base.deinit(l.gpa);
-    l.engine_delta.deinit(l.gpa);
-    l.* = undefined;
+pub fn deinit(live: *Live) void {
+    live.base.deinit(live.gpa);
+    live.delta.deinit(live.gpa);
+    live.delta_b.deinit(live.gpa);
+    live.freeRoots();
+    freeScans(live.gpa, &live.scans);
+    sys.freeList(live.gpa, live.slow_mounts);
+    live.watcher.destroy(live.gpa);
+    live.engine_base.deinit(live.gpa);
+    live.engine_delta.deinit(live.gpa);
+    live.* = undefined;
 }
 
 /// Forgets what indexes the delta: its scaffolding roots and `kids`.
-fn freeRoots(l: *Live) void {
-    var it = l.delta_roots.keyIterator();
-    while (it.next()) |k| l.gpa.free(k.*);
-    l.delta_roots.deinit(l.gpa);
-    l.delta_roots = .empty;
-    var kit = l.kids.valueIterator();
-    while (kit.next()) |list| list.deinit(l.gpa);
-    l.kids.deinit(l.gpa);
-    l.kids = .empty;
+fn freeRoots(live: *Live) void {
+    var it = live.delta_roots.keyIterator();
+    while (it.next()) |k| live.gpa.free(k.*);
+    live.delta_roots.deinit(live.gpa);
+    live.delta_roots = .empty;
+    var kit = live.kids.valueIterator();
+    while (kit.next()) |list| list.deinit(live.gpa);
+    live.kids.deinit(live.gpa);
+    live.kids = .empty;
 }
 
 /// Arms up to `budget` pending watches. True if more remain. Returns a bool,
 /// not a count: counting walked every entry with the lock held, per batch.
-pub fn armProgress(l: *Live, budget: usize) bool {
-    if (l.arm_cursor == std.math.maxInt(u32)) return false;
-    const n = l.base.len();
-    const fl = l.base.flags();
-    const ps = l.base.parents();
+pub fn armProgress(live: *Live, budget: usize) bool {
+    if (live.arm_cursor == std.math.maxInt(u32)) return false;
+    const n = live.base.len();
+    const fl = live.base.flags();
+    const ps = live.base.parents();
     var done: usize = 0;
-    var id = l.arm_cursor;
+    var id = live.arm_cursor;
     var buf: [4096]u8 = undefined;
     while (id < n and done < budget) : (id += 1) {
-        if (fl[id] & store_mod.flag_dir == 0 or l.base.isTombstoned(id)) continue;
-        if (pathZ(&l.base, id, &buf)) |p| {
+        if (fl[id] & store_mod.flag_dir == 0 or live.base.isTombstoned(id)) continue;
+        if (pathZ(&live.base, id, &buf)) |p| {
             const placement: Watcher.Placement =
                 if (ps[id] == store_mod.no_parent) .root else .below_root;
-            l.watcher.watchBestEffort(l.gpa, p, id, placement) catch {
+            live.watcher.watchBestEffort(live.gpa, p, id, placement) catch {
                 // Out of memory: this directory is armed on the next call.
                 break;
             };
         }
         done += 1;
     }
-    l.stats.watches = l.watcher.count();
+    live.stats.watches = live.watcher.count();
     if (id >= n) {
-        l.arm_cursor = std.math.maxInt(u32);
+        live.arm_cursor = std.math.maxInt(u32);
         return false;
     }
-    l.arm_cursor = id;
+    live.arm_cursor = id;
     return true;
 }
 
-pub fn fullyArmed(l: *const Live) bool {
-    return l.arm_cursor == std.math.maxInt(u32);
+pub fn fullyArmed(live: *const Live) bool {
+    return live.arm_cursor == std.math.maxInt(u32);
 }
 
 /// Applies a batch of changes; returns how many took effect. New
 /// directories are only entered: what they hold waits in `scans` (see
 /// `Scan`).
-pub fn apply(l: *Live, changes: []const Watcher.Change) std.mem.Allocator.Error!usize {
+pub fn apply(live: *Live, changes: []const Watcher.Change) std.mem.Allocator.Error!usize {
     // An overflow cannot be patched: something was missed. The rescan is
     // only requested here (this runs with exclusive access; ~0.3 s of
     // scanning would stall every search); the service does it unlocked.
     for (changes) |ch| if (ch == .overflow) {
-        l.stats.resyncs += 1;
-        l.pending_resync = true;
+        live.stats.resyncs += 1;
+        live.pending_resync = true;
         return changes.len;
     };
     var n: usize = 0;
     for (changes) |ch| switch (ch) {
-        .created => |c| n += @intFromBool(try l.add(c.parent, c.name, c.is_dir)),
-        .removed => |r| n += @intFromBool(l.remove(r.parent, r.name)),
+        .created => |c| n += @intFromBool(try live.add(c.parent, c.name, c.is_dir)),
+        .removed => |r| n += @intFromBool(live.remove(r.parent, r.name)),
         .dir_gone => |id| {
             // The watched directory went away, and its subtree with it.
             // Unless its path is still there: a MOVE_SELF read in a later
             // batch than the move's MOVED_TO carries the id the watch was
             // re-pointed to (the rescanned destination), and tombstoning it
             // made a directory moved inside the tree vanish.
-            if (!l.alive(id) or l.pathExists(id)) continue;
-            l.stats.removed += l.tombstoneTree(id);
+            if (!live.alive(id) or live.pathExists(id)) continue;
+            live.stats.removed += live.tombstoneTree(id);
             n += 1;
         },
         .overflow => unreachable, // returned above: an overflow resyncs instead
     };
     if (n > 0) {
-        l.dirty = true;
-        try l.rebuildDelta();
+        live.dirty = true;
+        try live.rebuildDelta();
     }
     // With scans pending, `addScans` prunes once their watches re-pointed
     // the descriptors of a directory moved inside the tree.
-    if (l.scans.items.len == 0) l.pruneWatches();
+    if (live.scans.items.len == 0) live.pruneWatches();
     return n;
 }
 
 /// The delta id an event's parent maps to, if any. `add` and `remove` both
 /// go through here: when they resolved parents differently, deleting
 /// something added after the scan did nothing (bug found in the Rust one).
-fn deltaParent(l: *Live, parent: u32) ?u32 {
+fn deltaParent(live: *Live, parent: u32) ?u32 {
     if (isDelta(parent)) {
         const i = deltaIdx(parent);
-        return if (i < l.delta_b.len()) i else null;
+        return if (i < live.delta_b.len()) i else null;
     }
     var buf: [4096]u8 = undefined;
-    const p = l.pathOf(parent, &buf) orelse return null;
-    return l.delta_roots.get(p);
+    const p = live.pathOf(parent, &buf) orelse return null;
+    return live.delta_roots.get(p);
 }
 
 /// The live entry named `name` in directory `parent`, base or delta (as a
 /// delta id). It may be in the base or added to the delta after the scan.
-fn childOf(l: *Live, parent: u32, name: []const u8) ?u32 {
-    if (!isDelta(parent) and parent < l.base.len()) {
-        if (l.base.findChild(parent, name)) |id| return id;
+fn childOf(live: *Live, parent: u32, name: []const u8) ?u32 {
+    if (!isDelta(parent) and parent < live.base.len()) {
+        if (live.base.findChild(parent, name)) |id| return id;
     }
-    const dp = l.deltaParent(parent) orelse return null;
-    return if (l.deltaChild(dp, name)) |i| delta_bit | i else null;
+    const dp = live.deltaParent(parent) orelse return null;
+    return if (live.deltaChild(dp, name)) |i| delta_bit | i else null;
 }
 
-fn remove(l: *Live, parent: u32, name: []const u8) bool {
-    const id = l.childOf(parent, name) orelse return false;
-    l.stats.removed += l.tombstoneTree(id);
+fn remove(live: *Live, parent: u32, name: []const u8) bool {
+    const id = live.childOf(parent, name) orelse return false;
+    live.stats.removed += live.tombstoneTree(id);
     return true;
 }
 
@@ -271,9 +271,9 @@ fn remove(l: *Live, parent: u32, name: []const u8) bool {
 /// deleted within one batch (an editor's temp file) was never found and
 /// stayed searchable for good. Among `dir`'s `kids` only: walking the
 /// whole delta made every event cost everything added since the rescan.
-fn deltaChild(l: *const Live, dir: u32, n: []const u8) ?u32 {
-    const b = &l.delta_b;
-    const kids = l.kids.get(dir) orelse return null;
+fn deltaChild(live: *const Live, dir: u32, n: []const u8) ?u32 {
+    const b = &live.delta_b;
+    const kids = live.kids.get(dir) orelse return null;
     for (kids.items) |i| {
         if (b.masks.items[i] == 0) continue;
         const off = b.name_off.items[i];
@@ -284,22 +284,22 @@ fn deltaChild(l: *const Live, dir: u32, n: []const u8) ?u32 {
 
 /// Whether entry `id` (base or delta) is still in the index. A directory
 /// moved out of the tree keeps its watch until `pruneWatches`.
-fn alive(l: *const Live, id: u32) bool {
+fn alive(live: *const Live, id: u32) bool {
     if (isDelta(id)) {
         const i = deltaIdx(id);
-        return i < l.delta_b.len() and l.delta_b.masks.items[i] != 0;
+        return i < live.delta_b.len() and live.delta_b.masks.items[i] != 0;
     }
-    return id < l.base.len() and !l.base.isTombstoned(id);
+    return id < live.base.len() and !live.base.isTombstoned(id);
 }
 
-fn isDirEntry(l: *const Live, id: u32) bool {
-    if (isDelta(id)) return l.delta_b.flags.items[deltaIdx(id)] & store_mod.flag_dir != 0;
-    return l.base.isDir(id);
+fn isDirEntry(live: *const Live, id: u32) bool {
+    if (isDelta(id)) return live.delta_b.flags.items[deltaIdx(id)] & store_mod.flag_dir != 0;
+    return live.base.isDir(id);
 }
 
-fn pathExists(l: *const Live, id: u32) bool {
+fn pathExists(live: *const Live, id: u32) bool {
     var buf: [4096]u8 = undefined;
-    const p = l.pathOf(id, buf[0 .. buf.len - 1]) orelse return false;
+    const p = live.pathOf(id, buf[0 .. buf.len - 1]) orelse return false;
     if (p.len == 0) return false;
     buf[p.len] = 0;
     return sys.exists(buf[0..p.len :0]);
@@ -308,11 +308,11 @@ fn pathExists(l: *const Live, id: u32) bool {
 /// Hidden as the scan sets it: by name, and inherited from the parent.
 /// Without it, new files under a dot-dir ranked as the user's own until the
 /// next rescan.
-fn hiddenFlag(l: *const Live, parent: u32, name: []const u8) u8 {
+fn hiddenFlag(live: *const Live, parent: u32, name: []const u8) u8 {
     const parent_fl = if (isDelta(parent))
-        l.delta_b.flags.items[deltaIdx(parent)]
+        live.delta_b.flags.items[deltaIdx(parent)]
     else
-        l.base.flags()[parent];
+        live.base.flags()[parent];
     const hidden = parent_fl & store_mod.flag_hidden != 0 or name[0] == '.' or
         std.ascii.findIgnoreCase(name, "cache") != null;
     return if (hidden) store_mod.flag_hidden else 0;
@@ -321,8 +321,8 @@ fn hiddenFlag(l: *const Live, parent: u32, name: []const u8) u8 {
 /// `scan.shouldDescend` for a directory created after the scan (a copy:
 /// that one is private to scan.zig). Without it `npm install` scanned and
 /// watched the whole new node_modules.
-fn descends(l: *const Live, parent: []const u8, name: []const u8) bool {
-    for (l.cfg.skip) |rule| {
+fn descends(live: *const Live, parent: []const u8, name: []const u8) bool {
+    for (live.cfg.skip) |rule| {
         if (std.mem.findScalarLast(u8, rule, '/')) |slash| {
             if (std.mem.eql(
                 u8,
@@ -331,7 +331,7 @@ fn descends(l: *const Live, parent: []const u8, name: []const u8) bool {
             ) and std.mem.endsWith(u8, parent, rule[0..slash])) return false;
         } else if (std.mem.eql(u8, rule, name)) return false;
     }
-    for (l.cfg.cachedir_probe) |probe| {
+    for (live.cfg.cachedir_probe) |probe| {
         if (!std.mem.eql(u8, probe, name)) continue;
         var buf: [4096]u8 = undefined;
         const tag = std.mem.printSentinel(
@@ -346,38 +346,38 @@ fn descends(l: *const Live, parent: []const u8, name: []const u8) bool {
 }
 
 /// Tombstones entry `id` (base, or delta as a delta id) and its subtree.
-fn tombstoneTree(l: *Live, id: u32) usize {
-    if (l.isDirEntry(id)) l.prune_watches = true;
-    return if (isDelta(id)) l.tombstoneDeltaTree(deltaIdx(id)) else l.tombstoneBaseTree(id);
+fn tombstoneTree(live: *Live, id: u32) usize {
+    if (live.isDirEntry(id)) live.prune_watches = true;
+    return if (isDelta(id)) live.tombstoneDeltaTree(deltaIdx(id)) else live.tombstoneBaseTree(id);
 }
 
 /// Tombstones an entry and its whole subtree. Moving a directory sends one
 /// event, for the directory; `path()` walks up and never checks ancestors,
 /// so without this the children stay searchable under dead paths.
-fn tombstoneBaseTree(l: *Live, root: u32) usize {
-    var n: usize = if (l.base.isDir(root)) l.tombstoneDeltaUnder(root) else 0;
+fn tombstoneBaseTree(live: *Live, root: u32) usize {
+    var n: usize = if (live.base.isDir(root)) live.tombstoneDeltaUnder(root) else 0;
     var stack: std.ArrayList(u32) = .empty;
-    defer stack.deinit(l.gpa);
+    defer stack.deinit(live.gpa);
     // Out of memory: part of the subtree would stay searchable under dead
     // paths, so the index is rebuilt instead.
-    stack.append(l.gpa, root) catch {
-        l.pending_resync = true;
+    stack.append(live.gpa, root) catch {
+        live.pending_resync = true;
         return n;
     };
     var graves: usize = 0;
     while (stack.pop()) |id| {
-        if (l.base.isTombstoned(id)) continue;
-        if (l.base.isDir(id)) {
-            const r = l.base.children(id);
+        if (live.base.isTombstoned(id)) continue;
+        if (live.base.isDir(id)) {
+            const r = live.base.children(id);
             var c = r.lo;
-            while (c < r.hi) : (c += 1) stack.append(l.gpa, c) catch {
-                l.pending_resync = true;
+            while (c < r.hi) : (c += 1) stack.append(live.gpa, c) catch {
+                live.pending_resync = true;
             };
         }
-        l.base.tombstone(id);
+        live.base.tombstone(id);
         graves += 1;
     }
-    l.graves += graves;
+    live.graves += graves;
     n += graves;
     return n;
 }
@@ -386,26 +386,26 @@ fn tombstoneBaseTree(l: *Live, root: u32) usize {
 /// scaffolding roots found by path (`deltaRoot`), not from `dir`, so walking
 /// the base missed it: a file created in a folder then moved away with it
 /// stayed searchable under the old path for good.
-fn tombstoneDeltaUnder(l: *Live, dir: u32) usize {
+fn tombstoneDeltaUnder(live: *Live, dir: u32) usize {
     var buf: [4096]u8 = undefined;
-    const dir_path = l.base.path(dir, &buf) orelse return 0;
+    const dir_path = live.base.path(dir, &buf) orelse return 0;
     var n: usize = 0;
     var gone: std.ArrayList([]const u8) = .empty;
-    defer gone.deinit(l.gpa);
-    var it = l.delta_roots.iterator();
+    defer gone.deinit(live.gpa);
+    var it = live.delta_roots.iterator();
     while (it.next()) |e| {
         if (!engine.isUnder(e.key_ptr.*, dir_path)) continue;
-        if (l.kids.get(e.value_ptr.*)) |kids| for (kids.items) |c| {
-            n += l.tombstoneDeltaTree(c);
+        if (live.kids.get(e.value_ptr.*)) |kids| for (kids.items) |c| {
+            n += live.tombstoneDeltaTree(c);
         };
         // Forgotten too: a folder at that path again is another folder.
-        gone.append(l.gpa, e.key_ptr.*) catch {
-            l.pending_resync = true;
+        gone.append(live.gpa, e.key_ptr.*) catch {
+            live.pending_resync = true;
         };
     }
     for (gone.items) |k| {
-        _ = l.delta_roots.remove(k);
-        l.gpa.free(k);
+        _ = live.delta_roots.remove(k);
+        live.gpa.free(k);
     }
     return n;
 }
@@ -413,53 +413,53 @@ fn tombstoneDeltaUnder(l: *Live, dir: u32) usize {
 /// Same on the delta, finding children through `kids` (the delta is not
 /// built level by level, so no binary search). On the builder, for the same
 /// reason as `deltaChild`.
-fn tombstoneDeltaTree(l: *Live, root: u32) usize {
+fn tombstoneDeltaTree(live: *Live, root: u32) usize {
     var stack: std.ArrayList(u32) = .empty;
-    defer stack.deinit(l.gpa);
-    stack.append(l.gpa, root) catch {
-        l.pending_resync = true;
+    defer stack.deinit(live.gpa);
+    stack.append(live.gpa, root) catch {
+        live.pending_resync = true;
         return 0;
     };
     var n: usize = 0;
-    const b = &l.delta_b;
+    const b = &live.delta_b;
     while (stack.pop()) |id| {
         if (b.masks.items[id] == 0) continue;
-        if (b.flags.items[id] & store_mod.flag_dir != 0) if (l.kids.get(id)) |kids| {
-            stack.appendSlice(l.gpa, kids.items) catch {
-                l.pending_resync = true;
+        if (b.flags.items[id] & store_mod.flag_dir != 0) if (live.kids.get(id)) |kids| {
+            stack.appendSlice(live.gpa, kids.items) catch {
+                live.pending_resync = true;
             };
         };
         b.tombstone(id);
-        if (id < l.delta.len()) l.delta.tombstone(id);
+        if (id < live.delta.len()) live.delta.tombstone(id);
         n += 1;
     }
     return n;
 }
 
-fn add(l: *Live, parent: u32, name: []const u8, is_dir: bool) !bool {
+fn add(live: *Live, parent: u32, name: []const u8, is_dir: bool) !bool {
     // A directory moved out of the tree is still watched: what happens in
     // it now must not come back under its old path.
-    if (!l.alive(parent)) return false;
-    if (l.childOf(parent, name)) |known| {
+    if (!live.alive(parent)) return false;
+    if (live.childOf(parent, name)) |known| {
         // Already indexed: an IN_MOVED_TO of something known, or what a
         // rescan read before its event came. No duplicate. Except for a
         // directory renamed over an empty one (`mv -T a b`): same name,
         // another directory, and what came from `a` was lost, unwatched.
-        if (!is_dir or !l.isDirEntry(known)) return false;
-        l.stats.removed += l.tombstoneTree(known);
+        if (!is_dir or !live.isDirEntry(known)) return false;
+        live.stats.removed += live.tombstoneTree(known);
     }
     var pbuf: [4096]u8 = undefined;
-    const parent_path = l.pathOf(parent, &pbuf) orelse return false;
-    const depth = l.depthOf(parent) +| 1;
-    const hidden = l.hiddenFlag(parent, name);
+    const parent_path = live.pathOf(parent, &pbuf) orelse return false;
+    const depth = live.depthOf(parent) +| 1;
+    const hidden = live.hiddenFlag(parent, name);
     // A parent already in the delta is used as is; a base parent gets a
     // scaffolding root.
-    const root = if (isDelta(parent)) deltaIdx(parent) else try l.deltaRoot(
+    const root = if (isDelta(parent)) deltaIdx(parent) else try live.deltaRoot(
         parent_path,
         depth -| 1,
     );
 
-    if (is_dir and l.descends(parent_path, name)) {
+    if (is_dir and live.descends(parent_path, name)) {
         // inotify race: files may have appeared before the watch existed, so
         // a new directory is read whole (`readScans`).
         var fbuf: [4096]u8 = undefined;
@@ -468,11 +468,11 @@ fn add(l: *Live, parent: u32, name: []const u8, is_dir: bool) !bool {
             if (std.mem.endsWith(u8, parent_path, "/")) "" else "/",
             name,
         }) catch return false;
-        const path = try l.gpa.dupeSentinel(u8, full, 0);
-        errdefer l.gpa.free(path);
-        try l.scans.ensureUnusedCapacity(l.gpa, 1);
-        const id = try l.deltaPush(name, root, store_mod.flag_dir | hidden, depth);
-        l.scans.appendAssumeCapacity(.{
+        const path = try live.gpa.dupeSentinel(u8, full, 0);
+        errdefer live.gpa.free(path);
+        try live.scans.ensureUnusedCapacity(live.gpa, 1);
+        const id = try live.deltaPush(name, root, store_mod.flag_dir | hidden, depth);
+        live.scans.appendAssumeCapacity(.{
             .dir = id,
             .path = path,
             .depth = depth,
@@ -481,9 +481,9 @@ fn add(l: *Live, parent: u32, name: []const u8, is_dir: bool) !bool {
     } else {
         // A file, or a directory skipped like the scan does: searchable,
         // never opened.
-        _ = try l.deltaPush(name, root, hidden, depth);
+        _ = try live.deltaPush(name, root, hidden, depth);
     }
-    l.stats.added += 1;
+    live.stats.added += 1;
     return true;
 }
 
@@ -503,9 +503,9 @@ pub const Scan = struct {
     /// would ask for anyway.
     too_big: bool = false,
 
-    fn deinit(sc: *Scan, gpa: std.mem.Allocator) void {
-        gpa.free(sc.path);
-        if (sc.sub) |*s| s.deinit(gpa);
+    fn deinit(scan_job: *Scan, gpa: std.mem.Allocator) void {
+        gpa.free(scan_job.path);
+        if (scan_job.sub) |*s| s.deinit(gpa);
     }
 };
 
@@ -514,9 +514,9 @@ pub const Scans = std.ArrayList(Scan);
 /// The directories `apply` left to read. Between this and `addScans`
 /// nothing else may change the index: the service's thread does both,
 /// with only `readScans` (and searches) in between.
-pub fn takeScans(l: *Live) Scans {
-    const s = l.scans;
-    l.scans = .empty;
+pub fn takeScans(live: *Live) Scans {
+    const s = live.scans;
+    live.scans = .empty;
     return s;
 }
 
@@ -550,22 +550,22 @@ pub fn readScans(
 
 /// Adds what `readScans` found under each directory's entry and watches
 /// the directories, then frees `scans`.
-pub fn addScans(l: *Live, scans: *Scans) std.mem.Allocator.Error!void {
-    defer freeScans(l.gpa, scans);
+pub fn addScans(live: *Live, scans: *Scans) std.mem.Allocator.Error!void {
+    defer freeScans(live.gpa, scans);
     var added = false;
     for (scans.items) |*sc| {
         // Removed again before it was read (later in the same batch).
-        if (sc.dir >= l.delta_b.len() or l.delta_b.masks.items[sc.dir] == 0) continue;
+        if (sc.dir >= live.delta_b.len() or live.delta_b.masks.items[sc.dir] == 0) continue;
         const sub = if (sc.sub) |*s| s else {
-            l.pending_resync = true;
+            live.pending_resync = true;
             continue;
         };
         if (sc.too_big) {
-            l.pending_resync = true;
+            live.pending_resync = true;
             continue;
         }
-        const map = try l.appendStore(sub, sc.dir, sc.depth, sc.hidden);
-        defer l.gpa.free(map);
+        const map = try live.appendStore(sub, sc.dir, sc.depth, sc.hidden);
+        defer live.gpa.free(map);
         // Watch the new directories under their delta ids, or events from
         // inside could not be attributed.
         var buf: [4096]u8 = undefined;
@@ -573,42 +573,42 @@ pub fn addScans(l: *Live, scans: *Scans) std.mem.Allocator.Error!void {
             const id: u32 = @intCast(i);
             if (!sub.isDir(id)) continue;
             const path = pathZ(sub, id, &buf) orelse continue;
-            try l.watcher.watchBestEffort(l.gpa, path, delta_bit | map[i], .below_root);
+            try live.watcher.watchBestEffort(live.gpa, path, delta_bit | map[i], .below_root);
         }
-        l.stats.added += sub.len() - 1;
+        live.stats.added += sub.len() - 1;
         added = true;
     }
     if (added) {
-        l.dirty = true;
-        try l.rebuildDelta();
+        live.dirty = true;
+        try live.rebuildDelta();
     }
-    l.pruneWatches();
+    live.pruneWatches();
 }
 
 /// `takeScans`, `readScans` and `addScans` with the lock held throughout,
 /// for callers that hold it anyway (tests).
-pub fn finishScans(l: *Live) std.mem.Allocator.Error!void {
-    var scans = l.takeScans();
-    readScans(l.gpa, l.scan_pool, l.cfg, scans.items, l.limits.delta_max);
-    try l.addScans(&scans);
+pub fn finishScans(live: *Live) std.mem.Allocator.Error!void {
+    var scans = live.takeScans();
+    readScans(live.gpa, live.scan_pool, live.cfg, scans.items, live.limits.delta_max);
+    try live.addScans(&scans);
 }
 
 /// Drops the watches of directories that left the index (moved out of the
 /// tree: the kernel only drops a deleted one's), once a batch tombstoned
 /// one: a pass over every watch.
-fn pruneWatches(l: *Live) void {
-    if (!l.prune_watches) return;
-    l.prune_watches = false;
-    l.watcher.prune(l.gpa, @as(*const Live, l), alive);
-    l.stats.watches = l.watcher.count();
+fn pruneWatches(live: *Live) void {
+    if (!live.prune_watches) return;
+    live.prune_watches = false;
+    live.watcher.prune(live.gpa, @as(*const Live, live), alive);
+    live.stats.watches = live.watcher.count();
 }
 
 /// Copies a freshly scanned sub-index into the delta under `dir`, the entry
 /// its root stands for (scan names roots by absolute path, which here would
 /// be a result that does not exist after compaction).
-fn appendStore(l: *Live, sub: *const Store, dir: u32, base_depth: u16, hidden: u8) ![]u32 {
-    const map = try l.gpa.alloc(u32, sub.len());
-    errdefer l.gpa.free(map);
+fn appendStore(live: *Live, sub: *const Store, dir: u32, base_depth: u16, hidden: u8) ![]u32 {
+    const map = try live.gpa.alloc(u32, sub.len());
+    errdefer live.gpa.free(map);
     const ps = sub.parents();
     const fl = sub.flags();
     const ds = sub.depths();
@@ -619,85 +619,85 @@ fn appendStore(l: *Live, sub: *const Store, dir: u32, base_depth: u16, hidden: u
             continue;
         }
         const name = sub.name(@intCast(i));
-        map[i] = try l.deltaPush(name, map[p], fl[i] | hidden, base_depth +| ds[i]);
+        map[i] = try live.deltaPush(name, map[p], fl[i] | hidden, base_depth +| ds[i]);
     }
     return map;
 }
 
 /// Adds an entry to the delta and to its parent's `kids`.
-fn deltaPush(l: *Live, name: []const u8, parent: u32, fl: u8, depth: u16) !u32 {
-    const id = try l.delta_b.push(l.gpa, name, parent, fl, depth);
-    const gop = try l.kids.getOrPut(l.gpa, parent);
+fn deltaPush(live: *Live, name: []const u8, parent: u32, fl: u8, depth: u16) !u32 {
+    const id = try live.delta_b.push(live.gpa, name, parent, fl, depth);
+    const gop = try live.kids.getOrPut(live.gpa, parent);
     if (!gop.found_existing) gop.value_ptr.* = .empty;
-    try gop.value_ptr.append(l.gpa, id);
+    try gop.value_ptr.append(live.gpa, id);
     return id;
 }
 
 /// Scaffolding root for a directory, memoized. Its name is the whole path:
 /// it rebuilds paths but never shows up (mask 0).
-fn deltaRoot(l: *Live, dir_path: []const u8, depth: u16) !u32 {
-    if (l.delta_roots.get(dir_path)) |id| return id;
-    const id = try l.delta_b.pushStructural(
-        l.gpa,
+fn deltaRoot(live: *Live, dir_path: []const u8, depth: u16) !u32 {
+    if (live.delta_roots.get(dir_path)) |id| return id;
+    const id = try live.delta_b.pushStructural(
+        live.gpa,
         dir_path,
         store_mod.no_parent,
         store_mod.flag_dir,
         depth,
     );
-    const key = try l.gpa.dupe(u8, dir_path);
-    errdefer l.gpa.free(key);
-    try l.delta_roots.put(l.gpa, key, id);
+    const key = try live.gpa.dupe(u8, dir_path);
+    errdefer live.gpa.free(key);
+    try live.delta_roots.put(live.gpa, key, id);
     return id;
 }
 
-pub fn pathOf(l: *const Live, id: u32, buf: []u8) ?[]const u8 {
+pub fn pathOf(live: *const Live, id: u32, buf: []u8) ?[]const u8 {
     if (isDelta(id)) {
         const i = deltaIdx(id);
-        return if (i < l.delta.len()) l.delta.path(i, buf) else null;
+        return if (i < live.delta.len()) live.delta.path(i, buf) else null;
     }
-    return if (id < l.base.len()) l.base.path(id, buf) else null;
+    return if (id < live.base.len()) live.base.path(id, buf) else null;
 }
 
-fn depthOf(l: *const Live, id: u32) u16 {
+fn depthOf(live: *const Live, id: u32) u16 {
     if (isDelta(id)) {
         const i = deltaIdx(id);
-        return if (i < l.delta.len()) l.delta.depths()[i] else 0;
+        return if (i < live.delta.len()) live.delta.depths()[i] else 0;
     }
-    return if (id < l.base.len()) l.base.depths()[id] else 0;
+    return if (id < live.base.len()) live.base.depths()[id] else 0;
 }
 
 /// The delta is small by construction (compaction keeps it so): rebuilding
 /// it whole is cheaper and simpler than keeping it mutable. Ids stay the
 /// same (`kids` relies on it). On error the builder may be partly consumed:
 /// the caller asks for a rescan.
-fn rebuildDelta(l: *Live) !void {
+fn rebuildDelta(live: *Live) !void {
     // Refill a builder from the new store so more can be added; scaffolding
     // stays mask 0. Both are complete before anything is replaced.
-    var fresh = try l.delta_b.finish(l.gpa);
-    errdefer fresh.deinit(l.gpa);
+    var fresh = try live.delta_b.finish(live.gpa);
+    errdefer fresh.deinit(live.gpa);
     var nb: Builder = .empty;
-    errdefer nb.deinit(l.gpa);
+    errdefer nb.deinit(live.gpa);
     const ps = fresh.parents();
     const fl = fresh.flags();
     const ds = fresh.depths();
     for (0..fresh.len()) |i| {
         const id: u32 = @intCast(i);
         if (fresh.isTombstoned(id))
-            _ = try nb.pushStructural(l.gpa, fresh.name(id), ps[i], fl[i], ds[i])
+            _ = try nb.pushStructural(live.gpa, fresh.name(id), ps[i], fl[i], ds[i])
         else
-            _ = try nb.push(l.gpa, fresh.name(id), ps[i], fl[i], ds[i]);
+            _ = try nb.push(live.gpa, fresh.name(id), ps[i], fl[i], ds[i]);
     }
-    l.delta.deinit(l.gpa);
-    l.delta = fresh;
-    l.delta_b = nb;
+    live.delta.deinit(live.gpa);
+    live.delta = fresh;
+    live.delta_b = nb;
     // Ids changed: the delta engine's cached candidates mean nothing now.
-    l.engine_delta.reset();
+    live.engine_delta.reset();
 }
 
 /// Searches base and delta and merges by score. Paths are allocated in
 /// `arena`.
 pub fn search(
-    l: *Live,
+    live: *Live,
     arena: std.mem.Allocator,
     pool: *Pool,
     query: []const u8,
@@ -706,25 +706,25 @@ pub fn search(
 ) std.mem.Allocator.Error!void {
     const limit = opts.limit;
     var o = opts;
-    o.no_stat = l.slow_mounts;
+    o.no_stat = live.slow_mounts;
     out.clearRetainingCapacity();
     var hits: std.ArrayList(engine.Hit) = .empty;
-    defer hits.deinit(l.gpa);
+    defer hits.deinit(live.gpa);
     var buf: [4096]u8 = undefined;
-    try l.engine_base.search(l.gpa, pool, &l.base, query, o, &hits);
+    try live.engine_base.search(live.gpa, pool, &live.base, query, o, &hits);
     // A path that does not fit (deeper than PATH_MAX) cannot be opened:
     // left out, where it used to come out as "" (and dedup as one).
     for (hits.items) |h| try out.append(arena, .{
-        .path = try arena.dupe(u8, l.base.path(h.id, &buf) orelse continue),
+        .path = try arena.dupe(u8, live.base.path(h.id, &buf) orelse continue),
         .score = h.score,
-        .is_dir = l.base.isDir(h.id),
+        .is_dir = live.base.isDir(h.id),
     });
-    if (l.delta.len() > 0) {
-        try l.engine_delta.search(l.gpa, pool, &l.delta, query, o, &hits);
+    if (live.delta.len() > 0) {
+        try live.engine_delta.search(live.gpa, pool, &live.delta, query, o, &hits);
         for (hits.items) |h| try out.append(arena, .{
-            .path = try arena.dupe(u8, l.delta.path(h.id, &buf) orelse continue),
+            .path = try arena.dupe(u8, live.delta.path(h.id, &buf) orelse continue),
             .score = h.score,
-            .is_dir = l.delta.isDir(h.id),
+            .is_dir = live.delta.isDir(h.id),
         });
     }
     std.mem.sort(Hit, out.items, {}, struct {
@@ -740,10 +740,10 @@ pub fn search(
     // By set, not by neighbour: the two copies need not score the same, and
     // another hit between them left both in.
     var seen: std.StringHashMapUnmanaged(void) = .empty;
-    defer seen.deinit(l.gpa);
+    defer seen.deinit(live.gpa);
     var w: usize = 0;
     for (out.items) |h| {
-        if ((try seen.getOrPut(l.gpa, h.path)).found_existing) continue;
+        if ((try seen.getOrPut(live.gpa, h.path)).found_existing) continue;
         out.items[w] = h;
         w += 1;
     }
@@ -757,33 +757,33 @@ pub const Replaced = struct { base: Store, watcher: *Watcher };
 /// milliseconds; done here it would be done with the lock held (worst
 /// search went from 1.7 to 19.8 ms in the Rust version). On error nothing
 /// changed and `base` and `watcher` are still the caller's.
-pub fn adopt(l: *Live, base: Store, watcher: *Watcher) std.mem.Allocator.Error!Replaced {
+pub fn adopt(live: *Live, base: Store, watcher: *Watcher) std.mem.Allocator.Error!Replaced {
     // The only fallible step, first: the new index starts with an empty delta.
     var empty: Builder = .empty;
-    const delta = try empty.finish(l.gpa);
-    const old: Replaced = .{ .base = l.base, .watcher = l.watcher };
-    l.base = base;
-    l.graves = base.len() - base.liveLen();
-    l.watcher = watcher;
-    l.stats.watches = watcher.count();
-    l.arm_cursor = std.math.maxInt(u32);
-    l.delta_b.deinit(l.gpa);
-    l.freeRoots();
-    freeScans(l.gpa, &l.scans);
-    l.scans = .empty;
-    l.prune_watches = false;
-    l.delta.deinit(l.gpa);
-    l.delta = delta;
-    l.pending_resync = false;
-    l.dirty = false;
-    l.last_compact_ns = sys.monotonicNs();
-    l.engine_delta.reset();
-    l.engine_base.reset();
+    const delta = try empty.finish(live.gpa);
+    const old: Replaced = .{ .base = live.base, .watcher = live.watcher };
+    live.base = base;
+    live.graves = base.len() - base.liveLen();
+    live.watcher = watcher;
+    live.stats.watches = watcher.count();
+    live.arm_cursor = std.math.maxInt(u32);
+    live.delta_b.deinit(live.gpa);
+    live.freeRoots();
+    freeScans(live.gpa, &live.scans);
+    live.scans = .empty;
+    live.prune_watches = false;
+    live.delta.deinit(live.gpa);
+    live.delta = delta;
+    live.pending_resync = false;
+    live.dirty = false;
+    live.last_compact_ns = sys.monotonicNs();
+    live.engine_delta.reset();
+    live.engine_base.reset();
     // A few lines of /proc: what was mounted since the last rescan. Out of
     // memory, the old list stays.
-    if (slowMountsOf(l.gpa, l.cfg)) |m| {
-        sys.freeList(l.gpa, l.slow_mounts);
-        l.slow_mounts = m;
+    if (slowMountsOf(live.gpa, live.cfg)) |m| {
+        sys.freeList(live.gpa, live.slow_mounts);
+        live.slow_mounts = m;
     } else |_| {}
     return old;
 }
@@ -809,12 +809,12 @@ fn slowMountsOf(gpa: std.mem.Allocator, cfg: *const scan.Config) std.mem.Allocat
 
 /// True when the layers on top weigh enough to be worth a rescan, or when
 /// changes have been waiting too long to reach the file.
-pub fn needsCompaction(l: *const Live) bool {
-    const graves = l.graves;
-    const lim = l.limits;
-    if (l.delta.len() > lim.delta_max or
-        (graves > lim.graves_min and graves > l.base.len() / lim.graves_div)) return true;
-    return l.dirty and sys.monotonicNs() -| l.last_compact_ns >= lim.interval_ns;
+pub fn needsCompaction(live: *const Live) bool {
+    const graves = live.graves;
+    const lim = live.limits;
+    if (live.delta.len() > lim.delta_max or
+        (graves > lim.graves_min and graves > live.base.len() / lim.graves_div)) return true;
+    return live.dirty and sys.monotonicNs() -| live.last_compact_ns >= lim.interval_ns;
 }
 
 /// Builds the replacement index without touching the current one: the
@@ -848,8 +848,8 @@ pub fn prepareCompaction(
     return .{ .base = base, .watcher = w };
 }
 
-fn pathZ(s: *const Store, id: u32, buf: *[4096]u8) ?[*:0]const u8 {
-    const p = s.path(id, buf[0 .. buf.len - 1]) orelse return null;
+fn pathZ(store: *const Store, id: u32, buf: *[4096]u8) ?[*:0]const u8 {
+    const p = store.path(id, buf[0 .. buf.len - 1]) orelse return null;
     if (p.len == 0) return null;
     buf[p.len] = 0;
     return buf[0..p.len :0];
@@ -902,118 +902,118 @@ const Tree = struct {
         return t;
     }
 
-    fn destroy(t: *Tree) void {
-        t.live.deinit();
-        t.pool.destroy();
-        t.arena.deinit();
-        t.tmp.cleanup();
-        testing.allocator.destroy(t);
+    fn destroy(tree: *Tree) void {
+        tree.live.deinit();
+        tree.pool.destroy();
+        tree.arena.deinit();
+        tree.tmp.cleanup();
+        testing.allocator.destroy(tree);
     }
 
     /// Absolute path of `rel`, relative to the temp dir.
-    fn abs(t: *Tree, rel: []const u8, buf: *[4096]u8) [:0]const u8 {
+    fn abs(tree: *Tree, rel: []const u8, buf: *[4096]u8) [:0]const u8 {
         return std.mem.printSentinel(
             buf,
             "{s}/{s}",
-            .{ t.dir, std.mem.trimEnd(u8, rel, "/") },
+            .{ tree.dir, std.mem.trimEnd(u8, rel, "/") },
             0,
         ) catch unreachable;
     }
 
-    fn mkAbs(t: *Tree, rel: []const u8) void {
+    fn mkAbs(tree: *Tree, rel: []const u8) void {
         var buf: [4096]u8 = undefined;
         if (std.mem.endsWith(u8, rel, "/")) {
-            sys.mkdirP(t.abs(rel, &buf));
+            sys.mkdirP(tree.abs(rel, &buf));
         } else {
             if (std.mem.findScalarLast(u8, rel, '/')) |slash| sys.mkdirP(
-                t.abs(rel[0..slash], &buf),
+                tree.abs(rel[0..slash], &buf),
             );
-            sys.writeFile(t.abs(rel, &buf), "x") catch unreachable;
+            sys.writeFile(tree.abs(rel, &buf), "x") catch unreachable;
         }
     }
 
     /// Creates `rel` (relative to the root), parents included.
-    fn mk(t: *Tree, rel: []const u8) void {
+    fn mk(tree: *Tree, rel: []const u8) void {
         var buf: [4096]u8 = undefined;
-        t.mkAbs(std.mem.print(&buf, "root/{s}", .{rel}) catch unreachable);
+        tree.mkAbs(std.mem.print(&buf, "root/{s}", .{rel}) catch unreachable);
     }
 
     /// Deletes `rel` (relative to the root): a file, or an empty directory.
-    fn rm(t: *Tree, rel: []const u8) void {
+    fn rm(tree: *Tree, rel: []const u8) void {
         var rb: [4096]u8 = undefined;
         var buf: [4096]u8 = undefined;
-        const p = t.abs(std.mem.print(&rb, "root/{s}", .{rel}) catch unreachable, &buf);
+        const p = tree.abs(std.mem.print(&rb, "root/{s}", .{rel}) catch unreachable, &buf);
         if (std.mem.endsWith(u8, rel, "/")) _ = linux.rmdir(p) else _ = linux.unlink(p);
     }
 
     /// Renames, both paths relative to the temp dir.
-    fn mv(t: *Tree, from: []const u8, to: []const u8) void {
+    fn mv(tree: *Tree, from: []const u8, to: []const u8) void {
         var a: [4096]u8 = undefined;
         var b: [4096]u8 = undefined;
-        sys.rename(t.abs(from, &a), t.abs(to, &b)) catch unreachable;
+        sys.rename(tree.abs(from, &a), tree.abs(to, &b)) catch unreachable;
     }
 
     /// Drains and applies everything pending; returns how many took effect.
-    fn sync(t: *Tree) !usize {
+    fn sync(tree: *Tree) !usize {
         var n: usize = 0;
         while (true) {
             var changes: std.ArrayList(Watcher.Change) = .empty;
-            try t.live.watcher.drain(t.arena.allocator(), &changes);
+            try tree.live.watcher.drain(tree.arena.allocator(), &changes);
             if (changes.items.len == 0) return n;
-            n += try t.live.apply(changes.items);
-            try t.live.finishScans();
+            n += try tree.live.apply(changes.items);
+            try tree.live.finishScans();
         }
     }
 
-    fn searchOpts(t: *Tree, query: []const u8, opts: engine.Options) ![]const Hit {
-        try t.live.search(t.arena.allocator(), t.pool, query, opts, &t.hits);
-        return t.hits.items;
+    fn searchOpts(tree: *Tree, query: []const u8, opts: engine.Options) ![]const Hit {
+        try tree.live.search(tree.arena.allocator(), tree.pool, query, opts, &tree.hits);
+        return tree.hits.items;
     }
 
     /// Hits for `query` whose path ends in "<root>/<rel>".
-    fn count(t: *Tree, query: []const u8, rel: []const u8) !usize {
+    fn count(tree: *Tree, query: []const u8, rel: []const u8) !usize {
         var buf: [4096]u8 = undefined;
-        const want = try std.mem.print(&buf, "{s}/{s}", .{ t.root, rel });
+        const want = try std.mem.print(&buf, "{s}/{s}", .{ tree.root, rel });
         var n: usize = 0;
-        for (try t.searchOpts(query, .{
+        for (try tree.searchOpts(query, .{
             .limit = 50,
             .recency = false,
         })) |h| n += @intFromBool(std.mem.eql(u8, h.path, want));
         return n;
     }
 
-    fn found(t: *Tree, query: []const u8, rel: []const u8) !bool {
-        return try t.count(query, rel) > 0;
+    fn found(tree: *Tree, query: []const u8, rel: []const u8) !bool {
+        return try tree.count(query, rel) > 0;
     }
 
     /// Hits whose path is anywhere under the temp dir's `rel`. The root
     /// entry is left out: its name is its whole path, which a short query
     /// can match by chance.
-    fn under(t: *Tree, query: []const u8, rel: []const u8) !usize {
+    fn under(tree: *Tree, query: []const u8, rel: []const u8) !usize {
         var buf: [4096]u8 = undefined;
-        const prefix = try std.mem.print(&buf, "{s}/{s}", .{ t.dir, rel });
+        const prefix = try std.mem.print(&buf, "{s}/{s}", .{ tree.dir, rel });
         var n: usize = 0;
-        for (try t.searchOpts(query, .{ .limit = 50, .recency = false })) |h| {
+        for (try tree.searchOpts(query, .{ .limit = 50, .recency = false })) |h| {
             n += @intFromBool(
-                std.mem.startsWith(u8, h.path, prefix) and !std.mem.eql(u8, h.path, t.root),
+                std.mem.startsWith(u8, h.path, prefix) and !std.mem.eql(u8, h.path, tree.root),
             );
         }
         return n;
     }
 
     /// Stands in for `Service.rescan`, without the lock to release.
-    fn compact(t: *Tree) !void {
-        const fresh = try prepareCompaction(testing.allocator, t.pool, &t.cfg, null);
-        const old = try t.live.adopt(fresh.base, fresh.watcher);
+    fn compact(tree: *Tree) !void {
+        const fresh = try prepareCompaction(testing.allocator, tree.pool, &tree.cfg, null);
+        const old = try tree.live.adopt(fresh.base, fresh.watcher);
         var b = old.base;
         b.deinit(testing.allocator);
         old.watcher.destroy(testing.allocator);
     }
 
-    fn scoreOf(t: *Tree, query: []const u8, rel: []const u8) !?i32 {
+    fn scoreOf(tree: *Tree, query: []const u8, rel: []const u8) !?i32 {
         var buf: [4096]u8 = undefined;
-        const want = try std.mem.print(&buf, "{s}/{s}", .{ t.root, rel });
-        for (try t.searchOpts(query, .{
+        const want = try std.mem.print(&buf, "{s}/{s}", .{ tree.root, rel });
+        for (try tree.searchOpts(query, .{
             .limit = 50,
             .recency = false,
         })) |h| if (std.mem.eql(u8, h.path, want)) return h.score;

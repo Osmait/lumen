@@ -135,35 +135,35 @@ pub fn start(
 
 /// Stops the thread, saves what was learned if needed, frees everything.
 /// The flush is what makes today's files still be there tomorrow.
-pub fn shutdown(s: *Service) void {
-    s.stop.store(true, .release);
-    if (s.wake_fd != no_fd) {
+pub fn shutdown(service: *Service) void {
+    service.stop.store(true, .release);
+    if (service.wake_fd != no_fd) {
         const one: u64 = 1;
-        _ = std.os.linux.write(s.wake_fd, std.mem.asBytes(&one), 8);
+        _ = std.os.linux.write(service.wake_fd, std.mem.asBytes(&one), 8);
     }
-    if (s.thread) |t| t.join();
-    if (s.wake_fd != no_fd) sys.close(s.wake_fd);
-    if (s.live.dirty or s.live.pending_resync) {
-        if (Live.prepareCompaction(s.gpa, s.scan_pool, &s.cfg, s.cache_path)) |fresh| {
-            if (s.live.adopt(fresh.base, fresh.watcher)) |old| freeReplaced(s.gpa, old) else |err| {
+    if (service.thread) |t| t.join();
+    if (service.wake_fd != no_fd) sys.close(service.wake_fd);
+    if (service.live.dirty or service.live.pending_resync) {
+        if (Live.prepareCompaction(service.gpa, service.scan_pool, &service.cfg, service.cache_path)) |fresh| {
+            if (service.live.adopt(fresh.base, fresh.watcher)) |old| freeReplaced(service.gpa, old) else |err| {
                 log.warn("saving the file index: {t}", .{err});
-                freeReplaced(s.gpa, fresh);
+                freeReplaced(service.gpa, fresh);
             }
         } else |err| log.warn("saving the file index: {t}", .{err});
     }
-    s.live.deinit();
-    s.search_pool.destroy();
-    s.scan_pool.destroy();
-    s.content_search_pool.destroy();
-    s.content_build_pool.destroy();
-    s.gpa.free(s.roots[0]);
-    s.gpa.free(s.cache_path);
-    s.gpa.destroy(s);
+    service.live.deinit();
+    service.search_pool.destroy();
+    service.scan_pool.destroy();
+    service.content_search_pool.destroy();
+    service.content_build_pool.destroy();
+    service.gpa.free(service.roots[0]);
+    service.gpa.free(service.cache_path);
+    service.gpa.destroy(service);
 }
 
 /// Top `limit` files for `query`; paths live in `arena`.
 pub fn search(
-    s: *Service,
+    service: *Service,
     arena: std.mem.Allocator,
     query: []const u8,
     limit: usize,
@@ -171,9 +171,9 @@ pub fn search(
 ) std.mem.Allocator.Error!void {
     // Exclusive, not shared: a search mutates the engines' refinement cache.
     // Only the UI thread searches, so readers never queue behind each other.
-    s.lock.lockUncancelable(s.io);
-    defer s.lock.unlock(s.io);
-    try s.live.search(arena, s.search_pool, query, .{ .limit = limit }, out);
+    service.lock.lockUncancelable(service.io);
+    defer service.lock.unlock(service.io);
+    try service.live.search(arena, service.search_pool, query, .{ .limit = limit }, out);
 }
 
 pub const Status = struct {
@@ -187,19 +187,19 @@ pub const Status = struct {
     last_rescan_ns: u64 = 0,
 };
 
-pub fn status(s: *Service) Status {
-    s.lock.lockSharedUncancelable(s.io);
-    defer s.lock.unlockShared(s.io);
+pub fn status(service: *Service) Status {
+    service.lock.lockSharedUncancelable(service.io);
+    defer service.lock.unlockShared(service.io);
     return .{
         // Live entries: the delta also holds scaffolding and its own graves.
-        .entries = s.live.base.liveLen() + s.live.delta.liveLen(),
-        .watches = s.live.stats.watches,
-        .unwatched = s.live.watcher.unwatched,
-        .armed = s.live.fullyArmed(),
-        .rescanning = s.live.pending_resync,
-        .index_bytes = s.live.base.buf.len + s.live.delta.buf.len,
-        .rescans = s.rescans.load(.monotonic),
-        .last_rescan_ns = s.last_rescan_ns.load(.monotonic),
+        .entries = service.live.base.liveLen() + service.live.delta.liveLen(),
+        .watches = service.live.stats.watches,
+        .unwatched = service.live.watcher.unwatched,
+        .armed = service.live.fullyArmed(),
+        .rescanning = service.live.pending_resync,
+        .index_bytes = service.live.base.buf.len + service.live.delta.buf.len,
+        .rescans = service.rescans.load(.monotonic),
+        .last_rescan_ns = service.last_rescan_ns.load(.monotonic),
     };
 }
 
@@ -211,16 +211,16 @@ fn freeReplaced(gpa: std.mem.Allocator, old: Live.Replaced) void {
 
 /// `name_changes`, or null while it cannot be trusted: watches not all
 /// armed yet, or directories left unwatched (the inotify limit).
-pub fn nameChanges(s: *Service) ?u64 {
-    s.lock.lockSharedUncancelable(s.io);
-    defer s.lock.unlockShared(s.io);
-    if (!s.live.fullyArmed() or s.live.watcher.unwatched > 0) return null;
-    return s.name_changes.load(.acquire);
+pub fn nameChanges(service: *Service) ?u64 {
+    service.lock.lockSharedUncancelable(service.io);
+    defer service.lock.unlockShared(service.io);
+    if (!service.live.fullyArmed() or service.live.watcher.unwatched > 0) return null;
+    return service.name_changes.load(.acquire);
 }
 
 /// Whether a change may concern the content index (see `name_changes`).
 /// Under the lock, before the change is applied (its parent id resolves).
-fn concernsContent(s: *Service, ch: Watcher.Change) bool {
+fn concernsContent(service: *Service, ch: Watcher.Change) bool {
     const parent: u32, const name: []const u8 = switch (ch) {
         .created => |x| .{ x.parent, x.name },
         .removed => |x| .{ x.parent, x.name },
@@ -228,8 +228,8 @@ fn concernsContent(s: *Service, ch: Watcher.Change) bool {
     };
     if (name.len > 0 and name[0] == '.') return false;
     var buf: [4096]u8 = undefined;
-    const dir = s.live.pathOf(parent, &buf) orelse return true;
-    const root = s.roots[0];
+    const dir = service.live.pathOf(parent, &buf) orelse return true;
+    const root = service.roots[0];
     const rel = if (std.mem.startsWith(u8, dir, root)) dir[root.len..] else dir;
     var it = std.mem.tokenizeScalar(u8, rel, '/');
     while (it.next()) |part| if (part[0] == '.') return false;
@@ -244,128 +244,128 @@ fn backoffFor(prev: u64, since: u64) u64 {
 }
 
 /// Sleeps `ns`, or less if `shutdown` is called: false then.
-fn pause(s: *Service, ns: u64) bool {
+fn pause(service: *Service, ns: u64) bool {
     const deadline = sys.monotonicNs() +| ns;
-    while (!s.stop.load(.acquire)) {
+    while (!service.stop.load(.acquire)) {
         const left = deadline -| sys.monotonicNs();
         if (left == 0) return true;
         // `shutdown` writes the eventfd and nothing reads it: once written
         // it stays readable. Without one, a look at `stop` every 100 ms.
         const ms: i32 = @intCast(@min(left / std.time.ns_per_ms + 1, 100));
-        if (s.wake_fd != no_fd) _ = sys.waitReadable(s.wake_fd, ms) else sys.sleepUs(
+        if (service.wake_fd != no_fd) _ = sys.waitReadable(service.wake_fd, ms) else sys.sleepUs(
             @as(u64, @intCast(ms)) * std.time.us_per_ms,
         );
     }
     return false;
 }
 
-fn rescan(s: *Service) void {
-    if (s.last_rescan_end_ns) |end| {
+fn rescan(service: *Service) void {
+    if (service.last_rescan_end_ns) |end| {
         const since = sys.monotonicNs() -| end;
-        s.backoff_ns = backoffFor(s.backoff_ns, since);
+        service.backoff_ns = backoffFor(service.backoff_ns, since);
         // Stopping: the request stays, `shutdown` rescans.
-        if (s.backoff_ns > since and !s.pause(s.backoff_ns - since)) return;
+        if (service.backoff_ns > since and !service.pause(service.backoff_ns - since)) return;
     }
     const t0 = sys.monotonicNs();
     // Nobody can tell what changed while the index is rebuilt.
-    defer _ = s.name_changes.fetchAdd(1, .release);
+    defer _ = service.name_changes.fetchAdd(1, .release);
     defer {
         const t1 = sys.monotonicNs();
-        s.last_rescan_end_ns = t1;
-        s.last_rescan_ns.store(t1 - t0, .monotonic);
-        _ = s.rescans.fetchAdd(1, .monotonic);
+        service.last_rescan_end_ns = t1;
+        service.last_rescan_ns.store(t1 - t0, .monotonic);
+        _ = service.rescans.fetchAdd(1, .monotonic);
         @import("root.zig").trimHeap();
     }
-    const fresh = Live.prepareCompaction(s.gpa, s.scan_pool, &s.cfg, s.cache_path) catch |err| {
+    const fresh = Live.prepareCompaction(service.gpa, service.scan_pool, &service.cfg, service.cache_path) catch |err| {
         log.warn("rescan: {t}", .{err});
         // Clear the request so a failing rescan does not spin the CPU.
-        s.lock.lockUncancelable(s.io);
-        defer s.lock.unlock(s.io);
-        s.live.pending_resync = false;
+        service.lock.lockUncancelable(service.io);
+        defer service.lock.unlock(service.io);
+        service.live.pending_resync = false;
         return;
     };
     const old = blk: {
-        s.lock.lockUncancelable(s.io);
-        defer s.lock.unlock(s.io);
-        break :blk s.live.adopt(fresh.base, fresh.watcher);
+        service.lock.lockUncancelable(service.io);
+        defer service.lock.unlock(service.io);
+        break :blk service.live.adopt(fresh.base, fresh.watcher);
     };
     // Outside the lock: closing tens of thousands of watches is kernel time
     // no search should pay.
-    if (old) |o| freeReplaced(s.gpa, o) else |err| {
+    if (old) |o| freeReplaced(service.gpa, o) else |err| {
         log.warn("rescan: {t}", .{err});
-        freeReplaced(s.gpa, fresh);
+        freeReplaced(service.gpa, fresh);
     }
 }
 
 /// Drains and applies what inotify reported; true if a rescan is due.
-fn applyEvents(s: *Service, arena: std.mem.Allocator) bool {
+fn applyEvents(service: *Service, arena: std.mem.Allocator) bool {
     var scans: Live.Scans = .empty;
     var max_entries: usize = 0;
     {
-        s.lock.lockUncancelable(s.io);
-        defer s.lock.unlock(s.io);
+        service.lock.lockUncancelable(service.io);
+        defer service.lock.unlock(service.io);
         var changes: std.ArrayList(Watcher.Change) = .empty;
         // Events drained from the kernel and then lost would leave the
         // index wrong for good: a failure asks for a rescan instead.
-        s.live.watcher.drain(arena, &changes) catch |err| {
+        service.live.watcher.drain(arena, &changes) catch |err| {
             log.warn("reading file events: {t}", .{err});
-            s.live.pending_resync = true;
+            service.live.pending_resync = true;
         };
-        for (changes.items) |ch| if (s.concernsContent(ch)) {
-            _ = s.name_changes.fetchAdd(1, .release);
+        for (changes.items) |ch| if (service.concernsContent(ch)) {
+            _ = service.name_changes.fetchAdd(1, .release);
             break;
         };
-        _ = s.live.apply(changes.items) catch |err| {
+        _ = service.live.apply(changes.items) catch |err| {
             log.warn("applying file events: {t}", .{err});
-            s.live.pending_resync = true;
+            service.live.pending_resync = true;
         };
-        if (s.live.scans.items.len == 0) return s.live.pending_resync or s.live.needsCompaction();
-        scans = s.live.takeScans();
-        max_entries = s.live.limits.delta_max;
+        if (service.live.scans.items.len == 0) return service.live.pending_resync or service.live.needsCompaction();
+        scans = service.live.takeScans();
+        max_entries = service.live.limits.delta_max;
     }
     // New directories are read without the lock: a large tree moved in
     // held it, and every search with it, for as long as reading took.
-    Live.readScans(s.gpa, s.scan_pool, &s.cfg, scans.items, max_entries);
-    s.lock.lockUncancelable(s.io);
-    defer s.lock.unlock(s.io);
-    s.live.addScans(&scans) catch |err| {
+    Live.readScans(service.gpa, service.scan_pool, &service.cfg, scans.items, max_entries);
+    service.lock.lockUncancelable(service.io);
+    defer service.lock.unlock(service.io);
+    service.live.addScans(&scans) catch |err| {
         log.warn("applying file events: {t}", .{err});
-        s.live.pending_resync = true;
+        service.live.pending_resync = true;
     };
-    return s.live.pending_resync or s.live.needsCompaction();
+    return service.live.pending_resync or service.live.needsCompaction();
 }
 
-fn run(s: *Service) void {
-    var arena_state: std.heap.ArenaAllocator = .init(s.gpa);
+fn run(service: *Service) void {
+    var arena_state: std.heap.ArenaAllocator = .init(service.gpa);
     defer arena_state.deinit();
-    while (!s.stop.load(.acquire)) {
+    while (!service.stop.load(.acquire)) {
         // A pending rescan goes first: arming watches on an index about to be
         // replaced is wasted work.
-        s.lock.lockSharedUncancelable(s.io);
-        const resync = s.live.pending_resync;
-        s.lock.unlockShared(s.io);
+        service.lock.lockSharedUncancelable(service.io);
+        const resync = service.live.pending_resync;
+        service.lock.unlockShared(service.io);
         if (resync) {
-            s.rescan();
+            service.rescan();
             continue;
         }
 
         // Phase 1: finish arming, yielding the index between batches.
-        s.lock.lockUncancelable(s.io);
-        const more = s.live.armProgress(arm_batch);
-        s.lock.unlock(s.io);
+        service.lock.lockUncancelable(service.io);
+        const more = service.live.armProgress(arm_batch);
+        service.lock.unlock(service.io);
         if (more) {
             sys.sleepUs(arm_yield_us);
             continue;
         }
 
         // Phase 2: wait for events without holding the index.
-        s.lock.lockSharedUncancelable(s.io);
-        const fd = s.live.watcher.fd;
-        s.lock.unlockShared(s.io);
-        if (!sys.waitEvents(fd, s.wake_fd)) continue;
+        service.lock.lockSharedUncancelable(service.io);
+        const fd = service.live.watcher.fd;
+        service.lock.unlockShared(service.io);
+        if (!sys.waitEvents(fd, service.wake_fd)) continue;
 
         _ = arena_state.reset(.retain_capacity);
-        if (s.applyEvents(arena_state.allocator())) s.rescan();
+        if (service.applyEvents(arena_state.allocator())) service.rescan();
     }
 }
 
@@ -383,10 +383,10 @@ fn touch(dir: []const u8, name: []const u8) !void {
 /// test with its own thread pool, and a loaded machine is slow.
 const wait_tries = 1000;
 
-fn waitFor(s: *Service, arena: std.mem.Allocator, query: []const u8, want: bool) !bool {
+fn waitFor(service: *Service, arena: std.mem.Allocator, query: []const u8, want: bool) !bool {
     var hits: std.ArrayList(Live.Hit) = .empty;
     for (0..wait_tries) |_| {
-        try s.search(arena, query, 10, &hits);
+        try service.search(arena, query, 10, &hits);
         if ((hits.items.len > 0) == want) return true;
         sys.sleepUs(10_000);
     }
@@ -438,25 +438,25 @@ test "live: new, nested and deleted files show up without a rescan" {
 const tmpAbs = sys.tmpDirAbs;
 
 /// Waits until the thread has nothing pending: armed and not rescanning.
-fn settle(s: *Service) !void {
+fn settle(service: *Service) !void {
     for (0..wait_tries) |_| {
-        const st = s.status();
+        const st = service.status();
         if (st.armed and !st.rescanning) return;
         sys.sleepUs(20_000);
     }
     return error.NeverSettled;
 }
 
-fn has(s: *Service, arena: std.mem.Allocator, query: []const u8, suffix: []const u8) !bool {
+fn has(service: *Service, arena: std.mem.Allocator, query: []const u8, suffix: []const u8) !bool {
     var hits: std.ArrayList(Live.Hit) = .empty;
-    try s.search(arena, query, 50, &hits);
+    try service.search(arena, query, 50, &hits);
     for (hits.items) |h| if (std.mem.endsWith(u8, h.path, suffix)) return true;
     return false;
 }
 
-fn waitHas(s: *Service, arena: std.mem.Allocator, query: []const u8, suffix: []const u8) !bool {
+fn waitHas(service: *Service, arena: std.mem.Allocator, query: []const u8, suffix: []const u8) !bool {
     for (0..wait_tries) |_| {
-        if (try has(s, arena, query, suffix)) return true;
+        if (try has(service, arena, query, suffix)) return true;
         sys.sleepUs(10_000);
     }
     return false;
@@ -638,9 +638,9 @@ test "service: shutdown saves what was learned and the next start maps it" {
 }
 
 /// Waits until `nameChanges` differs from `from` (or, `from` null, is known).
-pub fn waitNames(s: *Service, from: ?u64) error{NoNameChange}!u64 {
+pub fn waitNames(service: *Service, from: ?u64) error{NoNameChange}!u64 {
     for (0..wait_tries) |_| {
-        if (s.nameChanges()) |n| if (from == null or n != from.?) return n;
+        if (service.nameChanges()) |n| if (from == null or n != from.?) return n;
         sys.sleepUs(10_000);
     }
     return error.NoNameChange;
