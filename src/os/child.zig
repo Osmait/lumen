@@ -143,14 +143,9 @@ const Pump = struct {
     const End = enum { closed, timed_out, capped };
 
     fn loop(p: *Pump) Error!End {
-        if (p.child.stdin) |f| {
-            const nonblock: u32 = @bitCast(linux.O{ .NONBLOCK = true });
-            _ = linux.fcntl(
-                f.handle,
-                linux.F.SETFL,
-                linux.fcntl(f.handle, linux.F.GETFL, 0) | nonblock,
-            );
-        }
+        // A blocking stdin would let one write stall the whole poll loop,
+        // deadline included: if it cannot be made non-blocking, give up.
+        if (p.child.stdin) |f| try setNonblocking(f.handle);
         while (p.out_open or p.err_open) {
             const now_ns = os.monotonicNs();
             if (now_ns >= p.opts.deadline_ns) return .timed_out;
@@ -228,6 +223,15 @@ const Pump = struct {
     }
 };
 
+/// Adds O_NONBLOCK to `fd`'s status flags, keeping the others.
+fn setNonblocking(fd: i32) error{Syscall}!void {
+    const flags = linux.fcntl(fd, linux.F.GETFL, 0);
+    if (linux.errno(flags) != .SUCCESS) return error.Syscall;
+    const nonblock: u32 = @bitCast(linux.O{ .NONBLOCK = true });
+    const set_rc = linux.fcntl(fd, linux.F.SETFL, flags | nonblock);
+    if (linux.errno(set_rc) != .SUCCESS) return error.Syscall;
+}
+
 const testing = std.testing;
 
 fn deadline(ms: u64) u64 {
@@ -275,6 +279,18 @@ test "a program that closes its output but keeps running still times out" {
     });
     defer r.deinit(testing.allocator);
     try testing.expect(r.timed_out);
+}
+
+test "a descriptor that cannot be made non-blocking is an error" {
+    try testing.expectError(error.Syscall, setNonblocking(-1));
+
+    var pipe: [2]i32 = undefined;
+    try testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&pipe, .{ .CLOEXEC = true })));
+    defer for (pipe) |fd| os.close(fd);
+    try setNonblocking(pipe[1]);
+    const flags = linux.fcntl(pipe[1], linux.F.GETFL, 0);
+    const nonblock: u32 = @bitCast(linux.O{ .NONBLOCK = true });
+    try testing.expect(flags & nonblock != 0);
 }
 
 test "a missing program is an error, not a crash" {
