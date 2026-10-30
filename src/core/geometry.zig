@@ -6,6 +6,8 @@ const assert = std.debug.assert;
 
 pub const Rect = struct { x: i32, y: i32, w: i32, h: i32 };
 
+pub const Size = struct { w: i32, h: i32 };
+
 pub const Monitor = struct {
     x: i32,
     y: i32,
@@ -77,7 +79,7 @@ pub const Layout = enum {
 
 /// Where a window of size `current` goes for `layout`, with `gap_px`
 /// pixels kept around it.
-pub fn place(layout: Layout, outer: Rect, current: struct { w: i32, h: i32 }, gap_px: i32) Rect {
+pub fn place(layout: Layout, outer: Rect, current: Size, gap_px: i32) Rect {
     const area: Rect = .{
         .x = outer.x + gap_px,
         .y = outer.y + gap_px,

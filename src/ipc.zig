@@ -12,7 +12,7 @@ const std = @import("std");
 pub const default_app_id = "dev.osmait.Lumen";
 
 /// Arguments and payload together; a copy larger than this is not kept
-/// anyway (Db.max_bytes).
+/// anyway (Db.clip_bytes_max).
 pub const max_request_bytes = (1 << 20) + 64 * 1024;
 pub const max_args = 64;
 

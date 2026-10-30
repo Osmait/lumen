@@ -557,7 +557,7 @@ fn clipStore(init: std.process.Init) !void {
     // Larger copies are not kept (images, huge selections).
     const content = stdin.interface.allocRemaining(
         init.gpa,
-        .limited(Db.max_bytes),
+        .limited(Db.clip_bytes_max),
     ) catch |err| switch (err) {
         error.StreamTooLong => return,
         error.ReadFailed => return stdin.err.?,
