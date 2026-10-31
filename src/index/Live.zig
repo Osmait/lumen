@@ -12,6 +12,19 @@
 //!
 //! When the delta grows or tombstones pile up, a rescan (prepared outside the
 //! lock) replaces everything with one clean index.
+//!
+//! How `Service`'s thread drives it, with the lock held unless noted:
+//!
+//!   1. `armProgress` until every base directory is watched.
+//!   2. `apply` for each batch of `Watcher.Change`s. A new directory gets
+//!      its entry at once; what it holds is read by `takeScans`,
+//!      `readScans` (unlocked) and `addScans`.
+//!   3. `needsCompaction`, or `pending_resync` set by an overflow or by
+//!      running out of memory, asks for a rescan: `prepareCompaction`
+//!      (unlocked), then `adopt`, whose returned index is freed unlocked.
+//!
+//! Searches (`search`) come from the UI thread between any of these.
+//! Entries are named by `EntryId`, an index into the base or the delta.
 
 const std = @import("std");
 const paths = @import("paths.zig");
@@ -51,6 +64,8 @@ arm_cursor: ?u32 = null,
 /// Persistent engines: what enables refinement while typing (measured in the
 /// Rust version: 503 us cold vs 14 us reusing the engine).
 engine_base: engine.Engine = .empty,
+/// The index may be wrong (events were lost, or a change could not be
+/// applied for lack of memory): the service rescans, without the lock.
 pending_resync: bool = false,
 /// Changes not yet in the index file. Without this, what was learned while
 /// running lived only in the delta and died with the process.
