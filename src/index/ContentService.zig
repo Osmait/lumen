@@ -931,7 +931,12 @@ fn dropStaleText(service: *ContentService, old: *const content.Index, gone: []co
     for (gone) |id| {
         if (old.sources[id] != @backingInt(content.Source.extracted)) continue;
         const text_path = service.textPath(&path_buffer, old.docIn(id)) orelse continue;
-        _ = std.os.linux.unlink(text_path);
+        // Left behind, it is deleted by the next whole build's sweep.
+        const result = std.os.linux.unlink(text_path);
+        switch (std.os.linux.errno(result)) {
+            .SUCCESS, .NOENT => {},
+            else => |errno| log.warn("deleting {s}: {t}", .{ text_path, errno }),
+        }
     }
 }
 
@@ -973,13 +978,22 @@ fn sweepText(service: *ContentService) void {
         var name_buffer: [256]u8 = undefined;
         const name = std.mem.printSentinel(&name_buffer, "{s}", .{entry.name}, 0) catch continue;
         const name_wanted = keep.get(entry.name) orelse {
-            _ = std.os.linux.unlinkat(fd, name, 0);
+            // Left behind, it is tried again by the next sweep.
+            const result = std.os.linux.unlinkat(fd, name, 0);
+            switch (std.os.linux.errno(result)) {
+                .SUCCESS, .NOENT => {},
+                else => |errno| log.warn("deleting {s}/{s}: {t}", .{ text_dir, name, errno }),
+            }
             continue;
         };
         if (std.mem.eql(u8, name_wanted, entry.name)) continue;
         var wanted_buffer: [64]u8 = undefined;
         const target = std.mem.printSentinel(&wanted_buffer, "{s}", .{name_wanted}, 0) catch continue;
-        _ = std.os.linux.renameat(fd, name, fd, target);
+        // Not renamed, the text is extracted again under its new name.
+        const result = std.os.linux.renameat(fd, name, fd, target);
+        if (std.os.linux.errno(result) != .SUCCESS) {
+            log.warn("renaming {s}/{s}: {t}", .{ text_dir, name, std.os.linux.errno(result) });
+        }
     }
 }
 
