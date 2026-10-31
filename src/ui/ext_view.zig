@@ -4,6 +4,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const c = @import("c");
+const gtk = @import("gtk.zig");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
 const Host = @import("../ext/Host.zig");
@@ -552,24 +553,24 @@ pub fn openTarget(ui: *Ui, target: []const u8, text: ?[*:0]const u8) bool {
                 return true;
             },
             .form => {
-                if (c.gtk_widget_get_visible(ui.window) == 0) ui.show();
+                if (!gtk.isVisible(ui.window)) ui.show();
                 form_view.open(ui, i);
                 return true;
             },
             .list, .search => {},
         }
         ui.ext_cmd = i;
-        if (c.gtk_widget_get_visible(ui.window) == 0) {
+        if (!gtk.isVisible(ui.window)) {
             ui.showWith(.ext, text);
         } else {
             ui.navigate(.ext);
-            if (text) |t| c.gtk_editable_set_text(@ptrCast(ui.entry), t);
+            if (text) |t| c.gtk_editable_set_text(gtk.editable(ui.entry), t);
         }
         return true;
     };
     const view = std.meta.stringToEnum(item_mod.View, target) orelse return false;
     if (view == .ext or view == .choose) return false;
-    if (c.gtk_widget_get_visible(ui.window) == 0) ui.showWith(view, text) else ui.navigate(view);
+    if (!gtk.isVisible(ui.window)) ui.showWith(view, text) else ui.navigate(view);
     return true;
 }
 

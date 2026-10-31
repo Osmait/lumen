@@ -3,6 +3,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const c = @import("c");
+const gtk = @import("gtk.zig");
 const item_mod = @import("../item.zig");
 const Ui = @import("Ui.zig");
 
@@ -81,7 +82,7 @@ fn escape(ui: *Ui) void {
         // The text is the value being edited: Esc leaves it unsaved.
         ui.goBack();
     } else if (ui.query().len > 0) {
-        c.gtk_editable_set_text(@ptrCast(ui.entry), "");
+        c.gtk_editable_set_text(gtk.editable(ui.entry), "");
     } else if (ui.view != .root) ui.goBack() else ui.hide();
 }
 

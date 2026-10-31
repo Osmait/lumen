@@ -8,6 +8,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const c = @import("c");
+const gtk = @import("gtk.zig");
 const core = @import("core");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
@@ -99,45 +100,45 @@ apps: Apps,
 /// Coalesces the app monitor's bursts (onAppsChanged).
 apps_reload_timer: c_uint = 0,
 
-window: *c.GtkWidget = undefined,
+window: *c.GtkWindow = undefined,
 /// The search bar and the results, sized by the layout settings.
-column: *c.GtkWidget = undefined,
+column: *c.GtkBox = undefined,
 /// lumen.layout from init.lua (defaults until the files load).
 layout: layout_mod.Layout = .{},
 /// Takes the room above the results when the search bar is at the bottom.
-spacer: *c.GtkWidget = undefined,
+spacer: *c.GtkBox = undefined,
 /// The bar under the results (lumen.layout's footer): the view's name,
 /// what Enter does, and Actions.
-footer: *c.GtkWidget = undefined,
-footer_title: *c.GtkWidget = undefined,
-footer_action: *c.GtkWidget = undefined,
-footer_enter: *c.GtkWidget = undefined,
-footer_sep: *c.GtkWidget = undefined,
+footer: *c.GtkBox = undefined,
+footer_title: *c.GtkLabel = undefined,
+footer_action: *c.GtkLabel = undefined,
+footer_enter: *c.GtkLabel = undefined,
+footer_sep: *c.GtkLabel = undefined,
 /// The "Ctrl K" chip in the search bar, and the magnifier before the text.
 key_chip: *c.GtkWidget = undefined,
 search_icon: *c.GtkWidget = undefined,
 /// lumen.layout's prompt (rofi's "drun"), before the text.
-prompt_label: *c.GtkWidget = undefined,
+prompt_label: *c.GtkLabel = undefined,
 /// True once `build` has made the widgets. Settings read before that are
 /// applied to the widgets when they exist.
 built: bool = false,
-entry: *c.GtkWidget = undefined,
+entry: *c.GtkText = undefined,
 back: *c.GtkWidget = undefined,
-list: *c.GtkWidget = undefined,
+list: *c.GtkListBox = undefined,
 /// Extension commands with `grid = true` show their rows here instead.
-grid: *c.GtkWidget = undefined,
+grid: *c.GtkFlowBox = undefined,
 grid_mode: bool = false,
 grid_columns: c_int = 5,
-scroller: *c.GtkWidget = undefined,
-detail: *c.GtkWidget = undefined,
-detail_text: *c.GtkWidget = undefined,
-detail_picture: *c.GtkWidget = undefined,
+scroller: *c.GtkScrolledWindow = undefined,
+detail: *c.GtkBox = undefined,
+detail_text: *c.GtkLabel = undefined,
+detail_picture: *c.GtkPicture = undefined,
 /// The "Information" block under the preview (hidden for extensions).
-detail_meta: *c.GtkWidget = undefined,
-meta_keys: [item_mod.meta_max]*c.GtkWidget = undefined,
+detail_meta: *c.GtkBox = undefined,
+meta_keys: [item_mod.meta_max]*c.GtkLabel = undefined,
 /// The rows of the Information block (extensions show as many as they give).
-meta_lines: [item_mod.meta_max]*c.GtkWidget = undefined,
-meta_values: [item_mod.meta_max]*c.GtkWidget = undefined,
+meta_lines: [item_mod.meta_max]*c.GtkBox = undefined,
+meta_values: [item_mod.meta_max]*c.GtkLabel = undefined,
 /// File index, started by main once the window exists.
 files: ?*index.Service = null,
 /// Content (full-text) index, started by main after `files`.
@@ -154,17 +155,17 @@ frame_clock_hooked: bool = false,
 /// Icons made for the current rows; released on the next refresh.
 icons: std.ArrayList(*c.GIcon) = .empty,
 /// The view's name, a chip in the search bar (hidden in the root view).
-scope: *c.GtkWidget = undefined,
+scope: *c.GtkLabel = undefined,
 /// The island holding the results (and the detail pane).
-results: *c.GtkWidget = undefined,
-search_bar: *c.GtkWidget = undefined,
+results: *c.GtkBox = undefined,
+search_bar: *c.GtkBox = undefined,
 /// Clear full-screen layers under the window, one per monitor: a click on
 /// one (anywhere outside Lumen) hides it.
 backdrops: [8]?*c.GtkWidget = @splat(null),
 /// What Enter does on the selected row, shown inside it.
 primary: [:0]const u8 = "",
-panel: *c.GtkWidget = undefined,
-panel_list: *c.GtkWidget = undefined,
+panel: *c.GtkBox = undefined,
+panel_list: *c.GtkListBox = undefined,
 
 view: View = .root,
 /// Lives until the view changes: clipboard entries, window list, scripts.
@@ -398,9 +399,9 @@ pub fn build(self: *Ui) void {
     // results, as tall as their rows (the rest of the surface stays clear).
     const column = widgets.vbox(10);
     self.column = column;
-    c.gtk_widget_add_css_class(column, "shell");
-    c.gtk_widget_set_size_request(column, self.panelW(), self.panelH());
-    c.gtk_overlay_set_child(@ptrCast(overlay), column);
+    gtk.addClass(column, "shell");
+    gtk.setSizeRequest(column, self.panelW(), self.panelH());
+    c.gtk_overlay_set_child(overlay, gtk.widget(column));
 
     self.buildSearchBar(column);
     self.buildResults(column);
@@ -410,36 +411,36 @@ pub fn build(self: *Ui) void {
     const keys = c.gtk_event_controller_key_new();
     c.gtk_event_controller_set_propagation_phase(keys, c.GTK_PHASE_CAPTURE);
     widgets.connect(keys, "key-pressed", &onKey, self);
-    c.gtk_widget_add_controller(win, keys);
+    c.gtk_widget_add_controller(gtk.widget(win), keys);
 
     // A click on the clear part of the surface hides the window, like one on
     // the backdrop. Capture phase: it sees every press, and claims none.
     const click = c.gtk_gesture_click_new();
     c.gtk_event_controller_set_propagation_phase(click, c.GTK_PHASE_CAPTURE);
     widgets.connect(click, "pressed", &backdrop.onWindowPressed, self);
-    c.gtk_widget_add_controller(win, click);
+    c.gtk_widget_add_controller(gtk.widget(win), click);
     self.built = true;
     self.scanIconDir();
     self.applyStructure();
 }
 
 /// The layer-shell window and the overlay everything goes in.
-fn buildWindow(self: *Ui) *c.GtkWidget {
-    const win = c.gtk_application_window_new(self.app);
+fn buildWindow(self: *Ui) *c.GtkOverlay {
+    const win = gtk.window(self.app);
     self.window = win;
-    c.gtk_widget_add_css_class(win, "lumen");
-    c.gtk_window_set_title(@ptrCast(win), "Lumen");
-    c.gtk_window_set_resizable(@ptrCast(win), 0);
-    c.gtk_window_set_decorated(@ptrCast(win), 0);
+    gtk.addClass(win, "lumen");
+    c.gtk_window_set_title(win, "Lumen");
+    c.gtk_window_set_resizable(win, 0);
+    c.gtk_window_set_decorated(win, 0);
     // A fixed size: the layer surface would otherwise grow to its content's
     // natural size (a large image preview, a long path).
     c.gtk_window_set_default_size(
-        @ptrCast(win),
+        win,
         self.panelW() + 2 * shell_margin,
         self.panelH() + 2 * shell_margin,
     );
 
-    const window: *c.GtkWindow = @ptrCast(win);
+    const window = win;
     c.gtk_layer_init_for_window(window);
     c.gtk_layer_set_layer(window, c.GTK_LAYER_SHELL_LAYER_OVERLAY);
     c.gtk_layer_set_keyboard_mode(
@@ -452,138 +453,138 @@ fn buildWindow(self: *Ui) *c.GtkWidget {
     c.gtk_layer_set_namespace(window, "lumen");
     c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_TOP, 1);
 
-    const overlay = c.gtk_overlay_new();
-    c.gtk_window_set_child(window, overlay);
+    const overlay = gtk.overlay();
+    c.gtk_window_set_child(window, gtk.widget(overlay));
     return overlay;
 }
 
 /// The back arrow, magnifier, prompt, scope, entry and Ctrl K chip.
-fn buildSearchBar(self: *Ui, column: *c.GtkWidget) void {
+fn buildSearchBar(self: *Ui, column: *c.GtkBox) void {
     const search = widgets.hbox(0);
-    c.gtk_widget_add_css_class(search, "search");
+    gtk.addClass(search, "search");
     self.search_bar = search;
     self.back = c.gtk_image_new_from_icon_name("go-previous-symbolic");
-    c.gtk_widget_add_css_class(self.back, "back");
-    c.gtk_widget_set_valign(self.back, c.GTK_ALIGN_CENTER);
+    gtk.addClass(self.back, "back");
+    gtk.setValign(self.back, c.GTK_ALIGN_CENTER);
     // An image has no click of its own: a gesture makes it the back button.
     c.gtk_widget_set_cursor_from_name(self.back, "pointer");
     const back_click = c.gtk_gesture_click_new();
     widgets.connect(back_click, "released", &onBackClicked, self);
     c.gtk_widget_add_controller(self.back, back_click);
-    c.gtk_box_append(@ptrCast(search), self.back);
+    gtk.append(search, self.back);
     self.search_icon = c.gtk_image_new_from_icon_name("system-search-symbolic");
-    c.gtk_widget_add_css_class(self.search_icon, "search-icon");
-    c.gtk_widget_set_valign(self.search_icon, c.GTK_ALIGN_CENTER);
-    c.gtk_widget_set_visible(self.search_icon, 0);
-    c.gtk_box_append(@ptrCast(search), self.search_icon);
+    gtk.addClass(self.search_icon, "search-icon");
+    gtk.setValign(self.search_icon, c.GTK_ALIGN_CENTER);
+    gtk.setVisible(self.search_icon, false);
+    gtk.append(search, self.search_icon);
     self.prompt_label = widgets.label("", "prompt");
-    c.gtk_widget_set_valign(self.prompt_label, c.GTK_ALIGN_CENTER);
-    c.gtk_widget_set_visible(self.prompt_label, 0);
-    c.gtk_box_append(@ptrCast(search), self.prompt_label);
+    gtk.setValign(self.prompt_label, c.GTK_ALIGN_CENTER);
+    gtk.setVisible(self.prompt_label, false);
+    gtk.append(search, self.prompt_label);
     self.scope = widgets.label("", "scope");
-    c.gtk_widget_set_valign(self.scope, c.GTK_ALIGN_CENTER);
-    c.gtk_widget_set_visible(self.scope, 0);
-    c.gtk_box_append(@ptrCast(search), self.scope);
-    self.entry = c.gtk_text_new();
-    c.gtk_widget_add_css_class(self.entry, "query");
-    c.gtk_widget_set_hexpand(self.entry, 1);
-    c.gtk_widget_set_valign(self.entry, c.GTK_ALIGN_CENTER);
-    c.gtk_box_append(@ptrCast(search), self.entry);
+    gtk.setValign(self.scope, c.GTK_ALIGN_CENTER);
+    gtk.setVisible(self.scope, false);
+    gtk.append(search, self.scope);
+    self.entry = gtk.textField();
+    gtk.addClass(self.entry, "query");
+    gtk.setHexpand(self.entry, true);
+    gtk.setValign(self.entry, c.GTK_ALIGN_CENTER);
+    gtk.append(search, self.entry);
     widgets.connect(self.entry, "changed", &onChanged, self);
     const key_chip = widgets.label("Ctrl K", "kbd");
-    self.key_chip = key_chip;
-    c.gtk_widget_set_valign(key_chip, c.GTK_ALIGN_CENTER);
-    c.gtk_widget_set_tooltip_text(key_chip, "Actions");
-    c.gtk_box_append(@ptrCast(search), key_chip);
+    self.key_chip = gtk.widget(key_chip);
+    gtk.setValign(key_chip, c.GTK_ALIGN_CENTER);
+    c.gtk_widget_set_tooltip_text(gtk.widget(key_chip), "Actions");
+    gtk.append(search, key_chip);
     self.spacer = widgets.vbox(0);
-    c.gtk_widget_set_vexpand(self.spacer, 1);
-    c.gtk_widget_set_visible(self.spacer, 0);
-    c.gtk_box_append(@ptrCast(column), self.spacer);
-    c.gtk_box_append(@ptrCast(column), search);
+    gtk.setVexpand(self.spacer, true);
+    gtk.setVisible(self.spacer, false);
+    gtk.append(column, self.spacer);
+    gtk.append(column, search);
 }
 
 /// The list and the grid in their scroller, beside the detail pane.
-fn buildResults(self: *Ui, column: *c.GtkWidget) void {
+fn buildResults(self: *Ui, column: *c.GtkBox) void {
     const body = widgets.hbox(0);
-    c.gtk_widget_add_css_class(body, "results-island");
+    gtk.addClass(body, "results-island");
     self.results = body;
-    self.scroller = c.gtk_scrolled_window_new();
+    self.scroller = gtk.scrolledWindow();
     c.gtk_scrolled_window_set_policy(
-        @ptrCast(self.scroller),
+        self.scroller,
         c.GTK_POLICY_NEVER,
         c.GTK_POLICY_AUTOMATIC,
     );
     // As tall as the rows, up to the space left under the search bar.
-    c.gtk_scrolled_window_set_propagate_natural_height(@ptrCast(self.scroller), 1);
-    c.gtk_scrolled_window_set_max_content_height(@ptrCast(self.scroller), self.listMaxH());
-    c.gtk_widget_set_hexpand(self.scroller, 1);
-    self.list = c.gtk_list_box_new();
-    c.gtk_widget_add_css_class(self.list, "results");
-    c.gtk_list_box_set_selection_mode(@ptrCast(self.list), c.GTK_SELECTION_SINGLE);
-    c.gtk_widget_set_focusable(self.list, 0);
+    c.gtk_scrolled_window_set_propagate_natural_height(self.scroller, 1);
+    c.gtk_scrolled_window_set_max_content_height(self.scroller, self.listMaxH());
+    gtk.setHexpand(self.scroller, true);
+    self.list = gtk.listBox();
+    gtk.addClass(self.list, "results");
+    c.gtk_list_box_set_selection_mode(self.list, c.GTK_SELECTION_SINGLE);
+    gtk.setFocusable(self.list, false);
     widgets.connect(self.list, "row-activated", &onRowActivated, self);
-    self.grid = c.gtk_flow_box_new();
-    c.gtk_widget_add_css_class(self.grid, "grid");
-    c.gtk_flow_box_set_selection_mode(@ptrCast(self.grid), c.GTK_SELECTION_SINGLE);
-    c.gtk_flow_box_set_homogeneous(@ptrCast(self.grid), 1);
-    c.gtk_flow_box_set_activate_on_single_click(@ptrCast(self.grid), 1);
-    c.gtk_flow_box_set_row_spacing(@ptrCast(self.grid), 6);
-    c.gtk_flow_box_set_column_spacing(@ptrCast(self.grid), 6);
-    c.gtk_widget_set_focusable(self.grid, 0);
-    c.gtk_widget_set_valign(self.grid, c.GTK_ALIGN_START);
-    c.gtk_widget_set_visible(self.grid, 0);
+    self.grid = gtk.flowBox();
+    gtk.addClass(self.grid, "grid");
+    c.gtk_flow_box_set_selection_mode(self.grid, c.GTK_SELECTION_SINGLE);
+    c.gtk_flow_box_set_homogeneous(self.grid, 1);
+    c.gtk_flow_box_set_activate_on_single_click(self.grid, 1);
+    c.gtk_flow_box_set_row_spacing(self.grid, 6);
+    c.gtk_flow_box_set_column_spacing(self.grid, 6);
+    gtk.setFocusable(self.grid, false);
+    gtk.setValign(self.grid, c.GTK_ALIGN_START);
+    gtk.setVisible(self.grid, false);
     widgets.connect(self.grid, "child-activated", &onGridActivated, self);
     // The list and the grid share the scroller; showEmptyOrResults shows one
     // of them at a time.
     const lists = widgets.vbox(0);
-    c.gtk_box_append(@ptrCast(lists), self.list);
-    c.gtk_box_append(@ptrCast(lists), self.grid);
-    c.gtk_scrolled_window_set_child(@ptrCast(self.scroller), lists);
-    c.gtk_box_append(@ptrCast(body), self.scroller);
+    gtk.append(lists, self.list);
+    gtk.append(lists, self.grid);
+    c.gtk_scrolled_window_set_child(self.scroller, gtk.widget(lists));
+    gtk.append(body, self.scroller);
     detail_pane.buildDetail(self);
-    c.gtk_box_append(@ptrCast(body), self.detail);
-    c.gtk_box_append(@ptrCast(column), body);
+    gtk.append(body, self.detail);
+    gtk.append(column, body);
 }
 
 /// The footer (lumen.layout { footer = true }): title, action, keys.
-fn buildFooter(self: *Ui, column: *c.GtkWidget) void {
+fn buildFooter(self: *Ui, column: *c.GtkBox) void {
     self.footer = widgets.hbox(8);
-    c.gtk_widget_add_css_class(self.footer, "footer");
-    c.gtk_widget_set_size_request(self.footer, -1, footer_h);
+    gtk.addClass(self.footer, "footer");
+    gtk.setSizeRequest(self.footer, -1, footer_h);
     self.footer_title = widgets.label("Lumen", "footer-title");
-    c.gtk_widget_set_hexpand(self.footer_title, 1);
-    c.gtk_label_set_xalign(@ptrCast(self.footer_title), 0);
-    c.gtk_label_set_ellipsize(@ptrCast(self.footer_title), c.PANGO_ELLIPSIZE_END);
-    c.gtk_box_append(@ptrCast(self.footer), self.footer_title);
+    gtk.setHexpand(self.footer_title, true);
+    c.gtk_label_set_xalign(self.footer_title, 0);
+    c.gtk_label_set_ellipsize(self.footer_title, c.PANGO_ELLIPSIZE_END);
+    gtk.append(self.footer, self.footer_title);
     self.footer_action = widgets.label("", "footer-action");
-    c.gtk_box_append(@ptrCast(self.footer), self.footer_action);
+    gtk.append(self.footer, self.footer_action);
     self.footer_enter = widgets.label("↵", "kbd");
-    c.gtk_widget_set_valign(self.footer_enter, c.GTK_ALIGN_CENTER);
-    c.gtk_box_append(@ptrCast(self.footer), self.footer_enter);
+    gtk.setValign(self.footer_enter, c.GTK_ALIGN_CENTER);
+    gtk.append(self.footer, self.footer_enter);
     self.footer_sep = widgets.label("", "footer-sep");
-    c.gtk_widget_set_valign(self.footer_sep, c.GTK_ALIGN_CENTER);
-    c.gtk_box_append(@ptrCast(self.footer), self.footer_sep);
-    c.gtk_box_append(@ptrCast(self.footer), widgets.label("Actions", "footer-action"));
+    gtk.setValign(self.footer_sep, c.GTK_ALIGN_CENTER);
+    gtk.append(self.footer, self.footer_sep);
+    gtk.append(self.footer, widgets.label("Actions", "footer-action"));
     const actions_key_label = widgets.label("Ctrl K", "kbd");
-    c.gtk_widget_set_valign(actions_key_label, c.GTK_ALIGN_CENTER);
-    c.gtk_box_append(@ptrCast(self.footer), actions_key_label);
-    c.gtk_widget_set_visible(self.footer, 0);
-    c.gtk_box_append(@ptrCast(column), self.footer);
+    gtk.setValign(actions_key_label, c.GTK_ALIGN_CENTER);
+    gtk.append(self.footer, actions_key_label);
+    gtk.setVisible(self.footer, false);
+    gtk.append(column, self.footer);
 }
 
 /// The action panel, floating over the top right corner of the results.
-fn buildPanel(self: *Ui, overlay: *c.GtkWidget) void {
+fn buildPanel(self: *Ui, overlay: *c.GtkOverlay) void {
     self.panel = widgets.vbox(0);
-    c.gtk_widget_add_css_class(self.panel, "actions");
-    c.gtk_widget_set_halign(self.panel, c.GTK_ALIGN_END);
-    c.gtk_widget_set_valign(self.panel, c.GTK_ALIGN_START);
-    c.gtk_box_append(@ptrCast(self.panel), widgets.label("Actions", "actions-title"));
-    self.panel_list = c.gtk_list_box_new();
-    c.gtk_widget_set_focusable(self.panel_list, 0);
+    gtk.addClass(self.panel, "actions");
+    gtk.setHalign(self.panel, c.GTK_ALIGN_END);
+    gtk.setValign(self.panel, c.GTK_ALIGN_START);
+    gtk.append(self.panel, widgets.label("Actions", "actions-title"));
+    self.panel_list = gtk.listBox();
+    gtk.setFocusable(self.panel_list, false);
     widgets.connect(self.panel_list, "row-activated", &onPanelRowActivated, self);
-    c.gtk_box_append(@ptrCast(self.panel), self.panel_list);
-    c.gtk_widget_set_visible(self.panel, 0);
-    c.gtk_overlay_add_overlay(@ptrCast(overlay), self.panel);
+    gtk.append(self.panel, self.panel_list);
+    gtk.setVisible(self.panel, false);
+    c.gtk_overlay_add_overlay(overlay, gtk.widget(self.panel));
 }
 
 /// ~/.config/lumen/icons/<name>.svg|png replaces the icon <name> everywhere
@@ -621,20 +622,13 @@ pub fn keyIcon(self: *const Ui, key: []const u8) ?item_mod.Icon {
     return null;
 }
 
-fn cssClass(widget: *c.GtkWidget, name: [*:0]const u8, on: bool) void {
-    if (on) c.gtk_widget_add_css_class(widget, name) else c.gtk_widget_remove_css_class(
-        widget,
-        name,
-    );
-}
-
 fn barWidget(self: *Ui, part: layout_mod.BarPart) *c.GtkWidget {
     return switch (part) {
         .back => self.back,
         .icon => self.search_icon,
-        .prompt => self.prompt_label,
-        .scope => self.scope,
-        .entry => self.entry,
+        .prompt => gtk.widget(self.prompt_label),
+        .scope => gtk.widget(self.scope),
+        .entry => gtk.widget(self.entry),
         .keys => self.key_chip,
     };
 }
@@ -648,58 +642,61 @@ pub fn applyStructure(self: *Ui) void {
     widgets.rows_inline = layout.rows == .inline_;
     widgets.row_parts = layout.row;
     // The search bar's parts in order; setView decides which of them show.
-    const bar: *c.GtkBox = @ptrCast(self.search_bar);
+    const bar: *c.GtkBox = self.search_bar;
     var prev: ?*c.GtkWidget = null;
     for (layout.searchbar.slice()) |part| {
         const widget = self.barWidget(part);
         c.gtk_box_reorder_child_after(bar, widget, prev);
         prev = widget;
     }
-    c.gtk_label_set_text(@ptrCast(self.prompt_label), layout.prompt.ptr);
-    c.gtk_widget_set_visible(self.prompt_label, @intFromBool(
+    c.gtk_label_set_text(self.prompt_label, layout.prompt.ptr);
+    c.gtk_widget_set_visible(gtk.widget(self.prompt_label), @intFromBool(
         layout.prompt.len > 0 and layout.searchbar.has(.prompt),
     ));
     c.gtk_widget_set_visible(self.search_icon, @intFromBool(
         layout.show.search_icon and layout.searchbar.has(.icon),
     ));
-    const column_box: *c.GtkBox = @ptrCast(self.column);
+    const column_box: *c.GtkBox = self.column;
     c.gtk_box_set_spacing(column_box, if (layout.panels == .single) 0 else 10);
-    cssClass(self.column, "single", layout.panels == .single);
-    cssClass(self.column, "search-bottom", layout.search == .bottom);
-    cssClass(self.column, "with-footer", layout.footer);
+    gtk.setClass(self.column, "single", layout.panels == .single);
+    gtk.setClass(self.column, "search-bottom", layout.search == .bottom);
+    gtk.setClass(self.column, "with-footer", layout.footer);
     // spacer, then search and results in the chosen order, footer last.
-    c.gtk_box_reorder_child_after(column_box, self.spacer, null);
+    c.gtk_box_reorder_child_after(column_box, gtk.widget(self.spacer), null);
     const first, const second = if (layout.search == .bottom) .{
         self.results,
         self.search_bar,
     } else .{ self.search_bar, self.results };
-    c.gtk_box_reorder_child_after(column_box, first, self.spacer);
-    c.gtk_box_reorder_child_after(column_box, second, first);
-    c.gtk_box_reorder_child_after(column_box, self.footer, second);
-    c.gtk_widget_set_visible(self.spacer, @intFromBool(layout.search == .bottom));
-    c.gtk_widget_set_visible(self.footer, @intFromBool(layout.footer));
+    c.gtk_box_reorder_child_after(column_box, gtk.widget(first), gtk.widget(self.spacer));
+    c.gtk_box_reorder_child_after(column_box, gtk.widget(second), gtk.widget(first));
+    c.gtk_box_reorder_child_after(column_box, gtk.widget(self.footer), gtk.widget(second));
+    gtk.setVisible(self.spacer, layout.search == .bottom);
+    gtk.setVisible(self.footer, layout.footer);
     c.gtk_widget_set_visible(self.key_chip, @intFromBool(
         layout.show.key_hints and layout.searchbar.has(.keys),
     ));
     // With a footer, or the search bar at the bottom, the action panel opens
     // down there, above them.
     c.gtk_widget_set_valign(
-        self.panel,
+        gtk.widget(self.panel),
         if (layout.footer or layout.search == .bottom) c.GTK_ALIGN_END else c.GTK_ALIGN_START,
     );
-    cssClass(self.panel, "from-footer", layout.footer);
-    cssClass(self.panel, "from-bottom", layout.search == .bottom);
+    gtk.setClass(self.panel, "from-footer", layout.footer);
+    gtk.setClass(self.panel, "from-bottom", layout.search == .bottom);
 
-    const island: *c.GtkBox = @ptrCast(self.results);
+    const island: *c.GtkBox = self.results;
     c.gtk_orientable_set_orientation(
         self.results,
         if (layout.detail == .bottom) c.GTK_ORIENTATION_VERTICAL else c.GTK_ORIENTATION_HORIZONTAL,
     );
     // Null puts the detail pane first: on the left of the list.
-    const detail_after: ?*c.GtkWidget = if (layout.detail == .left) null else self.scroller;
-    c.gtk_box_reorder_child_after(island, self.detail, detail_after);
-    cssClass(self.results, "detail-left", layout.detail == .left);
-    cssClass(self.results, "detail-bottom", layout.detail == .bottom);
+    const detail_after: ?*c.GtkWidget = switch (layout.detail) {
+        .left => null,
+        else => gtk.widget(self.scroller),
+    };
+    c.gtk_box_reorder_child_after(island, gtk.widget(self.detail), detail_after);
+    gtk.setClass(self.results, "detail-left", layout.detail == .left);
+    gtk.setClass(self.results, "detail-bottom", layout.detail == .bottom);
     self.applyLayout();
 }
 
@@ -714,25 +711,25 @@ fn applyLayout(self: *Ui) void {
     if (!self.built) return;
     const width_px = self.panelW();
     const height_px = self.panelH();
-    c.gtk_scrolled_window_set_max_content_height(@ptrCast(self.scroller), self.listMaxH());
+    c.gtk_scrolled_window_set_max_content_height(self.scroller, self.listMaxH());
     var width_current_px: c_int = 0;
     var height_current_px: c_int = 0;
-    c.gtk_widget_get_size_request(self.column, &width_current_px, &height_current_px);
+    c.gtk_widget_get_size_request(gtk.widget(self.column), &width_current_px, &height_current_px);
     if (width_current_px == width_px and height_current_px == height_px) return;
-    c.gtk_widget_set_size_request(self.column, width_px, height_px);
+    gtk.setSizeRequest(self.column, width_px, height_px);
     c.gtk_window_set_default_size(
-        @ptrCast(self.window),
+        self.window,
         width_px + 2 * shell_margin,
         height_px + 2 * shell_margin,
     );
-    if (c.gtk_widget_get_visible(self.window) != 0) {
-        c.gtk_widget_set_visible(self.window, 0);
-        c.gtk_widget_set_visible(self.window, 1);
-        _ = c.gtk_widget_grab_focus(self.entry);
+    if (gtk.isVisible(self.window)) {
+        gtk.setVisible(self.window, false);
+        gtk.setVisible(self.window, true);
+        _ = c.gtk_widget_grab_focus(gtk.widget(self.entry));
     }
     // The list beside a detail pane keeps ~40% of the width.
-    if (c.gtk_widget_get_visible(self.detail) != 0) {
-        c.gtk_widget_set_size_request(self.scroller, @divTrunc(width_px * 2, 5), -1);
+    if (gtk.isVisible(self.detail)) {
+        gtk.setSizeRequest(self.scroller, @divTrunc(width_px * 2, 5), -1);
     }
 }
 
@@ -953,7 +950,7 @@ pub fn actionCtx(self: *Ui) run.Ctx {
 // --------------------------------------------------------- show / hide
 
 pub fn toggle(self: *Ui) void {
-    if (c.gtk_widget_get_visible(self.window) != 0) self.hide() else self.show();
+    if (gtk.isVisible(self.window)) self.hide() else self.show();
 }
 
 pub fn show(self: *Ui) void {
@@ -963,11 +960,11 @@ pub fn show(self: *Ui) void {
 /// Shows `view`, optionally with `text` already typed in the search bar.
 pub fn showWith(self: *Ui, view: View, text: ?[*:0]const u8) void {
     const show_start_ns = stats.now();
-    const was_hidden = c.gtk_widget_get_visible(self.window) == 0;
+    const was_hidden = !gtk.isVisible(self.window);
     _ = self.frec_arena.reset(.retain_capacity);
     // Without it, results are ranked by match quality alone.
     self.frec = self.db.loadFrecency(self.frec_arena.allocator(), labels.now()) catch .empty;
-    if (c.gtk_widget_get_visible(self.window) == 0) {
+    if (!gtk.isVisible(self.window)) {
         // The settings file may have been edited by hand since the window
         // last opened.
         const settings_stamp = settings_mod.Stamp.of(self.settings_path.ptr);
@@ -986,18 +983,18 @@ pub fn showWith(self: *Ui, view: View, text: ?[*:0]const u8) void {
         if (view == .choose and self.choosing == .none) .settings else if (view == .ext and
             ext_view.command(self) == null) .root else view,
     );
-    if (text) |t| c.gtk_editable_set_text(@ptrCast(self.entry), t);
+    if (text) |t| c.gtk_editable_set_text(gtk.editable(self.entry), t);
     if (was_hidden) backdrop.showBackdrops(self);
-    c.gtk_widget_set_visible(self.window, 1);
-    c.gtk_window_present(@ptrCast(self.window));
-    _ = c.gtk_widget_grab_focus(self.entry);
+    gtk.setVisible(self.window, true);
+    c.gtk_window_present(self.window);
+    _ = c.gtk_widget_grab_focus(gtk.widget(self.entry));
     // Focusing selects the text; put the cursor at the end instead.
-    c.gtk_editable_set_position(@ptrCast(self.entry), -1);
+    c.gtk_editable_set_position(gtk.editable(self.entry), -1);
 
     // Time to the first painted frame (the frame clock exists once the
     // window is realized, so it is hooked on the first show).
     if (!self.frame_clock_hooked) {
-        if (c.gtk_widget_get_frame_clock(self.window)) |clock| {
+        if (c.gtk_widget_get_frame_clock(gtk.widget(self.window))) |clock| {
             widgets.connect(clock, "after-paint", &onAfterPaint, null);
             self.frame_clock_hooked = true;
         }
@@ -1019,13 +1016,14 @@ fn onAfterPaint(_: *anyopaque, _: ?*anyopaque) callconv(.c) void {
 /// Vulkan device), and the root view's rows, styles and text measured. Now
 /// ~31 ms. Runs once, hidden, right after the daemon starts.
 pub fn prewarm(self: *Ui) void {
-    if (c.gtk_widget_get_visible(self.window) != 0) return;
-    c.gtk_widget_realize(self.window);
+    if (gtk.isVisible(self.window)) return;
+    c.gtk_widget_realize(gtk.widget(self.window));
     backdrop.prewarmBackdrops(self);
     self.setView(.root);
     var size: c_int = 0;
-    c.gtk_widget_measure(self.window, c.GTK_ORIENTATION_HORIZONTAL, -1, &size, null, null, null);
-    c.gtk_widget_measure(self.window, c.GTK_ORIENTATION_VERTICAL, -1, &size, null, null, null);
+    const window = gtk.widget(self.window);
+    c.gtk_widget_measure(window, c.GTK_ORIENTATION_HORIZONTAL, -1, &size, null, null, null);
+    c.gtk_widget_measure(window, c.GTK_ORIENTATION_VERTICAL, -1, &size, null, null, null);
 }
 
 pub fn hide(self: *Ui) void {
@@ -1037,7 +1035,7 @@ pub fn hide(self: *Ui) void {
     if (self.view == .themes) self.applyAppearance(null);
     self.closePanel();
     self.confirm_key = "";
-    c.gtk_widget_set_visible(self.window, 0);
+    gtk.setVisible(self.window, false);
     backdrop.hideBackdrops(self);
 }
 
@@ -1056,10 +1054,10 @@ fn placeOnFocusedMonitor(self: *Ui) void {
         const monitor: *c.GdkMonitor = @ptrCast(obj);
         const connector = c.gdk_monitor_get_connector(monitor) orelse continue;
         if (!std.mem.eql(u8, std.mem.span(connector), name)) continue;
-        c.gtk_layer_set_monitor(@ptrCast(self.window), monitor);
+        c.gtk_layer_set_monitor(self.window, monitor);
         var geometry: c.GdkRectangle = undefined;
         c.gdk_monitor_get_geometry(monitor, &geometry);
-        const window: *c.GtkWindow = @ptrCast(self.window);
+        const window: *c.GtkWindow = self.window;
         const chosen: layout_mod.Position = switch (self.settings.position) {
             .upper_third => .upper_third,
             .center => .center,
@@ -1155,7 +1153,7 @@ pub fn setView(self: *Ui, view: View) void {
     _ = self.data_arena.reset(arena_keep);
     if (view == .ext) ext_view.enter(self);
     // A password preference hides what is typed.
-    c.gtk_text_set_visibility(@ptrCast(self.entry), @intFromBool(
+    c.gtk_text_set_visibility(self.entry, @intFromBool(
         !(view == .input and prefs_view.isPassword(self)),
     ));
     self.base = self.loadBase(self.data_arena.allocator());
@@ -1163,22 +1161,22 @@ pub fn setView(self: *Ui, view: View) void {
     self.layoutFor(view);
     var placeholder_buf: [128]u8 = undefined;
     c.gtk_text_set_placeholder_text(
-        @ptrCast(self.entry),
+        self.entry,
         self.placeholderFor(view, &placeholder_buf),
     );
-    c.gtk_label_set_text(@ptrCast(self.scope), self.viewTitle());
-    c.gtk_widget_set_visible(self.scope, @intFromBool(
+    c.gtk_label_set_text(self.scope, self.viewTitle());
+    c.gtk_widget_set_visible(gtk.widget(self.scope), @intFromBool(
         view != .root and self.layout.show.scope and self.layout.searchbar.has(.scope),
     ));
-    c.gtk_label_set_text(@ptrCast(self.footer_title), self.viewTitle());
+    c.gtk_label_set_text(self.footer_title, self.viewTitle());
 
     // Clearing the text emits `changed`, which refreshes; an entry that is
     // already empty emits nothing, so it is refreshed here.
-    const entry_empty = c.gtk_editable_get_text(@ptrCast(self.entry))[0] == 0;
+    const entry_empty = c.gtk_editable_get_text(gtk.editable(self.entry))[0] == 0;
     if (entry_empty) {
         self.refresh();
     } else {
-        c.gtk_editable_set_text(@ptrCast(self.entry), "");
+        c.gtk_editable_set_text(gtk.editable(self.entry), "");
     }
     // The rows are this base's now: nothing points into replaced app lists.
     self.apps.dropStale();
@@ -1192,31 +1190,31 @@ fn layoutFor(self: *Ui, view: View) void {
     self.grid_mode = view == .ext and if (ext_view.command(self)) |cmd| cmd.grid else false;
     if (self.grid_mode) {
         self.grid_columns = ext_view.command(self).?.columns;
-        c.gtk_flow_box_set_min_children_per_line(@ptrCast(self.grid), @intCast(self.grid_columns));
-        c.gtk_flow_box_set_max_children_per_line(@ptrCast(self.grid), @intCast(self.grid_columns));
+        c.gtk_flow_box_set_min_children_per_line(self.grid, @intCast(self.grid_columns));
+        c.gtk_flow_box_set_max_children_per_line(self.grid, @intCast(self.grid_columns));
     }
-    c.gtk_widget_set_visible(self.detail_meta, @intFromBool(view != .ext));
-    for (self.meta_lines) |meta_line| c.gtk_widget_set_visible(meta_line, 1);
+    gtk.setVisible(self.detail_meta, view != .ext);
+    for (self.meta_lines) |meta_line| gtk.setVisible(meta_line, true);
     const bar = self.layout.searchbar;
     const back_shows = view != .root and self.layout.show.back and bar.has(.back);
-    c.gtk_widget_set_visible(self.back, @intFromBool(back_shows));
+    gtk.setVisible(self.back, back_shows);
     // The magnifier gives way to the back arrow inside a view.
     c.gtk_widget_set_visible(self.search_icon, @intFromBool(
         self.layout.show.search_icon and bar.has(.icon) and !back_shows,
     ));
-    c.gtk_widget_set_visible(self.detail, @intFromBool(has_detail));
+    gtk.setVisible(self.detail, has_detail);
     // A preview needs room: the results take the full height then.
-    c.gtk_widget_set_vexpand(self.results, @intFromBool(has_detail));
+    gtk.setVexpand(self.results, has_detail);
     // Beside the detail pane the list takes ~40%; above it, ~half the height.
     const detail_below = self.layout.detail == .bottom;
     c.gtk_widget_set_size_request(
-        self.scroller,
+        gtk.widget(self.scroller),
         if (has_detail and !detail_below) @divTrunc(self.panelW() * 2, 5) else -1,
         -1,
     );
-    c.gtk_widget_set_hexpand(self.scroller, @intFromBool(!has_detail or detail_below));
+    gtk.setHexpand(self.scroller, !has_detail or detail_below);
     c.gtk_scrolled_window_set_max_content_height(
-        @ptrCast(self.scroller),
+        self.scroller,
         if (has_detail and detail_below) @divTrunc(self.listMaxH(), 2) else self.listMaxH(),
     );
     const keys: [4][:0]const u8 = switch (view) {
@@ -1224,17 +1222,17 @@ fn layoutFor(self: *Ui, view: View) void {
         .contents => .{ "Kind", "Matches", "Modified", "Where" },
         else => .{ "Content type", "Characters", "Words", "Copied" },
     };
-    for (self.meta_keys, keys) |w, k| c.gtk_label_set_text(@ptrCast(w), k);
+    for (self.meta_keys, keys) |w, k| c.gtk_label_set_text(w, k);
     // Code previews do not wrap, they clip long lines like an editor: a
     // wrapping GtkLabel makes GTK lay its text out at several widths per frame
     // (~30 ms measured with `lumen --stats`). Clipboard text is prose: wrap.
     const wrap = view == .clipboard or view == .ext;
-    c.gtk_label_set_wrap(@ptrCast(self.detail_text), @intFromBool(wrap));
+    c.gtk_label_set_wrap(self.detail_text, @intFromBool(wrap));
     c.gtk_label_set_ellipsize(
-        @ptrCast(self.detail_text),
+        self.detail_text,
         if (wrap) c.PANGO_ELLIPSIZE_NONE else c.PANGO_ELLIPSIZE_END,
     );
-    c.gtk_widget_set_visible(self.detail_picture, 0);
+    gtk.setVisible(self.detail_picture, false);
 }
 
 /// The search bar's text while empty, for `view` (`buf` may hold it).
@@ -1329,7 +1327,7 @@ fn windowCandidates(self: *Ui, arena: std.mem.Allocator) []Item {
 // ------------------------------------------------------------- refresh
 
 pub fn query(self: *Ui) []const u8 {
-    return std.mem.span(c.gtk_editable_get_text(@ptrCast(self.entry)));
+    return std.mem.span(c.gtk_editable_get_text(gtk.editable(self.entry)));
 }
 
 /// No rows (what they pointed to is going away).
@@ -1350,7 +1348,7 @@ fn resetRows(self: *Ui) void {
     self.content_query.shown = null;
     self.ext_list.shown = null;
     self.selected = null;
-    c.gtk_list_box_remove_all(@ptrCast(self.list));
+    c.gtk_list_box_remove_all(self.list);
 }
 
 pub fn refresh(self: *Ui) void {
@@ -1369,7 +1367,7 @@ pub fn refresh(self: *Ui) void {
     }
     self.resetRows();
     self.confirm_key = "";
-    c.gtk_flow_box_remove_all(@ptrCast(self.grid));
+    c.gtk_flow_box_remove_all(self.grid);
     widgets.forgetGridPictures();
     // The rows holding the previous icons are gone; GtkImage kept its refs.
     for (self.icons.items) |icon| c.g_object_unref(icon);
@@ -1465,28 +1463,28 @@ fn fillContents(self: *Ui, arena: std.mem.Allocator, query_text: []const u8, sta
 fn showEmptyOrResults(self: *Ui, arena: std.mem.Allocator, query_text: []const u8) void {
     const searching = self.view == .files or self.view == .contents;
     if (self.rows.items.len == 0 or (searching and self.items.items.len == 0)) {
-        if (self.rows.items.len > 0) c.gtk_list_box_remove_all(@ptrCast(self.list));
+        if (self.rows.items.len > 0) c.gtk_list_box_remove_all(self.list);
         self.rows.clearRetainingCapacity();
         const empty = self.emptyText(arena);
-        const row = c.gtk_list_box_row_new();
-        c.gtk_list_box_row_set_selectable(@ptrCast(row), 0);
-        c.gtk_list_box_row_set_activatable(@ptrCast(row), 0);
-        c.gtk_list_box_row_set_child(@ptrCast(row), widgets.label(empty, "empty"));
-        c.gtk_list_box_append(@ptrCast(self.list), row);
+        const row = gtk.listBoxRow();
+        c.gtk_list_box_row_set_selectable(row, 0);
+        c.gtk_list_box_row_set_activatable(row, 0);
+        c.gtk_list_box_row_set_child(row, gtk.widget(widgets.label(empty, "empty")));
+        c.gtk_list_box_append(self.list, gtk.widget(row));
     }
     // A grid shows its cells; the list is there for the "No Results" row.
-    c.gtk_widget_set_visible(self.grid, @intFromBool(self.grid_mode and self.items.items.len > 0));
-    c.gtk_widget_set_visible(self.list, @intFromBool(!self.grid_mode or self.items.items.len == 0));
+    gtk.setVisible(self.grid, self.grid_mode and self.items.items.len > 0);
+    gtk.setVisible(self.list, !self.grid_mode or self.items.items.len == 0);
     // Nothing typed and nothing to suggest: only the search bar shows.
     const alone = self.view == .root and query_text.len == 0 and self.items.items.len == 0;
-    c.gtk_widget_set_visible(self.results, @intFromBool(!alone));
+    gtk.setVisible(self.results, !alone);
     // One panel with only the search bar showing rounds all its corners.
-    cssClass(self.column, "alone", alone);
+    gtk.setClass(self.column, "alone", alone);
 }
 
 /// Selects the first row, or the one asked for with `setReselect`.
 fn selectAfterRefresh(self: *Ui) void {
-    const adjustment = c.gtk_scrolled_window_get_vadjustment(@ptrCast(self.scroller));
+    const adjustment = c.gtk_scrolled_window_get_vadjustment(self.scroller);
     c.gtk_adjustment_set_value(adjustment, 0);
     var first = self.nextSelectable(null, 1);
     const top = first;
@@ -1732,13 +1730,17 @@ fn buildSection(self: *Ui, title: [:0]const u8) void {
     // Room first: a widget without its `rows` entry would shift every later
     // row's index.
     self.rows.ensureUnusedCapacity(self.query_arena.allocator(), 1) catch return;
-    const row = c.gtk_list_box_row_new();
-    c.gtk_widget_add_css_class(row, "section");
-    c.gtk_list_box_row_set_selectable(@ptrCast(row), 0);
-    c.gtk_list_box_row_set_activatable(@ptrCast(row), 0);
-    c.gtk_list_box_row_set_child(@ptrCast(row), widgets.label(title, "section-title"));
-    c.gtk_list_box_append(@ptrCast(self.list), row);
-    self.rows.appendAssumeCapacity(.{ .widget = row, .item = null, .section = title });
+    const row = gtk.listBoxRow();
+    gtk.addClass(row, "section");
+    c.gtk_list_box_row_set_selectable(row, 0);
+    c.gtk_list_box_row_set_activatable(row, 0);
+    c.gtk_list_box_row_set_child(row, gtk.widget(widgets.label(title, "section-title")));
+    c.gtk_list_box_append(self.list, gtk.widget(row));
+    self.rows.appendAssumeCapacity(.{
+        .widget = gtk.widget(row),
+        .item = null,
+        .section = title,
+    });
 }
 
 pub fn addItem(self: *Ui, item_given: Item) void {
@@ -1766,9 +1768,9 @@ fn buildItemRow(self: *Ui, item_index: usize) void {
     if (self.grid_mode) {
         const gap = 6 * (self.grid_columns - 1) + 24;
         const cell = widgets.gridCell(item, @divTrunc(self.panelW() - gap, self.grid_columns) - 12);
-        c.gtk_flow_box_append(@ptrCast(self.grid), cell);
+        c.gtk_flow_box_append(self.grid, cell);
         const child = c.gtk_flow_box_get_child_at_index(
-            @ptrCast(self.grid),
+            self.grid,
             @intCast(item_index),
         ) orelse return;
         self.rows.appendAssumeCapacity(.{ .widget = @ptrCast(child), .item = item_index });
@@ -1776,8 +1778,8 @@ fn buildItemRow(self: *Ui, item_index: usize) void {
     }
     var parts: widgets.RowParts = .{};
     const row = if (item.action == .calc) widgets.calcRow(item) else widgets.itemRow(item, &parts);
-    c.g_object_set_data(@ptrCast(row), "lumen-row", @ptrFromInt(self.rows.items.len + 1));
-    c.gtk_list_box_append(@ptrCast(self.list), row);
+    c.g_object_set_data(row, "lumen-row", @ptrFromInt(self.rows.items.len + 1));
+    c.gtk_list_box_append(self.list, row);
     self.rows.appendAssumeCapacity(.{
         .widget = row,
         .item = item_index,
@@ -1822,16 +1824,16 @@ pub fn select(self: *Ui, row_index: ?usize) void {
     defer assert(self.selected == row_index);
     if (self.selected) |old| if (old < self.rows.items.len) {
         const row_old = self.rows.items[old];
-        if (row_old.hint) |hint| c.gtk_widget_set_visible(hint, 0);
-        if (row_old.accessory) |acc| c.gtk_widget_set_visible(acc, 1);
+        if (row_old.hint) |hint| gtk.setVisible(hint, false);
+        if (row_old.accessory) |acc| gtk.setVisible(acc, true);
     };
     self.selected = row_index;
     self.confirm_key = "";
     self.primary = "";
     const selected_index = row_index orelse {
         self.setFooterAction("", false);
-        c.gtk_list_box_unselect_all(@ptrCast(self.list));
-        c.gtk_flow_box_unselect_all(@ptrCast(self.grid));
+        c.gtk_list_box_unselect_all(self.list);
+        c.gtk_flow_box_unselect_all(self.grid);
         detail_pane.showDetail(self, null);
         return;
     };
@@ -1840,9 +1842,9 @@ pub fn select(self: *Ui, row_index: ?usize) void {
     assert(row.item != null);
     assert(row.item.? < self.items.items.len);
     if (self.grid_mode)
-        c.gtk_flow_box_select_child(@ptrCast(self.grid), @ptrCast(row.widget))
+        c.gtk_flow_box_select_child(self.grid, @ptrCast(row.widget))
     else
-        c.gtk_list_box_select_row(@ptrCast(self.list), @ptrCast(row.widget));
+        c.gtk_list_box_select_row(self.list, @ptrCast(row.widget));
     if (!self.no_scroll) self.scrollTo(row.widget);
     const item = &self.items.items[row.item.?];
     self.primary = item_mod.actionsFor(item)[0].label;
@@ -1860,12 +1862,12 @@ pub fn select(self: *Ui, row_index: ?usize) void {
 /// The footer's "what Enter does" (hidden with nothing selected).
 fn setFooterAction(self: *Ui, text: []const u8, warn: bool) void {
     const text_z = self.query_arena.allocator().dupeSentinel(u8, text, 0) catch return;
-    c.gtk_label_set_text(@ptrCast(self.footer_action), text_z.ptr);
-    cssClass(self.footer_action, "warn", warn);
+    c.gtk_label_set_text(self.footer_action, text_z.ptr);
+    gtk.setClass(self.footer_action, "warn", warn);
     const any = text.len > 0;
-    c.gtk_widget_set_visible(self.footer_action, @intFromBool(any));
-    c.gtk_widget_set_visible(self.footer_enter, @intFromBool(any and !warn));
-    c.gtk_widget_set_visible(self.footer_sep, @intFromBool(any));
+    gtk.setVisible(self.footer_action, any);
+    gtk.setVisible(self.footer_enter, any and !warn);
+    gtk.setVisible(self.footer_sep, any);
 }
 
 /// The selected row's hint: "Open ↵", or a warning waiting for Enter (and
@@ -1876,28 +1878,28 @@ fn setHint(self: *Ui, text: []const u8, warn: bool) void {
     const row_index = self.selected orelse return;
     const row = self.rows.items[row_index];
     const hint = row.hint orelse return;
-    if (row.accessory) |acc| c.gtk_widget_set_visible(acc, 0);
+    if (row.accessory) |acc| gtk.setVisible(acc, false);
     // Beside the detail pane the list is narrow: the action's name would
     // squeeze the title to a few letters, so only the key shows there.
-    const narrow = c.gtk_widget_get_visible(self.detail) != 0;
+    const narrow = gtk.isVisible(self.detail);
     const shown = if (warn) text else if (narrow) "↵" else self.query_arena.allocator().print(
         "{s}  ↵",
         .{text},
     ) catch return;
     const text_z = self.query_arena.allocator().dupeSentinel(u8, shown, 0) catch return;
     c.gtk_label_set_text(@ptrCast(hint), text_z.ptr);
-    if (warn) c.gtk_widget_add_css_class(hint, "warn") else c.gtk_widget_remove_css_class(
+    if (warn) gtk.addClass(hint, "warn") else c.gtk_widget_remove_css_class(
         hint,
         "warn",
     );
-    c.gtk_widget_set_visible(hint, 1);
+    gtk.setVisible(hint, true);
 }
 
 fn scrollTo(self: *Ui, row: *c.GtkWidget) void {
     var bounds: c.graphene_rect_t = undefined;
     // A row just added has no place yet: it is scrolled to on a later frame,
     // once the list's layout is done.
-    const container = if (self.grid_mode) self.grid else self.list;
+    const container = if (self.grid_mode) gtk.widget(self.grid) else gtk.widget(self.list);
     const placed = c.gtk_widget_compute_bounds(
         row,
         container,
@@ -1907,7 +1909,7 @@ fn scrollTo(self: *Ui, row: *c.GtkWidget) void {
         if (self.scroll_tick == 0) {
             self.scroll_tries = 0;
             self.scroll_tick = c.gtk_widget_add_tick_callback(
-                self.scroller,
+                gtk.widget(self.scroller),
                 &onScrollTick,
                 self,
                 null,
@@ -1915,7 +1917,7 @@ fn scrollTo(self: *Ui, row: *c.GtkWidget) void {
         }
         return;
     }
-    const adjustment = c.gtk_scrolled_window_get_vadjustment(@ptrCast(self.scroller));
+    const adjustment = c.gtk_scrolled_window_get_vadjustment(self.scroller);
     const value = c.gtk_adjustment_get_value(adjustment);
     const page = c.gtk_adjustment_get_page_size(adjustment);
     const top: f64 = bounds.origin.y;
@@ -1944,7 +1946,7 @@ fn onScrollTick(_: ?*c.GtkWidget, _: ?*c.GdkFrameClock, data: ?*anyopaque) callc
     var bounds: c.graphene_rect_t = undefined;
     const placed = c.gtk_widget_compute_bounds(
         row,
-        if (self.grid_mode) self.grid else self.list,
+        if (self.grid_mode) gtk.widget(self.grid) else gtk.widget(self.list),
         &bounds,
     ) != 0 and bounds.size.height > 0;
     if (!placed and self.scroll_tries < 10) return 1;
@@ -1985,37 +1987,37 @@ pub fn openPanel(self: *Ui) void {
     // Every item has a primary action: the panel is never empty, and the
     // keys that move in it count on that.
     assert(self.panel_entries.len > 0);
-    c.gtk_list_box_remove_all(@ptrCast(self.panel_list));
+    c.gtk_list_box_remove_all(self.panel_list);
     for (self.panel_entries) |entry| {
-        const row = c.gtk_list_box_row_new();
+        const row = gtk.listBoxRow();
         const box = widgets.hbox(8);
         const label_widget = widgets.label(entry.label, null);
-        c.gtk_widget_set_hexpand(label_widget, 1);
-        c.gtk_box_append(@ptrCast(box), label_widget);
+        gtk.setHexpand(label_widget, true);
+        gtk.append(box, label_widget);
         if (entry.keys.len > 0) {
             const keys_label = widgets.label(entry.keys, "kbd");
-            c.gtk_widget_set_valign(keys_label, c.GTK_ALIGN_CENTER);
-            c.gtk_box_append(@ptrCast(box), keys_label);
+            gtk.setValign(keys_label, c.GTK_ALIGN_CENTER);
+            gtk.append(box, keys_label);
         }
-        c.gtk_list_box_row_set_child(@ptrCast(row), box);
-        c.gtk_list_box_append(@ptrCast(self.panel_list), row);
+        c.gtk_list_box_row_set_child(row, gtk.widget(box));
+        c.gtk_list_box_append(self.panel_list, gtk.widget(row));
     }
     self.panel_selected = 0;
     self.panel_open = true;
     self.selectPanel(0);
-    c.gtk_widget_set_visible(self.panel, 1);
+    gtk.setVisible(self.panel, true);
 }
 
 pub fn closePanel(self: *Ui) void {
     self.panel_open = false;
-    c.gtk_widget_set_visible(self.panel, 0);
+    gtk.setVisible(self.panel, false);
 }
 
 pub fn selectPanel(self: *Ui, i: usize) void {
     assert(i < self.panel_entries.len);
     self.panel_selected = i;
-    const row = c.gtk_list_box_get_row_at_index(@ptrCast(self.panel_list), @intCast(i));
-    c.gtk_list_box_select_row(@ptrCast(self.panel_list), row);
+    const row = c.gtk_list_box_get_row_at_index(self.panel_list, @intCast(i));
+    c.gtk_list_box_select_row(self.panel_list, row);
 }
 
 // ------------------------------------------------------------- actions
@@ -2106,7 +2108,7 @@ fn onChanged(_: *c.GtkEditable, data: ?*anyopaque) callconv(.c) void {
 
 fn onRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, data: ?*anyopaque) callconv(.c) void {
     const self: *Ui = @ptrCast(@alignCast(data));
-    const tag = @intFromPtr(c.g_object_get_data(@ptrCast(row), "lumen-row"));
+    const tag = @intFromPtr(c.g_object_get_data(row, "lumen-row"));
     if (tag == 0) return;
     self.select(tag - 1);
     const item = self.selectedItem() orelse return;
@@ -2145,7 +2147,7 @@ fn onBackClicked(
 ) callconv(.c) void {
     const self: *Ui = @ptrCast(@alignCast(data));
     if (self.view != .root) self.goBack();
-    _ = c.gtk_widget_grab_focus(self.entry);
+    _ = c.gtk_widget_grab_focus(gtk.widget(self.entry));
 }
 
 /// An install or update changes many .desktop files: one reload (~5 ms of
@@ -2161,7 +2163,7 @@ fn reloadApps(data: ?*anyopaque) callconv(.c) c.gboolean {
     const self: *Ui = @ptrCast(@alignCast(data));
     self.apps_reload_timer = 0;
     self.apps.reload();
-    if (c.gtk_widget_get_visible(self.window) != 0) {
+    if (gtk.isVisible(self.window)) {
         self.keepSelection();
         self.rebuild();
     } else {
@@ -2235,7 +2237,7 @@ pub fn dump(
     const writer = &out.writer;
     try writer.print("view: {t}\nvisible: {}\nquery: {s}\n", .{
         self.view,
-        c.gtk_widget_get_visible(self.window) != 0,
+        gtk.isVisible(self.window),
         self.query(),
     });
     try writer.print("title: {s}\nprimary: {s}\n", .{ self.viewTitle(), self.primary });
@@ -2262,8 +2264,8 @@ pub fn dump(
     for (lay.row.slice(), 0..) |p, i| try writer.print("{s}{t}", .{ if (i > 0) "," else "", p });
     try writer.print(" prompt={s} placeholder={s}\n", .{ lay.prompt, lay.placeholder });
     if (lay.footer) try writer.print("footer: {s} | {s}\n", .{
-        c.gtk_label_get_text(@ptrCast(self.footer_title)),
-        c.gtk_label_get_text(@ptrCast(self.footer_action)),
+        c.gtk_label_get_text(self.footer_title),
+        c.gtk_label_get_text(self.footer_action),
     });
     try writer.print("rows:\n", .{});
     self.ensureRows();
@@ -2300,20 +2302,20 @@ pub fn dump(
             .{if (std.unicode.utf8ValidateSlice(item.key)) item.key else "?"},
         );
     }
-    if (c.gtk_widget_get_visible(self.detail) != 0) {
+    if (gtk.isVisible(self.detail)) {
         try writer.print("detail:\n", .{});
         if (self.view == .ext) {
-            const text = std.mem.span(c.gtk_label_get_text(@ptrCast(self.detail_text)));
+            const text = std.mem.span(c.gtk_label_get_text(self.detail_text));
             try writer.print("  text = {s}\n", .{
                 text[0 .. std.mem.findScalar(u8, text, '\n') orelse text.len],
             });
         }
-        if (c.gtk_widget_get_visible(self.detail_meta) != 0) {
+        if (gtk.isVisible(self.detail_meta)) {
             for (self.meta_lines, self.meta_keys, self.meta_values) |logo, k, v| {
-                if (c.gtk_widget_get_visible(logo) == 0) continue;
+                if (!gtk.isVisible(logo)) continue;
                 try writer.print("  {s} = {s}\n", .{
-                    c.gtk_label_get_text(@ptrCast(k)),
-                    c.gtk_label_get_text(@ptrCast(v)),
+                    c.gtk_label_get_text(k),
+                    c.gtk_label_get_text(v),
                 });
             }
         }

@@ -3,6 +3,7 @@
 const std = @import("std");
 const core = @import("core");
 const c = @import("c");
+const gtk = @import("gtk.zig");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
 const index = @import("index");
@@ -15,59 +16,59 @@ const labels = @import("labels.zig");
 
 pub fn buildDetail(ui: *Ui) void {
     ui.detail = widgets.vbox(0);
-    c.gtk_widget_add_css_class(ui.detail, "detail");
-    c.gtk_widget_set_hexpand(ui.detail, 1);
+    gtk.addClass(ui.detail, "detail");
+    gtk.setHexpand(ui.detail, true);
 
     // Image previews (files view).
-    ui.detail_picture = c.gtk_picture_new();
-    c.gtk_picture_set_content_fit(@ptrCast(ui.detail_picture), c.GTK_CONTENT_FIT_SCALE_DOWN);
-    c.gtk_widget_set_vexpand(ui.detail_picture, 1);
-    c.gtk_widget_add_css_class(ui.detail_picture, "preview");
-    c.gtk_box_append(@ptrCast(ui.detail), ui.detail_picture);
+    ui.detail_picture = gtk.picture();
+    c.gtk_picture_set_content_fit(ui.detail_picture, c.GTK_CONTENT_FIT_SCALE_DOWN);
+    gtk.setVexpand(ui.detail_picture, true);
+    gtk.addClass(ui.detail_picture, "preview");
+    gtk.append(ui.detail, ui.detail_picture);
 
-    const scroller = c.gtk_scrolled_window_new();
+    const scroller = gtk.scrolledWindow();
     c.gtk_scrolled_window_set_policy(
-        @ptrCast(scroller),
+        scroller,
         c.GTK_POLICY_NEVER,
         c.GTK_POLICY_AUTOMATIC,
     );
-    c.gtk_widget_set_vexpand(scroller, 1);
+    gtk.setVexpand(scroller, true);
     ui.detail_text = widgets.label("", "detail-text");
-    c.gtk_label_set_wrap(@ptrCast(ui.detail_text), 1);
-    c.gtk_label_set_wrap_mode(@ptrCast(ui.detail_text), c.PANGO_WRAP_WORD_CHAR);
+    c.gtk_label_set_wrap(ui.detail_text, 1);
+    c.gtk_label_set_wrap_mode(ui.detail_text, c.PANGO_WRAP_WORD_CHAR);
     // A wrapping GtkLabel asks for its unwrapped width unless told otherwise;
     // this lets the list keep its share of the row.
-    c.gtk_label_set_max_width_chars(@ptrCast(ui.detail_text), 1);
-    c.gtk_widget_set_hexpand(ui.detail_text, 1);
-    c.gtk_label_set_yalign(@ptrCast(ui.detail_text), 0);
-    c.gtk_widget_set_valign(ui.detail_text, c.GTK_ALIGN_START);
-    c.gtk_scrolled_window_set_child(@ptrCast(scroller), ui.detail_text);
-    c.gtk_box_append(@ptrCast(ui.detail), scroller);
+    c.gtk_label_set_max_width_chars(ui.detail_text, 1);
+    gtk.setHexpand(ui.detail_text, true);
+    c.gtk_label_set_yalign(ui.detail_text, 0);
+    gtk.setValign(ui.detail_text, c.GTK_ALIGN_START);
+    c.gtk_scrolled_window_set_child(scroller, gtk.widget(ui.detail_text));
+    gtk.append(ui.detail, scroller);
 
     const meta = widgets.vbox(4);
     ui.detail_meta = meta;
-    c.gtk_widget_add_css_class(meta, "meta");
-    c.gtk_box_append(@ptrCast(meta), widgets.label("Information", "meta-header"));
+    gtk.addClass(meta, "meta");
+    gtk.append(meta, widgets.label("Information", "meta-header"));
     const keys = [_][:0]const u8{ "Content type", "Characters", "Words", "Copied" };
     comptime std.debug.assert(keys.len == item_mod.meta_max);
     for (keys, 0..) |key, i| {
         const line = widgets.hbox(12);
         ui.meta_lines[i] = line;
         ui.meta_keys[i] = widgets.label(key, "meta-key");
-        c.gtk_box_append(@ptrCast(line), ui.meta_keys[i]);
+        gtk.append(line, ui.meta_keys[i]);
         const spacer = widgets.hbox(0);
-        c.gtk_widget_set_hexpand(spacer, 1);
-        c.gtk_box_append(@ptrCast(line), spacer);
+        gtk.setHexpand(spacer, true);
+        gtk.append(line, spacer);
         ui.meta_values[i] = widgets.label("", "meta-value");
-        c.gtk_label_set_ellipsize(@ptrCast(ui.meta_values[i]), c.PANGO_ELLIPSIZE_START);
+        c.gtk_label_set_ellipsize(ui.meta_values[i], c.PANGO_ELLIPSIZE_START);
         // The layer surface grows to its content's natural width; a long path
         // here would widen the whole window.
-        c.gtk_label_set_max_width_chars(@ptrCast(ui.meta_values[i]), 30);
-        c.gtk_box_append(@ptrCast(line), ui.meta_values[i]);
-        c.gtk_box_append(@ptrCast(meta), line);
+        c.gtk_label_set_max_width_chars(ui.meta_values[i], 30);
+        gtk.append(line, ui.meta_values[i]);
+        gtk.append(meta, line);
     }
-    c.gtk_box_append(@ptrCast(ui.detail), meta);
-    c.gtk_widget_set_visible(ui.detail, 0);
+    gtk.append(ui.detail, meta);
+    gtk.setVisible(ui.detail, false);
 }
 
 /// The lines around the match, words highlighted.
@@ -76,7 +77,7 @@ pub fn showContentDetail(ui: *Ui, item: *const Item) void {
     var arena_instance: std.heap.ArenaAllocator = .init(ui.gpa);
     defer arena_instance.deinit();
     const arena = arena_instance.allocator();
-    c.gtk_widget_set_visible(ui.detail_picture, 0);
+    gtk.setVisible(ui.detail_picture, false);
 
     const info = os.info(file.path);
     const service = ui.contents orelse return;
@@ -94,7 +95,7 @@ pub fn showContentDetail(ui: *Ui, item: *const Item) void {
         std.mem.sliceTo(&ui.hl_fg, 0),
     }) catch return;
     c.gtk_label_set_markup(
-        @ptrCast(ui.detail_text),
+        ui.detail_text,
         labels.contextMarkup(arena, text, file.line, words, hl_open).ptr,
     );
 
@@ -145,7 +146,7 @@ fn showImage(ui: *Ui, path: [:0]const u8, mtime: i64) void {
 fn forgetImage(ui: *Ui) void {
     pictures.preview_lane.forget();
     image_len = 0;
-    c.gtk_picture_set_paintable(ui.detail_picture, null);
+    c.gtk_picture_set_paintable(gtk.widget(ui.detail_picture), null);
 }
 
 fn onImageLoaded(ctx: ?*anyopaque, pb: ?*c.GdkPixbuf, current: bool) void {
@@ -154,7 +155,7 @@ fn onImageLoaded(ctx: ?*anyopaque, pb: ?*c.GdkPixbuf, current: bool) void {
     const pixbuf = pb orelse return;
     const tex = c.gdk_texture_new_for_pixbuf(pixbuf);
     defer c.g_object_unref(tex);
-    c.gtk_picture_set_paintable(ui.detail_picture, tex);
+    c.gtk_picture_set_paintable(gtk.widget(ui.detail_picture), tex);
 }
 
 pub fn showFileDetail(ui: *Ui, item: *const Item) void {
@@ -173,7 +174,7 @@ pub fn showFileDetail(ui: *Ui, item: *const Item) void {
         std.mem.startsWith(u8, std.mem.span(content_type), "image/");
     const image = image_type and os.isRegular(file.path);
     const info = os.info(file.path);
-    c.gtk_widget_set_visible(ui.detail_picture, @intFromBool(image));
+    gtk.setVisible(ui.detail_picture, image);
     if (image) showImage(ui, file.path, if (info) |i| i.mtime else 0) else forgetImage(ui);
 
     // Text preview: the head of anything that is valid UTF-8.
@@ -187,7 +188,7 @@ pub fn showFileDetail(ui: *Ui, item: *const Item) void {
         if (text_like) text = labels.firstLines(valid, preview_lines);
     }
     c.gtk_label_set_text(
-        @ptrCast(ui.detail_text),
+        ui.detail_text,
         (arena.dupeSentinel(u8, text, 0) catch return).ptr,
     );
 
@@ -209,27 +210,27 @@ fn showExtDetail(ui: *Ui, item: ?*const Item) void {
     var arena_instance: std.heap.ArenaAllocator = .init(ui.gpa);
     defer arena_instance.deinit();
     const arena = arena_instance.allocator();
-    const label: *c.GtkLabel = @ptrCast(ui.detail_text);
+    const label: *c.GtkLabel = ui.detail_text;
     const markup = if (item) |i| i.markup else false;
     if (markup) {
         // Markup is shown whole: cutting it could leave a tag open.
         c.gtk_label_set_markup(label, (arena.dupeSentinel(u8, item.?.detail, 0) catch return).ptr);
-        c.gtk_widget_add_css_class(ui.detail_text, "markdown");
+        gtk.addClass(ui.detail_text, "markdown");
     } else {
         const text = if (item) |i| i.detail[0..@min(i.detail.len, 20_000)] else "";
         c.gtk_label_set_text(
             label,
             (arena.dupeSentinel(u8, core.utf8.validPrefix(text), 0) catch return).ptr,
         );
-        c.gtk_widget_remove_css_class(ui.detail_text, "markdown");
+        c.gtk_widget_remove_css_class(gtk.widget(ui.detail_text), "markdown");
     }
     const meta = if (item) |i| i.meta else &.{};
-    c.gtk_widget_set_visible(ui.detail_meta, @intFromBool(meta.len > 0));
+    gtk.setVisible(ui.detail_meta, meta.len > 0);
     for (ui.meta_lines, ui.meta_keys, ui.meta_values, 0..) |line, k, v, i| {
-        c.gtk_widget_set_visible(line, @intFromBool(i < meta.len));
+        gtk.setVisible(line, i < meta.len);
         if (i >= meta.len) continue;
-        c.gtk_label_set_text(@ptrCast(k), meta[i].label.ptr);
-        c.gtk_label_set_text(@ptrCast(v), meta[i].value.ptr);
+        c.gtk_label_set_text(k, meta[i].label.ptr);
+        c.gtk_label_set_text(v, meta[i].value.ptr);
     }
 }
 
@@ -237,7 +238,7 @@ fn showExtDetail(ui: *Ui, item: ?*const Item) void {
 /// Where for files; Content type, Characters, Words, Copied for copies).
 fn setMeta(ui: *Ui, values: [4][:0]const u8) void {
     for (ui.meta_values, values) |value_label, value| {
-        c.gtk_label_set_text(@ptrCast(value_label), value.ptr);
+        c.gtk_label_set_text(value_label, value.ptr);
     }
 }
 
@@ -246,15 +247,15 @@ pub fn showDetail(ui: *Ui, item: ?*const Item) void {
         if (item) |i| if (i.action == .file) {
             return if (ui.view == .contents) showContentDetail(ui, i) else showFileDetail(ui, i);
         };
-        c.gtk_widget_set_visible(ui.detail_picture, 0);
-        c.gtk_label_set_text(@ptrCast(ui.detail_text), "");
+        gtk.setVisible(ui.detail_picture, false);
+        c.gtk_label_set_text(ui.detail_text, "");
         setMeta(ui, @splat(""));
         return;
     }
     if (ui.view == .ext) return showExtDetail(ui, item);
     if (ui.view != .clipboard) return;
     const i = item orelse {
-        c.gtk_label_set_text(@ptrCast(ui.detail_text), "");
+        c.gtk_label_set_text(ui.detail_text, "");
         setMeta(ui, @splat(""));
         return;
     };
@@ -268,7 +269,7 @@ pub fn showDetail(ui: *Ui, item: ?*const Item) void {
         i.detail;
     const text = content[0..@min(content.len, 20_000)];
     c.gtk_label_set_text(
-        @ptrCast(ui.detail_text),
+        ui.detail_text,
         (arena.dupeSentinel(u8, core.utf8.validPrefix(text), 0) catch return).ptr,
     );
     const chars = std.unicode.utf8CountCodepoints(content) catch content.len;
