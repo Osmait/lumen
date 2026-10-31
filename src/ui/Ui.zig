@@ -1611,12 +1611,12 @@ pub fn refresh(self: *Ui) void {
     if (self.answerPending(start_ns)) return;
     self.search_ns = 0;
     defer {
-        const total_ns = stats.now() - start_ns;
+        const elapsed_ns = stats.now() - start_ns;
         stats.pending = .{
             .start_ns = start_ns,
             .view = self.view,
             .search_ns = self.search_ns,
-            .rows_ns = total_ns -| self.search_ns,
+            .rows_ns = elapsed_ns -| self.search_ns,
             .is_show = false,
         };
     }
