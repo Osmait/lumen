@@ -1456,9 +1456,10 @@ fn layoutFor(self: *Ui, view: View) void {
         -1,
     );
     gtk.setHexpand(self.scroller, !has_detail or detail_below);
+    const list_height_max = self.listHeightMax();
     c.gtk_scrolled_window_set_max_content_height(
         self.scroller,
-        if (has_detail and detail_below) @divTrunc(self.listHeightMax(), 2) else self.listHeightMax(),
+        if (has_detail and detail_below) @divTrunc(list_height_max, 2) else list_height_max,
     );
     const keys: [4][:0]const u8 = switch (view) {
         .files => .{ "Kind", "Size", "Modified", "Where" },
@@ -2474,13 +2475,29 @@ pub fn dump(
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
     const writer = &out.writer;
+    try self.dumpWindow(writer);
+    try self.dumpRows(writer, arena);
+    if (gtk.isVisible(self.detail.box)) try self.dumpDetail(writer);
+    if (self.panel.open) {
+        try writer.print("panel:\n", .{});
+        for (self.panel.entries, 0..) |entry, i| try writer.print("  {s} {s} [{s}]\n", .{
+            if (i == self.panel.selected) ">" else " ",
+            entry.label,
+            entry.keys,
+        });
+    }
+    return out.toOwnedSliceSentinel(0);
+}
+
+/// The dump's first lines: the view, the query, the layout and the footer.
+fn dumpWindow(self: *Ui, writer: *std.Io.Writer) std.Io.Writer.Error!void {
     try writer.print("view: {t}\nvisible: {}\nquery: {s}\n", .{
         self.view,
         gtk.isVisible(self.window),
         self.query(),
     });
     try writer.print("title: {s}\nprimary: {s}\n", .{ self.viewTitle(), self.primary });
-    const lay = self.layout;
+    const layout = self.layout;
     try writer.print(
         "style: {s}\n",
         .{if (self.settings.style.len > 0) self.settings.style else "-"},
@@ -2488,24 +2505,29 @@ pub fn dump(
     try writer.print("layout: {d}x{d} panels={t} search={t} detail={t} rows={t} footer={}", .{
         self.panelWidth(),
         self.panelHeight(),
-        lay.panels,
-        lay.search,
-        lay.detail,
-        lay.rows,
-        lay.footer,
+        layout.panels,
+        layout.search,
+        layout.detail,
+        layout.rows,
+        layout.footer,
     });
     try writer.writeAll(" bar=");
-    for (lay.searchbar.slice(), 0..) |p, i| try writer.print(
-        "{s}{t}",
-        .{ if (i > 0) "," else "", p },
-    );
+    for (layout.searchbar.slice(), 0..) |part, i| {
+        try writer.print("{s}{t}", .{ if (i > 0) "," else "", part });
+    }
     try writer.writeAll(" row=");
-    for (lay.row.slice(), 0..) |p, i| try writer.print("{s}{t}", .{ if (i > 0) "," else "", p });
-    try writer.print(" prompt={s} placeholder={s}\n", .{ lay.prompt, lay.placeholder });
-    if (lay.footer) try writer.print("footer: {s} | {s}\n", .{
+    for (layout.row.slice(), 0..) |part, i| {
+        try writer.print("{s}{t}", .{ if (i > 0) "," else "", part });
+    }
+    try writer.print(" prompt={s} placeholder={s}\n", .{ layout.prompt, layout.placeholder });
+    if (layout.footer) try writer.print("footer: {s} | {s}\n", .{
         c.gtk_label_get_text(self.footer.title),
         c.gtk_label_get_text(self.footer.action),
     });
+}
+
+/// One line per row: the selection mark, the texts, the icon and the key.
+fn dumpRows(self: *Ui, writer: *std.Io.Writer, arena: std.mem.Allocator) std.Io.Writer.Error!void {
     try writer.print("rows:\n", .{});
     self.ensureRows();
     if (self.rows.items.len == 0) try writer.print("  (empty) {s}\n", .{self.emptyText(arena)});
@@ -2530,7 +2552,7 @@ pub fn dump(
                 "file:{s}",
                 .{std.Io.Dir.path.basename(file_path)},
             ),
-            .swatch => |sw| try writer.print("swatch:{s}", .{sw.id}),
+            .swatch => |swatch| try writer.print("swatch:{s}", .{swatch.id}),
             .named => |name| try writer.print("icon:{s}", .{name}),
             .none => try writer.print("none", .{}),
         }
@@ -2541,34 +2563,27 @@ pub fn dump(
             .{if (std.unicode.utf8ValidateSlice(item.key)) item.key else "?"},
         );
     }
-    if (gtk.isVisible(self.detail.box)) {
-        try writer.print("detail:\n", .{});
-        if (self.view == .ext) {
-            const text = std.mem.span(c.gtk_label_get_text(self.detail.text));
-            try writer.print("  text = {s}\n", .{
-                text[0 .. std.mem.findScalar(u8, text, '\n') orelse text.len],
-            });
-        }
-        if (gtk.isVisible(self.detail.meta)) {
-            const detail = &self.detail;
-            for (detail.meta_lines, detail.meta_keys, detail.meta_values) |line, key, value| {
-                if (!gtk.isVisible(line)) continue;
-                try writer.print("  {s} = {s}\n", .{
-                    c.gtk_label_get_text(key),
-                    c.gtk_label_get_text(value),
-                });
-            }
-        }
-    }
-    if (self.panel.open) {
-        try writer.print("panel:\n", .{});
-        for (self.panel.entries, 0..) |emoji, i| try writer.print("  {s} {s} [{s}]\n", .{
-            if (i == self.panel.selected) ">" else " ",
-            emoji.label,
-            emoji.keys,
+}
+
+/// The detail pane: an extension's first line of text, and the metadata.
+fn dumpDetail(self: *Ui, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try writer.print("detail:\n", .{});
+    if (self.view == .ext) {
+        const text = std.mem.span(c.gtk_label_get_text(self.detail.text));
+        try writer.print("  text = {s}\n", .{
+            text[0 .. std.mem.findScalar(u8, text, '\n') orelse text.len],
         });
     }
-    return out.toOwnedSliceSentinel(0);
+    if (gtk.isVisible(self.detail.meta)) {
+        const detail = &self.detail;
+        for (detail.meta_lines, detail.meta_keys, detail.meta_values) |line, key, value| {
+            if (!gtk.isVisible(line)) continue;
+            try writer.print("  {s} = {s}\n", .{
+                c.gtk_label_get_text(key),
+                c.gtk_label_get_text(value),
+            });
+        }
+    }
 }
 
 /// The placeholder row's text when nothing is listed.

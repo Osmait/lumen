@@ -184,12 +184,7 @@ fn appendRow(
 }
 
 /// The values a choice can take, in the order they are listed.
-pub fn choiceOptions(
-    ui: *Ui,
-    arena: std.mem.Allocator,
-    choice: settings_mod.Choice,
-) []const Option {
-    _ = ui;
+pub fn choiceOptions(arena: std.mem.Allocator, choice: settings_mod.Choice) []const Option {
     return switch (choice) {
         .text_size => enumOptions(settings_mod.TextSize, .{
             .small = "Small",
@@ -228,34 +223,37 @@ pub fn choiceOptions(
             "5,000 entries",
         }),
         .icon_theme => iconThemes(arena),
-        .terminal, .editor => blk: {
-            var out: std.ArrayList(Option) = .empty;
-            const terminal = choice == .terminal;
-            const list: []const settings_mod.Program = if (terminal)
-                &settings_mod.terminals
-            else
-                &settings_mod.editors;
-            const auto_cmd: []const u8 = if (terminal) run.autoTerminal() else run.autoEditor();
-            const auto_base = std.Io.Dir.path.basename(auto_cmd);
-            var auto_name: []const u8 = auto_base;
-            for (list) |program| if (std.mem.eql(u8, program.command, auto_base)) {
-                auto_name = program.title;
-            };
-            appendRow(Option, arena, &out, .{
-                .value = "",
-                .label = arena.printSentinel("Automatic ({s})", .{auto_name}, 0) catch "Automatic",
-            });
-            for (list) |program| {
-                if (proc.have(program.command)) {
-                    appendRow(Option, arena, &out, .{
-                        .value = program.command,
-                        .label = program.title,
-                    });
-                }
-            }
-            break :blk out.items;
-        },
+        .terminal => programOptions(arena, &settings_mod.terminals, run.autoTerminal()),
+        .editor => programOptions(arena, &settings_mod.editors, run.autoEditor()),
     };
+}
+
+/// "Automatic" with the program it finds (`automatic_command`), then the
+/// programs of `programs` that are installed.
+fn programOptions(
+    arena: std.mem.Allocator,
+    programs: []const settings_mod.Program,
+    automatic_command: []const u8,
+) []const Option {
+    var out: std.ArrayList(Option) = .empty;
+    const automatic_base = std.Io.Dir.path.basename(automatic_command);
+    var automatic_name: []const u8 = automatic_base;
+    for (programs) |program| if (std.mem.eql(u8, program.command, automatic_base)) {
+        automatic_name = program.title;
+    };
+    appendRow(Option, arena, &out, .{
+        .value = "",
+        .label = arena.printSentinel("Automatic ({s})", .{automatic_name}, 0) catch "Automatic",
+    });
+    for (programs) |program| {
+        if (proc.have(program.command)) {
+            appendRow(Option, arena, &out, .{
+                .value = program.command,
+                .label = program.title,
+            });
+        }
+    }
+    return out.items;
 }
 
 /// The options of a setting stored as one of `Enum`'s tags, in the tags'
@@ -362,7 +360,7 @@ fn iconThemes(arena: std.mem.Allocator) []const Option {
 pub fn choiceLabel(ui: *Ui, arena: std.mem.Allocator, choice: settings_mod.Choice) [:0]const u8 {
     var buf: [32]u8 = undefined;
     const value = ui.settings.choiceValue(choice, &buf);
-    for (choiceOptions(ui, arena, choice)) |option| {
+    for (choiceOptions(arena, choice)) |option| {
         if (std.mem.eql(u8, option.value, value)) return option.label;
     }
     // Set by hand to something not offered (not installed, unusual value).
@@ -427,7 +425,7 @@ pub fn chooseCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
         .setting => |choice| {
             var buf: [32]u8 = undefined;
             const current = ui.settings.choiceValue(choice, &buf);
-            for (choiceOptions(ui, arena, choice)) |option| out.append(
+            for (choiceOptions(arena, choice)) |option| out.append(
                 arena,
                 pickRow(arena, option, current) catch break,
             ) catch break;
@@ -701,7 +699,6 @@ pub fn swatchOf(theme: *const themes.Theme) item_mod.Icon {
     } };
 }
 
-/// Applies what a settings row does.
 /// A value picked in the choose view, for what it was opened for.
 fn pick(ui: *Ui, value: [:0]const u8) void {
     switch (ui.choosing) {
@@ -751,13 +748,19 @@ fn openWith(ui: *Ui, id: [:0]const u8, choice: OpenWithChoice) void {
     ui.hide();
 }
 
-pub fn performSetting(ui: *Ui, setting: item_mod.Setting, op: item_mod.Op) void {
-    const locked: ?[]const u8 = switch (setting) {
+/// The settings key a row changes, when it changes one: init.lua may have
+/// fixed it.
+fn lockKey(setting: item_mod.Setting) ?[]const u8 {
+    return switch (setting) {
         .theme => @tagName(settings_mod.Text.theme),
         .style => @tagName(settings_mod.Text.style),
         else => settingName(setting),
     };
-    if (locked) |key| if (ui.overridden(key)) return ui.showFailure("Set in init.lua");
+}
+
+/// Applies what a settings row does.
+pub fn performSetting(ui: *Ui, setting: item_mod.Setting, operation: item_mod.Op) void {
+    if (lockKey(setting)) |key| if (ui.overridden(key)) return ui.showFailure("Set in init.lua");
     switch (setting) {
         .toggle => |toggle| {
             ui.settings.setToggle(toggle, !ui.settings.get(toggle));
@@ -795,7 +798,9 @@ pub fn performSetting(ui: *Ui, setting: item_mod.Setting, op: item_mod.Op) void 
             ui.setReselect("style:{s}", .{id});
             ui.rebuild();
         },
-        .open_with => |id| openWith(ui, id, if (op == .always_use) .as_default else .once),
+        .open_with => |id| {
+            openWith(ui, id, if (operation == .always_use) .as_default else .once);
+        },
         .open_file => {
             // Write the defaults first: an empty editor helps nobody.
             if (os.info(ui.settings_path.ptr) == null) ui.saveSettings();
@@ -816,15 +821,18 @@ pub fn performSetting(ui: *Ui, setting: item_mod.Setting, op: item_mod.Op) void 
             Ui.installer.update(ui, null, id);
         },
         .ext_uninstall => |id| Ui.installer.uninstall(ui, null, id),
-        .reset => {
-            ui.settings.deinit();
-            ui.settings = Settings.init(ui.gpa);
-            ui.applyOverrides();
-            ui.saveSettings();
-            ui.setReselect("set:reset", .{});
-            ui.rebuild();
-        },
+        .reset => resetSettings(ui),
     }
+}
+
+/// Every setting back to its default, but for what init.lua fixes.
+fn resetSettings(ui: *Ui) void {
+    ui.settings.deinit();
+    ui.settings = Settings.init(ui.gpa);
+    ui.applyOverrides();
+    ui.saveSettings();
+    ui.setReselect("set:reset", .{});
+    ui.rebuild();
 }
 
 /// Open With for a file from the files or contents view.
@@ -852,7 +860,7 @@ test "every listed choice is a value Settings accepts" {
         .text_size, .opacity, .position, .width, .height, .density, .clipboard_keep,
     };
     for (fixed_choices) |choice| {
-        const options = choiceOptions(undefined, std.testing.allocator, choice);
+        const options = choiceOptions(std.testing.allocator, choice);
         try std.testing.expect(options.len > 0);
         for (options) |option| {
             try std.testing.expect(settings.setChoice(choice, option.value));

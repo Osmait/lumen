@@ -397,83 +397,91 @@ pub fn iconWidget(look: *const RowLook, icon: item_mod.Icon, size: c_int) *c.Gtk
     switch (icon) {
         .logo => |logo| {
             const texture = logos.texture(logo.name) orelse return iconWidget(look, .none, size);
-            const img = gtk.imageFromPaintable(texture);
-            c.gtk_image_set_pixel_size(img, if (logo.on_light) size - 6 else size);
-            gtk.addClass(img, if (logo.on_light) "logo-plate" else "logo");
-            gtk.setValign(img, c.GTK_ALIGN_CENTER);
-            return gtk.widget(img);
+            const image = gtk.imageFromPaintable(texture);
+            c.gtk_image_set_pixel_size(image, if (logo.on_light) size - 6 else size);
+            gtk.addClass(image, if (logo.on_light) "logo-plate" else "logo");
+            gtk.setValign(image, c.GTK_ALIGN_CENTER);
+            return gtk.widget(image);
         },
         .gicon => |gicon| {
-            const img = gtk.imageFromGicon(gicon);
-            c.gtk_image_set_pixel_size(img, size);
-            gtk.addClass(img, css_class.app_icon);
-            return gtk.widget(img);
+            const image = gtk.imageFromGicon(gicon);
+            c.gtk_image_set_pixel_size(image, size);
+            gtk.addClass(image, css_class.app_icon);
+            return gtk.widget(image);
         },
         .tile => |tile| {
             if (look.renamed.get(tile.name)) |path| {
                 return iconWidget(look, .{ .file = path }, size);
             }
-            const img = gtk.imageFromIconName(tile.name);
-            c.gtk_image_set_pixel_size(img, @divTrunc(size, 2) + 2);
-            gtk.addClass(img, "tile");
-            var cls: [24:0]u8 = undefined;
-            const name = std.mem.printSentinel(
-                &cls,
-                "tile-{t}",
-                .{tile.color},
-                0,
-            ) catch "tile-gray";
-            gtk.addClass(img, name.ptr);
-            gtk.setValign(img, c.GTK_ALIGN_CENTER);
-            return gtk.widget(img);
+            return tileIcon(tile, size);
         },
         .emoji => |emoji| return gtk.widget(label(emoji, "emoji")),
         .named => |name| {
             if (look.renamed.get(name)) |path| return iconWidget(look, .{ .file = path }, size);
-            const img = gtk.imageFromIconName(name);
-            c.gtk_image_set_pixel_size(img, size);
-            gtk.addClass(img, css_class.app_icon);
-            return gtk.widget(img);
+            const image = gtk.imageFromIconName(name);
+            c.gtk_image_set_pixel_size(image, size);
+            gtk.addClass(image, css_class.app_icon);
+            return gtk.widget(image);
         },
         .swatch => |colors| {
             const texture = swatchTexture(colors.bg, colors.fg, colors.accent) orelse {
                 return iconWidget(look, .none, size);
             };
-            const img = gtk.imageFromPaintable(texture);
-            c.gtk_image_set_pixel_size(img, size);
-            gtk.setValign(img, c.GTK_ALIGN_CENTER);
-            return gtk.widget(img);
+            const image = gtk.imageFromPaintable(texture);
+            c.gtk_image_set_pixel_size(image, size);
+            gtk.setValign(image, c.GTK_ALIGN_CENTER);
+            return gtk.widget(image);
         },
-        .badge => |badge| {
-            const badge_label = label(badge.text, "badge");
-            c.gtk_label_set_xalign(badge_label, 0.5);
-            var cls: [24:0]u8 = undefined;
-            const name = std.mem.printSentinel(
-                &cls,
-                "badge-{t}",
-                .{badge.color},
-                0,
-            ) catch "badge-gray";
-            gtk.addClass(badge_label, name.ptr);
-            // Longer extensions get a smaller font so the tile keeps its size.
-            if (badge.text.len >= 4) gtk.addClass(badge_label, "badge-long");
-            gtk.setValign(badge_label, c.GTK_ALIGN_CENTER);
-            return gtk.widget(badge_label);
-        },
+        .badge => |badge| return badgeIcon(badge),
         .file => |path| {
-            const tex = fileTexture(path, size) orelse return iconWidget(look, .none, size);
-            const img = gtk.imageFromPaintable(tex);
-            c.gtk_image_set_pixel_size(img, size);
-            gtk.addClass(img, "file-icon");
-            gtk.setValign(img, c.GTK_ALIGN_CENTER);
-            return gtk.widget(img);
+            const texture = fileTexture(path, size) orelse return iconWidget(look, .none, size);
+            const image = gtk.imageFromPaintable(texture);
+            c.gtk_image_set_pixel_size(image, size);
+            gtk.addClass(image, "file-icon");
+            gtk.setValign(image, c.GTK_ALIGN_CENTER);
+            return gtk.widget(image);
         },
         .none => {
-            const img = gtk.imageFromIconName("application-x-executable");
-            c.gtk_image_set_pixel_size(img, size);
-            return gtk.widget(img);
+            const image = gtk.imageFromIconName("application-x-executable");
+            c.gtk_image_set_pixel_size(image, size);
+            return gtk.widget(image);
         },
     }
+}
+
+/// A symbolic icon on a tile of the tile's colour, half the icon's size.
+fn tileIcon(tile: @FieldType(item_mod.Icon, "tile"), size: c_int) *c.GtkWidget {
+    const image = gtk.imageFromIconName(tile.name);
+    c.gtk_image_set_pixel_size(image, @divTrunc(size, 2) + 2);
+    gtk.addClass(image, "tile");
+    var class_bytes: [24:0]u8 = undefined;
+    const class = std.mem.printSentinel(
+        &class_bytes,
+        "tile-{t}",
+        .{tile.color},
+        0,
+    ) catch "tile-gray";
+    gtk.addClass(image, class.ptr);
+    gtk.setValign(image, c.GTK_ALIGN_CENTER);
+    return gtk.widget(image);
+}
+
+/// A file extension's text on a tile of the badge's colour.
+fn badgeIcon(badge: @FieldType(item_mod.Icon, "badge")) *c.GtkWidget {
+    const badge_label = label(badge.text, "badge");
+    c.gtk_label_set_xalign(badge_label, 0.5);
+    var class_bytes: [24:0]u8 = undefined;
+    const class = std.mem.printSentinel(
+        &class_bytes,
+        "badge-{t}",
+        .{badge.color},
+        0,
+    ) catch "badge-gray";
+    gtk.addClass(badge_label, class.ptr);
+    // Longer extensions get a smaller font so the tile keeps its size.
+    if (badge.text.len >= 4) gtk.addClass(badge_label, "badge-long");
+    gtk.setValign(badge_label, c.GTK_ALIGN_CENTER);
+    return gtk.widget(badge_label);
 }
 
 // -------------------------------------------------------------- helpers

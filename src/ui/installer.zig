@@ -317,6 +317,14 @@ fn onDone(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
         const end = tail(why, failure_output_bytes_max);
         return fail(ui, cmdline, "{s} failed:\n{s}{s}", .{ @tagName(job.kind), end[0], end[1] });
     }
+    reportSuccess(job, output);
+}
+
+/// The outcome of a job that succeeded: to the caller, or on the selected
+/// row.
+fn reportSuccess(job: *Job, output: [:0]const u8) void {
+    const ui = job.ui;
+    const cmdline = job.cmdline;
     switch (job.kind) {
         .install => {
             var buf: [4200]u8 = undefined;
