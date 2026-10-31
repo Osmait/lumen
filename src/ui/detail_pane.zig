@@ -49,6 +49,7 @@ pub fn buildDetail(ui: *Ui) void {
     c.gtk_widget_add_css_class(meta, "meta");
     c.gtk_box_append(@ptrCast(meta), widgets.label("Information", "meta-header"));
     const keys = [_][:0]const u8{ "Content type", "Characters", "Words", "Copied" };
+    comptime std.debug.assert(keys.len == item_mod.meta_max);
     for (keys, 0..) |key, i| {
         const line = widgets.hbox(12);
         ui.meta_lines[i] = line;

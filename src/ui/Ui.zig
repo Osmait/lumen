@@ -133,10 +133,10 @@ detail_text: *c.GtkWidget = undefined,
 detail_picture: *c.GtkWidget = undefined,
 /// The "Information" block under the preview (hidden for extensions).
 detail_meta: *c.GtkWidget = undefined,
-meta_keys: [4]*c.GtkWidget = undefined,
+meta_keys: [item_mod.meta_max]*c.GtkWidget = undefined,
 /// The rows of the Information block (extensions show as many as they give).
-meta_lines: [4]*c.GtkWidget = undefined,
-meta_values: [4]*c.GtkWidget = undefined,
+meta_lines: [item_mod.meta_max]*c.GtkWidget = undefined,
+meta_values: [item_mod.meta_max]*c.GtkWidget = undefined,
 /// File index, started by main once the window exists.
 files: ?*index.Service = null,
 /// Content (full-text) index, started by main after `files`.
@@ -975,7 +975,7 @@ pub fn show(self: *Ui) void {
 
 /// Shows `view`, optionally with `text` already typed in the search bar.
 pub fn showWith(self: *Ui, view: View, text: ?[*:0]const u8) void {
-    const t_show = stats.now();
+    const show_start_ns = stats.now();
     const was_hidden = c.gtk_widget_get_visible(self.window) == 0;
     _ = self.frec_arena.reset(.retain_capacity);
     // Without it, results are ranked by match quality alone.
@@ -1017,7 +1017,7 @@ pub fn showWith(self: *Ui, view: View, text: ?[*:0]const u8) void {
     }
     if (was_hidden) {
         if (stats.pending) |*pending_stats| {
-            pending_stats.t0 = t_show;
+            pending_stats.start_ns = show_start_ns;
             pending_stats.is_show = true;
         }
     }
@@ -1373,10 +1373,10 @@ pub fn refresh(self: *Ui) void {
     defer {
         const total = stats.now() - start_ns;
         stats.pending = .{
-            .t0 = start_ns,
+            .start_ns = start_ns,
             .view = self.view,
-            .search = self.search_ns,
-            .rows = total -| self.search_ns,
+            .search_ns = self.search_ns,
+            .rows_ns = total -| self.search_ns,
             .is_show = false,
         };
     }

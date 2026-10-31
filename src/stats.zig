@@ -69,8 +69,17 @@ pub var started_ns: u64 = 0;
 /// main() -> window built and indexes started.
 pub var startup_ns: u64 = 0;
 
-/// A refresh waiting for its frame.
-pub var pending: ?struct { t0: u64, view: View, search: u64, rows: u64, is_show: bool } = null;
+/// A refresh waiting for its frame: when it started, how long the search
+/// and the rows took, and whether it was the window being shown.
+pub var pending: ?Pending = null;
+
+pub const Pending = struct {
+    start_ns: u64,
+    view: View,
+    search_ns: u64,
+    rows_ns: u64,
+    is_show: bool,
+};
 
 pub fn now() u64 {
     return os.monotonicNs();
@@ -80,15 +89,15 @@ pub fn now() u64 {
 pub fn onPainted() void {
     const refresh = pending orelse return;
     pending = null;
-    const latency_ns = now() - refresh.t0;
+    const latency_ns = now() - refresh.start_ns;
     if (refresh.is_show) {
         show.add(latency_ns);
         return;
     }
     const view_stats = &views[@backingInt(refresh.view)];
     view_stats.painted.add(latency_ns);
-    view_stats.search.add(refresh.search);
-    view_stats.rows.add(refresh.rows);
+    view_stats.search.add(refresh.search_ns);
+    view_stats.rows.add(refresh.rows_ns);
 }
 
 const MallInfo2 = extern struct {

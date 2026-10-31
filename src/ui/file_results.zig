@@ -42,8 +42,8 @@ pub fn onContentResult(result: *Ui.ContentSearch.Result, ctx: ?*anyopaque) void 
         self.refresh();
         // Latency from the keystroke that asked, not from this rebuild.
         if (stats.pending) |*pending_stats| {
-            pending_stats.t0 = result.start_ns;
-            pending_stats.search = result.search_ns;
+            pending_stats.start_ns = result.start_ns;
+            pending_stats.search_ns = result.search_ns;
         }
     }
     if (old) |old_result| old_result.destroy(self.gpa);

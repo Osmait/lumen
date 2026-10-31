@@ -1,6 +1,7 @@
 //! What a row in the list is, and what can be done with it.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const c = @import("c");
 const core = @import("core");
 const settings = @import("settings.zig");
@@ -121,6 +122,10 @@ pub const Action = union(enum) {
 };
 
 pub const Meta = struct { label: [:0]const u8, value: [:0]const u8 };
+
+/// Label and value pairs a row shows in the detail pane. The pane has one
+/// line of widgets for each.
+pub const meta_max = 4;
 
 pub const ExtItem = struct {
     /// The extension command that listed it (index in the registry), and
@@ -254,7 +259,7 @@ pub const Entry = struct {
 /// Actions for the action panel (Ctrl+K). The first is Enter, the second
 /// Ctrl+Enter.
 pub fn actionsFor(item: *const Item) []const Entry {
-    return switch (item.action) {
+    const entries: []const Entry = switch (item.action) {
         .app => &.{
             .{ .label = "Open Application", .keys = "↵", .op = .open },
             .{ .label = "Copy Name", .keys = "Ctrl ↵", .op = .copy_name },
@@ -333,4 +338,8 @@ pub fn actionsFor(item: *const Item) []const Entry {
             .{ .label = "Use Typed Text", .keys = "Ctrl ↵", .op = .pick_typed },
         },
     };
+    // The action panel and Enter run `entries[0]`. An extension's row has
+    // at least one action: Host refuses `actions = {}`.
+    assert(entries.len >= 1);
+    return entries;
 }

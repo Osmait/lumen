@@ -71,7 +71,7 @@ const rows_too_big = std.fmt.comptimePrint(
     .{rows_bytes_max >> 20},
 );
 /// Label and value pairs of a row's `metadata`.
-const meta_max = 4;
+const meta_max = item_mod.meta_max;
 /// Fields of one form.
 const form_fields_max = 20;
 /// An extension's folder name, a command's or a field's name.
