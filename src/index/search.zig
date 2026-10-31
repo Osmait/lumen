@@ -14,6 +14,7 @@
 //!   + Recency: mtime of the head of the list breaks ties among equals.
 
 const std = @import("std");
+const paths = @import("paths.zig");
 const assert = std.debug.assert;
 const store_mod = @import("store.zig");
 const Store = store_mod.Store;
@@ -21,6 +22,7 @@ const Pool = @import("Pool.zig");
 const fine = @import("fine.zig");
 const sys = @import("os");
 const fold = @import("core").fold;
+const recency = @import("recency.zig");
 
 /// Candidates one pool task scores.
 const chunk_entries = 8192;
@@ -39,8 +41,11 @@ const finalist_mul = 64;
 const recency_mul = 16;
 /// Candidate sets larger than this are not cached for refinement.
 const cache_max = 100_000;
+/// Shorter queries are not cached: with one or two letters almost every
+/// name matches.
+const cache_query_bytes_min = 3;
 /// Ceiling of the recency bonus; bounds how many results need a `stat`.
-pub const recency_max = 300;
+pub const recency_max = recency.bonus_max;
 /// Longest query, in bytes once spaces are dropped: the longest file name.
 pub const query_bytes_max = 255;
 
@@ -132,7 +137,7 @@ pub const Engine = struct {
         const query_mask = store_mod.charMask(query_folded);
         // With 1-2 letters almost everything matches: caching half a million
         // ids would not speed anything up.
-        const cacheable = query_folded.len > 2;
+        const cacheable = query_folded.len >= cache_query_bytes_min;
 
         // On folded queries (see `refines`).
         const refine = engine.refines(query_folded);
@@ -164,13 +169,22 @@ pub const Engine = struct {
 
         const take = @min(limit, hits.items.len);
         try out.ensureTotalCapacity(gpa, take);
-        for (hits.items[0..take]) |h| out.appendAssumeCapacity(.{ .id = h.id, .score = h.score });
+        for (hits.items[0..take]) |hit| out.appendAssumeCapacity(.{ .id = hit.id, .score = hit.score });
+        // Best first, the recency bonus included: `byRecency` re-sorts the
+        // head, and nothing below its cut can climb past it.
+        assert(out.items.len <= limit);
+        for (out.items) |hit| assert(hit.id < store.len());
+        if (out.items.len > 1) {
+            for (out.items[0 .. out.items.len - 1], out.items[1..]) |better, worse| {
+                assert(better.score >= worse.score);
+            }
+        }
 
-        if (cacheable and !sifted.overflow and sifted.cands.items.len <= cache_max) {
+        if (cacheable and !sifted.overflow and sifted.candidates.items.len <= cache_max) {
             engine.last_query.clearRetainingCapacity();
             try engine.last_query.appendSlice(gpa, query_folded);
             engine.last_candidates.clearRetainingCapacity();
-            try engine.last_candidates.appendSlice(gpa, sifted.cands.items);
+            try engine.last_candidates.appendSlice(gpa, sifted.candidates.items);
             engine.cache_valid = true;
         } else engine.cache_valid = false;
     }
@@ -188,13 +202,13 @@ pub const Engine = struct {
         /// The best `limit * finalist_mul` by cheap score.
         finalists: std.ArrayList(Pair) = .empty,
         /// Every entry that matched, for refining the next keystroke.
-        cands: std.ArrayList(u32) = .empty,
-        /// Some chunk ran out of memory: `cands` is incomplete.
+        candidates: std.ArrayList(u32) = .empty,
+        /// Some chunk ran out of memory: `candidates` is incomplete.
         overflow: bool = false,
 
         fn deinit(sifted: *Sifted, gpa: std.mem.Allocator) void {
             sifted.finalists.deinit(gpa);
-            sifted.cands.deinit(gpa);
+            sifted.candidates.deinit(gpa);
         }
     };
 
@@ -224,10 +238,10 @@ pub const Engine = struct {
         );
         const partials = try gpa.alloc(Partial, n_chunks);
         defer {
-            for (partials) |*p| p.deinit(gpa);
+            for (partials) |*partial| partial.deinit(gpa);
             gpa.free(partials);
         }
-        for (partials) |*p| p.* = .{};
+        for (partials) |*partial| partial.* = .{};
         var ctx: SiftCtx = .{
             .gpa = gpa,
             .store = store,
@@ -243,12 +257,12 @@ pub const Engine = struct {
 
         var out: Sifted = .{};
         errdefer out.deinit(gpa);
-        for (partials) |*p| {
-            try out.finalists.appendSlice(gpa, p.top.items);
-            out.overflow = out.overflow or p.overflow;
+        for (partials) |*partial| {
+            try out.finalists.appendSlice(gpa, partial.top.items);
+            out.overflow = out.overflow or partial.overflow;
         }
         if (cacheable and !out.overflow) {
-            for (partials) |*p| try out.cands.appendSlice(gpa, p.cands.items);
+            for (partials) |*partial| try out.candidates.appendSlice(gpa, partial.candidates.items);
         }
         if (out.finalists.items.len > keep) {
             selectTop(out.finalists.items, keep);
@@ -262,15 +276,15 @@ pub const Engine = struct {
 /// becomes "cargotoml", a subsequence of "Cargo.toml" (the Rust version
 /// matched the space literally, so multi-word queries found nothing).
 /// Longer than `query_bytes_max`: nothing (no name can match it).
-fn packQuery(q: []const u8, buf: *[query_bytes_max]u8) []const u8 {
-    var n: usize = 0;
-    for (q) |ch| {
-        if (ch == ' ' or ch == '\t') continue;
-        if (n == buf.len) return buf[0..0];
-        buf[n] = ch;
-        n += 1;
+fn packQuery(query: []const u8, buf: *[query_bytes_max]u8) []const u8 {
+    var packed_count: usize = 0;
+    for (query) |byte| {
+        if (byte == ' ' or byte == '\t') continue;
+        if (packed_count == buf.len) return buf[0..0];
+        buf[packed_count] = byte;
+        packed_count += 1;
     }
-    return buf[0..n];
+    return buf[0..packed_count];
 }
 
 fn lessThan(_: void, a: Pair, b: Pair) bool {
@@ -279,12 +293,12 @@ fn lessThan(_: void, a: Pair, b: Pair) bool {
 
 const Partial = struct {
     top: std.ArrayList(Pair) = .empty,
-    cands: std.ArrayList(u32) = .empty,
+    candidates: std.ArrayList(u32) = .empty,
     overflow: bool = false,
 
     fn deinit(partial: *Partial, gpa: std.mem.Allocator) void {
         partial.top.deinit(gpa);
-        partial.cands.deinit(gpa);
+        partial.candidates.deinit(gpa);
     }
 };
 
@@ -302,11 +316,11 @@ const SiftCtx = struct {
 };
 
 fn siftChunk(ctx: *SiftCtx, lo: usize, hi: usize) void {
-    const ci = lo / chunk_entries;
+    const chunk_index = lo / chunk_entries;
     // Out of memory: the chunk's candidates are incomplete, so they must not
     // be refined on the next keystroke as if they were all of them.
-    sift(ctx, ci, lo, hi) catch {
-        ctx.partials[ci].overflow = true;
+    sift(ctx, chunk_index, lo, hi) catch {
+        ctx.partials[chunk_index].overflow = true;
     };
 }
 
@@ -314,14 +328,14 @@ fn siftChunk(ctx: *SiftCtx, lo: usize, hi: usize) void {
 /// can still fight for the chunk's top-K is pushed (the Rust profile showed
 /// unselective queries spending their time pushing entries to throw away
 /// 99.98% of them).
-fn sift(ctx: *SiftCtx, ci: usize, lo: usize, hi: usize) !void {
-    const p = &ctx.partials[ci];
+fn sift(ctx: *SiftCtx, chunk_index: usize, lo: usize, hi: usize) !void {
+    const partial = &ctx.partials[chunk_index];
     const masks = ctx.store.masks();
-    const k = ctx.per_chunk;
-    const compact_at = k * 2;
-    try p.top.ensureTotalCapacity(ctx.gpa, compact_at);
+    const kept_max = ctx.per_chunk;
+    const compact_at = kept_max * 2;
+    try partial.top.ensureTotalCapacity(ctx.gpa, compact_at);
     // Room for the chunk's candidates at once, not grown one by one.
-    if (ctx.cache_cap > 0) try p.cands.ensureTotalCapacity(ctx.gpa, @min(hi - lo, ctx.cache_cap));
+    if (ctx.cache_cap > 0) try partial.candidates.ensureTotalCapacity(ctx.gpa, @min(hi - lo, ctx.cache_cap));
     var threshold: i32 = std.math.minInt(i32);
 
     var idx = lo;
@@ -329,37 +343,37 @@ fn sift(ctx: *SiftCtx, ci: usize, lo: usize, hi: usize) !void {
         const id: u32 = if (ctx.ids) |ids| ids[idx] else @intCast(idx);
         if (masks[id] & ctx.query_mask != ctx.query_mask) continue;
         const cheap = cheapScoreMasked(ctx.store.name(id), ctx.q, masks[id]) orelse continue;
-        const s = adjust(ctx.store, id, cheap);
+        const score = adjust(ctx.store, id, cheap);
         // `>=`: on equal scores the id breaks the tie, so an equal can still
         // displace the k-th.
-        if (s >= threshold) {
-            p.top.appendAssumeCapacity(.{ .score = s, .id = id });
-            if (p.top.items.len == compact_at) {
-                selectTop(p.top.items, k);
-                p.top.shrinkRetainingCapacity(k);
-                threshold = worst(p.top.items).score;
+        if (score >= threshold) {
+            partial.top.appendAssumeCapacity(.{ .score = score, .id = id });
+            if (partial.top.items.len == compact_at) {
+                selectTop(partial.top.items, kept_max);
+                partial.top.shrinkRetainingCapacity(kept_max);
+                threshold = worst(partial.top.items).score;
             }
         }
         if (ctx.cache_cap > 0) {
-            if (p.cands.items.len < ctx.cache_cap) {
-                try p.cands.append(ctx.gpa, id);
+            if (partial.candidates.items.len < ctx.cache_cap) {
+                try partial.candidates.append(ctx.gpa, id);
             } else {
-                p.overflow = true;
+                partial.overflow = true;
             }
         }
     }
-    if (p.top.items.len > k) {
-        selectTop(p.top.items, k);
-        p.top.shrinkRetainingCapacity(k);
+    if (partial.top.items.len > kept_max) {
+        selectTop(partial.top.items, kept_max);
+        partial.top.shrinkRetainingCapacity(kept_max);
     }
 }
 
 fn worst(items: []const Pair) Pair {
-    var w = items[0];
-    for (items[1..]) |it| if (Pair.better(w, it)) {
-        w = it;
+    var result = items[0];
+    for (items[1..]) |item| if (Pair.better(result, item)) {
+        result = item;
     };
-    return w;
+    return result;
 }
 
 /// Reorders `items` so its first `k` are the best `k` (in any order):
@@ -426,11 +440,11 @@ pub fn cheapScoreMasked(name: []const u8, q: []const u8, mask: u64) ?i32 {
 noinline fn cheapFolded(name: []const u8, q: []const u8) ?i32 {
     var buf: [folded_bytes_max]u8 = undefined;
     var upper: [folded_bytes_max]bool = undefined;
-    const n = fold.foldCase(&buf, &upper, name);
+    const folded_count = fold.foldCase(&buf, &upper, name);
     return cheapCore(
         .folded,
-        buf[0..n],
-        upper[0..n],
+        buf[0..folded_count],
+        upper[0..folded_count],
         q,
     ) catch unreachable; // NonAscii comes only from .ascii mode
 }
@@ -438,6 +452,56 @@ noinline fn cheapFolded(name: []const u8, q: []const u8) ?i32 {
 /// Longest name folded for `cheapScore`; a longer non-ASCII name is scored
 /// on its first `folded_bytes_max` characters (Linux names stop at 255 bytes).
 const folded_bytes_max = 1024;
+
+/// What each property of a match is worth to the cheap scorer. Together
+/// they order the names the fine scorer then looks at.
+const cheap_weight = struct {
+    /// A matched character right after the previous match.
+    const consecutive = 30;
+    /// A match on the name's first character.
+    const name_start = 45;
+    /// A match right after a separator (`isWordSeparator`).
+    const word_start = 28;
+    /// A match on a camelCase boundary.
+    const camel_start = 22;
+    /// Taken per byte before the first match, up to `before_first_bytes_max`.
+    const before_first_per_byte = 2;
+    const before_first_bytes_max = 64;
+    /// One point taken per this many bytes of name: shorter names first.
+    const name_bytes_per_point = 4;
+    /// The name is the query, with or without its extension: people type
+    /// "readme" for README.md as much as for README.
+    const whole_name = 120;
+};
+
+/// Whether a match right after `byte` starts a word. A switch, not a
+/// search in a string: it runs once per matched byte of every candidate.
+inline fn isWordSeparator(byte: u8) bool {
+    return switch (byte) {
+        '_', '-', '.', ' ', '/' => true,
+        else => false,
+    };
+}
+
+/// What the entry's metadata adds to its cheap score (`adjust`).
+const metadata_weight = struct {
+    const directory = 15;
+    /// Taken from a hidden entry on top of the whole recency bonus, so that
+    /// a cache touched every day still ranks below a plain file.
+    const hidden_beyond_recency = 60;
+    /// Taken per level of depth: twelve levels down is rarely what you
+    /// were after.
+    const per_depth = 3;
+};
+
+/// The fine score counts this many times the cheap one in the final score.
+const fine_weight = 4;
+
+comptime {
+    // A hidden entry with the full recency bonus still loses to the same
+    // name unhidden and not recent.
+    assert(metadata_weight.hidden_beyond_recency > 0);
+}
 
 const CheapMode = enum {
     /// `name` is the original, known to be ASCII (its mask says so):
@@ -468,23 +532,23 @@ fn cheapCore(
             seen = i;
             break;
         }
-        if (mode == .ascii and raw >= 0x80) return error.NonAscii;
+        if (mode == .ascii and !std.ascii.isAscii(raw)) return error.NonAscii;
         const h = if (ascii) std.ascii.toLower(raw) else raw;
         if (h != q[qi]) continue;
         if (first_hit == std.math.maxInt(usize)) first_hit = i;
-        if (prev_hit +% 1 == i) s += 30;
+        if (prev_hit +% 1 == i) s += cheap_weight.consecutive;
         if (i == 0) {
-            s += 45;
+            s += cheap_weight.name_start;
         } else {
             const prev = name[i - 1];
             const camel_boundary = if (ascii)
                 std.ascii.isLower(prev) and std.ascii.isUpper(raw)
             else
                 std.ascii.isLower(prev) and !upper[i - 1] and upper[i];
-            if (prev == '_' or prev == '-' or prev == '.' or prev == ' ' or prev == '/') {
-                s += 28;
+            if (isWordSeparator(prev)) {
+                s += cheap_weight.word_start;
             } else if (camel_boundary) {
-                s += 22;
+                s += cheap_weight.camel_start;
             }
         }
         prev_hit = i;
@@ -494,25 +558,22 @@ fn cheapCore(
     // The lengths below are folded lengths: an unseen tail must be ASCII
     // too for the original's to be the same.
     if (mode == .ascii and !fold.isAscii(name[seen..])) return error.NonAscii;
-    s -= @as(i32, @intCast(@min(first_hit, 64))) * 2;
-    s -= @as(i32, @intCast(name.len / 4));
-    // The name IS the query, with or without its extension: people type
-    // "readme" for README.md as much as for README.
+    const before_first: i32 = @intCast(@min(first_hit, cheap_weight.before_first_bytes_max));
+    s -= before_first * cheap_weight.before_first_per_byte;
+    s -= @as(i32, @intCast(name.len / cheap_weight.name_bytes_per_point));
     const stem_len = std.mem.findScalarLast(u8, name, '.') orelse name.len;
-    if (name.len == q.len or (stem_len > 0 and stem_len == q.len)) s += 120;
+    if (name.len == q.len or (stem_len > 0 and stem_len == q.len)) s += cheap_weight.whole_name;
     return s;
 }
 
 /// Metadata adjustments, shared by the cascade and the exhaustive reference
 /// (the Rust version learned to keep them in one place the hard way).
 fn adjust(store: *const Store, id: u32, cheap: i32) i32 {
-    const fl = store.flags()[id];
-    var s = cheap;
-    if (fl & store_mod.flag_dir != 0) s += 15;
-    // Must outweigh the recency bonus: an active cache is touched every day.
-    if (fl & store_mod.flag_hidden != 0) s -= recency_max + 60;
-    // Twelve levels down is rarely what you were after.
-    return s - @as(i32, store.depths()[id]) * 3;
+    const entry_flags = store.flags()[id];
+    var score = cheap;
+    if (entry_flags & store_mod.flag_dir != 0) score += metadata_weight.directory;
+    if (entry_flags & store_mod.flag_hidden != 0) score -= recency_max + metadata_weight.hidden_beyond_recency;
+    return score - @as(i32, store.depths()[id]) * metadata_weight.per_depth;
 }
 
 /// Finalists per pool task for the fine scorer and the recency stats.
@@ -528,7 +589,7 @@ const FineCtx = struct {
     fn block(ctx: *FineCtx, lo: usize, hi: usize) void {
         for (ctx.in[lo..hi], ctx.out[lo..hi]) |f, *h| {
             const fs = fine.score(ctx.store.name(f.id), ctx.q) orelse 0;
-            h.* = .{ .score = fs * 4 + f.score, .id = f.id };
+            h.* = .{ .score = fs * fine_weight + f.score, .id = f.id };
         }
     }
 };
@@ -540,7 +601,7 @@ const RecencyCtx = struct {
     no_stat: []const []const u8,
 
     fn block(ctx: *RecencyCtx, lo: usize, hi: usize) void {
-        var buf: [4096]u8 = undefined;
+        var buf: paths.Buffer = undefined;
         for (ctx.hits[lo..hi]) |*h| h.score += recencyBonus(ctx, h.id, &buf);
     }
 };
@@ -560,44 +621,37 @@ fn byRecency(
     if (hits.len == 0) return;
     const cut = hits[@min(limit, hits.len) - 1].score;
     const floor = cut -| recency_max;
-    var n: usize = 0;
-    while (n < hits.len and hits[n].score >= floor) n += 1;
-    n = @min(n, limit * recency_mul);
+    var stat_count: usize = 0;
+    while (stat_count < hits.len and hits[stat_count].score >= floor) stat_count += 1;
+    stat_count = @min(stat_count, limit * recency_mul);
     // Up to 960 path rebuilds and stats for the UI's 60: on the pool.
     var recency_context: RecencyCtx = .{
         .store = store,
-        .hits = hits[0..n],
+        .hits = hits[0..stat_count],
         .now = sys.nowSeconds(),
         .no_stat = no_stat,
     };
-    pool.runBlocks(n, recency_block, &recency_context, RecencyCtx.block);
-    std.mem.sort(Pair, hits[0..n], {}, lessThan);
+    pool.runBlocks(stat_count, recency_block, &recency_context, RecencyCtx.block);
+    std.mem.sort(Pair, hits[0..stat_count], {}, lessThan);
 }
 
 /// Whether `path` is folder `dir` or below it ("/a/bc" is not below "/a/b").
 pub fn isUnder(path: []const u8, dir: []const u8) bool {
     if (!std.mem.startsWith(u8, path, dir)) return false;
-    return path.len == dir.len or path[dir.len] == '/' or std.mem.endsWith(u8, dir, "/");
+    if (path.len == dir.len) return true;
+    return path[dir.len] == paths.separator or std.mem.endsWith(u8, dir, paths.separator_str);
 }
 
 /// Coarse on purpose: today vs this month vs old.
-fn recencyBonus(ctx: *const RecencyCtx, id: u32, buf: *[4096]u8) i32 {
+fn recencyBonus(ctx: *const RecencyCtx, id: u32, buf: *paths.Buffer) i32 {
     const now = ctx.now;
     const path = ctx.store.path(id, buf[0 .. buf.len - 1]) orelse return 0;
     if (path.len == 0) return 0;
     for (ctx.no_stat) |dir| if (isUnder(path, dir)) return 0;
     buf[path.len] = 0;
     const mtime = sys.mtime(buf[0..path.len :0]) orelse return 0;
-    if (mtime > now) return recency_max;
     // Saturating: an mtime is whatever the file system says.
-    return switch (@divTrunc(now -| mtime, std.time.s_per_day)) {
-        0 => 300,
-        1...6 => 220,
-        7...29 => 140,
-        30...179 => 60,
-        180...364 => 20,
-        else => 0,
-    };
+    return recency.bonus(now -| mtime);
 }
 
 /// Reference: scores every entry with the fine scorer, no cascade, no cuts.
@@ -618,17 +672,18 @@ pub fn searchExhaustive(
     const query_mask = store_mod.charMask(query_folded);
     var all: std.ArrayList(Pair) = .empty;
     defer all.deinit(gpa);
-    for (store.masks(), 0..) |m, i| {
-        if (m & query_mask != query_mask) continue;
+    for (store.masks(), 0..) |mask, i| {
+        if (mask & query_mask != query_mask) continue;
         const id: u32 = @intCast(i);
-        const cheap = cheapScoreMasked(store.name(id), query_folded, m) orelse continue;
-        const fs = fine.score(store.name(id), query_folded) orelse 0;
-        try all.append(gpa, .{ .score = fs * 4 + adjust(store, id, cheap), .id = id });
+        const cheap = cheapScoreMasked(store.name(id), query_folded, mask) orelse continue;
+        const fine_score = fine.score(store.name(id), query_folded) orelse 0;
+        const score = fine_score * fine_weight + adjust(store, id, cheap);
+        try all.append(gpa, .{ .score = score, .id = id });
     }
     std.mem.sort(Pair, all.items, {}, lessThan);
-    for (all.items[0..@min(limit, all.items.len)]) |h| try out.append(gpa, .{
-        .id = h.id,
-        .score = h.score,
+    for (all.items[0..@min(limit, all.items.len)]) |hit| try out.append(gpa, .{
+        .id = hit.id,
+        .score = hit.score,
     });
 }
 
@@ -862,9 +917,9 @@ test "recency: nothing under a slow mount is stat'ed" {
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
+    var dbuf: paths.Buffer = undefined;
     const dir = try sys.tmpDirAbs(&tmp, &dbuf);
-    var pbuf: [4096]u8 = undefined;
+    var pbuf: paths.Buffer = undefined;
     try sys.writeFile(try std.mem.printSentinel(&pbuf, "{s}/recent_note.txt", .{dir}, 0), "x");
     var b: store_mod.Builder = .empty;
     const root = try b.push(gpa, dir, store_mod.no_parent, store_mod.flag_dir, 0);

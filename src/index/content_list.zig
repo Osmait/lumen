@@ -4,6 +4,7 @@
 //! ripgrep resolves every .gitignore of a home directory in ~70 ms.
 
 const std = @import("std");
+const paths = @import("paths.zig");
 const linux = std.os.linux;
 const content = @import("content.zig");
 const extract = @import("extract.zig");
@@ -23,6 +24,15 @@ pub const ListError = std.process.RunError || std.mem.Allocator.Error;
 /// A hung network or FUSE mount under the root must not hang the content
 /// service forever: ripgrep gets this long, then the current index stays.
 const list_timeout_ns = 60 * std.time.ns_per_s;
+/// How often a running listing looks at `stop` and the deadline.
+const list_poll_ms = 100;
+/// The most bytes read per look at ripgrep's output.
+const list_read_bytes_min = 64;
+/// The most a listing may print: paths of a few million files.
+const list_output_bytes_max = 256 << 20;
+/// Documents above this (PDF, Office) are not extracted: a book-sized PDF
+/// gives far more text than `content.extracted_bytes_max` keeps.
+const document_bytes_max = 64 << 20;
 
 pub const ListOptions = struct {
     /// Also documents whose text is extracted (PDF, Office), not only
@@ -55,7 +65,7 @@ pub fn list(
         "--no-messages",
         "--no-ignore-parent",
     });
-    for (excludes) |g| try argv.appendSlice(arena, &.{ "-g", g });
+    for (excludes) |glob| try argv.appendSlice(arena, &.{ "-g", glob });
     // Run inside the root and list ".": rg matches globs against the path it
     // prints, so with the root as argument a root below any excluded name
     // (a home in /srv/build, the tests' .zig-cache/tmp) listed nothing.
@@ -63,11 +73,11 @@ pub fn list(
     const out = try runLister(gpa, io, argv.items, root, options.stop);
     defer gpa.free(out);
 
-    const sep: []const u8 = if (std.mem.endsWith(u8, root, "/")) "" else "/";
+    const sep = paths.separatorAfter(root);
     var docs: std.ArrayList(content.DocIn) = .empty;
-    var it = std.mem.tokenizeScalar(u8, out, 0);
-    var path_buffer: [4096]u8 = undefined;
-    while (it.next()) |line| {
+    var lines = std.mem.tokenizeScalar(u8, out, 0);
+    var path_buffer: paths.Buffer = undefined;
+    while (lines.next()) |line| {
         const path_relative = if (std.mem.startsWith(u8, line, "./")) line[2..] else line;
         const path_z = std.mem.printSentinel(
             &path_buffer,
@@ -121,17 +131,17 @@ fn runLister(
     defer reader.deinit();
     const deadline = sys.monotonicNs() + list_timeout_ns;
     const slice: std.Io.Timeout = .{
-        .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake },
+        .duration = .{ .raw = .fromMilliseconds(list_poll_ms), .clock = .awake },
     };
     while (true) {
-        reader.fill(64, slice) catch |err| switch (err) {
+        reader.fill(list_read_bytes_min, slice) catch |err| switch (err) {
             error.EndOfStream => break,
             error.Timeout => {},
-            else => |e| return e,
+            else => |other| return other,
         };
-        if (stop) |s| if (s.load(.acquire)) return error.Canceled;
+        if (stop) |stop_flag| if (stop_flag.load(.acquire)) return error.Canceled;
         if (sys.monotonicNs() >= deadline) return error.Timeout;
-        if (reader.reader(0).buffered().len > 256 << 20) return error.StreamTooLong;
+        if (reader.reader(0).buffered().len > list_output_bytes_max) return error.StreamTooLong;
     }
     try reader.checkAnyError();
     _ = try child.wait(io);
@@ -157,8 +167,12 @@ pub fn stat(path: [*:0]const u8, kind: Kind) ?Stat {
     );
     if (linux.errno(rc) != .SUCCESS or stx.mode & linux.S.IFMT != linux.S.IFREG) return null;
     switch (kind) {
-        .text => if (stx.size > content.text_bytes_max or stx.size < 3) return null,
-        .document => if (stx.size > 64 << 20) return null,
+        // Shorter than a trigram: no query can find anything in it.
+        .text => {
+            if (stx.size > content.text_bytes_max) return null;
+            if (stx.size < content.trigram_chars) return null;
+        },
+        .document => if (stx.size > document_bytes_max) return null,
     }
     return .{ .mtime = stx.mtime.sec, .size = stx.size };
 }
@@ -218,7 +232,7 @@ fn binaryByName(path: []const u8) bool {
         ".fbx",
         ".mov",
     };
-    for (exts) |e| if (std.ascii.endsWithIgnoreCase(path, e)) return true;
+    for (exts) |extension| if (std.ascii.endsWithIgnoreCase(path, extension)) return true;
     return false;
 }
 
@@ -303,7 +317,7 @@ test "list: what is indexed and what is excluded" {
     try t.mkdir("proj/.git");
     try t.write("proj/.gitignore", "ignored.txt\ngen/\n");
     // Sizes without writing the bytes: sparse files.
-    var buf: [4096]u8 = undefined;
+    var buf: paths.Buffer = undefined;
     for ([_]struct { []const u8, i64 }{ .{ "big.log", content.text_bytes_max + 1 }, .{
         "exactly_max.log",
         content.text_bytes_max,

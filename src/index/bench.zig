@@ -11,6 +11,13 @@ const index = @import("index");
 const sys = @import("os");
 const Store = index.store.Store;
 
+/// The first argument when it is not a query.
+const Command = enum {
+    bench,
+    content,
+    @"content-live",
+};
+
 pub fn main(init: std.process.Init) !void {
     const gpa = std.heap.c_allocator;
     const io = init.io;
@@ -25,14 +32,12 @@ pub fn main(init: std.process.Init) !void {
 
     const pool = try index.Pool.create(gpa, io, index.Pool.allCores());
     defer pool.destroy();
-    if (std.mem.eql(u8, cmd, "content")) return contentBench(gpa, io, pool, root, args.next());
-    if (std.mem.eql(u8, cmd, "content-live")) return contentLive(
-        gpa,
-        io,
-        pool,
-        init.environ_map.get("XDG_CACHE_HOME"),
-        home,
-    );
+    // Anything else is a query.
+    const command = std.meta.stringToEnum(Command, cmd);
+    if (command == .content) return contentBench(gpa, io, pool, root, args.next());
+    if (command == .@"content-live") {
+        return contentLive(gpa, io, pool, init.environ_map.get("XDG_CACHE_HOME"), home);
+    }
     const cfg: index.scan.Config = .{ .roots = &.{root} };
 
     var stats: index.scan.Stats = .{};
@@ -52,7 +57,7 @@ pub fn main(init: std.process.Init) !void {
         ) / 1e6,
     });
 
-    if (!std.mem.eql(u8, cmd, "bench")) {
+    if (command != .bench) {
         var e: index.search.Engine = .empty;
         defer e.deinit(gpa);
         var hits: std.ArrayList(index.search.Hit) = .empty;
@@ -60,7 +65,7 @@ pub fn main(init: std.process.Init) !void {
         const t = sys.monotonicNs();
         try e.search(gpa, pool, &store, cmd, .{ .limit = 20 }, &hits);
         std.debug.print("search    {d:>8.3} ms\n", .{ms(sys.monotonicNs() - t)});
-        var buf: [4096]u8 = undefined;
+        var buf: index.paths.Buffer = undefined;
         for (hits.items, 1..) |h, i| std.debug.print("{d:>3}. {d:>5}  {s}\n", .{
             i,
             h.score,
@@ -72,7 +77,7 @@ pub fn main(init: std.process.Init) !void {
     // Save and map back: the start-up path.
     var dir: TempDir = try .create();
     defer dir.remove();
-    var pbuf: [4096]u8 = undefined;
+    var pbuf: index.paths.Buffer = undefined;
     const path = try dir.file(&pbuf, "files.idx");
     var t = sys.monotonicNs();
     try store.save(path);
@@ -162,7 +167,7 @@ pub fn main(init: std.process.Init) !void {
         try e.search(gpa, pool, &mapped, typed[0..n], .{ .limit = 60 }, &hits);
         std.debug.print("  {s:<12} {d:>8.3} ms\n", .{ typed[0..n], ms(sys.monotonicNs() - t) });
     }
-    var buf: [4096]u8 = undefined;
+    var buf: index.paths.Buffer = undefined;
     std.debug.print("\ntop 5 for \"cargo.toml\":\n", .{});
     for (hits.items[0..@min(5, hits.items.len)]) |h| std.debug.print(
         "  {s}\n",
@@ -249,7 +254,7 @@ fn contentBench(
     // Written to the file as it grows, as the daemon builds it.
     var dir: TempDir = try .create();
     defer dir.remove();
-    var pbuf: [4096]u8 = undefined;
+    var pbuf: index.paths.Buffer = undefined;
     const path = try dir.file(&pbuf, "content.idx");
     var ix = try index.content.buildFile(
         gpa,
@@ -328,7 +333,7 @@ fn contentLive(
     xdg_cache: ?[]const u8,
     home: []const u8,
 ) !void {
-    var buf: [4096]u8 = undefined;
+    var buf: index.paths.Buffer = undefined;
     const cache = if (xdg_cache) |x| try std.mem.print(
         &buf,
         "{s}/lumen",

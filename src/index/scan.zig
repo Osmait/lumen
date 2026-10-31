@@ -14,6 +14,7 @@
 //! dropped it for being `unsafe`; in Zig it is the natural API.
 
 const std = @import("std");
+const paths = @import("paths.zig");
 const assert = std.debug.assert;
 const store_mod = @import("store.zig");
 const Store = store_mod.Store;
@@ -121,7 +122,7 @@ fn addLevel(
             }
             stats.dirs += 1;
             if (!level.descend) continue;
-            const sep = if (std.mem.endsWith(u8, parent.path, "/")) "" else "/";
+            const sep = paths.separatorAfter(parent.path);
             const child = try gpa.printSentinel("{s}{s}{s}", .{ parent.path, sep, name }, 0);
             errdefer gpa.free(child);
             try next.append(gpa, .{
@@ -144,20 +145,20 @@ pub fn scan(
     watcher: ?*Watcher,
     stats: ?*Stats,
 ) std.mem.Allocator.Error!Store {
-    const t0 = sys.monotonicNs();
-    var st: Stats = .{};
-    var b: Builder = .empty;
-    errdefer b.deinit(gpa);
+    const start_ns = sys.monotonicNs();
+    var totals: Stats = .{};
+    var builder: Builder = .empty;
+    errdefer builder.deinit(gpa);
 
     var frontier: std.ArrayList(Frontier) = .empty;
     defer {
-        for (frontier.items) |f| gpa.free(f.path);
+        for (frontier.items) |folder| gpa.free(folder.path);
         frontier.deinit(gpa);
     }
     // Level 0: the roots, whose "name" is their absolute path.
     for (cfg.roots) |root| {
-        const id = try b.push(gpa, root, store_mod.no_parent, store_mod.flag_dir, 0);
-        st.dirs += 1;
+        const id = try builder.push(gpa, root, store_mod.no_parent, store_mod.flag_dir, 0);
+        totals.dirs += 1;
         try frontier.append(gpa, .{
             .id = id,
             .path = try gpa.dupeSentinel(u8, root, 0),
@@ -168,19 +169,19 @@ pub fn scan(
     var depth: u16 = 1;
     while (frontier.items.len > 0 and depth <= cfg.depth_max) : (depth +|= 1) {
         const follow = depth == 1 and cfg.follow_roots;
-        if (watcher) |w| {
+        if (watcher) |inotify| {
             const placement: Watcher.Placement = if (follow) .root else .below_root;
             for (frontier.items) |folder| {
-                try w.watchBestEffort(gpa, folder.path, folder.id, placement);
+                try inotify.watchBestEffort(gpa, folder.path, folder.id, placement);
             }
         }
 
         const batches = try gpa.alloc(Batch, frontier.items.len);
         defer {
-            for (batches) |*bt| bt.deinit(gpa);
+            for (batches) |*batch| batch.deinit(gpa);
             gpa.free(batches);
         }
-        for (batches) |*bt| bt.* = .{};
+        for (batches) |*batch| batch.* = .{};
         var ctx: LevelCtx = .{
             .gpa = gpa,
             .cfg = cfg,
@@ -192,23 +193,23 @@ pub fn scan(
 
         var next: std.ArrayList(Frontier) = .empty;
         errdefer {
-            for (next.items) |f| gpa.free(f.path);
+            for (next.items) |folder| gpa.free(folder.path);
             next.deinit(gpa);
         }
         const level: Level = .{ .depth = depth, .descend = depth < cfg.depth_max };
-        try addLevel(gpa, &b, frontier.items, batches, level, &next, &st);
-        for (frontier.items) |f| gpa.free(f.path);
+        try addLevel(gpa, &builder, frontier.items, batches, level, &next, &totals);
+        for (frontier.items) |folder| gpa.free(folder.path);
         frontier.deinit(gpa);
         frontier = next;
-        if (b.len() > cfg.entries_max) {
-            st.truncated = true;
+        if (builder.len() > cfg.entries_max) {
+            totals.truncated = true;
             break;
         }
     }
 
-    st.ns = sys.monotonicNs() - t0;
-    if (stats) |s| s.* = st;
-    return b.finish(gpa);
+    totals.ns = sys.monotonicNs() - start_ns;
+    if (stats) |stats_out| stats_out.* = totals;
+    return builder.finish(gpa);
 }
 
 fn readOne(ctx: *LevelCtx, i: usize) void {
@@ -227,8 +228,8 @@ fn readOne(ctx: *LevelCtx, i: usize) void {
 /// per inotify event, under the lock) is a binary search instead of a walk
 /// over every sibling (100k names per event in a folder of 100k files).
 fn sortBatch(gpa: std.mem.Allocator, batch: *Batch) std.mem.Allocator.Error!void {
-    const n = batch.ends.items.len;
-    if (n < 2) return;
+    const names_count = batch.ends.items.len;
+    if (names_count < 2) return;
     const Order = struct {
         b: *const Batch,
         fn name(o: @This(), i: u32) []const u8 {
@@ -241,17 +242,17 @@ fn sortBatch(gpa: std.mem.Allocator, batch: *Batch) std.mem.Allocator.Error!void
     };
     const o: Order = .{ .b = batch };
     var sorted = true;
-    for (1..n) |i| sorted = sorted and !o.lt(@intCast(i), @intCast(i - 1));
+    for (1..names_count) |i| sorted = sorted and !o.lt(@intCast(i), @intCast(i - 1));
     if (sorted) return;
-    const perm = try gpa.alloc(u32, n);
+    const perm = try gpa.alloc(u32, names_count);
     defer gpa.free(perm);
     for (perm, 0..) |*p, i| p.* = @intCast(i);
     std.mem.sort(u32, perm, o, Order.lt);
     var out: Batch = .{ .errors = batch.errors };
     errdefer out.deinit(gpa);
     try out.names.ensureTotalCapacity(gpa, batch.names.items.len);
-    try out.ends.ensureTotalCapacity(gpa, n);
-    try out.flags.ensureTotalCapacity(gpa, n);
+    try out.ends.ensureTotalCapacity(gpa, names_count);
+    try out.flags.ensureTotalCapacity(gpa, names_count);
     for (perm) |i| {
         out.names.appendSliceAssumeCapacity(o.name(i));
         out.ends.appendAssumeCapacity(@intCast(out.names.items.len));
@@ -274,15 +275,15 @@ fn readDir(
         return;
     };
     defer sys.close(fd);
-    var it: sys.DirIter = .{ .fd = fd };
-    while (try it.next()) |e| {
-        var kind = e.kind;
+    var entries: sys.DirIter = .{ .fd = fd };
+    while (try entries.next()) |entry| {
+        var kind = entry.kind;
         if (kind == sys.Kind.unknown) {
-            var buf: [4096]u8 = undefined;
+            var buf: paths.Buffer = undefined;
             const full = std.mem.printSentinel(
                 &buf,
                 "{s}/{s}",
-                .{ path, e.name },
+                .{ path, entry.name },
                 0,
             ) catch continue;
             kind = sys.kindOf(full);
@@ -291,11 +292,11 @@ fn readDir(
         // Dot-dirs and caches are noise: searchable, ranked low, and the
         // flag is inherited by everything below ("~/orca/skein-zig-pkg-cache"
         // READMEs outranked the user's own).
-        if (hiddenByName(e.name)) flags |= store_mod.flag_hidden;
+        if (hiddenByName(entry.name)) flags |= store_mod.flag_hidden;
         if (kind == sys.Kind.symlink) flags |= store_mod.flag_symlink;
         // A skipped directory is still indexed (searchable), just not opened.
-        if (kind == sys.Kind.dir and shouldDescend(path, e.name, cfg)) flags |= store_mod.flag_dir;
-        try batch.names.appendSlice(gpa, e.name);
+        if (kind == sys.Kind.dir and shouldDescend(path, entry.name, cfg)) flags |= store_mod.flag_dir;
+        try batch.names.appendSlice(gpa, entry.name);
         try batch.ends.append(gpa, @intCast(batch.names.items.len));
         try batch.flags.append(gpa, flags);
     }
@@ -304,10 +305,14 @@ fn readDir(
 /// Whether `name` hides itself and what is below it: a dot-name, or one
 /// that says "cache". The scan sets `flag_hidden` by it, and so does `Live`
 /// for what appears after the scan.
+/// A name with this in it, in any case, is hidden: "cache", "Cache",
+/// "ShaderCache", "__pycache__".
+const hidden_word = "cache";
+
 pub fn hiddenByName(name: []const u8) bool {
     assert(name.len > 0);
     if (name[0] == '.') return true;
-    return std.ascii.findIgnoreCase(name, "cache") != null;
+    return std.ascii.findIgnoreCase(name, hidden_word) != null;
 }
 
 /// Whether directory `name` in `parent` is opened, or only indexed: the
@@ -328,7 +333,7 @@ pub fn shouldDescend(parent: []const u8, name: []const u8, cfg: *const Config) b
     for (cfg.cachedir_probe) |probe| {
         if (!std.mem.eql(u8, probe, name)) continue;
         // One stat, only for the handful of suspicious names.
-        var buf: [4096]u8 = undefined;
+        var buf: paths.Buffer = undefined;
         const tag = std.mem.printSentinel(
             &buf,
             "{s}/{s}/CACHEDIR.TAG",
@@ -348,7 +353,7 @@ const ScanTree = struct {
     tmp: testing.TmpDir,
     /// The temp dir's absolute path is `buf[0..len]` (a length, not a
     /// slice: the struct is returned by value).
-    buf: [4096]u8 = undefined,
+    buf: paths.Buffer = undefined,
     len: usize = 0,
 
     fn init() !ScanTree {
@@ -363,7 +368,7 @@ const ScanTree = struct {
     }
 
     fn file(tree: *const ScanTree, rel: []const u8) void {
-        var buf: [4096]u8 = undefined;
+        var buf: paths.Buffer = undefined;
         const p = tree.path(&buf, rel);
         sys.mkdirP(p[0 .. std.mem.findScalarLast(u8, p, '/') orelse 0]);
         sys.writeFile(p, "x") catch unreachable;
@@ -372,7 +377,7 @@ const ScanTree = struct {
     fn scanOf(tree: *const ScanTree, root: []const u8, cfg_in: Config, st: ?*Stats) !Store {
         const pool = try Pool.create(testing.allocator, testing.io, 2);
         defer pool.destroy();
-        var buf: [4096]u8 = undefined;
+        var buf: paths.Buffer = undefined;
         const roots = [_][]const u8{tree.path(&buf, root)};
         var cfg = cfg_in;
         cfg.roots = &roots;
@@ -392,8 +397,8 @@ test "scan: a root may be a link, nothing below one is followed" {
     defer t.tmp.cleanup();
     t.file("real/inside.txt");
     t.file("other/secret.txt");
-    var a: [4096]u8 = undefined;
-    var b: [4096]u8 = undefined;
+    var a: paths.Buffer = undefined;
+    var b: paths.Buffer = undefined;
     _ = std.os.linux.symlink(t.path(&a, "real"), t.path(&b, "home"));
     _ = std.os.linux.symlink(t.path(&a, "other"), t.path(&b, "real/to_other"));
 

@@ -104,7 +104,7 @@ fn stop(pool: *Pool, started: []std.Thread) void {
     pool.stopping.store(true, .release);
     _ = pool.generation.fetchAdd(1, .release);
     pool.io.futexWake(u32, &pool.generation.raw, std.math.maxInt(u32));
-    for (started) |t| t.join();
+    for (started) |thread| thread.join();
 }
 
 /// `run` over `count` items in blocks of `block_size`: `f(ctx, lo, hi)` for

@@ -17,6 +17,7 @@
 //!     one on the terminal the daemon was started from, and wait for it.
 
 const std = @import("std");
+const paths = @import("paths.zig");
 const linux = std.os.linux;
 const sys = @import("os");
 
@@ -27,9 +28,13 @@ pub const timeout_ms = 15_000;
 
 /// Kind from the file name's extension (case-insensitive), or null if not supported.
 /// Office's `~$name.docx` owner files (not zips) are not documents.
+/// Office writes `~$name.docx` next to an open document: who has it open,
+/// not a zip.
+const office_owner_prefix = "~$";
+
 pub fn kindOf(path: []const u8) ?Kind {
-    const base = path[if (std.mem.findScalarLast(u8, path, '/')) |s| s + 1 else 0..];
-    if (std.mem.startsWith(u8, base, "~$")) return null;
+    const base = std.Io.Dir.path.basename(path);
+    if (std.mem.startsWith(u8, base, office_owner_prefix)) return null;
     var buf: [4]u8 = undefined;
     const ext = @import("core").file_kind.lowerExt(&buf, base) orelse return null;
     return std.meta.stringToEnum(Kind, ext);
@@ -83,16 +88,14 @@ pub fn extractText(
     @memcpy(argv[head.len..][0..members.len], members);
 
     // Markup outweighs text several times over; the cap only guards memory.
-    const xml_cap = @max(bytes_max, @min(bytes_max *| 8, 256 << 20));
-    // unzip: 11 = some member not found (optional ones, or an xlsx without
-    // strings); a corrupt archive is 9, a password-protected one 82.
+    const xml_cap = @max(bytes_max, @min(bytes_max *| xml_per_text_max, xml_bytes_max));
     const xml = try runTool(
         gpa,
         io,
         argv[0 .. head.len + members.len],
         fd,
         xml_cap,
-        &.{ 0, 11 },
+        &.{ unzip_exit.ok, unzip_exit.member_missing },
         timeout_ms,
         cancel,
     );
@@ -106,6 +109,23 @@ pub const Error = sys.Error || error{ ToolMissing, ToolFailed, Timeout };
 /// stdout. Reaching the cap kills the tool and keeps what was read; the
 /// timeout kills it and fails (what it printed may be any part of the
 /// text); otherwise its exit code must be in `ok_codes`.
+/// How many bytes of markup an Office document may have per byte of text
+/// wanted, and the most markup read whatever the text: markup outweighs
+/// text several times over, and these caps only guard memory.
+const xml_per_text_max = 8;
+/// The usual markup bytes per text byte, for the first allocation.
+const xml_per_text_guess = 4;
+const xml_bytes_max = 256 << 20;
+
+/// unzip's exit codes that still give text. A corrupt archive is 9 and a
+/// password-protected one 82: those fail.
+const unzip_exit = struct {
+    const ok = 0;
+    /// Some member was not found: an optional one, or an xlsx without
+    /// shared strings.
+    const member_missing = 11;
+};
+
 fn runTool(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -126,7 +146,7 @@ fn runTool(
         .cancel = cancel,
     }) catch |err| return switch (err) {
         error.FileNotFound => error.ToolMissing,
-        else => |e| e,
+        else => |other| other,
     };
     gpa.free(result.stderr);
     errdefer gpa.free(result.stdout);
@@ -157,8 +177,8 @@ fn gapOf(local: []const u8) Gap {
         "table-row", "line-break", "page", "list-item",
     };
     const space = [_][]const u8{ "tab", "tc", "table-cell", "s", "c" };
-    for (newline) |n| if (std.mem.eql(u8, local, n)) return .newline;
-    for (space) |n| if (std.mem.eql(u8, local, n)) return .space;
+    for (newline) |element| if (std.mem.eql(u8, local, element)) return .newline;
+    for (space) |element| if (std.mem.eql(u8, local, element)) return .space;
     return .none;
 }
 
@@ -167,7 +187,7 @@ fn gapOf(local: []const u8) Gap {
 /// change tracking.
 fn skipped(local: []const u8) bool {
     const names = [_][]const u8{ "instrText", "delText", "Fallback", "rPh", "tracked-changes" };
-    for (names) |n| if (std.mem.eql(u8, local, n)) return true;
+    for (names) |skipped_name| if (std.mem.eql(u8, local, skipped_name)) return true;
     return false;
 }
 
@@ -178,16 +198,17 @@ fn skipped(local: []const u8) bool {
 fn xmlToText(gpa: std.mem.Allocator, xml: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
-    try out.ensureTotalCapacity(gpa, xml.len / 4 + 16);
-    var w: TextOut = .{ .out = &out, .gpa = gpa };
+    // A guess that saves most regrowth: text is a fraction of its markup.
+    try out.ensureTotalCapacity(gpa, xml.len / xml_per_text_guess + 16);
+    var text_out: TextOut = .{ .out = &out, .gpa = gpa };
     var skip: Skip = .{};
     var i: usize = 0;
     while (i < xml.len) {
         if (xml[i] != '<') {
-            i = try w.charData(xml, i, skip.name != null);
+            i = try text_out.charData(xml, i, skip.name != null);
             continue;
         }
-        if (try w.markup(xml, i, skip.name != null)) |next| {
+        if (try text_out.markup(xml, i, skip.name != null)) |next| {
             i = next;
             continue;
         }
@@ -198,7 +219,7 @@ fn xmlToText(gpa: std.mem.Allocator, xml: []const u8) ![]u8 {
             skip = .{ .name = tag.name, .depth = 1 };
             continue;
         }
-        w.sep(gapOf(tag.local));
+        text_out.sep(gapOf(tag.local));
     }
     return out.toOwnedSlice(gpa);
 }
@@ -250,13 +271,13 @@ const TextOut = struct {
         if (!skipping) {
             if (entity.len == 0) {
                 try text_out.text("&");
-            } else if (entity.cp) |cp| switch (cp) {
+            } else if (entity.cp) |code_point| switch (code_point) {
                 '\n' => text_out.sep(.newline),
                 ' ', '\t', '\r' => text_out.sep(.space),
                 else => {
                     var buf: [4]u8 = undefined;
                     // decodeEntity returns only encodable code points.
-                    try text_out.text(buf[0 .. std.unicode.utf8Encode(cp, &buf) catch unreachable]);
+                    try text_out.text(buf[0 .. std.unicode.utf8Encode(code_point, &buf) catch unreachable]);
                 },
             };
         }
@@ -323,7 +344,7 @@ const Tag = struct {
         const name = xml[name_start..name_end];
         return .{
             .name = name,
-            .local = name[if (std.mem.findScalarLast(u8, name, ':')) |c| c + 1 else 0..],
+            .local = name[if (std.mem.findScalarLast(u8, name, ':')) |colon| colon + 1 else 0..],
             .closing = closing,
             .self_closing = xml[tag_end - 1] == '/',
             .end = tag_end,
