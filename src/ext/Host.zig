@@ -706,8 +706,12 @@ pub fn act(
     return request_gen;
 }
 
+/// The window keeps 0 for "no request pending" (`ext_act_gen`), so 0 is
+/// never handed out, even after the counter wraps.
 fn requestGenNext(host: *Host) u32 {
     host.request_gen_last +%= 1;
+    if (host.request_gen_last == 0) host.request_gen_last = 1;
+    assert(host.request_gen_last != 0);
     return host.request_gen_last;
 }
 
@@ -2378,6 +2382,13 @@ fn testHost(probe: *Probe, dir: []const u8) !*Host {
         .act = &Probe.onAct,
         .root = &Probe.onRoot,
     });
+}
+
+test "request generations skip 0, which the window keeps for none pending" {
+    var host: Host = undefined;
+    host.request_gen_last = std.math.maxInt(u32);
+    try testing.expectEqual(1, host.requestGenNext());
+    try testing.expectEqual(2, host.requestGenNext());
 }
 
 test "extensions load, list, search and run actions" {
