@@ -531,14 +531,14 @@ pub fn readScans(
     pool: *Pool,
     cfg: *const scan.Config,
     scans: []Scan,
-    max_entries: usize,
+    entries_max: usize,
 ) void {
     for (scans) |*scan_job| {
         var sub_cfg = cfg.*;
         const roots = [_][]const u8{scan_job.path};
         sub_cfg.roots = &roots;
         sub_cfg.follow_roots = false;
-        sub_cfg.max_entries = max_entries;
+        sub_cfg.entries_max = entries_max;
         var scan_stats: scan.Stats = .{};
         // Out of memory: no store, and `addScans` asks for a rescan.
         scan_job.sub = scan.scan(gpa, pool, &sub_cfg, null, &scan_stats) catch null;

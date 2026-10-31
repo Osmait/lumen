@@ -19,15 +19,15 @@ const Ui = @import("Ui.zig");
 
 const log = std.log.scoped(.dmenu);
 
-const max_lines = 200_000;
-const max_bytes = 64 << 20;
+const lines_max = 200_000;
+const bytes_max = 64 << 20;
 /// Rows listed with nothing typed, and best matches listed when filtering.
 const shown_all = 500;
 const shown_matches = 200;
 /// Bytes of a line, and of its meta, that filtering matches against. Each
 /// keystroke scores every line on the main thread, and one multi-MB line
 /// cost as much as thousands of short ones. Rows show less still
-/// (`widgets.max_row_text`); the whole line is what gets printed.
+/// (`widgets.row_text_bytes_max`); the whole line is what gets printed.
 const match_bytes = 1024;
 
 const Line = struct {
@@ -151,7 +151,7 @@ fn onRead(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
             log.warn("out of memory: stopped reading after {d} lines", .{session.lines.items.len});
             session.partial.clearRetainingCapacity();
             session.done_reading = true;
-        } else if (session.lines.items.len >= max_lines or session.bytes >= max_bytes) {
+        } else if (session.lines.items.len >= lines_max or session.bytes >= bytes_max) {
             log.warn("stopped reading after {d} lines", .{session.lines.items.len});
             session.done_reading = true;
         } else readMore(session);
@@ -189,7 +189,7 @@ fn showLines(session: *Session) void {
 }
 
 fn addLine(session: *Session, raw: []const u8) void {
-    if (session.lines.items.len >= max_lines) return;
+    if (session.lines.items.len >= lines_max) return;
     const arena = session.arena.allocator();
     var text = raw;
     if (text.len > 0 and text[text.len - 1] == '\r') text = text[0 .. text.len - 1];

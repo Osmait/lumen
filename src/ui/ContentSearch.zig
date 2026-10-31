@@ -21,10 +21,10 @@ const log = std.log.scoped(.content_search);
 
 /// Longer queries are cut to this many bytes; compare results against
 /// `clip(query)`, not the query typed.
-pub const max_query = 1024;
+pub const query_bytes_max = 1024;
 
 pub fn clip(query: []const u8) []const u8 {
-    return query[0..core.utf8.floorBoundary(query, max_query)];
+    return query[0..core.utf8.floorBoundary(query, query_bytes_max)];
 }
 
 /// Owned by the receiver of `Callback`, which frees it with `destroy`.
@@ -62,7 +62,7 @@ gen: std.atomic.Value(u32) = .init(0),
 /// the query: the query running is stale.
 newer: std.atomic.Value(bool) = .init(false),
 stop: std.atomic.Value(bool) = .init(false),
-query: core.FixedStr(max_query) = .{},
+query: core.FixedStr(query_bytes_max) = .{},
 query_start_ns: u64 = 0,
 
 pub const StartError = std.mem.Allocator.Error || std.Thread.SpawnError;

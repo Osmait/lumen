@@ -250,7 +250,7 @@ fn outputText(bytes: ?*c.GBytes) [:0]u8 {
 }
 
 /// What git says last on a failure, in bytes: the message has to fit 1 KB.
-const max_failure_output = 800;
+const failure_output_bytes_max = 800;
 
 fn onDone(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) void {
     const job: *Job = @ptrCast(@alignCast(data.?));
@@ -282,7 +282,7 @@ fn onDone(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
             output,
             " \n",
         );
-        const end = tail(why, max_failure_output);
+        const end = tail(why, failure_output_bytes_max);
         return fail(ui, cmdline, "{s} failed:\n{s}{s}", .{ @tagName(job.kind), end[0], end[1] });
     }
     switch (job.kind) {
@@ -306,7 +306,7 @@ fn onDone(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
             );
         },
         .update => if (cmdline != null) {
-            const end = tail(if (output.len > 0) output else "Up to date\n", max_print - 8);
+            const end = tail(if (output.len > 0) output else "Up to date\n", print_bytes_max - 8);
             print(ui, cmdline, "{s}{s}", .{ end[0], end[1] });
         } else {
             // git's own lines are too long for a row: a summary.
@@ -320,7 +320,7 @@ fn onDone(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
     if (cmdline == null and job.kind == .uninstall and ui.view == .prefs) ui.goBack();
 }
 
-const max_print = 8192;
+const print_bytes_max = 8192;
 
 /// Success: to the caller's stdout, or on the selected row.
 fn print(
@@ -329,7 +329,7 @@ fn print(
     comptime fmt: []const u8,
     args: anytype,
 ) void {
-    var buf: [max_print]u8 = undefined;
+    var buf: [print_bytes_max]u8 = undefined;
     const msg = format(&buf, fmt, args);
     const cl = cmdline orelse return note(ui, msg);
     c.g_application_command_line_print(cl, "%s", msg.ptr);

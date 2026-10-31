@@ -393,12 +393,12 @@ test "watcher: a flooded queue reports the overflow in one drain" {
     var dbuf: [4096]u8 = undefined;
     const dir = try tmpAbs(&tmp, &dbuf);
     var qbuf: [32]u8 = undefined;
-    const max_queued = std.fmt.parseInt(
+    const queued_max = std.fmt.parseInt(
         usize,
         std.mem.trim(u8, sys.readHead("/proc/sys/fs/inotify/max_queued_events", &qbuf), " \n"),
         10,
     ) catch 16384;
-    if (max_queued > 200_000) return error.SkipZigTest;
+    if (queued_max > 200_000) return error.SkipZigTest;
 
     const w = try create(gpa);
     defer w.destroy(gpa);
@@ -411,7 +411,7 @@ test "watcher: a flooded queue reports the overflow in one drain" {
     const pb = try std.mem.printSentinel(&b, "{s}/rename_target_b_xx", .{dir}, 0);
     try sys.writeFile(pa, "x");
     // Two events per rename, never coalesced (different cookies).
-    for (0..max_queued / 2 + 100) |i| {
+    for (0..queued_max / 2 + 100) |i| {
         if (i % 2 == 0) try sys.rename(pa, pb) else try sys.rename(pb, pa);
     }
 
@@ -419,6 +419,6 @@ test "watcher: a flooded queue reports the overflow in one drain" {
     defer arena_state.deinit();
     var changes: std.ArrayList(Change) = .empty;
     try w.drain(arena_state.allocator(), &changes);
-    try testing.expect(changes.items.len >= max_queued - 1);
+    try testing.expect(changes.items.len >= queued_max - 1);
     try testing.expect(changes.items[changes.items.len - 1] == .overflow);
 }

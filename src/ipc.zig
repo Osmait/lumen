@@ -14,8 +14,8 @@ pub const default_app_id = "dev.osmait.Lumen";
 
 /// Arguments and payload together; a copy larger than this is not kept
 /// anyway (Db.clip_bytes_max).
-pub const max_request_bytes = (1 << 20) + 64 * 1024;
-pub const max_args = 64;
+pub const request_bytes_max = (1 << 20) + 64 * 1024;
+pub const args_max = 64;
 
 /// What a sockaddr_un holds of a path, its terminating zero included.
 const socket_path_bytes = @sizeOf(@FieldType(std.os.linux.sockaddr.un, "path"));
@@ -34,7 +34,7 @@ pub fn dir(buf: []u8, runtime_dir: []const u8) ?[:0]const u8 {
 }
 
 pub const Request = struct {
-    args: [max_args][]const u8 = undefined,
+    args: [args_max][]const u8 = undefined,
     argc: usize = 0,
     payload: []const u8 = "",
 };
@@ -44,7 +44,7 @@ pub fn parse(bytes: []const u8) ?Request {
     var request: Request = .{};
     if (bytes.len < 4) return null;
     const args_count = std.mem.readInt(u32, bytes[0..4], .little);
-    if (args_count > max_args) return null;
+    if (args_count > args_max) return null;
     var offset: usize = 4;
     for (0..args_count) |arg_index| {
         if (bytes.len - offset < 4) return null;
@@ -62,7 +62,7 @@ pub fn parse(bytes: []const u8) ?Request {
 
 /// Writes the request head (the arguments) into `buf`.
 pub fn encode(buf: []u8, args: []const []const u8) ?[]const u8 {
-    if (args.len > max_args) return null;
+    if (args.len > args_max) return null;
     if (buf.len < 4) return null;
     std.mem.writeInt(u32, buf[0..4], @intCast(args.len), .little);
     var offset: usize = 4;

@@ -35,14 +35,14 @@ pub const Config = struct {
         "cache",
         "dist",
     },
-    max_depth: u16 = std.math.maxInt(u16),
+    depth_max: u16 = std.math.maxInt(u16),
     /// Whether a root may be a link to a folder ($HOME often is). Nothing
     /// below a root is ever followed; a folder that appeared after the scan
     /// is scanned as a root, and must not be followed either.
     follow_roots: bool = true,
     /// Stops after the level that passes this many entries (and says so in
     /// `Stats.truncated`): past it the caller rescans instead.
-    max_entries: usize = std.math.maxInt(usize),
+    entries_max: usize = std.math.maxInt(usize),
 };
 
 pub const default_skip = [_][]const u8{
@@ -60,7 +60,7 @@ pub const Stats = struct {
     dirs: u64 = 0,
     errors: u64 = 0,
     ns: u64 = 0,
-    /// Stopped at `Config.max_entries`: the store holds part of the tree.
+    /// Stopped at `Config.entries_max`: the store holds part of the tree.
     truncated: bool = false,
 };
 
@@ -163,7 +163,7 @@ pub fn scan(
     }
 
     var depth: u16 = 1;
-    while (frontier.items.len > 0 and depth <= cfg.max_depth) : (depth +|= 1) {
+    while (frontier.items.len > 0 and depth <= cfg.depth_max) : (depth +|= 1) {
         const follow = depth == 1 and cfg.follow_roots;
         if (watcher) |w| {
             const placement: Watcher.Placement = if (follow) .root else .below_root;
@@ -192,11 +192,11 @@ pub fn scan(
             for (next.items) |f| gpa.free(f.path);
             next.deinit(gpa);
         }
-        try addLevel(gpa, &b, frontier.items, batches, depth, depth < cfg.max_depth, &next, &st);
+        try addLevel(gpa, &b, frontier.items, batches, depth, depth < cfg.depth_max, &next, &st);
         for (frontier.items) |f| gpa.free(f.path);
         frontier.deinit(gpa);
         frontier = next;
-        if (b.len() > cfg.max_entries) {
+        if (b.len() > cfg.entries_max) {
             st.truncated = true;
             break;
         }
@@ -431,14 +431,14 @@ test "scan: each folder's entries come sorted by name" {
     }
 }
 
-test "scan: stops past max_entries and says so" {
+test "scan: stops past entries_max and says so" {
     var t = try ScanTree.init();
     defer t.tmp.cleanup();
     t.file("r/a/b/c/d/deep.txt");
     t.file("r/one.txt");
     t.file("r/two.txt");
     var st: Stats = .{};
-    var s = try t.scanOf("r", .{ .roots = &.{}, .max_entries = 3 }, &st);
+    var s = try t.scanOf("r", .{ .roots = &.{}, .entries_max = 3 }, &st);
     defer s.deinit(testing.allocator);
     try testing.expect(st.truncated);
     try testing.expectEqual(4, s.len()); // the root and its three entries

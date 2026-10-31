@@ -38,7 +38,7 @@ pub fn kindOf(path: []const u8) ?Kind {
 pub const ExtractError = Error || std.mem.Allocator.Error || sys.child.Error;
 
 /// Extracted UTF-8 text of the document at `path` (absolute), owned by
-/// `gpa`, at most `max_bytes` long (truncated, never failing for size).
+/// `gpa`, at most `bytes_max` long (truncated, never failing for size).
 /// An error for unreadable or corrupt files, which callers skip;
 /// error.ToolMissing when pdftotext or unzip is not installed. Setting
 /// `cancel` kills the tool: error.Timeout.
@@ -47,7 +47,7 @@ pub fn extractText(
     io: std.Io,
     path: [:0]const u8,
     kind: Kind,
-    max_bytes: usize,
+    bytes_max: usize,
     cancel: ?*const std.atomic.Value(bool),
 ) ExtractError![]u8 {
     const fd = try sys.openRegular(path);
@@ -59,14 +59,14 @@ pub fn extractText(
             io,
             &.{ "pdftotext", "-q", "-enc", "UTF-8", "/dev/stdin", "-" },
             fd,
-            max_bytes,
+            bytes_max,
             &.{0},
             timeout_ms,
             cancel,
         );
         // Pages are separated by form feeds.
         std.mem.replaceScalar(u8, raw, '\x0c', '\n');
-        return shrink(gpa, raw, max_bytes);
+        return shrink(gpa, raw, bytes_max);
     }
 
     const members: []const []const u8 = switch (kind) {
@@ -83,7 +83,7 @@ pub fn extractText(
     @memcpy(argv[head.len..][0..members.len], members);
 
     // Markup outweighs text several times over; the cap only guards memory.
-    const xml_cap = @max(max_bytes, @min(max_bytes *| 8, 256 << 20));
+    const xml_cap = @max(bytes_max, @min(bytes_max *| 8, 256 << 20));
     // unzip: 11 = some member not found (optional ones, or an xlsx without
     // strings); a corrupt archive is 9, a password-protected one 82.
     const xml = try runTool(
@@ -97,7 +97,7 @@ pub fn extractText(
         cancel,
     );
     defer gpa.free(xml);
-    return shrink(gpa, try xmlToText(gpa, xml), max_bytes);
+    return shrink(gpa, try xmlToText(gpa, xml), bytes_max);
 }
 
 pub const Error = sys.Error || error{ ToolMissing, ToolFailed, Timeout };
@@ -120,7 +120,7 @@ fn runTool(
         .stdin = .{ .fd = input },
         .stderr = .ignore,
         .environ = .empty,
-        .max_output_bytes = cap,
+        .output_bytes_max = cap,
         .at_cap = .kill,
         .deadline_ns = sys.monotonicNs() + limit_ms * std.time.ns_per_ms,
         .cancel = cancel,
@@ -702,7 +702,7 @@ test "extract pdf" {
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("Hello Lumen PDF", std.mem.trim(u8, got, " \n"));
 
-    // Truncation, not failure, past max_bytes.
+    // Truncation, not failure, past bytes_max.
     const short = try td.extract("hello.pdf", 5);
     defer testing.allocator.free(short);
     try testing.expectEqualStrings("Hello", short);

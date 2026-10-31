@@ -330,7 +330,7 @@ fn rescan(service: *Service) void {
 /// Drains and applies what inotify reported; true if a rescan is due.
 fn applyEvents(service: *Service, arena: std.mem.Allocator) bool {
     var scans: Live.Scans = .empty;
-    var max_entries: usize = 0;
+    var entries_max: usize = 0;
     {
         service.lock.lockUncancelable(service.io);
         defer service.lock.unlock(service.io);
@@ -352,11 +352,11 @@ fn applyEvents(service: *Service, arena: std.mem.Allocator) bool {
         };
         if (service.live.scans.items.len == 0) return service.rescanDue();
         scans = service.live.takeScans();
-        max_entries = service.live.limits.delta_max;
+        entries_max = service.live.limits.delta_max;
     }
     // New directories are read without the lock: a large tree moved in
     // held it, and every search with it, for as long as reading took.
-    Live.readScans(service.gpa, service.scan_pool, &service.cfg, scans.items, max_entries);
+    Live.readScans(service.gpa, service.scan_pool, &service.cfg, scans.items, entries_max);
     service.lock.lockUncancelable(service.io);
     defer service.lock.unlock(service.io);
     service.live.addScans(&scans) catch |err| {
@@ -514,12 +514,12 @@ test "service: a flooded queue ends in a rescan that finds everything" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var qbuf: [32]u8 = undefined;
-    const max_queued = std.fmt.parseInt(
+    const queued_max = std.fmt.parseInt(
         usize,
         std.mem.trim(u8, sys.readHead("/proc/sys/fs/inotify/max_queued_events", &qbuf), " \n"),
         10,
     ) catch 16384;
-    if (max_queued > 100_000) return error.SkipZigTest;
+    if (queued_max > 100_000) return error.SkipZigTest;
 
     var dbuf: [4096]u8 = undefined;
     const dir = try tmpAbs(&tmp, &dbuf);
@@ -544,7 +544,7 @@ test "service: a flooded queue ends in a rescan that finds everything" {
     // overflows for real.
     var fbuf: [4096]u8 = undefined;
     const flood = try std.mem.print(&fbuf, "{s}/flood", .{root});
-    const n = max_queued + 1_000;
+    const n = queued_max + 1_000;
     s.lock.lockUncancelable(s.io);
     for (0..n) |i| {
         var nb: [32]u8 = undefined;

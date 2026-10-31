@@ -402,15 +402,15 @@ pub fn writeAllAt(fd: i32, data: []const u8, at: ?usize) Error!void {
     assert(written == data.len);
 }
 
-/// Reads `fd` into `buf` until its end or `buf` holds `max_bytes` (it can
+/// Reads `fd` into `buf` until its end or `buf` holds `bytes_max` (it can
 /// hold a little more: a read is not cut short). A read error ends it.
 pub fn readUpTo(
     gpa: std.mem.Allocator,
     fd: i32,
     buf: *std.ArrayList(u8),
-    max_bytes: usize,
+    bytes_max: usize,
 ) std.mem.Allocator.Error!void {
-    while (buf.items.len < max_bytes) {
+    while (buf.items.len < bytes_max) {
         try buf.ensureUnusedCapacity(gpa, 64 * 1024);
         const spare = buf.unusedCapacitySlice();
         const bytes_read = linux.read(fd, spare.ptr, spare.len);

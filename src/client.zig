@@ -19,7 +19,7 @@ const writeAll = unix.writeAll;
 
 /// Static buffers: the client has no allocator (no libc, nothing to free
 /// before exit_group).
-var request: [ipc.max_request_bytes]u8 = undefined;
+var request: [ipc.request_bytes_max]u8 = undefined;
 /// The longest answer read; past it the rest is cut. `--stats` and `--dump`
 /// answer a few KB, an extension's command at most a few hundred.
 const answer_bytes_max = 8 << 20;
@@ -95,7 +95,7 @@ fn memfdStdin(bytes: []const u8) bool {
 
 /// The request head for `args`, in `request`; null when they do not fit.
 fn encodeArgs(args: []const [*:0]const u8) ?[]const u8 {
-    var spans: [ipc.max_args][]const u8 = undefined;
+    var spans: [ipc.args_max][]const u8 = undefined;
     if (args.len > spans.len) return null;
     for (args, spans[0..args.len]) |arg, *span| span.* = std.mem.span(arg);
     return ipc.encode(&request, spans[0..args.len]);

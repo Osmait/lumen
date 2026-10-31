@@ -406,13 +406,13 @@ pub fn label(text: [*:0]const u8, css: ?[*:0]const u8) *c.GtkWidget {
 /// shows about 60 characters, but Pango lays out and measures all of the
 /// text, several times per frame: a 1 MB line from `lumen --dmenu` took
 /// 324 ms each time. The item keeps all of it (dmenu prints the whole line).
-pub const max_row_text = 512;
+pub const row_text_bytes_max = 512;
 
-/// A label for row text, cut to `max_row_text` bytes on a character boundary.
+/// A label for row text, cut to `row_text_bytes_max` bytes on a character boundary.
 fn shortLabel(text: [:0]const u8, css: ?[*:0]const u8) *c.GtkWidget {
-    if (text.len <= max_row_text) return label(text, css);
-    var buf: [max_row_text + 1]u8 = undefined;
-    const length = core.utf8.floorBoundary(text, max_row_text);
+    if (text.len <= row_text_bytes_max) return label(text, css);
+    var buf: [row_text_bytes_max + 1]u8 = undefined;
+    const length = core.utf8.floorBoundary(text, row_text_bytes_max);
     @memcpy(buf[0..length], text[0..length]);
     buf[length] = 0;
     return label(buf[0..length :0], css);

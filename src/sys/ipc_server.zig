@@ -161,7 +161,7 @@ fn isPrivateDir(dir: [:0]const u8) bool {
 /// next, so a flood of them cannot hold the window.
 const accepts_max = 16;
 /// Connections open at once; past it the socket is left alone until one
-/// ends (each may hold a request up to ipc.max_request_bytes). Also the
+/// ends (each may hold a request up to ipc.request_bytes_max). Also the
 /// listen backlog.
 const connections_max = 16;
 /// How long a client has to send its request, and again to take the answer.
@@ -279,10 +279,10 @@ const Conn = struct {
     /// Reads what the client has sent so far; done at the end of its input
     /// or when the buffer is full (the client sends no more than that).
     fn read(self: *Conn) enum { more, done, failed } {
-        while (self.buf.items.len < ipc.max_request_bytes) {
+        while (self.buf.items.len < ipc.request_bytes_max) {
             self.buf.ensureUnusedCapacity(server.gpa, 64 * 1024) catch return .failed;
             const spare = self.buf.unusedCapacitySlice();
-            const room = @min(spare.len, ipc.max_request_bytes - self.buf.items.len);
+            const room = @min(spare.len, ipc.request_bytes_max - self.buf.items.len);
             const bytes_read = linux.read(self.fd, spare.ptr, room);
             if (failed(bytes_read)) |errno| switch (errno) {
                 .AGAIN => return .more,

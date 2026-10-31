@@ -23,7 +23,7 @@ pub const Options = struct {
     /// Output kept per stream. Past it the rest is dropped while the
     /// program runs on (`drop`), or the program is killed (`kill`: a
     /// tool whose output only grows).
-    max_output_bytes: usize = 16 << 20,
+    output_bytes_max: usize = 16 << 20,
     at_cap: enum { drop, kill } = .drop,
     /// Lumen's environment, or none (what a tool prints must not depend
     /// on the user's locale or settings).
@@ -40,7 +40,7 @@ pub const Result = struct {
     /// Exit code; null when killed by a signal, the deadline or the cap.
     code: ?u8,
     timed_out: bool,
-    /// Killed at `max_output_bytes` (`at_cap = .kill`).
+    /// Killed at `output_bytes_max` (`at_cap = .kill`).
     capped: bool = false,
 
     pub fn deinit(result: *Result, gpa: std.mem.Allocator) void {
@@ -249,7 +249,7 @@ const Pump = struct {
             if (is_out) pump.out_open = false else pump.err_open = false;
             return false;
         }
-        const output_bytes_max = pump.opts.max_output_bytes;
+        const output_bytes_max = pump.opts.output_bytes_max;
         const keep = @min(rc, output_bytes_max -| list.items.len);
         try list.appendSlice(pump.gpa, buf[0..keep]);
         assert(list.items.len <= output_bytes_max);
