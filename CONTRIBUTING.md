@@ -106,6 +106,43 @@ where they fit a desktop program:
   `luart` for Lua). Two copies that only look alike (the fuzzy scorers, the
   two tombstone walks) stay apart.
 
+The rules above can be counted; the ones that make TigerBeetle's code easy
+to read cannot, so they are spelled out too:
+
+- **No abbreviations.** A name says what the thing is: `arena`, `query`,
+  `item`, `row_index`, `host`, `width_px`, not `a`, `q`, `it`, `ri`, `h`,
+  `w`. The same letter used to mean up to four things depending on the
+  file. Allowed: `i` and `j` as indexes in short loops, the primitive
+  arguments of a sort or a hot loop, and `L` for a `lua_State` (the Lua C
+  API's own convention). Words that recur keep one name everywhere:
+  `gpa` and `arena` for allocators, `query` for the typed text,
+  `*_generation` for generation counters, `*_count` for counts.
+- **Qualifiers go last**, most significant word first: `items_max`,
+  `results_max`, `latency_ns_max`, not `max_items`. Related names then
+  line up and sort together.
+- **Braces on an `if` unless it fits on one line.** When `zig fmt` would
+  have to break the body (`if (bad) lua.raise(` and the arguments on four
+  more lines), the body goes in braces; when it would break the condition,
+  the condition gets a named local first. The 100-column rule is met with
+  names, not by breaking calls apart.
+- **Callbacks are named after their caller**: `read` and `read_callback`,
+  `list` and `list_callback`, so the call history reads off the names.
+  Arguments that can be mixed up (two integers, several booleans) go in an
+  options struct.
+- **Order inside a type**: fields, then nested types, then functions. A
+  nested type that is long becomes a top-level one (or a file).
+- **Comments are sentences**, with a subject and a full stop: "An
+  optional value is taken only if the next argument is not a flag.", not
+  "Not the next flag.". A doc comment sits on the declaration it
+  describes.
+- **On-disk formats are `extern struct`s** with `comptime` assertions on
+  their size and offsets, never byte offsets spelled as numbers. What a
+  reader validates, the writer asserts.
+- **Assert what a function assumes**: the preconditions of a public
+  function, the invariant between two fields that move together, the
+  relation between two constants (`comptime assert`). Split compound
+  assertions (`assert(a); assert(b);`) so a failure says which one.
+
 Not adopted, on purpose: static allocation (a launcher's working set
 depends on what is on disk), a ban on recursion (the calculator and the
 markdown spans are bounded, and the bounds are asserted), `u32` everywhere,
