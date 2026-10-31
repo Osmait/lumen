@@ -64,6 +64,7 @@ const interface_schema = "org.gnome.desktop.interface";
 const color_scheme_key = "color-scheme";
 
 pub fn loadCss(ui: *Ui) void {
+    renderFontsUnhinted();
     ui.appearance.css = c.gtk_css_provider_new();
     const display = c.gdk_display_get_default() orelse return;
     c.gtk_style_context_add_provider_for_display(
@@ -131,6 +132,28 @@ pub fn overridden(ui: *const Ui, key: []const u8) bool {
     const registry = ui.ext_registry orelse return false;
     for (registry.settings) |override| if (std.mem.eql(u8, override.key, key)) return true;
     return false;
+}
+
+/// GtkFontRendering's MANUAL: the gtk-xft-* settings are used as set.
+const font_rendering_manual: c_int = 1;
+
+/// Glyphs drawn without hinting, for Lumen's process only. GTK's automatic
+/// rendering hints them slightly at scale 1, and at the calculator's 26 px
+/// that lifts the top row of the digits half a pixel past the bounds GTK
+/// keeps for the text: the row was drawn hard and flat (the digits looked
+/// cut at the top), and when the text changed it was not repainted (marks
+/// over the digits of an earlier keystroke). Unhinted, the outlines stay
+/// within their bounds; the rows' small text looks the same.
+fn renderFontsUnhinted() void {
+    const gtk_settings = c.gtk_settings_get_default() orelse return;
+    c.g_object_set(
+        gtk_settings,
+        "gtk-font-rendering",
+        font_rendering_manual,
+        "gtk-xft-hintstyle",
+        "hintnone",
+        @as(?*anyopaque, null),
+    );
 }
 
 /// The Icon Theme setting, for Lumen's process only.
