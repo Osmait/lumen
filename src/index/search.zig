@@ -188,6 +188,9 @@ pub const Engine = struct {
         query_folded: []const u8,
         candidates: []const u32,
     ) std.mem.Allocator.Error!void {
+        // Invalid until both are in: a failed append must not leave the
+        // previous query's flag on a half-written cache.
+        engine.cache_valid = false;
         engine.last_query.clearRetainingCapacity();
         try engine.last_query.appendSlice(gpa, query_folded);
         engine.last_candidates.clearRetainingCapacity();
