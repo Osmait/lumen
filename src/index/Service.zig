@@ -244,13 +244,12 @@ pub fn status(service: *Service) Status {
     service.lock.lockSharedUncancelable(service.io);
     defer service.lock.unlockShared(service.io);
     return .{
-        // Live entries: the delta also holds scaffolding and its own graves.
-        .entries = service.live.base.liveLen() + service.live.delta.store.liveLen(),
+        .entries = service.live.entriesLive(),
         .watches = service.live.stats.watches,
-        .unwatched = service.live.watcher.unwatched,
+        .unwatched = service.live.unwatched(),
         .armed = service.live.fullyArmed(),
         .rescanning = service.live.pending_resync,
-        .index_bytes = service.live.base.buf.len + service.live.delta.store.buf.len,
+        .index_bytes = service.live.indexBytes(),
         .rescans = service.rescans.load(.monotonic),
         .last_rescan_ns = service.last_rescan_ns.load(.monotonic),
     };
@@ -285,7 +284,7 @@ fn freeReplaced(gpa: std.mem.Allocator, old: Live.Replaced) void {
 pub fn nameChanges(service: *Service) ?u64 {
     service.lock.lockSharedUncancelable(service.io);
     defer service.lock.unlockShared(service.io);
-    if (!service.live.fullyArmed() or service.live.watcher.unwatched > 0) return null;
+    if (!service.live.fullyArmed() or service.live.unwatched() > 0) return null;
     return service.name_changes.load(.acquire);
 }
 
@@ -400,7 +399,7 @@ fn applyEvents(service: *Service, arena: std.mem.Allocator) bool {
             log.warn("applying file events: {t}", .{err});
             service.live.pending_resync = true;
         };
-        if (service.live.scans.items.len == 0) return service.rescanDue();
+        if (!service.live.scansPending()) return service.rescanDue();
         scans = service.live.takeScans();
         entries_max = service.live.limits.delta_max;
     }

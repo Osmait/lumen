@@ -169,7 +169,7 @@ pub fn shutdown(service: *ContentService) void {
     service.stop.store(true, .release);
     service.poke();
     if (service.thread) |t| t.join();
-    if (service.index) |*ix| ix.deinit(service.gpa);
+    if (service.index) |*index| index.deinit(service.gpa);
     service.worker.retry_arena.deinit();
     service.gpa.free(service.root);
     service.gpa.free(service.cache_path);
@@ -205,19 +205,14 @@ pub const Status = struct {
 pub fn status(service: *ContentService) Status {
     service.lock.lockSharedUncancelable(service.io);
     defer service.lock.unlockShared(service.io);
-    var extracted: usize = 0;
-    if (service.index) |ix| {
-        for (ix.sources, 0..) |src, i| extracted += @intFromBool(
-            src == @backingInt(content.Source.extracted) and !ix.removed(@intCast(i)),
-        );
-    }
+    const index: ?*const content.Index = if (service.index) |*index| index else null;
     return .{
-        .docs = if (service.index) |ix| ix.live() else 0,
+        .docs = if (index) |present| present.live() else 0,
         .building = service.counters.building.load(.acquire),
-        .ready = service.index != null,
-        .extracted = extracted,
-        .segments = if (service.index) |ix| ix.segments_count else 0,
-        .index_bytes = if (service.index) |ix| ix.buf.len else 0,
+        .ready = index != null,
+        .extracted = if (index) |present| present.extractedCount() else 0,
+        .segments = if (index) |present| present.segments_count else 0,
+        .index_bytes = if (index) |present| present.buf.len else 0,
         .builds = service.counters.builds.load(.acquire),
         .updates = service.counters.updates.load(.acquire),
         .listings = service.counters.listings.load(.acquire),
@@ -266,10 +261,10 @@ pub fn searchUntil(
     out.clearRetainingCapacity();
     service.lock.lockSharedUncancelable(service.io);
     defer service.lock.unlockShared(service.io);
-    const ix = if (service.index) |*i| i else return;
+    const index = if (service.index) |*present| present else return;
     var matches: std.ArrayList(content.Match) = .empty;
     try content.search(
-        ix,
+        index,
         service.gpa,
         arena,
         service.search_pool,
@@ -277,14 +272,14 @@ pub fn searchUntil(
         .{ .limit = limit, .text_path = pathOf, .text_ctx = service, .stop = stop },
         &matches,
     );
-    for (matches.items) |m| try out.append(arena, .{
-        .path = try arena.dupe(u8, ix.path(m.doc)),
-        .line = m.line,
-        .count = m.count,
-        .snippet = m.snippet,
-        .mtime = ix.mtimes[m.doc],
-        .size = ix.sizes[m.doc],
-        .extracted = ix.sources[m.doc] == @backingInt(content.Source.extracted),
+    for (matches.items) |match| try out.append(arena, .{
+        .path = try arena.dupe(u8, index.path(match.doc)),
+        .line = match.line,
+        .count = match.count,
+        .snippet = match.snippet,
+        .mtime = index.mtimes[match.doc],
+        .size = index.sizes[match.doc],
+        .extracted = index.sources[match.doc] == @backingInt(content.Source.extracted),
     });
 }
 
@@ -907,22 +902,22 @@ fn dropStaleText(service: *ContentService, old: *const content.Index, gone: []co
 /// start and after a whole build, on the service thread: the one that
 /// writes them.
 fn sweepText(service: *ContentService) void {
-    const ix = &(service.index orelse return);
+    const index = &(service.index orelse return);
     var arena_state: std.heap.ArenaAllocator = .init(service.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     // A name in the cache -> the name it should have.
     var keep: std.StringHashMapUnmanaged([]const u8) = .empty;
-    for (0..ix.docs_count) |i| {
-        const id: u32 = @intCast(i);
-        if (ix.removed(id) or ix.sources[id] != @backingInt(content.Source.extracted)) continue;
-        const d = ix.docIn(id);
-        var nbuf: [64]u8 = undefined;
-        const name = arena.dupe(u8, textName(&nbuf, d)) catch return;
+    for (0..index.docs_count) |doc_index| {
+        const id: u32 = @intCast(doc_index);
+        if (!index.extractedLive(id)) continue;
+        const doc = index.docIn(id);
+        var name_buffer: [64]u8 = undefined;
+        const name = arena.dupe(u8, textName(&name_buffer, doc)) catch return;
         keep.put(arena, name, name) catch return;
         const old = arena.print("{x:0>16}-{d}.txt", .{
-            std.hash.Wyhash.hash(0, d.path),
-            d.mtime,
+            std.hash.Wyhash.hash(0, doc.path),
+            doc.mtime,
         }) catch return;
         keep.put(arena, old, name) catch return;
     }

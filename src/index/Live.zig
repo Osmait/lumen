@@ -215,6 +215,27 @@ pub fn fullyArmed(live: *const Live) bool {
     return live.arm_cursor == null;
 }
 
+/// Entries a search can find, in the base and the delta. The delta's
+/// scaffolding and its own tombstones are not counted.
+pub fn entriesLive(live: *const Live) usize {
+    return live.base.liveLen() + live.delta.store.liveLen();
+}
+
+/// Bytes the two stores take, mapped or in memory.
+pub fn indexBytes(live: *const Live) usize {
+    return live.base.buf.len + live.delta.store.buf.len;
+}
+
+/// Directories inotify could not watch (the limit was reached).
+pub fn unwatched(live: *const Live) u32 {
+    return live.watcher.unwatched;
+}
+
+/// New directories entered by `apply` whose contents wait to be read.
+pub fn scansPending(live: *const Live) bool {
+    return live.scans.items.len > 0;
+}
+
 /// Applies a batch of changes; returns how many took effect. New
 /// directories are only entered: what they hold waits in `scans` (see
 /// `Scan`).
