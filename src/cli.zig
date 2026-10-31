@@ -38,7 +38,7 @@ const Group = enum { window, extensions, dmenu, tests, hidden };
 pub const Spec = struct {
     value: Value = .none,
     /// What the usage shows after the flag.
-    arg: []const u8 = "",
+    value_name: []const u8 = "",
     /// Help text; "\n" starts a continuation line, indented under the
     /// first.
     help: []const u8 = "",
@@ -67,21 +67,21 @@ pub const specs: std.enums.EnumArray(Flag, Spec) = .init(.{
     .view = .{
         .group = .window,
         .value = .required,
-        .arg = "VIEW",
+        .value_name = "VIEW",
         .socket = true,
         .help = "Open a view: " ++ views,
     },
     .query = .{
         .group = .window,
         .value = .required,
-        .arg = "TEXT",
+        .value_name = "TEXT",
         .socket = true,
         .help = "Open with TEXT typed in the search bar",
     },
     .command = .{
         .group = .window,
         .value = .required,
-        .arg = "EXT.CMD",
+        .value_name = "EXT.CMD",
         .socket = true,
         .help = "Open an extension's command",
     },
@@ -102,27 +102,27 @@ pub const specs: std.enums.EnumArray(Flag, Spec) = .init(.{
     .install = .{
         .group = .extensions,
         .value = .required,
-        .arg = "URL",
+        .value_name = "URL",
         .needs_daemon = true,
         .help = "Install an extension from git",
     },
     .as = .{
         .group = .extensions,
         .value = .required,
-        .arg = "NAME",
+        .value_name = "NAME",
         .help = "With --install: the name to give it",
     },
     .update = .{
         .group = .extensions,
         .value = .optional,
-        .arg = "[NAME]",
+        .value_name = "[NAME]",
         .needs_daemon = true,
         .help = "Update an extension from git, or every one",
     },
     .uninstall = .{
         .group = .extensions,
         .value = .required,
-        .arg = "NAME",
+        .value_name = "NAME",
         .needs_daemon = true,
         .help = "Remove an extension",
     },
@@ -134,7 +134,7 @@ pub const specs: std.enums.EnumArray(Flag, Spec) = .init(.{
     .prompt = .{
         .group = .dmenu,
         .value = .required,
-        .arg = "TEXT",
+        .value_name = "TEXT",
         .help = "With --dmenu: what the empty search bar says",
     },
     .dump = .{
@@ -146,7 +146,7 @@ pub const specs: std.enums.EnumArray(Flag, Spec) = .init(.{
     .key = .{
         .group = .tests,
         .value = .required,
-        .arg = "KEY",
+        .value_name = "KEY",
         .socket = true,
         .needs_daemon = true,
         .help = "Press KEY in the window (down, enter, ctrl+k, ...)",
@@ -154,7 +154,7 @@ pub const specs: std.enums.EnumArray(Flag, Spec) = .init(.{
     .text = .{
         .group = .tests,
         .value = .required,
-        .arg = "TEXT",
+        .value_name = "TEXT",
         .socket = true,
         .needs_daemon = true,
         .help = "Type TEXT into the search bar",
@@ -170,7 +170,7 @@ comptime {
         // tell a value from the next flag the way lumen-gtk does.
         if (spec.socket) assert(spec.value != .optional);
         // What the usage shows after a flag is the name of its value.
-        if (spec.value == .none) assert(spec.arg.len == 0);
+        if (spec.value == .none) assert(spec.value_name.len == 0);
     }
 }
 
@@ -180,20 +180,20 @@ pub fn name(flag: Flag) []const u8 {
 }
 
 const names: std.enums.EnumArray(Flag, []const u8) = blk: {
-    var out: std.enums.EnumArray(Flag, []const u8) = .initUndefined();
+    var flag_names: std.enums.EnumArray(Flag, []const u8) = .initUndefined();
     for (std.enums.values(Flag)) |flag| {
         var dashed: [@tagName(flag).len]u8 = @tagName(flag).*;
         std.mem.replaceScalar(u8, &dashed, '_', '-');
         const final = dashed;
-        out.set(flag, "--" ++ &final);
+        flag_names.set(flag, "--" ++ &final);
     }
-    break :blk out;
+    break :blk flag_names;
 };
 
-/// The flag `arg` names, or null.
-pub fn parse(arg: []const u8) ?Flag {
+/// The flag `text` names, or null.
+pub fn parse(text: []const u8) ?Flag {
     for (std.enums.values(Flag)) |flag| {
-        if (std.mem.eql(u8, arg, name(flag))) return flag;
+        if (std.mem.eql(u8, text, name(flag))) return flag;
     }
     return null;
 }
@@ -214,7 +214,8 @@ pub const usage: [:0]const u8 = blk: {
         for (std.enums.values(Flag)) |flag| {
             const spec = specs.get(flag);
             if (spec.group != group) continue;
-            const left = name(flag) ++ (if (spec.arg.len > 0) " " ++ spec.arg else "");
+            const value_shown = if (spec.value_name.len > 0) " " ++ spec.value_name else "";
+            const left = name(flag) ++ value_shown;
             // Continuation lines start under the first one.
             var help: []const u8 = "";
             var lines = std.mem.splitScalar(u8, spec.help, '\n');

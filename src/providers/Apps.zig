@@ -82,8 +82,8 @@ fn itemOf(arena: std.mem.Allocator, info: *c.GAppInfo) std.mem.Allocator.Error!?
     const name = std.mem.span(c.g_app_info_get_display_name(info) orelse return null);
     const desktop_info: *c.GDesktopAppInfo = @ptrCast(info);
     var generic_name: [:0]const u8 = "";
-    if (c.g_desktop_app_info_get_generic_name(desktop_info)) |generic_name_z| {
-        generic_name = std.mem.span(generic_name_z);
+    if (c.g_desktop_app_info_get_generic_name(desktop_info)) |generic_name_terminated| {
+        generic_name = std.mem.span(generic_name_terminated);
     }
     return .{
         .key = try arena.print("app:{s}", .{id}),
@@ -131,19 +131,19 @@ fn keywords(
     desktop_info: *c.GDesktopAppInfo,
     info: *c.GAppInfo,
 ) std.mem.Allocator.Error![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    if (c.g_desktop_app_info_get_keywords(desktop_info)) |keywords_z| {
+    var joined: std.ArrayList(u8) = .empty;
+    if (c.g_desktop_app_info_get_keywords(desktop_info)) |keywords_terminated| {
         var keyword_index: usize = 0;
-        while (keywords_z[keyword_index]) |keyword| : (keyword_index += 1) {
-            try out.appendSlice(arena, std.mem.span(keyword));
-            try out.append(arena, ' ');
+        while (keywords_terminated[keyword_index]) |keyword| : (keyword_index += 1) {
+            try joined.appendSlice(arena, std.mem.span(keyword));
+            try joined.append(arena, ' ');
         }
     }
-    if (c.g_app_info_get_executable(info)) |executable_z| {
-        const executable = std.mem.span(executable_z);
+    if (c.g_app_info_get_executable(info)) |executable_terminated| {
+        const executable = std.mem.span(executable_terminated);
         const slash = std.mem.findScalarLast(u8, executable, '/');
-        const base = if (slash) |at| executable[at + 1 ..] else executable;
-        try out.appendSlice(arena, base);
+        const base = if (slash) |slash_index| executable[slash_index + 1 ..] else executable;
+        try joined.appendSlice(arena, base);
     }
-    return out.items;
+    return joined.items;
 }

@@ -24,10 +24,10 @@ pub fn Parts(comptime T: type) type {
     const parts_count = @typeInfo(T).@"enum".field_names.len;
     return struct {
         items: [parts_count]T = std.enums.values(T)[0..parts_count].*,
-        len: u8 = parts_count,
+        count: u8 = parts_count,
 
         pub fn slice(parts: *const @This()) []const T {
-            return parts.items[0..parts.len];
+            return parts.items[0..parts.count];
         }
 
         pub fn has(parts: *const @This(), part: T) bool {
@@ -145,10 +145,10 @@ fn enumValue(comptime Enum: type, value: Value) SetError!Enum {
 }
 
 /// Sets one `show` flag.
-pub fn setShow(show: *Show, key: []const u8, on: bool) SetError!void {
+pub fn setShow(show: *Show, key: []const u8, shown: bool) SetError!void {
     inline for (@typeInfo(Show).@"struct".field_names) |name| {
         if (std.mem.eql(u8, key, name)) {
-            @field(show, name) = on;
+            @field(show, name) = shown;
             return;
         }
     }
@@ -163,15 +163,15 @@ pub fn setParts(
     required: Part,
 ) SetError!void {
     if (names.len == 0 or names.len > parts.items.len) return error.BadValue;
-    var parts_new: Parts(Part) = .{ .len = 0 };
+    var parts_new: Parts(Part) = .{ .count = 0 };
     for (names) |name| {
         const part = std.meta.stringToEnum(Part, name) orelse return error.UnknownKey;
         if (parts_new.has(part)) return error.BadValue;
-        parts_new.items[parts_new.len] = part;
-        parts_new.len += 1;
+        parts_new.items[parts_new.count] = part;
+        parts_new.count += 1;
     }
     if (!parts_new.has(required)) return error.BadValue;
-    assert(parts_new.len == names.len);
+    assert(parts_new.count == names.len);
     parts.* = parts_new;
 }
 
@@ -182,45 +182,46 @@ pub const Value = struct {
 };
 
 test "orders of parts" {
-    var l: Layout = .{};
-    try std.testing.expect(l.searchbar.has(.keys) and l.row.has(.hint));
-    try setParts(RowPart, &l.row, &.{ "text", "icon" }, .text);
-    try std.testing.expectEqualSlices(RowPart, &.{ .text, .icon }, l.row.slice());
-    try std.testing.expect(!l.row.has(.accessory));
-    try std.testing.expectError(error.BadValue, setParts(RowPart, &l.row, &.{"icon"}, .text));
+    var layout: Layout = .{};
+    try std.testing.expect(layout.searchbar.has(.keys) and layout.row.has(.hint));
+    try setParts(RowPart, &layout.row, &.{ "text", "icon" }, .text);
+    try std.testing.expectEqualSlices(RowPart, &.{ .text, .icon }, layout.row.slice());
+    try std.testing.expect(!layout.row.has(.accessory));
+    try std.testing.expectError(error.BadValue, setParts(RowPart, &layout.row, &.{"icon"}, .text));
     try std.testing.expectError(error.BadValue, setParts(
         BarPart,
-        &l.searchbar,
+        &layout.searchbar,
         &.{ "entry", "entry" },
         .entry,
     ));
     try std.testing.expectError(error.UnknownKey, setParts(
         BarPart,
-        &l.searchbar,
+        &layout.searchbar,
         &.{ "entry", "logo" },
         .entry,
     ));
 }
 
 test "layout keys and values" {
-    var l: Layout = .{};
-    try set(&l, "width", .{ .number = 820 });
-    try set(&l, "position", .{ .string = "bottom" });
-    try set(&l, "footer", .{ .boolean = true });
-    try set(&l, "offset", .{ .number = -40 });
-    try std.testing.expectEqual(@as(?u16, 820), l.width);
-    try std.testing.expectEqual(@as(?Position, .bottom), l.position);
-    try std.testing.expect(l.footer);
-    try std.testing.expectEqual(@as(i16, -40), l.offset);
-    try std.testing.expectError(error.BadValue, set(&l, "width", .{ .number = 50 }));
-    try std.testing.expectError(error.BadValue, set(&l, "panels", .{ .string = "triple" }));
-    try std.testing.expectError(error.BadValue, set(&l, "footer", .{ .string = "yes" }));
-    try std.testing.expectError(error.UnknownKey, set(&l, "colour", .{ .string = "red" }));
-    try std.testing.expectError(error.BadValue, set(&l, "width", .{ .number = std.math.nan(f64) }));
-    try set(&l, "rows", .{ .string = "inline" });
-    try std.testing.expectEqual(Rows.@"inline", l.rows);
-    try std.testing.expectError(error.BadValue, set(&l, "rows", .{ .string = "inline_" }));
-    try setShow(&l.show, "icons", false);
-    try std.testing.expect(!l.show.icons);
-    try std.testing.expectError(error.UnknownKey, setShow(&l.show, "iconz", false));
+    var layout: Layout = .{};
+    try set(&layout, "width", .{ .number = 820 });
+    try set(&layout, "position", .{ .string = "bottom" });
+    try set(&layout, "footer", .{ .boolean = true });
+    try set(&layout, "offset", .{ .number = -40 });
+    try std.testing.expectEqual(@as(?u16, 820), layout.width);
+    try std.testing.expectEqual(@as(?Position, .bottom), layout.position);
+    try std.testing.expect(layout.footer);
+    try std.testing.expectEqual(@as(i16, -40), layout.offset);
+    try std.testing.expectError(error.BadValue, set(&layout, "width", .{ .number = 50 }));
+    try std.testing.expectError(error.BadValue, set(&layout, "panels", .{ .string = "triple" }));
+    try std.testing.expectError(error.BadValue, set(&layout, "footer", .{ .string = "yes" }));
+    try std.testing.expectError(error.UnknownKey, set(&layout, "colour", .{ .string = "red" }));
+    const not_a_number: Value = .{ .number = std.math.nan(f64) };
+    try std.testing.expectError(error.BadValue, set(&layout, "width", not_a_number));
+    try set(&layout, "rows", .{ .string = "inline" });
+    try std.testing.expectEqual(Rows.@"inline", layout.rows);
+    try std.testing.expectError(error.BadValue, set(&layout, "rows", .{ .string = "inline_" }));
+    try setShow(&layout.show, "icons", false);
+    try std.testing.expect(!layout.show.icons);
+    try std.testing.expectError(error.UnknownKey, setShow(&layout.show, "iconz", false));
 }
