@@ -35,9 +35,9 @@ pub const Ring = struct {
 
     pub const Summary = struct {
         samples_total: u64 = 0,
-        p50_ms: f64 = 0,
-        p95_ms: f64 = 0,
-        max_ms: f64 = 0,
+        latency_ms_p50: f64 = 0,
+        latency_ms_p95: f64 = 0,
+        latency_ms_max: f64 = 0,
     };
 
     pub fn summary(ring: *const Ring) Summary {
@@ -49,9 +49,9 @@ pub const Ring = struct {
         const last = ring.samples_count - 1;
         return .{
             .samples_total = ring.total,
-            .p50_ms = msFromNs(sorted[ring.samples_count / 2]),
-            .p95_ms = msFromNs(sorted[@min(last, ring.samples_count * 95 / percent)]),
-            .max_ms = msFromNs(sorted[last]),
+            .latency_ms_p50 = msFromNs(sorted[ring.samples_count / 2]),
+            .latency_ms_p95 = msFromNs(sorted[@min(last, ring.samples_count * 95 / percent)]),
+            .latency_ms_max = msFromNs(sorted[last]),
         };
     }
 };
@@ -271,13 +271,13 @@ fn reportLatency(writer: *std.Io.Writer) ReportError!void {
             .{
                 name,
                 painted.samples_total,
-                painted.p50_ms,
-                painted.p95_ms,
-                painted.max_ms,
-                search.p50_ms,
-                search.p95_ms,
-                rows.p50_ms,
-                rows.p95_ms,
+                painted.latency_ms_p50,
+                painted.latency_ms_p95,
+                painted.latency_ms_max,
+                search.latency_ms_p50,
+                search.latency_ms_p95,
+                rows.latency_ms_p50,
+                rows.latency_ms_p95,
             },
         );
     }
@@ -285,7 +285,7 @@ fn reportLatency(writer: *std.Io.Writer) ReportError!void {
     if (shown.samples_total > 0) {
         try writer.print(
             "  {s:<10} {d:>6} {d:>8.2} {d:>8.2} {d:>8.2}   (window shown -> first frame)\n",
-            .{ "show", shown.samples_total, shown.p50_ms, shown.p95_ms, shown.max_ms },
+            .{ "show", shown.samples_total, shown.latency_ms_p50, shown.latency_ms_p95, shown.latency_ms_max },
         );
     }
 }
@@ -303,5 +303,5 @@ test "a ring keeps the last samples and counts them all" {
     for (0..Ring.samples_max + 10) |i| ring.add(@intCast(i * std.time.ns_per_ms));
     const summary = ring.summary();
     try std.testing.expectEqual(@as(u64, Ring.samples_max + 10), summary.samples_total);
-    try std.testing.expectEqual(@as(f64, Ring.samples_max + 9), summary.max_ms);
+    try std.testing.expectEqual(@as(f64, Ring.samples_max + 9), summary.latency_ms_max);
 }

@@ -65,7 +65,7 @@ pub fn perform(context: Ctx, item: *const Item, operation: item_mod.Op) Outcome 
 /// What Enter does on a row.
 fn primary(context: Ctx, item: *const Item) Outcome {
     return switch (item.action) {
-        .app => |info| hideAfter(launch(info)),
+        .app => |app_info| hideAfter(launch(app_info)),
         .view => |view| .{ .open_view = view },
         .system => |system_action| hideAfter(system(context, system_action)),
         .layout => |layout| hideAfter(hypr.applyLayout(context.gpa, layout)),
@@ -99,8 +99,8 @@ fn settingOf(item: *const Item) item_mod.Setting {
 /// Copies the path behind a row: an app's desktop file or a file.
 fn copyPath(item: *const Item) void {
     switch (item.action) {
-        .app => |info| {
-            const desktop_app_info: *c.GDesktopAppInfo = @ptrCast(info);
+        .app => |app_info| {
+            const desktop_app_info: *c.GDesktopAppInfo = @ptrCast(app_info);
             const filename = c.g_desktop_app_info_get_filename(desktop_app_info) orelse return;
             copy(std.mem.span(filename));
         },
@@ -472,11 +472,11 @@ fn copyFile(context: Ctx, path: [:0]const u8) void {
     proc.pipeTo(&.{ "wl-copy", "--type", "text/uri-list" }, list);
 }
 
-fn launch(info: *c.GAppInfo) void {
+fn launch(app_info: *c.GAppInfo) void {
     const launch_context = proc.launchContext() orelse return;
     defer c.g_object_unref(launch_context);
     var err: ?*c.GError = null;
-    const launched = c.g_app_info_launch(info, null, launch_context, &err) != 0;
+    const launched = c.g_app_info_launch(app_info, null, launch_context, &err) != 0;
     if (!launched) proc.warnError(.actions, err, "launch", .{});
 }
 
