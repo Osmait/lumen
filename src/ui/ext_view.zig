@@ -14,6 +14,9 @@ const run = @import("../actions.zig");
 const proc = @import("../sys/proc.zig");
 const os = @import("os");
 const themes = @import("themes.zig");
+const config = @import("config.zig");
+const row_list = @import("row_list.zig");
+const window_layout = @import("window_layout.zig");
 const Ui = @import("Ui.zig");
 const form_view = @import("form_view.zig");
 
@@ -91,20 +94,20 @@ fn registryCallback(registry: *Host.Registry, context: ?*anyopaque) void {
     // rebuilds them): the open view may have lost it.
     const lost = if (old_registry) |old| remap(ui, old, registry) else false;
     ui.layout = registry.layout;
-    ui.applyStructure();
+    window_layout.applyStructure(ui);
     // Rows and theme names point into the old registry: rebuild before
     // freeing it. A theme from init.lua may be the one in use, and lumen.set
     // may have changed (or stopped changing) settings.
-    ui.reloadSettings();
+    config.reloadSettings(ui);
     // A style just chosen: its lumen.set as the new values.
     if (ui.style_defaults_pending) {
         ui.style_defaults_pending = false;
         var changed = false;
         for (registry.style_settings) |style_setting| {
-            if (ui.overridden(style_setting.key)) continue;
+            if (config.overridden(ui, style_setting.key)) continue;
             changed = ui.settings.set(style_setting.key, style_setting.value) or changed;
         }
-        if (changed) ui.saveSettings();
+        if (changed) config.saveSettings(ui);
     }
     if (lost or (ui.view == .ext and command(ui) == null)) {
         ui.setView(.root);
@@ -202,8 +205,8 @@ pub fn addRootSections(ui: *Ui, query: []const u8) void {
     if (ui.ext_root_search.latest) |answer| if (std.mem.eql(u8, answer.query, query)) {
         for (answer.sections) |section| {
             const section_command = registry.command(section.command) orelse continue;
-            ui.addSection(section_command.title);
-            for (section.items) |item| ui.addItem(item);
+            row_list.addSection(ui, section_command.title);
+            for (section.items) |item| row_list.addItem(ui, item);
         }
         return;
     };
@@ -246,7 +249,7 @@ fn actCallback(answer: *Host.ActResult, context: ?*anyopaque) void {
     }
     switch (answer.outcome) {
         .close => ui.hide(),
-        .stay => ui.select(ui.selected),
+        .stay => row_list.select(ui, ui.selected),
         .refresh => if (ui.view == .ext) {
             ui.keepSelection();
             ui.setView(.ext);

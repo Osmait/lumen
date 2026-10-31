@@ -8,6 +8,8 @@ const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
 const index = @import("index");
 const stats = @import("../stats.zig");
+const config = @import("config.zig");
+const search = @import("search.zig");
 const Ui = @import("Ui.zig");
 
 const log = std.log.scoped(.ui);
@@ -88,7 +90,7 @@ pub fn itemsFromHits(
 /// up, from the same minimum the search uses.
 const type_more_hint = std.fmt.comptimePrint(
     "Type at least {d} characters",
-    .{Ui.content_query_bytes_min},
+    .{search.content_query_bytes_min},
 );
 
 /// The contents view's empty row, by how much is typed (`typed_bytes`).
@@ -139,7 +141,7 @@ const extension_bytes_max = 16;
 /// badge for code and text, the theme's icon for the rest.
 pub fn fileIcon(ui: *Ui, path: [:0]const u8, is_directory: bool) item_mod.Icon {
     if (is_directory) {
-        if (ui.keyIcon(file_key_prefix ++ "folder")) |icon| return icon;
+        if (config.keyIcon(ui, file_key_prefix ++ "folder")) |icon| return icon;
     } else {
         const slash = std.mem.findScalarLast(u8, path, '/');
         const name = if (slash) |slash_index| path[slash_index + 1 ..] else path;
@@ -149,7 +151,7 @@ pub fn fileIcon(ui: *Ui, path: [:0]const u8, is_directory: bool) item_mod.Icon {
             var key_bytes: [file_key_prefix.len + extension_bytes_max]u8 = undefined;
             const extension = name[dot.? + 1 ..];
             const key = std.mem.print(&key_bytes, file_key_prefix ++ "{s}", .{extension}) catch "";
-            if (ui.keyIcon(std.ascii.lowerString(key_bytes[0..key.len], key))) |icon| return icon;
+            if (config.keyIcon(ui, std.ascii.lowerString(key_bytes[0..key.len], key))) |icon| return icon;
         }
         if (core.file_badge.logoOf(name)) |logo| return .{ .logo = logo };
         var badge_text: [4]u8 = undefined;

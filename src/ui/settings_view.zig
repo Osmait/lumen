@@ -17,6 +17,7 @@ const ext_view = @import("ext_view.zig");
 const Settings = settings_mod.Settings;
 const themes = @import("themes.zig");
 const Kind = core.file_kind.Kind;
+const config = @import("config.zig");
 const Ui = @import("Ui.zig");
 const prefs_view = @import("prefs_view.zig");
 const Host = @import("../ext/Host.zig");
@@ -84,7 +85,7 @@ fn settingRow(
         switch (source) {
             .theme => .{
                 "theme",
-                themes.displayName(arena, ui.settings.theme, ui.preferDark(), ui.customThemes()),
+                themes.displayName(arena, ui.settings.theme, config.preferDark(ui), config.customThemes(ui)),
                 .{ .go = .themes },
             },
             .default_apps => .{
@@ -145,7 +146,7 @@ pub fn settingsCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
     // What init.lua fixes cannot be changed here.
     for (out.items) |*item| {
         const key = settingName(item.action.setting) orelse continue;
-        if (ui.overridden(key)) item.subtitle = "Set in init.lua";
+        if (config.overridden(ui, key)) item.subtitle = "Set in init.lua";
     }
     return out.items;
 }
@@ -585,7 +586,7 @@ pub fn defaultAppsCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
 pub fn themeCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
     var out: std.ArrayList(Item) = .empty;
     styleCandidates(ui, arena, &out);
-    const dark = ui.preferDark();
+    const dark = config.preferDark(ui);
     const auto_theme = themes.find(themes.auto_id, dark, &.{});
     appendRow(Item, arena, &out, .{
         .key = "theme:auto",
@@ -609,11 +610,11 @@ pub fn themeCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
         .{styleTitle(arena, ui.settings.style)},
         0,
     ) catch "Style Themes";
-    for (ui.customThemes()) |*theme| {
+    for (config.customThemes(ui)) |*theme| {
         if (!theme.from_style) continue;
         out.append(arena, themeItem(ui, arena, theme, style_section)) catch break;
     }
-    for (ui.customThemes()) |*theme| {
+    for (config.customThemes(ui)) |*theme| {
         if (theme.from_style) continue;
         out.append(arena, themeItem(ui, arena, theme, "Your Themes")) catch break;
     }
@@ -723,12 +724,12 @@ fn pick(ui: *Ui, value: [:0]const u8) void {
     switch (ui.choosing) {
         .setting => |choice| {
             _ = ui.settings.setChoice(choice, value);
-            ui.saveSettings();
+            config.saveSettings(ui);
             ui.goBack();
         },
         .kind => |kind| {
             if (ui.settings.setOpenWith(@tagName(kind), value)) {
-                ui.saveSettings();
+                config.saveSettings(ui);
             } else |err| {
                 log.warn("default app for {t}: {t}", .{ kind, err });
             }
@@ -757,7 +758,7 @@ fn openWith(ui: *Ui, id: [:0]const u8, choice: OpenWithChoice) void {
             core.file_kind.extensionKey(&extension_bytes, name);
         if (key.len > 0) {
             if (ui.settings.setOpenWith(key, id)) {
-                ui.saveSettings();
+                config.saveSettings(ui);
             } else |err| {
                 log.warn("default app for {s}: {t}", .{ key, err });
             }
@@ -779,11 +780,11 @@ fn lockKey(setting: item_mod.Setting) ?[]const u8 {
 
 /// Applies what a settings row does.
 pub fn performSetting(ui: *Ui, setting: item_mod.Setting, operation: item_mod.Operation) void {
-    if (lockKey(setting)) |key| if (ui.overridden(key)) return ui.showFailure("Set in init.lua");
+    if (lockKey(setting)) |key| if (config.overridden(ui, key)) return ui.showFailure("Set in init.lua");
     switch (setting) {
         .toggle => |toggle| {
             ui.settings.setToggle(toggle, !ui.settings.get(toggle));
-            ui.saveSettings();
+            config.saveSettings(ui);
             ui.setReselect("set:{t}", .{toggle});
             ui.rebuild();
         },
@@ -805,13 +806,13 @@ pub fn performSetting(ui: *Ui, setting: item_mod.Setting, operation: item_mod.Op
         },
         .theme => |id| {
             _ = ui.settings.setTextValue(.theme, id);
-            ui.saveSettings();
+            config.saveSettings(ui);
             ui.goBack();
         },
         .style => |id| {
             // Its CSS now, its Lua (layout, themes, lumen.set) on the reload.
             _ = ui.settings.setTextValue(.style, id);
-            ui.saveSettings();
+            config.saveSettings(ui);
             ui.style_defaults_pending = true;
             ext_view.syncStyle(ui);
             ui.setReselect("style:{s}", .{id});
@@ -822,7 +823,7 @@ pub fn performSetting(ui: *Ui, setting: item_mod.Setting, operation: item_mod.Op
         },
         .open_file => {
             // Write the defaults first: an empty editor helps nobody.
-            if (os.info(ui.settings_path.ptr) == null) ui.saveSettings();
+            if (os.info(ui.settings_path.ptr) == null) config.saveSettings(ui);
             run.openFile(ui.actionContext(), ui.settings_path, .file);
             ui.hide();
         },
@@ -848,8 +849,8 @@ pub fn performSetting(ui: *Ui, setting: item_mod.Setting, operation: item_mod.Op
 fn resetSettings(ui: *Ui) void {
     ui.settings.deinit();
     ui.settings = Settings.init(ui.gpa);
-    ui.applyOverrides();
-    ui.saveSettings();
+    config.applyOverrides(ui);
+    config.saveSettings(ui);
     ui.setReselect("set:reset", .{});
     ui.rebuild();
 }

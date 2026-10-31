@@ -15,6 +15,7 @@ const c = @import("c");
 const core = @import("core");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
+const row_list = @import("row_list.zig");
 const Ui = @import("Ui.zig");
 
 const log = std.log.scoped(.dmenu);
@@ -257,7 +258,7 @@ pub fn finish(ui: *Ui, choice: ?[]const u8) void {
     c.g_object_unref(session.caller);
     session.finished = true;
     // The rows point into the session's lines.
-    if (ui.view == .dmenu) ui.clearRows();
+    if (ui.view == .dmenu) row_list.clearRows(ui);
     if (session.reading) c.g_cancellable_cancel(session.cancellable) else session.destroy();
 }
 
@@ -293,7 +294,7 @@ pub fn fill(ui: *Ui, arena: std.mem.Allocator, query: []const u8) void {
     const lines = session.lines.items;
     if (query.len == 0) {
         for (lines[0..@min(lines.len, rows_unfiltered_max)], 0..) |line, i| {
-            ui.addItem(itemOf(arena, line, @intCast(i)));
+            row_list.addItem(ui, itemOf(arena, line, @intCast(i)));
         }
         return;
     }
@@ -313,7 +314,7 @@ pub fn fill(ui: *Ui, arena: std.mem.Allocator, query: []const u8) void {
         }
     }.better);
     const best = hits.items[0..@min(hits.items.len, rows_filtered_max)];
-    for (best) |hit| ui.addItem(itemOf(arena, lines[hit.line_index], hit.line_index));
+    for (best) |hit| row_list.addItem(ui, itemOf(arena, lines[hit.line_index], hit.line_index));
 }
 
 /// The part of `text` filtering looks at.
