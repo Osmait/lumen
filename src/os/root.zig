@@ -299,18 +299,21 @@ pub fn freeList(gpa: std.mem.Allocator, list: []const []u8) void {
     gpa.free(list);
 }
 
+/// File systems whose calls may block for as long as a server takes to
+/// answer: network ones, and FUSE (any user program behind it).
+const fstypes_that_may_hang: std.StaticStringMap(void) = .initComptime(.{
+    .{"fuse"},      .{"nfs"},  .{"nfs4"},   .{"cifs"}, .{"smb3"},  .{"smbfs"},
+    .{"9p"},        .{"ceph"}, .{"lustre"}, .{"afs"},  .{"davfs"}, .{"ncpfs"},
+    .{"glusterfs"},
+});
+
+/// FUSE file systems report themselves as "fuse.<name>" ("fuse.sshfs").
+/// Plain "fuseblk" is a local disk (ntfs-3g) and does not match.
+const fuse_subtype_prefix = "fuse.";
+
 fn mayHang(fstype: []const u8) bool {
-    // Plain "fuseblk" is a local disk (ntfs-3g).
-    if (std.mem.startsWith(u8, fstype, "fuse.")) return true;
-    if (std.mem.eql(u8, fstype, "fuse")) return true;
-    const network = [_][]const u8{
-        "nfs",  "nfs4",      "cifs",   "smb3", "smbfs", "9p",
-        "ceph", "glusterfs", "lustre", "afs",  "davfs", "ncpfs",
-    };
-    for (network) |network_fstype| {
-        if (std.mem.eql(u8, fstype, network_fstype)) return true;
-    }
-    return false;
+    if (std.mem.startsWith(u8, fstype, fuse_subtype_prefix)) return true;
+    return fstypes_that_may_hang.has(fstype);
 }
 
 /// mountinfo writes space, tab, newline and backslash as `\ooo`.

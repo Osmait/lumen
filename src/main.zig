@@ -110,7 +110,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (args.len == 1 and first_flag == .version) return printToStdout(init.io, version_line);
 
-    if (c.g_getenv("LUMEN_APP_ID")) |app_id| daemon.app_id = std.mem.span(app_id);
+    if (c.g_getenv(ipc.env.app_id)) |app_id| daemon.app_id = std.mem.span(app_id);
     // Commands that only talk to a running daemon must not become one: with
     // none running GApplication makes the caller the primary instance, so
     // `lumen --stats` would start a whole new daemon and never return. As a
@@ -180,7 +180,7 @@ fn startupCallback(gtk_app: *c.GtkApplication, data: ?*anyopaque) callconv(.c) v
     daemon.ui_ready = true;
     Ui.ext_view.start(ui);
     c.g_application_hold(daemon.app);
-    if (c.g_getenv("LUMEN_TEST") == null) {
+    if (c.g_getenv(ipc.env.test_mode) == null) {
         if (ui.settings.clipboard) startClipboardWatcher();
     } else {
         // Tests feed the clipboard store directly (`--clip-store`).
@@ -632,7 +632,7 @@ fn clipboardWatcherRestartCallback(_: ?*anyopaque) callconv(.c) c.gboolean {
 
 /// Clipboard History on/off in Settings starts or stops the watcher.
 fn settingsChangedCallback() void {
-    if (c.g_getenv("LUMEN_TEST") != null) return;
+    if (c.g_getenv(ipc.env.test_mode) != null) return;
     if (daemon.shutting_down) return;
     const ui = readyUi() orelse return;
     const watcher = &daemon.clipboard_watcher;
@@ -675,8 +675,8 @@ fn storeClip(content: []const u8) void {
 /// database.
 fn clipStore(init: std.process.Init) !void {
     // wl-clipboard tells us about password managers and cleared selections.
-    if (init.environ_map.get("CLIPBOARD_STATE")) |state| {
-        if (!std.mem.eql(u8, state, "data")) return;
+    if (init.environ_map.get(ipc.env.clipboard_state)) |state| {
+        if (!ipc.keepsCopy(state)) return;
     }
     var buf: [16 * 1024]u8 = undefined;
     var stdin = std.Io.File.stdin().reader(init.io, &buf);

@@ -21,8 +21,12 @@ pub const Error = error{ DbOpen, DbExec, DbPrepare, DbBind, DbStep };
 /// before it fails with SQLITE_BUSY.
 const busy_timeout_ms = 2000;
 
+/// SQLite's name for a database that lives in memory only (the tests').
+/// It has no file to make private.
+pub const in_memory = ":memory:";
+
 pub fn open(path: [:0]const u8) Error!Db {
-    if (!std.mem.eql(u8, path, ":memory:")) makePrivate(path);
+    if (!std.mem.eql(u8, path, in_memory)) makePrivate(path);
     var handle: ?*c.sqlite3 = null;
     if (c.sqlite3_open(path.ptr, &handle) != c.SQLITE_OK) {
         // SQLite gives a handle even when opening fails, but not when it
@@ -327,7 +331,7 @@ fn columnText(stmt: *c.sqlite3_stmt, column: c_int) []const u8 {
 }
 
 test "clipboard dedupes and orders by recency" {
-    var db = try Db.open(":memory:");
+    var db = try Db.open(Db.in_memory);
     defer db.close();
     try db.addClip("one", 1, Db.clip_entries_max);
     try db.addClip("two", 2, Db.clip_entries_max);
@@ -341,7 +345,7 @@ test "clipboard dedupes and orders by recency" {
 }
 
 test "copies within the same second keep their order" {
-    var db = try Db.open(":memory:");
+    var db = try Db.open(Db.in_memory);
     defer db.close();
     try db.addClip("first", 50, Db.clip_entries_max);
     try db.addClip("second", 50, Db.clip_entries_max);
@@ -354,7 +358,7 @@ test "copies within the same second keep their order" {
 }
 
 test "the history keeps as many entries as the setting says" {
-    var db = try Db.open(":memory:");
+    var db = try Db.open(Db.in_memory);
     defer db.close();
     for (0..8) |i| {
         var buf: [16]u8 = undefined;
@@ -369,7 +373,7 @@ test "the history keeps as many entries as the setting says" {
 }
 
 test "the list loads each entry's head, the entry is read whole by id" {
-    var db = try Db.open(":memory:");
+    var db = try Db.open(Db.in_memory);
     defer db.close();
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
@@ -407,7 +411,7 @@ test "the database and its -wal and -shm are owner-only" {
 }
 
 test "frecency accumulates" {
-    var db = try Db.open(":memory:");
+    var db = try Db.open(Db.in_memory);
     defer db.close();
     try db.recordUse("app:a", 100);
     try db.recordUse("app:a", 100);
@@ -420,7 +424,7 @@ test "frecency accumulates" {
 }
 
 test "frecency forgets what decayed to nothing, keeps the rest" {
-    var db = try Db.open(":memory:");
+    var db = try Db.open(Db.in_memory);
     defer db.close();
     const day = 86_400;
     const now: i64 = 1000 * day;
@@ -438,7 +442,7 @@ test "frecency forgets what decayed to nothing, keeps the rest" {
 }
 
 test "a failed write is an error, not silence" {
-    var db = try Db.open(":memory:");
+    var db = try Db.open(Db.in_memory);
     defer db.close();
     try db.exec(
         "CREATE TRIGGER no_delete BEFORE DELETE ON clipboard BEGIN SELECT RAISE(ABORT, 'locked'); END;",

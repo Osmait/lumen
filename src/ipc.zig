@@ -12,6 +12,29 @@ const assert = std.debug.assert;
 
 pub const default_app_id = "dev.osmait.Lumen";
 
+/// Environment variables the client and the daemon both read.
+pub const env = struct {
+    /// Another app id runs a second, isolated instance (end-to-end tests).
+    pub const app_id = "LUMEN_APP_ID";
+    /// Set by end-to-end tests: no keyboard grab, no clipboard watcher.
+    pub const test_mode = "LUMEN_TEST";
+    /// Where the socket lives.
+    pub const runtime_dir = "XDG_RUNTIME_DIR";
+    /// wl-clipboard's verdict on the copy `--clip-store` is handed.
+    pub const clipboard_state = "CLIPBOARD_STATE";
+};
+
+/// What wl-clipboard puts in CLIPBOARD_STATE. Only `data` is an ordinary
+/// copy: `sensitive` comes from a password manager, and `clear` and `nil`
+/// are no copy at all.
+pub const ClipboardState = enum { data, sensitive, clear, nil };
+
+/// Whether a copy whose CLIPBOARD_STATE is `state` is kept. An unknown
+/// state is not, so a state added later never stores a secret by mistake.
+pub fn keepsCopy(state: []const u8) bool {
+    return std.meta.stringToEnum(ClipboardState, state) == .data;
+}
+
 /// Arguments and payload together; a copy larger than this is not kept
 /// anyway (Db.clip_bytes_max).
 pub const request_bytes_max = (1 << 20) + 64 * 1024;

@@ -63,7 +63,7 @@ pub const ListenError = error{
 /// `lumen` still works, through lumen-gtk, only slower: a failure is
 /// logged here, and the daemon runs on.
 pub fn start(allocator: std.mem.Allocator, app_id: []const u8, handler: Handler) void {
-    const runtime_dir = if (c.g_getenv("XDG_RUNTIME_DIR")) |dir| std.mem.span(dir) else "";
+    const runtime_dir = if (c.g_getenv(ipc.env.runtime_dir)) |dir| std.mem.span(dir) else "";
     listenIn(allocator, runtime_dir, app_id, handler) catch |err| {
         log.warn("no socket ({t}): `lumen` goes through lumen-gtk, slower", .{err});
     };
