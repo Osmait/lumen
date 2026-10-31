@@ -155,9 +155,12 @@ fn daemonIsRunning() bool {
 }
 
 /// Nobody is told when stdout is closed (`lumen --help | head -0`): there
-/// is no one left to read it.
+/// is no one left to read it. Any other failure (a full disk) is logged.
 fn printToStdout(io: std.Io, text: []const u8) void {
-    std.Io.File.stdout().writeStreamingAll(io, text) catch {};
+    std.Io.File.stdout().writeStreamingAll(io, text) catch |err| switch (err) {
+        error.BrokenPipe => {},
+        else => log.warn("cannot write to stdout: {t}", .{err}),
+    };
 }
 
 /// A test instance takes no keyboard, so nobody can close it by hand: if
@@ -558,8 +561,13 @@ fn dbPath() ?[*:0]u8 {
     defer c.g_free(dir);
     if (c.g_mkdir_with_parents(dir, 0o700) != 0) return null;
     // Owner-only even if it already existed (made by hand or by another
-    // tool); one that is not ours stays as it is (EPERM).
-    _ = std.os.linux.chmod(dir, 0o700);
+    // tool). One that is not ours stays as it is (EPERM): the database
+    // still opens in it, so that is logged and not fatal.
+    const chmod_result = std.os.linux.chmod(dir, 0o700);
+    switch (std.os.linux.errno(chmod_result)) {
+        .SUCCESS => {},
+        else => |errno| log.warn("cannot make {s} owner-only: {t}", .{ dir, errno }),
+    }
     return c.g_build_filename(dir, "lumen.db", @as(?*const anyopaque, null));
 }
 
