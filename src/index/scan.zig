@@ -330,13 +330,14 @@ fn readDir(
         try batch.flags.append(gpa, flags);
     }
 }
-/// Whether `name` hides itself and what is below it: a dot-name, or one
-/// that says "cache". The scan sets `flag_hidden` by it, and so does `Live`
-/// for what appears after the scan.
+
 /// A name with this in it, in any case, is hidden: "cache", "Cache",
 /// "ShaderCache", "__pycache__".
 const hidden_word = "cache";
 
+/// Whether `name` hides itself and what is below it: a dot-name, or one
+/// that says "cache". The scan sets `flag_hidden` by it, and so does `Live`
+/// for what appears after the scan.
 pub fn hiddenByName(name: []const u8) bool {
     assert(name.len > 0);
     if (name[0] == '.') return true;
