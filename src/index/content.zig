@@ -883,7 +883,7 @@ pub fn appendFile(
 ) FileError!?Index {
     var file = (try sys.AppendFile.open(path_z, old.buf.len)) orelse return null;
     defer file.deinit();
-    var sink: Sink = .{ .gpa = gpa, .append_file = &file, .written = file.len };
+    var sink: Sink = .{ .gpa = gpa, .append_file = &file, .written_bytes = file.len };
     defer sink.deinit();
     const header = try appendInto(&sink, pool, old, gone, added, text, stats);
     try sink.flush();
@@ -1030,7 +1030,7 @@ const Sink = struct {
     /// What is not in the file yet; in memory, the whole index.
     bytes: BytesAligned8 = .empty,
     /// Bytes already in the file.
-    written: usize = 0,
+    written_bytes: usize = 0,
 
     /// Larger pieces go to the file directly instead of through `bytes`.
     const direct_bytes_min = 64 * 1024;
@@ -1040,7 +1040,7 @@ const Sink = struct {
     }
 
     fn position(sink: *const Sink) usize {
-        return sink.written + sink.bytes.items.len;
+        return sink.written_bytes + sink.bytes.items.len;
     }
 
     fn append(sink: *Sink, bytes: []const u8) FileError!void {
@@ -1048,7 +1048,7 @@ const Sink = struct {
         if (to_file and bytes.len >= direct_bytes_min) {
             try sink.flush();
             try sink.put(bytes);
-            sink.written += bytes.len;
+            sink.written_bytes += bytes.len;
             return;
         }
         try sink.bytes.appendSlice(sink.gpa, bytes);
@@ -1073,7 +1073,7 @@ const Sink = struct {
     fn flush(sink: *Sink) FileError!void {
         if (sink.file == null and sink.append_file == null) return;
         try sink.put(sink.bytes.items);
-        sink.written += sink.bytes.items.len;
+        sink.written_bytes += sink.bytes.items.len;
         sink.bytes.clearRetainingCapacity();
     }
 };
@@ -1627,10 +1627,10 @@ fn findFoldImpl(
     var j: usize = 0;
     const first = fold.step(needle, &j);
     const letter = first >= 'a' and first <= 'z';
-    const last_start = hay.len - needle_folded_count;
+    const start_last = hay.len - needle_folded_count;
     const Chunk = @Vector(vector_bytes, u8);
     var i = from;
-    while (i + vector_bytes <= last_start + 1) : (i += vector_bytes) {
+    while (i + vector_bytes <= start_last + 1) : (i += vector_bytes) {
         const chunk: Chunk = hay[i..][0..vector_bytes].*;
         var mask: u32 = undefined;
         if (letter) {
@@ -1655,7 +1655,7 @@ fn findFoldImpl(
             mask &= mask - 1;
         }
     }
-    while (i <= last_start) : (i += 1) {
+    while (i <= start_last) : (i += 1) {
         const byte = hay[i];
         const candidate = std.ascii.toLower(byte) == first or
             (letter and byte >= folded_lead_first and byte <= folded_lead_last);
@@ -1728,15 +1728,15 @@ fn findFoldNaive(gpa: std.mem.Allocator, hay: []const u8, needle: []const u8, fr
 
 pub const Verified = struct { count: u32, line: u32, snippet: []const u8, phrase: bool };
 
-/// A hit further into its line than `snippet_lead_max` bytes starts the
-/// snippet `snippet_lead` bytes before it, so that it shows.
-const snippet_lead_max = 60;
-const snippet_lead = 40;
+/// A hit further into its line than `snippet_lead_bytes_max` bytes starts the
+/// snippet `snippet_lead_bytes` bytes before it, so that it shows.
+const snippet_lead_bytes_max = 60;
+const snippet_lead_bytes = 40;
 const snippet_bytes_max = 200;
 
 comptime {
-    assert(snippet_lead <= snippet_lead_max);
-    assert(snippet_lead < snippet_bytes_max);
+    assert(snippet_lead_bytes <= snippet_lead_bytes_max);
+    assert(snippet_lead_bytes < snippet_bytes_max);
 }
 
 /// Checks that `text` holds every word and describes the first hit. With
@@ -1777,8 +1777,8 @@ pub fn verify(
     const line_end = std.mem.findScalarPos(u8, text, hit_start, '\n') orelse text.len;
     const line_number: u32 = @intCast(std.mem.count(u8, text[0..hit_start], "\n") + 1);
     // Keep the hit visible: start the snippet a little before it.
-    const hit_far_into_line = hit_start - line_start > snippet_lead_max;
-    const snippet_start = if (hit_far_into_line) hit_start - snippet_lead else line_start;
+    const hit_far_into_line = hit_start - line_start > snippet_lead_bytes_max;
+    const snippet_start = if (hit_far_into_line) hit_start - snippet_lead_bytes else line_start;
     const snippet_end = @min(line_end, snippet_start + snippet_bytes_max);
     const snippet = std.mem.trim(u8, text[snippet_start..snippet_end], " \t\r");
     return .{
@@ -2865,27 +2865,27 @@ test "corrupt content indexes are rejected, not trusted" {
     const Case = struct { offset: usize, value: u64, wide: bool = true };
     const cases = [_]Case{
         .{ .offset = 0, .value = 0x3130585443_4d554c }, // magic of another version (LUMCTX01)
-        .{ .offset = 8, .value = u64_max }, // doc count: overflows the layout
-        .{ .offset = 8, .value = docs_count + 1 }, // one too many: the arrays shift onto other data
+        .{ .offset = 8, .value = u64_max }, // Doc count: overflows the layout.
+        .{ .offset = 8, .value = docs_count + 1 }, // One too many: the arrays shift onto others.
         .{ .offset = 8, .value = @as(u64, std.math.maxInt(u32)) + 1 },
-        .{ .offset = 16, .value = u64_max / 8 }, // segment count
+        .{ .offset = 16, .value = u64_max / 8 }, // Segment count.
         .{ .offset = 16, .value = index.segments_count + 1 },
-        .{ .offset = 24, .value = good.len }, // paths blob past the end
-        .{ .offset = 32, .value = docs_offset + 4 }, // misaligned doc table
-        .{ .offset = 32, .value = good.len + 8 }, // past the end
-        .{ .offset = 32, .value = 0 }, // over the header
-        .{ .offset = 40, .value = directory_offset + 4 }, // misaligned directory
-        .{ .offset = 40, .value = good.len - 8 }, // directory past the end
-        .{ .offset = 48, .value = good.len - 1 }, // total length
+        .{ .offset = 24, .value = good.len }, // Paths blob past the end.
+        .{ .offset = 32, .value = docs_offset + 4 }, // Misaligned doc table.
+        .{ .offset = 32, .value = good.len + 8 }, // Past the end.
+        .{ .offset = 32, .value = 0 }, // Over the header.
+        .{ .offset = 40, .value = directory_offset + 4 }, // Misaligned directory.
+        .{ .offset = 40, .value = good.len - 8 }, // Directory past the end.
+        .{ .offset = 48, .value = good.len - 1 }, // Total length.
         // Segment directory entry.
-        .{ .offset = directory_offset, .value = u64_max }, // keys_count: overflows
-        .{ .offset = directory_offset, .value = segment.keys_count * 100 }, // keys past the end
-        .{ .offset = directory_offset + 8, .value = segment.keys_offset + 2 }, // misaligned keys
-        .{ .offset = directory_offset + 8, .value = good.len }, // keys past the end
-        .{ .offset = directory_offset + 16, .value = good.len - 4 }, // offsets past the end
-        .{ .offset = directory_offset + 24, .value = good.len }, // postings past the end
-        .{ .offset = directory_offset + 32, .value = good.len }, // postings longer than the file
-        .{ .offset = directory_offset + 32, .value = 0 }, // offsets beyond the postings
+        .{ .offset = directory_offset, .value = u64_max }, // `keys_count`: overflows.
+        .{ .offset = directory_offset, .value = segment.keys_count * 100 }, // Keys past the end.
+        .{ .offset = directory_offset + 8, .value = segment.keys_offset + 2 }, // Misaligned keys.
+        .{ .offset = directory_offset + 8, .value = good.len }, // Keys past the end.
+        .{ .offset = directory_offset + 16, .value = good.len - 4 }, // Offsets past the end.
+        .{ .offset = directory_offset + 24, .value = good.len }, // Postings past the end.
+        .{ .offset = directory_offset + 32, .value = good.len }, // Postings longer than the file.
+        .{ .offset = directory_offset + 32, .value = 0 }, // Offsets beyond the postings.
         // A path past the end of the file, an unknown document kind.
         .{ .offset = docs_offset + docs_count * 16, .value = 0xffff_fff0, .wide = false },
         .{ .offset = docs_offset + docs_count * 22, .value = 9, .wide = false },
@@ -3013,7 +3013,7 @@ fn appendMemory(
     added: []const DocIn,
     text: TextReader,
 ) !Index {
-    var sink: Sink = .{ .gpa = gpa, .written = old.buf.len };
+    var sink: Sink = .{ .gpa = gpa, .written_bytes = old.buf.len };
     defer sink.deinit();
     const header = appendInto(&sink, pool, old, gone, added, text, null) catch |err|
         return memoryOnly(err);

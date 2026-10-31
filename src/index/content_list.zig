@@ -269,10 +269,10 @@ test "list: what is indexed and what is excluded" {
         "notes.md",
         "src/main.zig",
         "src/deep/er/lib.rs",
-        "about-cache.txt", // "cache" in a file name, not a dir: kept
+        "about-cache.txt", // "cache" in a file name, not a dir: kept.
         "proj/kept.txt",
-        "three.txt", // written with exactly 3 bytes below
-        "exactly_max.log", // exactly content.text_bytes_max bytes below
+        "three.txt", // Written with exactly 3 bytes below.
+        "exactly_max.log", // Exactly content.text_bytes_max bytes below.
     };
     for (keep) |name| try tree.write(name, text);
     try tree.write("three.txt", "abc");
@@ -304,11 +304,11 @@ test "list: what is indexed and what is excluded" {
         ".hidden.txt",
         ".config/app/settings.toml",
         "proj/ignored.txt", // in proj/.gitignore (proj is a repo)
-        "proj/gen/out.txt", // gen/ in proj/.gitignore
-        "two.txt", // 2 bytes
+        "proj/gen/out.txt", // `gen/` is in proj/.gitignore.
+        "two.txt", // 2 bytes.
         "empty.txt",
         "img/photo.png",
-        "big.log", // > text_bytes_max
+        "big.log", // > text_bytes_max.
     };
     for (drop) |name| try tree.write(name, text);
     try tree.write("two.txt", "ab");
@@ -390,7 +390,7 @@ test "list: a root below an excluded name still lists" {
         error.FileNotFound => return error.SkipZigTest,
         else => return err,
     };
-    try testing.expectEqual(@as(usize, 0), got.len); // 1 byte: too small
+    try testing.expectEqual(@as(usize, 0), got.len); // 1 byte: too small.
     try tree.write("build/target/node_modules/me/note.txt", "hello");
     const again = try list(arena_state.allocator(), testing.allocator, testing.io, root_nested, .{
         .documents = true,

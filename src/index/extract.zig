@@ -212,7 +212,7 @@ fn xmlToText(gpa: std.mem.Allocator, xml: []const u8) ![]u8 {
             i = next;
             continue;
         }
-        const tag = Tag.parse(xml, i) orelse break; // truncated
+        const tag = Tag.parse(xml, i) orelse break; // Truncated.
         i = tag.end + 1;
         if (skip.swallow(tag)) continue;
         if (!tag.closing and !tag.self_closing and skipped(tag.local)) {
