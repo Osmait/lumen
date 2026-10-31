@@ -1168,7 +1168,7 @@ test "live: a MOVE_SELF read after the move was applied keeps the destination" {
     try testing.expect(try tree.found("hoja", "renombrado/interno/hoja.rs"));
 
     var destination: ?u32 = null;
-    var watch_ids = tree.live.watcher.wd_to_id.valueIterator();
+    var watch_ids = tree.live.watcher.watch_ids.valueIterator();
     var path_buffer: paths.Buffer = undefined;
     var want_buffer: paths.Buffer = undefined;
     const want = try std.mem.print(&want_buffer, "{s}/renombrado", .{tree.root});
