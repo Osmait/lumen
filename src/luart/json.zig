@@ -76,12 +76,12 @@ pub fn encode(L: *lua.State, gpa: std.mem.Allocator, index: c_int) lua.Error!voi
     // Shared tables are written once per reference: `t = {t, t}` forty
     // times over is 2^40 values in a few bytes of Lua.
     var capped: lua.Capped = .leftIn(L, gpa);
-    var out: std.Io.Writer.Allocating = .init(capped.allocator());
-    defer out.deinit();
-    var encoder: Encoder = .{ .writer = &out.writer };
+    var output: std.Io.Writer.Allocating = .init(capped.allocator());
+    defer output.deinit();
+    var encoder: Encoder = .{ .writer = &output.writer };
     c.lua_pushvalue(L, index);
     if (!lua.tryCall(L, Encoder, &encoder, Encoder.run, 1, 0)) return error.Raise;
-    var text: Text = .{ .bytes = out.written() };
+    var text: Text = .{ .bytes = output.written() };
     if (!lua.tryCall(L, Text, &text, Text.push, 0, 1)) return error.Raise;
 }
 
@@ -100,7 +100,7 @@ const Encoder = struct {
 
     /// The deadline is checked once per this many values: often enough to
     /// stop within milliseconds, rarely enough to cost nothing.
-    const deadline_check_values = 4096;
+    const values_per_deadline_check = 4096;
 
     fn run(L: *lua.State, encoder: *Encoder) void {
         encoder.value(L, lua.trampoline_first_argument, 0);
@@ -110,7 +110,7 @@ const Encoder = struct {
         if (depth > depth_max) lua.raise(L, "json.encode: nested too deeply (a cycle?)", .{});
         if (c.lua_checkstack(L, 3) == 0) lua.raise(L, "json.encode: nested too deeply", .{});
         encoder.values_count +%= 1;
-        if (encoder.values_count % deadline_check_values == 0 and lua.pastDeadline(L)) {
+        if (encoder.values_count % values_per_deadline_check == 0 and lua.pastDeadline(L)) {
             lua.raise(L, "timed out", .{});
         }
         const mark: lua.StackMark = .init(L);
@@ -229,10 +229,10 @@ fn validUtf8End(text: []const u8, start: usize) usize {
             end += 1;
             continue;
         }
-        const sequence_len = std.unicode.utf8ByteSequenceLength(text[end]) catch break;
-        if (end + sequence_len > text.len) break;
-        if (!std.unicode.utf8ValidateSlice(text[end..][0..sequence_len])) break;
-        end += sequence_len;
+        const sequence_bytes = std.unicode.utf8ByteSequenceLength(text[end]) catch break;
+        if (end + sequence_bytes > text.len) break;
+        if (!std.unicode.utf8ValidateSlice(text[end..][0..sequence_bytes])) break;
+        end += sequence_bytes;
     }
     return end;
 }
@@ -253,46 +253,48 @@ fn runIn(budget: *lua.Budget, code: [:0]const u8) !?[]const u8 {
     defer c.lua_close(L);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const Ctx = struct {
+    const Context = struct {
         code: [:0]const u8,
-        fn go(Ls: *lua.State, ctx: *@This()) void {
-            lua.openLibs(Ls);
-            c.lua_createtable(Ls, 0, 2);
-            c.lua_pushcclosure(Ls, lua.wrap(dec), 0);
-            c.lua_setfield(Ls, -2, "decode");
-            c.lua_pushcclosure(Ls, lua.wrap(enc), 0);
-            c.lua_setfield(Ls, -2, "encode");
-            c.lua_setglobal(Ls, "json");
-            if (c.luaL_loadstring(Ls, ctx.code.ptr) != c.LUA_OK) _ = c.lua_error(Ls);
-            c.lua_callk(Ls, 0, 0, 0, null);
+        fn run(state: *lua.State, context: *@This()) void {
+            lua.openLibs(state);
+            c.lua_createtable(state, 0, 2);
+            c.lua_pushcclosure(state, lua.wrap(jsonDecode), 0);
+            c.lua_setfield(state, -2, "decode");
+            c.lua_pushcclosure(state, lua.wrap(jsonEncode), 0);
+            c.lua_setfield(state, -2, "encode");
+            c.lua_setglobal(state, "json");
+            const loaded = c.luaL_loadstring(state, context.code.ptr);
+            if (loaded != c.LUA_OK) _ = c.lua_error(state);
+            c.lua_callk(state, 0, 0, 0, null);
         }
-        fn dec(Ls: *lua.State) lua.Error!c_int {
-            try decode(Ls, testing.allocator, try lua.argString(Ls, 1, "decode"));
+        fn jsonDecode(state: *lua.State) lua.Error!c_int {
+            try decode(state, testing.allocator, try lua.argString(state, 1, "decode"));
             return 1;
         }
-        fn enc(Ls: *lua.State) lua.Error!c_int {
-            try encode(Ls, testing.allocator, 1);
+        fn jsonEncode(state: *lua.State) lua.Error!c_int {
+            try encode(state, testing.allocator, 1);
             return 1;
         }
     };
-    var ctx: Ctx = .{ .code = code };
-    const msg = lua.protect(L, arena.allocator(), Ctx, &ctx, Ctx.go) orelse return null;
-    return try testing.allocator.dupe(u8, msg);
+    var context: Context = .{ .code = code };
+    const message = lua.protect(L, arena.allocator(), Context, &context, Context.run) orelse
+        return null;
+    return try testing.allocator.dupe(u8, message);
 }
 
 fn expectOk(code: [:0]const u8) !void {
-    if (try run(code)) |msg| {
-        defer testing.allocator.free(msg);
-        std.debug.print("{s}\n", .{msg});
+    if (try run(code)) |message| {
+        defer testing.allocator.free(message);
+        std.debug.print("{s}\n", .{message});
         return error.TestUnexpectedResult;
     }
 }
 
 fn expectError(code: [:0]const u8, want: []const u8) !void {
-    const msg = (try run(code)) orelse return error.TestExpectedError;
-    defer testing.allocator.free(msg);
-    if (std.mem.find(u8, msg, want) == null) {
-        std.debug.print("{s}\n", .{msg});
+    const message = (try run(code)) orelse return error.TestExpectedError;
+    defer testing.allocator.free(message);
+    if (std.mem.find(u8, message, want) == null) {
+        std.debug.print("{s}\n", .{message});
         return error.TestUnexpectedResult;
     }
 }
@@ -348,10 +350,10 @@ test "json stops at the memory left and at the deadline" {
     // With memory to spare, the deadline stops it.
     var budget: lua.Budget = .{ .bytes_max = 1 << 30 };
     budget.deadline_ns = os.monotonicNs() + 50 * std.time.ns_per_ms;
-    const t0 = os.monotonicNs();
+    const start_ns = os.monotonicNs();
     const doubling = "local t = {} for i = 1, 40 do t = { t, t } end json.encode(t)";
-    const msg = (try runIn(&budget, doubling)).?;
-    defer testing.allocator.free(msg);
-    try testing.expect(std.mem.find(u8, msg, "timed out") != null);
-    try testing.expect(os.monotonicNs() - t0 < 5 * std.time.ns_per_s);
+    const message = (try runIn(&budget, doubling)).?;
+    defer testing.allocator.free(message);
+    try testing.expect(std.mem.find(u8, message, "timed out") != null);
+    try testing.expect(os.monotonicNs() - start_ns < 5 * std.time.ns_per_s);
 }
