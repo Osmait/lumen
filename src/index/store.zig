@@ -699,7 +699,8 @@ test "corrupt indexes are rejected, not trusted" {
     // A name past the end of the names blob.
     @memcpy(bad, good);
     const name_offset_bad: u32 = @intCast(layout.names_size - 3);
-    std.mem.writeInt(u32, bad[layout.name_offsets_offset + 4 * 2 ..][0..4], name_offset_bad, .little);
+    const name_offset_at = layout.name_offsets_offset + 4 * 2;
+    std.mem.writeInt(u32, bad[name_offset_at..][0..4], name_offset_bad, .little);
     try testing.expectError(error.BadIndex, Store.parse(bad, false));
     @memcpy(bad, good);
     const name_size_bad = std.math.maxInt(u16);

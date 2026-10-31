@@ -3056,7 +3056,8 @@ test "a round reads no more than round_pairs_max of possible text, one document 
     try testing.expectEqual(docs.len, roundEnd(&docs, docs.len - 5, reader));
     // Files of `text_bytes_max` or more (no more than that is read).
     for (&docs) |*d| d.size = 1 << 30;
-    try testing.expectEqual(@as(usize, round_pairs_max / text_bytes_max), roundEnd(&docs, 0, reader));
+    const round_docs_expected: usize = round_pairs_max / text_bytes_max;
+    try testing.expectEqual(round_docs_expected, roundEnd(&docs, 0, reader));
     // Extracted text: as long as the reader says, else the most kept.
     for (&docs) |*d| d.source = .extracted;
     try testing.expectEqual(@as(usize, 1), roundEnd(&docs, 0, reader));
