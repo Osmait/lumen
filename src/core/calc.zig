@@ -442,10 +442,11 @@ const Parser = struct {
 
     fn parseNumber(parser: *Parser) Error!f64 {
         const start = parser.pos;
-        if (parser.pos + 1 < parser.source.len and parser.source[parser.pos] == '0' and
-            (parser.source[parser.pos + 1] == 'x' or parser.source[parser.pos + 1] == 'b'))
-        {
-            const radix: u8 = if (parser.source[parser.pos + 1] == 'x') 16 else 2;
+        const rest = parser.source[parser.pos..];
+        // The letter of a "0x" or "0b" prefix, or 0 when there is none.
+        const radix_letter: u8 = if (rest.len >= 2 and rest[0] == '0') rest[1] else 0;
+        if (radix_letter == 'x' or radix_letter == 'b') {
+            const radix: u8 = if (radix_letter == 'x') 16 else 2;
             parser.pos += 2;
             const digits_start = parser.pos;
             parser.skipWhile(std.ascii.isAlphanumeric);

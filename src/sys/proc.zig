@@ -64,7 +64,7 @@ fn outputWithin(argv: []const [:0]const u8, timeout_ms: u64) ?[:0]u8 {
     var pid: c.GPid = 0;
     var out_fd: c_int = -1;
     var err: ?*c.GError = null;
-    if (c.g_spawn_async_with_pipes(
+    const spawned = c.g_spawn_async_with_pipes(
         null,
         argv_z,
         null,
@@ -76,7 +76,8 @@ fn outputWithin(argv: []const [:0]const u8, timeout_ms: u64) ?[:0]u8 {
         &out_fd,
         null,
         &err,
-    ) == 0) {
+    );
+    if (spawned == 0) {
         logError("run", argv[0], err);
         return null;
     }

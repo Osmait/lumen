@@ -151,13 +151,14 @@ fn isPrivateDir(dir: [:0]const u8) bool {
     const fd: linux.fd_t = @intCast(rc);
     defer _ = linux.close(fd);
     var stx: linux.Statx = undefined;
-    if (failed(linux.statx(
+    const statx_result = linux.statx(
         fd,
         "",
         linux.AT.EMPTY_PATH,
         .{ .TYPE = true, .MODE = true, .UID = true },
         &stx,
-    )) != null) return false;
+    );
+    if (failed(statx_result) != null) return false;
     if (stx.uid != linux.getuid() or stx.mode & linux.S.IFMT != linux.S.IFDIR) return false;
     return stx.mode & 0o777 == 0o700 or failed(linux.fchmod(fd, 0o700)) == null;
 }
