@@ -1587,10 +1587,9 @@ const vector_bytes = 32;
 /// Set in a lower-case ASCII letter, clear in its capital.
 const ascii_case_bit = 0x20;
 /// The UTF-8 lead bytes of the accented letters `core.fold` folds (Latin-1
-/// Supplement and Latin Extended-A). They mirror its own `lead_first` and
-/// `lead_last`.
-const folded_lead_first = 0xC3;
-const folded_lead_last = 0xC5;
+/// Supplement and Latin Extended-A).
+const folded_lead_first = fold.lead_first;
+const folded_lead_last = fold.lead_last;
 
 comptime {
     assert('a' | ascii_case_bit == 'a');

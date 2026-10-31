@@ -52,9 +52,10 @@ const uppers: [192]bool = blk: {
     break :blk table;
 };
 
-/// The UTF-8 lead bytes of the letters that fold: U+00C0..U+017F.
-const lead_first = 0xC3;
-const lead_last = 0xC5;
+/// The UTF-8 lead bytes of the letters that fold: U+00C0..U+017F. Public
+/// because the content index's vector loop skips every other lead byte.
+pub const lead_first = 0xC3;
+pub const lead_last = 0xC5;
 
 comptime {
     // Every continuation byte of every foldable lead has its entry.

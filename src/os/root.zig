@@ -586,12 +586,18 @@ pub fn makePrivate(path: []const u8) void {
     _ = linux.chmod(path_z, 0o700);
 }
 
-pub fn unmap(buf: []align(8) u8) void {
+/// The alignment `mapPrivate` promises. A mapping starts on a page, far
+/// beyond this; 8 is what readers of typed columns (u64, i64) need.
+pub const mapping_alignment_bytes = 8;
+/// The bytes of a mapping made by `mapPrivate`.
+pub const MappedBytes = []align(mapping_alignment_bytes) u8;
+
+pub fn unmap(buf: MappedBytes) void {
     _ = linux.munmap(buf.ptr, buf.len);
 }
 
 /// Private, writable (copy-on-write) mapping of a whole file.
-pub fn mapPrivate(path: [*:0]const u8) Error![]align(8) u8 {
+pub fn mapPrivate(path: [*:0]const u8) Error!MappedBytes {
     const fd = try openRegular(path);
     defer close(fd);
     const size = try check(linux.lseek(fd, 0, linux.SEEK.END));
@@ -604,7 +610,7 @@ pub fn mapPrivate(path: [*:0]const u8) Error![]align(8) u8 {
         fd,
         0,
     ));
-    const mapping: [*]align(8) u8 = @ptrFromInt(addr);
+    const mapping: [*]align(mapping_alignment_bytes) u8 = @ptrFromInt(addr);
     return mapping[0..size];
 }
 

@@ -14,6 +14,8 @@ pub const BytesConst = []align(alignment_bytes) const u8;
 comptime {
     std.debug.assert(alignment_bytes >= @alignOf(u64));
     std.debug.assert(std.math.isPowerOfTwo(alignment_bytes));
+    // A mapped file is used in place as `Bytes`.
+    std.debug.assert(sys.mapping_alignment_bytes >= alignment_bytes);
 }
 
 /// `size` rounded up to the next multiple of `alignment_bytes`.
