@@ -28,16 +28,12 @@ pub fn contentItems(self: *Ui, arena: std.mem.Allocator, query: []const u8, limi
 /// A content result arrived from the worker (on the GTK main loop).
 pub fn onContentResult(result: *Ui.ContentSearch.Result, ctx: ?*anyopaque) void {
     const self: *Ui = @ptrCast(@alignCast(ctx.?));
-    if (result.gen != self.content_gen) {
+    if (!self.content_query.current(result)) {
         result.destroy(self.gpa);
         return;
     }
-    // Each answer is delivered once: the one shown is never handed back.
-    assert(result != self.content_result);
     if (result.err) |err| log.warn("content search for \"{s}\": {t}", .{ result.query, err });
-    const old = self.content_result;
-    self.content_result = result;
-    self.content_pending = false;
+    const old = self.content_query.take(result);
     if (self.view == .contents) {
         self.refresh();
         // Latency from the keystroke that asked, not from this rebuild.

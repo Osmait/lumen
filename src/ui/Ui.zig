@@ -40,6 +40,7 @@ const prefs_view = @import("prefs_view.zig");
 const form_view = @import("form_view.zig");
 const ExtHost = @import("../ext/Host.zig");
 const layout_mod = @import("../layout.zig");
+const Inflight = @import("inflight.zig").Inflight;
 const Kind = core.file_kind.Kind;
 
 const Ui = @This();
@@ -143,15 +144,10 @@ files: ?*index.Service = null,
 contents: ?*index.ContentService = null,
 /// Runs content queries off the UI thread (null: run them inline).
 content_search: ?*ContentSearch = null,
-/// The latest content result applied; its arena backs the rows shown.
-content_result: ?*ContentSearch.Result = null,
-/// The result the visible rows were built from. A keystroke that only sends
-/// a new query to the worker keeps these rows on screen until its answer
-/// arrives.
-shown_content: ?*ContentSearch.Result = null,
-/// Generation of the last query submitted; older results are dropped.
-content_gen: u32 = 0,
-content_pending: bool = false,
+/// Queries sent to `content_search` and their answers. A keystroke that
+/// only sends a new query keeps the rows built from `shown` on screen until
+/// its answer arrives.
+content_query: Inflight(ContentSearch.Result, ContentSearch.query_bytes_max) = .{},
 /// Time spent searching during the current refresh (for `lumen --stats`).
 search_ns: u64 = 0,
 frame_clock_hooked: bool = false,
@@ -228,21 +224,12 @@ ext_registry: ?*ExtHost.Registry = null,
 ext_stamp: u64 = 0,
 /// The command the ext view shows (its index in the registry).
 ext_cmd: u16 = 0,
-/// The latest list answer for `ext_cmd`. The visible items point into it, so
-/// it is destroyed only after the rows are built again.
-ext_result: ?*ExtHost.ListResult = null,
-/// The result the rows on screen were built from (see `shown_content`).
-ext_shown: ?*ExtHost.ListResult = null,
-/// Generation of the last list asked for; older answers are dropped.
-ext_gen: u32 = 0,
-ext_pending: bool = false,
-/// The query of the last list asked for.
-ext_asked: core.FixedStr(256) = .{},
-/// Extension rows for the root search, and the query last asked for.
-ext_root: ?*ExtHost.RootResult = null,
-ext_root_gen: u32 = 0,
-ext_root_pending: bool = false,
-ext_root_asked: core.FixedStr(256) = .{},
+/// Lists asked of `ext_cmd` and their answers. The visible items point
+/// into the latest one, so it is destroyed only after the rows are built
+/// again.
+ext_list: Inflight(ExtHost.ListResult, 256) = .{},
+/// Extension rows asked for the root search, and their answers.
+ext_root_search: Inflight(ExtHost.RootResult, 256) = .{},
 /// The Lua action running (0: none); its answer decides what happens.
 ext_act_gen: u32 = 0,
 /// The extension whose preferences the prefs view lists.
@@ -1360,8 +1347,8 @@ fn resetRows(self: *Ui) void {
     self.pending = .empty;
     if (self.pending_idle != 0) _ = c.g_source_remove(self.pending_idle);
     self.pending_idle = 0;
-    self.shown_content = null;
-    self.ext_shown = null;
+    self.content_query.shown = null;
+    self.ext_list.shown = null;
     self.selected = null;
     c.gtk_list_box_remove_all(@ptrCast(self.list));
 }
@@ -1408,12 +1395,11 @@ fn answerPending(self: *Ui, start_ns: u64) bool {
     // Contents: the rows on screen are the last result's.
     if (self.view != .contents) return false;
     const content_search = self.content_search orelse return false;
-    const result = self.content_result orelse return false;
     if (query_text.len < 3) return false;
-    if (result != self.shown_content) return false;
-    if (std.mem.eql(u8, result.query, ContentSearch.clip(query_text))) return false;
-    self.content_gen = content_search.submit(query_text, start_ns);
-    self.content_pending = true;
+    if (!self.content_query.showingLatest()) return false;
+    const latest = self.content_query.latest.?;
+    if (std.mem.eql(u8, latest.query, ContentSearch.clip(query_text))) return false;
+    self.content_query.sent(content_search.submit(query_text, start_ns), query_text);
     return true;
 }
 
@@ -1435,7 +1421,7 @@ fn fill(self: *Ui, arena: std.mem.Allocator, query_text: []const u8, start_ns: u
         // filtered here.
         .ext => {
             self.fillSectioned(arena, if (ext_view.prepare(self, query_text)) query_text else "");
-            self.ext_shown = self.ext_result;
+            self.ext_list.shown = self.ext_list.latest;
         },
         .dmenu => dmenu.fill(self, arena, query_text),
         .prefs => self.fillSectioned(arena, query_text),
@@ -1458,17 +1444,19 @@ fn fillContents(self: *Ui, arena: std.mem.Allocator, query_text: []const u8, sta
     // here; meanwhile keep showing the last result. The worker searches the
     // clipped query: compare with that, or a query longer than the clip
     // never counts as answered.
-    const fresh = if (self.content_result) |result| std.mem.eql(
-        u8,
-        result.query,
-        ContentSearch.clip(query_text),
-    ) else false;
-    if (!fresh) self.content_gen = content_search.submit(query_text, start_ns);
-    self.content_pending = !fresh;
-    if (self.content_result) |result| {
+    const fresh = if (self.content_query.latest) |latest|
+        std.mem.eql(u8, latest.query, ContentSearch.clip(query_text))
+    else
+        false;
+    if (fresh) {
+        self.content_query.answered();
+    } else {
+        self.content_query.sent(content_search.submit(query_text, start_ns), query_text);
+    }
+    if (self.content_query.latest) |latest| {
         self.addSection("Matches");
-        for (file_results.itemsFromHits(self, arena, result.hits)) |item| self.addItem(item);
-        self.shown_content = result;
+        for (file_results.itemsFromHits(self, arena, latest.hits)) |item| self.addItem(item);
+        self.content_query.shown = latest;
     }
 }
 
@@ -2348,8 +2336,8 @@ fn emptyText(self: *Ui, arena: std.mem.Allocator) [:0]const u8 {
     if (self.view == .contents and query_text.len < 3) {
         return file_results.contentsHint(self, arena, query_text.len);
     }
-    if (self.view == .contents and self.content_pending) return "Searching...";
-    if (self.view == .contents) if (self.content_result) |result| if (result.err) |err|
+    if (self.view == .contents and self.content_query.pending) return "Searching...";
+    if (self.view == .contents) if (self.content_query.latest) |result| if (result.err) |err|
         return arena.printSentinel(
             "Content search failed ({t})",
             .{err},
@@ -2364,6 +2352,7 @@ fn emptyText(self: *Ui, arena: std.mem.Allocator) [:0]const u8 {
 
 test {
     _ = @import("dmenu.zig");
+    _ = @import("inflight.zig");
 }
 
 test "Navigation forgets the oldest view when it is full" {
