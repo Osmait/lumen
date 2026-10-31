@@ -524,7 +524,7 @@ fn startFileIndex(ui: *Ui) void {
         ui.io,
         home,
         cache_dir,
-        .{ .search = file_service.content_search_pool, .build = file_service.content_build_pool },
+        file_service.contentPools(),
         .{ .names = file_service },
     ) catch |err| {
         log.warn("content index: {t}", .{err});

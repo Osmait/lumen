@@ -18,6 +18,7 @@ const engine = @import("search.zig");
 const Pool = @import("Pool.zig");
 const Watcher = @import("Watcher.zig");
 const Live = @import("Live.zig");
+const ContentService = @import("ContentService.zig");
 const sys = @import("os");
 
 const Service = @This();
@@ -145,6 +146,11 @@ fn init(
     const event_fd = std.os.linux.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
     // Without one, `pause` looks at `stop` every 100 ms instead.
     if (std.os.linux.errno(event_fd) == .SUCCESS) service.wake_fd = @intCast(event_fd);
+}
+
+/// The pools the content index runs on, lent for the service's lifetime.
+pub fn contentPools(service: *const Service) ContentService.Pools {
+    return .{ .search = service.content_search_pool, .build = service.content_build_pool };
 }
 
 /// Frees what `init` made. The thread must have stopped (or never started).
