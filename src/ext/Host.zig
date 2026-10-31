@@ -42,8 +42,7 @@ const generation_mod = @import("generation.zig");
 const stamp_mod = @import("stamp.zig");
 const requests = @import("requests.zig");
 const loading = @import("loading.zig");
-pub const Extension = @import("Extension.zig");
-pub const Load = @import("Load.zig");
+const Extension = @import("Extension.zig");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
 

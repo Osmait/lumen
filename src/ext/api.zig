@@ -7,6 +7,8 @@
 const std = @import("std");
 const lua = @import("luart").lua;
 const Host = @import("Host.zig");
+const Extension = @import("Extension.zig");
+const Load = @import("Load.zig");
 const rows = @import("rows.zig");
 const json = @import("luart").json;
 const proc = @import("../sys/proc.zig");
@@ -37,13 +39,13 @@ const log_line_bytes_max = 2048;
 
 /// The extension whose state `L` is: its budget is the state's allocator
 /// data, and a field of the extension.
-fn extensionOf(L: *lua.State) *Host.Extension {
+fn extensionOf(L: *lua.State) *Extension {
     return @fieldParentPtr("budget", lua.budgetOf(L));
 }
 
 /// The file being loaded, or an error for a function only a file being
 /// loaded may call (`function_name` names it).
-fn loadOf(L: *lua.State, function_name: []const u8) lua.Error!*Host.Load {
+fn loadOf(L: *lua.State, function_name: []const u8) lua.Error!*Load {
     const format = "{s} works only while a file loads";
     return extensionOf(L).load orelse lua.fail(L, format, .{function_name});
 }
@@ -51,7 +53,7 @@ fn loadOf(L: *lua.State, function_name: []const u8) lua.Error!*Host.Load {
 /// Sets up `lumen` (also a global), `require` for the extension's own
 /// modules, and `print` (to Lumen's log). Inside `protect`; leaves the
 /// stack as it found it.
-pub fn install(L: *lua.State, extension: *Host.Extension) void {
+pub fn install(L: *lua.State, extension: *Extension) void {
     const mark: lua.StackMark = .init(L);
     defer mark.expectPushed(L, 0);
     setRequirePath(L, extension.folder);
