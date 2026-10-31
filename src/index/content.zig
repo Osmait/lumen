@@ -229,7 +229,7 @@ const DocColumns = struct {
 
 pub const Index = struct {
     buf: Bytes,
-    mapped: bool,
+    backing: format.Backing,
     docs_count: usize,
     segments_count: usize,
     mtimes: []const i64,
@@ -249,7 +249,7 @@ pub const Index = struct {
     bytes_live: usize,
 
     pub fn deinit(index: *Index, gpa: std.mem.Allocator) void {
-        format.release(index.buf, index.mapped, gpa);
+        format.release(index.buf, index.backing, gpa);
         index.* = undefined;
     }
 
@@ -292,7 +292,7 @@ pub const Index = struct {
     }
 
     /// Checks that `whole` is a well-formed index and wraps it without
-    /// copying (`mapped` says how `deinit` releases it).
+    /// copying (`backing` says how `deinit` releases it).
     ///
     /// The file comes from disk: it may be truncated, from another version or
     /// garbage. Everything later accesses index with is checked here, in
@@ -307,7 +307,7 @@ pub const Index = struct {
     /// would mean decoding every list on open. Whatever reads lists across
     /// segments copes with ids that repeat or go back instead (`candidates`,
     /// `closeSegment`).
-    pub fn parse(whole: Bytes, mapped: bool) error{BadIndex}!Index {
+    pub fn parse(whole: Bytes, backing: format.Backing) error{BadIndex}!Index {
         if (whole.len < header_size) return error.BadIndex;
         const header = Header.decode(whole[0..header_size]);
         if (!std.mem.eql(u8, &header.magic, magic)) return error.BadIndex;
@@ -351,7 +351,7 @@ pub const Index = struct {
 
         return .{
             .buf = whole,
-            .mapped = mapped,
+            .backing = backing,
             .docs_count = docs_count,
             .segments_count = segments_count,
             .mtimes = columns.mtimes,
@@ -375,7 +375,7 @@ pub const Index = struct {
     pub fn open(path_z: [:0]const u8) (sys.Error || error{BadIndex})!Index {
         const buf = try sys.mapPrivate(path_z);
         errdefer sys.unmap(buf);
-        return parse(buf, true);
+        return parse(buf, .mapped);
     }
 
     /// Posting list bytes of `key` in segment `segment_index` (empty if
@@ -1068,7 +1068,7 @@ fn toMemory(sink: *Sink, header: Header) BuildError!Index {
     @memcpy(sink.buf.items[0..header_size], &header.encode());
     const buf = try sink.buf.toOwnedSlice(sink.gpa);
     errdefer sink.gpa.free(buf);
-    return Index.parse(buf, false);
+    return Index.parse(buf, .heap);
 }
 
 fn toFile(sink: *Sink, header: Header, path_z: [:0]const u8) FileError!Index {
@@ -1950,7 +1950,7 @@ test "update: edited and deleted documents leave, new ones join, old ids keep th
         null,
     );
     defer built.deinit(gpa);
-    try testing.expect(built.mapped);
+    try testing.expect(built.backing == .mapped);
     try testing.expectEqualSlices(u8, ix.buf, built.buf);
     var streamed = try updateFile(
         gpa,
@@ -2819,7 +2819,7 @@ test "corrupt content indexes are rejected, not trusted" {
     // Truncated anywhere, or empty: the total length no longer matches.
     for (0..good.len) |cut| try testing.expectError(
         error.BadIndex,
-        Index.parse(good[0..cut], false),
+        Index.parse(good[0..cut], .heap),
     );
 
     const docs_offset = std.mem.readInt(u64, good[32..40], .little);
@@ -2863,7 +2863,7 @@ test "corrupt content indexes are rejected, not trusted" {
         if (c.at == docs_offset + n * 22) {
             bad[c.at] = @intCast(c.v);
         } else if (c.wide) H.put(bad, c.at, c.v) else H.put32(bad, c.at, @intCast(c.v));
-        if (Index.parse(bad, false)) |_| {
+        if (Index.parse(bad, .heap)) |_| {
             std.debug.print("case {d} accepted\n", .{i});
             return error.TestUnexpectedResult;
         } else |_| {}
@@ -2980,7 +2980,7 @@ fn appendMemory(
     @memcpy(buf[0..old.buf.len], old.buf);
     @memcpy(buf[old.buf.len..], sink.buf.items);
     @memcpy(buf[0..header_size], &h.encode());
-    return Index.parse(buf, false);
+    return Index.parse(buf, .heap);
 }
 
 /// What the service does with the index it mapped: updates it and appends
@@ -3015,7 +3015,7 @@ test "segments that repeat or reorder doc ids (a damaged file): queries, updates
     // "zig" lists 62 in segment 3, then 61. Nothing `parse` checks.
     const last = ix.segments[4];
     @memset(ix.buf[@intCast(last.postings_offset)..][0..@intCast(last.postings_size)], 61);
-    _ = try Index.parse(ix.buf, false);
+    _ = try Index.parse(ix.buf, .heap);
 
     var got: std.ArrayList(u32) = .empty;
     defer got.deinit(gpa);
@@ -3195,7 +3195,7 @@ test "random byte flips in a content index never crash, nor updating it" {
     for (0..3000) |_| {
         @memcpy(bad, ix.buf);
         for (0..r.intRangeAtMost(usize, 1, 4)) |_| bad[r.uintLessThan(usize, bad.len)] = r.int(u8);
-        if (Index.parse(bad, false)) |m| {
+        if (Index.parse(bad, .heap)) |m| {
             try exerciseIndex(&m, gpa);
             try exerciseUpdates(&m, gpa, pool);
             accepted += 1;
@@ -3224,7 +3224,7 @@ fn fuzzParseBytes(_: void, smith: *testing.Smith) anyerror!void {
         std.mem.writeInt(u64, b[40..48], directory_offset, .little);
         std.mem.writeInt(u64, b[48..56], b.len, .little);
     }
-    if (Index.parse(b, false)) |ix| try exerciseIndex(&ix, testing.allocator) else |_| {}
+    if (Index.parse(b, .heap)) |ix| try exerciseIndex(&ix, testing.allocator) else |_| {}
 }
 
 test "content: the header struct lays out the bytes LUMCTX04 always had" {
@@ -3276,7 +3276,7 @@ fn fuzzFlips(ctx: FlipsCtx, smith: *testing.Smith) anyerror!void {
         std.mem.writeInt(u32, buf[at..][0..4], smith.value(u32), .little);
     }
     const cut = if (smith.boolWeighted(7, 1)) smith.index(buf.len + 1) else buf.len;
-    const ix = Index.parse(buf[0..cut], false) catch return;
+    const ix = Index.parse(buf[0..cut], .heap) catch return;
     try exerciseIndex(&ix, gpa);
     try exerciseUpdates(&ix, gpa, ctx.pool);
 }

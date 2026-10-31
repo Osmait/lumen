@@ -306,7 +306,7 @@ fn concernsContent(service: *Service, change: Watcher.Change) bool {
     };
     if (name.len > 0 and name[0] == '.') return false;
     var buf: paths.Buffer = undefined;
-    const dir = service.live.pathOf(parent, &buf) orelse return true;
+    const dir = service.live.pathOf(.fromRaw(parent), &buf) orelse return true;
     const root = service.roots[0];
     const relative = if (std.mem.startsWith(u8, dir, root)) dir[root.len..] else dir;
     var parts = std.mem.tokenizeScalar(u8, relative, '/');

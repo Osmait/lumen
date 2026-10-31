@@ -21,10 +21,20 @@ pub fn alignUp(size: usize) usize {
     return std.mem.alignForward(usize, size, alignment_bytes);
 }
 
-/// Gives back an index's buffer: a mapping of its file, or heap memory
-/// (built in memory, or the file could not be written).
-pub fn release(buf: Bytes, mapped: bool, gpa: std.mem.Allocator) void {
-    if (mapped) sys.unmap(buf) else gpa.free(buf);
+/// Where an index's buffer lives, which says how it is given back.
+pub const Backing = enum {
+    /// A mapping of its file.
+    mapped,
+    /// Heap memory: built in memory, or the file could not be written.
+    heap,
+};
+
+/// Gives back an index's buffer.
+pub fn release(buf: Bytes, backing: Backing, gpa: std.mem.Allocator) void {
+    switch (backing) {
+        .mapped => sys.unmap(buf),
+        .heap => gpa.free(buf),
+    }
 }
 
 /// Smith input for a fuzz test that starts with one `slice()`: the length

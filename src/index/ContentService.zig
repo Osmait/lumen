@@ -779,7 +779,7 @@ fn buildStrategy(service: *const ContentService, input: BuildInput) BuildStrateg
     service.assertWorkerThread();
     if (input == .whole) return .build_whole;
     const index = &service.index.?;
-    if (!index.mapped) return .rewrite_file;
+    if (index.backing != .mapped) return .rewrite_file;
     if (service.worker.unsaved) return .rewrite_file;
     return .append_to_mapped_file;
 }
@@ -802,7 +802,7 @@ fn buildNext(service: *ContentService, input: BuildInput) ?content.Index {
     }
     const strategy = service.buildStrategy(input);
     if (service.buildNextToFile(strategy, input, reader)) |fresh| {
-        if (fresh.mapped) service.worker.unsaved = false;
+        if (fresh.backing == .mapped) service.worker.unsaved = false;
         return fresh;
     } else |err| switch (err) {
         error.OutOfMemory => {

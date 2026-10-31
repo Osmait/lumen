@@ -35,34 +35,42 @@ const Live = @This();
 /// rescan on every start covers anyway; a clean exit flushes.
 pub const compact_interval_ns: u64 = std.math.maxInt(u64);
 
-/// Distinguishes delta ids from base ids. inotify events arrive as (watch,
-/// name) and every watch must map to *some* entry; directories created after
-/// the scan only exist in the delta, so both need one id space. A base id is
-/// the entry's index in `base`; a delta id is this bit and the entry's index
-/// in the delta. `deltaId`, `isDelta` and `deltaIndex` are the only places
-/// that know it.
-const delta_bit: u32 = 1 << 31;
+/// An entry of the live index: its index in `base`, or in the delta.
+/// inotify events arrive as (watch, name) and every watch must map to
+/// *some* entry; directories created after the scan only exist in the
+/// delta, so both share one 32-bit space. The Watcher keeps the raw u32
+/// (`raw`, `fromRaw`); everything in Live that may be either goes through
+/// this type, and a plain u32 is always an index into one store.
+pub const EntryId = packed struct(u32) {
+    index: u31,
+    in_delta: bool,
 
-comptime {
-    // Base ids stay below the bit: a store has fewer than 2^31 entries.
-    assert(delta_bit == std.math.maxInt(u32) / 2 + 1);
-}
+    comptime {
+        // A base id is the store index itself: the scan watches with those,
+        // and a store has fewer than 2^31 entries.
+        assert(@as(u32, @bitCast(EntryId{ .index = 5, .in_delta = false })) == 5);
+        assert(@as(u32, @bitCast(EntryId{ .index = 0, .in_delta = true })) == 1 << 31);
+    }
 
-/// The id of entry `delta_index` of the delta.
-fn deltaId(delta_index: u32) u32 {
-    assert(delta_index < delta_bit);
-    return delta_bit | delta_index;
-}
+    pub fn ofBase(index: u32) EntryId {
+        assert(index <= std.math.maxInt(u31));
+        return .{ .index = @intCast(index), .in_delta = false };
+    }
 
-fn isDelta(id: u32) bool {
-    return id & delta_bit != 0;
-}
+    pub fn ofDelta(index: u32) EntryId {
+        assert(index <= std.math.maxInt(u31));
+        return .{ .index = @intCast(index), .in_delta = true };
+    }
 
-/// The delta index of a delta id (see `deltaId`).
-fn deltaIndex(id: u32) u32 {
-    assert(isDelta(id));
-    return id & ~delta_bit;
-}
+    /// The id a watch was registered with.
+    pub fn fromRaw(raw_id: u32) EntryId {
+        return @bitCast(raw_id);
+    }
+
+    pub fn raw(id: EntryId) u32 {
+        return @bitCast(id);
+    }
+};
 
 pub const Hit = struct { path: []const u8, score: i32, is_dir: bool };
 
@@ -269,13 +277,15 @@ pub fn apply(live: *Live, changes: []const Watcher.Change) std.mem.Allocator.Err
     var applied_count: usize = 0;
     for (changes) |change| switch (change) {
         .created => |created| {
-            const added = try live.add(created.parent, created.name, created.is_dir);
+            const parent: EntryId = .fromRaw(created.parent);
+            const added = try live.add(parent, created.name, created.is_dir);
             applied_count += @intFromBool(added);
         },
         .removed => |removed| {
-            applied_count += @intFromBool(live.remove(removed.parent, removed.name));
+            applied_count += @intFromBool(live.remove(.fromRaw(removed.parent), removed.name));
         },
-        .dir_gone => |id| {
+        .dir_gone => |raw_id| {
+            const id: EntryId = .fromRaw(raw_id);
             // The watched directory went away, and its subtree with it.
             // Unless its path is still there: a MOVE_SELF read in a later
             // batch than the move's MOVED_TO carries the id the watch was
@@ -303,29 +313,28 @@ pub fn apply(live: *Live, changes: []const Watcher.Change) std.mem.Allocator.Err
 /// The delta id an event's parent maps to, if any. `add` and `remove` both
 /// go through here: when they resolved parents differently, deleting
 /// something added after the scan did nothing (bug found in the Rust one).
-fn deltaParent(live: *Live, parent: u32) ?u32 {
-    if (isDelta(parent)) {
-        const delta_index = deltaIndex(parent);
-        if (delta_index >= live.delta.builder.len()) return null;
-        return delta_index;
+fn deltaParent(live: *Live, parent: EntryId) ?u32 {
+    if (parent.in_delta) {
+        if (parent.index >= live.delta.builder.len()) return null;
+        return parent.index;
     }
     var buf: paths.Buffer = undefined;
     const parent_path = live.pathOf(parent, &buf) orelse return null;
     return live.delta.roots.get(parent_path);
 }
 
-/// The live entry named `name` in directory `parent`, base or delta (as a
-/// delta id). It may be in the base or added to the delta after the scan.
-fn childOf(live: *Live, parent: u32, name: []const u8) ?u32 {
-    if (!isDelta(parent) and parent < live.base.len()) {
-        if (live.base.findChild(parent, name)) |id| return id;
+/// The live entry named `name` in directory `parent`. It may be in the base
+/// or added to the delta after the scan.
+fn childOf(live: *Live, parent: EntryId, name: []const u8) ?EntryId {
+    if (!parent.in_delta and parent.index < live.base.len()) {
+        if (live.base.findChild(parent.index, name)) |index| return .ofBase(index);
     }
     const delta_parent = live.deltaParent(parent) orelse return null;
     const delta_index = live.deltaChild(delta_parent, name) orelse return null;
-    return deltaId(delta_index);
+    return .ofDelta(delta_index);
 }
 
-fn remove(live: *Live, parent: u32, name: []const u8) bool {
+fn remove(live: *Live, parent: EntryId, name: []const u8) bool {
     const id = live.childOf(parent, name) orelse return false;
     live.stats.removed += live.tombstoneTree(id);
     return true;
@@ -348,26 +357,30 @@ fn deltaChild(live: *const Live, dir: u32, child_name: []const u8) ?u32 {
     return null;
 }
 
-/// Whether entry `id` (base or delta) is still in the index. A directory
-/// moved out of the tree keeps its watch until `pruneWatches`.
-fn alive(live: *const Live, id: u32) bool {
-    if (isDelta(id)) {
-        const delta_index = deltaIndex(id);
-        if (delta_index >= live.delta.builder.len()) return false;
-        return live.delta.builder.masks.items[delta_index] != 0;
+/// Whether entry `id` is still in the index. A directory moved out of the
+/// tree keeps its watch until `pruneWatches`.
+fn alive(live: *const Live, id: EntryId) bool {
+    if (id.in_delta) {
+        if (id.index >= live.delta.builder.len()) return false;
+        return live.delta.builder.masks.items[id.index] != 0;
     }
-    if (id >= live.base.len()) return false;
-    return !live.base.isTombstoned(id);
+    if (id.index >= live.base.len()) return false;
+    return !live.base.isTombstoned(id.index);
 }
 
-fn isDirEntry(live: *const Live, id: u32) bool {
-    if (isDelta(id)) {
-        return live.delta.builder.flags.items[deltaIndex(id)] & store_mod.flag_dir != 0;
-    }
-    return live.base.isDir(id);
+/// `alive` for the Watcher, which keeps ids raw.
+fn aliveWatched(live: *const Live, raw_id: u32) bool {
+    return live.alive(.fromRaw(raw_id));
 }
 
-fn pathExists(live: *const Live, id: u32) bool {
+fn isDirEntry(live: *const Live, id: EntryId) bool {
+    if (id.in_delta) {
+        return live.delta.builder.flags.items[id.index] & store_mod.flag_dir != 0;
+    }
+    return live.base.isDir(id.index);
+}
+
+fn pathExists(live: *const Live, id: EntryId) bool {
     var buf: paths.Buffer = undefined;
     const path = live.pathOf(id, buf[0 .. buf.len - 1]) orelse return false;
     if (path.len == 0) return false;
@@ -378,21 +391,21 @@ fn pathExists(live: *const Live, id: u32) bool {
 /// Hidden as the scan sets it: by name, and inherited from the parent.
 /// Without it, new files under a dot-dir ranked as the user's own until the
 /// next rescan.
-fn hiddenFlag(live: *const Live, parent: u32, name: []const u8) u8 {
-    const parent_flags = if (isDelta(parent))
-        live.delta.builder.flags.items[deltaIndex(parent)]
+fn hiddenFlag(live: *const Live, parent: EntryId, name: []const u8) u8 {
+    const parent_flags = if (parent.in_delta)
+        live.delta.builder.flags.items[parent.index]
     else
-        live.base.flags()[parent];
+        live.base.flags()[parent.index];
     if (parent_flags & store_mod.flag_hidden != 0) return store_mod.flag_hidden;
     if (scan.hiddenByName(name)) return store_mod.flag_hidden;
     return 0;
 }
 
-/// Tombstones entry `id` (base, or delta as a delta id) and its subtree.
-fn tombstoneTree(live: *Live, id: u32) usize {
+/// Tombstones entry `id` and its subtree.
+fn tombstoneTree(live: *Live, id: EntryId) usize {
     if (live.isDirEntry(id)) live.prune_watches = true;
-    if (isDelta(id)) return live.tombstoneDeltaTree(deltaIndex(id));
-    return live.tombstoneBaseTree(id);
+    if (id.in_delta) return live.tombstoneDeltaTree(id.index);
+    return live.tombstoneBaseTree(id.index);
 }
 
 /// Tombstones an entry and its whole subtree. Moving a directory sends one
@@ -484,7 +497,7 @@ fn tombstoneDeltaTree(live: *Live, root: u32) usize {
     return tombstoned_count;
 }
 
-fn add(live: *Live, parent: u32, name: []const u8, is_dir: bool) !bool {
+fn add(live: *Live, parent: EntryId, name: []const u8, is_dir: bool) !bool {
     // A directory moved out of the tree is still watched: what happens in
     // it now must not come back under its old path.
     if (!live.alive(parent)) return false;
@@ -502,8 +515,8 @@ fn add(live: *Live, parent: u32, name: []const u8, is_dir: bool) !bool {
     const hidden = live.hiddenFlag(parent, name);
     // A parent already in the delta is used as is; a base parent gets a
     // scaffolding root.
-    const root = if (isDelta(parent))
-        deltaIndex(parent)
+    const root: u32 = if (parent.in_delta)
+        parent.index
     else
         try live.deltaRoot(parent_path, depth -| 1);
 
@@ -624,8 +637,8 @@ pub fn addScans(live: *Live, scans: *Scans) std.mem.Allocator.Error!void {
             const id: u32 = @intCast(sub_index);
             if (!sub.isDir(id)) continue;
             const path = pathZ(sub, id, &buf) orelse continue;
-            const delta_id = deltaId(map[sub_index]);
-            try live.watcher.watchBestEffort(live.gpa, path, delta_id, .below_root);
+            const delta_id: EntryId = .ofDelta(map[sub_index]);
+            try live.watcher.watchBestEffort(live.gpa, path, delta_id.raw(), .below_root);
         }
         live.stats.added += sub.len() - 1;
         added = true;
@@ -651,7 +664,7 @@ pub fn finishScans(live: *Live) std.mem.Allocator.Error!void {
 fn pruneWatches(live: *Live) void {
     if (!live.prune_watches) return;
     live.prune_watches = false;
-    live.watcher.prune(live.gpa, @as(*const Live, live), alive);
+    live.watcher.prune(live.gpa, @as(*const Live, live), aliveWatched);
     live.stats.watches = live.watcher.count();
 }
 
@@ -705,22 +718,17 @@ fn deltaRoot(live: *Live, dir_path: []const u8, depth: u16) !u32 {
     return id;
 }
 
-pub fn pathOf(live: *const Live, id: u32, buf: []u8) ?[]const u8 {
-    if (isDelta(id)) {
-        const delta_index = deltaIndex(id);
-        if (delta_index >= live.delta.store.len()) return null;
-        return live.delta.store.path(delta_index, buf);
-    }
-    if (id >= live.base.len()) return null;
-    return live.base.path(id, buf);
+/// The path of entry `id`, or null if it is gone or does not fit `buf`.
+pub fn pathOf(live: *const Live, id: EntryId, buf: []u8) ?[]const u8 {
+    const store = if (id.in_delta) &live.delta.store else &live.base;
+    if (id.index >= store.len()) return null;
+    return store.path(id.index, buf);
 }
 
-fn depthOf(live: *const Live, id: u32) u16 {
-    if (isDelta(id)) {
-        const i = deltaIndex(id);
-        return if (i < live.delta.store.len()) live.delta.store.depths()[i] else 0;
-    }
-    return if (id < live.base.len()) live.base.depths()[id] else 0;
+fn depthOf(live: *const Live, id: EntryId) u16 {
+    const store = if (id.in_delta) &live.delta.store else &live.base;
+    if (id.index >= store.len()) return 0;
+    return store.depths()[id.index];
 }
 
 /// The delta is small by construction (compaction keeps it so): rebuilding
@@ -1148,12 +1156,11 @@ test "live: a MOVE_SELF read after the move was applied keeps the destination" {
     var buf: paths.Buffer = undefined;
     var want_buf: paths.Buffer = undefined;
     const want = try std.mem.print(&want_buf, "{s}/renombrado", .{t.root});
-    while (it.next()) |id| {
-        if (isDelta(id.*) and std.mem.eql(
-            u8,
-            t.live.pathOf(id.*, &buf) orelse "",
-            want,
-        )) dest = id.*;
+    while (it.next()) |raw_id| {
+        const id: EntryId = .fromRaw(raw_id.*);
+        if (!id.in_delta) continue;
+        const path = t.live.pathOf(id, &buf) orelse "";
+        if (std.mem.eql(u8, path, want)) dest = raw_id.*;
     }
     try testing.expect(dest != null);
     _ = try t.live.apply(&.{.{ .dir_gone = dest.? }});

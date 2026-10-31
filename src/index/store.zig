@@ -165,11 +165,11 @@ const Layout = struct {
 /// Immutable path index: built with `Builder` or mapped with `open`.
 pub const Store = struct {
     buf: Bytes,
-    mapped: bool,
+    backing: format.Backing,
     layout: Layout,
 
     pub fn deinit(store: *Store, gpa: std.mem.Allocator) void {
-        format.release(store.buf, store.mapped, gpa);
+        format.release(store.buf, store.backing, gpa);
         store.* = undefined;
     }
 
@@ -346,11 +346,11 @@ pub const Store = struct {
     pub fn open(path_z: [:0]const u8) (sys.Error || error{BadIndex})!Store {
         const buf = try sys.mapPrivate(path_z);
         errdefer sys.unmap(buf);
-        return parse(buf, true);
+        return parse(buf, .mapped);
     }
 
     /// Checks that `buf` is a well-formed index and wraps it without copying.
-    /// `mapped` says how `deinit` releases it (munmap, or free with the
+    /// `backing` says how `deinit` releases it (munmap, or free with the
     /// allocator it is given).
     ///
     /// The file comes from disk, so it may be truncated (disk full during a
@@ -359,8 +359,8 @@ pub const Store = struct {
     /// the header and layout fit the buffer exactly, every name lies inside
     /// the names blob, and every parent is `no_parent` (roots, first) or an
     /// earlier entry, so walking up from any entry ends at a root.
-    pub fn parse(buf: Bytes, mapped: bool) error{BadIndex}!Store {
-        return .{ .buf = buf, .mapped = mapped, .layout = try validate(buf) };
+    pub fn parse(buf: Bytes, backing: format.Backing) error{BadIndex}!Store {
+        return .{ .buf = buf, .backing = backing, .layout = try validate(buf) };
     }
 };
 
@@ -524,7 +524,7 @@ pub const Builder = struct {
         put(buf, layout.name_sizes_offset, builder.name_sizes.items);
         put(buf, layout.flags_offset, builder.flags.items);
         put(buf, layout.names_offset, builder.names.items);
-        return .{ .buf = buf, .mapped = false, .layout = layout };
+        return .{ .buf = buf, .backing = .heap, .layout = layout };
     }
 };
 
@@ -704,45 +704,45 @@ test "corrupt indexes are rejected, not trusted" {
     const gpa = testing.allocator;
     const good = try sampleBytes(gpa);
     defer gpa.free(good);
-    _ = try Store.parse(good, false);
+    _ = try Store.parse(good, .heap);
 
     const bad = try gpa.alignedAlloc(u8, .@"8", good.len);
     defer gpa.free(bad);
-    const layout = (try Store.parse(good, false)).layout;
+    const layout = (try Store.parse(good, .heap)).layout;
 
     // Truncated anywhere (a save interrupted by a full disk), or empty.
     for (0..good.len) |cut| try testing.expectError(
         error.BadIndex,
-        Store.parse(good[0..cut], false),
+        Store.parse(good[0..cut], .heap),
     );
 
     // Wrong magic (another version).
     @memcpy(bad, good);
     bad[7] = '1';
-    try testing.expectError(error.BadIndex, Store.parse(bad, false));
+    try testing.expectError(error.BadIndex, Store.parse(bad, .heap));
 
     // Entry count so large the layout arithmetic would overflow.
     @memcpy(bad, good);
     std.mem.writeInt(u64, bad[8..16], std.math.maxInt(u64), .little);
-    try testing.expectError(error.BadIndex, Store.parse(bad, false));
+    try testing.expectError(error.BadIndex, Store.parse(bad, .heap));
     std.mem.writeInt(u64, bad[8..16], std.math.maxInt(u64) / 8 + 1, .little);
-    try testing.expectError(error.BadIndex, Store.parse(bad, false));
+    try testing.expectError(error.BadIndex, Store.parse(bad, .heap));
 
     // Names blob length that does not match the file.
     @memcpy(bad, good);
     std.mem.writeInt(u64, bad[16..24], std.math.maxInt(u64), .little);
-    try testing.expectError(error.BadIndex, Store.parse(bad, false));
+    try testing.expectError(error.BadIndex, Store.parse(bad, .heap));
 
     // A name past the end of the names blob.
     @memcpy(bad, good);
     const name_offset_bad: u32 = @intCast(layout.names_size - 3);
     const name_offset_at = layout.name_offsets_offset + 4 * 2;
     std.mem.writeInt(u32, bad[name_offset_at..][0..4], name_offset_bad, .little);
-    try testing.expectError(error.BadIndex, Store.parse(bad, false));
+    try testing.expectError(error.BadIndex, Store.parse(bad, .heap));
     @memcpy(bad, good);
     const name_size_bad = std.math.maxInt(u16);
     std.mem.writeInt(u16, bad[layout.name_sizes_offset + 2 * 4 ..][0..2], name_size_bad, .little);
-    try testing.expectError(error.BadIndex, Store.parse(bad, false));
+    try testing.expectError(error.BadIndex, Store.parse(bad, .heap));
 
     // A parent out of range, a cycle (path() would loop forever), a parent
     // after its child, and a root that is not at the start.
@@ -754,7 +754,7 @@ test "corrupt indexes are rejected, not trusted" {
     }) |c| {
         @memcpy(bad, good);
         std.mem.writeInt(u32, bad[layout.parents_offset + 4 * c.id ..][0..4], c.parent, .little);
-        try testing.expectError(error.BadIndex, Store.parse(bad, false));
+        try testing.expectError(error.BadIndex, Store.parse(bad, .heap));
     }
 }
 
@@ -787,7 +787,7 @@ test "random byte flips never crash" {
         @memcpy(bad, good);
         for (0..r.intRangeAtMost(usize, 1, 4)) |_| bad[r.uintLessThan(usize, bad.len)] = r.int(u8);
         const cut = if (r.uintLessThan(u8, 8) == 0) r.uintAtMost(usize, bad.len) else bad.len;
-        if (Store.parse(bad[0..cut], false)) |s| {
+        if (Store.parse(bad[0..cut], .heap)) |s| {
             exercise(&s);
             accepted += 1;
         } else |_| {}
@@ -808,7 +808,7 @@ fn fuzzParse(_: void, smith: *testing.Smith) anyerror!void {
         std.mem.writeInt(u64, b[8..16], n, .little);
         std.mem.writeInt(u64, b[16..24], b.len -| fixed, .little);
     }
-    if (Store.parse(b, false)) |s| exercise(&s) else |_| {}
+    if (Store.parse(b, .heap)) |s| exercise(&s) else |_| {}
 }
 
 test "fuzz: parsing arbitrary bytes never crashes" {
@@ -835,7 +835,7 @@ fn fuzzBuilt(_: void, smith: *testing.Smith) anyerror!void {
     var s = try b.finish(gpa);
     defer s.deinit(gpa);
     // What the builder writes, the validator must accept, unchanged.
-    const m = try Store.parse(s.buf, false);
+    const m = try Store.parse(s.buf, .heap);
     var p1: paths.Buffer = undefined;
     var p2: paths.Buffer = undefined;
     for (0..s.len()) |i| try testing.expectEqualStrings(
