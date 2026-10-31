@@ -539,7 +539,8 @@ test "defaults, then values from the file" {
     try testing.expectEqual(@as(u32, 500), settings.clipboard_keep);
     try testing.expectEqualStrings("kitty", settings.terminal);
     try testing.expectEqualStrings("org.gnome.Evince.desktop", settings.appFor("", .pdf).?);
-    try testing.expectEqualStrings("org.gnome.TextEditor.desktop", settings.appFor(".log", .text).?);
+    const log_app = settings.appFor(".log", .text).?;
+    try testing.expectEqualStrings("org.gnome.TextEditor.desktop", log_app);
 }
 
 test "bad values keep the default, bad lines are ignored" {

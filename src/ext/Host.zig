@@ -1900,9 +1900,9 @@ test "extensions load, list, search and run actions" {
     // Several lumen.layout calls add up.
     try testing.expect(registry.has_layout);
     try testing.expectEqual(@as(?u16, 820), registry.layout.width);
-    try testing.expect(
-        registry.layout.footer and registry.layout.panels == .single and registry.layout.rows == .inline_,
-    );
+    try testing.expect(registry.layout.footer);
+    try testing.expect(registry.layout.panels == .single);
+    try testing.expect(registry.layout.rows == .inline_);
     try testing.expect(!registry.layout.show.icons and registry.layout.show.subtitles);
     for (registry.settings) |o| {
         const want: []const u8 = if (std.mem.eql(u8, o.key, "width")) "wide" else if (std.mem.eql(
@@ -2194,7 +2194,9 @@ test "storage never writes over what it cannot read, and reads back what it wrot
     try probe.wait("registry");
     const registry = probe.registry.?;
     try testing.expectEqual(@as(usize, 2), registry.problems.len);
-    for (registry.problems) |p| try testing.expect(std.mem.find(u8, p.message, "are taken") != null);
+    for (registry.problems) |registry_problem| {
+        try testing.expect(std.mem.find(u8, registry_problem.message, "are taken") != null);
+    }
 
     _ = host.list(registry.gen, 0, "");
     const broken = try probe.take("list");

@@ -379,13 +379,16 @@ pub fn raise(L: *State, comptime fmt: []const u8, args: anytype) noreturn {
     unreachable;
 }
 
+/// A function for `setFuncs`, written `.{ "name", function }` like the C
+/// API's luaL_Reg.
 pub const Fn = struct { [:0]const u8, (fn (*State) Error!c_int) };
 
 /// Sets each function, wrapped (`wrap`), as a field of the table on top.
 pub fn setFuncs(L: *State, comptime fns: []const Fn) void {
-    inline for (fns) |f| {
-        c.lua_pushcclosure(L, wrap(f[1]), 0);
-        c.lua_setfield(L, -2, f[0].ptr);
+    inline for (fns) |entry| {
+        const name, const function = entry;
+        c.lua_pushcclosure(L, wrap(function), 0);
+        c.lua_setfield(L, -2, name.ptr);
     }
 }
 
@@ -673,7 +676,11 @@ test "errors come back as messages, and the sandbox holds" {
     try testing.expect(std.mem.find(u8, message, "traceback") != null);
     // Nothing that ends the daemon or runs native code is reachable.
     try testing.expect(
-        runCode(L, arena, "assert(os.exit == nil and os.execute == nil and io.popen == nil)") == null,
+        runCode(
+            L,
+            arena,
+            "assert(os.exit == nil and os.execute == nil and io.popen == nil)",
+        ) == null,
     );
     try testing.expect(
         runCode(
@@ -727,7 +734,8 @@ test "what the time limit cannot stop is out of reach" {
     const arena = arena_state.allocator();
 
     // A finalizer runs with the instruction hook off: none can be set.
-    const gc_error = runCode(L, arena, "setmetatable({}, { __gc = function() while true do end end })").?;
+    const finalizer = "setmetatable({}, { __gc = function() while true do end end })";
+    const gc_error = runCode(L, arena, finalizer).?;
     try testing.expect(std.mem.find(u8, gc_error, "__gc is not available") != null);
     try testing.expect(runCode(L, arena, "setmetatable({}, { __gc = false })") != null);
     try testing.expect(runCode(
@@ -744,7 +752,8 @@ test "what the time limit cannot stop is out of reach" {
         arena,
         "assert(io.stdin == nil and io.read() == nil and io.lines()() == nil)",
     ) == null);
-    try testing.expect(std.mem.find(u8, runCode(L, arena, "dofile()").?, "file name expected") != null);
+    const dofile_error = runCode(L, arena, "dofile()").?;
+    try testing.expect(std.mem.find(u8, dofile_error, "file name expected") != null);
 
     // A FIFO would wait for a writer forever; regular and missing files
     // behave as usual.

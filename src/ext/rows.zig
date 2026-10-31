@@ -377,7 +377,12 @@ fn actionArgv(
 
 /// `keywords`: a string, or a list of strings joined with spaces; up to
 /// `keywords_bytes_max`.
-pub fn keywords(L: *lua.State, arena: std.mem.Allocator, table: c_int, where: []const u8) []const u8 {
+pub fn keywords(
+    L: *lua.State,
+    arena: std.mem.Allocator,
+    table: c_int,
+    where: []const u8,
+) []const u8 {
     const mark: lua.StackMark = .init(L);
     defer mark.restore(L);
     switch (lua.getField(L, table, "keywords")) {

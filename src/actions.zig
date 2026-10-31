@@ -278,7 +278,7 @@ pub fn autoEditor() [:0]const u8 {
 
 fn resolveTerminal(settings: *const Settings) [:0]const u8 {
     for (settings_mod.terminals) |terminal| {
-        const command = terminal[0];
+        const command, _ = terminal;
         if (std.mem.eql(u8, command, settings.terminal)) return command;
     }
     return autoTerminal();
@@ -288,7 +288,10 @@ fn resolveTerminal(settings: *const Settings) [:0]const u8 {
 /// installed.
 pub fn autoTerminal() [:0]const u8 {
     if (c.g_getenv("TERMINAL")) |terminal| return std.mem.span(terminal);
-    for (settings_mod.terminals) |terminal| if (proc.have(terminal[0])) return terminal[0];
+    for (settings_mod.terminals) |terminal| {
+        const command, _ = terminal;
+        if (proc.have(command)) return command;
+    }
     return "xterm";
 }
 
@@ -623,8 +626,9 @@ pub fn pasteChord(class: []const u8) Chord {
 test "editors open at a line, terminal ones inside a terminal" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
+    const allocator = arena.allocator();
     const Case = struct { []const u8, []const []const u8, bool };
+    // The editor command, the argv it gives, whether it runs in a terminal.
     const cases = [_]Case{
         .{ "nvim", &.{ "nvim", "+12", "/x/a.zig" }, true },
         .{ "/usr/bin/vim", &.{ "/usr/bin/vim", "+12", "/x/a.zig" }, true },
@@ -641,15 +645,17 @@ test "editors open at a line, terminal ones inside a terminal" {
         .{ "vim 'x", &.{ "vim 'x", "+12", "/x/a.zig" }, true },
     };
     for (cases) |case| {
-        const cmd = try editorCommand(a, try words(a, case[0]), "/x/a.zig", 12);
-        try std.testing.expectEqual(case[2], cmd.in_terminal);
-        try std.testing.expectEqual(case[1].len, cmd.argv.len);
-        for (case[1], cmd.argv) |want, got| try std.testing.expectEqualStrings(want, got);
+        const editor, const argv_expected, const in_terminal = case;
+        const command = try editorCommand(allocator, try words(allocator, editor), "/x/a.zig", 12);
+        try std.testing.expectEqual(in_terminal, command.in_terminal);
+        try std.testing.expectEqual(argv_expected.len, command.argv.len);
+        for (argv_expected, command.argv) |want, got| try std.testing.expectEqualStrings(want, got);
     }
-    try std.testing.expectEqualStrings("start", (try terminalPrefix(a, &.{"wezterm"}))[1]);
-    try std.testing.expectEqual(@as(usize, 1), (try terminalPrefix(a, &.{"kitty"})).len);
-    try std.testing.expectEqualStrings("-e", (try terminalPrefix(a, &.{"ghostty"}))[1]);
-    const kitty = try terminalPrefix(a, try words(a, "/usr/bin/kitty --single-instance"));
+    try std.testing.expectEqualStrings("start", (try terminalPrefix(allocator, &.{"wezterm"}))[1]);
+    try std.testing.expectEqual(@as(usize, 1), (try terminalPrefix(allocator, &.{"kitty"})).len);
+    try std.testing.expectEqualStrings("-e", (try terminalPrefix(allocator, &.{"ghostty"}))[1]);
+    const kitty_words = try words(allocator, "/usr/bin/kitty --single-instance");
+    const kitty = try terminalPrefix(allocator, kitty_words);
     try std.testing.expectEqual(@as(usize, 2), kitty.len);
     try std.testing.expectEqualStrings("--single-instance", kitty[1]);
 }
