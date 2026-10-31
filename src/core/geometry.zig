@@ -44,8 +44,8 @@ pub const Monitor = struct {
         return true;
     }
 
-    fn inRange(value: i32, min: i32, max: i32) bool {
-        return value >= min and value <= max;
+    fn inRange(value: i32, value_min: i32, value_max: i32) bool {
+        return value >= value_min and value <= value_max;
     }
 
     /// The area windows may use, in global layout coordinates.
@@ -90,14 +90,24 @@ pub fn place(layout: Layout, outer: Rect, current: Size, gap_px: i32) Rect {
         .w = outer.w - 2 * gap_px,
         .h = outer.h - 2 * gap_px,
     };
-    const half_w = @divTrunc(area.w - gap_px, 2);
-    const half_h = @divTrunc(area.h - gap_px, 2);
+    const half_width = @divTrunc(area.w - gap_px, 2);
+    const half_height = @divTrunc(area.h - gap_px, 2);
     const third = @divTrunc(area.w - 2 * gap_px, 3);
     const placed: Rect = switch (layout) {
-        .left_half => .{ .x = area.x, .y = area.y, .w = half_w, .h = area.h },
-        .right_half => .{ .x = area.x + area.w - half_w, .y = area.y, .w = half_w, .h = area.h },
-        .top_half => .{ .x = area.x, .y = area.y, .w = area.w, .h = half_h },
-        .bottom_half => .{ .x = area.x, .y = area.y + area.h - half_h, .w = area.w, .h = half_h },
+        .left_half => .{ .x = area.x, .y = area.y, .w = half_width, .h = area.h },
+        .right_half => .{
+            .x = area.x + area.w - half_width,
+            .y = area.y,
+            .w = half_width,
+            .h = area.h,
+        },
+        .top_half => .{ .x = area.x, .y = area.y, .w = area.w, .h = half_height },
+        .bottom_half => .{
+            .x = area.x,
+            .y = area.y + area.h - half_height,
+            .w = area.w,
+            .h = half_height,
+        },
         .maximize => area,
         .almost_maximize => shrinkCentered(area, 0.9),
         .center => centered(area, @min(current.w, area.w), @min(current.h, area.h)),
@@ -106,7 +116,8 @@ pub fn place(layout: Layout, outer: Rect, current: Size, gap_px: i32) Rect {
         .last_third => .{ .x = area.x + area.w - third, .y = area.y, .w = third, .h = area.h },
     };
     // On any area with room for the gaps, the window stays inside it.
-    if (third >= 0 and half_w >= 0 and half_h >= 0) assert(contains(area, placed));
+    const room_for_gaps = third >= 0 and half_width >= 0 and half_height >= 0;
+    if (room_for_gaps) assert(contains(area, placed));
     return placed;
 }
 
@@ -120,18 +131,18 @@ fn contains(outer: Rect, inner: Rect) bool {
 }
 
 fn shrinkCentered(area: Rect, factor: f64) Rect {
-    const w: i32 = @intFromFloat(@as(f64, @floatFromInt(area.w)) * factor);
-    const h: i32 = @intFromFloat(@as(f64, @floatFromInt(area.h)) * factor);
-    return centered(area, w, h);
+    const width_px: i32 = @intFromFloat(@as(f64, @floatFromInt(area.w)) * factor);
+    const height_px: i32 = @intFromFloat(@as(f64, @floatFromInt(area.h)) * factor);
+    return centered(area, width_px, height_px);
 }
 
-/// A rectangle of `w` by `h` in the middle of `area`.
-fn centered(area: Rect, w: i32, h: i32) Rect {
+/// A rectangle of `width_px` by `height_px` in the middle of `area`.
+fn centered(area: Rect, width_px: i32, height_px: i32) Rect {
     return .{
-        .x = area.x + @divTrunc(area.w - w, 2),
-        .y = area.y + @divTrunc(area.h - h, 2),
-        .w = w,
-        .h = h,
+        .x = area.x + @divTrunc(area.w - width_px, 2),
+        .y = area.y + @divTrunc(area.h - height_px, 2),
+        .w = width_px,
+        .h = height_px,
     };
 }
 

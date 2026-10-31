@@ -79,7 +79,7 @@ pub fn of(mime: []const u8, name: []const u8, entry: Entry) ?Kind {
     if (entry == .folder) return .folder;
     if (std.mem.eql(u8, mime, "inode/directory")) return .folder;
     if (std.mem.eql(u8, mime, "text/markdown")) return .markdown;
-    if (hasExt(name, &.{ ".md", ".markdown" })) return .markdown;
+    if (hasExtension(name, &.{ ".md", ".markdown" })) return .markdown;
     if (isAny(mime, &.{ "text/html", "application/xhtml+xml" })) return .html;
     if (std.mem.eql(u8, mime, "application/pdf")) return .pdf;
     if (std.mem.startsWith(u8, mime, "image/")) return .image;
@@ -145,25 +145,28 @@ fn isAny(mime: []const u8, mimes: []const []const u8) bool {
     return false;
 }
 
-/// "log" for "server.LOG", in `buf`: null when the name has none (no dot,
-/// only a leading one, a trailing one) or it is longer than `buf`.
-pub fn lowerExt(buf: []u8, name: []const u8) ?[]const u8 {
+/// "log" for "server.LOG", in `extension_buffer`: null when the name has
+/// none (no dot, only a leading one, a trailing one) or it is longer than
+/// `extension_buffer`.
+pub fn lowerExt(extension_buffer: []u8, name: []const u8) ?[]const u8 {
     const dot = std.mem.findScalarLast(u8, name, '.') orelse return null;
-    const ext = name[dot + 1 ..];
-    if (dot == 0 or ext.len == 0 or ext.len > buf.len) return null;
-    return std.ascii.lowerString(buf, ext);
+    const extension = name[dot + 1 ..];
+    if (dot == 0) return null;
+    if (extension.len == 0) return null;
+    if (extension.len > extension_buffer.len) return null;
+    return std.ascii.lowerString(extension_buffer, extension);
 }
 
 /// ".log" for "server.LOG": the key an extension override is stored under
 /// (lowercase, with the dot). Empty when the name has no extension.
-pub fn extKey(buf: []u8, name: []const u8) []const u8 {
-    if (buf.len < 2) return "";
-    const ext = lowerExt(buf[1..], name) orelse return "";
-    buf[0] = '.';
-    return buf[0 .. 1 + ext.len];
+pub fn extKey(key_buffer: []u8, name: []const u8) []const u8 {
+    if (key_buffer.len < 2) return "";
+    const extension = lowerExt(key_buffer[1..], name) orelse return "";
+    key_buffer[0] = '.';
+    return key_buffer[0 .. 1 + extension.len];
 }
 
-fn hasExt(name: []const u8, extensions: []const []const u8) bool {
+fn hasExtension(name: []const u8, extensions: []const []const u8) bool {
     for (extensions) |extension| {
         // The name must be more than the extension: ".md" alone is not one.
         if (name.len > extension.len and std.ascii.endsWithIgnoreCase(name, extension)) {
@@ -174,48 +177,49 @@ fn hasExt(name: []const u8, extensions: []const []const u8) bool {
 }
 
 test "kinds from MIME type and name" {
-    const t = std.testing;
-    try t.expectEqual(Kind.folder, of("", "Projects", .folder));
-    try t.expectEqual(Kind.pdf, of("application/pdf", "a.pdf", .file));
-    try t.expectEqual(Kind.image, of("image/jpeg", "a.jpg", .file));
-    try t.expectEqual(Kind.video, of("video/mp4", "a.mp4", .file));
-    try t.expectEqual(Kind.audio, of("audio/flac", "a.flac", .file));
-    try t.expectEqual(Kind.markdown, of("text/markdown", "README.md", .file));
-    try t.expectEqual(Kind.markdown, of("application/octet-stream", "notes.MD", .file));
-    try t.expectEqual(Kind.html, of("text/html", "index.html", .file));
-    try t.expectEqual(Kind.text, of("text/plain", "a.txt", .file));
-    try t.expectEqual(Kind.text, of("text/rust", "lib.rs", .file));
-    try t.expectEqual(Kind.text, of("application/json", "a.json", .file));
-    try t.expectEqual(Kind.office, of(
+    const testing = std.testing;
+    try testing.expectEqual(Kind.folder, of("", "Projects", .folder));
+    try testing.expectEqual(Kind.pdf, of("application/pdf", "a.pdf", .file));
+    try testing.expectEqual(Kind.image, of("image/jpeg", "a.jpg", .file));
+    try testing.expectEqual(Kind.video, of("video/mp4", "a.mp4", .file));
+    try testing.expectEqual(Kind.audio, of("audio/flac", "a.flac", .file));
+    try testing.expectEqual(Kind.markdown, of("text/markdown", "README.md", .file));
+    try testing.expectEqual(Kind.markdown, of("application/octet-stream", "notes.MD", .file));
+    try testing.expectEqual(Kind.html, of("text/html", "index.html", .file));
+    try testing.expectEqual(Kind.text, of("text/plain", "a.txt", .file));
+    try testing.expectEqual(Kind.text, of("text/rust", "lib.rs", .file));
+    try testing.expectEqual(Kind.text, of("application/json", "a.json", .file));
+    try testing.expectEqual(Kind.office, of(
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "a.docx",
         .file,
     ));
-    try t.expectEqual(Kind.archive, of("application/zip", "a.zip", .file));
+    try testing.expectEqual(Kind.archive, of("application/zip", "a.zip", .file));
     // GLib's guesses for code it does not know.
-    try t.expectEqual(Kind.text, of("application/octet-stream", "main.zig", .file));
-    try t.expectEqual(Kind.text, of("video/mp2t", "app.ts", .file));
-    try t.expectEqual(@as(?Kind, null), of("application/x-executable", "a.out", .file));
-    try t.expectEqual(@as(?Kind, null), of("application/octet-stream", "firmware.bin", .file));
-    try t.expectEqual(Kind.text, Kind.markdown.fallback().?);
+    try testing.expectEqual(Kind.text, of("application/octet-stream", "main.zig", .file));
+    try testing.expectEqual(Kind.text, of("video/mp2t", "app.ts", .file));
+    try testing.expectEqual(@as(?Kind, null), of("application/x-executable", "a.out", .file));
+    try testing.expectEqual(@as(?Kind, null), of("application/octet-stream", "firmware.bin", .file));
+    try testing.expectEqual(Kind.text, Kind.markdown.fallback().?);
 }
 
 test "extension keys" {
-    var buf: [16]u8 = undefined;
-    try std.testing.expectEqualStrings(".log", extKey(&buf, "server.LOG"));
-    try std.testing.expectEqualStrings(".gz", extKey(&buf, "a.tar.gz"));
-    try std.testing.expectEqualStrings("", extKey(&buf, ".bashrc"));
-    try std.testing.expectEqualStrings("", extKey(&buf, "Makefile"));
-    try std.testing.expectEqualStrings("", extKey(&buf, "trailing."));
+    var key_buffer: [16]u8 = undefined;
+    try std.testing.expectEqualStrings(".log", extKey(&key_buffer, "server.LOG"));
+    try std.testing.expectEqualStrings(".gz", extKey(&key_buffer, "a.tar.gz"));
+    try std.testing.expectEqualStrings("", extKey(&key_buffer, ".bashrc"));
+    try std.testing.expectEqualStrings("", extKey(&key_buffer, "Makefile"));
+    try std.testing.expectEqualStrings("", extKey(&key_buffer, "trailing."));
 }
 
 test "lowerExt and extKey" {
-    var buf: [8]u8 = undefined;
-    try std.testing.expectEqualStrings("log", lowerExt(&buf, "server.LOG").?);
-    try std.testing.expectEqualStrings("gz", lowerExt(&buf, "a.tar.gz").?);
-    for ([_][]const u8{ "README", ".bashrc", "trailing.", "x.toolongext" }) |n|
-        try std.testing.expect(lowerExt(&buf, n) == null);
-    try std.testing.expectEqualStrings(".log", extKey(&buf, "server.LOG"));
-    try std.testing.expectEqualStrings("", extKey(&buf, ".bashrc"));
-    try std.testing.expectEqualStrings("", extKey(buf[0..4], "x.abcd"));
+    var buffer: [8]u8 = undefined;
+    try std.testing.expectEqualStrings("log", lowerExt(&buffer, "server.LOG").?);
+    try std.testing.expectEqualStrings("gz", lowerExt(&buffer, "a.tar.gz").?);
+    for ([_][]const u8{ "README", ".bashrc", "trailing.", "x.toolongext" }) |name| {
+        try std.testing.expect(lowerExt(&buffer, name) == null);
+    }
+    try std.testing.expectEqualStrings(".log", extKey(&buffer, "server.LOG"));
+    try std.testing.expectEqualStrings("", extKey(&buffer, ".bashrc"));
+    try std.testing.expectEqualStrings("", extKey(buffer[0..4], "x.abcd"));
 }

@@ -34,15 +34,17 @@ const letters: *const [192]u8 =
 /// Whether code point U+00C0..U+017F is an uppercase letter. Latin-1 puts
 /// capitals at C0-DE; Extended-A alternates capital/small in pairs, with the
 /// phase shifted by ĸ (U+0138), ŉ (U+0149) and Ÿ (U+0178).
-fn upperCodePoint(cp: u21) bool {
-    if (cp < 0x100) return cp >= 0xC0 and cp <= 0xDE and cp != 0xD7;
-    if (cp <= 0x137) return cp % 2 == 0;
-    if (cp == 0x138) return false;
-    if (cp <= 0x148) return cp % 2 == 1;
-    if (cp == 0x149) return false;
-    if (cp <= 0x177) return cp % 2 == 0;
-    if (cp == 0x178) return true;
-    if (cp <= 0x17E) return cp % 2 == 1;
+fn upperCodePoint(code_point: u21) bool {
+    if (code_point < 0x100) {
+        return code_point >= 0xC0 and code_point <= 0xDE and code_point != 0xD7;
+    }
+    if (code_point <= 0x137) return code_point % 2 == 0;
+    if (code_point == 0x138) return false;
+    if (code_point <= 0x148) return code_point % 2 == 1;
+    if (code_point == 0x149) return false;
+    if (code_point <= 0x177) return code_point % 2 == 0;
+    if (code_point == 0x178) return true;
+    if (code_point <= 0x17E) return code_point % 2 == 1;
     return false;
 }
 
@@ -75,75 +77,75 @@ fn isFoldableLead(byte: u8) bool {
     return byte >= lead_first and byte <= lead_last;
 }
 
-/// Index into `letters` of the two-byte letter at `text[pos]`, or null when
-/// the bytes there are not a foldable letter.
-inline fn letterAt(text: []const u8, pos: usize) ?usize {
-    const lead = text[pos];
+/// Index into `letters` of the two-byte letter at `text[index]`, or null
+/// when the bytes there are not a foldable letter.
+inline fn letterAt(text: []const u8, index: usize) ?usize {
+    const lead = text[index];
     if (!isFoldableLead(lead)) return null;
-    if (pos + 1 == text.len) return null;
-    const continuation = text[pos + 1];
+    if (index + 1 == text.len) return null;
+    const continuation = text[index + 1];
     if (continuation & 0xC0 != 0x80) return null;
     const letter_index = @as(usize, lead - lead_first) * 64 + (continuation & 0x3F);
     return if (letters[letter_index] != 0) letter_index else null;
 }
 
-/// Folded character at `text[pos.*]`; advances `pos` past it (by 1 or 2
-/// bytes). `pos.*` must be < `text.len`.
-pub inline fn step(text: []const u8, pos: *usize) u8 {
-    const byte = text[pos.*];
+/// Folded character at `text[index.*]`; advances `index` past it (by 1 or
+/// 2 bytes). `index.*` must be < `text.len`.
+pub inline fn step(text: []const u8, index: *usize) u8 {
+    const byte = text[index.*];
     if (isFoldableLead(byte)) {
-        if (letterAt(text, pos.*)) |letter_index| {
-            pos.* += 2;
+        if (letterAt(text, index.*)) |letter_index| {
+            index.* += 2;
             return letters[letter_index];
         }
     }
-    pos.* += 1;
+    index.* += 1;
     return std.ascii.toLower(byte);
 }
 
 /// Like `step`, also telling whether the original was uppercase.
-pub inline fn next(text: []const u8, pos: *usize) Char {
-    const byte = text[pos.*];
+pub inline fn next(text: []const u8, index: *usize) Char {
+    const byte = text[index.*];
     if (isFoldableLead(byte)) {
-        if (letterAt(text, pos.*)) |letter_index| {
-            pos.* += 2;
+        if (letterAt(text, index.*)) |letter_index| {
+            index.* += 2;
             return .{ .byte = letters[letter_index], .upper = uppers[letter_index] };
         }
     }
-    pos.* += 1;
+    index.* += 1;
     return .{ .byte = std.ascii.toLower(byte), .upper = std.ascii.isUpper(byte) };
 }
 
 /// True when the second byte of a two-byte foldable letter is at
-/// `text[pos]`: not the start of a folded character.
-pub fn insideLetter(text: []const u8, pos: usize) bool {
-    if (pos == 0) return false;
-    if (text[pos] & 0xC0 != 0x80) return false;
-    return letterAt(text, pos - 1) != null;
+/// `text[index]`: not the start of a folded character.
+pub fn insideLetter(text: []const u8, index: usize) bool {
+    if (index == 0) return false;
+    if (text[index] & 0xC0 != 0x80) return false;
+    return letterAt(text, index - 1) != null;
 }
 
-/// Writes the folded `text` into `buf`; returns the written part. Truncated
-/// to `buf.len` folded characters if `text` folds to more.
-pub fn foldInto(buf: []u8, text: []const u8) []u8 {
-    var pos: usize = 0;
+/// Writes the folded `text` into `folded`; returns the written part.
+/// Truncated to `folded.len` folded characters if `text` folds to more.
+pub fn foldInto(folded: []u8, text: []const u8) []u8 {
+    var text_index: usize = 0;
     var folded_len: usize = 0;
-    while (pos < text.len and folded_len < buf.len) : (folded_len += 1) {
-        buf[folded_len] = step(text, &pos);
+    while (text_index < text.len and folded_len < folded.len) : (folded_len += 1) {
+        folded[folded_len] = step(text, &text_index);
     }
     // A folded character is never longer than the original one.
     std.debug.assert(folded_len <= text.len);
-    return buf[0..folded_len];
+    return folded[0..folded_len];
 }
 
-/// Like `foldInto`, also recording in `upper` (as long as `buf`) which
+/// Like `foldInto`, also recording in `upper` (as long as `folded`) which
 /// folded characters were uppercase letters. Returns the folded length.
-pub fn foldCase(buf: []u8, upper: []bool, text: []const u8) usize {
-    std.debug.assert(upper.len >= buf.len);
-    var pos: usize = 0;
+pub fn foldCase(folded: []u8, upper: []bool, text: []const u8) usize {
+    std.debug.assert(upper.len >= folded.len);
+    var text_index: usize = 0;
     var folded_len: usize = 0;
-    while (pos < text.len and folded_len < buf.len) : (folded_len += 1) {
-        const char = next(text, &pos);
-        buf[folded_len] = char.byte;
+    while (text_index < text.len and folded_len < folded.len) : (folded_len += 1) {
+        const char = next(text, &text_index);
+        folded[folded_len] = char.byte;
         upper[folded_len] = char.upper;
     }
     std.debug.assert(folded_len <= text.len);
@@ -152,29 +154,29 @@ pub fn foldCase(buf: []u8, upper: []bool, text: []const u8) usize {
 
 /// The folded string. Caller owns it.
 pub fn foldAlloc(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.Error![]u8 {
-    const buf = try gpa.alloc(u8, text.len);
-    errdefer gpa.free(buf);
-    return gpa.realloc(buf, foldInto(buf, text).len);
+    const folded = try gpa.alloc(u8, text.len);
+    errdefer gpa.free(folded);
+    return gpa.realloc(folded, foldInto(folded, text).len);
 }
 
 /// Folded characters in `text` (its folded length).
 pub fn foldedLen(text: []const u8) usize {
-    var pos: usize = 0;
+    var text_index: usize = 0;
     var folded_len: usize = 0;
-    while (pos < text.len) : (folded_len += 1) _ = step(text, &pos);
+    while (text_index < text.len) : (folded_len += 1) _ = step(text, &text_index);
     return folded_len;
 }
 
 /// Pure ASCII: folding is only lowercasing, byte for byte.
 pub fn isAscii(text: []const u8) bool {
     const Block = @Vector(16, u8);
-    var pos: usize = 0;
-    while (pos + 16 <= text.len) : (pos += 16) {
-        const block: Block = text[pos..][0..16].*;
+    var block_start: usize = 0;
+    while (block_start + 16 <= text.len) : (block_start += 16) {
+        const block: Block = text[block_start..][0..16].*;
         if (@reduce(.Or, block) >= 0x80) return false;
     }
     var bits: u8 = 0;
-    for (text[pos..]) |byte| bits |= byte;
+    for (text[block_start..]) |byte| bits |= byte;
     return bits < 0x80;
 }
 
@@ -182,10 +184,10 @@ pub fn isAscii(text: []const u8) bool {
 
 const testing = std.testing;
 
-fn expectFold(want: []const u8, s: []const u8) !void {
-    var buf: [512]u8 = undefined;
-    try testing.expectEqualStrings(want, foldInto(&buf, s));
-    try testing.expectEqual(want.len, foldedLen(s));
+fn expectFold(want: []const u8, text: []const u8) !void {
+    var folded: [512]u8 = undefined;
+    try testing.expectEqualStrings(want, foldInto(&folded, text));
+    try testing.expectEqual(want.len, foldedLen(text));
 }
 
 test "Latin-1 Supplement letters fold to their base letter" {
@@ -202,57 +204,59 @@ test "Latin Extended-A letters fold to their base letter" {
 }
 
 test "every code point of both blocks: one ASCII letter, or itself for × ÷" {
-    var cp: u21 = 0xC0;
-    while (cp <= 0x17F) : (cp += 1) {
-        var enc: [4]u8 = undefined;
-        const n = try std.unicode.utf8Encode(cp, &enc);
-        try testing.expectEqual(@as(usize, 2), n);
-        var buf: [4]u8 = undefined;
-        const f = foldInto(&buf, enc[0..n]);
-        if (cp == 0xD7 or cp == 0xF7) {
-            try testing.expectEqualSlices(u8, enc[0..n], f);
+    var code_point: u21 = 0xC0;
+    while (code_point <= 0x17F) : (code_point += 1) {
+        var encoded_buffer: [4]u8 = undefined;
+        const encoded_len = try std.unicode.utf8Encode(code_point, &encoded_buffer);
+        try testing.expectEqual(@as(usize, 2), encoded_len);
+        const encoded = encoded_buffer[0..encoded_len];
+        var folded_buffer: [4]u8 = undefined;
+        const folded = foldInto(&folded_buffer, encoded);
+        if (code_point == 0xD7 or code_point == 0xF7) {
+            try testing.expectEqualSlices(u8, encoded, folded);
         } else {
-            try testing.expectEqual(@as(usize, 1), f.len);
-            try testing.expect(f[0] >= 'a' and f[0] <= 'z');
-            try testing.expect(insideLetter(enc[0..n], 1));
+            try testing.expectEqual(@as(usize, 1), folded.len);
+            try testing.expect(std.ascii.isLower(folded[0]));
+            try testing.expect(insideLetter(encoded, 1));
         }
     }
 }
 
 test "case of the original letter" {
-    const cases = [_]struct { s: []const u8, upper: bool }{
-        .{ .s = "A", .upper = true },  .{ .s = "a", .upper = false },
-        .{ .s = "É", .upper = true },
-        .{ .s = "é", .upper = false },
-        .{ .s = "Ñ", .upper = true },
-        .{ .s = "ß", .upper = false },
-        .{ .s = "Ÿ", .upper = true },
-        .{ .s = "ÿ", .upper = false },
-        .{ .s = "İ", .upper = true },
-        .{ .s = "ı", .upper = false },
-        .{ .s = "ĸ", .upper = false },
-        .{ .s = "Ĺ", .upper = true },
-        .{ .s = "Ł", .upper = true },
-        .{ .s = "ł", .upper = false },
-        .{ .s = "ŉ", .upper = false },
-        .{ .s = "Ŋ", .upper = true },
-        .{ .s = "Ž", .upper = true },
-        .{ .s = "ž", .upper = false },
-        .{ .s = "ſ", .upper = false },
-        .{ .s = "Œ", .upper = true },
-        .{ .s = "1", .upper = false },
+    const cases = [_]struct { text: []const u8, upper: bool }{
+        .{ .text = "A", .upper = true },  .{ .text = "a", .upper = false },
+        .{ .text = "É", .upper = true },
+        .{ .text = "é", .upper = false },
+        .{ .text = "Ñ", .upper = true },
+        .{ .text = "ß", .upper = false },
+        .{ .text = "Ÿ", .upper = true },
+        .{ .text = "ÿ", .upper = false },
+        .{ .text = "İ", .upper = true },
+        .{ .text = "ı", .upper = false },
+        .{ .text = "ĸ", .upper = false },
+        .{ .text = "Ĺ", .upper = true },
+        .{ .text = "Ł", .upper = true },
+        .{ .text = "ł", .upper = false },
+        .{ .text = "ŉ", .upper = false },
+        .{ .text = "Ŋ", .upper = true },
+        .{ .text = "Ž", .upper = true },
+        .{ .text = "ž", .upper = false },
+        .{ .text = "ſ", .upper = false },
+        .{ .text = "Œ", .upper = true },
+        .{ .text = "1", .upper = false },
     };
-    for (cases) |c| {
+    for (cases) |case| {
         var i: usize = 0;
-        const ch = next(c.s, &i);
-        try testing.expectEqual(c.s.len, i);
-        try testing.expectEqual(c.upper, ch.upper);
+        const char = next(case.text, &i);
+        try testing.expectEqual(case.text.len, i);
+        try testing.expectEqual(case.upper, char.upper);
     }
-    var buf: [16]u8 = undefined;
-    var up: [16]bool = undefined;
-    const n = foldCase(&buf, &up, "ÁrbolÑ");
-    try testing.expectEqualStrings("arboln", buf[0..n]);
-    try testing.expectEqualSlices(bool, &.{ true, false, false, false, false, true }, up[0..n]);
+    var folded: [16]u8 = undefined;
+    var upper: [16]bool = undefined;
+    const folded_len = foldCase(&folded, &upper, "ÁrbolÑ");
+    try testing.expectEqualStrings("arboln", folded[0..folded_len]);
+    const upper_want = [_]bool{ true, false, false, false, false, true };
+    try testing.expectEqualSlices(bool, &upper_want, upper[0..folded_len]);
 }
 
 test "symbols never fold to letters" {
@@ -269,7 +273,7 @@ test "symbols never fold to letters" {
         "€",
         "ж",
         "日本",
-    }) |s| try expectFold(s, s);
+    }) |symbol| try expectFold(symbol, symbol);
     try expectFold("¿que?", "¿Qué?");
     try expectFold("3×4", "3×4");
 }
@@ -293,8 +297,8 @@ test "folding is idempotent and never lengthens" {
     var once: [64]u8 = undefined;
     var twice: [64]u8 = undefined;
     for (0..5000) |_| {
-        var len: usize = 0;
-        while (len < 50) {
+        var text_len: usize = 0;
+        while (text_len < 50) {
             var random_byte: [1]u8 = undefined;
             const piece = if (random.boolean()) blk: {
                 break :blk pieces[random.uintLessThan(usize, pieces.len)];
@@ -302,14 +306,14 @@ test "folding is idempotent and never lengthens" {
                 random_byte[0] = random.int(u8);
                 break :blk &random_byte;
             };
-            @memcpy(text[len .. len + piece.len], piece);
-            len += piece.len;
+            @memcpy(text[text_len .. text_len + piece.len], piece);
+            text_len += piece.len;
         }
-        const folded_once = foldInto(&once, text[0..len]);
+        const folded_once = foldInto(&once, text[0..text_len]);
         const folded_twice = foldInto(&twice, folded_once);
         try testing.expectEqualSlices(u8, folded_once, folded_twice);
-        try testing.expect(folded_once.len <= len);
-        try testing.expectEqual(folded_once.len, foldedLen(text[0..len]));
+        try testing.expect(folded_once.len <= text_len);
+        try testing.expectEqual(folded_once.len, foldedLen(text[0..text_len]));
     }
 }
 
@@ -323,9 +327,9 @@ test "isAscii" {
 }
 
 test "foldAlloc and a truncating buffer" {
-    const f = try foldAlloc(testing.allocator, "ÑANDÚ y Acción");
-    defer testing.allocator.free(f);
-    try testing.expectEqualStrings("nandu y accion", f);
+    const folded = try foldAlloc(testing.allocator, "ÑANDÚ y Acción");
+    defer testing.allocator.free(folded);
+    try testing.expectEqualStrings("nandu y accion", folded);
     var small: [3]u8 = undefined;
     try testing.expectEqualStrings("acc", foldInto(&small, "Acción"));
 }

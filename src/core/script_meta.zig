@@ -97,7 +97,7 @@ fn stripComment(line: []const u8) ?[]const u8 {
 }
 
 test "header" {
-    const src =
+    const source =
         \\#!/bin/bash
         \\
         \\# Required parameters:
@@ -111,22 +111,22 @@ test "header" {
         \\
         \\pkill waybar; waybar &
     ;
-    const m = parse(src).?;
-    try std.testing.expectEqualStrings("Restart Waybar", m.title);
-    try std.testing.expectEqual(Mode.compact, m.mode);
-    try std.testing.expectEqualStrings("🔄", m.icon);
-    try std.testing.expectEqualStrings("System", m.package_name);
+    const meta = parse(source).?;
+    try std.testing.expectEqualStrings("Restart Waybar", meta.title);
+    try std.testing.expectEqual(Mode.compact, meta.mode);
+    try std.testing.expectEqualStrings("🔄", meta.icon);
+    try std.testing.expectEqualStrings("System", meta.package_name);
 }
 
 test "@raycast keys and other comment styles" {
-    const src =
+    const source =
         \\#!/usr/bin/env node
         \\// @raycast.title Say Hi
         \\// @raycast.needsConfirmation true
     ;
-    const m = parse(src).?;
-    try std.testing.expectEqualStrings("Say Hi", m.title);
-    try std.testing.expect(m.needs_confirmation);
+    const meta = parse(source).?;
+    try std.testing.expectEqualStrings("Say Hi", meta.title);
+    try std.testing.expect(meta.needs_confirmation);
 }
 
 test "no title, no command" {

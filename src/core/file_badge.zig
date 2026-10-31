@@ -67,32 +67,32 @@ const named = [_]struct { []const u8, []const u8, Color }{
 /// Badge for a file name, or null when the theme icon fits better (media,
 /// documents, archives, no extension at all). Unknown short extensions get a
 /// gray badge: still more telling than a blank page.
-pub fn of(name: []const u8, upper_buf: *[4]u8) ?Badge {
+pub fn of(name: []const u8, text_buffer: *[4]u8) ?Badge {
     for (named) |entry| {
         const file_name, const text, const color = entry;
         if (std.mem.eql(u8, name, file_name)) return .{ .text = text, .color = color };
     }
-    var lower_buf: [16]u8 = undefined;
-    const lower = lowerExt(&lower_buf, name) orelse return null;
-    const ext = name[name.len - lower.len ..];
-    for (themed) |themed_ext| {
-        if (std.mem.eql(u8, lower, themed_ext)) return null;
+    var extension_buffer: [16]u8 = undefined;
+    const lower = lowerExt(&extension_buffer, name) orelse return null;
+    const extension = name[name.len - lower.len ..];
+    for (themed) |themed_extension| {
+        if (std.mem.eql(u8, lower, themed_extension)) return null;
     }
     const color = knownColor(lower);
-    if (color == null and ext.len > upper_buf.len) return null;
+    if (color == null and extension.len > text_buffer.len) return null;
     // Only letters and digits make a badge: "tar.gz~" or "c++" do not.
-    for (ext[0..@min(ext.len, upper_buf.len)]) |char| {
+    for (extension[0..@min(extension.len, text_buffer.len)]) |char| {
         if (!std.ascii.isAlphanumeric(char)) return null;
     }
-    const text_len = @min(ext.len, upper_buf.len);
-    _ = std.ascii.upperString(upper_buf[0..text_len], ext[0..text_len]);
-    return .{ .text = upper_buf[0..text_len], .color = color orelse .gray };
+    const text_len = @min(extension.len, text_buffer.len);
+    _ = std.ascii.upperString(text_buffer[0..text_len], extension[0..text_len]);
+    return .{ .text = text_buffer[0..text_len], .color = color orelse .gray };
 }
 
-fn knownColor(lower_ext: []const u8) ?Color {
+fn knownColor(lower_extension: []const u8) ?Color {
     for (known) |entry| {
-        const known_ext, const color = entry;
-        if (std.mem.eql(u8, lower_ext, known_ext)) return color;
+        const known_extension, const color = entry;
+        if (std.mem.eql(u8, lower_extension, known_extension)) return color;
     }
     return null;
 }
@@ -103,31 +103,31 @@ pub fn isKnown(name: []const u8) bool {
     for (named) |entry| {
         if (std.mem.eql(u8, name, entry[0])) return true;
     }
-    var lower_buf: [16]u8 = undefined;
-    const lower = lowerExt(&lower_buf, name) orelse return false;
+    var extension_buffer: [16]u8 = undefined;
+    const lower = lowerExt(&extension_buffer, name) orelse return false;
     return knownColor(lower) != null;
 }
 
 test "languages get their colour and short uppercase text" {
-    var buf: [4]u8 = undefined;
-    const go = of("handler_test.go", &buf).?;
-    try std.testing.expectEqualStrings("GO", go.text);
-    try std.testing.expectEqual(Color.cyan, go.color);
-    try std.testing.expectEqualStrings("ZIG", of("Ui.zig", &buf).?.text);
-    try std.testing.expectEqualStrings("JSON", of("package.JSON", &buf).?.text);
-    try std.testing.expectEqualStrings("SWIF", of("App.swift", &buf).?.text);
+    var text_buffer: [4]u8 = undefined;
+    const badge = of("handler_test.go", &text_buffer).?;
+    try std.testing.expectEqualStrings("GO", badge.text);
+    try std.testing.expectEqual(Color.cyan, badge.color);
+    try std.testing.expectEqualStrings("ZIG", of("Ui.zig", &text_buffer).?.text);
+    try std.testing.expectEqualStrings("JSON", of("package.JSON", &text_buffer).?.text);
+    try std.testing.expectEqualStrings("SWIF", of("App.swift", &text_buffer).?.text);
 }
 
 test "themed types, odd names and no extension get no badge" {
-    var buf: [4]u8 = undefined;
-    try std.testing.expect(of("photo.PNG", &buf) == null);
-    try std.testing.expect(of("book.pdf", &buf) == null);
-    try std.testing.expect(of("README", &buf) == null);
-    try std.testing.expect(of(".bashrc", &buf) == null);
-    try std.testing.expect(of("data.verylongext", &buf) == null);
-    try std.testing.expectEqualStrings("MAKE", of("Makefile", &buf).?.text);
+    var text_buffer: [4]u8 = undefined;
+    try std.testing.expect(of("photo.PNG", &text_buffer) == null);
+    try std.testing.expect(of("book.pdf", &text_buffer) == null);
+    try std.testing.expect(of("README", &text_buffer) == null);
+    try std.testing.expect(of(".bashrc", &text_buffer) == null);
+    try std.testing.expect(of("data.verylongext", &text_buffer) == null);
+    try std.testing.expectEqualStrings("MAKE", of("Makefile", &text_buffer).?.text);
     // Unknown but short: gray.
-    try std.testing.expectEqual(Color.gray, of("notes.foo", &buf).?.color);
+    try std.testing.expectEqual(Color.gray, of("notes.foo", &text_buffer).?.color);
 }
 
 // ------------------------------------------------------------------ logos
@@ -214,11 +214,11 @@ pub fn logoOf(name: []const u8) ?Logo {
         const file_name, const logo = entry;
         if (std.mem.eql(u8, name, file_name)) return logo;
     }
-    var lower_buf: [16]u8 = undefined;
-    const lower = lowerExt(&lower_buf, name) orelse return null;
+    var extension_buffer: [16]u8 = undefined;
+    const lower = lowerExt(&extension_buffer, name) orelse return null;
     for (logos) |entry| {
-        const ext, const logo = entry;
-        if (std.mem.eql(u8, lower, ext)) return logo;
+        const logo_extension, const logo = entry;
+        if (std.mem.eql(u8, lower, logo_extension)) return logo;
     }
     return null;
 }
