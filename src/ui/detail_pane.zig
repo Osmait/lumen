@@ -124,6 +124,7 @@ pub fn prepareFor(detail: *DetailPane, view: Ui.View) void {
 
 pub fn showContentDetail(ui: *Ui, item: *const Item) void {
     const file = item.action.file;
+    const line = file.line.?;
     var arena_instance: std.heap.ArenaAllocator = .init(ui.gpa);
     defer arena_instance.deinit();
     const arena = arena_instance.allocator();
@@ -136,7 +137,7 @@ pub fn showContentDetail(ui: *Ui, item: *const Item) void {
         file.path,
         if (info) |file_info| file_info.mtime else 0,
         if (file.extracted) .extracted else .plain,
-        file.line + labels.context_lines_after,
+        line + labels.context_lines_after,
     ) orelse item.detail;
     const words = index.content.splitWords(arena, ui.query()) catch return;
     // The theme's accent behind matches, its text colour on top.
@@ -149,7 +150,7 @@ pub fn showContentDetail(ui: *Ui, item: *const Item) void {
     ) catch return;
     c.gtk_label_set_markup(
         ui.detail.text,
-        labels.contextMarkup(arena, text, file.line, words, highlight_open).ptr,
+        labels.contextMarkup(arena, text, line, words, highlight_open).ptr,
     );
 
     const guessed_type = c.g_content_type_guess(file.path, null, 0, null);
@@ -322,7 +323,8 @@ fn setMeta(detail: *DetailPane, values: [item_mod.metadata_max][:0]const u8) voi
 pub fn showDetail(ui: *Ui, item: ?*const Item) void {
     if (ui.view == .files or ui.view == .contents) {
         if (item) |shown| if (shown.action == .file) {
-            if (ui.view == .contents) return showContentDetail(ui, shown);
+            const content_match = shown.action.file.line != null;
+            if (ui.view == .contents and content_match) return showContentDetail(ui, shown);
             return showFileDetail(ui, shown);
         };
         gtk.setVisible(ui.detail.picture, false);

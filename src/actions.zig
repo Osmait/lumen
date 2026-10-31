@@ -45,7 +45,8 @@ pub fn perform(context: Context, item: *const Item, operation: item_mod.Operatio
         .copy_name => hideAfter(copy(item.title)),
         .copy_path => hideAfter(copyPath(item)),
         .show_in_folder => hideAfter(showInFolder(fileOf(item).path)),
-        .open_at_line => hideAfter(openAtLine(context, fileOf(item).path, fileOf(item).line)),
+        // Offered only for a content match (item.actionsFor).
+        .open_at_line => hideAfter(openAtLine(context, fileOf(item).path, fileOf(item).line.?)),
         .copy_file => hideAfter(copyFile(context, fileOf(item).path)),
         .trash => trash(fileOf(item).path),
         .reset_ranking => resetRanking(context, item),

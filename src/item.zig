@@ -106,8 +106,8 @@ pub const Action = union(enum) {
     file: struct {
         path: [:0]const u8,
         is_dir: bool,
-        /// Line of a content match (0: not from a content search).
-        line: u32 = 0,
+        /// Line of a content match; null when not from a content search.
+        line: ?u32 = null,
         /// The match is in text extracted from a PDF/Office document.
         extracted: bool = false,
 
@@ -289,7 +289,7 @@ pub fn actionsFor(item: *const Item) []const Entry {
             .{ .label = "Delete Entry", .keys = "Ctrl X", .operation = .clip_delete },
             .{ .label = "Delete All Entries", .keys = "Ctrl Shift X", .operation = .clip_clear },
         },
-        .file => |file| if (file.line > 0 and !file.extracted) &.{
+        .file => |file| if (file.line != null and !file.extracted) &.{
             .{ .label = "Open at Line", .keys = "↵", .operation = .open_at_line },
             .{ .label = "Open", .keys = "Ctrl ↵", .operation = .open },
             .{ .label = "Open With...", .keys = "Ctrl O", .operation = .open_with },
