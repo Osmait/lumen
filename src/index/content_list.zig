@@ -26,7 +26,7 @@ pub const ListError = std.process.RunError || std.mem.Allocator.Error;
 const list_timeout_ns = 60 * std.time.ns_per_s;
 /// How often a running listing looks at `stop` and the deadline.
 const list_poll_ms = 100;
-/// The most bytes read per look at ripgrep's output.
+/// The least free room in the buffer before each read of ripgrep's output.
 const list_read_bytes_min = 64;
 /// The most a listing may print: paths of a few million files.
 const list_output_bytes_max = 256 << 20;
@@ -38,8 +38,8 @@ pub const ListOptions = struct {
     /// Also documents whose text is extracted (PDF, Office), not only
     /// plain text files.
     documents: bool,
-    /// Set: the listing is given up (error.Canceled) within ~0.1 s.
-    /// Shutting down waited for ripgrep, up to its minute.
+    /// Once it is set, the listing is given up (error.Canceled) within
+    /// ~0.1 s. Shutting down waited for ripgrep, up to its minute.
     stop: ?*const std.atomic.Value(bool) = null,
 };
 
@@ -70,19 +70,19 @@ pub fn list(
     // prints, so with the root as argument a root below any excluded name
     // (a home in /srv/build, the tests' .zig-cache/tmp) listed nothing.
     try argv.append(arena, ".");
-    const out = try runLister(gpa, io, argv.items, root, options.stop);
-    defer gpa.free(out);
+    const listing = try runLister(gpa, io, argv.items, root, options.stop);
+    defer gpa.free(listing);
 
-    const sep = paths.separatorAfter(root);
+    const separator = paths.separatorAfter(root);
     var docs: std.ArrayList(content.DocIn) = .empty;
-    var lines = std.mem.tokenizeScalar(u8, out, 0);
+    var lines = std.mem.tokenizeScalar(u8, listing, 0);
     var path_buffer: paths.Buffer = undefined;
     while (lines.next()) |line| {
         const path_relative = if (std.mem.startsWith(u8, line, "./")) line[2..] else line;
         const path_z = std.mem.printSentinel(
             &path_buffer,
             "{s}{s}{s}",
-            .{ root, sep, path_relative },
+            .{ root, separator, path_relative },
             0,
         ) catch continue;
         const path: []const u8 = path_z;
@@ -129,18 +129,18 @@ fn runLister(
     var reader: std.Io.File.MultiReader = undefined;
     reader.init(gpa, io, streams.toStreams(), &.{child.stdout.?});
     defer reader.deinit();
-    const deadline = sys.monotonicNs() + list_timeout_ns;
-    const slice: std.Io.Timeout = .{
+    const deadline_ns = sys.monotonicNs() + list_timeout_ns;
+    const poll_timeout: std.Io.Timeout = .{
         .duration = .{ .raw = .fromMilliseconds(list_poll_ms), .clock = .awake },
     };
     while (true) {
-        reader.fill(list_read_bytes_min, slice) catch |err| switch (err) {
+        reader.fill(list_read_bytes_min, poll_timeout) catch |err| switch (err) {
             error.EndOfStream => break,
             error.Timeout => {},
             else => |other| return other,
         };
         if (stop) |stop_flag| if (stop_flag.load(.acquire)) return error.Canceled;
-        if (sys.monotonicNs() >= deadline) return error.Timeout;
+        if (sys.monotonicNs() >= deadline_ns) return error.Timeout;
         if (reader.reader(0).buffered().len > list_output_bytes_max) return error.StreamTooLong;
     }
     try reader.checkAnyError();
@@ -157,24 +157,25 @@ pub const Kind = enum { text, document };
 /// A listed file's mtime and size, or null if it is not one to index (any
 /// more): not a regular file, or a size out of bounds for its `kind`.
 pub fn stat(path: [*:0]const u8, kind: Kind) ?Stat {
-    var stx: linux.Statx = undefined;
-    const rc = linux.statx(
+    var statx: linux.Statx = undefined;
+    const result = linux.statx(
         linux.AT.FDCWD,
         path,
         0,
         .{ .TYPE = true, .SIZE = true, .MTIME = true },
-        &stx,
+        &statx,
     );
-    if (linux.errno(rc) != .SUCCESS or stx.mode & linux.S.IFMT != linux.S.IFREG) return null;
+    if (linux.errno(result) != .SUCCESS) return null;
+    if (statx.mode & linux.S.IFMT != linux.S.IFREG) return null;
     switch (kind) {
         // Shorter than a trigram: no query can find anything in it.
         .text => {
-            if (stx.size > content.text_bytes_max) return null;
-            if (stx.size < content.trigram_chars) return null;
+            if (statx.size > content.text_bytes_max) return null;
+            if (statx.size < content.trigram_chars) return null;
         },
-        .document => if (stx.size > document_bytes_max) return null,
+        .document => if (statx.size > document_bytes_max) return null,
     }
-    return .{ .mtime = stx.mtime.sec, .size = stx.size };
+    return .{ .mtime = statx.mtime.sec, .size = statx.size };
 }
 
 pub fn documentKind(path: []const u8) bool {
@@ -186,7 +187,7 @@ pub fn documentKind(path: []const u8) bool {
 
 /// Obviously binary by extension: skips opening them at all.
 fn binaryByName(path: []const u8) bool {
-    const exts = [_][]const u8{
+    const extensions = [_][]const u8{
         ".png",
         ".jpg",
         ".jpeg",
@@ -232,7 +233,7 @@ fn binaryByName(path: []const u8) bool {
         ".fbx",
         ".mov",
     };
-    for (exts) |extension| if (std.ascii.endsWithIgnoreCase(path, extension)) return true;
+    for (extensions) |extension| if (std.ascii.endsWithIgnoreCase(path, extension)) return true;
     return false;
 }
 
@@ -243,12 +244,12 @@ const testing = std.testing;
 const TestTree = sys.TestDir;
 
 /// `list` relative to the tree, or SkipZigTest without ripgrep.
-fn listRel(arena: std.mem.Allocator, t: *const TestTree, documents: bool) ![]content.DocIn {
+fn listRel(arena: std.mem.Allocator, tree: *const TestTree, documents: bool) ![]content.DocIn {
     return list(
         arena,
         testing.allocator,
         testing.io,
-        t.abs,
+        tree.abs,
         .{ .documents = documents },
     ) catch |err| switch (err) {
         error.FileNotFound => error.SkipZigTest,
@@ -257,8 +258,8 @@ fn listRel(arena: std.mem.Allocator, t: *const TestTree, documents: bool) ![]con
 }
 
 test "list: what is indexed and what is excluded" {
-    var t = try TestTree.init();
-    defer t.deinit();
+    var tree = try TestTree.init();
+    defer tree.deinit();
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -273,10 +274,10 @@ test "list: what is indexed and what is excluded" {
         "three.txt", // written with exactly 3 bytes below
         "exactly_max.log", // exactly content.text_bytes_max bytes below
     };
-    for (keep) |k| try t.write(k, text);
-    try t.write("three.txt", "abc");
+    for (keep) |name| try tree.write(name, text);
+    try tree.write("three.txt", "abc");
     const docs = [_][]const u8{ "papers/a.pdf", "reports/b.docx" };
-    for (docs) |d| try t.write(d, "not really a document");
+    for (docs) |name| try tree.write(name, "not really a document");
 
     const drop = [_][]const u8{
         "node_modules/pkg/index.js",
@@ -309,85 +310,89 @@ test "list: what is indexed and what is excluded" {
         "img/photo.png",
         "big.log", // > text_bytes_max
     };
-    for (drop) |d| try t.write(d, text);
-    try t.write("two.txt", "ab");
-    try t.write("empty.txt", "");
+    for (drop) |name| try tree.write(name, text);
+    try tree.write("two.txt", "ab");
+    try tree.write("empty.txt", "");
     // A .gitignore applies inside a git repo only (rg's default; outside a
     // repo it is ignored, which in a home directory is what users expect).
-    try t.mkdir("proj/.git");
-    try t.write("proj/.gitignore", "ignored.txt\ngen/\n");
+    try tree.mkdir("proj/.git");
+    try tree.write("proj/.gitignore", "ignored.txt\ngen/\n");
     // Sizes without writing the bytes: sparse files.
-    var buf: paths.Buffer = undefined;
-    for ([_]struct { []const u8, i64 }{ .{ "big.log", content.text_bytes_max + 1 }, .{
-        "exactly_max.log",
-        content.text_bytes_max,
-    } }) |e| {
-        const rc = linux.open(try t.path(&buf, e[0]), .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
-        try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
-        const fd: i32 = @intCast(rc);
+    var path_buffer: paths.Buffer = undefined;
+    const sparse = [_]struct { name: []const u8, size: i64 }{
+        .{ .name = "big.log", .size = content.text_bytes_max + 1 },
+        .{ .name = "exactly_max.log", .size = content.text_bytes_max },
+    };
+    for (sparse) |file| {
+        const flags: linux.O = .{ .ACCMODE = .WRONLY, .CLOEXEC = true };
+        const result = linux.open(try tree.path(&path_buffer, file.name), flags, 0);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(result));
+        const fd: i32 = @intCast(result);
         defer sys.close(fd);
-        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.ftruncate(fd, e[1])));
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.ftruncate(fd, file.size)));
     }
 
-    const got = try listRel(arena, &t, true);
+    const got = try listRel(arena, &tree, true);
 
     var want: std.ArrayList([]const u8) = .empty;
-    for (keep ++ docs) |k| try want.append(arena, try arena.print("{s}/{s}", .{ t.abs, k }));
+    for (keep ++ docs) |name| try want.append(arena, try arena.print("{s}/{s}", .{ tree.abs, name }));
     std.mem.sort([]const u8, want.items, {}, struct {
         fn lt(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.order(u8, a, b) == .lt;
         }
     }.lt);
     var got_paths: std.ArrayList([]const u8) = .empty;
-    for (got) |d| try got_paths.append(arena, d.path);
+    for (got) |doc| try got_paths.append(arena, doc.path);
     const joined_want = try std.mem.join(arena, "\n", want.items);
     const joined_got = try std.mem.join(arena, "\n", got_paths.items);
     try testing.expectEqualStrings(joined_want, joined_got);
 
     const now = sys.nowSeconds();
-    for (got) |d| {
-        try testing.expectEqual(documentKind(d.path), d.source == .extracted);
-        try testing.expect(d.mtime > now - 3600 and d.mtime <= now + 1);
-        const info = sys.info(try std.mem.printSentinel(&buf, "{s}", .{d.path}, 0)).?;
-        try testing.expectEqual(info.size, d.size);
-        try testing.expectEqual(info.mtime, d.mtime);
+    for (got) |doc| {
+        try testing.expectEqual(documentKind(doc.path), doc.source == .extracted);
+        try testing.expect(doc.mtime > now - 3600);
+        try testing.expect(doc.mtime <= now + 1);
+        const info = sys.info(try std.mem.printSentinel(&path_buffer, "{s}", .{doc.path}, 0)).?;
+        try testing.expectEqual(info.size, doc.size);
+        try testing.expectEqual(info.mtime, doc.mtime);
     }
-    for (got) |d| {
-        if (std.mem.endsWith(u8, d.path, "/exactly_max.log")) try testing.expectEqual(
-            @as(u64, content.text_bytes_max),
-            d.size,
-        );
+    for (got) |doc| {
+        if (!std.mem.endsWith(u8, doc.path, "/exactly_max.log")) continue;
+        try testing.expectEqual(@as(u64, content.text_bytes_max), doc.size);
     }
 
     // Without documents: the same minus the PDF and the docx.
-    const plain = try listRel(arena, &t, false);
+    const plain = try listRel(arena, &tree, false);
     try testing.expectEqual(got.len - docs.len, plain.len);
-    for (plain) |d| try testing.expect(d.source == .plain);
+    for (plain) |doc| try testing.expect(doc.source == .plain);
 }
 
 test "list: a root below an excluded name still lists" {
     // Globs are matched against the path rg prints: with the root as rg's
     // argument, a root like this one (.zig-cache/tmp/...) or /srv/build/me
     // listed nothing.
-    var t = try TestTree.init();
-    defer t.deinit();
-    try t.write("build/target/node_modules/me/note.txt", "x");
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    try tree.write("build/target/node_modules/me/note.txt", "x");
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
-    const sub = try arena_state.allocator().print("{s}/build/target/node_modules/me/", .{t.abs});
+    const root_nested = try arena_state.allocator().print(
+        "{s}/build/target/node_modules/me/",
+        .{tree.abs},
+    );
     const got = list(
         arena_state.allocator(),
         testing.allocator,
         testing.io,
-        sub,
+        root_nested,
         .{ .documents = true },
     ) catch |err| switch (err) {
         error.FileNotFound => return error.SkipZigTest,
         else => return err,
     };
     try testing.expectEqual(@as(usize, 0), got.len); // 1 byte: too small
-    try t.write("build/target/node_modules/me/note.txt", "hello");
-    const again = try list(arena_state.allocator(), testing.allocator, testing.io, sub, .{
+    try tree.write("build/target/node_modules/me/note.txt", "hello");
+    const again = try list(arena_state.allocator(), testing.allocator, testing.io, root_nested, .{
         .documents = true,
     });
     try testing.expectEqual(@as(usize, 1), again.len);
@@ -397,17 +402,17 @@ test "list: a root below an excluded name still lists" {
 }
 
 test "list: file names with newlines and invalid UTF-8 come back whole" {
-    var t = try TestTree.init();
-    defer t.deinit();
-    try t.write("line1\nline2.txt", "newline in the name");
-    try t.write("bad-\xff\xfe.txt", "not utf-8 in the name");
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    try tree.write("line1\nline2.txt", "newline in the name");
+    try tree.write("bad-\xff\xfe.txt", "not utf-8 in the name");
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const got = list(
         arena_state.allocator(),
         testing.allocator,
         testing.io,
-        t.abs,
+        tree.abs,
         .{ .documents = true },
     ) catch |err| switch (err) {
         error.FileNotFound => return error.SkipZigTest,
@@ -419,26 +424,26 @@ test "list: file names with newlines and invalid UTF-8 come back whole" {
 }
 
 test "listing gives up soon after stop is set" {
-    var t = try TestTree.init();
-    defer t.deinit();
+    var tree = try TestTree.init();
+    defer tree.deinit();
     var stop: std.atomic.Value(bool) = .init(false);
     const setter = try std.Thread.spawn(.{}, struct {
-        fn later(s: *std.atomic.Value(bool)) void {
+        fn later(stop_flag: *std.atomic.Value(bool)) void {
             sys.sleepUs(100_000);
-            s.store(true, .release);
+            stop_flag.store(true, .release);
         }
     }.later, .{&stop});
     defer setter.join();
     // A lister stuck on a hung mount: silent, alive.
-    const t0 = sys.monotonicNs();
+    const start_ns = sys.monotonicNs();
     try testing.expectError(error.Canceled, runLister(
         testing.allocator,
         testing.io,
         &.{ "sh", "-c", "exec sleep 30" },
-        t.abs,
+        tree.abs,
         &stop,
     ));
-    try testing.expect(sys.monotonicNs() - t0 < 5 * std.time.ns_per_s);
+    try testing.expect(sys.monotonicNs() - start_ns < 5 * std.time.ns_per_s);
 }
 
 test "documentKind" {
