@@ -1169,7 +1169,9 @@ test "live: an overflow requests a rescan and does not do it" {
         .{ .created = .{ .parent = 0, .name = "nunca.rs", .is_dir = false } },
         .overflow,
     });
-    try testing.expect(sys.monotonicNs() - start_ns < 50 * std.time.ns_per_ms);
+    // A rescan done here would show in the stats below; the bound only
+    // catches one that blocks, with room for a loaded machine.
+    try testing.expect(sys.monotonicNs() - start_ns < 500 * std.time.ns_per_ms);
     try testing.expect(tree.live.pending_resync);
     try testing.expectEqual(1, tree.live.stats.resyncs);
     try testing.expectEqual(0, tree.live.delta.store.len());

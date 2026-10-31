@@ -507,7 +507,7 @@ const Done = struct {
 fn iterateUntil(done: *const fn () bool) u64 {
     const start_ns = os.monotonicNs();
     var longest_ns: u64 = 0;
-    while (!done() and os.monotonicNs() - start_ns < std.time.ns_per_s) {
+    while (!done() and os.monotonicNs() - start_ns < 5 * std.time.ns_per_s) {
         const turn_ns = os.monotonicNs();
         const busy = c.g_main_context_iteration(null, 0) != 0;
         longest_ns = @max(longest_ns, os.monotonicNs() - turn_ns);
@@ -567,8 +567,9 @@ test "a client that sends nothing holds neither the main loop nor the others" {
     const thread = try client.start();
     _ = iterateUntil(&Done.answered);
     thread.join();
-    // Served at once: a server waiting on the silent one would not be.
-    try testing.expect(os.monotonicNs() - start_ns < 300 * std.time.ns_per_ms);
+    // Served at once: a server waiting on the silent one would wait out its
+    // 10 s phase. The bound leaves room for a loaded machine.
+    try testing.expect(os.monotonicNs() - start_ns < 2 * std.time.ns_per_s);
     const answer = ipc.parseAnswer(got[0..client.got_len]).?;
     try testing.expectEqual(@as(u8, 7), answer.status);
     try testing.expectEqualStrings("--x copy", answer.stdout);
@@ -589,13 +590,14 @@ test "a large answer goes out as the client takes it, the main loop turning" {
 
     const got = try testing.allocator.alloc(u8, 2 << 20);
     defer testing.allocator.free(got);
-    var client: TestClient = .{ .path = socket_path, .arg = "--big", .wait_ms = 200, .got = got };
+    var client: TestClient = .{ .path = socket_path, .arg = "--big", .wait_ms = 500, .got = got };
     const thread = try client.start();
     const longest_ns = iterateUntil(&Done.answered);
     thread.join();
     try testing.expectEqual(@as(usize, ipc.answer_header_bytes + (1 << 20)), client.got_len);
-    // Not one turn spent waiting for the client to read.
-    try testing.expect(longest_ns < 100 * std.time.ns_per_ms);
+    // Not one turn spent waiting for the client to read: such a turn would
+    // last the client's whole 500 ms wait.
+    try testing.expect(longest_ns < 400 * std.time.ns_per_ms);
     _ = iterateUntil(&Done.closed);
     try testing.expectEqual(@as(usize, 0), server.connections_open);
 }
