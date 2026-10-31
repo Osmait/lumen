@@ -60,25 +60,26 @@ pub fn run(
     gpa: std.mem.Allocator,
     io: std.Io,
     argv: []const []const u8,
-    opts: Options,
+    options: Options,
 ) Error!Result {
-    var empty_env = std.process.Environ.Map.init(gpa);
-    defer empty_env.deinit();
-    const stdin_bytes = switch (opts.stdin) {
+    var empty_environment = std.process.Environ.Map.init(gpa);
+    defer empty_environment.deinit();
+    const stdin_bytes = switch (options.stdin) {
         .bytes => |bytes| bytes,
         .fd => "",
     };
     var child = try std.process.spawn(io, .{
         .argv = argv,
-        .environ_map = if (opts.environ == .empty) &empty_env else null,
-        .stdin = switch (opts.stdin) {
+        .environ_map = if (options.environ == .empty) &empty_environment else null,
+        .stdin = switch (options.stdin) {
             .bytes => |bytes| if (bytes.len > 0) .pipe else .ignore,
             .fd => |fd| .{ .file = .{ .handle = fd, .flags = .{ .nonblocking = false } } },
         },
         .stdout = .pipe,
-        .stderr = if (opts.stderr == .collect) .pipe else .ignore,
+        .stderr = if (options.stderr == .collect) .pipe else .ignore,
     });
-    // `kill` sends SIGTERM and waits: after a SIGKILL it only reaps.
+    // `kill` sends SIGTERM and waits: after a SIGKILL it only reaps. The
+    // child is not reaped yet, so the SIGKILL cannot miss it.
     defer if (child.id) |pid| {
         _ = linux.kill(pid, .KILL);
         child.kill(io);
@@ -88,30 +89,30 @@ pub fn run(
         .gpa = gpa,
         .io = io,
         .child = &child,
-        .opts = &opts,
+        .options = &options,
         .stdin_bytes = stdin_bytes,
-        .err_open = opts.stderr == .collect,
+        .stderr_open = options.stderr == .collect,
     };
-    errdefer pump.out.deinit(gpa);
-    errdefer pump.err.deinit(gpa);
+    errdefer pump.stdout.deinit(gpa);
+    errdefer pump.stderr.deinit(gpa);
     const end = try pump.loop();
 
     // Both outputs closed, but the program may live on (it closed them, or
     // a background child holds them): wait for its exit up to the deadline.
     const timed_out = end == .timed_out or
-        (end == .closed and !waitExit(child.id.?, &opts));
+        (end == .closed and !waitExit(child.id.?, &options));
     var code: ?u8 = null;
     if (end == .closed and !timed_out) {
         // A wait that fails leaves the code unknown, as a signal does; the
         // deferred kill reaps the child either way.
-        if (child.wait(io)) |term| switch (term) {
+        if (child.wait(io)) |termination| switch (termination) {
             .exited => |exit_code| code = exit_code,
             else => {},
         } else |_| {}
     }
     return .{
-        .stdout = try pump.out.toOwnedSlice(gpa),
-        .stderr = try pump.err.toOwnedSlice(gpa),
+        .stdout = try pump.stdout.toOwnedSlice(gpa),
+        .stderr = try pump.stderr.toOwnedSlice(gpa),
         .code = code,
         .timed_out = timed_out,
         .capped = end == .capped,
@@ -123,12 +124,13 @@ const cancel_poll_ms = 100;
 
 /// Whether the program exited before its deadline, looked at every
 /// `cancel_poll_ms` when it can be cancelled.
-fn waitExit(pid: linux.pid_t, opts: *const Options) bool {
-    const cancel = opts.cancel orelse return os.waitExit(pid, opts.deadline_ns);
+fn waitExit(pid: linux.pid_t, options: *const Options) bool {
+    const cancel = options.cancel orelse return os.waitExit(pid, options.deadline_ns);
     while (!cancel.load(.acquire)) {
         const now_ns = os.monotonicNs();
-        if (now_ns >= opts.deadline_ns) return false;
-        const slice_end_ns = @min(opts.deadline_ns, now_ns + cancel_poll_ms * std.time.ns_per_ms);
+        if (now_ns >= options.deadline_ns) return false;
+        const slice_ns = cancel_poll_ms * std.time.ns_per_ms;
+        const slice_end_ns = @min(options.deadline_ns, now_ns + slice_ns);
         if (os.waitExit(pid, slice_end_ns)) return true;
     }
     return false;
@@ -141,13 +143,13 @@ const Pump = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     child: *std.process.Child,
-    opts: *const Options,
+    options: *const Options,
     stdin_bytes: []const u8,
     written: usize = 0,
-    out: std.ArrayList(u8) = .empty,
-    err: std.ArrayList(u8) = .empty,
-    out_open: bool = true,
-    err_open: bool,
+    stdout: std.ArrayList(u8) = .empty,
+    stderr: std.ArrayList(u8) = .empty,
+    stdout_open: bool = true,
+    stderr_open: bool,
 
     const End = enum { closed, timed_out, capped };
 
@@ -155,14 +157,14 @@ const Pump = struct {
         // A blocking stdin would let one write stall the whole poll loop,
         // deadline included: if it cannot be made non-blocking, give up.
         if (pump.child.stdin) |stdin| try setNonblocking(stdin.handle);
-        while (pump.out_open or pump.err_open) {
+        while (pump.stdout_open or pump.stderr_open) {
             const now_ns = os.monotonicNs();
-            if (now_ns >= pump.opts.deadline_ns) return .timed_out;
+            if (now_ns >= pump.options.deadline_ns) return .timed_out;
             if (pump.cancelled()) return .timed_out;
             var poll_fds: [3]linux.pollfd = undefined;
             const poll_fds_count = pump.pollFds(&poll_fds);
-            const rc = linux.poll(&poll_fds, poll_fds_count, pump.pollTimeoutMs(now_ns));
-            switch (linux.errno(rc)) {
+            const ready_count = linux.poll(&poll_fds, poll_fds_count, pump.pollTimeoutMs(now_ns));
+            switch (linux.errno(ready_count)) {
                 .SUCCESS => {},
                 .INTR => continue,
                 else => return error.Syscall,
@@ -180,7 +182,7 @@ const Pump = struct {
     }
 
     fn cancelled(pump: *const Pump) bool {
-        const cancel = pump.opts.cancel orelse return false;
+        const cancel = pump.options.cancel orelse return false;
         return cancel.load(.acquire);
     }
 
@@ -188,11 +190,11 @@ const Pump = struct {
     /// write; how many were filled in.
     fn pollFds(pump: *const Pump, poll_fds: *[3]linux.pollfd) usize {
         var count: usize = 0;
-        if (pump.out_open) {
+        if (pump.stdout_open) {
             poll_fds[count] = pollFd(pump.child.stdout.?.handle, linux.POLL.IN);
             count += 1;
         }
-        if (pump.err_open) {
+        if (pump.stderr_open) {
             poll_fds[count] = pollFd(pump.child.stderr.?.handle, linux.POLL.IN);
             count += 1;
         }
@@ -211,9 +213,9 @@ const Pump = struct {
     /// Until the deadline; in slices of `cancel_poll_ms` when the run can
     /// be cancelled, so a cancel is seen in time.
     fn pollTimeoutMs(pump: *const Pump, now_ns: u64) i32 {
-        assert(now_ns < pump.opts.deadline_ns);
-        const left_ms = (pump.opts.deadline_ns - now_ns) / std.time.ns_per_ms + 1;
-        const cancellable = pump.opts.cancel != null;
+        assert(now_ns < pump.options.deadline_ns);
+        const left_ms = (pump.options.deadline_ns - now_ns) / std.time.ns_per_ms + 1;
+        const cancellable = pump.options.cancel != null;
         const slice_ms: u64 = if (cancellable) cancel_poll_ms else std.math.maxInt(i32);
         return @intCast(@min(left_ms, slice_ms));
     }
@@ -222,9 +224,9 @@ const Pump = struct {
     fn feed(pump: *Pump) void {
         const fd = pump.child.stdin.?.handle;
         const rest = pump.stdin_bytes[pump.written..];
-        const rc = linux.write(fd, rest.ptr, rest.len);
-        switch (linux.errno(rc)) {
-            .SUCCESS => pump.written += rc,
+        const bytes_written = linux.write(fd, rest.ptr, rest.len);
+        switch (linux.errno(bytes_written)) {
+            .SUCCESS => pump.written += bytes_written,
             .AGAIN, .INTR => {},
             // The program closed its stdin: it does not want the rest.
             else => pump.written = pump.stdin_bytes.len,
@@ -239,24 +241,24 @@ const Pump = struct {
     /// Reads what output `fd` has. True when the program is to be killed
     /// at the cap.
     fn drain(pump: *Pump, fd: i32) Error!bool {
-        const is_out = fd == pump.child.stdout.?.handle;
-        const list = if (is_out) &pump.out else &pump.err;
-        var buf: [read_chunk_bytes]u8 = undefined;
-        const rc = linux.read(fd, &buf, buf.len);
-        switch (linux.errno(rc)) {
+        const is_stdout = fd == pump.child.stdout.?.handle;
+        const output = if (is_stdout) &pump.stdout else &pump.stderr;
+        var chunk: [read_chunk_bytes]u8 = undefined;
+        const bytes_read = linux.read(fd, &chunk, chunk.len);
+        switch (linux.errno(bytes_read)) {
             .SUCCESS => {},
             .AGAIN, .INTR => return false,
             else => return error.Syscall,
         }
-        if (rc == 0) {
-            if (is_out) pump.out_open = false else pump.err_open = false;
+        if (bytes_read == 0) {
+            if (is_stdout) pump.stdout_open = false else pump.stderr_open = false;
             return false;
         }
-        const output_bytes_max = pump.opts.output_bytes_max;
-        const keep = @min(rc, output_bytes_max -| list.items.len);
-        try list.appendSlice(pump.gpa, buf[0..keep]);
-        assert(list.items.len <= output_bytes_max);
-        return pump.opts.at_cap == .kill and list.items.len == output_bytes_max;
+        const output_bytes_max = pump.options.output_bytes_max;
+        const keep = @min(bytes_read, output_bytes_max -| output.items.len);
+        try output.appendSlice(pump.gpa, chunk[0..keep]);
+        assert(output.items.len <= output_bytes_max);
+        return pump.options.at_cap == .kill and output.items.len == output_bytes_max;
     }
 };
 
@@ -265,14 +267,15 @@ fn setNonblocking(fd: i32) error{Syscall}!void {
     const flags = linux.fcntl(fd, linux.F.GETFL, 0);
     if (linux.errno(flags) != .SUCCESS) return error.Syscall;
     const nonblock: u32 = @bitCast(linux.O{ .NONBLOCK = true });
-    const set_rc = linux.fcntl(fd, linux.F.SETFL, flags | nonblock);
-    if (linux.errno(set_rc) != .SUCCESS) return error.Syscall;
+    const set_result = linux.fcntl(fd, linux.F.SETFL, flags | nonblock);
+    if (linux.errno(set_result) != .SUCCESS) return error.Syscall;
 }
 
 const testing = std.testing;
 
-fn deadline(ms: u64) u64 {
-    return os.monotonicNs() + ms * std.time.ns_per_ms;
+/// The monotonic time `duration_ms` from now, in ns.
+fn deadline(duration_ms: u64) u64 {
+    return os.monotonicNs() + duration_ms * std.time.ns_per_ms;
 }
 
 test "output, exit code and stdin" {
