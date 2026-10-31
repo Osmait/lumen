@@ -816,7 +816,7 @@ fn buildNext(service: *ContentService, input: BuildInput) ?content.Index {
     const reader: content.TextReader = .{
         .read = textOf,
         .ctx = service,
-        .extracted_len = cachedTextBytes,
+        .extracted_bytes = cachedTextBytes,
     };
     if (std.mem.findScalarLast(u8, service.cache_path, '/')) |slash| {
         // The save below fails and says so; the index is served from memory.

@@ -188,31 +188,31 @@ const DocColumns = struct {
     docs_removed_count: usize,
 
     fn parse(
-        buf: Bytes,
+        file: Bytes,
         docs_offset: usize,
         docs_count: usize,
     ) error{BadIndex}!DocColumns {
         assert(docs_offset % format.alignment_bytes == 0);
-        assert(docs_offset + docs_count * doc_size <= buf.len);
+        assert(docs_offset + docs_count * doc_size <= file.len);
         var cursor = docs_offset;
         var columns: DocColumns = undefined;
-        columns.mtimes = sliceAt(i64, buf, cursor, docs_count);
+        columns.mtimes = sliceAt(i64, file, cursor, docs_count);
         cursor += docs_count * @sizeOf(i64);
-        columns.sizes = sliceAt(u64, buf, cursor, docs_count);
+        columns.sizes = sliceAt(u64, file, cursor, docs_count);
         cursor += docs_count * @sizeOf(u64);
-        columns.path_offsets = sliceAt(u32, buf, cursor, docs_count);
+        columns.path_offsets = sliceAt(u32, file, cursor, docs_count);
         cursor += docs_count * @sizeOf(u32);
-        columns.path_sizes = sliceAt(u16, buf, cursor, docs_count);
+        columns.path_sizes = sliceAt(u16, file, cursor, docs_count);
         cursor += docs_count * @sizeOf(u16);
-        columns.sources = buf[cursor..][0..docs_count];
+        columns.sources = file[cursor..][0..docs_count];
         cursor += docs_count;
-        columns.flags = buf[cursor..][0..docs_count];
+        columns.flags = file[cursor..][0..docs_count];
         cursor += docs_count;
         assert(cursor == docs_offset + docs_count * doc_size);
 
         columns.paths_size_total = 0;
         for (columns.path_offsets, columns.path_sizes) |path_offset, path_size| {
-            if (@as(u64, path_offset) + path_size > buf.len) return error.BadIndex;
+            if (@as(u64, path_offset) + path_size > file.len) return error.BadIndex;
             columns.paths_size_total += path_size;
         }
         for (columns.sources) |source| {
@@ -317,12 +317,12 @@ pub const Index = struct {
         if (!std.mem.eql(u8, &header.magic, magic)) return error.BadIndex;
         if (header.size_total > whole.len) return error.BadIndex;
         if (header.size_total < header_size) return error.BadIndex;
-        const buf = whole[0..@intCast(header.size_total)];
+        const file = whole[0..@intCast(header.size_total)];
         // Doc ids are u32 in posting lists and results.
         if (header.docs_count > std.math.maxInt(u32)) return error.BadIndex;
         const docs_count: usize = @intCast(header.docs_count);
         const docs_offset = try region(
-            buf.len,
+            file.len,
             header.docs_offset,
             docs_count,
             doc_size,
@@ -330,9 +330,9 @@ pub const Index = struct {
         );
         if (docs_offset < header_size) return error.BadIndex;
         const paths_offset = docs_offset + docs_count * doc_size;
-        if (header.paths_size > buf.len - paths_offset) return error.BadIndex;
+        if (header.paths_size > file.len - paths_offset) return error.BadIndex;
         const directory_offset = try region(
-            buf.len,
+            file.len,
             header.directory_offset,
             header.segments_count,
             @sizeOf(SegmentEntry),
@@ -340,13 +340,13 @@ pub const Index = struct {
         );
         const segments_count: usize = @intCast(header.segments_count);
 
-        const columns = try DocColumns.parse(buf, docs_offset, docs_count);
+        const columns = try DocColumns.parse(file, docs_offset, docs_count);
 
-        const segments = sliceAt(SegmentEntry, buf, directory_offset, segments_count);
+        const segments = sliceAt(SegmentEntry, file, directory_offset, segments_count);
         var bytes_live = header_size + docs_count * doc_size + columns.paths_size_total +
             segments_count * @sizeOf(SegmentEntry);
         for (segments) |segment| {
-            try checkSegment(buf, segment);
+            try checkSegment(file, segment);
             const keys_count: usize = @intCast(segment.keys_count);
             // Keys, and one more offset than keys.
             bytes_live += keys_count * @sizeOf(u32) + (keys_count + 1) * @sizeOf(u32);
@@ -364,7 +364,7 @@ pub const Index = struct {
             .path_sizes = columns.path_sizes,
             .sources = columns.sources,
             .flags = columns.flags,
-            .file = buf,
+            .file = file,
             .segments = segments,
             .docs_removed_count = columns.docs_removed_count,
             .bytes_live = bytes_live,
@@ -377,9 +377,9 @@ pub const Index = struct {
     }
 
     pub fn open(path_z: [:0]const u8) (sys.Error || error{BadIndex})!Index {
-        const buf = try sys.mapPrivate(path_z);
-        errdefer sys.unmap(buf);
-        return parse(buf, .mapped);
+        const mapped = try sys.mapPrivate(path_z);
+        errdefer sys.unmap(mapped);
+        return parse(mapped, .mapped);
     }
 
     /// Posting list bytes of `key` in segment `segment_index` (empty if
@@ -387,17 +387,17 @@ pub const Index = struct {
     fn list(index: *const Index, segment_index: usize, key: u32) []const u8 {
         const segment = index.segments[segment_index];
         const keys = sliceAt(u32, index.buf, segment.keys_offset, segment.keys_count);
-        var lo: usize = 0;
-        var hi: usize = keys.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (keys[mid] < key) lo = mid + 1 else hi = mid;
+        var low: usize = 0;
+        var high: usize = keys.len;
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            if (keys[middle] < key) low = middle + 1 else high = middle;
         }
-        if (lo == keys.len) return &.{};
-        if (keys[lo] != key) return &.{};
+        if (low == keys.len) return &.{};
+        if (keys[low] != key) return &.{};
         const offsets = sliceAt(u32, index.buf, segment.offsets_offset, segment.keys_count + 1);
         const postings_offset = segment.postings_offset;
-        return index.buf[postings_offset + offsets[lo] .. postings_offset + offsets[lo + 1]];
+        return index.buf[postings_offset + offsets[low] .. postings_offset + offsets[low + 1]];
     }
 
     /// Documents containing every trigram of every word, folded (words of 3+
@@ -437,8 +437,8 @@ pub const Index = struct {
             if (some_list_empty) continue;
             // Shortest list first: every intersection only shrinks the set.
             std.mem.sort([]const u8, lists, {}, struct {
-                fn shorter(_: void, a: []const u8, b: []const u8) bool {
-                    return a.len < b.len;
+                fn shorter(_: void, list_a: []const u8, list_b: []const u8) bool {
+                    return list_a.len < list_b.len;
                 }
             }.shorter);
             docs_matching.clearRetainingCapacity();
@@ -493,14 +493,14 @@ fn region(
     return @intCast(offset);
 }
 
-fn checkSegment(buf: BytesConst, segment: SegmentEntry) error{BadIndex}!void {
-    const keys_offset = try region(buf.len, segment.keys_offset, segment.keys_count, 4, 4);
-    const keys_count: usize = @intCast(segment.keys_count); // Fits: bounded by buf.len.
+fn checkSegment(file: BytesConst, segment: SegmentEntry) error{BadIndex}!void {
+    const keys_offset = try region(file.len, segment.keys_offset, segment.keys_count, 4, 4);
+    const keys_count: usize = @intCast(segment.keys_count); // Fits: bounded by file.len.
     const offsets_count = std.math.add(u64, segment.keys_count, 1) catch return error.BadIndex;
-    const offsets_offset = try region(buf.len, segment.offsets_offset, offsets_count, 4, 4);
-    _ = try region(buf.len, segment.postings_offset, segment.postings_size, 1, 1);
-    const keys = sliceAt(u32, @constCast(buf), keys_offset, keys_count);
-    const offsets = sliceAt(u32, @constCast(buf), offsets_offset, keys_count + 1);
+    const offsets_offset = try region(file.len, segment.offsets_offset, offsets_count, 4, 4);
+    _ = try region(file.len, segment.postings_offset, segment.postings_size, 1, 1);
+    const keys = sliceAt(u32, @constCast(file), keys_offset, keys_count);
+    const offsets = sliceAt(u32, @constCast(file), offsets_offset, keys_count + 1);
     if (!strictlyAscending(u32, keys)) return error.BadIndex;
     // Ascending: the last key is the largest.
     if (keys_count > 0 and keys[keys_count - 1] > trigram_mask) return error.BadIndex;
@@ -512,10 +512,10 @@ fn checkSegment(buf: BytesConst, segment: SegmentEntry) error{BadIndex}!void {
     if (offsets[keys_count] > segment.postings_size) return error.BadIndex;
 }
 
-fn sliceAt(comptime T: type, buf: Bytes, offset: usize, count: usize) []T {
+fn sliceAt(comptime T: type, bytes: Bytes, offset: usize, count: usize) []T {
     assert(offset % @alignOf(T) == 0);
-    assert(offset + count * @sizeOf(T) <= buf.len);
-    const items: [*]T = @ptrCast(@alignCast(buf.ptr + offset));
+    assert(offset + count * @sizeOf(T) <= bytes.len);
+    const items: [*]T = @ptrCast(@alignCast(bytes.ptr + offset));
     return items[0..count];
 }
 
@@ -533,8 +533,8 @@ fn dedupSorted(comptime T: type, items: []T) []T {
 
 fn strictlyAscending(comptime T: type, items: []const T) bool {
     if (items.len < 2) return true;
-    for (items[0 .. items.len - 1], items[1..]) |a, b| {
-        if (a >= b) return false;
+    for (items[0 .. items.len - 1], items[1..]) |item, item_next| {
+        if (item >= item_next) return false;
     }
     return true;
 }
@@ -649,15 +649,15 @@ fn intersect(
 
 // --------------------------------------------------------------- building
 
-/// Reads a document's text into `buf` for indexing or verifying: false when
+/// Reads a document's text into `text` for indexing or verifying: false when
 /// it has none to index (gone, binary, too big). `extracted` documents are
 /// read from the text cache by the caller-provided resolver. Running out of
 /// memory is an error, never "no text": the index would keep the document
 /// empty until it changed.
 pub const TextFn = *const fn (
-    ctx: *anyopaque,
+    context: *anyopaque,
     doc: DocIn,
-    buf: *std.ArrayList(u8),
+    text: *std.ArrayList(u8),
     gpa: std.mem.Allocator,
 ) std.mem.Allocator.Error!bool;
 
@@ -666,17 +666,17 @@ pub const TextReader = struct {
     read: TextFn,
     ctx: *anyopaque,
     /// Most bytes of text `read` gives for an extracted document (its text
-    /// is not the size of the file, the size of the cached text is); null:
-    /// `extracted_bytes_max`.
-    extracted_len: ?*const fn (ctx: *anyopaque, doc: DocIn) u64 = null,
+    /// is not the size of the file, the size of the cached text is). When it
+    /// is null, `extracted_bytes_max`.
+    extracted_bytes: ?*const fn (context: *anyopaque, doc: DocIn) u64 = null,
 
     /// Most (trigram, doc) pairs reading `doc` can give: one per byte of
     /// text.
     fn mostPairs(reader: TextReader, doc: DocIn) usize {
         const text_size = switch (doc.source) {
             .plain => @min(doc.size, text_bytes_max),
-            .extracted => if (reader.extracted_len) |extracted_len|
-                @min(extracted_len(reader.ctx, doc), extracted_bytes_max)
+            .extracted => if (reader.extracted_bytes) |extracted_bytes|
+                @min(extracted_bytes(reader.ctx, doc), extracted_bytes_max)
             else
                 extracted_bytes_max,
         };
@@ -689,52 +689,53 @@ pub const TextReader = struct {
 pub fn readPlain(
     gpa: std.mem.Allocator,
     path: []const u8,
-    buf: *std.ArrayList(u8),
+    text: *std.ArrayList(u8),
 ) std.mem.Allocator.Error!bool {
-    buf.clearRetainingCapacity();
+    text.clearRetainingCapacity();
     var path_buffer: paths.Buffer = undefined;
     const path_z = std.mem.printSentinel(&path_buffer, "{s}", .{path}, 0) catch return false;
     // Not a plain open: the path may have become a FIFO since it was indexed.
     const fd = sys.openRegular(path_z) catch return false;
     defer sys.close(fd);
     // One byte past the limit tells a file over it.
-    sys.readUpTo(gpa, fd, buf, text_bytes_max + 1) catch |err| switch (err) {
+    sys.readUpTo(gpa, fd, text, text_bytes_max + 1) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         // Part of the file is not its text: left out, as if unreadable.
         error.ReadFailed => return false,
     };
-    if (buf.items.len > text_bytes_max) return false;
-    const head = buf.items[0..@min(buf.items.len, 8000)];
+    if (text.items.len > text_bytes_max) return false;
+    const head = text.items[0..@min(text.items.len, 8000)];
     return std.mem.findScalar(u8, head, 0) == null;
 }
 
-/// One round of reading: documents `lo..hi`, each taken by the next free
+/// One round of reading: documents `start..end`, each taken by the next free
 /// task (no fixed shares, so nobody waits for the slowest file of a share).
-const ExtractCtx = struct {
+const ExtractRound = struct {
     gpa: std.mem.Allocator,
     docs: []const DocIn,
-    lo: usize,
-    hi: usize,
+    start: usize,
+    end: usize,
     text: TextReader,
-    /// Per task: trigram keys of the documents it read, in the order read.
-    out: []std.ArrayList(u64),
-    /// Per document of the round: where its pairs are in `out`.
+    /// Per task: the (trigram, doc) pairs of the documents it read, in the
+    /// order read.
+    task_pairs: []std.ArrayList(u64),
+    /// Per document of the round: where its pairs are in `task_pairs`.
     spans: []Pairs,
     next: std.atomic.Value(usize),
     /// Set by a task that ran out of memory: the build fails (and is retried
     /// later) instead of indexing its documents as empty.
-    oom: std.atomic.Value(bool) = .init(false),
+    out_of_memory: std.atomic.Value(bool) = .init(false),
 };
 
-/// Where one document's pairs are: `out[task][start..][0..len]`.
-const Pairs = struct { task: usize, start: usize, len: usize };
+/// Where one document's pairs are: `task_pairs[task][start..][0..count]`.
+const Pairs = struct { task: usize, start: usize, count: usize };
 
-fn extractTask(ctx: *ExtractCtx, task: usize) void {
-    extractTaskOrFail(ctx, task) catch ctx.oom.store(true, .release);
+fn extractTask(round: *ExtractRound, task: usize) void {
+    extractTaskOrFail(round, task) catch round.out_of_memory.store(true, .release);
 }
 
-fn extractTaskOrFail(ctx: *ExtractCtx, task: usize) std.mem.Allocator.Error!void {
-    const gpa = ctx.gpa;
+fn extractTaskOrFail(round: *ExtractRound, task: usize) std.mem.Allocator.Error!void {
+    const gpa = round.gpa;
     // One bit per possible trigram: dedup in O(n) without sorting. Made on
     // the first document with text, then reused and cleared key by key.
     var seen: std.DynamicBitSetUnmanaged = .{};
@@ -743,17 +744,17 @@ fn extractTaskOrFail(ctx: *ExtractCtx, task: usize) std.mem.Allocator.Error!void
     defer keys.deinit(gpa);
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(gpa);
-    const out = &ctx.out[task];
+    const out = &round.task_pairs[task];
     while (true) {
-        const doc = ctx.next.fetchAdd(1, .monotonic);
-        if (doc >= ctx.hi) return;
+        const doc = round.next.fetchAdd(1, .monotonic);
+        if (doc >= round.end) return;
         const start = out.items.len;
-        defer ctx.spans[doc - ctx.lo] = .{
+        defer round.spans[doc - round.start] = .{
             .task = task,
             .start = start,
-            .len = out.items.len - start,
+            .count = out.items.len - start,
         };
-        if (!try ctx.text.read(ctx.text.ctx, ctx.docs[doc], &text, gpa)) continue;
+        if (!try round.text.read(round.text.ctx, round.docs[doc], &text, gpa)) continue;
         if (seen.bit_length == 0) seen = try .initEmpty(gpa, trigrams_count);
         keys.clearRetainingCapacity();
         var trigrams: Trigrams = .{ .text = text.items };
@@ -882,7 +883,7 @@ pub fn appendFile(
 ) FileError!?Index {
     var file = (try sys.AppendFile.open(path_z, old.buf.len)) orelse return null;
     defer file.deinit();
-    var sink: Sink = .{ .gpa = gpa, .app = &file, .written = file.len };
+    var sink: Sink = .{ .gpa = gpa, .append_file = &file, .written = file.len };
     defer sink.deinit();
     const header = try appendInto(&sink, pool, old, gone, added, text, stats);
     try sink.flush();
@@ -965,23 +966,32 @@ fn appendInto(
     if (old.segments.len - segments_kept_count < segments_small_merge_min) {
         segments_kept_count = old.segments.len;
     }
-    var dir: std.ArrayList(SegmentEntry) = .empty;
-    defer dir.deinit(gpa);
+    var directory: std.ArrayList(SegmentEntry) = .empty;
+    defer directory.deinit(gpa);
     // Where they are: the file only grows.
-    try dir.appendSlice(gpa, old.segments[0..segments_kept_count]);
+    try directory.appendSlice(gpa, old.segments[0..segments_kept_count]);
     var pairs_merged: std.ArrayList(u64) = .empty;
     defer pairs_merged.deinit(gpa);
     for (old.segments[segments_kept_count..]) |segment| {
         try segmentPairs(gpa, old, segment, flags, &pairs_merged);
     }
-    try indexDocs(sink, pool, &dir, docs, old.docs_count, text, &build_stats, pairs_merged.items);
+    try indexDocs(
+        sink,
+        pool,
+        &directory,
+        docs,
+        old.docs_count,
+        text,
+        &build_stats,
+        pairs_merged.items,
+    );
     const table = try writeDocs(sink, docs, .{
         .flags = flags,
         .header = .none,
         .path_offsets_reused = old.path_offsets,
     });
     build_stats.docs_indexed = added.len;
-    return finish(sink, dir.items, docs.len, table, start_ns, &build_stats, stats);
+    return finish(sink, directory.items, docs.len, table, start_ns, &build_stats, stats);
 }
 
 /// A segment's (trigram, doc) pairs, by trigram then doc, without the
@@ -1016,53 +1026,55 @@ const Sink = struct {
     gpa: std.mem.Allocator,
     file: ?*sys.AtomicFile = null,
     /// Or the end of an existing file (`appendFile`).
-    app: ?*sys.AppendFile = null,
-    buf: BytesAligned8 = .empty,
+    append_file: ?*sys.AppendFile = null,
+    /// What is not in the file yet; in memory, the whole index.
+    bytes: BytesAligned8 = .empty,
     /// Bytes already in the file.
     written: usize = 0,
 
-    /// Larger pieces go to the file directly instead of through `buf`.
-    const direct = 64 * 1024;
+    /// Larger pieces go to the file directly instead of through `bytes`.
+    const direct_bytes_min = 64 * 1024;
 
     fn deinit(sink: *Sink) void {
-        sink.buf.deinit(sink.gpa);
+        sink.bytes.deinit(sink.gpa);
     }
 
-    fn pos(sink: *const Sink) usize {
-        return sink.written + sink.buf.items.len;
+    fn position(sink: *const Sink) usize {
+        return sink.written + sink.bytes.items.len;
     }
 
     fn append(sink: *Sink, bytes: []const u8) FileError!void {
-        if ((sink.file != null or sink.app != null) and bytes.len >= direct) {
+        const to_file = sink.file != null or sink.append_file != null;
+        if (to_file and bytes.len >= direct_bytes_min) {
             try sink.flush();
             try sink.put(bytes);
             sink.written += bytes.len;
             return;
         }
-        try sink.buf.appendSlice(sink.gpa, bytes);
+        try sink.bytes.appendSlice(sink.gpa, bytes);
     }
 
     fn put(sink: *Sink, bytes: []const u8) FileError!void {
         if (sink.file) |file| return file.write(bytes);
-        if (sink.app) |file| return file.write(bytes);
+        if (sink.append_file) |file| return file.write(bytes);
     }
 
-    fn zeros(sink: *Sink, n: usize) FileError!void {
-        try sink.buf.appendNTimes(sink.gpa, 0, n);
+    fn zeros(sink: *Sink, count: usize) FileError!void {
+        try sink.bytes.appendNTimes(sink.gpa, 0, count);
     }
 
     /// Zeros up to the next multiple of `format.alignment_bytes`.
     fn padToAlignment(sink: *Sink) FileError!void {
-        try sink.zeros(alignUp(sink.pos()) - sink.pos());
-        assert(sink.pos() % format.alignment_bytes == 0);
+        try sink.zeros(alignUp(sink.position()) - sink.position());
+        assert(sink.position() % format.alignment_bytes == 0);
     }
 
     /// Writes what is buffered (file mode only).
     fn flush(sink: *Sink) FileError!void {
-        if (sink.file == null and sink.app == null) return;
-        try sink.put(sink.buf.items);
-        sink.written += sink.buf.items.len;
-        sink.buf.clearRetainingCapacity();
+        if (sink.file == null and sink.append_file == null) return;
+        try sink.put(sink.bytes.items);
+        sink.written += sink.bytes.items.len;
+        sink.bytes.clearRetainingCapacity();
     }
 };
 
@@ -1075,10 +1087,10 @@ fn memoryOnly(err: FileError) BuildError {
 }
 
 fn toMemory(sink: *Sink, header: Header) BuildError!Index {
-    @memcpy(sink.buf.items[0..header_size], &header.encode());
-    const buf = try sink.buf.toOwnedSlice(sink.gpa);
-    errdefer sink.gpa.free(buf);
-    return Index.parse(buf, .heap);
+    @memcpy(sink.bytes.items[0..header_size], &header.encode());
+    const bytes = try sink.bytes.toOwnedSlice(sink.gpa);
+    errdefer sink.gpa.free(bytes);
+    return Index.parse(bytes, .heap);
 }
 
 fn toFile(sink: *Sink, header: Header, path_z: [:0]const u8) FileError!Index {
@@ -1098,16 +1110,16 @@ fn buildInto(
 ) FileError!Header {
     const start_ns = sys.monotonicNs();
     var build_stats: BuildStats = .{};
-    var dir: std.ArrayList(SegmentEntry) = .empty;
-    defer dir.deinit(sink.gpa);
+    var directory: std.ArrayList(SegmentEntry) = .empty;
+    defer directory.deinit(sink.gpa);
     const table = try writeDocs(sink, docs, .{
         .flags = null,
         .header = .reserve,
         .path_offsets_reused = &.{},
     });
-    try indexDocs(sink, pool, &dir, docs, 0, text, &build_stats, &.{});
+    try indexDocs(sink, pool, &directory, docs, 0, text, &build_stats, &.{});
     build_stats.docs_indexed = docs.len;
-    return finish(sink, dir.items, docs.len, table, start_ns, &build_stats, stats);
+    return finish(sink, directory.items, docs.len, table, start_ns, &build_stats, stats);
 }
 
 fn updateInto(
@@ -1127,17 +1139,17 @@ fn updateInto(
     const docs = merged.docs;
     const flags = merged.flags;
 
-    var dir: std.ArrayList(SegmentEntry) = .empty;
-    defer dir.deinit(gpa);
+    var directory: std.ArrayList(SegmentEntry) = .empty;
+    defer directory.deinit(gpa);
     const table = try writeDocs(sink, docs, .{
         .flags = flags,
         .header = .reserve,
         .path_offsets_reused = &.{},
     });
-    for (old.segments) |segment| try copySegment(sink, &dir, old.buf, segment);
-    try indexDocs(sink, pool, &dir, docs, old.docs_count, text, &build_stats, &.{});
+    for (old.segments) |segment| try copySegment(sink, &directory, old.buf, segment);
+    try indexDocs(sink, pool, &directory, docs, old.docs_count, text, &build_stats, &.{});
     build_stats.docs_indexed = added.len;
-    return finish(sink, dir.items, docs.len, table, start_ns, &build_stats, stats);
+    return finish(sink, directory.items, docs.len, table, start_ns, &build_stats, stats);
 }
 
 /// Where `writeDocs` put the doc table, and how many bytes of paths it
@@ -1166,23 +1178,23 @@ fn writeDocs(
     if (options.flags) |flags| assert(flags.len == docs.len);
     switch (options.header) {
         .reserve => try sink.zeros(header_size),
-        .none => assert(sink.pos() >= header_size),
+        .none => assert(sink.position() >= header_size),
     }
     try sink.padToAlignment();
     var paths_size: usize = 0;
     for (docs[reused.len..]) |doc| paths_size += doc.path.len;
     // The path size column is u16; `DocIn.path` promises that it fits.
     for (docs) |doc| assert(doc.path.len <= path_bytes_max);
-    const docs_offset = sink.pos();
+    const docs_offset = sink.position();
     const paths_offset = docs_offset + docs.len * doc_size;
     // Path offsets are stored as u32, so the doc table and its paths must
     // end below 4 GiB.
     if (paths_offset + paths_size > std.math.maxInt(u32)) return error.IndexTooLarge;
 
     // Built in the buffer: nothing is written before the doc table is done.
-    const table_start = sink.buf.items.len;
+    const table_start = sink.bytes.items.len;
     try sink.zeros(alignUp(docs.len * doc_size + paths_size));
-    const table = sink.buf.items;
+    const table = sink.bytes.items;
     var cursor = table_start;
     for (docs) |doc| {
         std.mem.writeInt(i64, table[cursor..][0..8], doc.mtime, .little);
@@ -1234,7 +1246,7 @@ fn writeDocs(
 fn indexDocs(
     sink: *Sink,
     pool: *Pool,
-    dir: *std.ArrayList(SegmentEntry),
+    directory: *std.ArrayList(SegmentEntry),
     docs: []const DocIn,
     from: usize,
     text: TextReader,
@@ -1248,72 +1260,72 @@ fn indexDocs(
     var scratch: std.ArrayList(u64) = .empty;
     defer scratch.deinit(gpa);
     const tasks = pool.threads.len + 1;
-    const task_out = try gpa.alloc(std.ArrayList(u64), tasks);
+    const task_pairs = try gpa.alloc(std.ArrayList(u64), tasks);
     defer {
-        for (task_out) |*out| out.deinit(gpa);
-        gpa.free(task_out);
+        for (task_pairs) |*out| out.deinit(gpa);
+        gpa.free(task_pairs);
     }
-    for (task_out) |*out| out.* = .empty;
+    for (task_pairs) |*out| out.* = .empty;
     const spans = try gpa.alloc(Pairs, round_docs_max);
     defer gpa.free(spans);
 
-    var lo = from;
-    while (lo < docs.len) {
-        const hi = roundEnd(docs, lo, text);
-        var ctx: ExtractCtx = .{
+    var round_start = from;
+    while (round_start < docs.len) {
+        const round_end = roundEnd(docs, round_start, text);
+        var round: ExtractRound = .{
             .gpa = gpa,
             .docs = docs,
-            .lo = lo,
-            .hi = hi,
+            .start = round_start,
+            .end = round_end,
             .text = text,
-            .out = task_out,
+            .task_pairs = task_pairs,
             .spans = spans,
-            .next = .init(lo),
+            .next = .init(round_start),
         };
-        pool.run(@min(tasks, hi - lo), &ctx, extractTask);
-        if (ctx.oom.load(.acquire)) return error.OutOfMemory;
+        pool.run(@min(tasks, round_end - round_start), &round, extractTask);
+        if (round.out_of_memory.load(.acquire)) return error.OutOfMemory;
         // In doc order, which the stable radix sort turns into (key, doc).
-        for (spans[0 .. hi - lo]) |span| {
-            try pairs.appendSlice(gpa, task_out[span.task].items[span.start..][0..span.len]);
+        for (spans[0 .. round_end - round_start]) |span| {
+            try pairs.appendSlice(gpa, task_pairs[span.task].items[span.start..][0..span.count]);
             if (pairs.items.len >= segment_pairs_max) {
-                try closePairs(sink, dir, &pairs, &scratch, build_stats);
+                try closePairs(sink, directory, &pairs, &scratch, build_stats);
             }
         }
         // What a task kept from a large round would add up across rounds.
-        for (task_out) |*out| {
+        for (task_pairs) |*out| {
             if (out.capacity > round_pairs_max / tasks) {
                 out.clearAndFree(gpa);
             } else {
                 out.clearRetainingCapacity();
             }
         }
-        lo = hi;
+        round_start = round_end;
     }
-    if (pairs.items.len > 0) try closePairs(sink, dir, &pairs, &scratch, build_stats);
+    if (pairs.items.len > 0) try closePairs(sink, directory, &pairs, &scratch, build_stats);
 }
 
-/// Where the round of documents from `lo` ends: `round_docs_max` documents, or
-/// fewer when their text could give more than `round_pairs_max` pairs (one
-/// document at least).
-fn roundEnd(docs: []const DocIn, lo: usize, text: TextReader) usize {
-    var hi = lo;
+/// Where the round of documents from `start` ends: `round_docs_max`
+/// documents, or fewer when their text could give more than
+/// `round_pairs_max` pairs (one document at least).
+fn roundEnd(docs: []const DocIn, start: usize, text: TextReader) usize {
+    var end = start;
     var pairs_most: usize = 0;
-    while (hi < docs.len and hi - lo < round_docs_max) : (hi += 1) {
-        pairs_most += text.mostPairs(docs[hi]);
-        if (hi > lo and pairs_most > round_pairs_max) break;
+    while (end < docs.len and end - start < round_docs_max) : (end += 1) {
+        pairs_most += text.mostPairs(docs[end]);
+        if (end > start and pairs_most > round_pairs_max) break;
     }
-    return hi;
+    return end;
 }
 
 fn closePairs(
     sink: *Sink,
-    dir: *std.ArrayList(SegmentEntry),
+    directory: *std.ArrayList(SegmentEntry),
     pairs: *std.ArrayList(u64),
     scratch: *std.ArrayList(u64),
     build_stats: *BuildStats,
 ) FileError!void {
     build_stats.pairs += pairs.items.len;
-    try closeSegment(sink, dir, pairs.items, scratch);
+    try closeSegment(sink, directory, pairs.items, scratch);
     build_stats.segments += 1;
     pairs.clearRetainingCapacity();
     try sink.flush();
@@ -1322,22 +1334,22 @@ fn closePairs(
 /// A segment of another index, as it is.
 fn copySegment(
     sink: *Sink,
-    dir: *std.ArrayList(SegmentEntry),
+    directory: *std.ArrayList(SegmentEntry),
     from: BytesConst,
     segment: SegmentEntry,
 ) FileError!void {
     const keys_count: usize = @intCast(segment.keys_count);
     const postings_size: usize = @intCast(segment.postings_size);
     try sink.padToAlignment();
-    const keys_offset = sink.pos();
+    const keys_offset = sink.position();
     try sink.append(from[@intCast(segment.keys_offset)..][0 .. keys_count * @sizeOf(u32)]);
     try sink.padToAlignment();
-    const offsets_offset = sink.pos();
+    const offsets_offset = sink.position();
     const offsets_size = (keys_count + 1) * @sizeOf(u32);
     try sink.append(from[@intCast(segment.offsets_offset)..][0..offsets_size]);
-    const postings_offset = sink.pos();
+    const postings_offset = sink.position();
     try sink.append(from[@intCast(segment.postings_offset)..][0..postings_size]);
-    try dir.append(sink.gpa, .{
+    try directory.append(sink.gpa, .{
         .keys_count = segment.keys_count,
         .keys_offset = keys_offset,
         .offsets_offset = offsets_offset,
@@ -1352,7 +1364,7 @@ fn copySegment(
 /// file this code wrote and one it rejects can only differ by damage.
 fn finish(
     sink: *Sink,
-    dir: []const SegmentEntry,
+    directory: []const SegmentEntry,
     docs_count: usize,
     table: DocTableWritten,
     start_ns: u64,
@@ -1360,9 +1372,9 @@ fn finish(
     stats: ?*BuildStats,
 ) FileError!Header {
     try sink.padToAlignment();
-    const directory_offset = sink.pos();
-    try sink.append(std.mem.sliceAsBytes(dir));
-    const size_total = sink.pos();
+    const directory_offset = sink.position();
+    try sink.append(std.mem.sliceAsBytes(directory));
+    const size_total = sink.position();
     build_stats.ns = sys.monotonicNs() - start_ns;
     if (stats) |out| out.* = build_stats.*;
 
@@ -1371,7 +1383,7 @@ fn finish(
     assert(table.offset % format.alignment_bytes == 0);
     assert(table.offset + docs_count * doc_size + table.paths_size <= directory_offset);
     assert(directory_offset % format.alignment_bytes == 0);
-    for (dir) |segment| {
+    for (directory) |segment| {
         assert(segment.keys_offset % @alignOf(u32) == 0);
         assert(segment.offsets_offset % @alignOf(u32) == 0);
         assert(segment.postings_offset + segment.postings_size <= directory_offset);
@@ -1379,7 +1391,7 @@ fn finish(
     return .{
         .magic = magic.*,
         .docs_count = docs_count,
-        .segments_count = dir.len,
+        .segments_count = directory.len,
         .paths_size = table.paths_size,
         .docs_offset = table.offset,
         .directory_offset = directory_offset,
@@ -1399,7 +1411,7 @@ const BytesAligned8 = std.array_list.Aligned(u8, .@"8");
 /// sorted whole and deduplicated, never encoded as wrapped deltas.
 fn closeSegment(
     sink: *Sink,
-    dir: *std.ArrayList(SegmentEntry),
+    directory: *std.ArrayList(SegmentEntry),
     pairs: []u64,
     scratch: *std.ArrayList(u64),
 ) FileError!void {
@@ -1418,14 +1430,14 @@ fn closeSegment(
     }
 
     try sink.padToAlignment();
-    const keys_offset = sink.pos();
+    const keys_offset = sink.position();
     try sink.append(std.mem.sliceAsBytes(lists.keys.items));
     try sink.padToAlignment();
-    const offsets_offset = sink.pos();
+    const offsets_offset = sink.position();
     try sink.append(std.mem.sliceAsBytes(lists.offsets.items));
-    const postings_offset = sink.pos();
+    const postings_offset = sink.position();
     try sink.append(lists.postings.items);
-    try dir.append(gpa, .{
+    try directory.append(gpa, .{
         .keys_count = lists.keys.items.len,
         .keys_offset = keys_offset,
         .offsets_offset = offsets_offset,
@@ -1616,28 +1628,30 @@ fn findFoldImpl(
     const first = fold.step(needle, &j);
     const letter = first >= 'a' and first <= 'z';
     const last_start = hay.len - needle_folded_count;
-    const V = @Vector(vector_bytes, u8);
+    const Chunk = @Vector(vector_bytes, u8);
     var i = from;
     while (i + vector_bytes <= last_start + 1) : (i += vector_bytes) {
-        const v: V = hay[i..][0..vector_bytes].*;
+        const chunk: Chunk = hay[i..][0..vector_bytes].*;
         var mask: u32 = undefined;
         if (letter) {
-            // For a letter, `v | ascii_case_bit == first` holds exactly for
-            // its two cases (cheaper than folding A-Z first); plus every lead
-            // byte of an accented letter (one unsigned compare).
-            const lower: V = v | @as(V, @splat(ascii_case_bit));
-            const cases: u32 = @bitCast(lower == @as(V, @splat(first)));
-            const lead_offset = v -% @as(V, @splat(folded_lead_first));
-            const lead_span: V = @splat(folded_lead_last - folded_lead_first);
+            // For a letter, `chunk | ascii_case_bit == first` holds exactly
+            // for its two cases (cheaper than folding A-Z first); plus every
+            // lead byte of an accented letter (one unsigned compare).
+            const lower: Chunk = chunk | @as(Chunk, @splat(ascii_case_bit));
+            const cases: u32 = @bitCast(lower == @as(Chunk, @splat(first)));
+            const lead_offset = chunk -% @as(Chunk, @splat(folded_lead_first));
+            const lead_span: Chunk = @splat(folded_lead_last - folded_lead_first);
             const lead: u32 = @bitCast(lead_offset <= lead_span);
             mask = cases | lead;
         } else {
             // Nothing else folds: the byte itself.
-            mask = @bitCast(v == @as(V, @splat(first)));
+            mask = @bitCast(chunk == @as(Chunk, @splat(first)));
         }
         while (mask != 0) {
-            const at = i + @ctz(mask);
-            if (matchAt(kind, hay, at, needle, from)) |end| return .{ .start = at, .end = end };
+            const start = i + @ctz(mask);
+            if (matchAt(kind, hay, start, needle, from)) |end| {
+                return .{ .start = start, .end = end };
+            }
             mask &= mask - 1;
         }
     }
@@ -1651,38 +1665,38 @@ fn findFoldImpl(
     return null;
 }
 
-/// End in `hay` of `needle` matched, folded, at `at`; null if it does not
-/// match there or `at` is inside a two-byte letter (`from` starts a
+/// End in `hay` of `needle` matched, folded, at `start`; null if it does
+/// not match there or `start` is inside a two-byte letter (`from` starts a
 /// character by definition).
 inline fn matchAt(
     comptime kind: NeedleKind,
     hay: []const u8,
-    at: usize,
+    start: usize,
     needle: []const u8,
     from: usize,
 ) ?usize {
-    var k = at;
+    var i = start;
     var j: usize = 0;
     while (j < needle.len) {
-        if (k >= hay.len) return null;
+        if (i >= hay.len) return null;
         switch (kind) {
             .ascii => {
-                const h = hay[k];
-                if (std.ascii.isAscii(h)) {
-                    if (std.ascii.toLower(h) != needle[j]) return null;
-                    k += 1;
-                } else if (fold.step(hay, &k) != needle[j]) return null;
+                const byte = hay[i];
+                if (std.ascii.isAscii(byte)) {
+                    if (std.ascii.toLower(byte) != needle[j]) return null;
+                    i += 1;
+                } else if (fold.step(hay, &i) != needle[j]) return null;
                 j += 1;
             },
             .folded => {
-                if (fold.step(hay, &k) != needle[j]) return null;
+                if (fold.step(hay, &i) != needle[j]) return null;
                 j += 1;
             },
-            .raw => if (fold.step(hay, &k) != fold.step(needle, &j)) return null,
+            .raw => if (fold.step(hay, &i) != fold.step(needle, &j)) return null,
         }
     }
-    if (at > from and fold.insideLetter(hay, at)) return null;
-    return k;
+    if (start > from and fold.insideLetter(hay, start)) return null;
+    return i;
 }
 
 /// `findFold`, start only.
@@ -1705,10 +1719,11 @@ fn findFoldNaive(gpa: std.mem.Allocator, hay: []const u8, needle: []const u8, fr
         try folded.append(gpa, fold.step(hay, &i));
     }
     try origin.append(gpa, hay.len);
-    const fneedle = try fold.foldAlloc(gpa, needle);
-    defer gpa.free(fneedle);
-    const at = std.mem.find(u8, folded.items, fneedle) orelse return null;
-    return .{ .start = origin.items[at], .end = origin.items[at + fneedle.len] };
+    const needle_folded = try fold.foldAlloc(gpa, needle);
+    defer gpa.free(needle_folded);
+    const folded_start = std.mem.find(u8, folded.items, needle_folded) orelse return null;
+    const folded_end = folded_start + needle_folded.len;
+    return .{ .start = origin.items[folded_start], .end = origin.items[folded_end] };
 }
 
 pub const Verified = struct { count: u32, line: u32, snippet: []const u8, phrase: bool };
@@ -1748,7 +1763,7 @@ pub fn verify(
     }
     const counted = if (phrase_hit != null) phrase else words[0];
     const hit = first.?;
-    const at = hit.start;
+    const hit_start = hit.start;
     // The ranking stops caring after `count_cap` hits; so does counting
     // (in a 4 MB book, "the" would otherwise scan the whole text).
     var count: u32 = 0;
@@ -1757,12 +1772,13 @@ pub fn verify(
         count += 1;
         occurrence = findFold(text, counted, occurrence.end) orelse break;
     }
-    const newline_before = std.mem.findScalarLast(u8, text[0..at], '\n');
+    const newline_before = std.mem.findScalarLast(u8, text[0..hit_start], '\n');
     const line_start = if (newline_before) |newline| newline + 1 else 0;
-    const line_end = std.mem.findScalarPos(u8, text, at, '\n') orelse text.len;
-    const line_number: u32 = @intCast(std.mem.count(u8, text[0..at], "\n") + 1);
+    const line_end = std.mem.findScalarPos(u8, text, hit_start, '\n') orelse text.len;
+    const line_number: u32 = @intCast(std.mem.count(u8, text[0..hit_start], "\n") + 1);
     // Keep the hit visible: start the snippet a little before it.
-    const snippet_start = if (at - line_start > snippet_lead_max) at - snippet_lead else line_start;
+    const hit_far_into_line = hit_start - line_start > snippet_lead_max;
+    const snippet_start = if (hit_far_into_line) hit_start - snippet_lead else line_start;
     const snippet_end = @min(line_end, snippet_start + snippet_bytes_max);
     const snippet = std.mem.trim(u8, text[snippet_start..snippet_end], " \t\r");
     return .{
@@ -1777,83 +1793,85 @@ pub fn verify(
 
 const testing = std.testing;
 
+/// Texts by document: a document's path is the index of its text.
 const TestDocs = struct {
     texts: []const []const u8,
-    fn text(
-        ctx: *anyopaque,
-        d: DocIn,
-        buf: *std.ArrayList(u8),
+
+    fn readText(
+        context: *anyopaque,
+        doc: DocIn,
+        text: *std.ArrayList(u8),
         gpa: std.mem.Allocator,
     ) std.mem.Allocator.Error!bool {
-        const self: *TestDocs = @ptrCast(@alignCast(ctx));
-        const i = std.fmt.parseInt(usize, d.path, 10) catch return false;
-        buf.clearRetainingCapacity();
-        try buf.appendSlice(gpa, self.texts[i]);
+        const test_docs: *TestDocs = @ptrCast(@alignCast(context));
+        const text_index = std.fmt.parseInt(usize, doc.path, 10) catch return false;
+        text.clearRetainingCapacity();
+        try text.appendSlice(gpa, test_docs.texts[text_index]);
         return true;
     }
 };
 
 test "varint round trip and intersection" {
     const gpa = testing.allocator;
-    var enc: std.ArrayList(u8) = .empty;
-    defer enc.deinit(gpa);
+    var encoded: std.ArrayList(u8) = .empty;
+    defer encoded.deinit(gpa);
     const ids = [_]u32{ 3, 4, 200, 70000, 70001, 5_000_000 };
-    var prev: u32 = 0;
-    for (ids) |d| {
-        try writeVarint(gpa, &enc, d - prev);
-        prev = d;
+    var id_previous: u32 = 0;
+    for (ids) |id| {
+        try writeVarint(gpa, &encoded, id - id_previous);
+        id_previous = id;
     }
-    var dec: std.ArrayList(u32) = .empty;
-    defer dec.deinit(gpa);
-    try decodeAll(gpa, enc.items, 10_000_000, &dec);
-    try testing.expectEqualSlices(u32, &ids, dec.items);
-    var inter: std.ArrayList(u32) = .empty;
-    defer inter.deinit(gpa);
-    try intersect(gpa, &.{ 1, 4, 70000, 5_000_000, 6_000_000 }, enc.items, 10_000_000, &inter);
-    try testing.expectEqualSlices(u32, &.{ 4, 70000, 5_000_000 }, inter.items);
+    var decoded: std.ArrayList(u32) = .empty;
+    defer decoded.deinit(gpa);
+    try decodeAll(gpa, encoded.items, 10_000_000, &decoded);
+    try testing.expectEqualSlices(u32, &ids, decoded.items);
+    var intersection: std.ArrayList(u32) = .empty;
+    defer intersection.deinit(gpa);
+    const ids_wanted = [_]u32{ 1, 4, 70000, 5_000_000, 6_000_000 };
+    try intersect(gpa, &ids_wanted, encoded.items, 10_000_000, &intersection);
+    try testing.expectEqualSlices(u32, &.{ 4, 70000, 5_000_000 }, intersection.items);
 }
 
 test "candidates equal a brute-force scan, across segments, after save/open" {
     const gpa = testing.allocator;
     var prng = std.Random.DefaultPrng.init(9);
-    const r = prng.random();
+    const random = prng.random();
     const vocab = [_][]const u8{
         "arena", "allocator", "Config", "trigram", "posting", "lumen", "zig", "parser", "token", "Hyprland", "window",
         "élan",
     };
     var texts: std.ArrayList([]const u8) = .empty;
     defer {
-        for (texts.items) |t| gpa.free(t);
+        for (texts.items) |text| gpa.free(text);
         texts.deinit(gpa);
     }
     var docs: std.ArrayList(DocIn) = .empty;
     defer {
-        for (docs.items) |d| gpa.free(d.path);
+        for (docs.items) |doc| gpa.free(doc.path);
         docs.deinit(gpa);
     }
     for (0..3000) |i| {
-        var t: std.ArrayList(u8) = .empty;
-        for (0..r.intRangeAtMost(usize, 1, 30)) |_| {
-            try t.appendSlice(gpa, vocab[r.uintLessThan(usize, vocab.len)]);
-            try t.append(gpa, if (r.boolean()) ' ' else '\n');
+        var text: std.ArrayList(u8) = .empty;
+        for (0..random.intRangeAtMost(usize, 1, 30)) |_| {
+            try text.appendSlice(gpa, vocab[random.uintLessThan(usize, vocab.len)]);
+            try text.append(gpa, if (random.boolean()) ' ' else '\n');
         }
-        try texts.append(gpa, try t.toOwnedSlice(gpa));
+        try texts.append(gpa, try text.toOwnedSlice(gpa));
         try docs.append(gpa, .{ .path = try gpa.print("{d}", .{i}), .mtime = 0, .size = 0 });
     }
     const pool = try Pool.create(gpa, testing.io, 3);
     defer pool.destroy();
-    var td: TestDocs = .{ .texts = texts.items };
-    var ix = try build(gpa, pool, docs.items, .{ .read = TestDocs.text, .ctx = &td }, null);
-    defer ix.deinit(gpa);
+    var test_docs: TestDocs = .{ .texts = texts.items };
+    const reader: TextReader = .{ .read = TestDocs.readText, .ctx = &test_docs };
+    var index = try build(gpa, pool, docs.items, reader, null);
+    defer index.deinit(gpa);
 
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dbuf: paths.Buffer = undefined;
-    const dir = try sys.tmpDirPath(&tmp, &dbuf);
-    var pbuf: paths.Buffer = undefined;
-    const p = try std.mem.printSentinel(&pbuf, "{s}/content.idx", .{dir}, 0);
-    try ix.save(p);
-    var mapped = try Index.open(p);
+    var test_dir = try sys.TestDir.init();
+    defer test_dir.deinit();
+    var index_path_buffer: paths.Buffer = undefined;
+    const index_path = try test_dir.path(&index_path_buffer, "content.idx");
+    try index.save(index_path);
+    var mapped = try Index.open(index_path);
     defer mapped.deinit(gpa);
     try testing.expectEqualStrings("2999", mapped.path(2999));
 
@@ -1867,11 +1885,11 @@ test "candidates equal a brute-force scan, across segments, after save/open" {
     for (queries) |words| {
         try mapped.candidates(gpa, words, &got);
         // Every true match must be a candidate (no false negatives).
-        for (texts.items, 0..) |t, i| {
+        for (texts.items, 0..) |text, i| {
             var all = true;
-            for (words) |w| if (findCI(t, w, 0) == null) {
-                all = false;
-            };
+            for (words) |word| {
+                if (findCI(text, word, 0) == null) all = false;
+            }
             if (all) try testing.expect(std.mem.findScalar(u32, got.items, @intCast(i)) != null);
         }
     }
@@ -1891,8 +1909,8 @@ test "update: edited and deleted documents leave, new ones join, old ids keep th
         .{ .path = "1", .mtime = 1, .size = 1 },
         .{ .path = "2", .mtime = 1, .size = 1 },
     };
-    var ix = try build(gpa, pool, &docs, .{ .read = TestDocs.text, .ctx = &before }, null);
-    defer ix.deinit(gpa);
+    var index = try build(gpa, pool, &docs, .{ .read = TestDocs.readText, .ctx = &before }, null);
+    defer index.deinit(gpa);
 
     // "1" edited, "2" deleted, "3" new. TestDocs reads a path's number as
     // the index of its text, so the edit is "1" with another text.
@@ -1907,72 +1925,73 @@ test "update: edited and deleted documents leave, new ones join, old ids keep th
         .mtime = 2,
         .size = 1,
     } };
-    var st: BuildStats = .{};
-    var up = try update(
+    var stats: BuildStats = .{};
+    var updated = try update(
         gpa,
         pool,
-        &ix,
+        &index,
         &.{ 1, 2 },
         &added,
-        .{ .read = TestDocs.text, .ctx = &after },
-        &st,
+        .{ .read = TestDocs.readText, .ctx = &after },
+        &stats,
     );
-    defer up.deinit(gpa);
-    try testing.expectEqual(@as(usize, 2), st.docs_indexed);
-    try testing.expectEqual(ix.segments_count + 1, up.segments_count);
+    defer updated.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), stats.docs_indexed);
+    try testing.expectEqual(index.segments_count + 1, updated.segments_count);
 
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dbuf: paths.Buffer = undefined;
-    const dir = try sys.tmpDirPath(&tmp, &dbuf);
-    var pbuf: paths.Buffer = undefined;
-    const p = try std.mem.printSentinel(&pbuf, "{s}/content.idx", .{dir}, 0);
-    try up.save(p);
-    var mapped = try Index.open(p);
+    var test_dir = try sys.TestDir.init();
+    defer test_dir.deinit();
+    var index_path_buffer: paths.Buffer = undefined;
+    const index_path = try test_dir.path(&index_path_buffer, "content.idx");
+    try updated.save(index_path);
+    var mapped = try Index.open(index_path);
     defer mapped.deinit(gpa);
 
     var got: std.ArrayList(u32) = .empty;
     defer got.deinit(gpa);
-    for ([_]*const Index{ &up, &mapped }) |x| {
-        try testing.expectEqual(@as(usize, 5), x.docs_count);
-        try testing.expectEqual(@as(usize, 3), x.live());
-        try testing.expect(x.removed(1) and x.removed(2) and !x.removed(0));
-        try testing.expectEqualStrings("1", x.path(3));
-        try testing.expectEqual(@as(i64, 2), x.mtimes[3]);
-        try x.candidates(gpa, &.{"zanzibar"}, &got);
+    for ([_]*const Index{ &updated, &mapped }) |version| {
+        try testing.expectEqual(@as(usize, 5), version.docs_count);
+        try testing.expectEqual(@as(usize, 3), version.live());
+        try testing.expect(version.removed(1));
+        try testing.expect(version.removed(2));
+        try testing.expect(!version.removed(0));
+        try testing.expectEqualStrings("1", version.path(3));
+        try testing.expectEqual(@as(i64, 2), version.mtimes[3]);
+        try version.candidates(gpa, &.{"zanzibar"}, &got);
         try testing.expectEqualSlices(u32, &.{0}, got.items);
-        try x.candidates(gpa, &.{"kilimanjaro"}, &got);
+        try version.candidates(gpa, &.{"kilimanjaro"}, &got);
         try testing.expectEqual(@as(usize, 0), got.items.len);
-        try x.candidates(gpa, &.{"okavango"}, &got);
+        try version.candidates(gpa, &.{"okavango"}, &got);
         try testing.expectEqualSlices(u32, &.{ 3, 4 }, got.items);
     }
 
     // Written to a file as they grow: the same bytes. The update overwrites
     // the file its old index is mapped from, as the service does.
-    const fp = try std.mem.printSentinel(&pbuf, "{s}/streamed.idx", .{dir}, 0);
+    var streamed_path_buffer: paths.Buffer = undefined;
+    const streamed_path = try test_dir.path(&streamed_path_buffer, "streamed.idx");
     var built = try buildFile(
         gpa,
         pool,
         &docs,
-        .{ .read = TestDocs.text, .ctx = &before },
-        fp,
+        .{ .read = TestDocs.readText, .ctx = &before },
+        streamed_path,
         null,
     );
     defer built.deinit(gpa);
     try testing.expect(built.backing == .mapped);
-    try testing.expectEqualSlices(u8, ix.buf, built.buf);
+    try testing.expectEqualSlices(u8, index.buf, built.buf);
     var streamed = try updateFile(
         gpa,
         pool,
         &built,
         &.{ 1, 2 },
         &added,
-        .{ .read = TestDocs.text, .ctx = &after },
-        fp,
+        .{ .read = TestDocs.readText, .ctx = &after },
+        streamed_path,
         null,
     );
     defer streamed.deinit(gpa);
-    try testing.expectEqualSlices(u8, up.buf, streamed.buf);
+    try testing.expectEqualSlices(u8, updated.buf, streamed.buf);
     try testing.expectEqualStrings("0", built.path(0));
 
     // Updated again, with only a removal: no new segment.
@@ -1982,7 +2001,7 @@ test "update: edited and deleted documents leave, new ones join, old ids keep th
         &mapped,
         &.{0},
         &.{},
-        .{ .read = TestDocs.text, .ctx = &after },
+        .{ .read = TestDocs.readText, .ctx = &after },
         null,
     );
     defer again.deinit(gpa);
@@ -1998,12 +2017,10 @@ test "appended updates: same results as rewritten ones, old mappings stay good, 
     const gpa = testing.allocator;
     const pool = try Pool.create(gpa, testing.io, 2);
     defer pool.destroy();
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dbuf: paths.Buffer = undefined;
-    const dir = try sys.tmpDirPath(&tmp, &dbuf);
-    var pbuf: paths.Buffer = undefined;
-    const p = try std.mem.printSentinel(&pbuf, "{s}/content.idx", .{dir}, 0);
+    var test_dir = try sys.TestDir.init();
+    defer test_dir.deinit();
+    var index_path_buffer: paths.Buffer = undefined;
+    const index_path = try test_dir.path(&index_path_buffer, "content.idx");
 
     // Texts by id: 0-2 at first, then one edit or new file per round.
     const texts = [_][]const u8{
@@ -2017,17 +2034,17 @@ test "appended updates: same results as rewritten ones, old mappings stay good, 
         "hotel kalahari",
         "india zanzibar",
     };
-    var td: TestDocs = .{ .texts = &texts };
-    const reader: TextReader = .{ .read = TestDocs.text, .ctx = &td };
+    var test_docs: TestDocs = .{ .texts = &texts };
+    const reader: TextReader = .{ .read = TestDocs.readText, .ctx = &test_docs };
     var first = [_]DocIn{
         .{ .path = "0", .mtime = 1, .size = 1 },
         .{ .path = "1", .mtime = 1, .size = 1 },
         .{ .path = "2", .mtime = 1, .size = 1 },
     };
-    var cur = try buildFile(gpa, pool, &first, reader, p, null);
-    defer cur.deinit(gpa);
-    var mem = try build(gpa, pool, &first, reader, null);
-    defer mem.deinit(gpa);
+    var current = try buildFile(gpa, pool, &first, reader, index_path, null);
+    defer current.deinit(gpa);
+    var in_memory = try build(gpa, pool, &first, reader, null);
+    defer in_memory.deinit(gpa);
 
     var got: std.ArrayList(u32) = .empty;
     defer got.deinit(gpa);
@@ -2044,78 +2061,91 @@ test "appended updates: same results as rewritten ones, old mappings stay good, 
     // Each round replaces document `round - 3` (gone) by a new one (added).
     var round: usize = 3;
     while (round < texts.len) : (round += 1) {
-        var nbuf: [8]u8 = undefined;
+        var name_buffer: [8]u8 = undefined;
         const added = [_]DocIn{.{
-            .path = try std.mem.print(&nbuf, "{d}", .{round}),
+            .path = try std.mem.print(&name_buffer, "{d}", .{round}),
             .mtime = 2,
             .size = 1,
         }};
         const gone = [_]u32{@intCast(round - 3)};
-        const next = (try appendFile(gpa, pool, &cur, &gone, &added, reader, p, null)).?;
-        const next_mem = try update(gpa, pool, &mem, &gone, &added, reader, null);
+        const next = (try appendFile(
+            gpa,
+            pool,
+            &current,
+            &gone,
+            &added,
+            reader,
+            index_path,
+            null,
+        )).?;
+        const next_in_memory = try update(gpa, pool, &in_memory, &gone, &added, reader, null);
         // The old mapping still answers as before the append.
-        try cur.candidates(gpa, &.{"zanzibar"}, &got);
-        try mem.candidates(gpa, &.{"zanzibar"}, &want);
+        try current.candidates(gpa, &.{"zanzibar"}, &got);
+        try in_memory.candidates(gpa, &.{"zanzibar"}, &want);
         try testing.expectEqualSlices(u32, want.items, got.items);
-        cur.deinit(gpa);
-        mem.deinit(gpa);
-        cur = next;
-        mem = next_mem;
-        try testing.expectEqual(mem.docs_count, cur.docs_count);
-        try testing.expectEqualSlices(u8, mem.flags, cur.flags);
-        for (0..cur.docs_count) |i| try testing.expectEqualStrings(
-            mem.path(@intCast(i)),
-            cur.path(@intCast(i)),
+        current.deinit(gpa);
+        in_memory.deinit(gpa);
+        current = next;
+        in_memory = next_in_memory;
+        try testing.expectEqual(in_memory.docs_count, current.docs_count);
+        try testing.expectEqualSlices(u8, in_memory.flags, current.flags);
+        for (0..current.docs_count) |i| try testing.expectEqualStrings(
+            in_memory.path(@intCast(i)),
+            current.path(@intCast(i)),
         );
-        for (words) |w| {
-            try cur.candidates(gpa, &.{w}, &got);
-            try mem.candidates(gpa, &.{w}, &want);
+        for (words) |word| {
+            try current.candidates(gpa, &.{word}, &got);
+            try in_memory.candidates(gpa, &.{word}, &want);
             try testing.expectEqualSlices(u32, want.items, got.items);
         }
     }
     // Six updates of tiny segments: merged, not six more segments.
-    try testing.expect(cur.segments_count < mem.segments_count);
-    try testing.expect(cur.buf.len > cur.bytes_live);
+    try testing.expect(current.segments_count < in_memory.segments_count);
+    try testing.expect(current.buf.len > current.bytes_live);
 
     // An append whose header never got written (a crash): the file still
     // opens as it was.
     {
-        const fd: i32 = @intCast(linux.open(p, .{ .ACCMODE = .WRONLY, .APPEND = true }, 0));
-        defer _ = linux.close(fd);
-        _ = linux.write(fd, "garbage after the end", 21);
+        const opened = linux.open(index_path, .{ .ACCMODE = .WRONLY, .APPEND = true }, 0);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(opened));
+        const fd: i32 = @intCast(opened);
+        defer sys.close(fd);
+        const garbage = "garbage after the end";
+        try testing.expectEqual(garbage.len, linux.write(fd, garbage, garbage.len));
     }
-    var reopened = try Index.open(p);
+    var reopened = try Index.open(index_path);
     defer reopened.deinit(gpa);
-    try testing.expectEqual(cur.docs_count, reopened.docs_count);
+    try testing.expectEqual(current.docs_count, reopened.docs_count);
     try reopened.candidates(gpa, &.{"okavango"}, &got);
-    try mem.candidates(gpa, &.{"okavango"}, &want);
+    try in_memory.candidates(gpa, &.{"okavango"}, &want);
     try testing.expectEqualSlices(u32, want.items, got.items);
     // And the next append is not fooled by it: the file is longer than the
     // index that was mapped, so it says so (the service rewrites instead).
-    try testing.expect((try appendFile(gpa, pool, &cur, &.{}, &.{}, reader, p, null)) == null);
+    const appended = try appendFile(gpa, pool, &current, &.{}, &.{}, reader, index_path, null);
+    try testing.expect(appended == null);
 }
 
 test "verify finds the line and counts hits" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const text = "first line\n  const a = ArenaAllocator.init(gpa);\nArenaAllocator again\n";
-    const v = verify(text, &.{"arenaallocator"}, "arenaallocator", true, arena.allocator()).?;
-    try testing.expectEqual(@as(u32, 2), v.line);
-    try testing.expectEqual(@as(u32, 2), v.count);
-    try testing.expectEqualStrings("const a = ArenaAllocator.init(gpa);", v.snippet);
+    const verified = verify(text, &.{"arenaallocator"}, "arenaallocator", true, arena.allocator()).?;
+    try testing.expectEqual(@as(u32, 2), verified.line);
+    try testing.expectEqual(@as(u32, 2), verified.count);
+    try testing.expectEqualStrings("const a = ArenaAllocator.init(gpa);", verified.snippet);
     try testing.expect(
         verify(text, &.{ "arena", "missing" }, "arena missing", true, arena.allocator()) == null,
     );
     // The phrase wins over the first word's first occurrence.
-    const p = verify(
+    const phrase_verified = verify(
         "again here\nsee ArenaAllocator again\n",
         &.{ "arenaallocator", "again" },
         "arenaallocator again",
         true,
         arena.allocator(),
     ).?;
-    try testing.expectEqual(@as(u32, 2), p.line);
-    try testing.expect(p.phrase);
+    try testing.expectEqual(@as(u32, 2), phrase_verified.line);
+    try testing.expect(phrase_verified.phrase);
 }
 
 // ---------------------------------------------------------------- search
@@ -2134,7 +2164,7 @@ pub fn splitWords(
 /// The file that holds a document's text: the document itself, or its
 /// extracted text in a cache. Verification maps it instead of reading it,
 /// so a hit on page 1 of a 4 MB book touches a few pages, not the book.
-pub const PathFn = *const fn (ctx: *anyopaque, doc: DocIn, buf: []u8) ?[:0]const u8;
+pub const PathFn = *const fn (context: *anyopaque, doc: DocIn, path_buffer: []u8) ?[:0]const u8;
 
 pub const SearchOptions = struct {
     /// Matches wanted, best first.
@@ -2149,9 +2179,9 @@ pub const SearchOptions = struct {
 };
 
 /// For plain documents only (benchmarks, tests).
-pub fn plainPath(_: *anyopaque, doc: DocIn, buf: []u8) ?[:0]const u8 {
+pub fn plainPath(_: *anyopaque, doc: DocIn, path_buffer: []u8) ?[:0]const u8 {
     if (doc.source != .plain) return null;
-    return std.mem.printSentinel(buf, "{s}", .{doc.path}, 0) catch null;
+    return std.mem.printSentinel(path_buffer, "{s}", .{doc.path}, 0) catch null;
 }
 
 /// A candidate in verification order: by `bound`, the most its score can
@@ -2161,7 +2191,7 @@ const Candidate = struct { doc: u32, bound: i32, maybe_phrase: bool };
 /// Verification shared by the pool's threads: each takes the next candidate
 /// (no batches, so nobody waits for the slowest file of a batch) until the
 /// next one's bound cannot beat the `limit`-th match so far.
-const VerifyCtx = struct {
+const VerifyContext = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     index: *const Index,
@@ -2169,7 +2199,7 @@ const VerifyCtx = struct {
     phrase: []const u8,
     candidates: []const Candidate,
     text_path: PathFn,
-    text_ctx: *anyopaque,
+    text_context: *anyopaque,
     stop: ?*const std.atomic.Value(bool),
     arenas: []std.heap.ArenaAllocator,
     now_s: i64,
@@ -2181,26 +2211,26 @@ const VerifyCtx = struct {
     top: []Match,
     top_count: usize = 0,
     arena: std.mem.Allocator,
-    oom: std.atomic.Value(bool) = .init(false),
+    out_of_memory: std.atomic.Value(bool) = .init(false),
 
-    fn offer(ctx: *VerifyCtx, match: Match) void {
-        ctx.lock.lockUncancelable(ctx.io);
-        defer ctx.lock.unlock(ctx.io);
-        assert(ctx.top_count <= ctx.top.len);
-        var slot = ctx.top_count;
-        if (ctx.top_count == ctx.top.len) {
-            slot = worst(ctx.top);
-            if (!matchRanksBefore(match, ctx.top[slot])) return;
+    fn offer(context: *VerifyContext, match: Match) void {
+        context.lock.lockUncancelable(context.io);
+        defer context.lock.unlock(context.io);
+        assert(context.top_count <= context.top.len);
+        var slot = context.top_count;
+        if (context.top_count == context.top.len) {
+            slot = worst(context.top);
+            if (!matchRanksBefore(match, context.top[slot])) return;
         }
         var copy = match;
-        copy.snippet = ctx.arena.dupe(u8, match.snippet) catch {
-            ctx.oom.store(true, .release);
+        copy.snippet = context.arena.dupe(u8, match.snippet) catch {
+            context.out_of_memory.store(true, .release);
             return;
         };
-        ctx.top[slot] = copy;
-        if (ctx.top_count < ctx.top.len) ctx.top_count += 1;
-        if (ctx.top_count == ctx.top.len) {
-            ctx.floor.store(ctx.top[worst(ctx.top)].score, .release);
+        context.top[slot] = copy;
+        if (context.top_count < context.top.len) context.top_count += 1;
+        if (context.top_count == context.top.len) {
+            context.floor.store(context.top[worst(context.top)].score, .release);
         }
     }
 };
@@ -2226,26 +2256,27 @@ fn worst(matches: []const Match) usize {
     return worst_index;
 }
 
-fn verifyTask(ctx: *VerifyCtx, task: usize) void {
+fn verifyTask(context: *VerifyContext, task: usize) void {
     var path_buffer: paths.Buffer = undefined;
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(ctx.gpa);
-    const arena = ctx.arenas[task].allocator();
+    var plain_text: std.ArrayList(u8) = .empty;
+    defer plain_text.deinit(context.gpa);
+    const arena = context.arenas[task].allocator();
     while (true) {
-        if (ctx.stop) |stop| {
+        if (context.stop) |stop| {
             if (stop.load(.acquire)) return;
         }
-        const candidate_index = ctx.next.fetchAdd(1, .monotonic);
-        if (candidate_index >= ctx.candidates.len) return;
-        const candidate = ctx.candidates[candidate_index];
+        const candidate_index = context.next.fetchAdd(1, .monotonic);
+        if (candidate_index >= context.candidates.len) return;
+        const candidate = context.candidates[candidate_index];
         // Candidates come by bound: none after this one can enter either.
-        if (candidate.bound < ctx.floor.load(.acquire)) {
-            ctx.next.store(ctx.candidates.len, .monotonic);
+        if (candidate.bound < context.floor.load(.acquire)) {
+            context.next.store(context.candidates.len, .monotonic);
             return;
         }
-        defer _ = ctx.arenas[task].reset(.retain_capacity);
-        const doc = ctx.index.docIn(candidate.doc);
-        const text_path = ctx.text_path(ctx.text_ctx, doc, &path_buffer) orelse continue;
+        defer _ = context.arenas[task].reset(.retain_capacity);
+        const doc = context.index.docIn(candidate.doc);
+        const text_context = context.text_context;
+        const text_path = context.text_path(text_context, doc, &path_buffer) orelse continue;
         // Plain files (1 MB at most) are read into a reused buffer: cheaper
         // than map + unmap, whose TLB shootdown hits every core of a
         // 24-thread process. Extracted texts run to megabytes and usually
@@ -2255,24 +2286,25 @@ fn verifyTask(ctx: *VerifyCtx, task: usize) void {
         const text: []const u8 = switch (doc.source) {
             .plain => blk: {
                 // Out of memory: this candidate is left out of the results.
-                const has_text = readPlain(ctx.gpa, text_path, &buf) catch false;
+                const has_text = readPlain(context.gpa, text_path, &plain_text) catch false;
                 if (!has_text) continue;
-                break :blk buf.items;
+                break :blk plain_text.items;
             },
             .extracted => blk: {
                 mapped = sys.mapPrivate(text_path) catch continue;
                 break :blk mapped.?;
             },
         };
-        const verified = verify(text, ctx.words, ctx.phrase, candidate.maybe_phrase, arena) orelse
+        const maybe_phrase = candidate.maybe_phrase;
+        const verified = verify(text, context.words, context.phrase, maybe_phrase, arena) orelse
             continue;
         const phrase_bonus: i32 = if (verified.phrase) phrase_max else 0;
-        ctx.offer(.{
+        context.offer(.{
             .doc = candidate.doc,
             .count = verified.count,
             .line = verified.line,
             .snippet = verified.snippet,
-            .score = rank(doc, verified.count, ctx.words, ctx.now_s) + phrase_bonus,
+            .score = rank(doc, verified.count, context.words, context.now_s) + phrase_bonus,
         });
     }
 }
@@ -2368,12 +2400,12 @@ pub fn search(
     arena: std.mem.Allocator,
     pool: *Pool,
     query: []const u8,
-    opts: SearchOptions,
+    options: SearchOptions,
     out: *std.ArrayList(Match),
 ) std.mem.Allocator.Error!void {
-    const limit = opts.limit;
-    const text_path = opts.text_path;
-    const text_ctx = opts.text_ctx;
+    const limit = options.limit;
+    const text_path = options.text_path;
+    const text_context = options.text_ctx;
     out.clearRetainingCapacity();
     if (limit == 0) return;
     const words = try splitWords(arena, query);
@@ -2400,7 +2432,7 @@ pub fn search(
     for (arenas) |*task_arena| task_arena.* = .init(gpa);
     const top = try gpa.alloc(Match, limit);
     defer gpa.free(top);
-    var ctx: VerifyCtx = .{
+    var context: VerifyContext = .{
         .gpa = gpa,
         .io = pool.io,
         .index = index,
@@ -2408,16 +2440,16 @@ pub fn search(
         .phrase = phrase,
         .candidates = ordered[0..@min(ordered.len, candidates_verified_max)],
         .text_path = text_path,
-        .text_ctx = text_ctx,
-        .stop = opts.stop,
+        .text_context = text_context,
+        .stop = options.stop,
         .arenas = arenas,
         .now_s = now_s,
         .top = top,
         .arena = arena,
     };
-    pool.run(@min(tasks, ctx.candidates.len), &ctx, verifyTask);
-    if (ctx.oom.load(.acquire)) return error.OutOfMemory;
-    try out.appendSlice(arena, top[0..ctx.top_count]);
+    pool.run(@min(tasks, context.candidates.len), &context, verifyTask);
+    if (context.out_of_memory.load(.acquire)) return error.OutOfMemory;
+    try out.appendSlice(arena, top[0..context.top_count]);
     sortMatches(out.items);
 }
 
@@ -2431,7 +2463,7 @@ fn sortMatches(matches: []Match) void {
 
 test "SIMD findFold agrees with the naive folded scan" {
     var prng = std.Random.DefaultPrng.init(3);
-    const r = prng.random();
+    const random = prng.random();
     var hay: [400]u8 = undefined;
     // ASCII, accented letters (two bytes), a symbol, and stray UTF-8 bytes.
     const pieces = [_][]const u8{
@@ -2444,12 +2476,12 @@ test "SIMD findFold agrees with the naive folded scan" {
         "\xC3", "\xA1", "n",
     };
     for (0..150) |_| {
-        const want = r.intRangeAtMost(usize, 0, hay.len - 2);
-        var n: usize = 0;
-        while (n < want) {
-            const p = pieces[r.uintLessThan(usize, pieces.len)];
-            @memcpy(hay[n .. n + p.len], p);
-            n += p.len;
+        const want = random.intRangeAtMost(usize, 0, hay.len - 2);
+        var hay_length: usize = 0;
+        while (hay_length < want) {
+            const piece = pieces[random.uintLessThan(usize, pieces.len)];
+            @memcpy(hay[hay_length .. hay_length + piece.len], piece);
+            hay_length += piece.len;
         }
         const needles = [_][]const u8{
             "a",    "ab",   "AbC",      "zz", "c\n.", "B C a",
@@ -2461,24 +2493,24 @@ test "SIMD findFold agrees with the naive folded scan" {
             "\xA1", "\xC3", "aaaaaaaa",
             "ÑAN",
         };
-        for (needles) |nd| {
+        for (needles) |needle| {
             var from: usize = 0;
-            while (from <= n) : (from += 37) {
+            while (from <= hay_length) : (from += 37) {
                 try testing.expectEqual(
-                    try findFoldNaive(testing.allocator, hay[0..n], nd, from),
-                    findFold(hay[0..n], nd, from),
+                    try findFoldNaive(testing.allocator, hay[0..hay_length], needle, from),
+                    findFold(hay[0..hay_length], needle, from),
                 );
             }
         }
     }
 }
 
-/// `s` repeated `n` times, at comptime (Zig 0.17 has no `**`).
-fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
+/// `pattern` repeated `count` times, at comptime (Zig 0.17 has no `**`).
+fn repeat(comptime pattern: []const u8, comptime count: usize) *const [pattern.len * count]u8 {
     const done = comptime blk: {
-        @setEvalBranchQuota(n * 10 + 1000);
-        var out: [s.len * n]u8 = undefined;
-        for (0..n) |i| @memcpy(out[i * s.len ..][0..s.len], s);
+        @setEvalBranchQuota(count * 10 + 1000);
+        var out: [pattern.len * count]u8 = undefined;
+        for (0..count) |i| @memcpy(out[i * pattern.len ..][0..pattern.len], pattern);
         break :blk out;
     };
     return &done;
@@ -2486,21 +2518,21 @@ fn repeat(comptime s: []const u8, comptime n: usize) *const [s.len * n]u8 {
 
 test "folded search: accents and case, both ways, positions in the original" {
     const text = "Primera línea\nUna ACCIÓN rápida\nel Ñandú corre\n3×4 y 3x4\n";
-    for ([_][]const u8{ "accion", "ACCIÓN", "acción", "Accion" }) |q| {
-        const m = findFold(text, q, 0).?;
-        try testing.expectEqualStrings("ACCIÓN", text[m.start..m.end]);
+    for ([_][]const u8{ "accion", "ACCIÓN", "acción", "Accion" }) |query| {
+        const span = findFold(text, query, 0).?;
+        try testing.expectEqualStrings("ACCIÓN", text[span.start..span.end]);
     }
     try testing.expectEqualStrings("Ñandú", blk: {
-        const m = findFold(text, "nandu", 0).?;
-        break :blk text[m.start..m.end];
+        const span = findFold(text, "nandu", 0).?;
+        break :blk text[span.start..span.end];
     });
     try testing.expectEqualStrings("Ñandú", blk: {
-        const m = findFold(text, "ÑANDÚ", 0).?;
-        break :blk text[m.start..m.end];
+        const span = findFold(text, "ÑANDÚ", 0).?;
+        break :blk text[span.start..span.end];
     });
     try testing.expectEqualStrings("linea", blk: {
-        const m = findFold("linea", "línea", 0).?;
-        break :blk "linea"[m.start..m.end];
+        const span = findFold("linea", "línea", 0).?;
+        break :blk "linea"[span.start..span.end];
     });
     // A symbol is not a letter.
     const times = findFold(text, "×", 0).?;
@@ -2525,51 +2557,49 @@ test "folded search: accents and case, both ways, positions in the original" {
         findFold(long_hay, long_needle, 51),
     );
 
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    for ([_][]const u8{ "accion", "ACCIÓN", "acción" }) |q| {
-        const words = try splitWords(a, q);
-        const v = verify(text, words, words[0], true, a).?;
-        try testing.expectEqual(@as(u32, 2), v.line);
-        try testing.expectEqualStrings("Una ACCIÓN rápida", v.snippet);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    for ([_][]const u8{ "accion", "ACCIÓN", "acción" }) |query| {
+        const words = try splitWords(arena, query);
+        const verified = verify(text, words, words[0], true, arena).?;
+        try testing.expectEqual(@as(u32, 2), verified.line);
+        try testing.expectEqualStrings("Una ACCIÓN rápida", verified.snippet);
     }
-    const v = verify(
+    const verified = verify(
         text,
-        try splitWords(a, "nandu corre"),
-        try fold.foldAlloc(a, "nandu corre"),
+        try splitWords(arena, "nandu corre"),
+        try fold.foldAlloc(arena, "nandu corre"),
         true,
-        a,
+        arena,
     ).?;
-    try testing.expectEqual(@as(u32, 3), v.line);
-    try testing.expect(v.phrase);
+    try testing.expectEqual(@as(u32, 3), verified.line);
+    try testing.expect(verified.phrase);
     // Two hits of different lengths, counted without overlap.
     try testing.expectEqual(
         @as(u32, 3),
-        verify("acción accion ACCIÓN", &.{"accion"}, "accion", true, a).?.count,
+        verify("acción accion ACCIÓN", &.{"accion"}, "accion", true, arena).?.count,
     );
 }
 
 const FileDocs = struct {
-    fn text(
+    fn readText(
         _: *anyopaque,
-        d: DocIn,
-        buf: *std.ArrayList(u8),
+        doc: DocIn,
+        text: *std.ArrayList(u8),
         gpa: std.mem.Allocator,
     ) std.mem.Allocator.Error!bool {
-        return readPlain(gpa, d.path, buf);
+        return readPlain(gpa, doc.path, text);
     }
 };
 
 test "search: the top matches equal reading every document and ranking them all" {
     const gpa = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dbuf: paths.Buffer = undefined;
-    const dir = try sys.tmpDirPath(&tmp, &dbuf);
+    var test_dir = try sys.TestDir.init();
+    defer test_dir.deinit();
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
-    const a = arena_state.allocator();
+    const arena = arena_state.allocator();
     // Few words, so documents share them, phrases occur by chance, and
     // scores tie (recency and depth vary too).
     const vocab = [_][]const u8{
@@ -2577,92 +2607,87 @@ test "search: the top matches equal reading every document and ranking them all"
         "café",
     };
     var prng: std.Random.DefaultPrng = .init(42);
-    const r = prng.random();
-    const n = 400;
-    var docs: [n]DocIn = undefined;
+    const random = prng.random();
+    const docs_count = 400;
+    var docs: [docs_count]DocIn = undefined;
     const now = sys.nowSeconds();
-    for (&docs, 0..) |*d, i| {
-        var t: std.ArrayList(u8) = .empty;
-        for (0..r.intRangeAtMost(usize, 3, 40)) |_| {
-            try t.appendSlice(a, vocab[r.uintLessThan(usize, vocab.len)]);
-            try t.append(a, if (r.uintLessThan(u8, 6) == 0) '\n' else ' ');
+    try test_dir.mkdir("deep/er");
+    for (&docs, 0..) |*doc, i| {
+        var text: std.ArrayList(u8) = .empty;
+        for (0..random.intRangeAtMost(usize, 3, 40)) |_| {
+            try text.appendSlice(arena, vocab[random.uintLessThan(usize, vocab.len)]);
+            try text.append(arena, if (random.uintLessThan(u8, 6) == 0) '\n' else ' ');
         }
-        const sub = if (i % 3 == 0) "/deep/er" else "";
-        if (sub.len > 0) {
-            var mb: paths.Buffer = undefined;
-            _ = linux.mkdir(try std.mem.printSentinel(&mb, "{s}/deep", .{dir}, 0), 0o700);
-            _ = linux.mkdir(try std.mem.printSentinel(&mb, "{s}/deep/er", .{dir}, 0), 0o700);
-        }
-        const path = try a.print("{s}{s}/{s}{d}.txt", .{
-            dir,
-            sub,
+        const folder = if (i % 3 == 0) "/deep/er" else "";
+        const path = try arena.print("{s}{s}/{s}{d}.txt", .{
+            test_dir.abs,
+            folder,
             if (i % 7 == 0) "main" else "doc",
             i,
         });
-        var zb: paths.Buffer = undefined;
-        try sys.writeFile(try std.mem.printSentinel(&zb, "{s}", .{path}, 0), t.items);
-        const ages = [_]i64{ 0, 3, 20, 100, 300, 900 };
-        d.* = .{ .path = path, .mtime = now - ages[i % ages.len] * 86_400, .size = t.items.len };
+        var path_buffer: paths.Buffer = undefined;
+        try sys.writeFile(try std.mem.printSentinel(&path_buffer, "{s}", .{path}, 0), text.items);
+        const ages_days = [_]i64{ 0, 3, 20, 100, 300, 900 };
+        const age_s = ages_days[i % ages_days.len] * std.time.s_per_day;
+        doc.* = .{ .path = path, .mtime = now - age_s, .size = text.items.len };
     }
     const pool = try Pool.create(gpa, testing.io, 3);
     defer pool.destroy();
     var dummy: u8 = 0;
-    var ix = try build(gpa, pool, &docs, .{ .read = FileDocs.text, .ctx = &dummy }, null);
-    defer ix.deinit(gpa);
+    var index = try build(gpa, pool, &docs, .{ .read = FileDocs.readText, .ctx = &dummy }, null);
+    defer index.deinit(gpa);
 
     var out: std.ArrayList(Match) = .empty;
     var want: std.ArrayList(Match) = .empty;
-    var tbuf: std.ArrayList(u8) = .empty;
-    defer tbuf.deinit(gpa);
+    var doc_text: std.ArrayList(u8) = .empty;
+    defer doc_text.deinit(gpa);
     const queries = [_][]const u8{
         "select * from", "fn main",           "use state", "the lumen", "lumen", "where",
         "café index",
         "main",          "from where select",
     };
-    for (queries) |q| for ([_]usize{ 5, 20 }) |limit| {
+    for (queries) |query| for ([_]usize{ 5, 20 }) |limit| {
         try search(
-            &ix,
+            &index,
             gpa,
-            a,
+            arena,
             pool,
-            q,
+            query,
             .{ .limit = limit, .text_path = plainPath, .text_ctx = &dummy },
             &out,
         );
         // Every document read and ranked.
         want.clearRetainingCapacity();
-        const words = try splitWords(a, q);
-        const phrase = try fold.foldAlloc(a, std.mem.trim(u8, q, " \t"));
-        for (docs, 0..) |d, i| {
-            if (!try readPlain(gpa, d.path, &tbuf)) continue;
-            const v = verify(tbuf.items, words, phrase, true, a) orelse continue;
-            const bonus: i32 = if (v.phrase) phrase_max else 0;
-            try want.append(a, .{
+        const words = try splitWords(arena, query);
+        const phrase = try fold.foldAlloc(arena, std.mem.trim(u8, query, " \t"));
+        for (docs, 0..) |doc, i| {
+            if (!try readPlain(gpa, doc.path, &doc_text)) continue;
+            const verified = verify(doc_text.items, words, phrase, true, arena) orelse continue;
+            const bonus: i32 = if (verified.phrase) phrase_max else 0;
+            try want.append(arena, .{
                 .doc = @intCast(i),
-                .count = v.count,
-                .line = v.line,
-                .snippet = v.snippet,
-                .score = rank(d, v.count, words, now) + bonus,
+                .count = verified.count,
+                .line = verified.line,
+                .snippet = verified.snippet,
+                .score = rank(doc, verified.count, words, now) + bonus,
             });
         }
         sortMatches(want.items);
         want.shrinkRetainingCapacity(@min(want.items.len, limit));
         try testing.expectEqual(want.items.len, out.items.len);
-        for (want.items, out.items) |w, o| {
-            try testing.expectEqual(w.doc, o.doc);
-            try testing.expectEqual(w.score, o.score);
-            try testing.expectEqual(w.line, o.line);
-            try testing.expectEqualStrings(w.snippet, o.snippet);
+        for (want.items, out.items) |wanted, found| {
+            try testing.expectEqual(wanted.doc, found.doc);
+            try testing.expectEqual(wanted.score, found.score);
+            try testing.expectEqual(wanted.line, found.line);
+            try testing.expectEqualStrings(wanted.snippet, found.snippet);
         }
     };
 }
 
 test "search: unaccented and capital queries find accented text" {
     const gpa = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dbuf: paths.Buffer = undefined;
-    const dir = try sys.tmpDirPath(&tmp, &dbuf);
+    var test_dir = try sys.TestDir.init();
+    defer test_dir.deinit();
     const texts = [_][]const u8{
         "notas\nLa acción empieza aquí.\nfin\n",
         "el ÑANDÚ es un ave\n",
@@ -2671,48 +2696,49 @@ test "search: unaccented and capital queries find accented text" {
     };
     var test_paths: [texts.len][]u8 = undefined;
     var docs: [texts.len]DocIn = undefined;
-    for (texts, 0..) |t, i| {
-        test_paths[i] = try gpa.print("{s}/doc{d}.txt", .{ dir, i });
-        var zb: paths.Buffer = undefined;
-        try sys.writeFile(try std.mem.printSentinel(&zb, "{s}", .{test_paths[i]}, 0), t);
-        docs[i] = .{ .path = test_paths[i], .mtime = 0, .size = t.len };
+    for (texts, 0..) |text, i| {
+        test_paths[i] = try gpa.print("{s}/doc{d}.txt", .{ test_dir.abs, i });
+        var path_buffer: paths.Buffer = undefined;
+        const path = try std.mem.printSentinel(&path_buffer, "{s}", .{test_paths[i]}, 0);
+        try sys.writeFile(path, text);
+        docs[i] = .{ .path = test_paths[i], .mtime = 0, .size = text.len };
     }
-    defer for (test_paths) |p| gpa.free(p);
+    defer for (test_paths) |path| gpa.free(path);
     const pool = try Pool.create(gpa, testing.io, 2);
     defer pool.destroy();
     var dummy: u8 = 0;
-    var ix = try build(gpa, pool, &docs, .{ .read = FileDocs.text, .ctx = &dummy }, null);
-    defer ix.deinit(gpa);
+    var index = try build(gpa, pool, &docs, .{ .read = FileDocs.readText, .ctx = &dummy }, null);
+    defer index.deinit(gpa);
 
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     var out: std.ArrayList(Match) = .empty;
-    const cases = [_]struct { q: []const u8, doc: u32, line: u32, snippet: []const u8 }{
-        .{ .q = "accion", .doc = 0, .line = 2, .snippet = "La acción empieza aquí." },
-        .{ .q = "ACCIÓN", .doc = 0, .line = 2, .snippet = "La acción empieza aquí." },
-        .{ .q = "acción", .doc = 0, .line = 2, .snippet = "La acción empieza aquí." },
-        .{ .q = "nandu", .doc = 1, .line = 1, .snippet = "el ÑANDÚ es un ave" },
-        .{ .q = "ñandú ave", .doc = 1, .line = 1, .snippet = "el ÑANDÚ es un ave" },
-        .{ .q = "configuracion", .doc = 3, .line = 1, .snippet = "Configuración del sistema" },
-        .{ .q = "aqui", .doc = 0, .line = 2, .snippet = "La acción empieza aquí." },
+    const cases = [_]struct { query: []const u8, doc: u32, line: u32, snippet: []const u8 }{
+        .{ .query = "accion", .doc = 0, .line = 2, .snippet = "La acción empieza aquí." },
+        .{ .query = "ACCIÓN", .doc = 0, .line = 2, .snippet = "La acción empieza aquí." },
+        .{ .query = "acción", .doc = 0, .line = 2, .snippet = "La acción empieza aquí." },
+        .{ .query = "nandu", .doc = 1, .line = 1, .snippet = "el ÑANDÚ es un ave" },
+        .{ .query = "ñandú ave", .doc = 1, .line = 1, .snippet = "el ÑANDÚ es un ave" },
+        .{ .query = "configuracion", .doc = 3, .line = 1, .snippet = "Configuración del sistema" },
+        .{ .query = "aqui", .doc = 0, .line = 2, .snippet = "La acción empieza aquí." },
     };
-    for (cases) |c| {
+    for (cases) |case| {
         try search(
-            &ix,
+            &index,
             gpa,
             arena.allocator(),
             pool,
-            c.q,
+            case.query,
             .{ .limit = 10, .text_path = plainPath, .text_ctx = &dummy },
             &out,
         );
         try testing.expectEqual(@as(usize, 1), out.items.len);
-        try testing.expectEqual(c.doc, out.items[0].doc);
-        try testing.expectEqual(c.line, out.items[0].line);
-        try testing.expectEqualStrings(c.snippet, out.items[0].snippet);
+        try testing.expectEqual(case.doc, out.items[0].doc);
+        try testing.expectEqual(case.line, out.items[0].line);
+        try testing.expectEqualStrings(case.snippet, out.items[0].snippet);
     }
     try search(
-        &ix,
+        &index,
         gpa,
         arena.allocator(),
         pool,
@@ -2724,7 +2750,7 @@ test "search: unaccented and capital queries find accented text" {
     // Not wanted any more (a newer query waits): no file is read.
     var stop: std.atomic.Value(bool) = .init(true);
     try search(
-        &ix,
+        &index,
         gpa,
         arena.allocator(),
         pool,
@@ -2746,29 +2772,29 @@ fn smallIndex(gpa: std.mem.Allocator) !Index {
     var texts: [60][]const u8 = undefined;
     var test_paths: [60][]const u8 = undefined;
     var docs: [60]DocIn = undefined;
-    var n_made: usize = 0;
-    defer for (texts[0..n_made], test_paths[0..n_made]) |t, p| {
-        gpa.free(t);
-        gpa.free(p);
+    var made_count: usize = 0;
+    defer for (texts[0..made_count], test_paths[0..made_count]) |text, path| {
+        gpa.free(text);
+        gpa.free(path);
     };
     var prng = std.Random.DefaultPrng.init(5);
-    const r = prng.random();
+    const random = prng.random();
     for (0..texts.len) |i| {
-        var t: std.ArrayList(u8) = .empty;
-        errdefer t.deinit(gpa);
-        for (0..r.intRangeAtMost(usize, 1, 6)) |_| {
-            try t.appendSlice(gpa, vocab[r.uintLessThan(usize, vocab.len)]);
-            try t.append(gpa, ' ');
+        var text: std.ArrayList(u8) = .empty;
+        errdefer text.deinit(gpa);
+        for (0..random.intRangeAtMost(usize, 1, 6)) |_| {
+            try text.appendSlice(gpa, vocab[random.uintLessThan(usize, vocab.len)]);
+            try text.append(gpa, ' ');
         }
-        const p = try gpa.print("{d}", .{i});
-        texts[i] = t.toOwnedSlice(gpa) catch |e| {
-            gpa.free(p);
-            return e;
+        const path = try gpa.print("{d}", .{i});
+        texts[i] = text.toOwnedSlice(gpa) catch |err| {
+            gpa.free(path);
+            return err;
         };
-        test_paths[i] = p;
-        n_made += 1;
+        test_paths[i] = path;
+        made_count += 1;
         docs[i] = .{
-            .path = p,
+            .path = path,
             .mtime = @intCast(i),
             .size = i,
             .source = if (i % 7 == 0) .extracted else .plain,
@@ -2776,8 +2802,8 @@ fn smallIndex(gpa: std.mem.Allocator) !Index {
     }
     const pool = try Pool.create(gpa, testing.io, 1);
     defer pool.destroy();
-    var td: TestDocs = .{ .texts = &texts };
-    return build(gpa, pool, &docs, .{ .read = TestDocs.text, .ctx = &td }, null);
+    var test_docs: TestDocs = .{ .texts = &texts };
+    return build(gpa, pool, &docs, .{ .read = TestDocs.readText, .ctx = &test_docs }, null);
 }
 
 /// Touches everything a reader of an index may touch: must never crash on
@@ -2791,37 +2817,37 @@ fn exerciseIndex(index: *const Index, gpa: std.mem.Allocator) !void {
     var got: std.ArrayList(u32) = .empty;
     defer got.deinit(gpa);
     var sum: usize = index.postingBytes();
-    for (queries) |q| {
-        try index.candidates(gpa, q, &got);
+    for (queries) |words| {
+        try index.candidates(gpa, words, &got);
         try testing.expect(strictlyAscending(u32, got.items));
-        for (got.items) |d| {
-            try testing.expect(d < index.docs_count);
-            const src: Source = @fromBackingInt(@intCast(index.sources[d]));
-            sum +%= index.path(d).len +% @as(
+        for (got.items) |doc| {
+            try testing.expect(doc < index.docs_count);
+            const source: Source = @fromBackingInt(@intCast(index.sources[doc]));
+            sum +%= index.path(doc).len +% @as(
                 usize,
-                @bitCast(index.mtimes[d]),
-            ) +% index.sizes[d] +% @backingInt(src);
+                @bitCast(index.mtimes[doc]),
+            ) +% index.sizes[doc] +% @backingInt(source);
         }
     }
-    for (0..index.docs_count) |d| sum +%= index.path(@intCast(d)).len;
+    for (0..index.docs_count) |doc| sum +%= index.path(@intCast(doc)).len;
     std.mem.doNotOptimizeAway(sum);
 }
 
 test "corrupt content indexes are rejected, not trusted" {
     const gpa = testing.allocator;
-    var ix = try smallIndex(gpa);
-    defer ix.deinit(gpa);
-    const good = ix.buf;
-    try exerciseIndex(&ix, gpa);
+    var index = try smallIndex(gpa);
+    defer index.deinit(gpa);
+    const good = index.buf;
+    try exerciseIndex(&index, gpa);
 
     const bad = try gpa.alignedAlloc(u8, .@"8", good.len);
     defer gpa.free(bad);
-    const H = struct {
-        fn put(b: []u8, at: usize, v: u64) void {
-            std.mem.writeInt(u64, b[at..][0..8], v, .little);
+    const Patch = struct {
+        fn write64(bytes: []u8, offset: usize, value: u64) void {
+            std.mem.writeInt(u64, bytes[offset..][0..8], value, .little);
         }
-        fn put32(b: []u8, at: usize, v: u32) void {
-            std.mem.writeInt(u32, b[at..][0..4], v, .little);
+        fn write32(bytes: []u8, offset: usize, value: u32) void {
+            std.mem.writeInt(u32, bytes[offset..][0..4], value, .little);
         }
     };
 
@@ -2833,45 +2859,49 @@ test "corrupt content indexes are rejected, not trusted" {
 
     const docs_offset = std.mem.readInt(u64, good[32..40], .little);
     const directory_offset = std.mem.readInt(u64, good[40..48], .little);
-    const n = ix.docs_count;
-    const seg = ix.segments[0];
-    const max = std.math.maxInt(u64);
-    const Case = struct { at: usize, v: u64, wide: bool = true };
+    const docs_count = index.docs_count;
+    const segment = index.segments[0];
+    const u64_max = std.math.maxInt(u64);
+    const Case = struct { offset: usize, value: u64, wide: bool = true };
     const cases = [_]Case{
-        .{ .at = 0, .v = 0x3130585443_4d554c }, // magic of another version (LUMCTX01)
-        .{ .at = 8, .v = max }, // doc count: overflows the layout
-        .{ .at = 8, .v = n + 1 }, // count off by one: the arrays shift onto other data
-        .{ .at = 8, .v = @as(u64, std.math.maxInt(u32)) + 1 },
-        .{ .at = 16, .v = max / 8 }, // segment count
-        .{ .at = 16, .v = ix.segments_count + 1 },
-        .{ .at = 24, .v = good.len }, // paths blob past the end
-        .{ .at = 32, .v = docs_offset + 4 }, // misaligned doc table
-        .{ .at = 32, .v = good.len + 8 }, // past the end
-        .{ .at = 32, .v = 0 }, // over the header
-        .{ .at = 40, .v = directory_offset + 4 }, // misaligned directory
-        .{ .at = 40, .v = good.len - 8 }, // directory past the end
-        .{ .at = 48, .v = good.len - 1 }, // total length
+        .{ .offset = 0, .value = 0x3130585443_4d554c }, // magic of another version (LUMCTX01)
+        .{ .offset = 8, .value = u64_max }, // doc count: overflows the layout
+        .{ .offset = 8, .value = docs_count + 1 }, // one too many: the arrays shift onto other data
+        .{ .offset = 8, .value = @as(u64, std.math.maxInt(u32)) + 1 },
+        .{ .offset = 16, .value = u64_max / 8 }, // segment count
+        .{ .offset = 16, .value = index.segments_count + 1 },
+        .{ .offset = 24, .value = good.len }, // paths blob past the end
+        .{ .offset = 32, .value = docs_offset + 4 }, // misaligned doc table
+        .{ .offset = 32, .value = good.len + 8 }, // past the end
+        .{ .offset = 32, .value = 0 }, // over the header
+        .{ .offset = 40, .value = directory_offset + 4 }, // misaligned directory
+        .{ .offset = 40, .value = good.len - 8 }, // directory past the end
+        .{ .offset = 48, .value = good.len - 1 }, // total length
         // Segment directory entry.
-        .{ .at = directory_offset, .v = max }, // keys_count: overflows
-        .{ .at = directory_offset, .v = seg.keys_count * 100 }, // keys past the end
-        .{ .at = directory_offset + 8, .v = seg.keys_offset + 2 }, // misaligned keys
-        .{ .at = directory_offset + 8, .v = good.len }, // keys past the end
-        .{ .at = directory_offset + 16, .v = good.len - 4 }, // offsets past the end
-        .{ .at = directory_offset + 24, .v = good.len }, // postings past the end
-        .{ .at = directory_offset + 32, .v = good.len }, // postings longer than the file
-        .{ .at = directory_offset + 32, .v = 0 }, // offsets beyond the postings
+        .{ .offset = directory_offset, .value = u64_max }, // keys_count: overflows
+        .{ .offset = directory_offset, .value = segment.keys_count * 100 }, // keys past the end
+        .{ .offset = directory_offset + 8, .value = segment.keys_offset + 2 }, // misaligned keys
+        .{ .offset = directory_offset + 8, .value = good.len }, // keys past the end
+        .{ .offset = directory_offset + 16, .value = good.len - 4 }, // offsets past the end
+        .{ .offset = directory_offset + 24, .value = good.len }, // postings past the end
+        .{ .offset = directory_offset + 32, .value = good.len }, // postings longer than the file
+        .{ .offset = directory_offset + 32, .value = 0 }, // offsets beyond the postings
         // A path past the end of the file, an unknown document kind.
-        .{ .at = docs_offset + n * 16, .v = 0xffff_fff0, .wide = false },
-        .{ .at = docs_offset + n * 22, .v = 9, .wide = false },
+        .{ .offset = docs_offset + docs_count * 16, .value = 0xffff_fff0, .wide = false },
+        .{ .offset = docs_offset + docs_count * 22, .value = 9, .wide = false },
         // Keys out of order (binary search would miss), offsets going back.
-        .{ .at = seg.keys_offset, .v = 0xffff_ff, .wide = false },
-        .{ .at = seg.offsets_offset + 4, .v = 0xffff_ffff, .wide = false },
+        .{ .offset = segment.keys_offset, .value = 0xffff_ff, .wide = false },
+        .{ .offset = segment.offsets_offset + 4, .value = 0xffff_ffff, .wide = false },
     };
-    for (cases, 0..) |c, i| {
+    for (cases, 0..) |case, i| {
         @memcpy(bad, good);
-        if (c.at == docs_offset + n * 22) {
-            bad[c.at] = @intCast(c.v);
-        } else if (c.wide) H.put(bad, c.at, c.v) else H.put32(bad, c.at, @intCast(c.v));
+        if (case.offset == docs_offset + docs_count * 22) {
+            bad[case.offset] = @intCast(case.value);
+        } else if (case.wide) {
+            Patch.write64(bad, case.offset, case.value);
+        } else {
+            Patch.write32(bad, case.offset, @intCast(case.value));
+        }
         if (Index.parse(bad, .heap)) |_| {
             std.debug.print("case {d} accepted\n", .{i});
             return error.TestUnexpectedResult;
@@ -2881,27 +2911,30 @@ test "corrupt content indexes are rejected, not trusted" {
 
 test "malformed posting lists end, never over-read" {
     const gpa = testing.allocator;
-    var pos: usize = 0;
+    var position: usize = 0;
     // Continuation bit on the last byte of a list.
-    try testing.expectEqual(@as(?u32, null), readVarint(&.{0x80}, &pos));
-    pos = 0;
-    try testing.expectEqual(@as(?u32, 5), readVarint(&.{ 0x05, 0xff }, &pos));
-    try testing.expectEqual(@as(?u32, null), readVarint(&.{ 0x05, 0xff }, &pos));
-    try testing.expectEqual(@as(usize, 1), pos);
+    try testing.expectEqual(@as(?u32, null), readVarint(&.{0x80}, &position));
+    position = 0;
+    try testing.expectEqual(@as(?u32, 5), readVarint(&.{ 0x05, 0xff }, &position));
+    try testing.expectEqual(@as(?u32, null), readVarint(&.{ 0x05, 0xff }, &position));
+    try testing.expectEqual(@as(usize, 1), position);
     // Longer than a u32, or a 5th byte with more than 4 bits.
-    pos = 0;
-    try testing.expectEqual(@as(?u32, null), readVarint(&.{ 0xff, 0xff, 0xff, 0xff, 0x1f }, &pos));
-    pos = 0;
+    position = 0;
+    try testing.expectEqual(@as(?u32, null), readVarint(
+        &.{ 0xff, 0xff, 0xff, 0xff, 0x1f },
+        &position,
+    ));
+    position = 0;
     try testing.expectEqual(@as(?u32, null), readVarint(
         &.{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x00 },
-        &pos,
+        &position,
     ));
-    pos = 0;
+    position = 0;
     try testing.expectEqual(@as(?u32, std.math.maxInt(u32)), readVarint(
         &.{ 0xff, 0xff, 0xff, 0xff, 0x0f },
-        &pos,
+        &position,
     ));
-    try testing.expectEqual(@as(usize, 5), pos);
+    try testing.expectEqual(@as(usize, 5), position);
 
     var out: std.ArrayList(u32) = .empty;
     defer out.deinit(gpa);
@@ -2914,28 +2947,28 @@ test "malformed posting lists end, never over-read" {
         &.{ 3, 0xff, 0xff, 0xff, 0xff, 0x0f, 1 },
         &.{ 3, 0, 1 },
         &.{ 3, 98, 1 },
-    }) |l| {
+    }) |list| {
         out.clearRetainingCapacity();
-        try decodeAll(gpa, l, 100, &out);
+        try decodeAll(gpa, list, 100, &out);
         try testing.expectEqualSlices(u32, &.{3}, out.items);
         out.clearRetainingCapacity();
-        try intersect(gpa, &.{ 3, 4, 5, 99, 100, 101 }, l, 100, &out);
+        try intersect(gpa, &.{ 3, 4, 5, 99, 100, 101 }, list, 100, &out);
         try testing.expectEqualSlices(u32, &.{3}, out.items);
     }
 
     // The same inside a real index: every posting list's last byte gets
     // its continuation bit (each list now ends in a truncated varint).
-    var ix = try smallIndex(gpa);
-    defer ix.deinit(gpa);
-    const seg = ix.segments[0];
-    const offs = sliceAt(u32, ix.buf, seg.offsets_offset, seg.keys_count + 1);
-    for (offs[1..]) |o| if (o > 0) {
-        ix.buf[seg.postings_offset + o - 1] |= 0x80;
-    };
-    try exerciseIndex(&ix, gpa);
+    var index = try smallIndex(gpa);
+    defer index.deinit(gpa);
+    const segment = index.segments[0];
+    const offsets = sliceAt(u32, index.buf, segment.offsets_offset, segment.keys_count + 1);
+    for (offsets[1..]) |offset| {
+        if (offset > 0) index.buf[segment.postings_offset + offset - 1] |= 0x80;
+    }
+    try exerciseIndex(&index, gpa);
     // And with garbage postings: ids past the documents never come out.
-    @memset(ix.buf[seg.postings_offset..][0..seg.postings_size], 0x7f);
-    try exerciseIndex(&ix, gpa);
+    @memset(index.buf[segment.postings_offset..][0..segment.postings_size], 0x7f);
+    try exerciseIndex(&index, gpa);
 }
 
 /// Texts of the documents tests add by updates: they share words with
@@ -2951,24 +2984,24 @@ const update_texts = [_][]const u8{
 /// 60-63): five segments, the last four small, which the next append
 /// merges.
 fn segmentedIndex(gpa: std.mem.Allocator, pool: *Pool) !Index {
-    var ix = try smallIndex(gpa);
-    errdefer ix.deinit(gpa);
-    var td: TestDocs = .{ .texts = &update_texts };
+    var index = try smallIndex(gpa);
+    errdefer index.deinit(gpa);
+    var test_docs: TestDocs = .{ .texts = &update_texts };
     for (0..segments_small_merge_min) |i| {
-        var nbuf: [8]u8 = undefined;
+        var name_buffer: [8]u8 = undefined;
         const added = [_]DocIn{.{
-            .path = try std.mem.print(&nbuf, "{d}", .{i}),
+            .path = try std.mem.print(&name_buffer, "{d}", .{i}),
             .mtime = 100,
             .size = 1,
         }};
-        const next = try update(gpa, pool, &ix, &.{}, &added, .{
-            .read = TestDocs.text,
-            .ctx = &td,
+        const next = try update(gpa, pool, &index, &.{}, &added, .{
+            .read = TestDocs.readText,
+            .ctx = &test_docs,
         }, null);
-        ix.deinit(gpa);
-        ix = next;
+        index.deinit(gpa);
+        index = next;
     }
-    return ix;
+    return index;
 }
 
 /// `appendFile` without the file: `old`'s bytes, then what it appends.
@@ -2982,91 +3015,89 @@ fn appendMemory(
 ) !Index {
     var sink: Sink = .{ .gpa = gpa, .written = old.buf.len };
     defer sink.deinit();
-    const h = appendInto(&sink, pool, old, gone, added, text, null) catch |err|
+    const header = appendInto(&sink, pool, old, gone, added, text, null) catch |err|
         return memoryOnly(err);
-    const buf = try gpa.alignedAlloc(u8, .@"8", old.buf.len + sink.buf.items.len);
-    errdefer gpa.free(buf);
-    @memcpy(buf[0..old.buf.len], old.buf);
-    @memcpy(buf[old.buf.len..], sink.buf.items);
-    @memcpy(buf[0..header_size], &h.encode());
-    return Index.parse(buf, .heap);
+    const bytes = try gpa.alignedAlloc(u8, .@"8", old.buf.len + sink.bytes.items.len);
+    errdefer gpa.free(bytes);
+    @memcpy(bytes[0..old.buf.len], old.buf);
+    @memcpy(bytes[old.buf.len..], sink.bytes.items);
+    @memcpy(bytes[0..header_size], &header.encode());
+    return Index.parse(bytes, .heap);
 }
 
 /// What the service does with the index it mapped: updates it and appends
 /// to it. Must never crash on an index that `parse` accepted, and must give
 /// one that parses and answers.
 fn exerciseUpdates(index: *const Index, gpa: std.mem.Allocator, pool: *Pool) !void {
-    var td: TestDocs = .{ .texts = &update_texts };
-    const reader: TextReader = .{ .read = TestDocs.text, .ctx = &td };
+    var test_docs: TestDocs = .{ .texts = &update_texts };
+    const reader: TextReader = .{ .read = TestDocs.readText, .ctx = &test_docs };
     const added = [_]DocIn{
         .{ .path = "0", .mtime = 200, .size = 1 },
         .{ .path = "3", .mtime = 200, .size = 1 },
     };
     const gone: []const u32 = if (index.docs_count > 0) &.{0} else &.{};
-    var up = try update(gpa, pool, index, gone, &added, reader, null);
-    defer up.deinit(gpa);
-    try exerciseIndex(&up, gpa);
-    var app = try appendMemory(gpa, pool, index, gone, &added, reader);
-    defer app.deinit(gpa);
-    try exerciseIndex(&app, gpa);
+    var updated = try update(gpa, pool, index, gone, &added, reader, null);
+    defer updated.deinit(gpa);
+    try exerciseIndex(&updated, gpa);
+    var appended = try appendMemory(gpa, pool, index, gone, &added, reader);
+    defer appended.deinit(gpa);
+    try exerciseIndex(&appended, gpa);
 }
 
 test "segments that repeat or reorder doc ids (a damaged file): queries, updates and appends cope" {
     const gpa = testing.allocator;
     const pool = try Pool.create(gpa, testing.io, 1);
     defer pool.destroy();
-    var ix = try segmentedIndex(gpa, pool);
-    defer ix.deinit(gpa);
-    try testing.expectEqual(@as(usize, 5), ix.segments_count);
+    var index = try segmentedIndex(gpa, pool);
+    defer index.deinit(gpa);
+    try testing.expectEqual(@as(usize, 5), index.segments_count);
     // The last segment holds document 63 ("config arena zig") alone: each
     // of its lists is that id, one byte. Make it 61 ("token arena
     // parser"): "arena" lists 61 in segment 2 and again in segment 4, and
     // "zig" lists 62 in segment 3, then 61. Nothing `parse` checks.
-    const last = ix.segments[4];
-    @memset(ix.buf[@intCast(last.postings_offset)..][0..@intCast(last.postings_size)], 61);
-    _ = try Index.parse(ix.buf, .heap);
+    const last = index.segments[4];
+    @memset(index.buf[@intCast(last.postings_offset)..][0..@intCast(last.postings_size)], 61);
+    _ = try Index.parse(index.buf, .heap);
 
     var got: std.ArrayList(u32) = .empty;
     defer got.deinit(gpa);
-    try ix.candidates(gpa, &.{"arena"}, &got);
+    try index.candidates(gpa, &.{"arena"}, &got);
     try testing.expect(strictlyAscending(u32, got.items));
     try testing.expect(std.mem.findScalar(u32, got.items, 61) != null);
-    try ix.candidates(gpa, &.{"zig"}, &got);
+    try index.candidates(gpa, &.{"zig"}, &got);
     try testing.expect(strictlyAscending(u32, got.items));
 
     // Appended: the small segments (all five) are decoded and merged. That
     // asserted (a crash loop with safety checks, a wrapped delta and lost
     // results without).
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dbuf: paths.Buffer = undefined;
-    const dir = try sys.tmpDirPath(&tmp, &dbuf);
-    var pbuf: paths.Buffer = undefined;
-    const p = try std.mem.printSentinel(&pbuf, "{s}/content.idx", .{dir}, 0);
-    try ix.save(p);
-    var mapped = try Index.open(p);
+    var test_dir = try sys.TestDir.init();
+    defer test_dir.deinit();
+    var index_path_buffer: paths.Buffer = undefined;
+    const index_path = try test_dir.path(&index_path_buffer, "content.idx");
+    try index.save(index_path);
+    var mapped = try Index.open(index_path);
     defer mapped.deinit(gpa);
-    var td: TestDocs = .{ .texts = &update_texts };
+    var test_docs: TestDocs = .{ .texts = &update_texts };
     const added = [_]DocIn{.{ .path = "0", .mtime = 300, .size = 1 }};
-    var app = (try appendFile(
+    var appended = (try appendFile(
         gpa,
         pool,
         &mapped,
         &.{},
         &added,
-        .{ .read = TestDocs.text, .ctx = &td },
-        p,
+        .{ .read = TestDocs.readText, .ctx = &test_docs },
+        index_path,
         null,
     )).?;
-    defer app.deinit(gpa);
-    try testing.expectEqual(@as(usize, 1), app.segments_count);
-    try app.candidates(gpa, &.{"zig"}, &got);
+    defer appended.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), appended.segments_count);
+    try appended.candidates(gpa, &.{"zig"}, &got);
     try testing.expect(strictlyAscending(u32, got.items));
     // 61 by the damage, 62, and 64 (the new "arena zig élan").
-    for ([_]u32{ 61, 62, 64 }) |d| {
-        try testing.expect(std.mem.findScalar(u32, got.items, d) != null);
+    for ([_]u32{ 61, 62, 64 }) |doc| {
+        try testing.expect(std.mem.findScalar(u32, got.items, doc) != null);
     }
-    try exerciseUpdates(&ix, gpa, pool);
+    try exerciseUpdates(&index, gpa, pool);
 }
 
 /// Counts the bytes it holds and the most it held at once. Thread-safe.
@@ -3092,56 +3123,56 @@ const PeakAllocator = struct {
         peak.peak = @max(peak.peak, peak.held);
     }
 
-    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
-        const pa: *PeakAllocator = @ptrCast(@alignCast(ctx));
-        const p = pa.child.rawAlloc(len, a, ra) orelse return null;
-        pa.count(len, 0);
-        return p;
+    fn alloc(context: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const peak_allocator: *PeakAllocator = @ptrCast(@alignCast(context));
+        const memory = peak_allocator.child.rawAlloc(len, a, ra) orelse return null;
+        peak_allocator.count(len, 0);
+        return memory;
     }
 
-    fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
-        const pa: *PeakAllocator = @ptrCast(@alignCast(ctx));
-        if (!pa.child.rawResize(m, a, n, ra)) return false;
-        pa.count(n, m.len);
+    fn resize(context: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+        const peak_allocator: *PeakAllocator = @ptrCast(@alignCast(context));
+        if (!peak_allocator.child.rawResize(m, a, n, ra)) return false;
+        peak_allocator.count(n, m.len);
         return true;
     }
 
-    fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
-        const pa: *PeakAllocator = @ptrCast(@alignCast(ctx));
-        const p = pa.child.rawRemap(m, a, n, ra) orelse return null;
-        pa.count(n, m.len);
-        return p;
+    fn remap(context: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const peak_allocator: *PeakAllocator = @ptrCast(@alignCast(context));
+        const memory = peak_allocator.child.rawRemap(m, a, n, ra) orelse return null;
+        peak_allocator.count(n, m.len);
+        return memory;
     }
 
-    fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
-        const pa: *PeakAllocator = @ptrCast(@alignCast(ctx));
-        pa.child.rawFree(m, a, ra);
-        pa.count(0, m.len);
+    fn free(context: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+        const peak_allocator: *PeakAllocator = @ptrCast(@alignCast(context));
+        peak_allocator.child.rawFree(m, a, ra);
+        peak_allocator.count(0, m.len);
     }
 };
 
 test "a round reads no more than round_pairs_max of possible text, one document at least" {
     var dummy: u8 = 0;
-    const reader: TextReader = .{ .read = TestDocs.text, .ctx = &dummy };
+    const reader: TextReader = .{ .read = TestDocs.readText, .ctx = &dummy };
     var docs: [2000]DocIn = undefined;
-    for (&docs) |*d| d.* = .{ .path = "", .mtime = 0, .size = 4096 };
+    for (&docs) |*doc| doc.* = .{ .path = "", .mtime = 0, .size = 4096 };
     // Small files: `round_docs_max` a round, and what is left at the end.
     try testing.expectEqual(@as(usize, round_docs_max), roundEnd(&docs, 0, reader));
     try testing.expectEqual(docs.len, roundEnd(&docs, docs.len - 5, reader));
     // Files of `text_bytes_max` or more (no more than that is read).
-    for (&docs) |*d| d.size = 1 << 30;
+    for (&docs) |*doc| doc.size = 1 << 30;
     const round_docs_expected: usize = round_pairs_max / text_bytes_max;
     try testing.expectEqual(round_docs_expected, roundEnd(&docs, 0, reader));
     // Extracted text: as long as the reader says, else the most kept.
-    for (&docs) |*d| d.source = .extracted;
+    for (&docs) |*doc| doc.source = .extracted;
     try testing.expectEqual(@as(usize, 1), roundEnd(&docs, 0, reader));
-    const Len = struct {
+    const ExtractedBytes = struct {
         fn small(_: *anyopaque, _: DocIn) u64 {
             return 1000;
         }
     };
     var known = reader;
-    known.extracted_len = Len.small;
+    known.extracted_bytes = ExtractedBytes.small;
     try testing.expectEqual(@as(usize, round_docs_max), roundEnd(&docs, 0, known));
 }
 
@@ -3152,61 +3183,61 @@ test "building high-entropy text: memory stays bounded by rounds and segments" {
     // of such files was. Rounds bounded by documents only peak at ~380 MB
     // here (twice as much with twice the files), bounded by pairs ~200 MB,
     // whatever the number of files.
-    const n = 24;
+    const files_count = 24;
     var prng = std.Random.DefaultPrng.init(77);
-    var texts: [n][]const u8 = undefined;
+    var texts: [files_count][]const u8 = undefined;
     var made: usize = 0;
-    defer for (texts[0..made]) |t| testing.allocator.free(t);
-    var docs: [n]DocIn = undefined;
-    var names: [n][8]u8 = undefined;
-    for (&texts, &docs, &names, 0..) |*t, *d, *name, i| {
-        const b = try testing.allocator.alloc(u8, text_bytes_max);
-        prng.random().bytes(b);
-        t.* = b;
+    defer for (texts[0..made]) |text| testing.allocator.free(text);
+    var docs: [files_count]DocIn = undefined;
+    var names: [files_count][8]u8 = undefined;
+    for (&texts, &docs, &names, 0..) |*text, *doc, *name, i| {
+        const bytes = try testing.allocator.alloc(u8, text_bytes_max);
+        prng.random().bytes(bytes);
+        text.* = bytes;
         made += 1;
-        d.* = .{ .path = try std.mem.print(name, "{d}", .{i}), .mtime = 0, .size = text_bytes_max };
+        doc.* = .{ .path = try std.mem.print(name, "{d}", .{i}), .mtime = 0, .size = text_bytes_max };
     }
-    var pa: PeakAllocator = .{ .child = testing.allocator };
-    const gpa = pa.allocator();
+    var peak_allocator: PeakAllocator = .{ .child = testing.allocator };
+    const gpa = peak_allocator.allocator();
     const pool = try Pool.create(testing.allocator, testing.io, 3);
     defer pool.destroy();
-    var td: TestDocs = .{ .texts = &texts };
-    var st: BuildStats = .{};
+    var test_docs: TestDocs = .{ .texts = &texts };
+    var stats: BuildStats = .{};
     // Written as it grows, like the service does: the index is not held.
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dbuf: paths.Buffer = undefined;
-    const dir = try sys.tmpDirPath(&tmp, &dbuf);
-    var pbuf: paths.Buffer = undefined;
-    const p = try std.mem.printSentinel(&pbuf, "{s}/content.idx", .{dir}, 0);
-    const reader: TextReader = .{ .read = TestDocs.text, .ctx = &td };
-    var ix = try buildFile(gpa, pool, &docs, reader, p, &st);
-    defer ix.deinit(gpa);
-    try testing.expect(st.pairs > 20 << 20);
-    try testing.expect(st.segments >= 5);
+    var test_dir = try sys.TestDir.init();
+    defer test_dir.deinit();
+    var index_path_buffer: paths.Buffer = undefined;
+    const index_path = try test_dir.path(&index_path_buffer, "content.idx");
+    const reader: TextReader = .{ .read = TestDocs.readText, .ctx = &test_docs };
+    var index = try buildFile(gpa, pool, &docs, reader, index_path, &stats);
+    defer index.deinit(gpa);
+    try testing.expect(stats.pairs > 20 << 20);
+    try testing.expect(stats.segments >= 5);
     // A round (4 M pairs, plus growth), a segment (4 M and a document's
     // 1 M) and the sort's scratch, at 8 bytes a pair; the encoded segment
     // before it is written; per task a 2 MB trigram map and a text.
-    try testing.expect(pa.peak < 250 << 20);
+    try testing.expect(peak_allocator.peak < 250 << 20);
 }
 
 test "random byte flips in a content index never crash, nor updating it" {
     const gpa = testing.allocator;
     const pool = try Pool.create(gpa, testing.io, 1);
     defer pool.destroy();
-    var ix = try segmentedIndex(gpa, pool);
-    defer ix.deinit(gpa);
-    const bad = try gpa.alignedAlloc(u8, .@"8", ix.buf.len);
+    var index = try segmentedIndex(gpa, pool);
+    defer index.deinit(gpa);
+    const bad = try gpa.alignedAlloc(u8, .@"8", index.buf.len);
     defer gpa.free(bad);
     var prng = std.Random.DefaultPrng.init(23);
-    const r = prng.random();
+    const random = prng.random();
     var accepted: usize = 0;
     for (0..3000) |_| {
-        @memcpy(bad, ix.buf);
-        for (0..r.intRangeAtMost(usize, 1, 4)) |_| bad[r.uintLessThan(usize, bad.len)] = r.int(u8);
-        if (Index.parse(bad, .heap)) |m| {
-            try exerciseIndex(&m, gpa);
-            try exerciseUpdates(&m, gpa, pool);
+        @memcpy(bad, index.buf);
+        for (0..random.intRangeAtMost(usize, 1, 4)) |_| {
+            bad[random.uintLessThan(usize, bad.len)] = random.int(u8);
+        }
+        if (Index.parse(bad, .heap)) |parsed| {
+            try exerciseIndex(&parsed, gpa);
+            try exerciseUpdates(&parsed, gpa, pool);
             accepted += 1;
         } else |_| {}
     }
@@ -3214,26 +3245,27 @@ test "random byte flips in a content index never crash, nor updating it" {
 }
 
 fn fuzzParseBytes(_: void, smith: *testing.Smith) anyerror!void {
-    var buf: [16384]u8 align(format.alignment_bytes) = undefined;
-    const b = buf[0..smith.slice(&buf)];
+    var input_buffer: [16384]u8 align(format.alignment_bytes) = undefined;
+    const input = input_buffer[0..smith.slice(&input_buffer)];
     // Often make the header plausible, so the fuzzer reaches the checks
     // behind it.
-    if (b.len >= header_size and smith.value(bool)) {
-        @memcpy(b[0..8], magic);
-        const room = (b.len - header_size) / doc_size;
-        const n = smith.valueRangeAtMost(u32, 0, @intCast(@min(room, 1000)));
+    if (input.len >= header_size and smith.value(bool)) {
+        @memcpy(input[0..8], magic);
+        const room = (input.len - header_size) / doc_size;
+        const docs_count = smith.valueRangeAtMost(u32, 0, @intCast(@min(room, 1000)));
         const paths_size = smith.valueRangeAtMost(u32, 0, @intCast(
-            b.len - header_size - n * doc_size,
+            input.len - header_size - docs_count * doc_size,
         ));
-        const directory_offset = alignUp(header_size + n * doc_size + paths_size);
-        std.mem.writeInt(u64, b[8..16], n, .little);
-        std.mem.writeInt(u64, b[16..24], smith.valueRangeAtMost(u8, 0, 4), .little);
-        std.mem.writeInt(u64, b[24..32], paths_size, .little);
-        std.mem.writeInt(u64, b[32..40], header_size, .little);
-        std.mem.writeInt(u64, b[40..48], directory_offset, .little);
-        std.mem.writeInt(u64, b[48..56], b.len, .little);
+        const directory_offset = alignUp(header_size + docs_count * doc_size + paths_size);
+        std.mem.writeInt(u64, input[8..16], docs_count, .little);
+        std.mem.writeInt(u64, input[16..24], smith.valueRangeAtMost(u8, 0, 4), .little);
+        std.mem.writeInt(u64, input[24..32], paths_size, .little);
+        std.mem.writeInt(u64, input[32..40], header_size, .little);
+        std.mem.writeInt(u64, input[40..48], directory_offset, .little);
+        std.mem.writeInt(u64, input[48..56], input.len, .little);
     }
-    if (Index.parse(b, .heap)) |ix| try exerciseIndex(&ix, testing.allocator) else |_| {}
+    const index = Index.parse(input, .heap) catch return;
+    try exerciseIndex(&index, testing.allocator);
 }
 
 test "content: the header struct lays out the bytes LUMCTX04 always had" {
@@ -3262,47 +3294,47 @@ test "content: the header struct lays out the bytes LUMCTX04 always had" {
 
 test "fuzz: parsing arbitrary bytes as a content index never crashes" {
     const gpa = testing.allocator;
-    var ix = try smallIndex(gpa);
-    defer ix.deinit(gpa);
-    const seed = try corpusEntry(gpa, ix.buf);
+    var index = try smallIndex(gpa);
+    defer index.deinit(gpa);
+    const seed = try corpusEntry(gpa, index.buf);
     defer gpa.free(seed);
     try testing.fuzz({}, fuzzParseBytes, .{ .corpus = &.{seed} });
 }
 
-const FlipsCtx = struct { good: []const u8, pool: *Pool };
+const FlipsContext = struct { good: []const u8, pool: *Pool };
 
-fn fuzzFlips(ctx: FlipsCtx, smith: *testing.Smith) anyerror!void {
+fn fuzzFlips(context: FlipsContext, smith: *testing.Smith) anyerror!void {
     const gpa = testing.allocator;
-    const good = ctx.good;
-    const buf = try gpa.alignedAlloc(u8, .@"8", good.len);
-    defer gpa.free(buf);
-    @memcpy(buf, good);
+    const good = context.good;
+    const bytes = try gpa.alignedAlloc(u8, .@"8", good.len);
+    defer gpa.free(bytes);
+    @memcpy(bytes, good);
     const flips = smith.valueRangeAtMost(u8, 0, 8);
-    for (0..flips) |_| buf[smith.index(buf.len)] = smith.value(u8);
+    for (0..flips) |_| bytes[smith.index(bytes.len)] = smith.value(u8);
     // Sometimes a whole u32 or u64 field, aligned like the real ones.
     if (smith.boolWeighted(3, 1)) {
-        const at = smith.index(buf.len / 4) * 4;
-        std.mem.writeInt(u32, buf[at..][0..4], smith.value(u32), .little);
+        const offset = smith.index(bytes.len / 4) * 4;
+        std.mem.writeInt(u32, bytes[offset..][0..4], smith.value(u32), .little);
     }
-    const cut = if (smith.boolWeighted(7, 1)) smith.index(buf.len + 1) else buf.len;
-    const ix = Index.parse(buf[0..cut], .heap) catch return;
-    try exerciseIndex(&ix, gpa);
-    try exerciseUpdates(&ix, gpa, ctx.pool);
+    const cut = if (smith.boolWeighted(7, 1)) smith.index(bytes.len + 1) else bytes.len;
+    const index = Index.parse(bytes[0..cut], .heap) catch return;
+    try exerciseIndex(&index, gpa);
+    try exerciseUpdates(&index, gpa, context.pool);
 }
 
 test "fuzz: a real content index with random damage never crashes, nor updating it" {
     const gpa = testing.allocator;
     const pool = try Pool.create(gpa, testing.io, 1);
     defer pool.destroy();
-    var ix = try segmentedIndex(gpa, pool);
-    defer ix.deinit(gpa);
-    try testing.fuzz(FlipsCtx{ .good = ix.buf, .pool = pool }, fuzzFlips, .{});
+    var index = try segmentedIndex(gpa, pool);
+    defer index.deinit(gpa);
+    try testing.fuzz(FlipsContext{ .good = index.buf, .pool = pool }, fuzzFlips, .{});
 }
 
 fn fuzzFindFold(_: void, smith: *testing.Smith) anyerror!void {
     // Few distinct bytes, mixed case, and the bytes of accented letters
     // (0xC3 + 0xA1 = á, 0x81 = Á, 0x97 = ×), so folded matches are common.
-    const w: []const testing.Smith.Weight = &.{
+    const weights: []const testing.Smith.Weight = &.{
         .value(u8, 'a', 20),
         .value(u8, 'A', 20),
         .value(u8, 'b', 10),
@@ -3318,10 +3350,13 @@ fn fuzzFindFold(_: void, smith: *testing.Smith) anyerror!void {
     };
     var hay: [300]u8 = undefined;
     var needle: [12]u8 = undefined;
-    const h = hay[0..smith.sliceWeightedBytes(&hay, w)];
-    const n = needle[0..smith.sliceWeightedBytes(&needle, w)];
-    const from = smith.valueRangeAtMost(u32, 0, @intCast(h.len + 2));
-    try testing.expectEqual(try findFoldNaive(testing.allocator, h, n, from), findFold(h, n, from));
+    const hay_used = hay[0..smith.sliceWeightedBytes(&hay, weights)];
+    const needle_used = needle[0..smith.sliceWeightedBytes(&needle, weights)];
+    const from = smith.valueRangeAtMost(u32, 0, @intCast(hay_used.len + 2));
+    try testing.expectEqual(
+        try findFoldNaive(testing.allocator, hay_used, needle_used, from),
+        findFold(hay_used, needle_used, from),
+    );
 }
 
 test "fuzz: findFold agrees with the naive folded scan" {
@@ -3333,10 +3368,10 @@ test "fuzz: findFold agrees with the naive folded scan" {
 }
 
 fn fuzzVerify(_: void, smith: *testing.Smith) anyerror!void {
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const w: []const testing.Smith.Weight = &.{
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const weights: []const testing.Smith.Weight = &.{
         .value(u8, 'a', 20),
         .value(u8, 'b', 10),
         .value(u8, ' ', 8),
@@ -3346,13 +3381,15 @@ fn fuzzVerify(_: void, smith: *testing.Smith) anyerror!void {
     };
     var text: [600]u8 = undefined;
     var query: [16]u8 = undefined;
-    const t = text[0..smith.sliceWeightedBytes(&text, w)];
-    const q = query[0..smith.sliceWeightedBytes(&query, w)];
-    const words = try splitWords(a, q);
-    const phrase = try fold.foldAlloc(a, std.mem.trim(u8, q, " \t"));
-    if (verify(t, words, phrase, true, a)) |v| {
-        try testing.expect(std.unicode.utf8ValidateSlice(v.snippet));
-        try testing.expect(v.count >= 1 and v.count <= count_cap and v.line >= 1);
+    const text_used = text[0..smith.sliceWeightedBytes(&text, weights)];
+    const query_used = query[0..smith.sliceWeightedBytes(&query, weights)];
+    const words = try splitWords(arena, query_used);
+    const phrase = try fold.foldAlloc(arena, std.mem.trim(u8, query_used, " \t"));
+    if (verify(text_used, words, phrase, true, arena)) |verified| {
+        try testing.expect(std.unicode.utf8ValidateSlice(verified.snippet));
+        try testing.expect(verified.count >= 1);
+        try testing.expect(verified.count <= count_cap);
+        try testing.expect(verified.line >= 1);
     }
 }
 
