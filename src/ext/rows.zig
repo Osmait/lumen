@@ -43,7 +43,7 @@ comptime {
 /// key them.
 pub const RowsOrigin = struct {
     /// The request that listed them (`ExtItem.list_generation`).
-    list_gen: RequestGeneration,
+    list_generation: RequestGeneration,
     command: CommandIndex,
     from_root_search: bool = false,
     extension_id: []const u8,
@@ -204,7 +204,7 @@ fn extItem(
     return .{
         .command = source.origin.command,
         .from_root_search = source.origin.from_root_search,
-        .list_generation = source.origin.list_gen,
+        .list_generation = source.origin.list_generation,
         .row_index = source.row_index,
         .actions = actions,
         .entries = entries,
@@ -257,9 +257,9 @@ fn pairPart(
     defer mark.restore(L);
     switch (lua.c.lua_rawgeti(L, pair, part_number)) {
         lua.c.LUA_TSTRING, lua.c.LUA_TNUMBER => {
-            var len: usize = 0;
-            const bytes = lua.c.lua_tolstring(L, -1, &len);
-            const text = lua.cut(bytes[0..len], line_bytes_max);
+            var length: usize = 0;
+            const bytes = lua.c.lua_tolstring(L, -1, &length);
+            const text = lua.cut(bytes[0..length], line_bytes_max);
             return arena.dupeSentinel(u8, text, 0) catch lua.oom(L);
         },
         else => lua.raise(L, "{s}: {{ label, value }} expected", .{where}),
