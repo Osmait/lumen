@@ -178,12 +178,16 @@ pub const RootResult = struct {
 pub const RootSection = struct { command: u16, items: []Item };
 
 /// Called on the GTK main loop; each takes ownership of its result.
+/// Each request's answer is handed to its callback on the GTK main loop,
+/// with `context`: `reload` to `registry_callback`, `list` to
+/// `list_callback`, `act` and `submit` to `act_callback`, `root` to
+/// `root_callback`.
 pub const Callbacks = struct {
-    ctx: ?*anyopaque,
-    registry: *const fn (*Registry, ?*anyopaque) void,
-    list: *const fn (*ListResult, ?*anyopaque) void,
-    act: *const fn (*ActResult, ?*anyopaque) void,
-    root: *const fn (*RootResult, ?*anyopaque) void,
+    context: ?*anyopaque,
+    registry_callback: *const fn (*Registry, ?*anyopaque) void,
+    list_callback: *const fn (*ListResult, ?*anyopaque) void,
+    act_callback: *const fn (*ActResult, ?*anyopaque) void,
+    root_callback: *const fn (*RootResult, ?*anyopaque) void,
 };
 
 /// A form's values, as the UI hands them over.
@@ -1679,10 +1683,10 @@ fn deliverCallback(data: ?*anyopaque) callconv(.c) c.gboolean {
     defer host.gpa.destroy(delivery);
     const callbacks = host.callbacks;
     switch (delivery.answer) {
-        .registry => |registry| callbacks.registry(registry, callbacks.ctx),
-        .list => |result| callbacks.list(result, callbacks.ctx),
-        .act => |result| callbacks.act(result, callbacks.ctx),
-        .root => |result| callbacks.root(result, callbacks.ctx),
+        .registry => |registry| callbacks.registry_callback(registry, callbacks.context),
+        .list => |result| callbacks.list_callback(result, callbacks.context),
+        .act => |result| callbacks.act_callback(result, callbacks.context),
+        .root => |result| callbacks.root_callback(result, callbacks.context),
     }
     return 0;
 }
@@ -1777,22 +1781,22 @@ const Probe = struct {
     act: ?*ActResult = null,
     root: ?*RootResult = null,
 
-    fn onRegistry(answer: *Registry, context: ?*anyopaque) void {
+    fn registryCallback(answer: *Registry, context: ?*anyopaque) void {
         const probe: *Probe = @ptrCast(@alignCast(context.?));
         if (probe.registry) |old| old.destroy(testing.allocator);
         probe.registry = answer;
     }
-    fn onList(answer: *ListResult, context: ?*anyopaque) void {
+    fn listCallback(answer: *ListResult, context: ?*anyopaque) void {
         const probe: *Probe = @ptrCast(@alignCast(context.?));
         if (probe.list) |old| old.destroy(testing.allocator);
         probe.list = answer;
     }
-    fn onAct(answer: *ActResult, context: ?*anyopaque) void {
+    fn actCallback(answer: *ActResult, context: ?*anyopaque) void {
         const probe: *Probe = @ptrCast(@alignCast(context.?));
         if (probe.act) |old| old.destroy(testing.allocator);
         probe.act = answer;
     }
-    fn onRoot(answer: *RootResult, context: ?*anyopaque) void {
+    fn rootCallback(answer: *RootResult, context: ?*anyopaque) void {
         const probe: *Probe = @ptrCast(@alignCast(context.?));
         if (probe.root) |old| old.destroy(testing.allocator);
         probe.root = answer;
@@ -1833,11 +1837,11 @@ fn testHost(probe: *Probe, dir: []const u8) !*Host {
     var buf: [4096]u8 = undefined;
     const data = try std.mem.print(&buf, "{s}/data", .{dir});
     return start(testing.allocator, testing.io, dir, data, .{
-        .ctx = probe,
-        .registry = &Probe.onRegistry,
-        .list = &Probe.onList,
-        .act = &Probe.onAct,
-        .root = &Probe.onRoot,
+        .context = probe,
+        .registry_callback = &Probe.registryCallback,
+        .list_callback = &Probe.listCallback,
+        .act_callback = &Probe.actCallback,
+        .root_callback = &Probe.rootCallback,
     });
 }
 

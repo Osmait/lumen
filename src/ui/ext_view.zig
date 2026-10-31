@@ -27,11 +27,11 @@ pub fn start(ui: *Ui) void {
         std.mem.span(c.g_get_user_data_dir()),
     }) catch return;
     ui.ext_host = Host.start(ui.gpa, ui.io, ui.config_dir, data_dir, .{
-        .ctx = ui,
-        .registry = &onRegistry,
-        .list = &onList,
-        .act = &onAct,
-        .root = &onRoot,
+        .context = ui,
+        .registry_callback = &registryCallback,
+        .list_callback = &listCallback,
+        .act_callback = &actCallback,
+        .root_callback = &rootCallback,
     }) catch |err| {
         log.warn("extensions: {t}", .{err});
         return;
@@ -79,7 +79,7 @@ pub fn command(ui: *Ui) ?*const Host.Command {
 
 // ------------------------------------------------------------- results
 
-fn onRegistry(registry: *Host.Registry, ctx: ?*anyopaque) void {
+fn registryCallback(registry: *Host.Registry, ctx: ?*anyopaque) void {
     const ui: *Ui = @ptrCast(@alignCast(ctx.?));
     const old = ui.ext_registry;
     ui.ext_registry = registry;
@@ -125,7 +125,7 @@ fn onRegistry(registry: *Host.Registry, ctx: ?*anyopaque) void {
     }
 }
 
-fn onRoot(answer: *Host.RootResult, ctx: ?*anyopaque) void {
+fn rootCallback(answer: *Host.RootResult, ctx: ?*anyopaque) void {
     const ui: *Ui = @ptrCast(@alignCast(ctx.?));
     if (!ui.ext_root_search.current(answer)) {
         answer.destroy(ui.gpa);
@@ -196,7 +196,7 @@ fn rootAnswer(
 const root_query_bytes_min = 2;
 
 /// Extension rows for the root search `query`: shown when they answer it,
-/// asked for otherwise (they arrive with onRoot).
+/// asked for otherwise (they arrive with rootCallback).
 pub fn addRootSections(ui: *Ui, query: []const u8) void {
     const registry = ui.ext_registry orelse return;
     const host = ui.ext_host orelse return;
@@ -215,7 +215,7 @@ pub fn addRootSections(ui: *Ui, query: []const u8) void {
     ui.ext_root_search.sent(host.root(registry.gen, query), query);
 }
 
-fn onList(answer: *Host.ListResult, ctx: ?*anyopaque) void {
+fn listCallback(answer: *Host.ListResult, ctx: ?*anyopaque) void {
     const ui: *Ui = @ptrCast(@alignCast(ctx.?));
     if (!ui.ext_list.current(answer)) {
         answer.destroy(ui.gpa);
@@ -237,7 +237,7 @@ fn onList(answer: *Host.ListResult, ctx: ?*anyopaque) void {
     if (old) |old_value| old_value.destroy(ui.gpa);
 }
 
-fn onAct(answer: *Host.ActResult, ctx: ?*anyopaque) void {
+fn actCallback(answer: *Host.ActResult, ctx: ?*anyopaque) void {
     const ui: *Ui = @ptrCast(@alignCast(ctx.?));
     defer answer.destroy(ui.gpa);
     if (answer.gen != ui.ext_act_gen) return;
@@ -399,7 +399,7 @@ pub fn enter(ui: *Ui) void {
 
 /// A search command's next keystroke: while its answer is on its way, the
 /// rows on screen are the last answer's and stay as they are (rebuilding
-/// them cost a frame per keystroke; `onList` rebuilds when it comes). True
+/// them cost a frame per keystroke; `listCallback` rebuilds when it comes). True
 /// when the request is made and nothing else is to be done.
 pub fn waitingForSearch(ui: *Ui, query: []const u8) bool {
     const cmd = command(ui) orelse return false;
