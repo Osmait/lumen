@@ -7,6 +7,7 @@
 const std = @import("std");
 const lua = @import("luart").lua;
 const Host = @import("Host.zig");
+const rows = @import("rows.zig");
 const json = @import("luart").json;
 const proc = @import("../sys/proc.zig");
 const themes = @import("../ui/themes.zig");
@@ -274,7 +275,7 @@ fn execArgs(L: *lua.State, argv: *[argv_max][]const u8) lua.Error!ExecArgs {
                 }
                 timeout_ns = @intFromFloat(@min(timeout_s, 3600) * std.time.ns_per_s);
             }
-            lua.c.lua_settop(L, -2);
+            lua.pop(L, 1);
         },
         else => return lua.fail(
             L,
@@ -359,7 +360,7 @@ fn logFn(L: *lua.State) lua.Error!c_int {
         // A full buffer only cuts the line.
         if (argument > 1) writer.writeByte('\t') catch {};
         writer.writeAll(text[0..len]) catch {};
-        lua.c.lua_settop(L, -2);
+        lua.pop(L, 1);
     }
     log.info("[{s}] {s}", .{ extensionOf(L).id, writer.buffered() });
     return 0;
@@ -543,7 +544,7 @@ fn set(L: *lua.State) lua.Error!c_int {
             .value = arena.dupeSentinel(u8, value, 0) catch return lua.failOom(L),
         }) catch return lua.failOom(L);
         // Pops the value; `lua_next` takes the key off next.
-        lua.c.lua_settop(L, -2);
+        lua.pop(L, 1);
     }
     return 0;
 }
@@ -572,7 +573,7 @@ fn layout(L: *lua.State) lua.Error!c_int {
             try layoutValue(L, &layout_new, key);
         }
         // Pops the value; `lua_next` takes the key off next.
-        lua.c.lua_settop(L, -2);
+        lua.pop(L, 1);
     }
     load.layout = layout_new;
     load.has_layout = true;
@@ -609,7 +610,7 @@ fn layoutParts(
         _ = lua.c.lua_rawgeti(L, -1, @intCast(name_number));
         name.* = lua.toSlice(L, -1) orelse
             return lua.fail(L, "lumen.layout: {s}[{d}] is a part name", .{ key, name_number });
-        lua.c.lua_settop(L, -2);
+        lua.pop(L, 1);
     }
     const required: Part = if (Part == layout_mod.BarPart) .entry else .text;
     layout_mod.setParts(Part, parts, names[0..names_count], required) catch {
@@ -651,7 +652,7 @@ fn layoutShow(L: *lua.State, show: *layout_mod.Show) lua.Error!void {
             .{ show_key, layout_mod.show_keys },
         );
         // Pops the value; `lua_next` takes the key off next.
-        lua.c.lua_settop(L, -2);
+        lua.pop(L, 1);
     }
 }
 
@@ -698,13 +699,13 @@ fn icons(L: *lua.State) lua.Error!c_int {
                 .{key},
             );
         }
-        const icon = Host.parseIcon(L, arena, -1, "lumen.icons") orelse
+        const icon = rows.parseIcon(L, arena, -1, "lumen.icons") orelse
             return lua.fail(L, "lumen.icons: no icon for {s}", .{key});
         const full_key = iconKey(arena, key) catch return lua.failOom(L);
         load.icons.append(arena, .{ .key = full_key, .icon = icon }) catch
             return lua.failOom(L);
         // Pops the value; `lua_next` takes the key off next.
-        lua.c.lua_settop(L, -2);
+        lua.pop(L, 1);
     }
     return 0;
 }
@@ -775,10 +776,10 @@ fn jsonEncode(L: *lua.State) lua.Error!c_int {
 }
 
 test "keys parse like ctrl+g" {
-    const g = parseKeys("ctrl+g").?;
-    try std.testing.expectEqual(gtk.GDK_CONTROL_MASK, g.mods);
-    try std.testing.expectEqual(@as(c_uint, 'g'), g.keyval);
-    try std.testing.expectEqual(parseKeys("Ctrl+Shift+G").?.keyval, g.keyval);
+    const ctrl_g = parseKeys("ctrl+g").?;
+    try std.testing.expectEqual(gtk.GDK_CONTROL_MASK, ctrl_g.mods);
+    try std.testing.expectEqual(@as(c_uint, 'g'), ctrl_g.keyval);
+    try std.testing.expectEqual(parseKeys("Ctrl+Shift+G").?.keyval, ctrl_g.keyval);
     try std.testing.expectEqual(
         gtk.GDK_CONTROL_MASK | gtk.GDK_SHIFT_MASK,
         parseKeys("ctrl+shift+g").?.mods,

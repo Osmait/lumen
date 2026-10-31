@@ -167,7 +167,7 @@ const Encoder = struct {
             if (item_number > 1) try encoder.writer.writeByte(',');
             _ = c.lua_rawgeti(L, table, @intCast(item_number));
             encoder.value(L, -1, depth + 1);
-            c.lua_settop(L, -2);
+            lua.pop(L, 1);
         }
         try encoder.writer.writeByte(']');
     }
@@ -195,7 +195,7 @@ const Encoder = struct {
             try encoder.writer.writeByte(':');
             encoder.value(L, -1, depth + 1);
             // Pops the value; `lua_next` takes the key off next.
-            c.lua_settop(L, -2);
+            lua.pop(L, 1);
         }
         try encoder.writer.writeByte('}');
     }

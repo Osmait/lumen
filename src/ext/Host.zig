@@ -20,6 +20,8 @@ const std = @import("std");
 const c = @import("c");
 const lua = @import("luart").lua;
 const api = @import("api.zig");
+const rows_mod = @import("rows.zig");
+const registry_mod = @import("registry.zig");
 const os = @import("os");
 const core = @import("core");
 const item_mod = @import("../item.zig");
@@ -44,10 +46,9 @@ const act_budget_ns = 30 * std.time.ns_per_s;
 /// longer than this).
 const close_budget_ns = 1 * std.time.ns_per_s;
 
-/// The most rows one list answer takes.
-pub const items_max = 1000;
-/// The most actions one row takes.
-pub const actions_max = 9;
+/// The most rows one list answer takes, and actions one row takes.
+pub const items_max = rows_mod.items_max;
+pub const actions_max = rows_mod.actions_max;
 /// The most rows one command adds to the root search, so that a single
 /// extension cannot push the others' rows out.
 pub const root_search_items_max = 8;
@@ -55,13 +56,6 @@ const root_search_budget_ns = 3 * std.time.ns_per_s;
 /// The most of a query a search command or a root search gets.
 const query_bytes_max = 1024;
 
-/// A row's one-line texts (title, subtitle, accessory, section, id): longer
-/// is unreadable in a row, and a label of megabytes takes seconds to lay out.
-const line_bytes_max = 1024;
-const keywords_bytes_max = 4096;
-const path_bytes_max = 4096;
-/// A row's `detail` or `markdown`.
-const detail_bytes_max = 128 << 10;
 /// What one answer's rows take in all. They are copied out of the state, so
 /// its memory cap does not hold them: one string that 1000 rows refer to
 /// becomes 1000 copies.
@@ -70,8 +64,6 @@ const rows_too_big = std.fmt.comptimePrint(
     "the rows take more than {d} MB",
     .{rows_bytes_max >> 20},
 );
-/// Label and value pairs of a row's `metadata`.
-const meta_max = item_mod.meta_max;
 /// Fields of one form.
 const form_fields_max = 20;
 /// An extension's folder name, a command's or a field's name.
@@ -79,16 +71,9 @@ const id_bytes_max = 40;
 /// A grid command's cells to a line.
 const grid_columns_min = 2;
 const grid_columns_max = 10;
-/// A short text that starts with a byte past ASCII is an emoji icon; any
-/// other text names an icon.
-const emoji_bytes_max = 32;
 
 comptime {
     assert(root_search_items_max <= items_max);
-    // `Entry.index` holds an action's index.
-    assert(actions_max <= std.math.maxInt(@FieldType(item_mod.Entry, "index")));
-    // Each of the first two actions has its keys (`keysFor`).
-    assert(actions_max >= 2);
     assert(grid_columns_min <= grid_columns_max);
     assert(grid_columns_max <= std.math.maxInt(@FieldType(Command, "columns")));
 }
@@ -124,121 +109,19 @@ worker_arena: std.heap.ArenaAllocator,
 
 // ------------------------------------------------------------- results
 
-pub const Mode = enum {
-    /// `items`: listed once when the command opens, filtered by Lumen.
-    list,
-    /// `search`: asked again for every query.
-    search,
-    /// `run`: no list; Enter runs it.
-    run,
-    /// Only `root`: rows in the root search, not a command of its own.
-    provider,
-    /// `fields` and `submit`: a form.
-    form,
-};
-
-pub const Command = struct {
-    /// "<extension>.<name>"; what keymaps and `lumen --command` name.
-    id: [:0]const u8,
-    title: [:0]const u8,
-    subtitle: [:0]const u8,
-    icon: item_mod.Icon,
-    keywords: []const u8,
-    placeholder: [:0]const u8,
-    mode: Mode,
-    /// Show the detail pane (the selected row's `detail`).
-    detail: bool,
-    /// It answers root searches too (`root = function(query)`).
-    root: bool,
-    /// A form's fields, in order (preferences' types).
-    fields: []const Pref = &.{},
-    /// The form's last row ("Submit").
-    submit_title: [:0]const u8 = "Submit",
-    /// Rows as a grid of cells (`grid = true`), this many to a line.
-    grid: bool = false,
-    columns: u8 = 5,
-};
-
-pub const Keymap = struct {
-    /// As written: "ctrl+g", "alt+shift+p".
-    keys: [:0]const u8,
-    /// Parsed: the key (lower case) and the modifiers.
-    keyval: c_uint,
-    mods: c_uint,
-    /// A command id, or a built-in view name ("clipboard").
-    target: [:0]const u8,
-    /// Where it was defined, for error messages.
-    ext: [:0]const u8,
-};
-
-pub const PrefKind = enum { toggle, choice, text, password };
-
-/// A preference an extension declares; Settings edits it, Lua reads it as
-/// `lumen.preferences.<name>`.
-pub const Pref = struct {
-    /// The extension's id and title.
-    ext: [:0]const u8,
-    ext_title: [:0]const u8,
-    /// Where Settings writes the values: <data>/preferences.json.
-    file: [:0]const u8,
-    name: [:0]const u8,
-    title: [:0]const u8,
-    description: [:0]const u8,
-    kind: PrefKind,
-    /// As JSON would spell it for a toggle ("true"), else the text.
-    default: [:0]const u8,
-    choices: []const PrefChoice = &.{},
-    /// Form fields: submitting needs a value.
-    required: bool = false,
-};
-
-pub const PrefChoice = struct { value: [:0]const u8, label: [:0]const u8 };
-
-/// `lumen.icons { ["cmd:clipboard"] = "📋" }`: an item's icon replaced.
-pub const IconOverride = struct { key: [:0]const u8, icon: item_mod.Icon };
-
-/// `lumen.set { width = "wide" }`: a setting init.lua fixes.
-pub const SettingOverride = struct {
-    key: [:0]const u8,
-    value: [:0]const u8,
-};
-
-/// An extension that loaded, for Settings > Extensions.
-pub const ExtInfo = struct { id: [:0]const u8, title: [:0]const u8, commands: u16 };
-
-/// A file that did not load, or loaded only in part, and why.
-pub const Problem = struct {
-    ext: [:0]const u8,
-    message: [:0]const u8,
-};
-
-/// Everything the files define. Owned by the receiver: `destroy`.
-pub const Registry = struct {
-    gen: u32,
-    commands: []const Command = &.{},
-    themes: []const themes.Theme = &.{},
-    keymaps: []const Keymap = &.{},
-    settings: []const SettingOverride = &.{},
-    prefs: []const Pref = &.{},
-    icons: []const IconOverride = &.{},
-    /// The extensions that loaded (init.lua not included).
-    extensions: []const ExtInfo = &.{},
-    /// lumen.set in the style: defaults the UI applies when the style is
-    /// chosen (unlike init.lua's, they fix nothing).
-    style_settings: []const SettingOverride = &.{},
-    /// `lumen.layout { ... }`: the window's structure.
-    layout: layout_mod.Layout = .{},
-    /// Whether any file called lumen.layout (its size and place then win
-    /// over Settings).
-    has_layout: bool = false,
-    problems: []const Problem = &.{},
-    arena: std.heap.ArenaAllocator,
-
-    pub fn destroy(registry: *Registry, gpa: std.mem.Allocator) void {
-        registry.arena.deinit();
-        gpa.destroy(registry);
-    }
-};
+/// The registry's types live in registry.zig; they are re-exported here
+/// because the window names them through Host.
+pub const Mode = registry_mod.Mode;
+pub const Command = registry_mod.Command;
+pub const Keymap = registry_mod.Keymap;
+pub const PrefKind = registry_mod.PrefKind;
+pub const Pref = registry_mod.Pref;
+pub const PrefChoice = registry_mod.PrefChoice;
+pub const IconOverride = registry_mod.IconOverride;
+pub const SettingOverride = registry_mod.SettingOverride;
+pub const ExtInfo = registry_mod.ExtInfo;
+pub const Problem = registry_mod.Problem;
+pub const Registry = registry_mod.Registry;
 
 /// A command's rows. Owned by the receiver: `destroy`.
 pub const ListResult = struct {
@@ -764,11 +647,10 @@ fn closeAll(host: *Host) void {
 fn reloadExecute(host: *Host) void {
     host.closeAll();
     host.registry_gen +%= 1;
-    const registry = host.gpa.create(Registry) catch {
-        log.warn("reload: out of memory", .{});
-        return;
-    };
-    registry.* = .{ .gen = host.registry_gen, .arena = .init(host.gpa) };
+    const registry = host.answerCreate(Registry, "reload", .{
+        .gen = host.registry_gen,
+        .arena = .init(host.gpa),
+    }) orelse return;
     var load: Load = .{ .arena = registry.arena.allocator() };
     host.loadAll(&load);
     host.registryFill(registry, &load);
@@ -1042,7 +924,7 @@ fn parseExtension(L: *lua.State, context: *LoadContext, spec: c_int) void {
     const title = lua.fieldString(L, arena, spec, "title", "extension") orelse
         context.extension.id;
     context.title = title;
-    const default_icon = fieldIcon(L, arena, spec, "extension.icon") orelse addon_icon;
+    const default_icon = rows_mod.fieldIcon(L, arena, spec, "extension.icon") orelse addon_icon;
     parsePreferences(L, context, spec, title);
     parseCommands(L, context, spec, title, default_icon);
 }
@@ -1348,8 +1230,8 @@ fn parseCommand(
         .title = title,
         .subtitle = lua.fieldString(L, arena, command_table, "subtitle", where) orelse
             extension_title,
-        .icon = fieldIcon(L, arena, command_table, where) orelse default_icon,
-        .keywords = keywords(L, arena, command_table, where),
+        .icon = rows_mod.fieldIcon(L, arena, command_table, where) orelse default_icon,
+        .keywords = rows_mod.keywords(L, arena, command_table, where),
         .placeholder = lua.fieldString(L, arena, command_table, "placeholder", where) orelse "",
         .mode = mode,
         .detail = lua.fieldBool(L, command_table, "detail", false, where),
@@ -1376,107 +1258,6 @@ fn parseCommand(
     assert(context.load.worker_commands.items.len == context.load.commands.items.len);
 }
 
-/// `keywords`: a string, or a list of strings joined with spaces; up to
-/// `keywords_bytes_max`.
-fn keywords(L: *lua.State, arena: std.mem.Allocator, table: c_int, where: []const u8) []const u8 {
-    const mark: lua.StackMark = .init(L);
-    defer mark.restore(L);
-    switch (lua.getField(L, table, "keywords")) {
-        lua.c.LUA_TNIL => return "",
-        lua.c.LUA_TSTRING => {
-            const text = lua.cut(lua.toSlice(L, -1).?, keywords_bytes_max);
-            return arena.dupe(u8, text) catch lua.oom(L);
-        },
-        lua.c.LUA_TTABLE => return keywordsJoined(L, arena, lua.absIndex(L, -1), where),
-        else => {
-            const type_name = lua.typeName(L, -1);
-            lua.raise(L, "{s}.keywords: string or list expected, got {s}", .{ where, type_name });
-        },
-    }
-}
-
-/// The strings of the list at `keyword_list`, joined with spaces, as many
-/// as fit in `keywords_bytes_max`.
-fn keywordsJoined(
-    L: *lua.State,
-    arena: std.mem.Allocator,
-    keyword_list: c_int,
-    where: []const u8,
-) []const u8 {
-    var joined: std.ArrayList(u8) = .empty;
-    const keywords_count = lua.c.lua_rawlen(L, keyword_list);
-    for (1..keywords_count + 1) |keyword_number| {
-        const mark: lua.StackMark = .init(L);
-        defer mark.restore(L);
-        _ = lua.c.lua_rawgeti(L, keyword_list, @intCast(keyword_number));
-        const keyword = lua.toSlice(L, -1) orelse
-            lua.raise(L, "{s}.keywords[{d}]: string expected", .{ where, keyword_number });
-        if (joined.items.len + 1 + keyword.len > keywords_bytes_max) break;
-        if (joined.items.len > 0) joined.append(arena, ' ') catch lua.oom(L);
-        joined.appendSlice(arena, keyword) catch lua.oom(L);
-    }
-    assert(joined.items.len <= keywords_bytes_max);
-    return joined.items;
-}
-
-/// `table.icon` (see `parseIcon`), or null when it has none.
-fn fieldIcon(
-    L: *lua.State,
-    arena: std.mem.Allocator,
-    table: c_int,
-    where: []const u8,
-) ?item_mod.Icon {
-    const mark: lua.StackMark = .init(L);
-    defer mark.restore(L);
-    _ = lua.getField(L, table, "icon");
-    return parseIcon(L, arena, -1, where);
-}
-
-/// An icon: an emoji ("🐙"), an icon name ("folder-symbolic") on a grey
-/// tile, or `{ name = ..., color = "blue" }`. Null for nil. Leaves the
-/// stack as it found it.
-pub fn parseIcon(
-    L: *lua.State,
-    arena: std.mem.Allocator,
-    index: c_int,
-    where: []const u8,
-) ?item_mod.Icon {
-    const mark: lua.StackMark = .init(L);
-    defer mark.expectPushed(L, 0);
-    const icon = lua.absIndex(L, index);
-    switch (lua.c.lua_type(L, icon)) {
-        lua.c.LUA_TNIL => return null,
-        lua.c.LUA_TSTRING => {
-            const text = lua.toSlice(L, icon).?;
-            // "~/icons/x.svg": a file in the home folder.
-            const in_home = std.mem.startsWith(u8, text, "~/");
-            const copy = if (in_home)
-                arena.printSentinel("{s}/{s}", .{ std.mem.span(c.g_get_home_dir()), text[2..] }, 0)
-            else
-                arena.dupeSentinel(u8, text, 0);
-            const name = copy catch lua.oom(L);
-            const is_emoji = text.len > 0 and text.len <= emoji_bytes_max and text[0] >= 0x80;
-            if (is_emoji) return .{ .emoji = name };
-            return .byName(name);
-        },
-        lua.c.LUA_TTABLE => {
-            const name = lua.fieldString(L, arena, icon, "name", where) orelse
-                lua.raise(L, "{s}.icon.name is missing", .{where});
-            const color_name = lua.fieldString(L, arena, icon, "color", where) orelse "gray";
-            const color = std.meta.stringToEnum(item_mod.Color, color_name) orelse lua.raise(
-                L,
-                "{s}.icon.color: one of red, orange, yellow, green, blue, purple, pink, gray (got \"{s}\")",
-                .{ where, color_name },
-            );
-            return .{ .tile = .{ .name = name, .color = color } };
-        },
-        else => {
-            const type_name = lua.typeName(L, icon);
-            lua.raise(L, "{s}.icon: string or table expected, got {s}", .{ where, type_name });
-        },
-    }
-}
-
 // ----------------------------------------------------------------- list
 
 /// The error a request gets when the files were reloaded after it was made.
@@ -1496,16 +1277,12 @@ fn requested(host: *Host, registry_gen: u32, command: u16) ?*WorkerCommand {
 }
 
 fn listExecute(host: *Host, request: *const ListRequest) void {
-    const result = host.gpa.create(ListResult) catch {
-        log.warn("list: out of memory, no answer", .{});
-        return;
-    };
-    result.* = .{
+    const result = host.answerCreate(ListResult, "list", .{
         .gen = request.request_gen,
         .command = request.command,
         .query = "",
         .arena = .init(host.gpa),
-    };
+    }) orelse return;
     defer host.deliver(.{ .list = result });
     const arena = result.arena.allocator();
     const query = request.query.slice();
@@ -1562,7 +1339,7 @@ const ListContext = struct {
             else => lua.raise(L, "items: a list expected, got {s}", .{lua.typeName(L, rows)}),
         }
         keep(L, &context.worker_command.list_kept, rows, context.request.request_gen);
-        context.result.items = parseItems(L, context.rows_arena, rows, .{
+        context.result.items = rows_mod.parseItems(L, context.rows_arena, rows, .{
             .list_gen = context.request.request_gen,
             .command = context.request.command,
             .extension_id = context.extension.id,
@@ -1581,352 +1358,14 @@ fn keep(L: *lua.State, kept: *Kept, rows: c_int, list_gen: u32) void {
     kept.list_gen = list_gen;
 }
 
-/// Where a list's rows came from: enough to run their actions later, and to
-/// key them.
-const RowsOrigin = struct {
-    /// The request that listed them (`ExtItem.gen`).
-    list_gen: u32,
-    command: u16,
-    from_root_search: bool = false,
-    extension_id: []const u8,
-};
-
-/// One row of a list: where its list came from, its place in it, and how
-/// errors name it.
-const RowSource = struct {
-    origin: RowsOrigin,
-    /// Its position in the list, from 0.
-    row_index: u32,
-    /// "items[3]".
-    where: []const u8,
-};
-
-fn parseItems(
-    L: *lua.State,
-    arena: std.mem.Allocator,
-    rows: c_int,
-    origin: RowsOrigin,
-    rows_max: usize,
-) []Item {
-    assert(rows_max <= items_max);
-    const rows_count = @min(lua.c.lua_rawlen(L, rows), rows_max);
-    const items = arena.alloc(Item, rows_count) catch lua.oom(L);
-    for (items, 0..) |*item, row_index| {
-        const mark: lua.StackMark = .init(L);
-        defer mark.restore(L);
-        var where_buffer: [24]u8 = undefined;
-        const where = std.mem.print(&where_buffer, "items[{d}]", .{row_index + 1}) catch "items";
-        _ = lua.c.lua_rawgeti(L, rows, @intCast(row_index + 1));
-        item.* = parseItem(L, arena, lua.absIndex(L, -1), .{
-            .origin = origin,
-            .row_index = @intCast(row_index),
-            .where = where,
-        });
-    }
-    assert(items.len <= rows_max);
-    return items;
-}
-
-fn parseItem(L: *lua.State, arena: std.mem.Allocator, row: c_int, source: RowSource) Item {
-    const where = source.where;
-    // A plain string is a row with that title.
-    if (lua.toSlice(L, row)) |text| {
-        const title = arena.dupeSentinel(u8, lua.cut(text, line_bytes_max), 0) catch lua.oom(L);
-        return .{
-            .key = rankingKey(L, arena, source.origin.extension_id, title),
-            .title = title,
-            .action = .{ .ext_item = defaultActions(L, arena, source, title) },
-        };
-    }
-    if (lua.c.lua_type(L, row) != lua.c.LUA_TTABLE) {
-        const type_name = lua.typeName(L, row);
-        lua.raise(L, "{s}: table or string expected, got {s}", .{ where, type_name });
-    }
-    const title = line(L, arena, row, "title", where) orelse
-        lua.raise(L, "{s}.title is missing", .{where});
-    const id = line(L, arena, row, "id", where) orelse title;
-    var item: Item = .{
-        .key = rankingKey(L, arena, source.origin.extension_id, id),
-        .title = title,
-        .subtitle = line(L, arena, row, "subtitle", where) orelse "",
-        .accessory = line(L, arena, row, "accessory", where) orelse "",
-        .keywords = keywords(L, arena, row, where),
-        .detail = lua.fieldStringMax(L, arena, row, "detail", where, detail_bytes_max) orelse "",
-        .section = line(L, arena, row, "section", where) orelse "",
-        .confirm = lua.fieldBool(L, row, "confirm", false, where),
-        .action = undefined,
-    };
-    if (fieldIcon(L, arena, row, where)) |icon| item.icon = icon;
-    if (lua.fieldStringMax(L, arena, row, "markdown", where, detail_bytes_max)) |markdown| {
-        var markup: std.Io.Writer.Allocating = .init(arena);
-        core.markdown.toMarkup(&markup.writer, markdown) catch lua.oom(L);
-        item.detail = markup.written();
-        item.markup = true;
-    }
-    item.meta = metadata(L, arena, row, where);
-    item.image = lua.fieldStringMax(L, arena, row, "image", where, path_bytes_max) orelse "";
-    item.action = .{ .ext_item = rowActions(L, arena, row, source, title) };
-    return item;
-}
-
-/// A row's one-line text `row[name]`, cut to `line_bytes_max`.
-fn line(
-    L: *lua.State,
-    arena: std.mem.Allocator,
-    row: c_int,
-    name: [:0]const u8,
-    where: []const u8,
-) ?[:0]const u8 {
-    return lua.fieldStringMax(L, arena, row, name, where, line_bytes_max);
-}
-
-/// A row's `actions` (up to `actions_max`, Lua functions or lumen.action
-/// values), or the default ones when it has none.
-fn rowActions(
-    L: *lua.State,
-    arena: std.mem.Allocator,
-    row: c_int,
-    source: RowSource,
-    title: [:0]const u8,
-) item_mod.ExtItem {
-    const mark: lua.StackMark = .init(L);
-    defer mark.restore(L);
-    const action_list = lua.fieldList(L, row, "actions", source.where) orelse
-        return defaultActions(L, arena, source, title);
-    const actions_count = @min(lua.c.lua_rawlen(L, action_list), actions_max);
-    if (actions_count == 0) lua.raise(L, "{s}.actions is empty", .{source.where});
-    const actions = arena.alloc(item_mod.ExtAction, actions_count) catch lua.oom(L);
-    const entries = arena.alloc(item_mod.Entry, actions_count) catch lua.oom(L);
-    for (actions, entries, 0..) |*action, *entry, action_index| {
-        const action_mark: lua.StackMark = .init(L);
-        defer action_mark.restore(L);
-        var where_buffer: [48]u8 = undefined;
-        const action_where = std.mem.print(
-            &where_buffer,
-            "{s}.actions[{d}]",
-            .{ source.where, action_index + 1 },
-        ) catch source.where;
-        const action_table = lua.tableAt(L, action_list, action_index + 1, action_where);
-        const parsed = parseAction(L, arena, action_table, action_where);
-        action.* = parsed.action;
-        entry.* = .{
-            .label = parsed.label,
-            .keys = keysFor(action_index),
-            .op = .ext,
-            .index = @intCast(action_index),
-        };
-    }
-    return extItem(source, actions, entries);
-}
-
-/// A row without actions copies its title.
-fn defaultActions(
-    L: *lua.State,
-    arena: std.mem.Allocator,
-    source: RowSource,
-    title: [:0]const u8,
-) item_mod.ExtItem {
-    const actions = arena.dupe(item_mod.ExtAction, &.{.{ .copy = title }}) catch lua.oom(L);
-    const entries = arena.dupe(item_mod.Entry, &.{.{
-        .label = "Copy to Clipboard",
-        .keys = "↵",
-        .op = .ext,
-    }}) catch lua.oom(L);
-    return extItem(source, actions, entries);
-}
-
-fn extItem(
-    source: RowSource,
-    actions: []const item_mod.ExtAction,
-    entries: []const item_mod.Entry,
-) item_mod.ExtItem {
-    assert(actions.len == entries.len);
-    assert(actions.len >= 1);
-    assert(actions.len <= actions_max);
-    return .{
-        .command = source.origin.command,
-        .root = source.origin.from_root_search,
-        .gen = source.origin.list_gen,
-        .index = source.row_index,
-        .actions = actions,
-        .entries = entries,
-    };
-}
-
-/// `metadata = { { "Label", "value" }, { label = "Size", value = 42 } }`:
-/// up to `meta_max` pairs for the detail pane.
-fn metadata(
-    L: *lua.State,
-    arena: std.mem.Allocator,
-    row: c_int,
-    where: []const u8,
-) []const item_mod.Meta {
-    const mark: lua.StackMark = .init(L);
-    defer mark.restore(L);
-    const pairs = lua.fieldList(L, row, "metadata", where) orelse return &.{};
-    const pairs_count = @min(lua.c.lua_rawlen(L, pairs), meta_max);
-    const metas = arena.alloc(item_mod.Meta, pairs_count) catch lua.oom(L);
-    for (metas, 1..) |*meta, pair_number| {
-        const pair_mark: lua.StackMark = .init(L);
-        defer pair_mark.restore(L);
-        var where_buffer: [48]u8 = undefined;
-        const pair_where = std.mem.print(
-            &where_buffer,
-            "{s}.metadata[{d}]",
-            .{ where, pair_number },
-        ) catch where;
-        const pair = lua.tableAt(L, pairs, pair_number, pair_where);
-        meta.* = .{
-            .label = line(L, arena, pair, "label", pair_where) orelse
-                pairPart(L, arena, pair, 1, pair_where),
-            .value = line(L, arena, pair, "value", pair_where) orelse
-                pairPart(L, arena, pair, 2, pair_where),
-        };
-    }
-    assert(metas.len <= meta_max);
-    return metas;
-}
-
-/// `pair[part_number]` as text (numbers too), cut to `line_bytes_max`.
-fn pairPart(
-    L: *lua.State,
-    arena: std.mem.Allocator,
-    pair: c_int,
-    part_number: c_int,
-    where: []const u8,
-) [:0]const u8 {
-    const mark: lua.StackMark = .init(L);
-    defer mark.restore(L);
-    switch (lua.c.lua_rawgeti(L, pair, part_number)) {
-        lua.c.LUA_TSTRING, lua.c.LUA_TNUMBER => {
-            var len: usize = 0;
-            const bytes = lua.c.lua_tolstring(L, -1, &len);
-            const text = lua.cut(bytes[0..len], line_bytes_max);
-            return arena.dupeSentinel(u8, text, 0) catch lua.oom(L);
-        },
-        else => lua.raise(L, "{s}: {{ label, value }} expected", .{where}),
-    }
-}
-
-/// The key a row's use is ranked by. Raises when out of memory: an empty
-/// key would merge rows' rankings.
-fn rankingKey(
-    L: *lua.State,
-    arena: std.mem.Allocator,
-    extension_id: []const u8,
-    id: []const u8,
-) []const u8 {
-    return arena.print("x:{s}:{s}", .{ extension_id, id }) catch lua.oom(L);
-}
-
-/// The key caps shown for a row's first two actions; the rest have none.
-fn keysFor(action_index: usize) [:0]const u8 {
-    return switch (action_index) {
-        0 => "↵",
-        1 => "Ctrl ↵",
-        else => "",
-    };
-}
-
-const ParsedAction = struct { action: item_mod.ExtAction, label: [:0]const u8 };
-
-/// What `lumen.action.*` makes: `kind` says which.
-const ActionKind = enum { open, copy, paste, exec };
-
-fn parseAction(
-    L: *lua.State,
-    arena: std.mem.Allocator,
-    action_table: c_int,
-    where: []const u8,
-) ParsedAction {
-    const title = lua.fieldString(L, arena, action_table, "title", where);
-    if (actionHasRun(L, action_table, where)) {
-        return .{ .action = .lua, .label = title orelse "Run" };
-    }
-    const kind_name = lua.fieldString(L, arena, action_table, "kind", where) orelse
-        lua.raise(L, "{s}: give it a run function, or make it with lumen.action.*", .{where});
-    const kind = std.meta.stringToEnum(ActionKind, kind_name) orelse
-        lua.raise(L, "{s}.kind: unknown \"{s}\"", .{ where, kind_name });
-    switch (kind) {
-        .open => {
-            const target = lua.fieldString(L, arena, action_table, "target", where) orelse
-                lua.raise(L, "{s}.target is missing", .{where});
-            return .{ .action = .{ .open = target }, .label = title orelse "Open" };
-        },
-        .copy => {
-            const text = actionText(L, arena, action_table, where);
-            return .{ .action = .{ .copy = text }, .label = title orelse "Copy to Clipboard" };
-        },
-        .paste => {
-            const text = actionText(L, arena, action_table, where);
-            return .{ .action = .{ .paste = text }, .label = title orelse "Paste to Active App" };
-        },
-        .exec => {
-            const argv = actionArgv(L, arena, action_table, where);
-            return .{ .action = .{ .exec = argv }, .label = title orelse "Run" };
-        },
-    }
-}
-
-/// Whether the action is a Lua function (`run`).
-fn actionHasRun(L: *lua.State, action_table: c_int, where: []const u8) bool {
-    const mark: lua.StackMark = .init(L);
-    defer mark.restore(L);
-    const run_type = lua.getField(L, action_table, "run");
-    if (run_type == lua.c.LUA_TFUNCTION) return true;
-    if (run_type != lua.c.LUA_TNIL) {
-        lua.raise(L, "{s}.run: function expected, got {s}", .{ where, lua.typeName(L, -1) });
-    }
-    return false;
-}
-
-fn actionText(
-    L: *lua.State,
-    arena: std.mem.Allocator,
-    action_table: c_int,
-    where: []const u8,
-) [:0]const u8 {
-    return lua.fieldString(L, arena, action_table, "text", where) orelse
-        lua.raise(L, "{s}.text is missing", .{where});
-}
-
-/// `lumen.action.exec`'s argv: 1 to `api.argv_max` strings.
-fn actionArgv(
-    L: *lua.State,
-    arena: std.mem.Allocator,
-    action_table: c_int,
-    where: []const u8,
-) []const [:0]const u8 {
-    const mark: lua.StackMark = .init(L);
-    defer mark.restore(L);
-    if (lua.getField(L, action_table, "argv") != lua.c.LUA_TTABLE) {
-        lua.raise(L, "{s}.argv: a list of strings expected", .{where});
-    }
-    const words = lua.absIndex(L, -1);
-    const words_count = lua.c.lua_rawlen(L, words);
-    if (words_count == 0 or words_count > api.argv_max) {
-        lua.raise(L, "{s}.argv: 1 to {d} strings expected", .{ where, api.argv_max });
-    }
-    const argv = arena.alloc([:0]const u8, words_count) catch lua.oom(L);
-    for (argv, 1..) |*word, word_number| {
-        const word_mark: lua.StackMark = .init(L);
-        defer word_mark.restore(L);
-        _ = lua.c.lua_rawgeti(L, words, @intCast(word_number));
-        const text = lua.toSlice(L, -1) orelse
-            lua.raise(L, "{s}.argv[{d}]: string expected", .{ where, word_number });
-        word.* = arena.dupeSentinel(u8, text, 0) catch lua.oom(L);
-    }
-    return argv;
-}
-
 // ----------------------------------------------------------------- root
 
 fn rootSearchExecute(host: *Host, request: *const RootSearchRequest) void {
-    const result = host.gpa.create(RootResult) catch {
-        log.warn("root: out of memory, no answer", .{});
-        return;
-    };
-    result.* = .{ .gen = request.request_gen, .query = "", .arena = .init(host.gpa) };
+    const result = host.answerCreate(RootResult, "root", .{
+        .gen = request.request_gen,
+        .query = "",
+        .arena = .init(host.gpa),
+    }) orelse return;
     defer host.deliver(.{ .root = result });
     const arena = result.arena.allocator();
     const query = request.query.slice();
@@ -2007,7 +1446,7 @@ const RootSearchContext = struct {
             else => lua.raise(L, "root: a list expected, got {s}", .{lua.typeName(L, rows)}),
         }
         keep(L, &context.worker_command.root_search_kept, rows, context.request.request_gen);
-        context.items = parseItems(L, context.rows_arena, rows, .{
+        context.items = rows_mod.parseItems(L, context.rows_arena, rows, .{
             .list_gen = context.request.request_gen,
             .command = context.command,
             .from_root_search = true,
@@ -2020,11 +1459,10 @@ const RootSearchContext = struct {
 
 fn submitExecute(host: *Host, request: *SubmitRequest) void {
     defer request.destroy(host.gpa);
-    const result = host.gpa.create(ActResult) catch {
-        log.warn("submit: out of memory, no answer", .{});
-        return;
-    };
-    result.* = .{ .gen = request.request_gen, .arena = .init(host.gpa) };
+    const result = host.answerCreate(ActResult, "submit", .{
+        .gen = request.request_gen,
+        .arena = .init(host.gpa),
+    }) orelse return;
     defer host.deliver(.{ .act = result });
     const worker_command = host.requested(request.registry_gen, request.command) orelse {
         result.err = reloaded;
@@ -2093,11 +1531,10 @@ fn outcomeOf(L: *lua.State) Outcome {
 // ------------------------------------------------------------------ act
 
 fn actExecute(host: *Host, request: ActRequest) void {
-    const result = host.gpa.create(ActResult) catch {
-        log.warn("action: out of memory, no answer", .{});
-        return;
-    };
-    result.* = .{ .gen = request.request_gen, .arena = .init(host.gpa) };
+    const result = host.answerCreate(ActResult, "action", .{
+        .gen = request.request_gen,
+        .arena = .init(host.gpa),
+    }) orelse return;
     defer host.deliver(.{ .act = result });
     const worker_command = host.requested(request.registry_gen, request.command) orelse {
         result.err = reloaded;
@@ -2178,6 +1615,21 @@ fn pushRowAction(
 }
 
 // ------------------------------------------------------------- delivery
+
+/// An answer for the window (a Registry, ListResult, ActResult or
+/// RootResult), owned by it once delivered. Null when out of memory: the
+/// request then gets no answer, as if a newer one had replaced it, and the
+/// log says which kind was dropped.
+fn answerCreate(host: *Host, comptime T: type, what: []const u8, answer: T) ?*T {
+    comptime assert(@hasField(T, "gen"));
+    comptime assert(@hasField(T, "arena"));
+    const created = host.gpa.create(T) catch {
+        log.warn("{s}: out of memory, no answer", .{what});
+        return null;
+    };
+    created.* = answer;
+    return created;
+}
 
 /// An answer the worker hands to the main loop, which owns it from then on.
 const Answer = union(enum) {
@@ -2301,63 +1753,61 @@ const testing = std.testing;
 
 /// Collects what the host delivers; the test pumps GLib's main loop.
 const Probe = struct {
-    reg: ?*Registry = null,
-    res: ?*ListResult = null,
+    registry: ?*Registry = null,
+    list: ?*ListResult = null,
     act: ?*ActResult = null,
     root: ?*RootResult = null,
 
-    fn onRegistry(r: *Registry, ctx: ?*anyopaque) void {
-        const p: *Probe = @ptrCast(@alignCast(ctx.?));
-        if (p.reg) |o| o.destroy(testing.allocator);
-        p.reg = r;
+    fn onRegistry(answer: *Registry, context: ?*anyopaque) void {
+        const probe: *Probe = @ptrCast(@alignCast(context.?));
+        if (probe.registry) |old| old.destroy(testing.allocator);
+        probe.registry = answer;
     }
-    fn onList(r: *ListResult, ctx: ?*anyopaque) void {
-        const p: *Probe = @ptrCast(@alignCast(ctx.?));
-        if (p.res) |o| o.destroy(testing.allocator);
-        p.res = r;
+    fn onList(answer: *ListResult, context: ?*anyopaque) void {
+        const probe: *Probe = @ptrCast(@alignCast(context.?));
+        if (probe.list) |old| old.destroy(testing.allocator);
+        probe.list = answer;
     }
-    fn onAct(r: *ActResult, ctx: ?*anyopaque) void {
-        const p: *Probe = @ptrCast(@alignCast(ctx.?));
-        if (p.act) |o| o.destroy(testing.allocator);
-        p.act = r;
+    fn onAct(answer: *ActResult, context: ?*anyopaque) void {
+        const probe: *Probe = @ptrCast(@alignCast(context.?));
+        if (probe.act) |old| old.destroy(testing.allocator);
+        probe.act = answer;
     }
-    fn onRoot(r: *RootResult, ctx: ?*anyopaque) void {
-        const p: *Probe = @ptrCast(@alignCast(ctx.?));
-        if (p.root) |o| o.destroy(testing.allocator);
-        p.root = r;
+    fn onRoot(answer: *RootResult, context: ?*anyopaque) void {
+        const probe: *Probe = @ptrCast(@alignCast(context.?));
+        if (probe.root) |old| old.destroy(testing.allocator);
+        probe.root = answer;
     }
-    fn deinit(p: *Probe) void {
-        if (p.root) |r| r.destroy(testing.allocator);
-        if (p.reg) |r| r.destroy(testing.allocator);
-        if (p.res) |r| r.destroy(testing.allocator);
-        if (p.act) |r| r.destroy(testing.allocator);
+    fn deinit(probe: *Probe) void {
+        if (probe.root) |answer| answer.destroy(testing.allocator);
+        if (probe.registry) |answer| answer.destroy(testing.allocator);
+        if (probe.list) |answer| answer.destroy(testing.allocator);
+        if (probe.act) |answer| answer.destroy(testing.allocator);
     }
     /// Pumps the main loop until `field` is set (up to 10 s).
-    fn wait(p: *Probe, comptime field: []const u8) !void {
-        const until = os.monotonicNs() + 10 * std.time.ns_per_s;
-        while (@field(p, field) == null) {
-            if (os.monotonicNs() > until) return error.Timeout;
-            // Nothing ready: a 1 ms nap (poll with no descriptors).
-            if (c.g_main_context_iteration(null, 0) == 0) _ = std.os.linux.poll(
-                &[0]std.os.linux.pollfd{},
-                0,
-                1,
-            );
+    fn wait(probe: *Probe, comptime field: []const u8) !void {
+        const until_ns = os.monotonicNs() + 10 * std.time.ns_per_s;
+        while (@field(probe, field) == null) {
+            if (os.monotonicNs() > until_ns) return error.Timeout;
+            // Nothing is ready: nap for 1 ms (a poll with no descriptors).
+            if (c.g_main_context_iteration(null, 0) == 0) {
+                _ = std.os.linux.poll(&[0]std.os.linux.pollfd{}, 0, 1);
+            }
         }
     }
-    fn take(p: *Probe, comptime field: []const u8) !@TypeOf(@field(p, field).?) {
-        try p.wait(field);
-        const r = @field(p, field).?;
-        @field(p, field) = null;
-        return r;
+    fn take(probe: *Probe, comptime field: []const u8) !@TypeOf(@field(probe, field).?) {
+        try probe.wait(field);
+        const answer = @field(probe, field).?;
+        @field(probe, field) = null;
+        return answer;
     }
 };
 
 fn writeTestFile(dir: []const u8, name: []const u8, data: []const u8) !void {
-    var buf: [4096]u8 = undefined;
-    const p = try std.mem.printSentinel(&buf, "{s}/{s}", .{ dir, name }, 0);
-    if (std.mem.findScalarLast(u8, p, '/')) |s| os.mkdirP(p[0..s]);
-    try os.writeFile(p, data);
+    var buffer: [4096]u8 = undefined;
+    const path = try std.mem.printSentinel(&buffer, "{s}/{s}", .{ dir, name }, 0);
+    if (std.mem.findScalarLast(u8, path, '/')) |slash| os.mkdirP(path[0..slash]);
+    try os.writeFile(path, data);
 }
 
 fn testHost(probe: *Probe, dir: []const u8) !*Host {
@@ -2425,36 +1875,36 @@ test "extensions load, list, search and run actions" {
 
     var probe: Probe = .{};
     defer probe.deinit();
-    const h = try testHost(&probe, dir);
-    defer h.shutdown();
-    h.reload();
-    try probe.wait("reg");
-    const reg = probe.reg.?;
+    const host = try testHost(&probe, dir);
+    defer host.shutdown();
+    host.reload();
+    try probe.wait("registry");
+    const registry = probe.registry.?;
 
-    try testing.expectEqual(@as(usize, 5), reg.commands.len);
-    try testing.expectEqual(Mode.provider, reg.commands[4].mode);
-    try testing.expect(reg.commands[4].root and !reg.commands[1].root);
-    try testing.expectEqualStrings("config.hello", reg.commands[0].id);
-    try testing.expectEqual(Mode.run, reg.commands[0].mode);
-    try testing.expectEqualStrings("demo.fruits", reg.commands[1].id);
-    try testing.expectEqualStrings("Demo", reg.commands[1].subtitle);
-    try testing.expectEqualStrings("🍎", reg.commands[1].icon.emoji);
-    try testing.expect(reg.commands[1].detail);
-    try testing.expectEqual(Mode.search, reg.commands[2].mode);
-    try testing.expectEqual(@as(usize, 1), reg.themes.len);
-    try testing.expectEqual(@as(u24, 0xff8800), reg.themes[0].accent);
-    try testing.expectEqual(@as(u24, 0x101010), reg.themes[0].surface);
-    try testing.expectEqual(@as(usize, 1), reg.keymaps.len);
-    try testing.expectEqualStrings("demo.fruits", reg.keymaps[0].target);
-    try testing.expectEqual(@as(usize, 3), reg.settings.len);
+    try testing.expectEqual(@as(usize, 5), registry.commands.len);
+    try testing.expectEqual(Mode.provider, registry.commands[4].mode);
+    try testing.expect(registry.commands[4].root and !registry.commands[1].root);
+    try testing.expectEqualStrings("config.hello", registry.commands[0].id);
+    try testing.expectEqual(Mode.run, registry.commands[0].mode);
+    try testing.expectEqualStrings("demo.fruits", registry.commands[1].id);
+    try testing.expectEqualStrings("Demo", registry.commands[1].subtitle);
+    try testing.expectEqualStrings("🍎", registry.commands[1].icon.emoji);
+    try testing.expect(registry.commands[1].detail);
+    try testing.expectEqual(Mode.search, registry.commands[2].mode);
+    try testing.expectEqual(@as(usize, 1), registry.themes.len);
+    try testing.expectEqual(@as(u24, 0xff8800), registry.themes[0].accent);
+    try testing.expectEqual(@as(u24, 0x101010), registry.themes[0].surface);
+    try testing.expectEqual(@as(usize, 1), registry.keymaps.len);
+    try testing.expectEqualStrings("demo.fruits", registry.keymaps[0].target);
+    try testing.expectEqual(@as(usize, 3), registry.settings.len);
     // Several lumen.layout calls add up.
-    try testing.expect(reg.has_layout);
-    try testing.expectEqual(@as(?u16, 820), reg.layout.width);
-    try testing.expect(
-        reg.layout.footer and reg.layout.panels == .single and reg.layout.rows == .inline_,
-    );
-    try testing.expect(!reg.layout.show.icons and reg.layout.show.subtitles);
-    for (reg.settings) |o| {
+    try testing.expect(registry.has_layout);
+    try testing.expectEqual(@as(?u16, 820), registry.layout.width);
+    try testing.expect(registry.layout.footer);
+    try testing.expect(registry.layout.panels == .single);
+    try testing.expect(registry.layout.rows == .inline_);
+    try testing.expect(!registry.layout.show.icons and registry.layout.show.subtitles);
+    for (registry.settings) |o| {
         const want: []const u8 = if (std.mem.eql(u8, o.key, "width")) "wide" else if (std.mem.eql(
             u8,
             o.key,
@@ -2463,13 +1913,13 @@ test "extensions load, list, search and run actions" {
         try testing.expectEqualStrings(want, o.value);
     }
     // The broken one is reported, the others load.
-    try testing.expectEqual(@as(usize, 1), reg.problems.len);
-    try testing.expectEqualStrings("broken", reg.problems[0].ext);
-    try testing.expect(std.mem.find(u8, reg.problems[0].message, "title is missing") != null);
+    try testing.expectEqual(@as(usize, 1), registry.problems.len);
+    try testing.expectEqualStrings("broken", registry.problems[0].ext);
+    try testing.expect(std.mem.find(u8, registry.problems[0].message, "title is missing") != null);
 
     // A list command's rows.
-    const g1 = h.list(reg.gen, 1, "");
-    const fruits = try probe.take("res");
+    const g1 = host.list(registry.gen, 1, "");
+    const fruits = try probe.take("list");
     defer fruits.destroy(testing.allocator);
     try testing.expectEqual(g1, fruits.gen);
     try testing.expect(fruits.err == null);
@@ -2489,7 +1939,7 @@ test "extensions load, list, search and run actions" {
 
     // Its Lua action runs against that list, and changes state other
     // commands of the extension see.
-    const ga = h.act(reg.gen, 1, .{ .row_action = .{
+    const action_gen = host.act(registry.gen, 1, .{ .row_action = .{
         .from_root_search = false,
         .list_gen = fruits.gen,
         .row_index = 1,
@@ -2497,12 +1947,12 @@ test "extensions load, list, search and run actions" {
     } });
     const done = try probe.take("act");
     defer done.destroy(testing.allocator);
-    try testing.expectEqual(ga, done.gen);
+    try testing.expectEqual(action_gen, done.gen);
     try testing.expect(done.err == null);
     try testing.expectEqual(Outcome.close, done.outcome);
     // The action took its row's actions away: pressing it again is an
     // error, not a read of whatever `row.actions` is now.
-    _ = h.act(reg.gen, 1, .{ .row_action = .{
+    _ = host.act(registry.gen, 1, .{ .row_action = .{
         .from_root_search = false,
         .list_gen = fruits.gen,
         .row_index = 1,
@@ -2511,54 +1961,54 @@ test "extensions load, list, search and run actions" {
     const again = try probe.take("act");
     defer again.destroy(testing.allocator);
     try testing.expect(std.mem.find(u8, again.err.?, "no actions") != null);
-    _ = h.list(reg.gen, 3, "");
-    const eaten = try probe.take("res");
+    _ = host.list(registry.gen, 3, "");
+    const eaten = try probe.take("list");
     defer eaten.destroy(testing.allocator);
     try testing.expectEqualStrings("Banana", eaten.items[0].title);
 
     // A search command gets the query, and lumen.exec runs programs.
-    _ = h.list(reg.gen, 2, "it's \"quoted\"");
-    const echo = try probe.take("res");
+    _ = host.list(registry.gen, 2, "it's \"quoted\"");
+    const echo = try probe.take("list");
     defer echo.destroy(testing.allocator);
     try testing.expect(echo.err == null);
     try testing.expectEqualStrings("you typed it's \"quoted\"", echo.items[0].title);
 
     // A run command's return value.
-    _ = h.act(reg.gen, 0, .command_run);
+    _ = host.act(registry.gen, 0, .command_run);
     const hello = try probe.take("act");
     defer hello.destroy(testing.allocator);
     try testing.expectEqual(Outcome.stay, hello.outcome);
 
     // Root search: rows from providers, their Lua actions run there.
-    const gr = h.root(reg.gen, "21");
+    const root_gen = host.root(registry.gen, "21");
     const r21 = try probe.take("root");
     defer r21.destroy(testing.allocator);
-    try testing.expectEqual(gr, r21.gen);
+    try testing.expectEqual(root_gen, r21.gen);
     try testing.expectEqual(@as(usize, 1), r21.sections.len);
     try testing.expectEqual(@as(u16, 4), r21.sections[0].command);
     const doubled = r21.sections[0].items[0];
     try testing.expectEqualStrings("42", doubled.title);
     try testing.expect(doubled.action.ext_item.root);
-    _ = h.act(reg.gen, 4, .{ .row_action = .{
+    _ = host.act(registry.gen, 4, .{ .row_action = .{
         .from_root_search = true,
         .list_gen = doubled.action.ext_item.gen,
         .row_index = 0,
         .action_index = 0,
     } });
     (try probe.take("act")).destroy(testing.allocator);
-    _ = h.list(reg.gen, 3, "");
-    const noted = try probe.take("res");
+    _ = host.list(registry.gen, 3, "");
+    const noted = try probe.take("list");
     defer noted.destroy(testing.allocator);
     try testing.expectEqualStrings("42", noted.items[0].title);
-    _ = h.root(reg.gen, "not a number");
+    _ = host.root(registry.gen, "not a number");
     const none = try probe.take("root");
     defer none.destroy(testing.allocator);
     try testing.expectEqual(@as(usize, 0), none.sections.len);
 
     // An action against a list that has been replaced is refused.
-    _ = h.list(reg.gen, 1, "");
-    (try probe.take("res")).destroy(testing.allocator);
-    _ = h.act(reg.gen, 1, .{ .row_action = .{
+    _ = host.list(registry.gen, 1, "");
+    (try probe.take("list")).destroy(testing.allocator);
+    _ = host.act(registry.gen, 1, .{ .row_action = .{
         .from_root_search = false,
         .list_gen = fruits.gen,
         .row_index = 1,
@@ -2569,10 +2019,10 @@ test "extensions load, list, search and run actions" {
     try testing.expect(std.mem.find(u8, stale.err.?, "changed") != null);
 
     // After a reload, requests against the old registry are refused.
-    h.reload();
-    try probe.wait("reg");
-    _ = h.list(reg.gen, 1, "");
-    const old = try probe.take("res");
+    host.reload();
+    try probe.wait("registry");
+    _ = host.list(registry.gen, 1, "");
+    const old = try probe.take("list");
     defer old.destroy(testing.allocator);
     try testing.expectEqualStrings("Extensions were reloaded", old.err.?);
 }
@@ -2598,15 +2048,15 @@ test "errors in extensions come back as messages" {
 
     var probe: Probe = .{};
     defer probe.deinit();
-    const h = try testHost(&probe, dir);
-    defer h.shutdown();
-    h.reload();
-    try probe.wait("reg");
-    const reg = probe.reg.?;
-    try testing.expectEqual(@as(usize, 4), reg.commands.len);
-    try testing.expectEqual(@as(usize, 5), reg.problems.len);
-    try testing.expect(!reg.has_layout);
-    for (reg.problems) |p| {
+    const host = try testHost(&probe, dir);
+    defer host.shutdown();
+    host.reload();
+    try probe.wait("registry");
+    const registry = probe.registry.?;
+    try testing.expectEqual(@as(usize, 4), registry.commands.len);
+    try testing.expectEqual(@as(usize, 5), registry.problems.len);
+    try testing.expect(!registry.has_layout);
+    for (registry.problems) |p| {
         const want: []const u8 = if (std.mem.eql(
             u8,
             p.ext,
@@ -2630,17 +2080,17 @@ test "errors in extensions come back as messages" {
         }
     }
 
-    _ = h.list(reg.gen, 0, "");
-    const boom = try probe.take("res");
+    _ = host.list(registry.gen, 0, "");
+    const boom = try probe.take("list");
     defer boom.destroy(testing.allocator);
     try testing.expect(std.mem.find(u8, boom.err.?, "kaboom") != null);
 
-    _ = h.list(reg.gen, 2, "");
-    const badrow = try probe.take("res");
+    _ = host.list(registry.gen, 2, "");
+    const badrow = try probe.take("list");
     defer badrow.destroy(testing.allocator);
     try testing.expect(std.mem.find(u8, badrow.err.?, "items[1].title is missing") != null);
 
-    _ = h.act(reg.gen, 3, .command_run);
+    _ = host.act(registry.gen, 3, .command_run);
     const badret = try probe.take("act");
     defer badret.destroy(testing.allocator);
     try testing.expect(std.mem.find(u8, badret.err.?, "must return") != null);
@@ -2675,41 +2125,41 @@ test "preferences read Settings' file over their defaults; storage persists" {
 
     var probe: Probe = .{};
     defer probe.deinit();
-    const h = try testHost(&probe, dir);
-    defer h.shutdown();
-    h.reload();
-    try probe.wait("reg");
-    const reg = probe.reg.?;
-    try testing.expectEqual(@as(usize, 3), reg.prefs.len);
-    try testing.expectEqual(PrefKind.toggle, reg.prefs[1].kind);
-    try testing.expectEqualStrings("false", reg.prefs[1].default);
-    try testing.expectEqualStrings("s", reg.prefs[2].default);
-    try testing.expectEqualStrings("Medium", reg.prefs[2].choices[1].label);
+    const host = try testHost(&probe, dir);
+    defer host.shutdown();
+    host.reload();
+    try probe.wait("registry");
+    const registry = probe.registry.?;
+    try testing.expectEqual(@as(usize, 3), registry.prefs.len);
+    try testing.expectEqual(PrefKind.toggle, registry.prefs[1].kind);
+    try testing.expectEqualStrings("false", registry.prefs[1].default);
+    try testing.expectEqualStrings("s", registry.prefs[2].default);
+    try testing.expectEqualStrings("Medium", registry.prefs[2].choices[1].label);
     try testing.expect(std.mem.endsWith(
         u8,
-        reg.prefs[0].file,
+        registry.prefs[0].file,
         "data/extensions/kv/preferences.json",
     ));
 
-    _ = h.list(reg.gen, 0, "");
-    const before = try probe.take("res");
+    _ = host.list(registry.gen, 0, "");
+    const before = try probe.take("list");
     defer before.destroy(testing.allocator);
     const want = [_][]const u8{ "nobody", "true", "s", "nil", "false" };
     try testing.expect(before.err == null);
     for (want, before.items) |w, it| try testing.expectEqualStrings(w, it.title);
 
-    _ = h.act(reg.gen, 1, .command_run);
+    _ = host.act(registry.gen, 1, .command_run);
     (try probe.take("act")).destroy(testing.allocator);
-    _ = h.act(reg.gen, 1, .command_run);
+    _ = host.act(registry.gen, 1, .command_run);
     (try probe.take("act")).destroy(testing.allocator);
     // Storage outlives a reload (a new Lua state reads the file).
-    probe.reg = null;
-    defer reg.destroy(testing.allocator);
-    h.reload();
-    try probe.wait("reg");
-    const reg2 = probe.reg.?;
-    _ = h.list(reg2.gen, 0, "");
-    const after = try probe.take("res");
+    probe.registry = null;
+    defer registry.destroy(testing.allocator);
+    host.reload();
+    try probe.wait("registry");
+    const reg2 = probe.registry.?;
+    _ = host.list(reg2.gen, 0, "");
+    const after = try probe.take("list");
     defer after.destroy(testing.allocator);
     try testing.expectEqualStrings("2", after.items[3].title);
 }
@@ -2738,23 +2188,25 @@ test "storage never writes over what it cannot read, and reads back what it wrot
 
     var probe: Probe = .{};
     defer probe.deinit();
-    const h = try testHost(&probe, dir);
-    defer h.shutdown();
-    h.reload();
-    try probe.wait("reg");
-    const reg = probe.reg.?;
-    try testing.expectEqual(@as(usize, 2), reg.problems.len);
-    for (reg.problems) |p| try testing.expect(std.mem.find(u8, p.message, "are taken") != null);
+    const host = try testHost(&probe, dir);
+    defer host.shutdown();
+    host.reload();
+    try probe.wait("registry");
+    const registry = probe.registry.?;
+    try testing.expectEqual(@as(usize, 2), registry.problems.len);
+    for (registry.problems) |registry_problem| {
+        try testing.expect(std.mem.find(u8, registry_problem.message, "are taken") != null);
+    }
 
-    _ = h.list(reg.gen, 0, "");
-    const broken = try probe.take("res");
+    _ = host.list(registry.gen, 0, "");
+    const broken = try probe.take("list");
     defer broken.destroy(testing.allocator);
     try testing.expect(broken.err == null);
     const want = [_][]const u8{ "false", "not overwritten", "{\"a\": 1, oops", "nil" };
     for (want, broken.items[0..want.len]) |w, it| try testing.expectEqualStrings(w, it.title);
 
-    _ = h.list(reg.gen, 1, "");
-    const bytes = try probe.take("res");
+    _ = host.list(registry.gen, 1, "");
+    const bytes = try probe.take("list");
     defer bytes.destroy(testing.allocator);
     try testing.expect(bytes.err == null);
     try testing.expectEqualStrings("true", bytes.items[0].title);
@@ -2796,30 +2248,30 @@ test "rows are kept to a size, and lumen.exec's strings outlive its options" {
 
     var probe: Probe = .{};
     defer probe.deinit();
-    const h = try testHost(&probe, dir);
-    defer h.shutdown();
-    h.reload();
-    try probe.wait("reg");
-    const reg = probe.reg.?;
+    const host = try testHost(&probe, dir);
+    defer host.shutdown();
+    host.reload();
+    try probe.wait("registry");
+    const registry = probe.registry.?;
 
     // One string 1000 rows copy: 5 GB outside the state's memory cap.
-    _ = h.list(reg.gen, 0, "");
-    const big = try probe.take("res");
+    _ = host.list(registry.gen, 0, "");
+    const big = try probe.take("list");
     defer big.destroy(testing.allocator);
     try testing.expectEqualStrings(rows_too_big, big.err.?);
 
-    _ = h.list(reg.gen, 1, "");
-    const long = try probe.take("res");
+    _ = host.list(registry.gen, 1, "");
+    const long = try probe.take("list");
     defer long.destroy(testing.allocator);
     try testing.expect(long.err == null);
     const row = long.items[0];
     // Cut between characters: 512 "é" of two bytes each.
-    try testing.expectEqual(@as(usize, line_bytes_max), row.title.len);
-    try testing.expectEqual(@as(usize, detail_bytes_max), row.detail.len);
-    try testing.expectEqual(@as(usize, line_bytes_max), row.meta[0].value.len);
+    try testing.expectEqual(@as(usize, rows_mod.line_bytes_max), row.title.len);
+    try testing.expectEqual(@as(usize, rows_mod.detail_bytes_max), row.detail.len);
+    try testing.expectEqual(@as(usize, rows_mod.line_bytes_max), row.meta[0].value.len);
 
-    _ = h.list(reg.gen, 2, "");
-    const ran = try probe.take("res");
+    _ = host.list(registry.gen, 2, "");
+    const ran = try probe.take("list");
     defer ran.destroy(testing.allocator);
     try testing.expect(ran.err == null);
     try testing.expectEqualStrings("true", ran.items[0].title);
