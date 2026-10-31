@@ -12,6 +12,7 @@
 const std = @import("std");
 const paths = @import("paths.zig");
 const Io = std.Io;
+const assert = std.debug.assert;
 const store_mod = @import("store.zig");
 const Store = store_mod.Store;
 const scan = @import("scan.zig");
@@ -496,7 +497,13 @@ test "live: new, nested and deleted files show up without a rescan" {
     try touch(abs, "first_note.md");
 
     var idx_buf: paths.Buffer = undefined;
-    const idx = try std.mem.print(&idx_buf, "{s}/../lumen-test-{s}.idx", .{ abs, tmp.sub_path });
+    const idx = try std.mem.printSentinel(&idx_buf, "{s}/../lumen-test-{s}.idx", .{ abs, tmp.sub_path }, 0);
+    // Deferred before the shutdown, so it runs after it: the shutdown saves
+    // the index again.
+    defer {
+        const unlinked = std.os.linux.errno(std.os.linux.unlink(idx));
+        assert(unlinked == .SUCCESS or unlinked == .NOENT);
+    }
     const s = try Service.start(gpa, testing.io, abs, idx);
     defer s.shutdown();
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -524,9 +531,6 @@ test "live: new, nested and deleted files show up without a rescan" {
     try testing.expect(try waitFor(s, arena, "first_note", false));
     _ = std.os.linux.unlink(try std.mem.printSentinel(&fbuf, "{s}/inner_walrus.txt", .{sub}, 0));
     try testing.expect(try waitFor(s, arena, "inner_walrus", false));
-
-    var cbuf: paths.Buffer = undefined;
-    _ = std.os.linux.unlink(try std.mem.printSentinel(&cbuf, "{s}", .{idx}, 0));
 }
 
 const tmpAbs = sys.tmpDirAbs;
