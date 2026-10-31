@@ -30,14 +30,23 @@ pub const Handler = *const fn (
 /// GLib callbacks; main thread only.
 const Server = struct {
     listen_fd: linux.fd_t = -1,
-    /// The socket's watch; while accepting is paused, the timer that
-    /// resumes it (or 0 until a connection ends).
-    listen_source: c_uint = 0,
+    accepting: Accepting = .paused,
     path_buffer: [256]u8 = undefined,
     path: [:0]const u8 = "",
     handler: Handler = undefined,
     gpa: std.mem.Allocator = undefined,
     connections_open: usize = 0,
+
+    /// What brings the listening socket's watch back.
+    const Accepting = union(enum) {
+        /// Not watched: before listening starts, after it stops, or at
+        /// `connections_max` until a connection ends (`Connection.close`).
+        paused,
+        /// Watched for connections: the GLib source.
+        watching: c_uint,
+        /// Out of descriptors: the GLib timer that watches it again.
+        backing_off: c_uint,
+    };
 
     fn listening(listener: *const Server) bool {
         return listener.listen_fd >= 0;
@@ -132,8 +141,11 @@ fn listenIn(
 /// on their own. Safe to call when not listening.
 pub fn stop() void {
     if (!server.listening()) return;
-    if (server.listen_source != 0) _ = c.g_source_remove(server.listen_source);
-    server.listen_source = 0;
+    switch (server.accepting) {
+        .paused => {},
+        .watching, .backing_off => |source| _ = c.g_source_remove(source),
+    }
+    server.accepting = .paused;
     _ = linux.close(server.listen_fd);
     server.listen_fd = -1;
     _ = linux.unlink(server.path.ptr);
@@ -186,20 +198,22 @@ const backoff_ms = 500;
 
 fn watchSocket() void {
     assert(server.listening());
-    assert(server.listen_source == 0);
-    server.listen_source = c.g_unix_fd_add(server.listen_fd, c.G_IO_IN, &acceptCallback, null);
+    assert(server.accepting == .paused);
+    const source = c.g_unix_fd_add(server.listen_fd, c.G_IO_IN, &acceptCallback, null);
+    server.accepting = .{ .watching = source };
 }
 
 fn acceptCallback(fd: c_int, _: c_uint, _: ?*anyopaque) callconv(.c) c.gboolean {
+    assert(server.accepting == .watching);
     for (0..accepts_max) |_| {
-        if (server.connections_open == connections_max) return pause(0);
+        if (server.connections_open == connections_max) return pauseUntilRoom();
         const accepted = linux.accept4(fd, null, null, linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK);
         if (failed(accepted)) |errno| switch (errno) {
             // The connection stays queued and the socket readable: watching
             // it now would wake the main loop again at once, forever.
             .MFILE, .NFILE, .NOBUFS, .NOMEM => {
                 log.warn("cannot accept a connection: {t}", .{errno});
-                return pause(backoff_ms);
+                return backOff();
             },
             else => break,
         };
@@ -208,19 +222,24 @@ fn acceptCallback(fd: c_int, _: c_uint, _: ?*anyopaque) callconv(.c) c.gboolean 
     return 1;
 }
 
-/// Stops watching the socket: for `duration_ms`, or until a connection ends
-/// (0). Returns what removes the socket's current watch.
-fn pause(duration_ms: c_uint) c.gboolean {
-    server.listen_source = if (duration_ms == 0)
-        0
-    else
-        c.g_timeout_add(duration_ms, &pauseCallback, null);
+/// Stops watching the socket until a connection ends. Returns what removes
+/// the socket's current watch.
+fn pauseUntilRoom() c.gboolean {
+    server.accepting = .paused;
     return 0;
 }
 
-fn pauseCallback(_: ?*anyopaque) callconv(.c) c.gboolean {
+/// Stops watching the socket for `backoff_ms`. Returns what removes the
+/// socket's current watch.
+fn backOff() c.gboolean {
+    server.accepting = .{ .backing_off = c.g_timeout_add(backoff_ms, &backOffCallback, null) };
+    return 0;
+}
+
+fn backOffCallback(_: ?*anyopaque) callconv(.c) c.gboolean {
+    assert(server.accepting == .backing_off);
     // The source ends with this call: watchSocket must see it gone.
-    server.listen_source = 0;
+    server.accepting = .paused;
     watchSocket();
     return 0;
 }
@@ -265,7 +284,7 @@ const Connection = struct {
         assert(server.connections_open > 0);
         server.connections_open -= 1;
         // Paused at connections_max: there is room again.
-        if (server.listening() and server.listen_source == 0) watchSocket();
+        if (server.listening() and server.accepting == .paused) watchSocket();
     }
 
     fn readableCallback(_: c_int, _: c_uint, data: ?*anyopaque) callconv(.c) c.gboolean {
