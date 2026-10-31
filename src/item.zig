@@ -304,25 +304,7 @@ pub fn actionsFor(item: *const Item) []const Entry {
             .{ .label = "Copy File", .keys = "Ctrl Shift F", .op = .copy_file },
             .{ .label = "Move to Trash", .keys = "Ctrl X", .op = .trash },
         },
-        .setting => |setting| switch (setting) {
-            .toggle => &.{.{ .label = "Toggle", .keys = "↵", .op = .run }},
-            .choose, .kind, .go => &.{.{ .label = "Change", .keys = "↵", .op = .run }},
-            .pick => &.{.{ .label = "Select", .keys = "↵", .op = .run }},
-            .theme => &.{.{ .label = "Use Theme", .keys = "↵", .op = .run }},
-            .style => &.{.{ .label = "Use Style", .keys = "↵", .op = .run }},
-            .open_with => &.{
-                .{ .label = "Open", .keys = "↵", .op = .run },
-                .{ .label = "Open and Always Use", .keys = "Ctrl ↵", .op = .always_use },
-            },
-            .open_file => &.{.{ .label = "Open Settings File", .keys = "↵", .op = .run }},
-            .reset => &.{.{ .label = "Reset All Settings", .keys = "↵", .op = .run }},
-            .ext_prefs, .pref, .field => &.{.{ .label = "Change", .keys = "↵", .op = .run }},
-            .submit_form => &.{.{ .label = "Submit", .keys = "↵", .op = .run }},
-            .ext_open => &.{.{ .label = "Open Folder", .keys = "↵", .op = .run }},
-            .ext_update => &.{.{ .label = "Update", .keys = "↵", .op = .run }},
-            .ext_uninstall => &.{.{ .label = "Uninstall", .keys = "↵", .op = .run }},
-            .save_input => &.{.{ .label = "Save", .keys = "↵", .op = .run }},
-        },
+        .setting => |setting| settingActions(setting),
         .calc => &.{
             .{ .label = "Copy Answer", .keys = "↵", .op = .calc_copy },
             .{ .label = "Paste Answer", .keys = "Ctrl ↵", .op = .calc_paste },
@@ -347,4 +329,28 @@ pub fn actionsFor(item: *const Item) []const Entry {
     // at least one action: Host refuses `actions = {}`.
     assert(entries.len >= 1);
     return entries;
+}
+
+/// The actions of a row in the Settings views: most run the row, Open With
+/// can also remember the app.
+fn settingActions(setting: Setting) []const Entry {
+    return switch (setting) {
+        .toggle => &.{.{ .label = "Toggle", .keys = "↵", .op = .run }},
+        .choose, .kind, .go => &.{.{ .label = "Change", .keys = "↵", .op = .run }},
+        .pick => &.{.{ .label = "Select", .keys = "↵", .op = .run }},
+        .theme => &.{.{ .label = "Use Theme", .keys = "↵", .op = .run }},
+        .style => &.{.{ .label = "Use Style", .keys = "↵", .op = .run }},
+        .open_with => &.{
+            .{ .label = "Open", .keys = "↵", .op = .run },
+            .{ .label = "Open and Always Use", .keys = "Ctrl ↵", .op = .always_use },
+        },
+        .open_file => &.{.{ .label = "Open Settings File", .keys = "↵", .op = .run }},
+        .reset => &.{.{ .label = "Reset All Settings", .keys = "↵", .op = .run }},
+        .ext_prefs, .pref, .field => &.{.{ .label = "Change", .keys = "↵", .op = .run }},
+        .submit_form => &.{.{ .label = "Submit", .keys = "↵", .op = .run }},
+        .ext_open => &.{.{ .label = "Open Folder", .keys = "↵", .op = .run }},
+        .ext_update => &.{.{ .label = "Update", .keys = "↵", .op = .run }},
+        .ext_uninstall => &.{.{ .label = "Uninstall", .keys = "↵", .op = .run }},
+        .save_input => &.{.{ .label = "Save", .keys = "↵", .op = .run }},
+    };
 }
