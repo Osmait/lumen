@@ -44,6 +44,8 @@ const Server = struct {
     }
 };
 
+/// The daemon listens on one socket, so there is one server. GLib's watch
+/// callbacks reach it here; main thread only.
 var server: Server = .{};
 
 pub const ListenError = error{
@@ -63,7 +65,7 @@ pub const ListenError = error{
 /// `lumen` still works, through lumen-gtk, only slower: a failure is
 /// logged here, and the daemon runs on.
 pub fn start(allocator: std.mem.Allocator, app_id: []const u8, handler: Handler) void {
-    const runtime_dir = if (c.g_getenv("XDG_RUNTIME_DIR")) |dir| std.mem.span(dir) else "";
+    const runtime_dir = if (c.g_getenv(ipc.env.runtime_dir)) |dir| std.mem.span(dir) else "";
     listenIn(allocator, runtime_dir, app_id, handler) catch |err| {
         log.warn("no socket ({t}): `lumen` goes through lumen-gtk, slower", .{err});
     };
@@ -160,6 +162,13 @@ fn isPrivateDir(dir: [:0]const u8) bool {
 /// Connections taken per turn of the main loop: the rest wait for the
 /// next, so a flood of them cannot hold the window.
 const accepts_max = 16;
+/// How much more room a connection's buffer gets each time it fills, up to
+/// ipc.request_bytes_max.
+const read_chunk_bytes = 64 << 10;
+
+comptime {
+    std.debug.assert(read_chunk_bytes <= ipc.request_bytes_max);
+}
 /// Connections open at once; past it the socket is left alone until one
 /// ends (each may hold a request up to ipc.request_bytes_max). Also the
 /// listen backlog.
@@ -280,7 +289,7 @@ const Conn = struct {
     /// or when the buffer is full (the client sends no more than that).
     fn read(self: *Conn) enum { more, done, failed } {
         while (self.buf.items.len < ipc.request_bytes_max) {
-            self.buf.ensureUnusedCapacity(server.gpa, 64 * 1024) catch return .failed;
+            self.buf.ensureUnusedCapacity(server.gpa, read_chunk_bytes) catch return .failed;
             const spare = self.buf.unusedCapacitySlice();
             const room = @min(spare.len, ipc.request_bytes_max - self.buf.items.len);
             const bytes_read = linux.read(self.fd, spare.ptr, room);

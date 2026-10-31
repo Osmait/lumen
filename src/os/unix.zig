@@ -4,6 +4,7 @@
 //! hold a per-call timeout forever).
 
 const std = @import("std");
+const assert = std.debug.assert;
 const linux = std.os.linux;
 const os = @import("root.zig");
 
@@ -114,6 +115,7 @@ pub fn readAll(fd: linux.fd_t, buf: []u8, deadline_ns: u64) ReadError!usize {
         if (chunk_len == 0) break;
         bytes_read += chunk_len;
     }
+    assert(bytes_read <= buf.len);
     return bytes_read;
 }
 

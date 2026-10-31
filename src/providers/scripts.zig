@@ -6,6 +6,10 @@ const script_meta = @import("core").script_meta;
 const os = @import("os");
 const Item = @import("../item.zig").Item;
 
+/// How much of a script is read for its metadata: script_meta reads at most
+/// 40 lines of header comments, which fit in it.
+const script_header_bytes_max = 4096;
+
 /// ~/.config/lumen/scripts, in `arena`; null only when out of memory.
 pub fn dir(arena: std.mem.Allocator) ?[:0]const u8 {
     const config = std.mem.span(c.g_get_user_config_dir());
@@ -13,12 +17,16 @@ pub fn dir(arena: std.mem.Allocator) ?[:0]const u8 {
 }
 
 /// The last scan's scripts, and what the folder looked like then: the root
-/// view is built on every show, and each scan read every script. Main
-/// thread only.
-var cache_arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
-var cache_items: []Item = &.{};
-/// Null until the first scan.
-var cache_stamp: ?FolderStamp = null;
+/// view is built on every show, and each scan read every script.
+const Cache = struct {
+    arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator),
+    items: []Item = &.{},
+    /// Null until the first scan.
+    stamp: ?FolderStamp = null,
+};
+
+/// The process's one cache. Main thread only, like `load`.
+var cache: Cache = .{};
 
 const log = std.log.scoped(.scripts);
 
@@ -27,14 +35,14 @@ const log = std.log.scoped(.scripts);
 pub fn load(arena: std.mem.Allocator) []Item {
     const path = dir(arena) orelse return &.{};
     const folder_stamp = stamp(path);
-    const cached = if (cache_stamp) |last| std.meta.eql(last, folder_stamp) else false;
+    const cached = if (cache.stamp) |last| std.meta.eql(last, folder_stamp) else false;
     if (!cached) {
-        _ = cache_arena.reset(.retain_capacity);
-        cache_items = scan(cache_arena.allocator(), path);
-        cache_stamp = folder_stamp;
+        _ = cache.arena.reset(.retain_capacity);
+        cache.items = scan(cache.arena.allocator(), path);
+        cache.stamp = folder_stamp;
     }
-    const items = arena.alloc(Item, cache_items.len) catch return &.{};
-    for (cache_items, items, 0..) |cached_item, *item, copied| {
+    const items = arena.alloc(Item, cache.items.len) catch return &.{};
+    for (cache.items, items, 0..) |cached_item, *item, copied| {
         item.* = copy(arena, cached_item) catch {
             log.warn("out of memory: {d} of {d} scripts listed", .{ copied, items.len });
             return items[0..copied];
@@ -73,7 +81,7 @@ fn stamp(path: [:0]const u8) FolderStamp {
     const dir_handle = c.g_dir_open(path.ptr, 0, null) orelse return .missing;
     defer c.g_dir_close(dir_handle);
     var hasher: std.hash.Wyhash = .init(0);
-    var path_buffer: [4096]u8 = undefined;
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     while (c.g_dir_read_name(dir_handle)) |name_c| {
         const name = std.mem.span(name_c);
         hasher.update(name);
@@ -121,9 +129,8 @@ fn itemOf(
     name: []const u8,
 ) std.mem.Allocator.Error!?Item {
     const file_path = try arena.printSentinel("{s}/{s}", .{ path, name }, 0);
-    // Only the first 4 KB is read: script metadata lives in the header
-    // comments.
-    var head_buf: [4096]u8 = undefined;
+    // Only the header is read: script metadata lives in its comments.
+    var head_buf: [script_header_bytes_max]u8 = undefined;
     const head = os.readHead(file_path.ptr, &head_buf);
     const meta = script_meta.parse(head) orelse return null;
     const subtitle = if (meta.package_name.len > 0) meta.package_name else "Script Command";
@@ -152,7 +159,7 @@ fn looksLikeEmoji(icon: []const u8) bool {
 test "a missing folder and an empty one stamp differently, and edits show" {
     var test_dir = try os.TestDir.init();
     defer test_dir.deinit();
-    var path_buffer: [4096]u8 = undefined;
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
 
     const missing = try test_dir.path(&path_buffer, "scripts");
     try std.testing.expectEqual(FolderStamp.missing, stamp(missing));

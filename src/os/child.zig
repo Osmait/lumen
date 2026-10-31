@@ -33,6 +33,9 @@ pub const Options = struct {
     cancel: ?*const std.atomic.Value(bool) = null,
 };
 
+/// What one read of a program's output takes: a pipe holds 64 KB.
+const read_chunk_bytes = 64 << 10;
+
 /// Owned by the caller: free with `deinit`.
 pub const Result = struct {
     stdout: []u8,
@@ -238,7 +241,7 @@ const Pump = struct {
     fn drain(pump: *Pump, fd: i32) Error!bool {
         const is_out = fd == pump.child.stdout.?.handle;
         const list = if (is_out) &pump.out else &pump.err;
-        var buf: [64 * 1024]u8 = undefined;
+        var buf: [read_chunk_bytes]u8 = undefined;
         const rc = linux.read(fd, &buf, buf.len);
         switch (linux.errno(rc)) {
             .SUCCESS => {},

@@ -21,8 +21,12 @@ pub const Error = error{ DbOpen, DbExec, DbPrepare, DbBind, DbStep };
 /// before it fails with SQLITE_BUSY.
 const busy_timeout_ms = 2000;
 
+/// SQLite's name for a database that lives in memory only (the tests').
+/// It has no file to make private.
+pub const in_memory = ":memory:";
+
 pub fn open(path: [:0]const u8) Error!Db {
-    if (!std.mem.eql(u8, path, ":memory:")) makePrivate(path);
+    if (!std.mem.eql(u8, path, in_memory)) makePrivate(path);
     var handle: ?*c.sqlite3 = null;
     if (c.sqlite3_open(path.ptr, &handle) != c.SQLITE_OK) {
         // SQLite gives a handle even when opening fails, but not when it
@@ -78,7 +82,7 @@ fn makePrivate(path: [:0]const u8) void {
         _ = linux.close(fd);
     }
     for ([_][]const u8{ "-wal", "-shm" }) |suffix| {
-        var buf: [4096]u8 = undefined;
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const side = std.mem.printSentinel(&buf, "{s}{s}", .{ path, suffix }, 0) catch continue;
         _ = linux.chmod(side, 0o600);
     }
@@ -159,6 +163,8 @@ fn stepFailed(db: *Db, rc: c_int) Error {
 // ---------------------------------------------------------------- frecency
 
 pub fn recordUse(db: *Db, key: []const u8, now: i64) Error!void {
+    // An item without a key has no ranking; Ui.perform skips those.
+    assert(key.len > 0);
     try db.execArgs(
         \\INSERT INTO frecency (key, count, last_used) VALUES (?1, 1, ?2)
         \\ON CONFLICT(key) DO UPDATE SET count = count + 1, last_used = ?2
@@ -278,6 +284,8 @@ pub fn recentClips(
     defer _ = c.sqlite3_finalize(stmt);
     try db.bind(stmt, .{ limit, head_chars });
     while (try db.nextRow(stmt)) {
+        // SQLite's LIMIT holds: never more rows than asked for.
+        assert(list.items.len < limit);
         try list.append(arena, .{
             .id = c.sqlite3_column_int64(stmt, 0),
             .head = try arena.dupe(u8, columnText(stmt, 1)),
@@ -302,10 +310,13 @@ pub fn clipContent(
 }
 
 pub fn touchClip(db: *Db, id: i64, now: i64) Error!void {
+    // Ids come from `recentClips`: SQLite's rowids, which start at 1.
+    assert(id > 0);
     try db.execArgs("UPDATE clipboard SET last_copied = ?2 WHERE id = ?1", .{ id, now });
 }
 
 pub fn deleteClip(db: *Db, id: i64) Error!void {
+    assert(id > 0);
     try db.execArgs("DELETE FROM clipboard WHERE id = ?1", .{id});
 }
 
@@ -327,7 +338,7 @@ fn columnText(stmt: *c.sqlite3_stmt, column: c_int) []const u8 {
 }
 
 test "clipboard dedupes and orders by recency" {
-    var db = try Db.open(":memory:");
+    var db = try Db.open(Db.in_memory);
     defer db.close();
     try db.addClip("one", 1, Db.clip_entries_max);
     try db.addClip("two", 2, Db.clip_entries_max);
@@ -341,7 +352,7 @@ test "clipboard dedupes and orders by recency" {
 }
 
 test "copies within the same second keep their order" {
-    var db = try Db.open(":memory:");
+    var db = try Db.open(Db.in_memory);
     defer db.close();
     try db.addClip("first", 50, Db.clip_entries_max);
     try db.addClip("second", 50, Db.clip_entries_max);
@@ -354,7 +365,7 @@ test "copies within the same second keep their order" {
 }
 
 test "the history keeps as many entries as the setting says" {
-    var db = try Db.open(":memory:");
+    var db = try Db.open(Db.in_memory);
     defer db.close();
     for (0..8) |i| {
         var buf: [16]u8 = undefined;
@@ -369,7 +380,7 @@ test "the history keeps as many entries as the setting says" {
 }
 
 test "the list loads each entry's head, the entry is read whole by id" {
-    var db = try Db.open(":memory:");
+    var db = try Db.open(Db.in_memory);
     defer db.close();
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
@@ -390,7 +401,7 @@ test "the database and its -wal and -shm are owner-only" {
     const linux = std.os.linux;
     var dir: @import("os").TestDir = try .init();
     defer dir.deinit();
-    var buf: [4096]u8 = undefined;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     // Made world-readable, as earlier versions left it.
     try dir.write("lumen.db", "");
     _ = linux.chmod(try dir.path(&buf, "lumen.db"), 0o644);
@@ -407,7 +418,7 @@ test "the database and its -wal and -shm are owner-only" {
 }
 
 test "frecency accumulates" {
-    var db = try Db.open(":memory:");
+    var db = try Db.open(Db.in_memory);
     defer db.close();
     try db.recordUse("app:a", 100);
     try db.recordUse("app:a", 100);
@@ -420,7 +431,7 @@ test "frecency accumulates" {
 }
 
 test "frecency forgets what decayed to nothing, keeps the rest" {
-    var db = try Db.open(":memory:");
+    var db = try Db.open(Db.in_memory);
     defer db.close();
     const day = 86_400;
     const now: i64 = 1000 * day;
@@ -438,7 +449,7 @@ test "frecency forgets what decayed to nothing, keeps the rest" {
 }
 
 test "a failed write is an error, not silence" {
-    var db = try Db.open(":memory:");
+    var db = try Db.open(Db.in_memory);
     defer db.close();
     try db.exec(
         "CREATE TRIGGER no_delete BEFORE DELETE ON clipboard BEGIN SELECT RAISE(ABORT, 'locked'); END;",

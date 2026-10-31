@@ -24,13 +24,16 @@ pub const Monitor = struct {
     /// (checked where the numbers come in: Hyprland's reply).
     pub const pixels_max = 1 << 16;
     pub const position_max = 1 << 20;
+    /// Hyprland's own range for a monitor's scale.
+    pub const scale_min = 0.1;
+    pub const scale_max = 16;
 
     /// Whether the numbers are within what a real monitor reports. Checked
     /// where they come in (`hypr.findMonitor`) and asserted where they are
     /// used (`usable`).
     pub fn plausible(monitor: Monitor) bool {
         // Written so that a NaN scale fails too.
-        if (!(monitor.scale >= 0.1 and monitor.scale <= 16)) return false;
+        if (!(monitor.scale >= scale_min and monitor.scale <= scale_max)) return false;
         if (!inRange(monitor.width, 1, pixels_max)) return false;
         if (!inRange(monitor.height, 1, pixels_max)) return false;
         if (@abs(monitor.x) > position_max) return false;
@@ -80,6 +83,7 @@ pub const Layout = enum {
 /// Where a window of size `current` goes for `layout`, with `gap_px`
 /// pixels kept around it.
 pub fn place(layout: Layout, outer: Rect, current: Size, gap_px: i32) Rect {
+    assert(gap_px >= 0);
     const area: Rect = .{
         .x = outer.x + gap_px,
         .y = outer.y + gap_px,
@@ -89,7 +93,7 @@ pub fn place(layout: Layout, outer: Rect, current: Size, gap_px: i32) Rect {
     const half_w = @divTrunc(area.w - gap_px, 2);
     const half_h = @divTrunc(area.h - gap_px, 2);
     const third = @divTrunc(area.w - 2 * gap_px, 3);
-    return switch (layout) {
+    const placed: Rect = switch (layout) {
         .left_half => .{ .x = area.x, .y = area.y, .w = half_w, .h = area.h },
         .right_half => .{ .x = area.x + area.w - half_w, .y = area.y, .w = half_w, .h = area.h },
         .top_half => .{ .x = area.x, .y = area.y, .w = area.w, .h = half_h },
@@ -101,6 +105,18 @@ pub fn place(layout: Layout, outer: Rect, current: Size, gap_px: i32) Rect {
         .center_third => .{ .x = area.x + third + gap_px, .y = area.y, .w = third, .h = area.h },
         .last_third => .{ .x = area.x + area.w - third, .y = area.y, .w = third, .h = area.h },
     };
+    // On any area with room for the gaps, the window stays inside it.
+    if (third >= 0 and half_w >= 0 and half_h >= 0) assert(contains(area, placed));
+    return placed;
+}
+
+/// Whether `inner` lies within `outer`, edges included.
+fn contains(outer: Rect, inner: Rect) bool {
+    if (inner.x < outer.x) return false;
+    if (inner.y < outer.y) return false;
+    if (inner.x + inner.w > outer.x + outer.w) return false;
+    if (inner.y + inner.h > outer.y + outer.h) return false;
+    return true;
 }
 
 fn shrinkCentered(area: Rect, factor: f64) Rect {

@@ -37,12 +37,12 @@ pub fn main(init: std.process.Init.Minimal) void {
     }
     if (only_flag == .version) printVersion(init.environ);
     const getEnv = std.process.Environ.getPosix;
-    if (getEnv(init.environ, "XDG_RUNTIME_DIR")) |runtime_dir| {
-        const app_id = getEnv(init.environ, "LUMEN_APP_ID") orelse ipc.default_app_id;
+    if (getEnv(init.environ, ipc.env.runtime_dir)) |runtime_dir| {
+        const app_id = getEnv(init.environ, ipc.env.app_id) orelse ipc.default_app_id;
         if (only_flag == .clip_store) {
             // wl-clipboard says when a copy is a password manager's or a clear.
-            if (getEnv(init.environ, "CLIPBOARD_STATE")) |state| {
-                if (!std.mem.eql(u8, state, "data")) linux.exit_group(0);
+            if (getEnv(init.environ, ipc.env.clipboard_state)) |state| {
+                if (!ipc.keepsCopy(state)) linux.exit_group(0);
             }
             storeCopy(runtime_dir, app_id, argv, envp);
         }
@@ -121,8 +121,8 @@ fn passable(args: []const [*:0]const u8) bool {
 fn printVersion(environ: std.process.Environ) noreturn {
     _ = writeAll(1, "lumen " ++ version ++ "\n");
     const getEnv = std.process.Environ.getPosix;
-    const runtime_dir = getEnv(environ, "XDG_RUNTIME_DIR") orelse linux.exit_group(0);
-    const app_id = getEnv(environ, "LUMEN_APP_ID") orelse ipc.default_app_id;
+    const runtime_dir = getEnv(environ, ipc.env.runtime_dir) orelse linux.exit_group(0);
+    const app_id = getEnv(environ, ipc.env.app_id) orelse ipc.default_app_id;
     const request_head = encodeArgs(&.{"--version"}) orelse linux.exit_group(0);
     const answer = exchange(runtime_dir, app_id, request_head) orelse linux.exit_group(0);
     const theirs = std.mem.trim(u8, answer.stdout, " \n");
@@ -187,8 +187,8 @@ fn failedAnswer(message: []const u8) ipc.Answer {
 /// lumen-gtk beside this file, else on PATH.
 fn runFull(argv: []const [*:0]const u8, envp: [*:null]const ?[*:0]const u8) noreturn {
     const argv_z: [*:null]const ?[*:0]const u8 = @ptrCast(argv.ptr);
-    var self_path_buffer: [4096]u8 = undefined;
-    var candidate_buffer: [4096]u8 = undefined;
+    var self_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var candidate_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     // An execve that returns failed: the next place is tried.
     const self_path_len = linux.readlink("/proc/self/exe", &self_path_buffer, self_path_buffer.len);
     if (failed(self_path_len) == null and self_path_len < self_path_buffer.len) {
@@ -212,8 +212,11 @@ fn runFull(argv: []const [*:0]const u8, envp: [*:null]const ?[*:0]const u8) nore
         }
     }
     _ = writeAll(2, "lumen: cannot find lumen-gtk (it is installed beside lumen)\n");
-    linux.exit_group(127);
+    linux.exit_group(exit_command_not_found);
 }
+
+/// The shell's status for a program it cannot find.
+const exit_command_not_found = 127;
 
 test "what goes over the socket" {
     const ok = [_][*:0]const u8{ "--view", "clipboard", "--query", "" };

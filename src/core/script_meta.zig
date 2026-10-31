@@ -52,7 +52,7 @@ pub fn parse(source: []const u8) ?Meta {
             .icon => meta.icon = value,
             .packageName => meta.package_name = value,
             .description => meta.description = value,
-            .needsConfirmation => meta.needs_confirmation = std.mem.eql(u8, value, "true"),
+            .needsConfirmation => meta.needs_confirmation = parseFlag(value),
         }
     }
     if (meta.title.len == 0) return null;
@@ -67,12 +67,21 @@ fn stripPrefix(comment: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Modes as headers spell them: Raycast's camelCase, not the enum's names.
+const modes_by_name: std.StaticStringMap(Mode) = .initComptime(.{
+    .{ "silent", .silent },
+    .{ "compact", .compact },
+    .{ "fullOutput", .full_output },
+    .{ "inline", .@"inline" },
+});
+
 fn parseMode(value: []const u8) Mode {
-    if (std.mem.eql(u8, value, "silent")) return .silent;
-    if (std.mem.eql(u8, value, "compact")) return .compact;
-    if (std.mem.eql(u8, value, "fullOutput")) return .full_output;
-    if (std.mem.eql(u8, value, "inline")) return .@"inline";
-    return .unknown;
+    return modes_by_name.get(value) orelse .unknown;
+}
+
+/// A header flag is on only when written `true`, as Raycast reads it.
+fn parseFlag(value: []const u8) bool {
+    return std.mem.eql(u8, value, "true");
 }
 
 /// The text after a `#`, `//` or `--` comment marker; null for the shebang
