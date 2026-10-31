@@ -69,7 +69,9 @@ fn storeCopy(
 ) noreturn {
     const head = encodeArguments(argv[1..]) orelse runFull(argv, envp);
     const copy_buffer = request[head.len..];
-    const copy_bytes = unix.readAll(0, copy_buffer, unix.deadline_ns_none) catch linux.exit_group(1);
+    const copy_bytes = unix.readAll(0, copy_buffer, unix.deadline_ns_none) catch {
+        linux.exit_group(1);
+    };
     // A copy too large to keep is dropped here, as lumen-gtk would.
     if (copy_bytes == copy_buffer.len) linux.exit_group(0);
     const request_bytes = head.len + copy_bytes;

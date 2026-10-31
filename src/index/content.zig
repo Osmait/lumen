@@ -1909,7 +1909,8 @@ test "update: edited and deleted documents leave, new ones join, old ids keep th
         .{ .path = "1", .mtime = 1, .size = 1 },
         .{ .path = "2", .mtime = 1, .size = 1 },
     };
-    var index = try build(gpa, pool, &docs, .{ .read = TestDocs.readText, .context = &before }, null);
+    const reader: TextReader = .{ .read = TestDocs.readText, .context = &before };
+    var index = try build(gpa, pool, &docs, reader, null);
     defer index.deinit(gpa);
 
     // "1" edited, "2" deleted, "3" new. TestDocs reads a path's number as
@@ -2634,7 +2635,8 @@ test "search: the top matches equal reading every document and ranking them all"
     const pool = try Pool.create(gpa, testing.io, 3);
     defer pool.destroy();
     var dummy: u8 = 0;
-    var index = try build(gpa, pool, &docs, .{ .read = FileDocs.readText, .context = &dummy }, null);
+    const reader: TextReader = .{ .read = FileDocs.readText, .context = &dummy };
+    var index = try build(gpa, pool, &docs, reader, null);
     defer index.deinit(gpa);
 
     var out: std.ArrayList(Match) = .empty;
@@ -2707,7 +2709,8 @@ test "search: unaccented and capital queries find accented text" {
     const pool = try Pool.create(gpa, testing.io, 2);
     defer pool.destroy();
     var dummy: u8 = 0;
-    var index = try build(gpa, pool, &docs, .{ .read = FileDocs.readText, .context = &dummy }, null);
+    const reader: TextReader = .{ .read = FileDocs.readText, .context = &dummy };
+    var index = try build(gpa, pool, &docs, reader, null);
     defer index.deinit(gpa);
 
     var arena: std.heap.ArenaAllocator = .init(gpa);

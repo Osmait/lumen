@@ -20,6 +20,7 @@ const std = @import("std");
 const paths = @import("paths.zig");
 const linux = std.os.linux;
 const sys = @import("os");
+const file_kind = @import("core").file_kind;
 
 pub const Kind = enum { pdf, docx, xlsx, pptx, odt, ods, odp };
 
@@ -36,7 +37,7 @@ pub fn kindOf(path: []const u8) ?Kind {
     const base = std.Io.Dir.path.basename(path);
     if (std.mem.startsWith(u8, base, office_owner_prefix)) return null;
     var extension_buffer: [4]u8 = undefined;
-    const extension = @import("core").file_kind.lowerExtension(&extension_buffer, base) orelse return null;
+    const extension = file_kind.lowerExtension(&extension_buffer, base) orelse return null;
     return std.meta.stringToEnum(Kind, extension);
 }
 

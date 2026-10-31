@@ -1244,7 +1244,8 @@ test "content service: with the name index, checks without name changes only loo
     try fixture.root.write("a.txt", "first apricot\n");
     var names_path_buffer: paths.Buffer = undefined;
     const names_path = try fixture.cache.path(&names_path_buffer, "files.idx");
-    const names = try Service.start(testing.allocator, testing.io, fixture.root.absolute, names_path);
+    const root = fixture.root.absolute;
+    const names = try Service.start(testing.allocator, testing.io, root, names_path);
     defer names.shutdown();
     _ = try Service.waitNames(names, null);
     const service = try fixture.startWith(.{
