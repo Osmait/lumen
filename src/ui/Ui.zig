@@ -43,6 +43,7 @@ const ExtHost = @import("../ext/Host.zig");
 const ipc = @import("../ipc.zig");
 const layout_mod = @import("../layout.zig");
 const Inflight = @import("inflight.zig").Inflight;
+const ActionPanel = @import("ActionPanel.zig");
 const Kind = core.file_kind.Kind;
 
 const Ui = @This();
@@ -177,7 +178,7 @@ grid: *c.GtkFlowBox = undefined,
 grid_mode: bool = false,
 grid_columns: c_int = ExtHost.grid_columns_default,
 scroller: *c.GtkScrolledWindow = undefined,
-detail: DetailPane = .{},
+detail: detail_pane.DetailPane = .{},
 /// File index, started by main once the window exists.
 files: ?*index.Service = null,
 /// Content (full-text) index, started by main after `files`.
@@ -316,74 +317,6 @@ const Footer = struct {
         gtk.setVisible(footer.action, any);
         gtk.setVisible(footer.enter, any and !warn);
         gtk.setVisible(footer.separator, any);
-    }
-};
-
-/// The selected row's preview, picture and "Information" block.
-pub const DetailPane = struct {
-    box: *c.GtkBox = undefined,
-    text: *c.GtkLabel = undefined,
-    picture: *c.GtkPicture = undefined,
-    /// The "Information" block under the preview (hidden for extensions).
-    meta: *c.GtkBox = undefined,
-    /// One line per label and value pair; extensions show as many as they
-    /// give.
-    meta_lines: [item_mod.metadata_max]*c.GtkBox = undefined,
-    meta_keys: [item_mod.metadata_max]*c.GtkLabel = undefined,
-    meta_values: [item_mod.metadata_max]*c.GtkLabel = undefined,
-    /// The image the picture shows or is loading (see detail_pane.showImage).
-    image_path: [std.Io.Dir.max_path_bytes]u8 = undefined,
-    image_path_length: usize = 0,
-    image_mtime: i64 = 0,
-};
-
-/// The selected row's actions, floating over the results (Ctrl K).
-const ActionPanel = struct {
-    box: *c.GtkBox = undefined,
-    list: *c.GtkListBox = undefined,
-    open: bool = false,
-    /// The actions listed, empty while closed: they may point into an
-    /// answer that is freed when the rows are rebuilt.
-    entries: []const item_mod.Entry = &.{},
-    selected: usize = 0,
-
-    /// Lists `entries` and opens on the first.
-    fn show(panel: *ActionPanel, entries: []const item_mod.Entry) void {
-        // Every item has a primary action: the panel is never empty, and the
-        // keys that move in it count on that.
-        assert(entries.len > 0);
-        panel.entries = entries;
-        c.gtk_list_box_remove_all(panel.list);
-        for (entries) |entry| {
-            const row = gtk.listBoxRow();
-            const box = widgets.hbox(8);
-            const label_widget = widgets.label(entry.label, null);
-            gtk.setHexpand(label_widget, true);
-            gtk.append(box, label_widget);
-            if (entry.keys.len > 0) {
-                const keys_label = widgets.label(entry.keys, widgets.css_class.keys);
-                gtk.setValign(keys_label, c.GTK_ALIGN_CENTER);
-                gtk.append(box, keys_label);
-            }
-            c.gtk_list_box_row_set_child(row, gtk.widget(box));
-            c.gtk_list_box_append(panel.list, gtk.widget(row));
-        }
-        panel.open = true;
-        panel.select(0);
-        gtk.setVisible(panel.box, true);
-    }
-
-    pub fn close(panel: *ActionPanel) void {
-        panel.open = false;
-        panel.entries = &.{};
-        gtk.setVisible(panel.box, false);
-    }
-
-    pub fn select(panel: *ActionPanel, entry_index: usize) void {
-        assert(entry_index < panel.entries.len);
-        panel.selected = entry_index;
-        const row = c.gtk_list_box_get_row_at_index(panel.list, @intCast(entry_index));
-        c.gtk_list_box_select_row(panel.list, row);
     }
 };
 
@@ -621,7 +554,7 @@ pub fn build(self: *Ui) void {
     self.buildSearchBar(column);
     self.buildResults(column);
     self.buildFooter(column);
-    self.buildPanel(overlay);
+    self.panel.build(self, overlay);
     const keys = c.gtk_event_controller_key_new();
     c.gtk_event_controller_set_propagation_phase(keys, c.GTK_PHASE_CAPTURE);
     widgets.connect(keys, "key-pressed", &onKey, self);
@@ -781,21 +714,6 @@ fn buildFooter(self: *Ui, column: *c.GtkBox) void {
     gtk.append(self.footer.box, actions_key_label);
     gtk.setVisible(self.footer.box, false);
     gtk.append(column, self.footer.box);
-}
-
-/// The action panel, floating over the top right corner of the results.
-fn buildPanel(self: *Ui, overlay: *c.GtkOverlay) void {
-    self.panel.box = widgets.vbox(0);
-    gtk.addClass(self.panel.box, "actions");
-    gtk.setHalign(self.panel.box, c.GTK_ALIGN_END);
-    gtk.setValign(self.panel.box, c.GTK_ALIGN_START);
-    gtk.append(self.panel.box, widgets.label("Actions", "actions-title"));
-    self.panel.list = gtk.listBox();
-    gtk.setFocusable(self.panel.list, false);
-    widgets.connect(self.panel.list, "row-activated", &onPanelRowActivated, self);
-    gtk.append(self.panel.box, self.panel.list);
-    gtk.setVisible(self.panel.box, false);
-    c.gtk_overlay_add_overlay(overlay, gtk.widget(self.panel.box));
 }
 
 /// ~/.config/lumen/icons/<name>.svg|png replaces the icon <name> everywhere
@@ -1447,8 +1365,6 @@ fn layoutFor(self: *Ui, view: View) void {
         c.gtk_flow_box_set_min_children_per_line(self.grid, @intCast(self.grid_columns));
         c.gtk_flow_box_set_max_children_per_line(self.grid, @intCast(self.grid_columns));
     }
-    gtk.setVisible(self.detail.meta, view != .ext);
-    for (self.detail.meta_lines) |meta_line| gtk.setVisible(meta_line, true);
     const bar = self.layout.searchbar;
     const back_shows = view != .root and self.layout.show.back and bar.has(.back);
     gtk.setVisible(self.search_bar.back, back_shows);
@@ -1472,22 +1388,7 @@ fn layoutFor(self: *Ui, view: View) void {
         self.scroller,
         if (has_detail and detail_below) @divTrunc(list_height_max, 2) else list_height_max,
     );
-    const keys: [4][:0]const u8 = switch (view) {
-        .files => .{ "Kind", "Size", "Modified", "Where" },
-        .contents => .{ "Kind", "Matches", "Modified", "Where" },
-        else => .{ "Content type", "Characters", "Words", "Copied" },
-    };
-    for (self.detail.meta_keys, keys) |key_label, key| c.gtk_label_set_text(key_label, key);
-    // Code previews do not wrap, they clip long lines like an editor: a
-    // wrapping GtkLabel makes GTK lay its text out at several widths per frame
-    // (~30 ms measured with `lumen --stats`). Clipboard text is prose: wrap.
-    const wrap = view == .clipboard or view == .ext;
-    c.gtk_label_set_wrap(self.detail.text, @intFromBool(wrap));
-    c.gtk_label_set_ellipsize(
-        self.detail.text,
-        if (wrap) c.PANGO_ELLIPSIZE_NONE else c.PANGO_ELLIPSIZE_END,
-    );
-    gtk.setVisible(self.detail.picture, false);
+    detail_pane.prepareFor(&self.detail, view);
 }
 
 /// The search bar's text while empty, for `view` (`out` may hold it).
@@ -1626,8 +1527,8 @@ pub fn refresh(self: *Ui) void {
     // with it open; an extension row's actions live in that answer's
     // predecessor, which is freed once the rows are rebuilt, and Enter
     // would have run them on whatever row is selected then.
-    if (self.panel.open) self.panel.close();
-    assert(!self.panel.open);
+    if (self.panel.isOpen()) self.panel.close();
+    assert(!self.panel.isOpen());
     self.resetRows();
     self.confirm_key = "";
     c.gtk_flow_box_remove_all(self.grid);
@@ -2372,16 +2273,6 @@ fn onGridActivated(
     self.performEntry(item_mod.actionsFor(item)[0]);
 }
 
-fn onPanelRowActivated(
-    _: *c.GtkListBox,
-    row: *c.GtkListBoxRow,
-    data: ?*anyopaque,
-) callconv(.c) void {
-    const self: *Ui = @ptrCast(@alignCast(data));
-    const entry_index: usize = @intCast(c.gtk_list_box_row_get_index(row));
-    if (entry_index < self.panel.entries.len) self.performEntry(self.panel.entries[entry_index]);
-}
-
 fn onBackClicked(
     _: *c.GtkEventController,
     _: c_int,
@@ -2483,7 +2374,7 @@ pub fn dump(
     try self.dumpWindow(writer);
     try self.dumpRows(writer, arena);
     if (gtk.isVisible(self.detail.box)) try self.dumpDetail(writer);
-    if (self.panel.open) {
+    if (self.panel.isOpen()) {
         try writer.print("panel:\n", .{});
         for (self.panel.entries, 0..) |entry, i| try writer.print("  {s} {s} [{s}]\n", .{
             if (i == self.panel.selected) ">" else " ",

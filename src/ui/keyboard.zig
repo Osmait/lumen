@@ -9,9 +9,9 @@ const Ui = @import("Ui.zig");
 
 /// A key press, real or from `lumen --key`; true (1) when Lumen handled it.
 pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
-    const key: KeyPress = .decode(keyval, state, .{ .panel_open = ui.panel.open });
+    const key: KeyPress = .decode(keyval, state, .{ .panel_open = ui.panel.isOpen() });
 
-    if (ui.panel.open) {
+    if (ui.panel.isOpen()) {
         panelKey(ui, key);
         return 1;
     }
@@ -102,7 +102,7 @@ const page_rows = 8;
 
 /// Keys while the action panel is open: they all go to it.
 fn panelKey(ui: *Ui, key: KeyPress) void {
-    assert(ui.panel.open);
+    assert(ui.panel.isOpen());
     assert(ui.panel.entries.len > 0);
     assert(ui.panel.selected < ui.panel.entries.len);
     const closes = key.keyval == c.GDK_KEY_Escape or
