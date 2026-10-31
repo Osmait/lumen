@@ -255,7 +255,7 @@ fn commandLineCallback(
     var argc: c_int = 0;
     const argv = c.g_application_command_line_get_arguments(command_line, &argc);
     defer c.g_strfreev(argv);
-    var arguments: [ipc.args_max][:0]const u8 = undefined;
+    var arguments: [ipc.arguments_max][:0]const u8 = undefined;
     var arguments_count: usize = 0;
     // From 1: without the program's name.
     var argv_index: usize = 1;
