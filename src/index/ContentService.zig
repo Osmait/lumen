@@ -309,7 +309,7 @@ pub fn readText(
     const doc = std.mem.printSentinel(&pbuf, "{s}", .{path}, 0) catch return null;
     var tbuf: [4096]u8 = undefined;
     const p: [:0]const u8 = if (extracted) blk: {
-        const st = content_list.stat(doc, true) orelse return null;
+        const st = content_list.stat(doc, .document) orelse return null;
         break :blk service.textPath(&tbuf, .{
             .path = path,
             .mtime = mtime,
@@ -576,14 +576,10 @@ fn unchanged(index: *const content.Index, id: u32, doc: content.DocIn) bool {
 fn listAll(service: *ContentService, arena: std.mem.Allocator, names: ?u64) ?[]content.DocIn {
     service.assertWorkerThread();
     const start_ns = sys.monotonicNs();
-    const docs = content_list.listUntil(
-        arena,
-        service.gpa,
-        service.io,
-        service.root,
-        true,
-        &service.stop,
-    ) catch |err| {
+    const docs = content_list.list(arena, service.gpa, service.io, service.root, .{
+        .documents = true,
+        .stop = &service.stop,
+    }) catch |err| {
         if (err != error.Canceled) log.warn("listing files: {t}", .{err});
         return null;
     };
@@ -612,7 +608,10 @@ fn indexedChanges(
         if (index.removed(id)) continue;
         const doc = index.docIn(id);
         const path = std.mem.printSentinel(&path_buffer, "{s}", .{doc.path}, 0) catch continue;
-        const stat_now = content_list.stat(path, doc.source == .extracted);
+        const stat_now = content_list.stat(path, switch (doc.source) {
+            .extracted => .document,
+            .plain => .text,
+        });
         if (stat_now) |stat| {
             if (stat.mtime == doc.mtime and stat.size == doc.size) continue;
         }
@@ -629,7 +628,7 @@ fn indexedChanges(
     // Not in the index (`extractMissing` left them out): as they are now.
     for (service.worker.retry) |doc| {
         const path = std.mem.printSentinel(&path_buffer, "{s}", .{doc.path}, 0) catch continue;
-        const stat = content_list.stat(path, true) orelse continue;
+        const stat = content_list.stat(path, .document) orelse continue;
         try added.append(arena, .{
             .path = try arena.dupe(u8, doc.path),
             .mtime = stat.mtime,
@@ -1449,7 +1448,9 @@ test "content service: a document whose extraction failed in passing is left out
         },
     };
     defer s.worker.retry_arena.deinit();
-    const docs = content_list.list(arena, testing.allocator, testing.io, t.abs, true) catch |err|
+    const docs = content_list.list(arena, testing.allocator, testing.io, t.abs, .{
+        .documents = true,
+    }) catch |err|
         return switch (err) {
             error.FileNotFound => error.SkipZigTest, // no ripgrep
             else => err,

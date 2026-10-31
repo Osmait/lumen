@@ -235,7 +235,7 @@ fn contentBench(
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var t = sys.monotonicNs();
-    const docs = try index.content_list.list(arena, gpa, io, root, false);
+    const docs = try index.content_list.list(arena, gpa, io, root, .{ .documents = false });
     var bytes: u64 = 0;
     for (docs) |d| bytes += d.size;
     std.debug.print("list      {d:>8.1} ms  {d} text files, {d:.0} MB\n", .{
