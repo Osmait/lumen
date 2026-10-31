@@ -1805,8 +1805,8 @@ fn hashFolders(hasher: *std.hash.Wyhash, config_dir: []const u8, kind: []const u
 fn hashFile(hasher: *std.hash.Wyhash, path: [:0]const u8) void {
     hasher.update(path);
     const file_stamp = os.Stamp.of(path.ptr);
-    hasher.update(std.mem.asBytes(&.{ file_stamp.sec, file_stamp.size, file_stamp.ino }));
-    hasher.update(std.mem.asBytes(&file_stamp.nsec));
+    hasher.update(std.mem.asBytes(&.{ file_stamp.mtime_s, file_stamp.size, file_stamp.inode }));
+    hasher.update(std.mem.asBytes(&file_stamp.mtime_subsecond_ns));
 }
 
 // ---------------------------------------------------------------- tests

@@ -754,7 +754,7 @@ fn openWith(ui: *Ui, id: [:0]const u8, choice: OpenWithChoice) void {
         const key: []const u8 = if (core.file_kind.of(file.mime, name, .file)) |kind|
             @tagName(kind)
         else
-            core.file_kind.extKey(&extension_bytes, name);
+            core.file_kind.extensionKey(&extension_bytes, name);
         if (key.len > 0) {
             if (ui.settings.setOpenWith(key, id)) {
                 ui.saveSettings();

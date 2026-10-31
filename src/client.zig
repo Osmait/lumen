@@ -69,7 +69,7 @@ fn storeCopy(
 ) noreturn {
     const head = encodeArguments(argv[1..]) orelse runFull(argv, envp);
     const copy_buffer = request[head.len..];
-    const copy_bytes = unix.readAll(0, copy_buffer, unix.no_deadline) catch linux.exit_group(1);
+    const copy_bytes = unix.readAll(0, copy_buffer, unix.deadline_ns_none) catch linux.exit_group(1);
     // A copy too large to keep is dropped here, as lumen-gtk would.
     if (copy_bytes == copy_buffer.len) linux.exit_group(0);
     const request_bytes = head.len + copy_bytes;
@@ -180,7 +180,7 @@ fn exchange(runtime_dir: []const u8, app_id: []const u8, request_bytes: []const 
         return failedAnswer("lumen: cannot finish the request to the daemon\n");
     }
     // The daemon answers when it is done, however long that takes.
-    const answer_bytes = unix.readAll(fd, &answer_buffer, unix.no_deadline) catch 0;
+    const answer_bytes = unix.readAll(fd, &answer_buffer, unix.deadline_ns_none) catch 0;
     _ = linux.close(fd);
     if (answer_bytes < ipc.answer_header_bytes) {
         return failedAnswer("lumen: no answer from the daemon\n");

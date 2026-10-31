@@ -249,7 +249,7 @@ fn listTree(arena: std.mem.Allocator, tree: *const TestTree, documents: bool) ![
         arena,
         testing.allocator,
         testing.io,
-        tree.abs,
+        tree.absolute,
         .{ .documents = documents },
     ) catch |err| switch (err) {
         error.FileNotFound => error.SkipZigTest,
@@ -335,7 +335,7 @@ test "list: what is indexed and what is excluded" {
     const got = try listTree(arena, &tree, true);
 
     var want: std.ArrayList([]const u8) = .empty;
-    for (keep ++ docs) |name| try want.append(arena, try arena.print("{s}/{s}", .{ tree.abs, name }));
+    for (keep ++ docs) |name| try want.append(arena, try arena.print("{s}/{s}", .{ tree.absolute, name }));
     std.mem.sort([]const u8, want.items, {}, struct {
         fn lt(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.order(u8, a, b) == .lt;
@@ -378,7 +378,7 @@ test "list: a root below an excluded name still lists" {
     defer arena_state.deinit();
     const root_nested = try arena_state.allocator().print(
         "{s}/build/target/node_modules/me/",
-        .{tree.abs},
+        .{tree.absolute},
     );
     const got = list(
         arena_state.allocator(),
@@ -412,7 +412,7 @@ test "list: file names with newlines and invalid UTF-8 come back whole" {
         arena_state.allocator(),
         testing.allocator,
         testing.io,
-        tree.abs,
+        tree.absolute,
         .{ .documents = true },
     ) catch |err| switch (err) {
         error.FileNotFound => return error.SkipZigTest,
@@ -440,7 +440,7 @@ test "listing gives up soon after stop is set" {
         testing.allocator,
         testing.io,
         &.{ "sh", "-c", "exec sleep 30" },
-        tree.abs,
+        tree.absolute,
         &stop,
     ));
     try testing.expect(sys.monotonicNs() - start_ns < 5 * std.time.ns_per_s);

@@ -120,7 +120,7 @@ pub fn subdirs(
 /// Whether `entry` of the folder at `path` is a folder, following a link
 /// (and asking the file system when d_type is unknown).
 fn isDirEntry(path: [:0]const u8, entry: DirIter.Entry) bool {
-    if (entry.kind == Kind.dir) return true;
+    if (entry.kind == Kind.directory) return true;
     if (entry.kind != Kind.symlink and entry.kind != Kind.unknown) return false;
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const full = std.mem.printSentinel(&path_buffer, "{s}/{s}", .{ path, entry.name }, 0) catch {
@@ -133,10 +133,10 @@ fn isDirEntry(path: [:0]const u8, entry: DirIter.Entry) bool {
 /// A file's identity for "did it change?": modification time to the
 /// nanosecond, size and inode (editors that save by renaming a new file).
 pub const Stamp = struct {
-    sec: i64 = -1,
-    nsec: u32 = 0,
+    mtime_s: i64 = -1,
+    mtime_subsecond_ns: u32 = 0,
     size: u64 = 0,
-    ino: u64 = 0,
+    inode: u64 = 0,
 
     /// What no file has: the first look always counts as a change.
     pub const none: Stamp = .{};
@@ -151,7 +151,12 @@ pub const Stamp = struct {
             &stx,
         );
         if (linux.errno(result) != .SUCCESS) return .{};
-        return .{ .sec = stx.mtime.sec, .nsec = stx.mtime.nsec, .size = stx.size, .ino = stx.ino };
+        return .{
+            .mtime_s = stx.mtime.sec,
+            .mtime_subsecond_ns = stx.mtime.nsec,
+            .size = stx.size,
+            .inode = stx.ino,
+        };
     }
 
     pub fn eql(left: Stamp, right: Stamp) bool {
@@ -160,7 +165,7 @@ pub const Stamp = struct {
 };
 
 pub const Kind = struct {
-    pub const dir = linux.DT.DIR;
+    pub const directory = linux.DT.DIR;
     pub const symlink = linux.DT.LNK;
     pub const unknown = linux.DT.UNKNOWN;
 };
@@ -177,7 +182,7 @@ pub fn kindOf(path: [*:0]const u8) u8 {
     );
     if (linux.errno(result) != .SUCCESS) return Kind.unknown;
     return switch (stx.mode & linux.S.IFMT) {
-        linux.S.IFDIR => Kind.dir,
+        linux.S.IFDIR => Kind.directory,
         linux.S.IFLNK => Kind.symlink,
         else => linux.DT.REG,
     };
@@ -658,8 +663,8 @@ pub fn mapPrivate(path: [*:0]const u8) Error!MappedBytes {
 /// A testing tmp dir with its absolute path (tests run from the build
 /// root; what they test often takes absolute paths), and files in it.
 pub const TestDir = struct {
-    tmp: std.testing.TmpDir,
-    abs: []u8,
+    folder: std.testing.TmpDir,
+    absolute: []u8,
 
     pub fn init() !TestDir {
         var tmp_dir = std.testing.tmpDir(.{});
@@ -669,17 +674,17 @@ pub const TestDir = struct {
         const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
         defer std.testing.allocator.free(cwd);
         const absolute = try std.testing.allocator.print("{s}/{s}", .{ cwd, relative });
-        return .{ .tmp = tmp_dir, .abs = absolute };
+        return .{ .folder = tmp_dir, .absolute = absolute };
     }
 
     pub fn deinit(test_dir: *TestDir) void {
-        std.testing.allocator.free(test_dir.abs);
-        test_dir.tmp.cleanup();
+        std.testing.allocator.free(test_dir.absolute);
+        test_dir.folder.cleanup();
     }
 
     /// Absolute path of `name`, in the caller's `path_buffer`.
     pub fn path(test_dir: *const TestDir, path_buffer: []u8, name: []const u8) ![:0]u8 {
-        return std.mem.printSentinel(path_buffer, "{s}/{s}", .{ test_dir.abs, name }, 0);
+        return std.mem.printSentinel(path_buffer, "{s}/{s}", .{ test_dir.absolute, name }, 0);
     }
 
     /// Writes `name` (creating parent dirs) with `data`.

@@ -184,7 +184,7 @@ pub fn openFile(context: Ctx, path: [:0]const u8, entry: core.file_kind.Entry) v
     var extension_buffer: [16]u8 = undefined;
     const extension_key = switch (entry) {
         .folder => "",
-        .file => core.file_kind.extKey(&extension_buffer, name),
+        .file => core.file_kind.extensionKey(&extension_buffer, name),
     };
     if (context.settings.appFor(extension_key, kind)) |app| {
         var app_id_buffer: [256]u8 = undefined;

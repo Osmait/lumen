@@ -36,7 +36,7 @@ pub fn kindOf(path: []const u8) ?Kind {
     const base = std.Io.Dir.path.basename(path);
     if (std.mem.startsWith(u8, base, office_owner_prefix)) return null;
     var extension_buffer: [4]u8 = undefined;
-    const extension = @import("core").file_kind.lowerExt(&extension_buffer, base) orelse return null;
+    const extension = @import("core").file_kind.lowerExtension(&extension_buffer, base) orelse return null;
     return std.meta.stringToEnum(Kind, extension);
 }
 
@@ -542,11 +542,11 @@ test "shrink cuts at a UTF-8 boundary" {
 
 const TestDir = struct {
     tree: sys.TestDir,
-    abs: []const u8,
+    absolute: []const u8,
 
     fn init(test_dir: *TestDir) !void {
         test_dir.tree = try .init();
-        test_dir.abs = test_dir.tree.abs;
+        test_dir.absolute = test_dir.tree.absolute;
     }
     fn deinit(test_dir: *TestDir) void {
         test_dir.tree.deinit();
@@ -555,7 +555,7 @@ const TestDir = struct {
         try test_dir.tree.write(name, data);
     }
     fn absZ(test_dir: *TestDir, name: []const u8) ![:0]u8 {
-        return testing.allocator.printSentinel("{s}/{s}", .{ test_dir.abs, name }, 0);
+        return testing.allocator.printSentinel("{s}/{s}", .{ test_dir.absolute, name }, 0);
     }
     fn extract(test_dir: *TestDir, name: []const u8, bytes_max: usize) ![]u8 {
         const path = try test_dir.absZ(name);
@@ -645,7 +645,7 @@ fn zipInto(test_dir: *TestDir, folder: []const u8, name: []const u8) !void {
 /// `zipInto` with more options for zip.
 fn zipWith(test_dir: *TestDir, folder: []const u8, name: []const u8, options: []const u8) !void {
     var folder_buffer: [256]u8 = undefined;
-    const folder_path = try std.mem.print(&folder_buffer, "{s}/{s}", .{ test_dir.abs, folder });
+    const folder_path = try std.mem.print(&folder_buffer, "{s}/{s}", .{ test_dir.absolute, folder });
     var script_buffer: [256]u8 = undefined;
     const script = try std.mem.print(
         &script_buffer,

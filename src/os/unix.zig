@@ -87,13 +87,13 @@ pub fn peerUid(fd: linux.fd_t) ?u32 {
 pub const ReadError = error{ Timeout, Syscall };
 
 /// No deadline: wait as long as the peer takes.
-pub const no_deadline: u64 = std.math.maxInt(u64);
+pub const deadline_ns_none: u64 = std.math.maxInt(u64);
 
 /// One read into `bytes` once `fd` is readable, waiting until `deadline_ns`
 /// (monotonic) at most: 0 at end of input.
 pub fn readSome(fd: linux.fd_t, bytes: []u8, deadline_ns: u64) ReadError!usize {
     while (true) {
-        if (deadline_ns != no_deadline) {
+        if (deadline_ns != deadline_ns_none) {
             const now_ns = os.monotonicNs();
             if (now_ns >= deadline_ns) return error.Timeout;
             const left_ms: i32 = @intCast(@min(
@@ -108,7 +108,7 @@ pub fn readSome(fd: linux.fd_t, bytes: []u8, deadline_ns: u64) ReadError!usize {
             // A non-blocking descriptor with nothing yet (a stdin left
             // O_NONBLOCK): wait for it rather than spin on read.
             .AGAIN => {
-                if (deadline_ns == no_deadline) _ = os.waitReadable(fd, -1);
+                if (deadline_ns == deadline_ns_none) _ = os.waitReadable(fd, -1);
                 continue;
             },
             else => return error.Syscall,
@@ -176,7 +176,7 @@ test "a non-blocking descriptor is waited on, without a deadline too" {
     const writer = try std.Thread.spawn(.{}, Late.write, .{fds[1]});
     defer writer.join();
     var received: [16]u8 = undefined;
-    const received_len = try readAll(fds[0], &received, no_deadline);
+    const received_len = try readAll(fds[0], &received, deadline_ns_none);
     try std.testing.expectEqualStrings("late", received[0..received_len]);
 }
 

@@ -323,7 +323,7 @@ fn readDir(
         if (hiddenByName(entry.name)) flags |= store_mod.flag_hidden;
         if (kind == sys.Kind.symlink) flags |= store_mod.flag_symlink;
         // A skipped directory is still indexed (searchable), just not opened.
-        const descend = kind == sys.Kind.dir and shouldDescend(path, entry.name, config);
+        const descend = kind == sys.Kind.directory and shouldDescend(path, entry.name, config);
         if (descend) flags |= store_mod.flag_dir;
         try batch.names.appendSlice(gpa, entry.name);
         try batch.ends.append(gpa, @intCast(batch.names.items.len));

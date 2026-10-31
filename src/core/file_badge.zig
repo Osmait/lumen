@@ -5,7 +5,7 @@
 //! their icons say more than letters, so those get no badge.
 
 const std = @import("std");
-const lowerExt = @import("file_kind.zig").lowerExt;
+const lowerExtension = @import("file_kind.zig").lowerExtension;
 
 pub const Color = enum { cyan, blue, yellow, orange, red, green, purple, pink, brown, gray };
 
@@ -73,7 +73,7 @@ pub fn of(name: []const u8, text_buffer: *[4]u8) ?Badge {
         if (std.mem.eql(u8, name, file_name)) return .{ .text = text, .color = color };
     }
     var extension_buffer: [16]u8 = undefined;
-    const lower = lowerExt(&extension_buffer, name) orelse return null;
+    const lower = lowerExtension(&extension_buffer, name) orelse return null;
     const extension = name[name.len - lower.len ..];
     for (themed) |themed_extension| {
         if (std.mem.eql(u8, lower, themed_extension)) return null;
@@ -104,7 +104,7 @@ pub fn isKnown(name: []const u8) bool {
         if (std.mem.eql(u8, name, entry[0])) return true;
     }
     var extension_buffer: [16]u8 = undefined;
-    const lower = lowerExt(&extension_buffer, name) orelse return false;
+    const lower = lowerExtension(&extension_buffer, name) orelse return false;
     return knownColor(lower) != null;
 }
 
@@ -215,7 +215,7 @@ pub fn logoOf(name: []const u8) ?Logo {
         if (std.mem.eql(u8, name, file_name)) return logo;
     }
     var extension_buffer: [16]u8 = undefined;
-    const lower = lowerExt(&extension_buffer, name) orelse return null;
+    const lower = lowerExtension(&extension_buffer, name) orelse return null;
     for (logos) |entry| {
         const logo_extension, const logo = entry;
         if (std.mem.eql(u8, lower, logo_extension)) return logo;

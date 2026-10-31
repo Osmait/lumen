@@ -1091,8 +1091,8 @@ const Fixture = struct {
         return ContentService.startWith(
             testing.allocator,
             testing.io,
-            fixture.root.abs,
-            fixture.cache.abs,
+            fixture.root.absolute,
+            fixture.cache.absolute,
             .{ .search = fixture.search_pool, .build = fixture.build_pool },
             options,
         );
@@ -1244,7 +1244,7 @@ test "content service: with the name index, checks without name changes only loo
     try fixture.root.write("a.txt", "first apricot\n");
     var names_path_buffer: paths.Buffer = undefined;
     const names_path = try fixture.cache.path(&names_path_buffer, "files.idx");
-    const names = try Service.start(testing.allocator, testing.io, fixture.root.abs, names_path);
+    const names = try Service.start(testing.allocator, testing.io, fixture.root.absolute, names_path);
     defer names.shutdown();
     _ = try Service.waitNames(names, null);
     const service = try fixture.startWith(.{
@@ -1344,7 +1344,7 @@ test "content service: Office documents are extracted once per version" {
             try testing.expect(unlinked == .SUCCESS or unlinked == .NOENT);
             const result = try std.process.run(testing.allocator, testing.io, .{
                 .argv = &.{ "zip", "-q", "-X", "-r", out, "." },
-                .cwd = .{ .path = tree.abs },
+                .cwd = .{ .path = tree.absolute },
             });
             testing.allocator.free(result.stdout);
             testing.allocator.free(result.stderr);
@@ -1438,13 +1438,13 @@ test "content service: Office documents are extracted once per version" {
     var old_name_buffer: paths.Buffer = undefined;
     const size = sys.info(report).?.size;
     const now_name = try std.mem.printSentinel(&now_name_buffer, "{s}/text/{s}{d}-{d}.txt", .{
-        fixture.cache.abs,
+        fixture.cache.absolute,
         prefix,
         mtime_second,
         size,
     }, 0);
     const old_name = try std.mem.printSentinel(&old_name_buffer, "{s}/text/{s}{d}.txt", .{
-        fixture.cache.abs,
+        fixture.cache.absolute,
         prefix,
         mtime_second,
     }, 0);
@@ -1486,7 +1486,7 @@ test "content service: a document whose extraction failed in passing is left out
     var service: ContentService = .{
         .gpa = testing.allocator,
         .io = testing.io,
-        .root = tree.abs,
+        .root = tree.absolute,
         .cache_path = undefined,
         .text_dir = undefined,
         .search_pool = pool,
@@ -1498,7 +1498,7 @@ test "content service: a document whose extraction failed in passing is left out
         },
     };
     defer service.worker.retry_arena.deinit();
-    const docs = content_list.list(arena, testing.allocator, testing.io, tree.abs, .{
+    const docs = content_list.list(arena, testing.allocator, testing.io, tree.absolute, .{
         .documents = true,
     }) catch |err| switch (err) {
         // Without ripgrep.

@@ -2620,7 +2620,7 @@ test "search: the top matches equal reading every document and ranking them all"
         }
         const folder = if (i % 3 == 0) "/deep/er" else "";
         const path = try arena.print("{s}{s}/{s}{d}.txt", .{
-            test_dir.abs,
+            test_dir.absolute,
             folder,
             if (i % 7 == 0) "main" else "doc",
             i,
@@ -2697,7 +2697,7 @@ test "search: unaccented and capital queries find accented text" {
     var test_paths: [texts.len][]u8 = undefined;
     var docs: [texts.len]DocIn = undefined;
     for (texts, 0..) |text, i| {
-        test_paths[i] = try gpa.print("{s}/doc{d}.txt", .{ test_dir.abs, i });
+        test_paths[i] = try gpa.print("{s}/doc{d}.txt", .{ test_dir.absolute, i });
         var path_buffer: paths.Buffer = undefined;
         const path = try std.mem.printSentinel(&path_buffer, "{s}", .{test_paths[i]}, 0);
         try sys.writeFile(path, text);

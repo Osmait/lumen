@@ -148,7 +148,7 @@ fn isAny(mime: []const u8, mimes: []const []const u8) bool {
 /// "log" for "server.LOG", in `extension_buffer`: null when the name has
 /// none (no dot, only a leading one, a trailing one) or it is longer than
 /// `extension_buffer`.
-pub fn lowerExt(extension_buffer: []u8, name: []const u8) ?[]const u8 {
+pub fn lowerExtension(extension_buffer: []u8, name: []const u8) ?[]const u8 {
     const dot = std.mem.findScalarLast(u8, name, '.') orelse return null;
     const extension = name[dot + 1 ..];
     if (dot == 0) return null;
@@ -159,9 +159,9 @@ pub fn lowerExt(extension_buffer: []u8, name: []const u8) ?[]const u8 {
 
 /// ".log" for "server.LOG": the key an extension override is stored under
 /// (lowercase, with the dot). Empty when the name has no extension.
-pub fn extKey(key_buffer: []u8, name: []const u8) []const u8 {
+pub fn extensionKey(key_buffer: []u8, name: []const u8) []const u8 {
     if (key_buffer.len < 2) return "";
-    const extension = lowerExt(key_buffer[1..], name) orelse return "";
+    const extension = lowerExtension(key_buffer[1..], name) orelse return "";
     key_buffer[0] = '.';
     return key_buffer[0 .. 1 + extension.len];
 }
@@ -205,21 +205,21 @@ test "kinds from MIME type and name" {
 
 test "extension keys" {
     var key_buffer: [16]u8 = undefined;
-    try std.testing.expectEqualStrings(".log", extKey(&key_buffer, "server.LOG"));
-    try std.testing.expectEqualStrings(".gz", extKey(&key_buffer, "a.tar.gz"));
-    try std.testing.expectEqualStrings("", extKey(&key_buffer, ".bashrc"));
-    try std.testing.expectEqualStrings("", extKey(&key_buffer, "Makefile"));
-    try std.testing.expectEqualStrings("", extKey(&key_buffer, "trailing."));
+    try std.testing.expectEqualStrings(".log", extensionKey(&key_buffer, "server.LOG"));
+    try std.testing.expectEqualStrings(".gz", extensionKey(&key_buffer, "a.tar.gz"));
+    try std.testing.expectEqualStrings("", extensionKey(&key_buffer, ".bashrc"));
+    try std.testing.expectEqualStrings("", extensionKey(&key_buffer, "Makefile"));
+    try std.testing.expectEqualStrings("", extensionKey(&key_buffer, "trailing."));
 }
 
-test "lowerExt and extKey" {
+test "lowerExtension and extensionKey" {
     var buffer: [8]u8 = undefined;
-    try std.testing.expectEqualStrings("log", lowerExt(&buffer, "server.LOG").?);
-    try std.testing.expectEqualStrings("gz", lowerExt(&buffer, "a.tar.gz").?);
+    try std.testing.expectEqualStrings("log", lowerExtension(&buffer, "server.LOG").?);
+    try std.testing.expectEqualStrings("gz", lowerExtension(&buffer, "a.tar.gz").?);
     for ([_][]const u8{ "README", ".bashrc", "trailing.", "x.toolongext" }) |name| {
-        try std.testing.expect(lowerExt(&buffer, name) == null);
+        try std.testing.expect(lowerExtension(&buffer, name) == null);
     }
-    try std.testing.expectEqualStrings(".log", extKey(&buffer, "server.LOG"));
-    try std.testing.expectEqualStrings("", extKey(&buffer, ".bashrc"));
-    try std.testing.expectEqualStrings("", extKey(buffer[0..4], "x.abcd"));
+    try std.testing.expectEqualStrings(".log", extensionKey(&buffer, "server.LOG"));
+    try std.testing.expectEqualStrings("", extensionKey(&buffer, ".bashrc"));
+    try std.testing.expectEqualStrings("", extensionKey(buffer[0..4], "x.abcd"));
 }

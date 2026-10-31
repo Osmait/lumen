@@ -164,10 +164,10 @@ fn fileKey(path: [*:0]const u8, width_px: c_int, height_px: c_int) ?u64 {
     var hash: std.hash.Wyhash = .init(0);
     hash.update(std.mem.span(path));
     const parts = [_]i64{
-        stamp.sec,
-        stamp.nsec,
+        stamp.mtime_s,
+        stamp.mtime_subsecond_ns,
         @bitCast(stamp.size),
-        @bitCast(stamp.ino),
+        @bitCast(stamp.inode),
         width_px,
         height_px,
     };
