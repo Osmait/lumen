@@ -1753,63 +1753,61 @@ const testing = std.testing;
 
 /// Collects what the host delivers; the test pumps GLib's main loop.
 const Probe = struct {
-    reg: ?*Registry = null,
-    res: ?*ListResult = null,
+    registry: ?*Registry = null,
+    list: ?*ListResult = null,
     act: ?*ActResult = null,
     root: ?*RootResult = null,
 
-    fn onRegistry(r: *Registry, ctx: ?*anyopaque) void {
-        const p: *Probe = @ptrCast(@alignCast(ctx.?));
-        if (p.reg) |o| o.destroy(testing.allocator);
-        p.reg = r;
+    fn onRegistry(answer: *Registry, context: ?*anyopaque) void {
+        const probe: *Probe = @ptrCast(@alignCast(context.?));
+        if (probe.registry) |old| old.destroy(testing.allocator);
+        probe.registry = answer;
     }
-    fn onList(r: *ListResult, ctx: ?*anyopaque) void {
-        const p: *Probe = @ptrCast(@alignCast(ctx.?));
-        if (p.res) |o| o.destroy(testing.allocator);
-        p.res = r;
+    fn onList(answer: *ListResult, context: ?*anyopaque) void {
+        const probe: *Probe = @ptrCast(@alignCast(context.?));
+        if (probe.list) |old| old.destroy(testing.allocator);
+        probe.list = answer;
     }
-    fn onAct(r: *ActResult, ctx: ?*anyopaque) void {
-        const p: *Probe = @ptrCast(@alignCast(ctx.?));
-        if (p.act) |o| o.destroy(testing.allocator);
-        p.act = r;
+    fn onAct(answer: *ActResult, context: ?*anyopaque) void {
+        const probe: *Probe = @ptrCast(@alignCast(context.?));
+        if (probe.act) |old| old.destroy(testing.allocator);
+        probe.act = answer;
     }
-    fn onRoot(r: *RootResult, ctx: ?*anyopaque) void {
-        const p: *Probe = @ptrCast(@alignCast(ctx.?));
-        if (p.root) |o| o.destroy(testing.allocator);
-        p.root = r;
+    fn onRoot(answer: *RootResult, context: ?*anyopaque) void {
+        const probe: *Probe = @ptrCast(@alignCast(context.?));
+        if (probe.root) |old| old.destroy(testing.allocator);
+        probe.root = answer;
     }
-    fn deinit(p: *Probe) void {
-        if (p.root) |r| r.destroy(testing.allocator);
-        if (p.reg) |r| r.destroy(testing.allocator);
-        if (p.res) |r| r.destroy(testing.allocator);
-        if (p.act) |r| r.destroy(testing.allocator);
+    fn deinit(probe: *Probe) void {
+        if (probe.root) |answer| answer.destroy(testing.allocator);
+        if (probe.registry) |answer| answer.destroy(testing.allocator);
+        if (probe.list) |answer| answer.destroy(testing.allocator);
+        if (probe.act) |answer| answer.destroy(testing.allocator);
     }
     /// Pumps the main loop until `field` is set (up to 10 s).
-    fn wait(p: *Probe, comptime field: []const u8) !void {
-        const until = os.monotonicNs() + 10 * std.time.ns_per_s;
-        while (@field(p, field) == null) {
-            if (os.monotonicNs() > until) return error.Timeout;
-            // Nothing ready: a 1 ms nap (poll with no descriptors).
-            if (c.g_main_context_iteration(null, 0) == 0) _ = std.os.linux.poll(
-                &[0]std.os.linux.pollfd{},
-                0,
-                1,
-            );
+    fn wait(probe: *Probe, comptime field: []const u8) !void {
+        const until_ns = os.monotonicNs() + 10 * std.time.ns_per_s;
+        while (@field(probe, field) == null) {
+            if (os.monotonicNs() > until_ns) return error.Timeout;
+            // Nothing is ready: nap for 1 ms (a poll with no descriptors).
+            if (c.g_main_context_iteration(null, 0) == 0) {
+                _ = std.os.linux.poll(&[0]std.os.linux.pollfd{}, 0, 1);
+            }
         }
     }
-    fn take(p: *Probe, comptime field: []const u8) !@TypeOf(@field(p, field).?) {
-        try p.wait(field);
-        const r = @field(p, field).?;
-        @field(p, field) = null;
-        return r;
+    fn take(probe: *Probe, comptime field: []const u8) !@TypeOf(@field(probe, field).?) {
+        try probe.wait(field);
+        const answer = @field(probe, field).?;
+        @field(probe, field) = null;
+        return answer;
     }
 };
 
 fn writeTestFile(dir: []const u8, name: []const u8, data: []const u8) !void {
-    var buf: [4096]u8 = undefined;
-    const p = try std.mem.printSentinel(&buf, "{s}/{s}", .{ dir, name }, 0);
-    if (std.mem.findScalarLast(u8, p, '/')) |s| os.mkdirP(p[0..s]);
-    try os.writeFile(p, data);
+    var buffer: [4096]u8 = undefined;
+    const path = try std.mem.printSentinel(&buffer, "{s}/{s}", .{ dir, name }, 0);
+    if (std.mem.findScalarLast(u8, path, '/')) |slash| os.mkdirP(path[0..slash]);
+    try os.writeFile(path, data);
 }
 
 fn testHost(probe: *Probe, dir: []const u8) !*Host {
@@ -1877,36 +1875,36 @@ test "extensions load, list, search and run actions" {
 
     var probe: Probe = .{};
     defer probe.deinit();
-    const h = try testHost(&probe, dir);
-    defer h.shutdown();
-    h.reload();
-    try probe.wait("reg");
-    const reg = probe.reg.?;
+    const host = try testHost(&probe, dir);
+    defer host.shutdown();
+    host.reload();
+    try probe.wait("registry");
+    const registry = probe.registry.?;
 
-    try testing.expectEqual(@as(usize, 5), reg.commands.len);
-    try testing.expectEqual(Mode.provider, reg.commands[4].mode);
-    try testing.expect(reg.commands[4].root and !reg.commands[1].root);
-    try testing.expectEqualStrings("config.hello", reg.commands[0].id);
-    try testing.expectEqual(Mode.run, reg.commands[0].mode);
-    try testing.expectEqualStrings("demo.fruits", reg.commands[1].id);
-    try testing.expectEqualStrings("Demo", reg.commands[1].subtitle);
-    try testing.expectEqualStrings("🍎", reg.commands[1].icon.emoji);
-    try testing.expect(reg.commands[1].detail);
-    try testing.expectEqual(Mode.search, reg.commands[2].mode);
-    try testing.expectEqual(@as(usize, 1), reg.themes.len);
-    try testing.expectEqual(@as(u24, 0xff8800), reg.themes[0].accent);
-    try testing.expectEqual(@as(u24, 0x101010), reg.themes[0].surface);
-    try testing.expectEqual(@as(usize, 1), reg.keymaps.len);
-    try testing.expectEqualStrings("demo.fruits", reg.keymaps[0].target);
-    try testing.expectEqual(@as(usize, 3), reg.settings.len);
+    try testing.expectEqual(@as(usize, 5), registry.commands.len);
+    try testing.expectEqual(Mode.provider, registry.commands[4].mode);
+    try testing.expect(registry.commands[4].root and !registry.commands[1].root);
+    try testing.expectEqualStrings("config.hello", registry.commands[0].id);
+    try testing.expectEqual(Mode.run, registry.commands[0].mode);
+    try testing.expectEqualStrings("demo.fruits", registry.commands[1].id);
+    try testing.expectEqualStrings("Demo", registry.commands[1].subtitle);
+    try testing.expectEqualStrings("🍎", registry.commands[1].icon.emoji);
+    try testing.expect(registry.commands[1].detail);
+    try testing.expectEqual(Mode.search, registry.commands[2].mode);
+    try testing.expectEqual(@as(usize, 1), registry.themes.len);
+    try testing.expectEqual(@as(u24, 0xff8800), registry.themes[0].accent);
+    try testing.expectEqual(@as(u24, 0x101010), registry.themes[0].surface);
+    try testing.expectEqual(@as(usize, 1), registry.keymaps.len);
+    try testing.expectEqualStrings("demo.fruits", registry.keymaps[0].target);
+    try testing.expectEqual(@as(usize, 3), registry.settings.len);
     // Several lumen.layout calls add up.
-    try testing.expect(reg.has_layout);
-    try testing.expectEqual(@as(?u16, 820), reg.layout.width);
+    try testing.expect(registry.has_layout);
+    try testing.expectEqual(@as(?u16, 820), registry.layout.width);
     try testing.expect(
-        reg.layout.footer and reg.layout.panels == .single and reg.layout.rows == .inline_,
+        registry.layout.footer and registry.layout.panels == .single and registry.layout.rows == .inline_,
     );
-    try testing.expect(!reg.layout.show.icons and reg.layout.show.subtitles);
-    for (reg.settings) |o| {
+    try testing.expect(!registry.layout.show.icons and registry.layout.show.subtitles);
+    for (registry.settings) |o| {
         const want: []const u8 = if (std.mem.eql(u8, o.key, "width")) "wide" else if (std.mem.eql(
             u8,
             o.key,
@@ -1915,13 +1913,13 @@ test "extensions load, list, search and run actions" {
         try testing.expectEqualStrings(want, o.value);
     }
     // The broken one is reported, the others load.
-    try testing.expectEqual(@as(usize, 1), reg.problems.len);
-    try testing.expectEqualStrings("broken", reg.problems[0].ext);
-    try testing.expect(std.mem.find(u8, reg.problems[0].message, "title is missing") != null);
+    try testing.expectEqual(@as(usize, 1), registry.problems.len);
+    try testing.expectEqualStrings("broken", registry.problems[0].ext);
+    try testing.expect(std.mem.find(u8, registry.problems[0].message, "title is missing") != null);
 
     // A list command's rows.
-    const g1 = h.list(reg.gen, 1, "");
-    const fruits = try probe.take("res");
+    const g1 = host.list(registry.gen, 1, "");
+    const fruits = try probe.take("list");
     defer fruits.destroy(testing.allocator);
     try testing.expectEqual(g1, fruits.gen);
     try testing.expect(fruits.err == null);
@@ -1941,7 +1939,7 @@ test "extensions load, list, search and run actions" {
 
     // Its Lua action runs against that list, and changes state other
     // commands of the extension see.
-    const ga = h.act(reg.gen, 1, .{ .row_action = .{
+    const action_gen = host.act(registry.gen, 1, .{ .row_action = .{
         .from_root_search = false,
         .list_gen = fruits.gen,
         .row_index = 1,
@@ -1949,12 +1947,12 @@ test "extensions load, list, search and run actions" {
     } });
     const done = try probe.take("act");
     defer done.destroy(testing.allocator);
-    try testing.expectEqual(ga, done.gen);
+    try testing.expectEqual(action_gen, done.gen);
     try testing.expect(done.err == null);
     try testing.expectEqual(Outcome.close, done.outcome);
     // The action took its row's actions away: pressing it again is an
     // error, not a read of whatever `row.actions` is now.
-    _ = h.act(reg.gen, 1, .{ .row_action = .{
+    _ = host.act(registry.gen, 1, .{ .row_action = .{
         .from_root_search = false,
         .list_gen = fruits.gen,
         .row_index = 1,
@@ -1963,54 +1961,54 @@ test "extensions load, list, search and run actions" {
     const again = try probe.take("act");
     defer again.destroy(testing.allocator);
     try testing.expect(std.mem.find(u8, again.err.?, "no actions") != null);
-    _ = h.list(reg.gen, 3, "");
-    const eaten = try probe.take("res");
+    _ = host.list(registry.gen, 3, "");
+    const eaten = try probe.take("list");
     defer eaten.destroy(testing.allocator);
     try testing.expectEqualStrings("Banana", eaten.items[0].title);
 
     // A search command gets the query, and lumen.exec runs programs.
-    _ = h.list(reg.gen, 2, "it's \"quoted\"");
-    const echo = try probe.take("res");
+    _ = host.list(registry.gen, 2, "it's \"quoted\"");
+    const echo = try probe.take("list");
     defer echo.destroy(testing.allocator);
     try testing.expect(echo.err == null);
     try testing.expectEqualStrings("you typed it's \"quoted\"", echo.items[0].title);
 
     // A run command's return value.
-    _ = h.act(reg.gen, 0, .command_run);
+    _ = host.act(registry.gen, 0, .command_run);
     const hello = try probe.take("act");
     defer hello.destroy(testing.allocator);
     try testing.expectEqual(Outcome.stay, hello.outcome);
 
     // Root search: rows from providers, their Lua actions run there.
-    const gr = h.root(reg.gen, "21");
+    const root_gen = host.root(registry.gen, "21");
     const r21 = try probe.take("root");
     defer r21.destroy(testing.allocator);
-    try testing.expectEqual(gr, r21.gen);
+    try testing.expectEqual(root_gen, r21.gen);
     try testing.expectEqual(@as(usize, 1), r21.sections.len);
     try testing.expectEqual(@as(u16, 4), r21.sections[0].command);
     const doubled = r21.sections[0].items[0];
     try testing.expectEqualStrings("42", doubled.title);
     try testing.expect(doubled.action.ext_item.root);
-    _ = h.act(reg.gen, 4, .{ .row_action = .{
+    _ = host.act(registry.gen, 4, .{ .row_action = .{
         .from_root_search = true,
         .list_gen = doubled.action.ext_item.gen,
         .row_index = 0,
         .action_index = 0,
     } });
     (try probe.take("act")).destroy(testing.allocator);
-    _ = h.list(reg.gen, 3, "");
-    const noted = try probe.take("res");
+    _ = host.list(registry.gen, 3, "");
+    const noted = try probe.take("list");
     defer noted.destroy(testing.allocator);
     try testing.expectEqualStrings("42", noted.items[0].title);
-    _ = h.root(reg.gen, "not a number");
+    _ = host.root(registry.gen, "not a number");
     const none = try probe.take("root");
     defer none.destroy(testing.allocator);
     try testing.expectEqual(@as(usize, 0), none.sections.len);
 
     // An action against a list that has been replaced is refused.
-    _ = h.list(reg.gen, 1, "");
-    (try probe.take("res")).destroy(testing.allocator);
-    _ = h.act(reg.gen, 1, .{ .row_action = .{
+    _ = host.list(registry.gen, 1, "");
+    (try probe.take("list")).destroy(testing.allocator);
+    _ = host.act(registry.gen, 1, .{ .row_action = .{
         .from_root_search = false,
         .list_gen = fruits.gen,
         .row_index = 1,
@@ -2021,10 +2019,10 @@ test "extensions load, list, search and run actions" {
     try testing.expect(std.mem.find(u8, stale.err.?, "changed") != null);
 
     // After a reload, requests against the old registry are refused.
-    h.reload();
-    try probe.wait("reg");
-    _ = h.list(reg.gen, 1, "");
-    const old = try probe.take("res");
+    host.reload();
+    try probe.wait("registry");
+    _ = host.list(registry.gen, 1, "");
+    const old = try probe.take("list");
     defer old.destroy(testing.allocator);
     try testing.expectEqualStrings("Extensions were reloaded", old.err.?);
 }
@@ -2050,15 +2048,15 @@ test "errors in extensions come back as messages" {
 
     var probe: Probe = .{};
     defer probe.deinit();
-    const h = try testHost(&probe, dir);
-    defer h.shutdown();
-    h.reload();
-    try probe.wait("reg");
-    const reg = probe.reg.?;
-    try testing.expectEqual(@as(usize, 4), reg.commands.len);
-    try testing.expectEqual(@as(usize, 5), reg.problems.len);
-    try testing.expect(!reg.has_layout);
-    for (reg.problems) |p| {
+    const host = try testHost(&probe, dir);
+    defer host.shutdown();
+    host.reload();
+    try probe.wait("registry");
+    const registry = probe.registry.?;
+    try testing.expectEqual(@as(usize, 4), registry.commands.len);
+    try testing.expectEqual(@as(usize, 5), registry.problems.len);
+    try testing.expect(!registry.has_layout);
+    for (registry.problems) |p| {
         const want: []const u8 = if (std.mem.eql(
             u8,
             p.ext,
@@ -2082,17 +2080,17 @@ test "errors in extensions come back as messages" {
         }
     }
 
-    _ = h.list(reg.gen, 0, "");
-    const boom = try probe.take("res");
+    _ = host.list(registry.gen, 0, "");
+    const boom = try probe.take("list");
     defer boom.destroy(testing.allocator);
     try testing.expect(std.mem.find(u8, boom.err.?, "kaboom") != null);
 
-    _ = h.list(reg.gen, 2, "");
-    const badrow = try probe.take("res");
+    _ = host.list(registry.gen, 2, "");
+    const badrow = try probe.take("list");
     defer badrow.destroy(testing.allocator);
     try testing.expect(std.mem.find(u8, badrow.err.?, "items[1].title is missing") != null);
 
-    _ = h.act(reg.gen, 3, .command_run);
+    _ = host.act(registry.gen, 3, .command_run);
     const badret = try probe.take("act");
     defer badret.destroy(testing.allocator);
     try testing.expect(std.mem.find(u8, badret.err.?, "must return") != null);
@@ -2127,41 +2125,41 @@ test "preferences read Settings' file over their defaults; storage persists" {
 
     var probe: Probe = .{};
     defer probe.deinit();
-    const h = try testHost(&probe, dir);
-    defer h.shutdown();
-    h.reload();
-    try probe.wait("reg");
-    const reg = probe.reg.?;
-    try testing.expectEqual(@as(usize, 3), reg.prefs.len);
-    try testing.expectEqual(PrefKind.toggle, reg.prefs[1].kind);
-    try testing.expectEqualStrings("false", reg.prefs[1].default);
-    try testing.expectEqualStrings("s", reg.prefs[2].default);
-    try testing.expectEqualStrings("Medium", reg.prefs[2].choices[1].label);
+    const host = try testHost(&probe, dir);
+    defer host.shutdown();
+    host.reload();
+    try probe.wait("registry");
+    const registry = probe.registry.?;
+    try testing.expectEqual(@as(usize, 3), registry.prefs.len);
+    try testing.expectEqual(PrefKind.toggle, registry.prefs[1].kind);
+    try testing.expectEqualStrings("false", registry.prefs[1].default);
+    try testing.expectEqualStrings("s", registry.prefs[2].default);
+    try testing.expectEqualStrings("Medium", registry.prefs[2].choices[1].label);
     try testing.expect(std.mem.endsWith(
         u8,
-        reg.prefs[0].file,
+        registry.prefs[0].file,
         "data/extensions/kv/preferences.json",
     ));
 
-    _ = h.list(reg.gen, 0, "");
-    const before = try probe.take("res");
+    _ = host.list(registry.gen, 0, "");
+    const before = try probe.take("list");
     defer before.destroy(testing.allocator);
     const want = [_][]const u8{ "nobody", "true", "s", "nil", "false" };
     try testing.expect(before.err == null);
     for (want, before.items) |w, it| try testing.expectEqualStrings(w, it.title);
 
-    _ = h.act(reg.gen, 1, .command_run);
+    _ = host.act(registry.gen, 1, .command_run);
     (try probe.take("act")).destroy(testing.allocator);
-    _ = h.act(reg.gen, 1, .command_run);
+    _ = host.act(registry.gen, 1, .command_run);
     (try probe.take("act")).destroy(testing.allocator);
     // Storage outlives a reload (a new Lua state reads the file).
-    probe.reg = null;
-    defer reg.destroy(testing.allocator);
-    h.reload();
-    try probe.wait("reg");
-    const reg2 = probe.reg.?;
-    _ = h.list(reg2.gen, 0, "");
-    const after = try probe.take("res");
+    probe.registry = null;
+    defer registry.destroy(testing.allocator);
+    host.reload();
+    try probe.wait("registry");
+    const reg2 = probe.registry.?;
+    _ = host.list(reg2.gen, 0, "");
+    const after = try probe.take("list");
     defer after.destroy(testing.allocator);
     try testing.expectEqualStrings("2", after.items[3].title);
 }
@@ -2190,23 +2188,23 @@ test "storage never writes over what it cannot read, and reads back what it wrot
 
     var probe: Probe = .{};
     defer probe.deinit();
-    const h = try testHost(&probe, dir);
-    defer h.shutdown();
-    h.reload();
-    try probe.wait("reg");
-    const reg = probe.reg.?;
-    try testing.expectEqual(@as(usize, 2), reg.problems.len);
-    for (reg.problems) |p| try testing.expect(std.mem.find(u8, p.message, "are taken") != null);
+    const host = try testHost(&probe, dir);
+    defer host.shutdown();
+    host.reload();
+    try probe.wait("registry");
+    const registry = probe.registry.?;
+    try testing.expectEqual(@as(usize, 2), registry.problems.len);
+    for (registry.problems) |p| try testing.expect(std.mem.find(u8, p.message, "are taken") != null);
 
-    _ = h.list(reg.gen, 0, "");
-    const broken = try probe.take("res");
+    _ = host.list(registry.gen, 0, "");
+    const broken = try probe.take("list");
     defer broken.destroy(testing.allocator);
     try testing.expect(broken.err == null);
     const want = [_][]const u8{ "false", "not overwritten", "{\"a\": 1, oops", "nil" };
     for (want, broken.items[0..want.len]) |w, it| try testing.expectEqualStrings(w, it.title);
 
-    _ = h.list(reg.gen, 1, "");
-    const bytes = try probe.take("res");
+    _ = host.list(registry.gen, 1, "");
+    const bytes = try probe.take("list");
     defer bytes.destroy(testing.allocator);
     try testing.expect(bytes.err == null);
     try testing.expectEqualStrings("true", bytes.items[0].title);
@@ -2248,20 +2246,20 @@ test "rows are kept to a size, and lumen.exec's strings outlive its options" {
 
     var probe: Probe = .{};
     defer probe.deinit();
-    const h = try testHost(&probe, dir);
-    defer h.shutdown();
-    h.reload();
-    try probe.wait("reg");
-    const reg = probe.reg.?;
+    const host = try testHost(&probe, dir);
+    defer host.shutdown();
+    host.reload();
+    try probe.wait("registry");
+    const registry = probe.registry.?;
 
     // One string 1000 rows copy: 5 GB outside the state's memory cap.
-    _ = h.list(reg.gen, 0, "");
-    const big = try probe.take("res");
+    _ = host.list(registry.gen, 0, "");
+    const big = try probe.take("list");
     defer big.destroy(testing.allocator);
     try testing.expectEqualStrings(rows_too_big, big.err.?);
 
-    _ = h.list(reg.gen, 1, "");
-    const long = try probe.take("res");
+    _ = host.list(registry.gen, 1, "");
+    const long = try probe.take("list");
     defer long.destroy(testing.allocator);
     try testing.expect(long.err == null);
     const row = long.items[0];
@@ -2270,8 +2268,8 @@ test "rows are kept to a size, and lumen.exec's strings outlive its options" {
     try testing.expectEqual(@as(usize, rows_mod.detail_bytes_max), row.detail.len);
     try testing.expectEqual(@as(usize, rows_mod.line_bytes_max), row.meta[0].value.len);
 
-    _ = h.list(reg.gen, 2, "");
-    const ran = try probe.take("res");
+    _ = host.list(registry.gen, 2, "");
+    const ran = try probe.take("list");
     defer ran.destroy(testing.allocator);
     try testing.expect(ran.err == null);
     try testing.expectEqualStrings("true", ran.items[0].title);

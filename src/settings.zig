@@ -509,13 +509,13 @@ fn isTokenCharacter(character: u8) bool {
 const testing = std.testing;
 
 test "defaults, then values from the file" {
-    var d = Settings.parse(testing.allocator, "");
-    defer d.deinit();
-    try testing.expectEqualStrings(default_theme, d.theme);
-    try testing.expect(d.files_in_root and d.clipboard);
-    try testing.expectEqual(@as(u32, 1000), d.clipboard_keep);
+    var defaults = Settings.parse(testing.allocator, "");
+    defer defaults.deinit();
+    try testing.expectEqualStrings(default_theme, defaults.theme);
+    try testing.expect(defaults.files_in_root and defaults.clipboard);
+    try testing.expectEqual(@as(u32, 1000), defaults.clipboard_keep);
 
-    var s = Settings.parse(testing.allocator,
+    var settings = Settings.parse(testing.allocator,
         \\# comment
         \\theme = nord
         \\text_size = large
@@ -530,20 +530,20 @@ test "defaults, then values from the file" {
         \\pdf = org.gnome.Evince.desktop
         \\.LOG = org.gnome.TextEditor.desktop
     );
-    defer s.deinit();
-    try testing.expectEqualStrings("nord", s.theme);
-    try testing.expectEqual(TextSize.large, s.text_size);
-    try testing.expectEqual(@as(u8, 90), s.opacity);
-    try testing.expectEqual(Position.center, s.position);
-    try testing.expect(!s.files_in_root and !s.clipboard and s.suggestions);
-    try testing.expectEqual(@as(u32, 500), s.clipboard_keep);
-    try testing.expectEqualStrings("kitty", s.terminal);
-    try testing.expectEqualStrings("org.gnome.Evince.desktop", s.appFor("", .pdf).?);
-    try testing.expectEqualStrings("org.gnome.TextEditor.desktop", s.appFor(".log", .text).?);
+    defer settings.deinit();
+    try testing.expectEqualStrings("nord", settings.theme);
+    try testing.expectEqual(TextSize.large, settings.text_size);
+    try testing.expectEqual(@as(u8, 90), settings.opacity);
+    try testing.expectEqual(Position.center, settings.position);
+    try testing.expect(!settings.files_in_root and !settings.clipboard and settings.suggestions);
+    try testing.expectEqual(@as(u32, 500), settings.clipboard_keep);
+    try testing.expectEqualStrings("kitty", settings.terminal);
+    try testing.expectEqualStrings("org.gnome.Evince.desktop", settings.appFor("", .pdf).?);
+    try testing.expectEqualStrings("org.gnome.TextEditor.desktop", settings.appFor(".log", .text).?);
 }
 
 test "bad values keep the default, bad lines are ignored" {
-    var s = Settings.parse(testing.allocator,
+    var settings = Settings.parse(testing.allocator,
         \\text_size = enormous
         \\opacity = 7
         \\clipboard_keep = lots
@@ -558,19 +558,19 @@ test "bad values keep the default, bad lines are ignored" {
         \\image = not-a-desktop-id
         \\video = mpv.desktop
     ++ "\n\x00\xff garbage\n");
-    defer s.deinit();
-    try testing.expectEqual(TextSize.default, s.text_size);
-    try testing.expectEqual(@as(u8, 97), s.opacity);
-    try testing.expectEqual(@as(u32, 1000), s.clipboard_keep);
-    try testing.expect(s.files_in_root);
-    try testing.expectEqualStrings("", s.terminal);
-    try testing.expectEqualStrings(default_theme, s.theme);
-    try testing.expectEqual(@as(usize, 1), s.open_with.count());
-    try testing.expectEqualStrings("mpv.desktop", s.appFor("", .video).?);
+    defer settings.deinit();
+    try testing.expectEqual(TextSize.default, settings.text_size);
+    try testing.expectEqual(@as(u8, 97), settings.opacity);
+    try testing.expectEqual(@as(u32, 1000), settings.clipboard_keep);
+    try testing.expect(settings.files_in_root);
+    try testing.expectEqualStrings("", settings.terminal);
+    try testing.expectEqualStrings(default_theme, settings.theme);
+    try testing.expectEqual(@as(usize, 1), settings.open_with.count());
+    try testing.expectEqualStrings("mpv.desktop", settings.appFor("", .video).?);
 }
 
 test "written settings read back the same, unknown keys kept" {
-    var s = Settings.parse(testing.allocator,
+    var settings = Settings.parse(testing.allocator,
         \\theme = dracula
         \\future_option = 42
         \\suggestions = false
@@ -579,10 +579,10 @@ test "written settings read back the same, unknown keys kept" {
         \\markdown = md.desktop
         \\.csv = office.desktop
     );
-    defer s.deinit();
+    defer settings.deinit();
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try s.write(&out.writer);
+    try settings.write(&out.writer);
     var back = Settings.parse(testing.allocator, out.written());
     defer back.deinit();
     try testing.expectEqualStrings("dracula", back.theme);
@@ -595,19 +595,19 @@ test "written settings read back the same, unknown keys kept" {
 }
 
 test "open-with: extension beats kind, Markdown falls back to text" {
-    var s = Settings.init(testing.allocator);
-    defer s.deinit();
-    try s.setOpenWith("text", "zed.desktop");
-    try testing.expectEqualStrings("zed.desktop", s.appFor(".md", .markdown).?);
-    try s.setOpenWith("markdown", "obsidian.desktop");
-    try testing.expectEqualStrings("obsidian.desktop", s.appFor(".md", .markdown).?);
-    try s.setOpenWith(".md", "typora.desktop");
-    try testing.expectEqualStrings("typora.desktop", s.appFor(".md", .markdown).?);
-    try s.setOpenWith(".md", "");
-    try s.setOpenWith("markdown", "");
-    try testing.expectEqualStrings("zed.desktop", s.appFor(".md", .markdown).?);
-    try testing.expectEqual(@as(?[]const u8, null), s.appFor("", .pdf));
-    try testing.expectError(error.BadApp, s.setOpenWith("pdf", "x\ny.desktop"));
+    var settings = Settings.init(testing.allocator);
+    defer settings.deinit();
+    try settings.setOpenWith("text", "zed.desktop");
+    try testing.expectEqualStrings("zed.desktop", settings.appFor(".md", .markdown).?);
+    try settings.setOpenWith("markdown", "obsidian.desktop");
+    try testing.expectEqualStrings("obsidian.desktop", settings.appFor(".md", .markdown).?);
+    try settings.setOpenWith(".md", "typora.desktop");
+    try testing.expectEqualStrings("typora.desktop", settings.appFor(".md", .markdown).?);
+    try settings.setOpenWith(".md", "");
+    try settings.setOpenWith("markdown", "");
+    try testing.expectEqualStrings("zed.desktop", settings.appFor(".md", .markdown).?);
+    try testing.expectEqual(@as(?[]const u8, null), settings.appFor("", .pdf));
+    try testing.expectError(error.BadApp, settings.setOpenWith("pdf", "x\ny.desktop"));
 }
 
 test "save is atomic and owner-only; load survives a missing file" {
@@ -622,10 +622,10 @@ test "save is atomic and owner-only; load survives a missing file" {
     defer missing.deinit();
     try testing.expectEqualStrings(default_theme, missing.theme);
 
-    var s = Settings.init(testing.allocator);
-    defer s.deinit();
-    try testing.expect(s.setChoice(.text_size, "small"));
-    try s.save(testing.allocator, path, &.{});
+    var settings = Settings.init(testing.allocator);
+    defer settings.deinit();
+    try testing.expect(settings.setChoice(.text_size, "small"));
+    try settings.save(testing.allocator, path, &.{});
     const before = Stamp.of(path);
     var back = Settings.load(testing.allocator, path);
     defer back.deinit();
@@ -634,14 +634,14 @@ test "save is atomic and owner-only; load survives a missing file" {
     _ = std.os.linux.statx(std.os.linux.AT.FDCWD, path, 0, .{ .MODE = true }, &st);
     try testing.expectEqual(@as(u32, 0o600), st.mode & 0o777);
 
-    try testing.expect(s.setChoice(.text_size, "large"));
-    try s.save(testing.allocator, path, &.{});
+    try testing.expect(settings.setChoice(.text_size, "large"));
+    try settings.save(testing.allocator, path, &.{});
     try testing.expect(!Stamp.of(path).eql(before));
 
     // Keys init.lua sets keep the file's values when saving.
-    try testing.expect(s.setChoice(.width, "wide"));
-    try testing.expect(s.setChoice(.text_size, "small"));
-    try s.save(testing.allocator, path, &.{"width"});
+    try testing.expect(settings.setChoice(.width, "wide"));
+    try testing.expect(settings.setChoice(.text_size, "small"));
+    try settings.save(testing.allocator, path, &.{"width"});
     var kept = Settings.load(testing.allocator, path);
     defer kept.deinit();
     try testing.expectEqual(Width.default, kept.width);
@@ -649,16 +649,16 @@ test "save is atomic and owner-only; load survives a missing file" {
 }
 
 test "each text choice sets its own field" {
-    var s = Settings.init(testing.allocator);
-    defer s.deinit();
-    try testing.expect(s.setChoice(.terminal, "kitty"));
-    try testing.expect(s.setChoice(.editor, "hx"));
-    try testing.expect(s.setChoice(.icon_theme, "Papirus"));
-    try testing.expectEqualStrings("kitty", s.terminal);
-    try testing.expectEqualStrings("hx", s.editor);
-    try testing.expectEqualStrings("Papirus", s.icon_theme);
-    try testing.expect(!s.setChoice(.editor, "rm -rf"));
-    try testing.expectEqualStrings("hx", s.editor);
+    var settings = Settings.init(testing.allocator);
+    defer settings.deinit();
+    try testing.expect(settings.setChoice(.terminal, "kitty"));
+    try testing.expect(settings.setChoice(.editor, "hx"));
+    try testing.expect(settings.setChoice(.icon_theme, "Papirus"));
+    try testing.expectEqualStrings("kitty", settings.terminal);
+    try testing.expectEqualStrings("hx", settings.editor);
+    try testing.expectEqualStrings("Papirus", settings.icon_theme);
+    try testing.expect(!settings.setChoice(.editor, "rm -rf"));
+    try testing.expectEqualStrings("hx", settings.editor);
 }
 
 test "check tells unknown keys from bad values" {

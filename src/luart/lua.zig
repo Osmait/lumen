@@ -293,7 +293,7 @@ pub fn tryCall(
     assert(nargs <= c.lua_gettop(L));
     assert(nresults >= 0);
     if (c.lua_checkstack(L, 2) == 0) {
-        c.lua_settop(L, -nargs - 1);
+        pop(L, nargs);
         _ = c.lua_pushstring(L, "Lua stack overflow");
         return false;
     }
@@ -484,6 +484,16 @@ pub const StackMark = struct {
     }
 };
 
+/// Pops `count` values, like the C API's `lua_pop` macro (translate-c does
+/// not carry it over). For values a loop takes off one by one, such as the
+/// value `lua_next` leaves above its key; a function that only has to leave
+/// the stack as it found it uses `StackMark`.
+pub fn pop(L: *State, count: c_int) void {
+    assert(count >= 0);
+    assert(c.lua_gettop(L) >= count);
+    c.lua_settop(L, -count - 1);
+}
+
 /// Pushes `table[name]` and returns its type.
 pub fn getField(L: *State, table: c_int, name: [:0]const u8) c_int {
     return c.lua_getfield(L, table, name.ptr);
@@ -495,7 +505,7 @@ pub fn fieldList(L: *State, table: c_int, name: [:0]const u8, where: []const u8)
     switch (getField(L, table, name)) {
         c.LUA_TTABLE => return c.lua_gettop(L),
         c.LUA_TNIL => {
-            c.lua_settop(L, -2);
+            pop(L, 1);
             return null;
         },
         else => raise(L, "{s}.{s}: a list expected, got {s}", .{ where, name, typeName(L, -1) }),
@@ -653,27 +663,27 @@ test "errors come back as messages, and the sandbox holds" {
     var budget: Budget = .{ .bytes_max = 8 << 20 };
     const L = try testState(&budget);
     defer c.lua_close(L);
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    try testing.expect(runCode(L, a, "x = 1 + 1") == null);
-    const msg = runCode(L, a, "error('boom')").?;
-    try testing.expect(std.mem.find(u8, msg, "boom") != null);
-    try testing.expect(std.mem.find(u8, msg, "traceback") != null);
+    try testing.expect(runCode(L, arena, "x = 1 + 1") == null);
+    const message = runCode(L, arena, "error('boom')").?;
+    try testing.expect(std.mem.find(u8, message, "boom") != null);
+    try testing.expect(std.mem.find(u8, message, "traceback") != null);
     // Nothing that ends the daemon or runs native code is reachable.
     try testing.expect(
-        runCode(L, a, "assert(os.exit == nil and os.execute == nil and io.popen == nil)") == null,
+        runCode(L, arena, "assert(os.exit == nil and os.execute == nil and io.popen == nil)") == null,
     );
     try testing.expect(
         runCode(
             L,
-            a,
+            arena,
             "assert(debug == nil and package.loadlib == nil and package.cpath == '')",
         ) == null,
     );
     try testing.expect(
-        runCode(L, a, "assert(string.format('%d', 3) == '3' and os.time() > 0)") == null,
+        runCode(L, arena, "assert(string.format('%d', 3) == '3' and os.time() > 0)") == null,
     );
     try testing.expectEqual(@as(c_int, 0), c.lua_gettop(L));
 }
@@ -682,72 +692,72 @@ test "a runaway loop stops at its deadline" {
     var budget: Budget = .{ .bytes_max = 8 << 20 };
     const L = try testState(&budget);
     defer c.lua_close(L);
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
     budget.deadline_ns = os.monotonicNs() + 50 * std.time.ns_per_ms;
-    const t0 = os.monotonicNs();
-    const msg = runCode(L, arena.allocator(), "while true do end").?;
-    try testing.expect(std.mem.find(u8, msg, "timed out") != null);
-    try testing.expect(os.monotonicNs() - t0 < 2 * std.time.ns_per_s);
+    const start_ns = os.monotonicNs();
+    const message = runCode(L, arena_state.allocator(), "while true do end").?;
+    try testing.expect(std.mem.find(u8, message, "timed out") != null);
+    try testing.expect(os.monotonicNs() - start_ns < 2 * std.time.ns_per_s);
 }
 
 test "memory is capped per state" {
     var budget: Budget = .{ .bytes_max = 4 << 20 };
     const L = try testState(&budget);
     defer c.lua_close(L);
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const msg = runCode(
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const message = runCode(
         L,
-        arena.allocator(),
+        arena_state.allocator(),
         "local t = {} for i = 1, 1e8 do t[i] = ('x'):rep(100) .. i end",
     ).?;
-    try testing.expect(std.mem.find(u8, msg, "memory") != null);
+    try testing.expect(std.mem.find(u8, message, "memory") != null);
     try testing.expect(budget.used_bytes <= budget.bytes_max);
     // Still usable afterwards.
-    try testing.expect(runCode(L, arena.allocator(), "x = 1") == null);
+    try testing.expect(runCode(L, arena_state.allocator(), "x = 1") == null);
 }
 
 test "what the time limit cannot stop is out of reach" {
     var budget: Budget = .{ .bytes_max = 8 << 20 };
     const L = try testState(&budget);
     defer c.lua_close(L);
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
     // A finalizer runs with the instruction hook off: none can be set.
-    const gc = runCode(L, a, "setmetatable({}, { __gc = function() while true do end end })").?;
-    try testing.expect(std.mem.find(u8, gc, "__gc is not available") != null);
-    try testing.expect(runCode(L, a, "setmetatable({}, { __gc = false })") != null);
+    const gc_error = runCode(L, arena, "setmetatable({}, { __gc = function() while true do end end })").?;
+    try testing.expect(std.mem.find(u8, gc_error, "__gc is not available") != null);
+    try testing.expect(runCode(L, arena, "setmetatable({}, { __gc = false })") != null);
     try testing.expect(runCode(
         L,
-        a,
+        arena,
         "local t = setmetatable({}, { __index = string }) assert(t.rep == string.rep)",
     ) == null);
     // Nor through the files' metatable, which every open file is marked by.
-    try testing.expect(runCode(L, a, "assert(getmetatable(io.stdout) == false)") == null);
-    try testing.expect(runCode(L, a, "io.stdout:write('')") == null);
+    try testing.expect(runCode(L, arena, "assert(getmetatable(io.stdout) == false)") == null);
+    try testing.expect(runCode(L, arena, "io.stdout:write('')") == null);
     // The daemon's standard input reads as empty.
     try testing.expect(runCode(
         L,
-        a,
+        arena,
         "assert(io.stdin == nil and io.read() == nil and io.lines()() == nil)",
     ) == null);
-    try testing.expect(std.mem.find(u8, runCode(L, a, "dofile()").?, "file name expected") != null);
+    try testing.expect(std.mem.find(u8, runCode(L, arena, "dofile()").?, "file name expected") != null);
 
     // A FIFO would wait for a writer forever; regular and missing files
     // behave as usual.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [512]u8 = undefined;
-    const dir = try os.tmpDirPath(&tmp, &dbuf);
-    const fifo = try std.fmt.allocPrintSentinel(a, "{s}/fifo", .{dir}, 0);
+    var dir_buffer: [512]u8 = undefined;
+    const dir = try os.tmpDirPath(&tmp, &dir_buffer);
+    const fifo = try std.fmt.allocPrintSentinel(arena, "{s}/fifo", .{dir}, 0);
     const linux = std.os.linux;
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(
         linux.mknodat(linux.AT.FDCWD, fifo, linux.S.IFIFO | 0o600, 0),
     ));
-    const code = try std.fmt.allocPrintSentinel(a,
+    const code = try std.fmt.allocPrintSentinel(arena,
         \\local fifo = "{s}"
         \\local f, err = io.open(fifo)
         \\assert(f == nil and err:find("not a regular file"), err)
@@ -757,26 +767,26 @@ test "what the time limit cannot stop is out of reach" {
         \\assert(io.open(fifo .. ".txt"):read("a") == "hi")
         \\assert(io.open("/dev/null"):read("a") == "")
     , .{fifo}, 0);
-    if (runCode(L, a, code)) |msg| {
-        std.debug.print("{s}\n", .{msg});
+    if (runCode(L, arena, code)) |message| {
+        std.debug.print("{s}\n", .{message});
         return error.TestUnexpectedResult;
     }
 }
 
 test "a capped allocator holds no more than its cap" {
     var capped: Capped = .{ .child = testing.allocator, .bytes_max = 1000 };
-    const a = capped.allocator();
-    const x = try a.alloc(u8, 600);
-    try testing.expectError(error.OutOfMemory, a.alloc(u8, 600));
+    const allocator = capped.allocator();
+    const first = try allocator.alloc(u8, 600);
+    try testing.expectError(error.OutOfMemory, allocator.alloc(u8, 600));
     try testing.expect(capped.refused);
-    a.free(x);
+    allocator.free(first);
     try testing.expectEqual(@as(usize, 0), capped.used_bytes);
     // Growing counts too.
-    var y = try a.alloc(u8, 900);
-    try testing.expectError(error.OutOfMemory, a.realloc(y, 1200));
-    y = try a.realloc(y, 1000);
+    var second = try allocator.alloc(u8, 900);
+    try testing.expectError(error.OutOfMemory, allocator.realloc(second, 1200));
+    second = try allocator.realloc(second, 1000);
     try testing.expectEqual(@as(usize, 1000), capped.used_bytes);
-    a.free(y);
+    allocator.free(second);
     try testing.expectEqual(@as(usize, 0), capped.used_bytes);
 }
 
