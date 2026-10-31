@@ -243,9 +243,9 @@ pub fn openRegular(path: [*:0]const u8) Error!i32 {
 pub fn readHead(path: [*:0]const u8, buf: []u8) []const u8 {
     const fd = openRegular(path) catch return "";
     defer close(fd);
-    const n = linux.read(fd, buf.ptr, buf.len);
-    if (linux.errno(n) != .SUCCESS) return "";
-    return buf[0..n];
+    const bytes_read = linux.read(fd, buf.ptr, buf.len);
+    if (linux.errno(bytes_read) != .SUCCESS) return "";
+    return buf[0..bytes_read];
 }
 
 /// Mount points at or below `under` whose file system can hang a `stat`:
