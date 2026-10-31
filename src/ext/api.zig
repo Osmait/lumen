@@ -401,7 +401,7 @@ fn theme(L: *lua.State) lua.Error!c_int {
         .fg = foreground,
         .ink = try color(L, arena, "ink", foreground),
         .accent = try color(L, arena, "accent", null),
-        .from_style = std.mem.eql(u8, extension.id, "style"),
+        .from_style = std.mem.eql(u8, extension.id, Host.style_extension_id),
     };
     load.themes.append(arena, new_theme) catch return lua.failOom(L);
     return 0;
@@ -508,7 +508,7 @@ fn set(L: *lua.State) lua.Error!c_int {
     const load = try loadOf(L, "lumen.set");
     const arena = load.arena;
     // A style's settings are defaults for when it is chosen; init.lua's fix them.
-    const settings = if (std.mem.eql(u8, extension.id, "style"))
+    const settings = if (std.mem.eql(u8, extension.id, Host.style_extension_id))
         &load.style_settings
     else
         &load.settings;
@@ -520,7 +520,7 @@ fn set(L: *lua.State) lua.Error!c_int {
         };
         var number_buffer: [64]u8 = undefined;
         const value: []const u8 = switch (lua.c.lua_type(L, -1)) {
-            lua.c.LUA_TBOOLEAN => if (lua.c.lua_toboolean(L, -1) != 0) "true" else "false",
+            lua.c.LUA_TBOOLEAN => Host.toggleText(lua.c.lua_toboolean(L, -1) != 0),
             lua.c.LUA_TSTRING => lua.toSlice(L, -1).?,
             lua.c.LUA_TNUMBER => blk: {
                 const integer = lua.c.lua_tointegerx(L, -1, null);

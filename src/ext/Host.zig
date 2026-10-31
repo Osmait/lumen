@@ -112,6 +112,10 @@ worker_arena: std.heap.ArenaAllocator,
 /// The registry's types live in registry.zig; they are re-exported here
 /// because the window names them through Host.
 pub const Mode = registry_mod.Mode;
+pub const config_extension_id = registry_mod.config_extension_id;
+pub const style_extension_id = registry_mod.style_extension_id;
+pub const toggleText = registry_mod.toggleText;
+pub const toggleIsOn = registry_mod.toggleIsOn;
 pub const Command = registry_mod.Command;
 pub const Keymap = registry_mod.Keymap;
 pub const PrefKind = registry_mod.PrefKind;
@@ -668,16 +672,16 @@ fn loadAll(host: *Host, load: *Load) void {
         host.lock.lockUncancelable(host.io);
         defer host.lock.unlock(host.io);
         break :blk worker_arena.dupe(u8, host.style.slice()) catch {
-            problem(load, "style", "out of memory");
+            problem(load, style_extension_id, "out of memory");
             break :blk "";
         };
     };
     if (style.len > 0) host.loadStyle(load, style);
 
     if (worker_arena.printSentinel("{s}/init.lua", .{host.config_dir}, 0)) |path| {
-        if (os.info(path) != null) host.loadSource(load, "config", host.config_dir, path, null);
+        if (os.info(path) != null) host.loadSource(load, config_extension_id, host.config_dir, path, null);
     } else |_| {
-        problem(load, "config", "out of memory");
+        problem(load, config_extension_id, "out of memory");
     }
 
     for (host.extensionDirs(worker_arena)) |id| host.loadExtension(load, id);
@@ -765,7 +769,7 @@ fn isIdCharacter(character: u8) bool {
 /// their preferences and storage, and its themes and settings would pass
 /// for theirs.
 pub fn reservedId(id: []const u8) bool {
-    return std.mem.eql(u8, id, "config") or std.mem.eql(u8, id, "style");
+    return std.mem.eql(u8, id, config_extension_id) or std.mem.eql(u8, id, style_extension_id);
 }
 
 /// Reports what went wrong with a file in Settings > Extensions. Out of
@@ -813,13 +817,13 @@ fn loadStyle(host: *Host, load: *Load, name: []const u8) void {
         return;
     const path = worker_arena.printSentinel("{s}/init.lua", .{dir}, 0) catch return;
     if (os.info(path) != null) {
-        host.loadSource(load, "style", dir, path, null);
+        host.loadSource(load, style_extension_id, dir, path, null);
     } else if (os.info(dir) != null) {
         // A style folder may hold only a style.css.
     } else if (styles.find(name)) |built_in| {
-        host.loadSource(load, "style", host.config_dir, "=style", built_in.lua);
+        host.loadSource(load, style_extension_id, host.config_dir, "=style", built_in.lua);
     } else {
-        problem(load, "style", "no such style");
+        problem(load, style_extension_id, "no such style");
     }
 }
 
@@ -1073,7 +1077,7 @@ fn parseField(
     };
     if (kind == .choice) preference.choices = prefChoices(L, arena, field_table, where);
     preference.default = switch (kind) {
-        .toggle => if (lua.fieldBool(L, field_table, "default", false, where)) "true" else "false",
+        .toggle => registry_mod.toggleText(lua.fieldBool(L, field_table, "default", false, where)),
         .choice => lua.fieldString(L, arena, field_table, "default", where) orelse
             preference.choices[0].value,
         .text, .password => lua.fieldString(L, arena, field_table, "default", where) orelse "",
@@ -1493,7 +1497,7 @@ const SubmitContext = struct {
         lua.c.lua_createtable(L, 0, @intCast(values.len));
         for (values) |value| {
             if (value.toggle) {
-                const on = std.mem.eql(u8, value.value, "true");
+                const on = registry_mod.toggleIsOn(value.value);
                 lua.c.lua_pushboolean(L, @intFromBool(on));
             } else {
                 lua.pushString(L, value.value);
@@ -1904,13 +1908,14 @@ test "extensions load, list, search and run actions" {
     try testing.expect(registry.layout.panels == .single);
     try testing.expect(registry.layout.rows == .inline_);
     try testing.expect(!registry.layout.show.icons and registry.layout.show.subtitles);
-    for (registry.settings) |o| {
-        const want: []const u8 = if (std.mem.eql(u8, o.key, "width")) "wide" else if (std.mem.eql(
-            u8,
-            o.key,
-            "suggestions",
-        )) "false" else "90";
-        try testing.expectEqualStrings(want, o.value);
+    const settings_expected = std.StaticStringMap([]const u8).initComptime(.{
+        .{ "width", "wide" },
+        .{ "suggestions", "false" },
+        .{ "opacity", "90" },
+    });
+    try testing.expectEqual(settings_expected.kvs.len, registry.settings.len);
+    for (registry.settings) |setting| {
+        try testing.expectEqualStrings(settings_expected.get(setting.key).?, setting.value);
     }
     // The broken one is reported, the others load.
     try testing.expectEqual(@as(usize, 1), registry.problems.len);

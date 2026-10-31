@@ -8,6 +8,23 @@ const item_mod = @import("../item.zig");
 const themes = @import("../ui/themes.zig");
 const layout_mod = @import("../layout.zig");
 
+/// The extension id init.lua runs as.
+pub const config_extension_id = "config";
+/// The extension id the chosen style's file runs as.
+pub const style_extension_id = "style";
+
+/// A toggle's value as text, as preferences.json, form values and
+/// `Pref.default` hold it.
+pub fn toggleText(on: bool) [:0]const u8 {
+    return if (on) "true" else "false";
+}
+
+/// Whether a toggle's text value is on; anything but `toggleText(true)` is
+/// off.
+pub fn toggleIsOn(text: []const u8) bool {
+    return std.mem.eql(u8, text, toggleText(true));
+}
+
 pub const Mode = enum {
     /// `items`: listed once when the command opens, filtered by Lumen.
     list,

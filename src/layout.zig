@@ -145,11 +145,20 @@ fn enumValue(comptime Enum: type, value: Value) SetError!Enum {
     return std.meta.stringToEnum(Enum, name) orelse error.BadValue;
 }
 
+/// The names `rows` takes in Lua. `Rows` cannot use them as tags, because
+/// `inline` is a keyword.
+const rows_names = std.StaticStringMap(Rows).initComptime(.{
+    .{ "stacked", .stacked },
+    .{ "inline", .inline_ },
+});
+
+comptime {
+    assert(rows_names.kvs.len == std.enums.values(Rows).len);
+}
+
 fn rowsValue(value: Value) SetError!Rows {
     const name = value.string orelse return error.BadValue;
-    if (std.mem.eql(u8, name, "stacked")) return .stacked;
-    if (std.mem.eql(u8, name, "inline")) return .inline_;
-    return error.BadValue;
+    return rows_names.get(name) orelse error.BadValue;
 }
 
 /// Sets one `show` flag.
