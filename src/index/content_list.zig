@@ -24,6 +24,15 @@ pub const ListError = std.process.RunError || std.mem.Allocator.Error;
 /// service forever: ripgrep gets this long, then the current index stays.
 const list_timeout_ns = 60 * std.time.ns_per_s;
 
+pub const ListOptions = struct {
+    /// Also documents whose text is extracted (PDF, Office), not only
+    /// plain text files.
+    documents: bool,
+    /// Set: the listing is given up (error.Canceled) within ~0.1 s.
+    /// Shutting down waited for ripgrep, up to its minute.
+    stop: ?*const std.atomic.Value(bool) = null,
+};
+
 /// Documents to index, sorted by path (stable doc ids between builds).
 /// Paths are owned by `arena`.
 pub fn list(
@@ -31,20 +40,7 @@ pub fn list(
     gpa: std.mem.Allocator,
     io: std.Io,
     root: []const u8,
-    with_documents: bool,
-) ListError![]content.DocIn {
-    return listUntil(arena, gpa, io, root, with_documents, null);
-}
-
-/// `list`, given up (error.Canceled) within ~0.1 s of `stop` being set:
-/// shutting down waited for ripgrep, up to its minute.
-pub fn listUntil(
-    arena: std.mem.Allocator,
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    root: []const u8,
-    with_documents: bool,
-    stop: ?*const std.atomic.Value(bool),
+    options: ListOptions,
 ) ListError![]content.DocIn {
     var argv: std.ArrayList([]const u8) = .empty;
     // --no-ignore-parent: ignore files above the root are not about it (and
@@ -64,26 +60,34 @@ pub fn listUntil(
     // prints, so with the root as argument a root below any excluded name
     // (a home in /srv/build, the tests' .zig-cache/tmp) listed nothing.
     try argv.append(arena, ".");
-    const out = try runLister(gpa, io, argv.items, root, stop);
+    const out = try runLister(gpa, io, argv.items, root, options.stop);
     defer gpa.free(out);
 
     const sep: []const u8 = if (std.mem.endsWith(u8, root, "/")) "" else "/";
     var docs: std.ArrayList(content.DocIn) = .empty;
     var it = std.mem.tokenizeScalar(u8, out, 0);
-    var zbuf: [4096]u8 = undefined;
+    var path_buffer: [4096]u8 = undefined;
     while (it.next()) |line| {
-        const rel = if (std.mem.startsWith(u8, line, "./")) line[2..] else line;
-        const z = std.mem.printSentinel(&zbuf, "{s}{s}{s}", .{ root, sep, rel }, 0) catch continue;
-        const p: []const u8 = z;
-        const doc_kind = documentKind(p);
-        if (doc_kind and !with_documents) continue;
-        if (!doc_kind and binaryByName(p)) continue;
-        const st = stat(z, doc_kind) orelse continue;
+        const path_relative = if (std.mem.startsWith(u8, line, "./")) line[2..] else line;
+        const path_z = std.mem.printSentinel(
+            &path_buffer,
+            "{s}{s}{s}",
+            .{ root, sep, path_relative },
+            0,
+        ) catch continue;
+        const path: []const u8 = path_z;
+        const kind: Kind = if (documentKind(path)) .document else .text;
+        if (kind == .document and !options.documents) continue;
+        if (kind == .text and binaryByName(path)) continue;
+        const file_stat = stat(path_z, kind) orelse continue;
         try docs.append(arena, .{
-            .path = try arena.dupe(u8, p),
-            .mtime = st.mtime,
-            .size = st.size,
-            .source = if (doc_kind) .extracted else .plain,
+            .path = try arena.dupe(u8, path),
+            .mtime = file_stat.mtime,
+            .size = file_stat.size,
+            .source = switch (kind) {
+                .document => .extracted,
+                .text => .plain,
+            },
         });
     }
     std.mem.sort(content.DocIn, docs.items, {}, struct {
@@ -136,9 +140,13 @@ fn runLister(
 
 pub const Stat = struct { mtime: i64, size: u64 };
 
+/// What a listed file is indexed as: its own bytes, or extracted text.
+/// Their size bounds differ.
+pub const Kind = enum { text, document };
+
 /// A listed file's mtime and size, or null if it is not one to index (any
-/// more): not a regular file, or a size out of bounds.
-pub fn stat(path: [*:0]const u8, doc_kind: bool) ?Stat {
+/// more): not a regular file, or a size out of bounds for its `kind`.
+pub fn stat(path: [*:0]const u8, kind: Kind) ?Stat {
     var stx: linux.Statx = undefined;
     const rc = linux.statx(
         linux.AT.FDCWD,
@@ -148,8 +156,10 @@ pub fn stat(path: [*:0]const u8, doc_kind: bool) ?Stat {
         &stx,
     );
     if (linux.errno(rc) != .SUCCESS or stx.mode & linux.S.IFMT != linux.S.IFREG) return null;
-    if (!doc_kind and (stx.size > content.text_bytes_max or stx.size < 3)) return null;
-    if (doc_kind and stx.size > 64 << 20) return null;
+    switch (kind) {
+        .text => if (stx.size > content.text_bytes_max or stx.size < 3) return null,
+        .document => if (stx.size > 64 << 20) return null,
+    }
     return .{ .mtime = stx.mtime.sec, .size = stx.size };
 }
 
@@ -219,13 +229,13 @@ const testing = std.testing;
 const TestTree = sys.TestDir;
 
 /// `list` relative to the tree, or SkipZigTest without ripgrep.
-fn listRel(arena: std.mem.Allocator, t: *const TestTree, with_documents: bool) ![]content.DocIn {
+fn listRel(arena: std.mem.Allocator, t: *const TestTree, documents: bool) ![]content.DocIn {
     return list(
         arena,
         testing.allocator,
         testing.io,
         t.abs,
-        with_documents,
+        .{ .documents = documents },
     ) catch |err| switch (err) {
         error.FileNotFound => error.SkipZigTest,
         else => err,
@@ -356,14 +366,16 @@ test "list: a root below an excluded name still lists" {
         testing.allocator,
         testing.io,
         sub,
-        true,
+        .{ .documents = true },
     ) catch |err| switch (err) {
         error.FileNotFound => return error.SkipZigTest,
         else => return err,
     };
     try testing.expectEqual(@as(usize, 0), got.len); // 1 byte: too small
     try t.write("build/target/node_modules/me/note.txt", "hello");
-    const again = try list(arena_state.allocator(), testing.allocator, testing.io, sub, true);
+    const again = try list(arena_state.allocator(), testing.allocator, testing.io, sub, .{
+        .documents = true,
+    });
     try testing.expectEqual(@as(usize, 1), again.len);
     // A trailing slash on the root does not double it.
     try testing.expect(std.mem.endsWith(u8, again[0].path, "/me/note.txt"));
@@ -382,7 +394,7 @@ test "list: file names with newlines and invalid UTF-8 come back whole" {
         testing.allocator,
         testing.io,
         t.abs,
-        true,
+        .{ .documents = true },
     ) catch |err| switch (err) {
         error.FileNotFound => return error.SkipZigTest,
         else => return err,

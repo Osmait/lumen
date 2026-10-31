@@ -137,16 +137,11 @@ pub const Engine = struct {
         // On folded queries (see `refines`).
         const refine = engine.refines(query_folded);
 
-        var sifted = try engine.sift(
-            gpa,
-            pool,
-            store,
-            query_folded,
-            query_mask,
-            limit,
-            refine,
-            cacheable,
-        );
+        var sifted = try engine.sift(gpa, pool, store, query_folded, query_mask, .{
+            .limit = limit,
+            .refine = refine,
+            .cacheable = cacheable,
+        });
         defer sifted.deinit(gpa);
         const finalists = &sifted.finalists;
 
@@ -180,6 +175,15 @@ pub const Engine = struct {
         } else engine.cache_valid = false;
     }
 
+    const SiftOptions = struct {
+        /// Hits the search returns; `limit * finalist_mul` finalists are kept.
+        limit: usize,
+        /// Sift the last query's candidates instead of the whole store.
+        refine: bool,
+        /// Keep every match as the next keystroke's candidates.
+        cacheable: bool,
+    };
+
     const Sifted = struct {
         /// The best `limit * finalist_mul` by cheap score.
         finalists: std.ArrayList(Pair) = .empty,
@@ -203,10 +207,11 @@ pub const Engine = struct {
         store: *const Store,
         query_folded: []const u8,
         query_mask: u64,
-        limit: usize,
-        refine: bool,
-        cacheable: bool,
+        options: SiftOptions,
     ) std.mem.Allocator.Error!Sifted {
+        const limit = options.limit;
+        const refine = options.refine;
+        const cacheable = options.cacheable;
         const keep = limit * finalist_mul;
         const source_len: usize = if (refine) engine.last_candidates.items.len else store.len();
         // Fewer chunks when refining: split the finalist budget among them,
@@ -578,14 +583,14 @@ pub fn isUnder(path: []const u8, dir: []const u8) bool {
 /// Coarse on purpose: today vs this month vs old.
 fn recencyBonus(ctx: *const RecencyCtx, id: u32, buf: *[4096]u8) i32 {
     const now = ctx.now;
-    const p = ctx.store.path(id, buf[0 .. buf.len - 1]) orelse return 0;
-    if (p.len == 0) return 0;
-    for (ctx.no_stat) |dir| if (isUnder(p, dir)) return 0;
-    buf[p.len] = 0;
-    const mt = sys.mtime(buf[0..p.len :0]) orelse return 0;
-    if (mt > now) return recency_max;
+    const path = ctx.store.path(id, buf[0 .. buf.len - 1]) orelse return 0;
+    if (path.len == 0) return 0;
+    for (ctx.no_stat) |dir| if (isUnder(path, dir)) return 0;
+    buf[path.len] = 0;
+    const mtime = sys.mtime(buf[0..path.len :0]) orelse return 0;
+    if (mtime > now) return recency_max;
     // Saturating: an mtime is whatever the file system says.
-    return switch (@divTrunc(now -| mt, 86_400)) {
+    return switch (@divTrunc(now -| mtime, std.time.s_per_day)) {
         0 => 300,
         1...6 => 220,
         7...29 => 140,

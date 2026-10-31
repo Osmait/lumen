@@ -256,6 +256,22 @@ pub const Index = struct {
         return index.docs_count - index.docs_removed_count;
     }
 
+    /// Whether document `doc` is still indexed and its text was extracted
+    /// (a PDF, an Office file) rather than read from the file itself.
+    pub fn extractedLive(index: *const Index, doc: u32) bool {
+        return !index.removed(doc) and
+            index.sources[doc] == @backingInt(Source.extracted);
+    }
+
+    /// How many documents `extractedLive` is true for.
+    pub fn extractedCount(index: *const Index) usize {
+        var count: usize = 0;
+        for (0..index.docs_count) |doc_index| {
+            count += @intFromBool(index.extractedLive(@intCast(doc_index)));
+        }
+        return count;
+    }
+
     pub fn docIn(index: *const Index, doc: u32) DocIn {
         return .{
             .path = index.path(doc),
@@ -1035,9 +1051,9 @@ fn toMemory(sink: *Sink, header: Header) BuildError!Index {
 
 fn toFile(sink: *Sink, header: Header, path_z: [:0]const u8) FileError!Index {
     try sink.flush();
-    const f = sink.file.?;
-    try f.writeAt(&header.encode(), 0);
-    try f.commit();
+    const file = sink.file.?;
+    try file.writeAt(&header.encode(), 0);
+    try file.commit();
     return Index.open(path_z);
 }
 

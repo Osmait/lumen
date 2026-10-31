@@ -86,37 +86,45 @@ pub fn start(
 ) StartError!*Service {
     const service = try gpa.create(Service);
     errdefer gpa.destroy(service);
+    try service.init(gpa, io, root, cache_path);
+    errdefer service.deinit();
+    service.thread = try std.Thread.spawn(.{}, run, .{service});
+    // A thread without a name works the same; only `top` shows it.
+    service.thread.?.setName(io, "lm-files") catch {};
+    return service;
+}
+
+/// Fills `service` in place, with no thread yet. In place because the
+/// fields point at each other: `cfg` at `roots`, and `live` at `cfg`. On
+/// error nothing is left to free.
+fn init(
+    service: *Service,
+    gpa: std.mem.Allocator,
+    io: Io,
+    root: []const u8,
+    cache_path: []const u8,
+) StartError!void {
     const root_copy = try gpa.dupe(u8, root);
     errdefer gpa.free(root_copy);
     const cache = try gpa.dupeSentinel(u8, cache_path, 0);
     errdefer gpa.free(cache);
-    const search_pool = try Pool.create(gpa, io, Pool.allCores());
-    errdefer search_pool.destroy();
-    const scan_pool = try Pool.create(gpa, io, Pool.halfCores());
-    errdefer scan_pool.destroy();
-    const content_search_pool = try Pool.create(gpa, io, Pool.allCores());
-    errdefer content_search_pool.destroy();
-    const content_build_pool = try Pool.create(gpa, io, Pool.halfCores());
-    errdefer content_build_pool.destroy();
-    search_pool.nameThreads("lm-search");
-    scan_pool.nameThreads("lm-scan");
-    content_search_pool.nameThreads("lm-csearch");
-    content_build_pool.nameThreads("lm-cbuild");
+    const pools: Pools = try .create(gpa, io);
+    errdefer pools.destroy();
+
     service.* = .{
         .gpa = gpa,
         .io = io,
-        // Set below, once `cfg` has its final address.
+        // Set right below: Live keeps a pointer to `cfg`, and reads it while
+        // it starts, so `cfg` must be in its place first.
         .live = undefined,
-        .search_pool = search_pool,
-        .scan_pool = scan_pool,
-        .content_search_pool = content_search_pool,
-        .content_build_pool = content_build_pool,
-        .cfg = undefined,
+        .search_pool = pools.search,
+        .scan_pool = pools.scan,
+        .content_search_pool = pools.content_search,
+        .content_build_pool = pools.content_build,
         .roots = .{root_copy},
+        .cfg = .{ .roots = &service.roots },
         .cache_path = cache,
     };
-    service.cfg = .{ .roots = &service.roots };
-
     var base = Store.open(service.cache_path) catch blk: {
         var empty: store_mod.Builder = .empty;
         break :blk try empty.finish(gpa);
@@ -131,17 +139,66 @@ pub fn start(
         base.deinit(gpa);
         return err;
     };
-    errdefer service.live.deinit();
+    // A saved index is a photo: nobody watched while Lumen was off.
     service.live.pending_resync = true;
+
     const event_fd = std.os.linux.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
     // Without one, `pause` looks at `stop` every 100 ms instead.
     if (std.os.linux.errno(event_fd) == .SUCCESS) service.wake_fd = @intCast(event_fd);
-    errdefer if (service.wake_fd != no_fd) sys.close(service.wake_fd);
-    service.thread = try std.Thread.spawn(.{}, run, .{service});
-    // A thread without a name works the same; only `top` shows it.
-    service.thread.?.setName(io, "lm-files") catch {};
-    return service;
 }
+
+/// Frees what `init` made. The thread must have stopped (or never started).
+fn deinit(service: *Service) void {
+    if (service.wake_fd != no_fd) sys.close(service.wake_fd);
+    service.live.deinit();
+    const pools: Pools = .{
+        .search = service.search_pool,
+        .scan = service.scan_pool,
+        .content_search = service.content_search_pool,
+        .content_build = service.content_build_pool,
+    };
+    pools.destroy();
+    service.gpa.free(service.roots[0]);
+    service.gpa.free(service.cache_path);
+}
+
+/// The four pools a service owns. Two are its own; the content ones it only
+/// lends (see `content_search_pool`).
+const Pools = struct {
+    search: *Pool,
+    scan: *Pool,
+    content_search: *Pool,
+    content_build: *Pool,
+
+    const CreateError = Pool.CreateError;
+
+    fn create(gpa: std.mem.Allocator, io: Io) CreateError!Pools {
+        const search_pool = try Pool.create(gpa, io, Pool.allCores());
+        errdefer search_pool.destroy();
+        const scan_pool = try Pool.create(gpa, io, Pool.halfCores());
+        errdefer scan_pool.destroy();
+        const content_search_pool = try Pool.create(gpa, io, Pool.allCores());
+        errdefer content_search_pool.destroy();
+        const content_build_pool = try Pool.create(gpa, io, Pool.halfCores());
+        search_pool.nameThreads("lm-search");
+        scan_pool.nameThreads("lm-scan");
+        content_search_pool.nameThreads("lm-csearch");
+        content_build_pool.nameThreads("lm-cbuild");
+        return .{
+            .search = search_pool,
+            .scan = scan_pool,
+            .content_search = content_search_pool,
+            .content_build = content_build_pool,
+        };
+    }
+
+    fn destroy(pools: Pools) void {
+        pools.search.destroy();
+        pools.scan.destroy();
+        pools.content_search.destroy();
+        pools.content_build.destroy();
+    }
+};
 
 /// Stops the thread, saves what was learned if needed, frees everything.
 /// The flush is what makes today's files still be there tomorrow.
@@ -152,15 +209,8 @@ pub fn shutdown(service: *Service) void {
         _ = std.os.linux.write(service.wake_fd, std.mem.asBytes(&one), 8);
     }
     if (service.thread) |thread| thread.join();
-    if (service.wake_fd != no_fd) sys.close(service.wake_fd);
     if (service.live.dirty or service.live.pending_resync) service.saveOnShutdown();
-    service.live.deinit();
-    service.search_pool.destroy();
-    service.scan_pool.destroy();
-    service.content_search_pool.destroy();
-    service.content_build_pool.destroy();
-    service.gpa.free(service.roots[0]);
-    service.gpa.free(service.cache_path);
+    service.deinit();
     service.gpa.destroy(service);
 }
 
@@ -194,13 +244,12 @@ pub fn status(service: *Service) Status {
     service.lock.lockSharedUncancelable(service.io);
     defer service.lock.unlockShared(service.io);
     return .{
-        // Live entries: the delta also holds scaffolding and its own graves.
-        .entries = service.live.base.liveLen() + service.live.delta.liveLen(),
+        .entries = service.live.entriesLive(),
         .watches = service.live.stats.watches,
-        .unwatched = service.live.watcher.unwatched,
+        .unwatched = service.live.unwatched(),
         .armed = service.live.fullyArmed(),
         .rescanning = service.live.pending_resync,
-        .index_bytes = service.live.base.buf.len + service.live.delta.buf.len,
+        .index_bytes = service.live.indexBytes(),
         .rescans = service.rescans.load(.monotonic),
         .last_rescan_ns = service.last_rescan_ns.load(.monotonic),
     };
@@ -235,7 +284,7 @@ fn freeReplaced(gpa: std.mem.Allocator, old: Live.Replaced) void {
 pub fn nameChanges(service: *Service) ?u64 {
     service.lock.lockSharedUncancelable(service.io);
     defer service.lock.unlockShared(service.io);
-    if (!service.live.fullyArmed() or service.live.watcher.unwatched > 0) return null;
+    if (!service.live.fullyArmed() or service.live.unwatched() > 0) return null;
     return service.name_changes.load(.acquire);
 }
 
@@ -350,7 +399,7 @@ fn applyEvents(service: *Service, arena: std.mem.Allocator) bool {
             log.warn("applying file events: {t}", .{err});
             service.live.pending_resync = true;
         };
-        if (service.live.scans.items.len == 0) return service.rescanDue();
+        if (!service.live.scansPending()) return service.rescanDue();
         scans = service.live.takeScans();
         entries_max = service.live.limits.delta_max;
     }
@@ -755,7 +804,7 @@ test "service: the delta threshold triggers a compaction" {
         try testing.expect(try waitHas(s, arena, q, try arena.print("/umbral_{d}.txt", .{i})));
     }
     s.lock.lockSharedUncancelable(s.io);
-    const delta_live = s.live.delta.liveLen();
+    const delta_live = s.live.delta.store.liveLen();
     s.lock.unlockShared(s.io);
     try testing.expect(delta_live < 5);
 }

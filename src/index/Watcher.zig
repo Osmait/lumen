@@ -53,9 +53,9 @@ pub fn create(gpa: std.mem.Allocator) CreateError!*Watcher {
     if (linux.errno(rc) != .SUCCESS) return error.Inotify;
     const fd: i32 = @intCast(rc);
     errdefer sys.close(fd);
-    const w = try gpa.create(Watcher);
-    w.* = .{ .fd = fd };
-    return w;
+    const watcher = try gpa.create(Watcher);
+    watcher.* = .{ .fd = fd };
+    return watcher;
 }
 
 /// Closing a descriptor with 72k watches takes the kernel milliseconds:
