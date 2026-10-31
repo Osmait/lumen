@@ -43,9 +43,6 @@ prune_watches: bool = false,
 slow_mounts: [][]u8 = &.{},
 watcher: *Watcher,
 config: *const scan.Config,
-/// Where the index is saved after a rescan; without it the next start would
-/// rescan instead of mapping.
-cache_path: ?[:0]const u8,
 /// Small scans (a new directory) and rescans run here.
 scan_pool: *Pool,
 /// The next base entry whose directory `armProgress` watches; null once
@@ -172,7 +169,6 @@ pub fn initUnarmed(
     gpa: std.mem.Allocator,
     base: Store,
     config: *const scan.Config,
-    cache_path: ?[:0]const u8,
     scan_pool: *Pool,
 ) (std.mem.Allocator.Error || Watcher.CreateError)!Live {
     var delta: Delta = try .init(gpa);
@@ -187,7 +183,6 @@ pub fn initUnarmed(
         .delta = delta,
         .watcher = watcher,
         .config = config,
-        .cache_path = cache_path,
         .scan_pool = scan_pool,
         .arm_cursor = 0,
         .last_compact_ns = sys.monotonicNs(),
@@ -817,7 +812,7 @@ const Tree = struct {
         tree.makeAbsolute("outside/");
         for (entries) |entry| tree.make(entry);
         const base = try scan.scan(gpa, tree.pool, &tree.config, null, null);
-        tree.live = try Live.initUnarmed(gpa, base, &tree.config, null, tree.pool);
+        tree.live = try Live.initUnarmed(gpa, base, &tree.config, tree.pool);
         while (tree.live.armProgress(1000)) {}
         return tree;
     }
@@ -1480,7 +1475,7 @@ test "live: paths too long to open are left out, not shown empty" {
     defer pool.destroy();
     const roots = [_][]const u8{"/r"};
     const config: scan.Config = .{ .roots = &roots };
-    var live = try Live.initUnarmed(gpa, base, &config, null, pool);
+    var live = try Live.initUnarmed(gpa, base, &config, pool);
     defer live.deinit();
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();

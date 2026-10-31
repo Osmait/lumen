@@ -131,13 +131,7 @@ fn init(
         var empty: store_mod.Builder = .empty;
         break :blk try empty.finish(gpa);
     };
-    service.live = Live.initUnarmed(
-        gpa,
-        base,
-        &service.config,
-        service.cache_path,
-        service.scan_pool,
-    ) catch |err| {
+    service.live = Live.initUnarmed(gpa, base, &service.config, service.scan_pool) catch |err| {
         base.deinit(gpa);
         return err;
     };
