@@ -55,9 +55,9 @@ pub fn parse(comptime T: type, arena: std.mem.Allocator, json: []const u8) ?T {
 
 fn query(arena: std.mem.Allocator, comptime T: type, what: [:0]const u8) ?T {
     const json = request(arena, what) orelse blk: {
-        const out = proc.output(&.{ "hyprctl", "-j", what }) orelse return null;
-        defer proc.free(out);
-        break :blk arena.dupe(u8, out) catch return null;
+        const output = proc.output(&.{ "hyprctl", "-j", what }) orelse return null;
+        defer proc.free(output);
+        break :blk arena.dupe(u8, output) catch return null;
     };
     return parse(T, arena, json) orelse {
         log.warn("hyprctl {s}: unexpected JSON", .{what});
@@ -69,9 +69,9 @@ fn query(arena: std.mem.Allocator, comptime T: type, what: [:0]const u8) ?T {
 /// show asks for the focused monitor, and starting hyprctl for it took ~4 ms
 /// against 0.04. Null when the socket cannot be reached.
 fn request(arena: std.mem.Allocator, what: []const u8) ?[]const u8 {
-    var msg_buf: [64]u8 = undefined;
-    const msg = std.mem.print(&msg_buf, "j/{s}", .{what}) catch return null;
-    return talk(arena, msg);
+    var message_buffer: [64]u8 = undefined;
+    const message = std.mem.print(&message_buffer, "j/{s}", .{what}) catch return null;
+    return talk(arena, message);
 }
 
 /// Hyprland's two sockets: one for requests (dispatches, queries), one it
@@ -89,18 +89,18 @@ const Socket = enum {
 };
 
 /// Connects to one of Hyprland's sockets; null without Hyprland.
-fn connect(socket: Socket, opts: os.unix.ConnectOptions) ?linux.fd_t {
+fn connect(socket: Socket, options: os.unix.ConnectOptions) ?linux.fd_t {
     const signature_z = c.g_getenv("HYPRLAND_INSTANCE_SIGNATURE") orelse return null;
     const runtime_dir_z = c.g_getenv(ipc.env.runtime_dir) orelse return null;
     const instance_signature = std.mem.span(signature_z);
     const runtime_dir = std.mem.span(runtime_dir_z);
-    var path_buf: [@sizeOf(@FieldType(linux.sockaddr.un, "path"))]u8 = undefined;
+    var path_buffer: [@sizeOf(@FieldType(linux.sockaddr.un, "path"))]u8 = undefined;
     const path = std.mem.print(
-        &path_buf,
+        &path_buffer,
         "{s}/hypr/{s}/{s}",
         .{ runtime_dir, instance_signature, socket.fileName() },
     ) catch return null;
-    return os.unix.connect(path, opts);
+    return os.unix.connect(path, options);
 }
 
 /// A compositor that does not answer must not freeze the window.
@@ -129,15 +129,15 @@ comptime {
 /// nothing was sent (no socket), so hyprctl may try instead: once sent, a
 /// dispatch must never go twice (a toggle would undo itself). What Hyprland
 /// answers ("ok" per dispatch) does not matter.
-fn dispatchOver(msg: []const u8) bool {
+fn dispatchOver(message: []const u8) bool {
     const fd = connect(.requests, .{}) orelse return false;
     defer _ = linux.close(fd);
-    const written = linux.write(fd, msg.ptr, msg.len);
+    const written = linux.write(fd, message.ptr, message.len);
     if (os.unix.failed(written) != null) return false;
     if (written == 0) return false;
     // Partly sent: the rest goes too, never again from the start.
-    if (written < msg.len and !os.unix.writeAll(fd, msg[written..])) {
-        log.warn("dispatch partly sent: {d} of {d} bytes", .{ written, msg.len });
+    if (written < message.len and !os.unix.writeAll(fd, message[written..])) {
+        log.warn("dispatch partly sent: {d} of {d} bytes", .{ written, message.len });
     }
     const deadline_ns = os.monotonicNs() + answer_timeout_ns;
     var answer: [ok_answer_bytes_max]u8 = undefined;
@@ -147,16 +147,16 @@ fn dispatchOver(msg: []const u8) bool {
     return true;
 }
 
-/// Sends `msg` to the request socket and reads the whole answer.
-fn talk(arena: std.mem.Allocator, msg: []const u8) ?[]const u8 {
+/// Sends `message` to the request socket and reads the whole answer.
+fn talk(arena: std.mem.Allocator, message: []const u8) ?[]const u8 {
     const fd = connect(.requests, .{}) orelse return null;
     defer _ = linux.close(fd);
-    if (!os.unix.writeAll(fd, msg)) return null;
+    if (!os.unix.writeAll(fd, message)) return null;
     const deadline_ns = os.monotonicNs() + answer_timeout_ns;
     var answer: std.ArrayList(u8) = .empty;
     while (true) {
         if (answer.items.len >= answer_bytes_max) {
-            log.warn("{s}: answer over {d} bytes, dropped", .{ msg, answer_bytes_max });
+            log.warn("{s}: answer over {d} bytes, dropped", .{ message, answer_bytes_max });
             return null;
         }
         answer.ensureUnusedCapacity(arena, answer_chunk_bytes) catch return null;
@@ -329,13 +329,13 @@ pub fn sendAfterHide() void {
 /// Sends what `batch` queued; hyprctl if the socket cannot be reached.
 pub fn sendQueued() void {
     if (dispatch_queue.len == 0) return;
-    const msg = dispatch_queue.buffer[0..dispatch_queue.len];
+    const queued = dispatch_queue.buffer[0..dispatch_queue.len];
     dispatch_queue.len = 0;
-    if (dispatchOver(msg)) return;
-    assert(std.mem.startsWith(u8, msg, batch_prefix));
+    if (dispatchOver(queued)) return;
+    assert(std.mem.startsWith(u8, queued, batch_prefix));
     // The queue without its prefix, and the terminating zero.
     var batch_buffer: [dispatch_queue_bytes_max]u8 = undefined;
-    const commands = msg[batch_prefix.len..];
+    const commands = queued[batch_prefix.len..];
     const batch_z = std.mem.printSentinel(&batch_buffer, "{s}", .{commands}, 0) catch return;
     proc.spawn(&.{ "hyprctl", "--batch", batch_z });
 }
@@ -485,7 +485,7 @@ pub fn layoutCommands(
     // activeWindow returns no window without an address.
     assert(window.address.len > 0);
     const current_size: geometry.Size = .{ .w = window.size[0], .h = window.size[1] };
-    const rect = geometry.place(layout, monitor_area.usable(), current_size, layout_gap_px);
+    const placed = geometry.place(layout, monitor_area.usable(), current_size, layout_gap_px);
     var commands: std.ArrayList([]const u8) = .empty;
     if (window.fullscreen != 0) try commands.append(arena, "fullscreen 0");
     if (!window.floating) {
@@ -493,11 +493,11 @@ pub fn layoutCommands(
     }
     try commands.append(arena, try arena.print(
         "resizewindowpixel exact {d} {d},address:{s}",
-        .{ rect.w, rect.h, window.address },
+        .{ placed.w, placed.h, window.address },
     ));
     try commands.append(arena, try arena.print(
         "movewindowpixel exact {d} {d},address:{s}",
-        .{ rect.x, rect.y, window.address },
+        .{ placed.x, placed.y, window.address },
     ));
     return commands.items;
 }
@@ -514,7 +514,8 @@ test "clients: recorded output, extra fields ignored, ordered by focus" {
     sortByFocus(all);
     try testing.expectEqualStrings("com.mitchellh.ghostty", all[0].class);
     try testing.expectEqualStrings("🔊 voice | Server - Discord", all[2].title);
-    try testing.expect(!all[1].mapped); // the special-workspace one: the UI skips it
+    // The one on the special workspace is not mapped: the UI skips it.
+    try testing.expect(!all[1].mapped);
     try testing.expectEqual(@as(i64, -99), all[1].workspace.id);
 }
 
@@ -522,26 +523,29 @@ test "monitors: rotation and scale give the usable area" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const monitors_json = @embedFile("testdata/hypr_monitors.json");
-    const mons = parse([]MonitorJson, arena.allocator(), monitors_json).?;
-    try testing.expectEqualStrings("DP-1", focusedName(mons).?);
+    const monitors = parse([]MonitorJson, arena.allocator(), monitors_json).?;
+    try testing.expectEqualStrings("DP-1", focusedName(monitors).?);
     // HDMI-A-1: 1600x900 rotated 270° -> 900x1600 logical, bar on top.
-    const hdmi = findMonitor(mons, 0).?.usable();
+    const hdmi = findMonitor(monitors, 0).?.usable();
     try testing.expectEqual(geometry.Rect{ .x = 4307, .y = 38, .w = 900, .h = 1562 }, hdmi);
     // DP-1: 1920x1080 at scale 1.25 -> 1536x864 logical.
-    const dp = findMonitor(mons, 1).?.usable();
-    try testing.expectEqual(geometry.Rect{ .x = 2387, .y = 38, .w = 1536, .h = 826 }, dp);
-    try testing.expect(findMonitor(mons, 7) == null);
+    const display_port = findMonitor(monitors, 1).?.usable();
+    try testing.expectEqual(
+        geometry.Rect{ .x = 2387, .y = 38, .w = 1536, .h = 826 },
+        display_port,
+    );
+    try testing.expect(findMonitor(monitors, 7) == null);
 
     // Replies no monitor gives are refused, not computed with.
-    var bad = mons[1];
+    var bad = monitors[1];
     for ([_]f64{ 0, -1, 1e-300, std.math.nan(f64), std.math.inf(f64) }) |scale| {
         bad.scale = scale;
         try testing.expect(findMonitor(&.{bad}, bad.id) == null);
     }
-    bad = mons[1];
+    bad = monitors[1];
     bad.width = std.math.maxInt(i32);
     try testing.expect(findMonitor(&.{bad}, bad.id) == null);
-    bad = mons[1];
+    bad = monitors[1];
     bad.reserved[0] = -5;
     try testing.expect(findMonitor(&.{bad}, bad.id) == null);
 }
@@ -550,27 +554,33 @@ test "layout commands: tiled window floats first, fullscreen leaves first" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
-    const mons = parse([]MonitorJson, allocator, @embedFile("testdata/hypr_monitors.json")).?;
+    const monitors_json = @embedFile("testdata/hypr_monitors.json");
+    const monitors = parse([]MonitorJson, allocator, monitors_json).?;
     const all = parse([]Client, allocator, @embedFile("testdata/hypr_clients.json")).?;
-    const discord = all[0]; // tiled, on DP-1
-    const discord_monitor = findMonitor(mons, discord.monitor).?;
-    const cmds = try layoutCommands(allocator, discord, discord_monitor, .left_half);
-    try testing.expectEqual(@as(usize, 3), cmds.len);
-    try testing.expectEqualStrings("setfloating address:0x5600000000a0", cmds[0]);
+    // Discord's window is tiled, on DP-1.
+    const discord = all[0];
+    const discord_monitor = findMonitor(monitors, discord.monitor).?;
+    const commands = try layoutCommands(allocator, discord, discord_monitor, .left_half);
+    try testing.expectEqual(@as(usize, 3), commands.len);
+    try testing.expectEqualStrings("setfloating address:0x5600000000a0", commands[0]);
     try testing.expectEqualStrings(
         "resizewindowpixel exact 756 810,address:0x5600000000a0",
-        cmds[1],
+        commands[1],
     );
-    try testing.expectEqualStrings("movewindowpixel exact 2395 46,address:0x5600000000a0", cmds[2]);
+    try testing.expectEqualStrings(
+        "movewindowpixel exact 2395 46,address:0x5600000000a0",
+        commands[2],
+    );
 
     var full = all[1];
     full.fullscreen = 1;
     full.floating = true;
-    const full_cmds = try layoutCommands(allocator, full, findMonitor(mons, 0).?, .maximize);
-    try testing.expectEqualStrings("fullscreen 0", full_cmds[0]);
-    try testing.expectEqual(@as(usize, 3), full_cmds.len);
+    const full_monitor = findMonitor(monitors, 0).?;
+    const full_commands = try layoutCommands(allocator, full, full_monitor, .maximize);
+    try testing.expectEqualStrings("fullscreen 0", full_commands[0]);
+    try testing.expectEqual(@as(usize, 3), full_commands.len);
 
-    const joined = try batchString(testing.allocator, cmds[0..2]);
+    const joined = try batchString(testing.allocator, commands[0..2]);
     defer testing.allocator.free(joined);
     try testing.expectEqualStrings(
         "dispatch setfloating address:0x5600000000a0 ; dispatch resizewindowpixel exact 756 810,address:0x5600000000a0",

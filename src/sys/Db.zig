@@ -144,11 +144,11 @@ fn bind(db: *Db, stmt: *c.sqlite3_stmt, args: anytype) Error!void {
     assert(c.sqlite3_bind_parameter_count(stmt) == args.len);
     inline for (args, 0..) |arg, arg_index| {
         const parameter: c_int = arg_index + 1;
-        const rc = switch (@typeInfo(@TypeOf(arg))) {
+        const bind_result = switch (@typeInfo(@TypeOf(arg))) {
             .int, .comptime_int => c.sqlite3_bind_int64(stmt, parameter, arg),
             else => bindText(stmt, parameter, arg),
         };
-        if (rc != c.SQLITE_OK) {
+        if (bind_result != c.SQLITE_OK) {
             log.warn("bind ?{d}: {s}", .{ parameter, c.sqlite3_errmsg(db.handle) });
             return error.DbBind;
         }
@@ -165,8 +165,8 @@ fn execArgs(db: *Db, sql: [:0]const u8, args: anytype) Error!void {
 
 /// Runs a statement that returns no rows.
 fn run(db: *Db, stmt: *c.sqlite3_stmt) Error!void {
-    const rc = c.sqlite3_step(stmt);
-    if (rc != c.SQLITE_DONE) return db.stepFailed(rc);
+    const step_result = c.sqlite3_step(stmt);
+    if (step_result != c.SQLITE_DONE) return db.stepFailed(step_result);
 }
 
 /// The next row, or null once the statement is done (a failure is an
@@ -175,12 +175,12 @@ fn nextRow(db: *Db, stmt: *c.sqlite3_stmt) Error!bool {
     return switch (c.sqlite3_step(stmt)) {
         c.SQLITE_ROW => true,
         c.SQLITE_DONE => false,
-        else => |rc| db.stepFailed(rc),
+        else => |step_result| db.stepFailed(step_result),
     };
 }
 
-fn stepFailed(db: *Db, rc: c_int) Error {
-    log.warn("step ({d}): {s}", .{ rc, c.sqlite3_errmsg(db.handle) });
+fn stepFailed(db: *Db, step_result: c_int) Error {
+    log.warn("step ({d}): {s}", .{ step_result, c.sqlite3_errmsg(db.handle) });
     return error.DbStep;
 }
 
@@ -409,8 +409,9 @@ test "the history keeps as many entries as the setting says" {
     var db = try Db.open(Db.in_memory);
     defer db.close();
     for (0..8) |i| {
-        var buf: [16]u8 = undefined;
-        try db.addClip(try std.mem.print(&buf, "clip {d}", .{i}), @intCast(i), 5);
+        var content_buffer: [16]u8 = undefined;
+        const content = try std.mem.print(&content_buffer, "clip {d}", .{i});
+        try db.addClip(content, @intCast(i), 5);
     }
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
@@ -440,20 +441,21 @@ test "the list loads each entry's head, the entry is read whole by id" {
 
 test "the database and its -wal and -shm are owner-only" {
     const linux = std.os.linux;
-    var dir: @import("os").TestDir = try .init();
-    defer dir.deinit();
-    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var test_dir: @import("os").TestDir = try .init();
+    defer test_dir.deinit();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     // Made world-readable, as earlier versions left it.
-    try dir.write("lumen.db", "");
-    _ = linux.chmod(try dir.path(&buf, "lumen.db"), 0o644);
-    var db = try Db.open(try dir.path(&buf, "lumen.db"));
+    try test_dir.write("lumen.db", "");
+    const chmod_result = linux.chmod(try test_dir.path(&path_buffer, "lumen.db"), 0o644);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(chmod_result));
+    var db = try Db.open(try test_dir.path(&path_buffer, "lumen.db"));
     defer db.close();
     try db.addClip("a password", 1, Db.clip_entries_max);
     for ([_][]const u8{ "lumen.db", "lumen.db-wal", "lumen.db-shm" }) |name| {
         var stx: linux.Statx = undefined;
-        const path = try dir.path(&buf, name);
-        const rc = linux.statx(linux.AT.FDCWD, path, 0, .{ .MODE = true }, &stx);
-        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+        const path = try test_dir.path(&path_buffer, name);
+        const statx_result = linux.statx(linux.AT.FDCWD, path, 0, .{ .MODE = true }, &stx);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(statx_result));
         try std.testing.expectEqual(@as(u16, 0o600), stx.mode & 0o777);
     }
 }
