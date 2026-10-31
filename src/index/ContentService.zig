@@ -87,6 +87,9 @@ unsaved: bool = false,
 /// In `retry_arena`. Service thread only.
 retry: []const content.DocIn = &.{},
 retry_arena: std.heap.ArenaAllocator,
+/// The service thread, set by `run` before its first check. What the
+/// comments call "service thread only" asserts it (`assertWorkerThread`).
+worker_thread_id: ?std.Thread.Id = null,
 
 /// The thread pools it borrows: they must outlive the service.
 pub const Pools = struct { search: *Pool, build: *Pool };
@@ -519,6 +522,7 @@ fn diff(
     arena: std.mem.Allocator,
     docs: []content.DocIn,
 ) std.mem.Allocator.Error!Diff {
+    service.assertWorkerThread();
     const index = if (service.index) |*index| index else return .{ .gone = &.{}, .added = docs };
     var ids: std.StringHashMapUnmanaged(u32) = .empty;
     try ids.ensureTotalCapacity(arena, @intCast(index.live()));
@@ -558,6 +562,7 @@ fn unchanged(index: *const content.Index, id: u32, doc: content.DocIn) bool {
 /// Every file to index, listed by ripgrep; `names` is what the name index
 /// said before listing, so a change during the listing lists again next time.
 fn listAll(service: *ContentService, arena: std.mem.Allocator, names: ?u64) ?[]content.DocIn {
+    service.assertWorkerThread();
     const start_ns = sys.monotonicNs();
     const docs = content_list.listUntil(
         arena,
@@ -622,7 +627,15 @@ fn indexedChanges(
     return .{ .gone = gone.items, .added = added.items };
 }
 
+/// The service thread is the only one that replaces the index and the only
+/// one that reads `listed_names`, `unsaved` and `retry`: what it does
+/// without the lock relies on that.
+fn assertWorkerThread(service: *const ContentService) void {
+    assert(service.worker_thread_id.? == std.Thread.getCurrentId());
+}
+
 fn refresh(service: *ContentService) void {
+    service.assertWorkerThread();
     service.last_check_ns.store(sys.monotonicNs(), .release);
     // Counted when done, so `checks` going up means its result is visible.
     defer _ = service.checks.fetchAdd(1, .release);
@@ -753,6 +766,7 @@ fn buildNext(
     docs_all: ?[]const content.DocIn,
     changed: Diff,
 ) ?content.Index {
+    service.assertWorkerThread();
     const reader: content.TextReader = .{
         .read = textOf,
         .ctx = service,
@@ -843,6 +857,7 @@ fn buildNextToFile(
 }
 
 fn retrySave(service: *ContentService) void {
+    service.assertWorkerThread();
     service.lock.lockSharedUncancelable(service.io);
     defer service.lock.unlockShared(service.io);
     const index = service.index orelse return;
@@ -913,6 +928,7 @@ fn sweepText(service: *ContentService) void {
 }
 
 fn run(service: *ContentService) void {
+    service.worker_thread_id = std.Thread.getCurrentId();
     // A saved index is a photo: always check it on start.
     // `seen` is read before refreshing: a poke that lands during a refresh
     // still counts afterwards (it may come after the listing).

@@ -209,15 +209,18 @@ const TextOut = struct {
     gpa: std.mem.Allocator,
     gap: Gap = .none,
 
-    fn sep(text_out: *TextOut, g: Gap) void {
-        if (@backingInt(g) > @backingInt(text_out.gap)) text_out.gap = g;
+    /// A gap at least as wide as `gap` before the next text.
+    fn sep(text_out: *TextOut, gap: Gap) void {
+        if (@backingInt(gap) > @backingInt(text_out.gap)) text_out.gap = gap;
     }
 
-    fn text(text_out: *TextOut, s: []const u8) !void {
-        if (text_out.gap != .none and text_out.out.items.len > 0)
-            try text_out.out.append(text_out.gpa, if (text_out.gap == .newline) '\n' else ' ');
+    fn text(text_out: *TextOut, bytes: []const u8) !void {
+        if (text_out.gap != .none and text_out.out.items.len > 0) {
+            const separator: u8 = if (text_out.gap == .newline) '\n' else ' ';
+            try text_out.out.append(text_out.gpa, separator);
+        }
         text_out.gap = .none;
-        try text_out.out.appendSlice(text_out.gpa, s);
+        try text_out.out.appendSlice(text_out.gpa, bytes);
     }
 
     /// Character data, entities not decoded (CDATA) or already decoded.
@@ -263,20 +266,26 @@ const TextOut = struct {
     /// ends. Null for a tag.
     fn markup(text_out: *TextOut, xml: []const u8, i: usize, skipping: bool) !?usize {
         const rest = xml[i..];
-        if (std.mem.startsWith(u8, rest, "<!--"))
-            return if (std.mem.findPos(u8, xml, i + 4, "-->")) |e| e + 3 else xml.len;
+        if (std.mem.startsWith(u8, rest, "<!--")) {
+            const end = std.mem.findPos(u8, xml, i + "<!--".len, "-->") orelse return xml.len;
+            return end + "-->".len;
+        }
         if (std.mem.startsWith(u8, rest, "<![CDATA[")) {
-            const e = std.mem.findPos(u8, xml, i + 9, "]]>") orelse xml.len;
-            if (!skipping) try text_out.raw(xml[i + 9 .. e]);
-            return @min(e + 3, xml.len);
+            const start = i + "<![CDATA[".len;
+            const end = std.mem.findPos(u8, xml, start, "]]>") orelse xml.len;
+            if (!skipping) try text_out.raw(xml[start..end]);
+            return @min(end + "]]>".len, xml.len);
         }
         if (std.mem.startsWith(u8, rest, "<?")) {
             // A declaration starts each concatenated member (pptx slides).
             text_out.sep(.newline);
-            return if (std.mem.findPos(u8, xml, i + 2, "?>")) |e| e + 2 else xml.len;
+            const end = std.mem.findPos(u8, xml, i + "<?".len, "?>") orelse return xml.len;
+            return end + "?>".len;
         }
-        if (std.mem.startsWith(u8, rest, "<!"))
-            return if (std.mem.findScalarPos(u8, xml, i + 2, '>')) |e| e + 1 else xml.len;
+        if (std.mem.startsWith(u8, rest, "<!")) {
+            const end = std.mem.findScalarPos(u8, xml, i + "<!".len, '>') orelse return xml.len;
+            return end + ">".len;
+        }
         return null;
     }
 };
