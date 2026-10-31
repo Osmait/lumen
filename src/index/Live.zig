@@ -139,14 +139,24 @@ pub const Scan = struct {
     path: [:0]u8,
     depth: u16,
     hidden: u8,
-    sub: ?Store = null,
-    /// Over `Limits.delta_entries_max` entries: a rescan instead, which adding it
-    /// would ask for anyway.
-    too_big: bool = false,
+    outcome: Outcome = .unread,
+
+    /// What `readScans` found in the directory.
+    pub const Outcome = union(enum) {
+        /// `readScans` has not run yet.
+        unread,
+        /// Out of memory while reading: a rescan instead.
+        failed,
+        /// Over `Limits.delta_entries_max` entries: a rescan instead, which
+        /// adding it would ask for anyway.
+        too_big,
+        /// What the directory holds, as a store whose root is the directory.
+        read: Store,
+    };
 
     fn deinit(scan_job: *Scan, gpa: std.mem.Allocator) void {
         gpa.free(scan_job.path);
-        if (scan_job.sub) |*sub| sub.deinit(gpa);
+        if (scan_job.outcome == .read) scan_job.outcome.read.deinit(gpa);
     }
 };
 
@@ -509,28 +519,36 @@ pub fn readScans(
         sub_config.follow_roots = false;
         sub_config.entries_max = entries_max;
         var scan_stats: scan.Stats = .{};
-        // Out of memory: no store, and `addScans` asks for a rescan.
-        scan_job.sub = scan.scan(gpa, pool, &sub_config, null, &scan_stats) catch null;
-        scan_job.too_big = scan_stats.truncated;
+        var sub = scan.scan(gpa, pool, &sub_config, null, &scan_stats) catch {
+            scan_job.outcome = .failed;
+            continue;
+        };
+        if (scan_stats.truncated) {
+            sub.deinit(gpa);
+            scan_job.outcome = .too_big;
+            continue;
+        }
+        scan_job.outcome = .{ .read = sub };
     }
 }
 
 /// Adds what `readScans` found under each directory's entry and watches
-/// the directories, then frees `scans`.
+/// the directories, then frees `scans`. Every scan went through
+/// `readScans`.
 pub fn addScans(live: *Live, scans: *Scans) std.mem.Allocator.Error!void {
     defer freeScans(live.gpa, scans);
     var added = false;
     for (scans.items) |*scan_job| {
         // Removed again before it was read (later in the same batch).
         if (!live.delta.alive(scan_job.directory)) continue;
-        const sub = if (scan_job.sub) |*sub| sub else {
-            live.pending_resync = true;
-            continue;
+        const sub = switch (scan_job.outcome) {
+            .read => |*sub| sub,
+            .failed, .too_big => {
+                live.pending_resync = true;
+                continue;
+            },
+            .unread => unreachable,
         };
-        if (scan_job.too_big) {
-            live.pending_resync = true;
-            continue;
-        }
         const map = try live.delta.appendStore(
             live.gpa,
             sub,
