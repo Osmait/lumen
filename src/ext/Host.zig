@@ -11,41 +11,45 @@
 //! older registry (the files were reloaded since) is answered with an
 //! error, never run against the wrong command.
 //!
-//! A request goes: `list` (main thread) → `run` (the worker's loop) →
-//! `listExecute` → `ListContext.run` (inside Lua) → `deliver` →
-//! `deliverCallback` (main loop) → `Callbacks.list` (the UI). `act`,
-//! `submit`, `root` and `reload` go the same way.
+//! This file is the host's public side and its thread: the types the
+//! window receives, the requests it posts (main thread), the worker's loop
+//! that takes them, and the delivery of answers to the main loop. What the
+//! worker does with a request is in files of its own:
+//!
+//!   loading.zig    reload: each file in a new Lua state, a new registry
+//!   spec.zig       what `lumen.extension { ... }` returns, read into a Load
+//!   Load.zig       what a reload collects; undone for a file that fails
+//!   Extension.zig  one file's Lua state, and running Lua in it
+//!   requests.zig   list, root search, act and submit, run in that state
+//!   api.zig        the `lumen` module the files call
+//!   rows.zig       rows Lua returns, read into Items
+//!   registry.zig   what the window gets from a reload
+//!   stamp.zig      whether the files changed (the window asks, main thread)
+//!
+//! A request goes: `list` (main thread) → `post` → `run` (the worker's
+//! loop) → `requests.listExecute` → `ListContext.run` (inside Lua) →
+//! `deliver` → `deliverCallback` (main loop) → `Callbacks.list_callback`
+//! (the UI). `act`, `submit` and `root` go the same way; `reload` runs
+//! `loading.reloadExecute`.
 
 const std = @import("std");
 const c = @import("c");
-const lua = @import("luart").lua;
-const api = @import("api.zig");
+const os = @import("os");
+const core = @import("core");
 const rows_mod = @import("rows.zig");
 const registry_mod = @import("registry.zig");
 const generation_mod = @import("generation.zig");
-const os = @import("os");
-const core = @import("core");
+const stamp_mod = @import("stamp.zig");
+const requests = @import("requests.zig");
+const loading = @import("loading.zig");
+const Extension = @import("Extension.zig");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
-const themes = @import("../ui/themes.zig");
-const layout_mod = @import("../layout.zig");
-const styles = @import("styles");
 
 const Host = @This();
 
 const log = std.log.scoped(.ext);
 const assert = std.debug.assert;
-
-/// Limits for each extension's Lua state: the memory it may hold, and how
-/// long a load, a list or an action may run before the instruction hook
-/// stops it.
-const memory_bytes_max = 64 << 20;
-const load_budget_ns = 5 * std.time.ns_per_s;
-const list_budget_ns = 10 * std.time.ns_per_s;
-const act_budget_ns = 30 * std.time.ns_per_s;
-/// For anything Lua still runs as a state closes (lumen.exec waits no
-/// longer than this).
-const close_budget_ns = 1 * std.time.ns_per_s;
 
 /// The most rows one list answer takes, and actions one row takes.
 pub const items_max = rows_mod.items_max;
@@ -53,32 +57,12 @@ pub const actions_max = rows_mod.actions_max;
 /// The most rows one command adds to the root search, so that a single
 /// extension cannot push the others' rows out.
 pub const root_search_items_max = 8;
-const root_search_budget_ns = 3 * std.time.ns_per_s;
-/// The most of a query a search command or a root search gets.
-const query_bytes_max = 1024;
-
-/// What one answer's rows take in all. They are copied out of the state, so
-/// its memory cap does not hold them: one string that 1000 rows refer to
-/// becomes 1000 copies.
-const rows_bytes_max = 16 << 20;
-const rows_too_big = std.fmt.comptimePrint(
-    "the rows take more than {d} MB",
-    .{rows_bytes_max >> 20},
-);
 /// Fields of one form.
 pub const form_fields_max = 20;
 /// An extension's folder name, a command's or a field's name.
 pub const id_bytes_max = 40;
-/// A grid command's cells to a line.
-const grid_columns_min = 2;
-const grid_columns_max = 10;
-
 comptime {
     assert(root_search_items_max <= items_max);
-    assert(grid_columns_min <= grid_columns_max);
-    assert(registry_mod.grid_columns_default >= grid_columns_min);
-    assert(registry_mod.grid_columns_default <= grid_columns_max);
-    assert(grid_columns_max <= std.math.maxInt(@FieldType(Command, "columns")));
 }
 
 gpa: std.mem.Allocator,
@@ -97,7 +81,7 @@ stop: std.atomic.Value(bool) = .init(false),
 /// The last request number handed out. Main thread only.
 request_generation_last: RequestGeneration = .none,
 /// Under `lock`.
-pending: Pending = .{},
+pending: requests.Pending = .{},
 /// The style to load before init.lua; empty is none. Under `lock`.
 style: core.FixedStr(64) = .{},
 
@@ -105,7 +89,7 @@ style: core.FixedStr(64) = .{},
 extensions: std.ArrayList(*Extension) = .empty,
 /// Where the worker finds each command of the current registry, in the
 /// registry's order.
-worker_commands: []WorkerCommand = &.{},
+worker_commands: []requests.WorkerCommand = &.{},
 registry_generation: RegistryGeneration = .none,
 /// Extension ids and folders; reset on reload.
 worker_arena: std.heap.ArenaAllocator,
@@ -135,6 +119,7 @@ pub const SettingOverride = registry_mod.SettingOverride;
 pub const ExtensionInfo = registry_mod.ExtensionInfo;
 pub const Problem = registry_mod.Problem;
 pub const Registry = registry_mod.Registry;
+pub const stamp = stamp_mod.stamp;
 
 /// A command's rows. Owned by the receiver: `destroy`.
 pub const ListResult = struct {
@@ -183,11 +168,10 @@ pub const RootResult = struct {
 
 pub const RootSection = struct { command: CommandIndex, items: []Item };
 
-/// Called on the GTK main loop; each takes ownership of its result.
 /// Each request's answer is handed to its callback on the GTK main loop,
-/// with `context`: `reload` to `registry_callback`, `list` to
-/// `list_callback`, `act` and `submit` to `act_callback`, `root` to
-/// `root_callback`.
+/// with `context`, and the callback owns it from then on: `reload`'s to
+/// `registry_callback`, `list`'s to `list_callback`, `act`'s and `submit`'s
+/// to `act_callback`, `root`'s to `root_callback`.
 pub const Callbacks = struct {
     context: ?*anyopaque,
     registry_callback: *const fn (*Registry, ?*anyopaque) void,
@@ -199,209 +183,28 @@ pub const Callbacks = struct {
 /// A form's values, as the UI hands them over.
 pub const FormValue = struct { name: []const u8, value: []const u8, toggle: bool };
 
-// ------------------------------------------------- the worker's own types
-
-/// One loaded file and its Lua state. Worker thread only.
-pub const Extension = struct {
-    budget: lua.Budget = .{ .bytes_max = memory_bytes_max },
-    L: *lua.State = undefined,
-    host: *Host,
-    id: [:0]const u8,
-    folder: [:0]const u8,
-    /// Its storage and preferences: $XDG_DATA_HOME/lumen/extensions/<id>.
-    data: [:0]const u8,
-    /// Set only while this extension's file runs: `lumen.theme`,
-    /// `lumen.keymap`, `lumen.set`, `lumen.layout` and `lumen.icons` add
-    /// to it. Null at any other time, which those functions report as an
-    /// error.
-    load: ?*Load = null,
-
-    pub fn gpa(extension: *Extension) std.mem.Allocator {
-        return extension.host.gpa;
+/// Whether `id` may name an extension's folder, a command or a field:
+/// 1 to `id_bytes_max` of a-z, 0-9, - and _.
+pub fn validId(id: []const u8) bool {
+    if (id.len == 0) return false;
+    if (id.len > id_bytes_max) return false;
+    for (id) |character| {
+        if (!isIdCharacter(character)) return false;
     }
+    return true;
+}
 
-    pub fn io(extension: *Extension) std.Io {
-        return extension.host.io;
-    }
+fn isIdCharacter(character: u8) bool {
+    return std.ascii.isLower(character) or std.ascii.isDigit(character) or
+        character == '-' or character == '_';
+}
 
-    /// Runs `handler` in this state, protected, with `budget_ns` to finish
-    /// (the instruction hook stops it past that). Its error, or null.
-    fn run(
-        extension: *Extension,
-        arena: std.mem.Allocator,
-        budget_ns: u64,
-        comptime Context: type,
-        context: *Context,
-        comptime handler: fn (*lua.State, *Context) void,
-    ) ?[:0]const u8 {
-        extension.budget.deadline_ns = os.monotonicNs() + budget_ns;
-        defer extension.budget.deadline_ns = std.math.maxInt(u64);
-        return lua.protect(extension.L, arena, Context, context, handler);
-    }
-
-    /// Closes its state. Closing runs the finalizers left, with the
-    /// instruction hook off (Lua turns hooks off in `__gc`); extensions
-    /// cannot set any (lua.openLibs), and lumen.exec gets a deadline anyway.
-    fn close(extension: *Extension) void {
-        extension.budget.deadline_ns = os.monotonicNs() + close_budget_ns;
-        lua.c.lua_close(extension.L);
-    }
-};
-
-const c_noref = lua.c.LUA_NOREF;
-
-/// What a reload collects; lives in the new registry's arena.
-pub const Load = struct {
-    arena: std.mem.Allocator,
-    commands: std.ArrayList(Command) = .empty,
-    /// Parallel to `commands`: where the worker finds each one.
-    worker_commands: std.ArrayList(WorkerCommand) = .empty,
-    themes: std.ArrayList(themes.Theme) = .empty,
-    keymaps: std.ArrayList(Keymap) = .empty,
-    settings: std.ArrayList(SettingOverride) = .empty,
-    preferences: std.ArrayList(Preference) = .empty,
-    icons: std.ArrayList(IconOverride) = .empty,
-    extensions: std.ArrayList(ExtensionInfo) = .empty,
-    style_settings: std.ArrayList(SettingOverride) = .empty,
-    layout: layout_mod.Layout = .{},
-    has_layout: bool = false,
-    problems: std.ArrayList(Problem) = .empty,
-
-    /// What a file adds, dropped again if it fails half-way (its problem
-    /// and its extension entry are added after it ran).
-    const undone = .{
-        "commands",
-        "worker_commands",
-        "themes",
-        "keymaps",
-        "settings",
-        "preferences",
-        "icons",
-        "style_settings",
-    };
-
-    /// How far each list of `undone` had grown before a file ran.
-    const Mark = struct {
-        lengths: [undone.len]usize,
-        layout: layout_mod.Layout,
-        has_layout: bool,
-    };
-
-    fn mark(load: *const Load) Mark {
-        var saved: Mark = .{
-            .lengths = undefined,
-            .layout = load.layout,
-            .has_layout = load.has_layout,
-        };
-        inline for (undone, 0..) |field, index| {
-            saved.lengths[index] = @field(load, field).items.len;
-        }
-        return saved;
-    }
-
-    /// Drops what was added since `saved`. Lists only grow while a file
-    /// runs, so none can be shorter than it was.
-    fn rollback(load: *Load, saved: Mark) void {
-        inline for (undone, 0..) |field, index| {
-            assert(saved.lengths[index] <= @field(load, field).items.len);
-            @field(load, field).shrinkRetainingCapacity(saved.lengths[index]);
-        }
-        load.layout = saved.layout;
-        load.has_layout = saved.has_layout;
-        assert(load.commands.items.len == load.worker_commands.items.len);
-    }
-
-    /// The commands added since `saved`.
-    fn commandsSince(load: *const Load, saved: Mark) usize {
-        comptime assert(std.mem.eql(u8, undone[0], "commands"));
-        return load.commands.items.len - saved.lengths[0];
-    }
-};
-
-/// Where the worker finds a command: its state and its spec table, and the
-/// lists its rows came from (their actions run there).
-const WorkerCommand = struct {
-    /// Its file's state, in `Host.extensions`.
-    extension_index: u16,
-    /// The command's table (registry reference).
-    spec_reference: c_int,
-    mode: Mode,
-    answers_root_search: bool,
-    /// The list its last `items` or `search` returned.
-    list_kept: Kept = .{},
-    /// The list its last `root` returned.
-    root_search_kept: Kept = .{},
-};
-
-/// A Lua list kept alive in the registry so that its rows' actions can run
-/// later. An action for a row of another list is refused: the row it
-/// names may be gone, or another row now.
-const Kept = struct {
-    reference: c_int = c_noref,
-    /// The request that produced it.
-    list_generation: RequestGeneration = .none,
-};
-
-/// Requests the worker has not taken yet. A newer request of a kind
-/// replaces one not started.
-const Pending = struct {
-    reload: bool = false,
-    list: ?ListRequest = null,
-    root_search: ?RootSearchRequest = null,
-    act: ?ActRequest = null,
-    /// Owned: freed once it ran, or by the submit that replaces it.
-    submit: ?*SubmitRequest = null,
-};
-
-const ListRequest = struct {
-    registry_generation: RegistryGeneration,
-    command: CommandIndex,
-    request_generation: RequestGeneration,
-    query: core.FixedStr(query_bytes_max),
-};
-
-const RootSearchRequest = struct {
-    registry_generation: RegistryGeneration,
-    request_generation: RequestGeneration,
-    query: core.FixedStr(query_bytes_max),
-};
-
-const ActRequest = struct {
-    registry_generation: RegistryGeneration,
-    command: CommandIndex,
-    request_generation: RequestGeneration,
-    target: Target,
-
-    pub const Target = union(enum) {
-        /// The command's own `run`.
-        command_run,
-        /// An action of a row the command listed.
-        row_action: RowAction,
-    };
-
-    pub const RowAction = struct {
-        /// The row came from the root search, not from the command's list.
-        from_root_search: bool,
-        /// The list the row came from.
-        list_generation: RequestGeneration,
-        row_index: u32,
-        action_index: u8,
-    };
-};
-
-/// A form submitted; owns copies of its values.
-const SubmitRequest = struct {
-    registry_generation: RegistryGeneration,
-    command: CommandIndex,
-    request_generation: RequestGeneration,
-    values: []FormValue,
-    arena: std.heap.ArenaAllocator,
-
-    fn destroy(request: *SubmitRequest, gpa: std.mem.Allocator) void {
-        request.arena.deinit();
-        gpa.destroy(request);
-    }
-};
+/// The ids init.lua and the style run as. An extension named so would share
+/// their preferences and storage, and its themes and settings would pass
+/// for theirs.
+pub fn reservedId(id: []const u8) bool {
+    return std.mem.eql(u8, id, config_extension_id) or std.mem.eql(u8, id, style_extension_id);
+}
 
 // ------------------------------------------------------- the main thread
 
@@ -444,7 +247,7 @@ pub fn shutdown(host: *Host) void {
     host.wake();
     host.thread.join();
     if (host.pending.submit) |request| request.destroy(host.gpa);
-    host.closeAll();
+    loading.closeAll(host);
     host.extensions.deinit(host.gpa);
     host.worker_arena.deinit();
     host.gpa.free(host.config_dir);
@@ -467,12 +270,7 @@ pub fn setStyle(host: *Host, name: []const u8) bool {
 
 /// Loads every file again; the new registry arrives through the callback.
 pub fn reload(host: *Host) void {
-    {
-        host.lock.lockUncancelable(host.io);
-        defer host.lock.unlock(host.io);
-        host.pending.reload = true;
-    }
-    host.wake();
+    _ = host.post(.reload, true);
 }
 
 /// Asks for command `command`'s rows (`query` for search commands; longer
@@ -485,19 +283,14 @@ pub fn list(
     query: []const u8,
 ) RequestGeneration {
     const request_generation = host.requestGenerationNext();
-    var request: ListRequest = .{
+    var request: requests.ListRequest = .{
         .registry_generation = registry_generation,
         .command = command,
         .request_generation = request_generation,
         .query = .{},
     };
     request.query.set(query);
-    {
-        host.lock.lockUncancelable(host.io);
-        defer host.lock.unlock(host.io);
-        host.pending.list = request;
-    }
-    host.wake();
+    _ = host.post(.list, request);
     return request_generation;
 }
 
@@ -514,7 +307,7 @@ pub fn submit(
     assert(values.len >= 1);
     assert(values.len <= form_fields_max);
     const request_generation = host.requestGenerationNext();
-    const request = submitRequestCreate(
+    const request = requests.SubmitRequest.create(
         host.gpa,
         registry_generation,
         command,
@@ -524,48 +317,9 @@ pub fn submit(
         log.warn("submit: out of memory, not sent", .{});
         return request_generation;
     };
-    const replaced = blk: {
-        host.lock.lockUncancelable(host.io);
-        defer host.lock.unlock(host.io);
-        const replaced = host.pending.submit;
-        host.pending.submit = request;
-        break :blk replaced;
-    };
-    if (replaced) |old_request| old_request.destroy(host.gpa);
-    host.wake();
+    // The request it replaces never ran, and nothing else frees it.
+    if (host.post(.submit, request)) |replaced| replaced.destroy(host.gpa);
     return request_generation;
-}
-
-/// A submit request owning copies of `values`. All of them or none: half
-/// copied values would reach the extension as if the user had left fields
-/// empty.
-fn submitRequestCreate(
-    gpa: std.mem.Allocator,
-    registry_generation: RegistryGeneration,
-    command: CommandIndex,
-    request_generation: RequestGeneration,
-    values: []const FormValue,
-) error{OutOfMemory}!*SubmitRequest {
-    const request = try gpa.create(SubmitRequest);
-    request.* = .{
-        .registry_generation = registry_generation,
-        .command = command,
-        .request_generation = request_generation,
-        .values = &.{},
-        .arena = .init(gpa),
-    };
-    errdefer request.destroy(gpa);
-    const arena = request.arena.allocator();
-    const copies = try arena.alloc(FormValue, values.len);
-    for (copies, values) |*copy, value| {
-        copy.* = .{
-            .name = try arena.dupe(u8, value.name),
-            .value = try arena.dupe(u8, value.value),
-            .toggle = value.toggle,
-        };
-    }
-    request.values = copies;
-    return request;
 }
 
 /// Asks every command with `root` for rows for `query`; a newer root
@@ -576,24 +330,19 @@ pub fn root(
     query: []const u8,
 ) RequestGeneration {
     const request_generation = host.requestGenerationNext();
-    var request: RootSearchRequest = .{
+    var request: requests.RootSearchRequest = .{
         .registry_generation = registry_generation,
         .request_generation = request_generation,
         .query = .{},
     };
     request.query.set(query);
-    {
-        host.lock.lockUncancelable(host.io);
-        defer host.lock.unlock(host.io);
-        host.pending.root_search = request;
-    }
-    host.wake();
+    _ = host.post(.root_search, request);
     return request_generation;
 }
 
 /// What `act` runs: a command's own `run`, or one action of a row the
 /// command listed (in its list or in the root search).
-pub const ActTarget = ActRequest.Target;
+pub const ActTarget = requests.ActRequest.Target;
 
 /// Runs a Lua action of `command`; see `ActTarget`.
 pub fn act(
@@ -603,17 +352,12 @@ pub fn act(
     target: ActTarget,
 ) RequestGeneration {
     const request_generation = host.requestGenerationNext();
-    {
-        host.lock.lockUncancelable(host.io);
-        defer host.lock.unlock(host.io);
-        host.pending.act = .{
-            .registry_generation = registry_generation,
-            .command = command,
-            .request_generation = request_generation,
-            .target = target,
-        };
-    }
-    host.wake();
+    _ = host.post(.act, .{
+        .registry_generation = registry_generation,
+        .command = command,
+        .request_generation = request_generation,
+        .target = target,
+    });
     return request_generation;
 }
 
@@ -622,6 +366,25 @@ pub fn act(
 fn requestGenerationNext(host: *Host) RequestGeneration {
     host.request_generation_last = host.request_generation_last.next();
     return host.request_generation_last;
+}
+
+/// Hands `request` to the worker as the pending request of its kind, and
+/// wakes it. Returns the request it replaced (one the worker had not taken
+/// yet), if any.
+fn post(
+    host: *Host,
+    comptime kind: std.meta.FieldEnum(requests.Pending),
+    request: @FieldType(requests.Pending, @tagName(kind)),
+) @FieldType(requests.Pending, @tagName(kind)) {
+    const replaced = blk: {
+        host.lock.lockUncancelable(host.io);
+        defer host.lock.unlock(host.io);
+        const replaced = @field(host.pending, @tagName(kind));
+        @field(host.pending, @tagName(kind)) = request;
+        break :blk replaced;
+    };
+    host.wake();
+    return replaced;
 }
 
 /// Wakes the worker: bumps the sequence it sleeps on.
@@ -642,11 +405,11 @@ fn run(host: *Host) void {
     while (host.waitForWork(wake_sequence_seen)) |wake_sequence| {
         wake_sequence_seen = wake_sequence;
         const pending = host.pendingTake();
-        if (pending.reload) host.reloadExecute();
-        if (pending.act) |request| host.actExecute(request);
-        if (pending.submit) |request| host.submitExecute(request);
-        if (pending.list) |request| host.listExecute(&request);
-        if (pending.root_search) |request| host.rootSearchExecute(&request);
+        if (pending.reload) loading.reloadExecute(host);
+        if (pending.act) |request| requests.actExecute(host, request);
+        if (pending.submit) |request| requests.submitExecute(host, request);
+        if (pending.list) |request| requests.listExecute(host, &request);
+        if (pending.root_search) |request| requests.rootSearchExecute(host, &request);
     }
 }
 
@@ -661,1040 +424,12 @@ fn waitForWork(host: *Host, wake_sequence_seen: u32) ?u32 {
     }
 }
 
-fn pendingTake(host: *Host) Pending {
+fn pendingTake(host: *Host) requests.Pending {
     host.lock.lockUncancelable(host.io);
     defer host.lock.unlock(host.io);
     const pending = host.pending;
     host.pending = .{};
     return pending;
-}
-
-// --------------------------------------------------------------- reload
-
-fn closeAll(host: *Host) void {
-    for (host.extensions.items) |extension| {
-        extension.close();
-        host.gpa.destroy(extension);
-    }
-    host.extensions.clearRetainingCapacity();
-    host.gpa.free(host.worker_commands);
-    host.worker_commands = &.{};
-    _ = host.worker_arena.reset(.retain_capacity);
-}
-
-fn reloadExecute(host: *Host) void {
-    host.closeAll();
-    host.registry_generation = host.registry_generation.next();
-    const registry = host.answerCreate(Registry, "reload", .{
-        .generation = host.registry_generation,
-        .arena = .init(host.gpa),
-    }) orelse return;
-    var load: Load = .{ .arena = registry.arena.allocator() };
-    host.loadAll(&load);
-    host.registryFill(registry, &load);
-    for (registry.problems) |file_problem| {
-        log.warn("{s}: {s}", .{ file_problem.extension, file_problem.message });
-    }
-    host.deliver(.{ .registry = registry });
-}
-
-/// The style first (init.lua may adjust it), then init.lua, then each
-/// extension.
-fn loadAll(host: *Host, load: *Load) void {
-    const worker_arena = host.worker_arena.allocator();
-    const style = blk: {
-        host.lock.lockUncancelable(host.io);
-        defer host.lock.unlock(host.io);
-        break :blk worker_arena.dupe(u8, host.style.slice()) catch {
-            problem(load, style_extension_id, "out of memory");
-            break :blk "";
-        };
-    };
-    if (style.len > 0) host.loadStyle(load, style);
-
-    if (worker_arena.printSentinel("{s}/init.lua", .{host.config_dir}, 0)) |path| {
-        if (os.info(path) != null) {
-            host.loadSource(load, config_extension_id, host.config_dir, path, null);
-        }
-    } else |_| {
-        problem(load, config_extension_id, "out of memory");
-    }
-
-    for (host.extensionDirs(worker_arena)) |id| host.loadExtension(load, id);
-}
-
-/// The extension in extensions/<id>, when its folder name is one.
-fn loadExtension(host: *Host, load: *Load, id: [:0]const u8) void {
-    const worker_arena = host.worker_arena.allocator();
-    if (!validId(id)) {
-        problem(load, id, "extension folder names may use only a-z, 0-9, - and _");
-        return;
-    }
-    if (reservedId(id)) {
-        const message =
-            "\"config\" and \"style\" are taken (init.lua and the style); rename the folder";
-        problem(load, id, message);
-        return;
-    }
-    const folder_format = "{s}/extensions/{s}";
-    const folder = worker_arena.printSentinel(folder_format, .{ host.config_dir, id }, 0) catch {
-        problem(load, id, "out of memory");
-        return;
-    };
-    const path = worker_arena.printSentinel("{s}/init.lua", .{folder}, 0) catch {
-        problem(load, id, "out of memory");
-        return;
-    };
-    if (os.info(path) == null) {
-        problem(load, id, "no init.lua in the extension's folder");
-        return;
-    }
-    host.loadSource(load, id, folder, path, null);
-}
-
-/// Hands what the files defined to the registry. A command reaches the UI
-/// only with a worker command to run it.
-fn registryFill(host: *Host, registry: *Registry, load: *Load) void {
-    assert(load.worker_commands.items.len == load.commands.items.len);
-    host.worker_commands = host.gpa.dupe(WorkerCommand, load.worker_commands.items) catch blk: {
-        log.warn("reload: out of memory, extension commands left out", .{});
-        load.commands.clearRetainingCapacity();
-        break :blk &.{};
-    };
-    assert(host.worker_commands.len == load.commands.items.len);
-    registry.commands = load.commands.items;
-    registry.themes = load.themes.items;
-    registry.keymaps = load.keymaps.items;
-    registry.settings = load.settings.items;
-    registry.preferences = load.preferences.items;
-    registry.icons = load.icons.items;
-    registry.extensions = load.extensions.items;
-    registry.style_settings = load.style_settings.items;
-    registry.layout = load.layout;
-    registry.has_layout = load.has_layout;
-    registry.problems = load.problems.items;
-}
-
-/// Names of the folders under extensions/, sorted, in `arena`.
-fn extensionDirs(host: *Host, arena: std.mem.Allocator) []const [:0]const u8 {
-    const path = arena.printSentinel("{s}/extensions", .{host.config_dir}, 0) catch return &.{};
-    return os.subdirs(arena, path, anyName);
-}
-
-fn anyName(_: []const u8) bool {
-    return true;
-}
-
-/// Whether `id` may name an extension's folder, a command or a field:
-/// 1 to `id_bytes_max` of a-z, 0-9, - and _.
-pub fn validId(id: []const u8) bool {
-    if (id.len == 0) return false;
-    if (id.len > id_bytes_max) return false;
-    for (id) |character| {
-        if (!isIdCharacter(character)) return false;
-    }
-    return true;
-}
-
-fn isIdCharacter(character: u8) bool {
-    return std.ascii.isLower(character) or std.ascii.isDigit(character) or
-        character == '-' or character == '_';
-}
-
-/// The ids init.lua and the style run as. An extension named so would share
-/// their preferences and storage, and its themes and settings would pass
-/// for theirs.
-pub fn reservedId(id: []const u8) bool {
-    return std.mem.eql(u8, id, config_extension_id) or std.mem.eql(u8, id, style_extension_id);
-}
-
-/// Reports what went wrong with a file in Settings > Extensions. Out of
-/// memory, the report goes to the log instead, so it is never lost.
-fn problem(load: *Load, extension_id: []const u8, message: []const u8) void {
-    problemAppend(load, extension_id, message) catch {
-        log.warn("{s}: {s} (not shown in Settings: out of memory)", .{ extension_id, message });
-    };
-}
-
-fn problemAppend(
-    load: *Load,
-    extension_id: []const u8,
-    message: []const u8,
-) error{OutOfMemory}!void {
-    const extension_id_copy = try load.arena.dupeSentinel(u8, extension_id, 0);
-    const message_copy = try load.arena.dupeSentinel(u8, message, 0);
-    try load.problems.append(load.arena, .{
-        .extension = extension_id_copy,
-        .message = message_copy,
-    });
-}
-
-/// Lists an extension that loaded in Settings > Extensions. Out of memory,
-/// it is reported as a problem instead: an entry with an empty id would
-/// reach the views that act on an extension by its id.
-fn extensionLoaded(load: *Load, id: []const u8, title: [:0]const u8, commands_count: usize) void {
-    extensionLoadedAppend(load, id, title, commands_count) catch {
-        problem(load, id, "loaded, but out of memory to list it");
-    };
-}
-
-fn extensionLoadedAppend(
-    load: *Load,
-    id: []const u8,
-    title: [:0]const u8,
-    commands_count: usize,
-) error{OutOfMemory}!void {
-    const id_copy = try load.arena.dupeSentinel(u8, id, 0);
-    try load.extensions.append(load.arena, .{
-        .id = id_copy,
-        .title = if (title.len > 0) title else id_copy,
-        .commands = @intCast(commands_count),
-    });
-}
-
-/// A style: <config>/styles/<name>/init.lua, else the built-in one. Its
-/// file runs as the extension "style".
-fn loadStyle(host: *Host, load: *Load, name: []const u8) void {
-    const worker_arena = host.worker_arena.allocator();
-    const folder = worker_arena.printSentinel("{s}/styles/{s}", .{ host.config_dir, name }, 0) catch
-        return;
-    const path = worker_arena.printSentinel("{s}/init.lua", .{folder}, 0) catch return;
-    if (os.info(path) != null) {
-        host.loadSource(load, style_extension_id, folder, path, null);
-    } else if (os.info(folder) != null) {
-        // A style folder may hold only a style.css.
-    } else if (styles.find(name)) |built_in| {
-        host.loadSource(load, style_extension_id, host.config_dir, "=style", built_in.lua);
-    } else {
-        problem(load, style_extension_id, "no such style");
-    }
-}
-
-/// Runs a file (`path`), or `source` (then `path` names it in errors).
-fn loadSource(
-    host: *Host,
-    load: *Load,
-    id: []const u8,
-    folder: []const u8,
-    path: [:0]const u8,
-    source: ?[:0]const u8,
-) void {
-    const extension = host.extensionCreate(id, folder) orelse {
-        problem(load, id, "out of memory");
-        return;
-    };
-    const before = load.mark();
-    extension.load = load;
-    var context: LoadContext = .{
-        .extension = extension,
-        .load = load,
-        .path = path,
-        .source = source,
-        .extension_index = @intCast(host.extensions.items.len),
-    };
-    const failure = extension.run(
-        load.arena,
-        load_budget_ns,
-        LoadContext,
-        &context,
-        LoadContext.run,
-    );
-    extension.load = null;
-    if (failure == null) {
-        if (host.extensions.append(host.gpa, extension)) {
-            // init.lua and the style are not extensions to list.
-            if (!reservedId(id)) {
-                extensionLoaded(load, id, context.title, load.commandsSince(before));
-            }
-            return;
-        } else |_| {
-            // Out of memory: undone below, like a file that failed.
-        }
-    }
-    load.rollback(before);
-    problem(load, id, failure orelse "out of memory");
-    extension.close();
-    host.gpa.destroy(extension);
-}
-
-/// A new state for the file of extension `id` in `folder`; null when out of
-/// memory.
-fn extensionCreate(host: *Host, id: []const u8, folder: []const u8) ?*Extension {
-    const worker_arena = host.worker_arena.allocator();
-    // Never an empty data folder: its storage would go to "/storage.json".
-    const data = worker_arena.printSentinel("{s}/extensions/{s}", .{ host.data_dir, id }, 0) catch
-        return null;
-    const id_copy = worker_arena.dupeSentinel(u8, id, 0) catch return null;
-    const folder_copy = worker_arena.dupeSentinel(u8, folder, 0) catch return null;
-    const extension = host.gpa.create(Extension) catch return null;
-    extension.* = .{ .host = host, .id = id_copy, .folder = folder_copy, .data = data };
-    // Without it, the extension runs; lumen.storage fails and says so.
-    os.mkdirP(extension.data) catch |err| log.warn("{s}: {t}", .{ extension.data, err });
-    extension.L = lua.newState(&extension.budget) orelse {
-        host.gpa.destroy(extension);
-        return null;
-    };
-    return extension;
-}
-
-const LoadContext = struct {
-    extension: *Extension,
-    load: *Load,
-    path: [:0]const u8,
-    /// Code to run instead of the file (a built-in style).
-    source: ?[:0]const u8 = null,
-    extension_index: u16,
-    /// lumen.extension's title, once parsed.
-    title: [:0]const u8 = "",
-
-    fn run(L: *lua.State, context: *LoadContext) void {
-        lua.openLibs(L);
-        api.install(L, context.extension);
-        const loaded = if (context.source) |source|
-            lua.c.luaL_loadbufferx(L, source.ptr, source.len, context.path.ptr, "t")
-        else
-            lua.c.luaL_loadfilex(L, context.path.ptr, "t");
-        if (loaded != lua.c.LUA_OK) _ = lua.c.lua_error(L);
-        lua.c.lua_callk(L, 0, 1, 0, null);
-        switch (lua.c.lua_type(L, -1)) {
-            lua.c.LUA_TNIL => {},
-            lua.c.LUA_TTABLE => parseExtension(L, context, lua.absIndex(L, -1)),
-            else => {
-                const type_name = lua.typeName(L, -1);
-                lua.raise(
-                    L,
-                    "init.lua must return lumen.extension{{...}} or nothing, not a {s}",
-                    .{type_name},
-                );
-            },
-        }
-    }
-};
-
-/// What `lumen.extension { ... }` returned: its title, icon, preferences
-/// and commands.
-fn parseExtension(L: *lua.State, context: *LoadContext, spec: c_int) void {
-    const arena = context.load.arena;
-    const title = lua.fieldString(L, arena, spec, "title", "extension") orelse
-        context.extension.id;
-    context.title = title;
-    const icon_default = rows_mod.fieldIcon(L, arena, spec, "extension.icon") orelse addon_icon;
-    parsePreferences(L, context, spec, title);
-    parseCommands(L, context, spec, title, icon_default);
-}
-
-/// The icon of an extension's commands when neither it nor they name one.
-const addon_icon: item_mod.Icon = .{ .tile = .{
-    .name = "application-x-addon-symbolic",
-    .color = .purple,
-} };
-
-fn parsePreferences(
-    L: *lua.State,
-    context: *LoadContext,
-    spec: c_int,
-    extension_title: [:0]const u8,
-) void {
-    const mark: lua.StackMark = .init(L);
-    defer mark.restore(L);
-    const preferences = lua.fieldList(L, spec, "preferences", "extension") orelse return;
-    const preferences_count = lua.c.lua_rawlen(L, preferences);
-    for (1..preferences_count + 1) |preference_number| {
-        const preference_mark: lua.StackMark = .init(L);
-        defer preference_mark.restore(L);
-        var where_buffer: [32]u8 = undefined;
-        const where = std.mem.print(&where_buffer, "preferences[{d}]", .{preference_number}) catch
-            "preferences";
-        const field_table = lua.tableAt(L, preferences, preference_number, where);
-        const preference = parseField(L, context, field_table, where, extension_title);
-        if (preferenceDeclared(context.load, context.extension.id, preference.name)) {
-            lua.raise(L, "two preferences named \"{s}\"", .{preference.name});
-        }
-        context.load.preferences.append(context.load.arena, preference) catch lua.oom(L);
-    }
-}
-
-fn preferenceDeclared(load: *const Load, extension_id: []const u8, name: []const u8) bool {
-    for (load.preferences.items) |preference| {
-        if (!std.mem.eql(u8, preference.extension, extension_id)) continue;
-        if (std.mem.eql(u8, preference.name, name)) return true;
-    }
-    return false;
-}
-
-fn parseCommands(
-    L: *lua.State,
-    context: *LoadContext,
-    spec: c_int,
-    extension_title: [:0]const u8,
-    icon_default: item_mod.Icon,
-) void {
-    const mark: lua.StackMark = .init(L);
-    defer mark.restore(L);
-    if (lua.getField(L, spec, "commands") != lua.c.LUA_TTABLE) {
-        const type_name = lua.typeName(L, -1);
-        lua.raise(L, "extension.commands: a list of commands expected, got {s}", .{type_name});
-    }
-    const commands = lua.absIndex(L, -1);
-    const commands_count = lua.c.lua_rawlen(L, commands);
-    for (1..commands_count + 1) |command_number| {
-        const command_mark: lua.StackMark = .init(L);
-        defer command_mark.restore(L);
-        var where_buffer: [32]u8 = undefined;
-        const where = std.mem.print(&where_buffer, "commands[{d}]", .{command_number}) catch
-            "commands";
-        const command_table = lua.tableAt(L, commands, command_number, where);
-        parseCommand(L, context, command_table, where, extension_title, icon_default);
-    }
-}
-
-/// A command's or a field's `name`: present, and a-z, 0-9, - and _ only.
-fn fieldName(
-    L: *lua.State,
-    arena: std.mem.Allocator,
-    table: c_int,
-    where: []const u8,
-) [:0]const u8 {
-    const name = lua.fieldString(L, arena, table, "name", where) orelse
-        lua.raise(L, "{s}.name is missing", .{where});
-    if (!validId(name)) {
-        lua.raise(L, "{s}.name: use only a-z, 0-9, - and _ (got \"{s}\")", .{ where, name });
-    }
-    return name;
-}
-
-/// A choice's `choices`: strings, or tables with a value and a title.
-fn prefChoices(
-    L: *lua.State,
-    arena: std.mem.Allocator,
-    field_table: c_int,
-    where: []const u8,
-) []const PreferenceChoice {
-    const mark: lua.StackMark = .init(L);
-    defer mark.restore(L);
-    const choice_list = lua.fieldList(L, field_table, "choices", where) orelse
-        lua.raise(L, "{s}.choices: a list expected for a choice", .{where});
-    const choices_count = lua.c.lua_rawlen(L, choice_list);
-    if (choices_count == 0) lua.raise(L, "{s}.choices is empty", .{where});
-    const choices = arena.alloc(PreferenceChoice, choices_count) catch lua.oom(L);
-    for (choices, 1..) |*choice, choice_number| {
-        const choice_mark: lua.StackMark = .init(L);
-        defer choice_mark.restore(L);
-        _ = lua.c.lua_rawgeti(L, choice_list, @intCast(choice_number));
-        if (lua.toSlice(L, -1)) |text| {
-            const value = arena.dupeSentinel(u8, text, 0) catch lua.oom(L);
-            choice.* = .{ .value = value, .label = value };
-        } else if (lua.c.lua_type(L, -1) == lua.c.LUA_TTABLE) {
-            const value = lua.fieldString(L, arena, -1, "value", where) orelse
-                lua.raise(L, "{s}.choices[{d}].value is missing", .{ where, choice_number });
-            const label = lua.fieldString(L, arena, -1, "title", where) orelse value;
-            choice.* = .{ .value = value, .label = label };
-        } else {
-            lua.raise(L, "{s}.choices[{d}]: string or table expected", .{ where, choice_number });
-        }
-    }
-    return choices;
-}
-
-/// A preference, or a form field: the two take the same fields.
-fn parseField(
-    L: *lua.State,
-    context: *LoadContext,
-    field_table: c_int,
-    where: []const u8,
-    extension_title: [:0]const u8,
-) Preference {
-    const arena = context.load.arena;
-    const name = fieldName(L, arena, field_table, where);
-    const kind_name = lua.fieldString(L, arena, field_table, "type", where) orelse "text";
-    const kind = std.meta.stringToEnum(PreferenceKind, kind_name) orelse lua.raise(
-        L,
-        "{s}.type: toggle, choice, text or password (got \"{s}\")",
-        .{ where, kind_name },
-    );
-    const file = arena.printSentinel("{s}/preferences.json", .{context.extension.data}, 0) catch
-        lua.oom(L);
-    var preference: Preference = .{
-        .extension = context.extension.id,
-        .extension_title = extension_title,
-        .file = file,
-        .name = name,
-        .title = lua.fieldString(L, arena, field_table, "title", where) orelse name,
-        .description = lua.fieldString(L, arena, field_table, "description", where) orelse "",
-        .kind = kind,
-        .default = "",
-        .required = lua.fieldBool(L, field_table, "required", false, where),
-    };
-    if (kind == .choice) preference.choices = prefChoices(L, arena, field_table, where);
-    preference.default = switch (kind) {
-        .toggle => registry_mod.toggleText(lua.fieldBool(L, field_table, "default", false, where)),
-        .choice => lua.fieldString(L, arena, field_table, "default", where) orelse
-            preference.choices[0].value,
-        .text, .password => lua.fieldString(L, arena, field_table, "default", where) orelse "",
-    };
-    return preference;
-}
-
-/// The field of a command that sets its mode.
-const ModeField = struct {
-    name: [:0]const u8,
-    mode: Mode,
-    /// A table is allowed too (a fixed list), not only a function.
-    table_allowed: bool,
-};
-
-const mode_fields = [_]ModeField{
-    .{ .name = "items", .mode = .list, .table_allowed = true },
-    .{ .name = "search", .mode = .search, .table_allowed = false },
-    .{ .name = "run", .mode = .run, .table_allowed = false },
-    .{ .name = "submit", .mode = .form, .table_allowed = false },
-};
-
-/// Which of items, search, run or submit the command has (at most one);
-/// null for none.
-fn commandMode(L: *lua.State, command_table: c_int, where: []const u8) ?Mode {
-    var mode: ?Mode = null;
-    for (mode_fields) |mode_field| {
-        const mark: lua.StackMark = .init(L);
-        defer mark.restore(L);
-        const value_type = lua.getField(L, command_table, mode_field.name);
-        if (value_type == lua.c.LUA_TNIL) continue;
-        const is_function = value_type == lua.c.LUA_TFUNCTION;
-        const is_list = mode_field.table_allowed and value_type == lua.c.LUA_TTABLE;
-        if (!is_function and !is_list) {
-            const expected = if (mode_field.table_allowed) "function or table" else "function";
-            const type_name = lua.typeName(L, -1);
-            lua.raise(
-                L,
-                "{s}.{s}: {s} expected, got {s}",
-                .{ where, mode_field.name, expected, type_name },
-            );
-        }
-        if (mode != null) {
-            lua.raise(L, "{s}: give it one of items, search or run, not several", .{where});
-        }
-        mode = mode_field.mode;
-    }
-    return mode;
-}
-
-/// A form's fields (1 to `form_fields_max`, names unique); none for another
-/// command, which must not have any.
-fn formFields(
-    L: *lua.State,
-    context: *LoadContext,
-    command_table: c_int,
-    is_form: bool,
-    where: []const u8,
-    extension_title: [:0]const u8,
-) []const Preference {
-    const mark: lua.StackMark = .init(L);
-    defer mark.restore(L);
-    const field_list_type = lua.getField(L, command_table, "fields");
-    if (!is_form) {
-        if (field_list_type != lua.c.LUA_TNIL) {
-            lua.raise(L, "{s}.fields: a form needs submit too", .{where});
-        }
-        return &.{};
-    }
-    if (field_list_type != lua.c.LUA_TTABLE) {
-        lua.raise(L, "{s}.fields: a list of fields expected for a form", .{where});
-    }
-    const field_list = lua.absIndex(L, -1);
-    const fields_count = lua.c.lua_rawlen(L, field_list);
-    if (fields_count == 0 or fields_count > form_fields_max) {
-        lua.raise(L, "{s}.fields: 1 to {d} fields", .{ where, form_fields_max });
-    }
-    const fields = context.load.arena.alloc(Preference, fields_count) catch lua.oom(L);
-    for (fields, 1..) |*field, field_number| {
-        const field_mark: lua.StackMark = .init(L);
-        defer field_mark.restore(L);
-        var where_buffer: [48]u8 = undefined;
-        const field_where = std.mem.print(
-            &where_buffer,
-            "{s}.fields[{d}]",
-            .{ where, field_number },
-        ) catch where;
-        const field_table = lua.tableAt(L, field_list, field_number, field_where);
-        field.* = parseField(L, context, field_table, field_where, extension_title);
-        for (fields[0 .. field_number - 1]) |previous| {
-            if (std.mem.eql(u8, previous.name, field.name)) {
-                lua.raise(L, "{s}: two fields named \"{s}\"", .{ where, field.name });
-            }
-        }
-    }
-    assert(fields.len <= form_fields_max);
-    return fields;
-}
-
-/// "<extension>.<name>" from the command's `name`, checked and unique.
-fn commandId(
-    L: *lua.State,
-    context: *LoadContext,
-    command_table: c_int,
-    where: []const u8,
-) [:0]const u8 {
-    const arena = context.load.arena;
-    const name = fieldName(L, arena, command_table, where);
-    const id = arena.printSentinel("{s}.{s}", .{ context.extension.id, name }, 0) catch
-        lua.oom(L);
-    for (context.load.commands.items) |command| {
-        if (std.mem.eql(u8, command.id, id)) lua.raise(L, "two commands named \"{s}\"", .{name});
-    }
-    return id;
-}
-
-/// Whether the command has a `root` function (it answers root searches).
-fn commandAnswersRootSearch(L: *lua.State, command_table: c_int, where: []const u8) bool {
-    const mark: lua.StackMark = .init(L);
-    defer mark.restore(L);
-    const root_type = lua.getField(L, command_table, "root");
-    if (root_type == lua.c.LUA_TNIL) return false;
-    if (root_type != lua.c.LUA_TFUNCTION) {
-        lua.raise(L, "{s}.root: function expected, got {s}", .{ where, lua.typeName(L, -1) });
-    }
-    return true;
-}
-
-fn parseCommand(
-    L: *lua.State,
-    context: *LoadContext,
-    command_table: c_int,
-    where: []const u8,
-    extension_title: [:0]const u8,
-    icon_default: item_mod.Icon,
-) void {
-    const arena = context.load.arena;
-    const id = commandId(L, context, command_table, where);
-    const title = lua.fieldString(L, arena, command_table, "title", where) orelse
-        lua.raise(L, "{s}.title is missing", .{where});
-    const answers_root_search = commandAnswersRootSearch(L, command_table, where);
-    const mode_given = commandMode(L, command_table, where);
-    const mode = mode_given orelse if (answers_root_search)
-        Mode.provider
-    else
-        lua.raise(L, "{s}: give it items, search or run", .{where});
-    const columns = lua.fieldNumberIn(L, command_table, "columns", where, .{
-        .min = grid_columns_min,
-        .max = grid_columns_max,
-    }) orelse registry_mod.grid_columns_default;
-
-    const command: Command = .{
-        .id = id,
-        .title = title,
-        .subtitle = lua.fieldString(L, arena, command_table, "subtitle", where) orelse
-            extension_title,
-        .icon = rows_mod.fieldIcon(L, arena, command_table, where) orelse icon_default,
-        .keywords = rows_mod.keywords(L, arena, command_table, where),
-        .placeholder = lua.fieldString(L, arena, command_table, "placeholder", where) orelse "",
-        .mode = mode,
-        .detail = lua.fieldBool(L, command_table, "detail", false, where),
-        .answers_root_search = answers_root_search,
-        .fields = formFields(L, context, command_table, mode == .form, where, extension_title),
-        .submit_title = lua.fieldString(L, arena, command_table, "submit_title", where) orelse
-            "Submit",
-        .grid = lua.fieldBool(L, command_table, "grid", false, where),
-        .columns = @intFromFloat(columns),
-    };
-    // A command's index in the registry is a u16 everywhere.
-    if (context.load.commands.items.len >= std.math.maxInt(u16)) {
-        lua.raise(L, "too many commands", .{});
-    }
-    lua.c.lua_pushvalue(L, command_table);
-    const spec_reference = lua.ref(L);
-    context.load.worker_commands.append(arena, .{
-        .extension_index = context.extension_index,
-        .spec_reference = spec_reference,
-        .mode = mode,
-        .answers_root_search = answers_root_search,
-    }) catch lua.oom(L);
-    context.load.commands.append(arena, command) catch lua.oom(L);
-    assert(context.load.worker_commands.items.len == context.load.commands.items.len);
-}
-
-// ----------------------------------------------------------------- list
-
-/// The error a request gets when the files were reloaded after it was made.
-const reloaded = "Extensions were reloaded";
-
-/// The command a request names; null when the files were reloaded after
-/// the request was made (its command index is from a registry that is
-/// gone, and may name another command now).
-fn requested(
-    host: *Host,
-    registry_generation: RegistryGeneration,
-    command: CommandIndex,
-) ?*WorkerCommand {
-    if (registry_generation != host.registry_generation) return null;
-    // The registry the UI holds has as many commands as there are worker
-    // commands; anything past them is not a command of this registry.
-    if (command.position() >= host.worker_commands.len) return null;
-    const worker_command = &host.worker_commands[command.position()];
-    assert(worker_command.extension_index < host.extensions.items.len);
-    return worker_command;
-}
-
-/// The extension that defined `worker_command`.
-fn extensionOf(host: *const Host, worker_command: *const WorkerCommand) *Extension {
-    assert(worker_command.extension_index < host.extensions.items.len);
-    return host.extensions.items[worker_command.extension_index];
-}
-
-fn listExecute(host: *Host, request: *const ListRequest) void {
-    const result = host.answerCreate(ListResult, "list", .{
-        .generation = request.request_generation,
-        .command = request.command,
-        .query = "",
-        .arena = .init(host.gpa),
-    }) orelse return;
-    defer host.deliver(.{ .list = result });
-    const arena = result.arena.allocator();
-    const query = request.query.slice();
-    result.query = arena.dupe(u8, query) catch {
-        // An answer for "" would pass for the answer to an empty query.
-        result.error_message = "out of memory";
-        return;
-    };
-    const worker_command = host.requested(request.registry_generation, request.command) orelse {
-        result.error_message = reloaded;
-        return;
-    };
-    const extension = host.extensionOf(worker_command);
-    var rows: lua.Capped = .{ .child = arena, .bytes_max = rows_bytes_max };
-    var context: ListContext = .{
-        .extension = extension,
-        .worker_command = worker_command,
-        .request = request,
-        .result = result,
-        .rows_arena = rows.allocator(),
-    };
-    result.error_message = extension.run(
-        arena,
-        list_budget_ns,
-        ListContext,
-        &context,
-        ListContext.run,
-    );
-    if (result.error_message != null and rows.refused) result.error_message = rows_too_big;
-}
-
-const ListContext = struct {
-    extension: *Extension,
-    worker_command: *WorkerCommand,
-    request: *const ListRequest,
-    result: *ListResult,
-    /// The result's arena, up to `rows_bytes_max`.
-    rows_arena: std.mem.Allocator,
-
-    fn run(L: *lua.State, context: *ListContext) void {
-        _ = lua.pushRef(L, context.worker_command.spec_reference);
-        const spec = lua.absIndex(L, -1);
-        switch (context.worker_command.mode) {
-            .list => {
-                // `items` is a function to call, or the list itself.
-                const items_type = lua.getField(L, spec, "items");
-                if (items_type == lua.c.LUA_TFUNCTION) lua.c.lua_callk(L, 0, 1, 0, null);
-            },
-            .search => {
-                _ = lua.getField(L, spec, "search");
-                lua.pushString(L, context.request.query.slice());
-                lua.c.lua_callk(L, 1, 1, 0, null);
-            },
-            .run, .provider, .form => lua.raise(L, "this command has no list", .{}),
-        }
-        const rows = lua.absIndex(L, -1);
-        switch (lua.c.lua_type(L, rows)) {
-            lua.c.LUA_TNIL => return,
-            lua.c.LUA_TTABLE => {},
-            else => lua.raise(L, "items: a list expected, got {s}", .{lua.typeName(L, rows)}),
-        }
-        keep(L, &context.worker_command.list_kept, rows, context.request.request_generation);
-        context.result.items = rows_mod.parseItems(L, context.rows_arena, rows, .{
-            .list_generation = context.request.request_generation,
-            .command = context.request.command,
-            .extension_id = context.extension.id,
-        }, items_max);
-    }
-};
-
-/// Keeps the list at `rows` for its rows' actions, until the next one.
-fn keep(L: *lua.State, kept: *Kept, rows: c_int, list_generation: RequestGeneration) void {
-    if (kept.reference != c_noref) {
-        lua.unref(L, kept.reference);
-        kept.reference = c_noref;
-    }
-    lua.c.lua_pushvalue(L, rows);
-    kept.reference = lua.ref(L);
-    kept.list_generation = list_generation;
-}
-
-// ----------------------------------------------------------------- root
-
-fn rootSearchExecute(host: *Host, request: *const RootSearchRequest) void {
-    const result = host.answerCreate(RootResult, "root", .{
-        .generation = request.request_generation,
-        .query = "",
-        .arena = .init(host.gpa),
-    }) orelse return;
-    defer host.deliver(.{ .root = result });
-    const arena = result.arena.allocator();
-    const query = request.query.slice();
-    // Out of memory, no rows: an answer for "" would show no rows anyway.
-    result.query = arena.dupe(u8, query) catch return;
-    if (request.registry_generation != host.registry_generation) return;
-    var sections: std.ArrayList(RootSection) = .empty;
-    // Every provider's rows together.
-    var rows: lua.Capped = .{ .child = arena, .bytes_max = rows_bytes_max };
-    for (host.worker_commands, 0..) |*worker_command, command_index| {
-        if (!worker_command.answers_root_search) continue;
-        // A newer query came in: this one is already stale.
-        if (host.rootSearchSuperseded()) break;
-        const command: CommandIndex = .from(command_index);
-        const items = host.rootSearchCommand(arena, &rows, worker_command, command, request);
-        if (items.len == 0) continue;
-        sections.append(arena, .{ .command = command, .items = items }) catch {
-            log.warn("root search: out of memory, rows left out", .{});
-            break;
-        };
-    }
-    result.sections = sections.items;
-}
-
-/// One command's rows for a root search; none when it failed (logged: one
-/// provider failing must not hide the others' rows).
-fn rootSearchCommand(
-    host: *Host,
-    arena: std.mem.Allocator,
-    rows: *lua.Capped,
-    worker_command: *WorkerCommand,
-    command: CommandIndex,
-    request: *const RootSearchRequest,
-) []Item {
-    const extension = host.extensionOf(worker_command);
-    var context: RootSearchContext = .{
-        .extension = extension,
-        .worker_command = worker_command,
-        .command = command,
-        .request = request,
-        .rows_arena = rows.allocator(),
-    };
-    const failure = extension.run(
-        arena,
-        root_search_budget_ns,
-        RootSearchContext,
-        &context,
-        RootSearchContext.run,
-    ) orelse return context.items;
-    const message = if (rows.refused) rows_too_big else failure;
-    log.warn("{s}: root search: {s}", .{ extension.id, message });
-    rows.refused = false;
-    return &.{};
-}
-
-fn rootSearchSuperseded(host: *Host) bool {
-    host.lock.lockUncancelable(host.io);
-    defer host.lock.unlock(host.io);
-    return host.pending.root_search != null;
-}
-
-const RootSearchContext = struct {
-    extension: *Extension,
-    worker_command: *WorkerCommand,
-    command: CommandIndex,
-    request: *const RootSearchRequest,
-    rows_arena: std.mem.Allocator,
-    items: []Item = &.{},
-
-    fn run(L: *lua.State, context: *RootSearchContext) void {
-        _ = lua.pushRef(L, context.worker_command.spec_reference);
-        _ = lua.getField(L, -1, "root");
-        lua.pushString(L, context.request.query.slice());
-        lua.c.lua_callk(L, 1, 1, 0, null);
-        const rows = lua.absIndex(L, -1);
-        switch (lua.c.lua_type(L, rows)) {
-            lua.c.LUA_TNIL => return,
-            lua.c.LUA_TTABLE => {},
-            else => lua.raise(L, "root: a list expected, got {s}", .{lua.typeName(L, rows)}),
-        }
-        keep(L, &context.worker_command.root_search_kept, rows, context.request.request_generation);
-        context.items = rows_mod.parseItems(L, context.rows_arena, rows, .{
-            .list_generation = context.request.request_generation,
-            .command = context.command,
-            .from_root_search = true,
-            .extension_id = context.extension.id,
-        }, root_search_items_max);
-    }
-};
-
-// --------------------------------------------------------------- submit
-
-fn submitExecute(host: *Host, request: *SubmitRequest) void {
-    defer request.destroy(host.gpa);
-    const result = host.answerCreate(ActResult, "submit", .{
-        .generation = request.request_generation,
-        .arena = .init(host.gpa),
-    }) orelse return;
-    defer host.deliver(.{ .act = result });
-    const worker_command = host.requested(request.registry_generation, request.command) orelse {
-        result.error_message = reloaded;
-        return;
-    };
-    assert(request.values.len <= form_fields_max);
-    const extension = host.extensionOf(worker_command);
-    var context: SubmitContext = .{
-        .worker_command = worker_command,
-        .request = request,
-        .result = result,
-    };
-    const arena = result.arena.allocator();
-    result.error_message = extension.run(
-        arena,
-        act_budget_ns,
-        SubmitContext,
-        &context,
-        SubmitContext.run,
-    );
-}
-
-const SubmitContext = struct {
-    worker_command: *WorkerCommand,
-    request: *SubmitRequest,
-    result: *ActResult,
-
-    fn run(L: *lua.State, context: *SubmitContext) void {
-        _ = lua.pushRef(L, context.worker_command.spec_reference);
-        if (lua.getField(L, -1, "submit") != lua.c.LUA_TFUNCTION) {
-            lua.raise(L, "this command has no submit function", .{});
-        }
-        const values = context.request.values;
-        lua.c.lua_createtable(L, 0, @intCast(values.len));
-        for (values) |value| {
-            if (value.toggle) {
-                const is_on = registry_mod.toggleIsOn(value.value);
-                lua.c.lua_pushboolean(L, @intFromBool(is_on));
-            } else {
-                lua.pushString(L, value.value);
-            }
-            lua.pushString(L, value.name);
-            // The name under its value: table[name] = value.
-            lua.c.lua_rotate(L, -2, 1);
-            lua.c.lua_rawset(L, -3);
-        }
-        lua.c.lua_callk(L, 1, 1, 0, null);
-        context.result.outcome = outcomeOf(L);
-    }
-};
-
-/// What a run, an action or a submit returned.
-fn outcomeOf(L: *lua.State) Outcome {
-    switch (lua.c.lua_type(L, -1)) {
-        lua.c.LUA_TNIL => return .close,
-        lua.c.LUA_TSTRING => {
-            const text = lua.toSlice(L, -1).?;
-            return std.meta.stringToEnum(Outcome, text) orelse lua.raise(
-                L,
-                "run must return nothing, \"close\", \"stay\" or \"refresh\" (got \"{s}\")",
-                .{text},
-            );
-        },
-        else => lua.raise(
-            L,
-            "run must return nothing, \"close\", \"stay\" or \"refresh\", not a {s}",
-            .{lua.typeName(L, -1)},
-        ),
-    }
-}
-
-// ------------------------------------------------------------------ act
-
-fn actExecute(host: *Host, request: ActRequest) void {
-    const result = host.answerCreate(ActResult, "action", .{
-        .generation = request.request_generation,
-        .arena = .init(host.gpa),
-    }) orelse return;
-    defer host.deliver(.{ .act = result });
-    const worker_command = host.requested(request.registry_generation, request.command) orelse {
-        result.error_message = reloaded;
-        return;
-    };
-    const extension = host.extensionOf(worker_command);
-    var context: ActContext = .{
-        .worker_command = worker_command,
-        .request = request,
-        .result = result,
-    };
-    const arena = result.arena.allocator();
-    result.error_message = extension.run(
-        arena,
-        act_budget_ns,
-        ActContext,
-        &context,
-        ActContext.run,
-    );
-}
-
-const ActContext = struct {
-    worker_command: *WorkerCommand,
-    request: ActRequest,
-    result: *ActResult,
-
-    fn run(L: *lua.State, context: *ActContext) void {
-        switch (context.request.target) {
-            .command_run => {
-                pushCommandRun(L, context.worker_command);
-                lua.c.lua_callk(L, 0, 1, 0, null);
-            },
-            .row_action => |row_action| {
-                pushRowAction(L, context.worker_command, row_action);
-                lua.c.lua_callk(L, 1, 1, 0, null);
-            },
-        }
-        context.result.outcome = outcomeOf(L);
-    }
-};
-
-/// Pushes the command's `run` function.
-fn pushCommandRun(L: *lua.State, worker_command: *const WorkerCommand) void {
-    _ = lua.pushRef(L, worker_command.spec_reference);
-    if (lua.getField(L, -1, "run") != lua.c.LUA_TFUNCTION) {
-        lua.raise(L, "this command has no run function", .{});
-    }
-}
-
-/// Pushes a row's action function, then the row (its argument). What it
-/// read on the way stays below them; `protect` clears it.
-fn pushRowAction(
-    L: *lua.State,
-    worker_command: *const WorkerCommand,
-    row_action: ActRequest.RowAction,
-) void {
-    const kept = if (row_action.from_root_search)
-        &worker_command.root_search_kept
-    else
-        &worker_command.list_kept;
-    if (kept.reference == c_noref or kept.list_generation != row_action.list_generation) {
-        lua.raise(L, "the list changed meanwhile; try again", .{});
-    }
-    _ = lua.pushRef(L, kept.reference);
-    const rows = lua.absIndex(L, -1);
-    if (lua.c.lua_rawgeti(L, rows, @intCast(row_action.row_index + 1)) != lua.c.LUA_TTABLE) {
-        lua.raise(L, "that row has no actions", .{});
-    }
-    const row = lua.absIndex(L, -1);
-    // The row is a live table the extension may have changed since:
-    // rawgeti on a non-table reads garbage (no API checks in distribution
-    // builds of Lua).
-    if (lua.getField(L, row, "actions") != lua.c.LUA_TTABLE) {
-        lua.raise(L, "that row has no actions", .{});
-    }
-    const action_number = @as(c_int, row_action.action_index) + 1;
-    if (lua.c.lua_rawgeti(L, -1, action_number) != lua.c.LUA_TTABLE) {
-        lua.raise(L, "that action is not a Lua function", .{});
-    }
-    if (lua.getField(L, -1, "run") != lua.c.LUA_TFUNCTION) {
-        lua.raise(L, "that action is not a Lua function", .{});
-    }
-    lua.c.lua_pushvalue(L, row);
 }
 
 // ------------------------------------------------------------- delivery
@@ -1703,7 +438,7 @@ fn pushRowAction(
 /// RootResult), owned by it once delivered. Null when out of memory: the
 /// request then gets no answer, as if a newer one had replaced it, and the
 /// log says which kind was dropped.
-fn answerCreate(host: *Host, comptime T: type, what: []const u8, answer: T) ?*T {
+pub fn answerCreate(host: *Host, comptime T: type, what: []const u8, answer: T) ?*T {
     comptime assert(@hasField(T, "generation"));
     comptime assert(@hasField(T, "arena"));
     const created = host.gpa.create(T) catch {
@@ -1715,7 +450,7 @@ fn answerCreate(host: *Host, comptime T: type, what: []const u8, answer: T) ?*T 
 }
 
 /// An answer the worker hands to the main loop, which owns it from then on.
-const Answer = union(enum) {
+pub const Answer = union(enum) {
     registry: *Registry,
     list: *ListResult,
     act: *ActResult,
@@ -1724,7 +459,8 @@ const Answer = union(enum) {
 
 const Delivery = struct { host: *Host, answer: Answer };
 
-fn deliver(host: *Host, answer: Answer) void {
+/// Hands `answer` to its callback on the GTK main loop. Worker thread only.
+pub fn deliver(host: *Host, answer: Answer) void {
     const delivery = host.gpa.create(Delivery) catch {
         log.warn("out of memory: an answer for the window is dropped", .{});
         switch (answer) {
@@ -1749,85 +485,6 @@ fn deliverCallback(data: ?*anyopaque) callconv(.c) c.gboolean {
         .root => |result| callbacks.root_callback(result, callbacks.context),
     }
     return 0;
-}
-
-// ----------------------------------------------------------------- stamp
-
-/// Changes when init.lua or any .lua file in an extension's folder (not
-/// subfolders) is added, removed or edited: then the files are reloaded.
-/// `style`: the style in use; edits to the others' files change nothing.
-pub fn stamp(config_dir: []const u8, style: []const u8) u64 {
-    var hasher: std.hash.Wyhash = .init(0);
-    var path_buffer: [4096]u8 = undefined;
-    if (std.mem.printSentinel(&path_buffer, "{s}/init.lua", .{config_dir}, 0)) |path| {
-        hashFile(&hasher, path);
-    } else |_| {
-        // A config folder that long cannot hold a file anyway.
-    }
-    hashFolders(&hasher, config_dir, "extensions");
-    hasher.update(style);
-    if (style.len > 0) {
-        const style_dir = std.mem.printSentinel(
-            &path_buffer,
-            "{s}/styles/{s}",
-            .{ config_dir, style },
-            0,
-        ) catch return hasher.final();
-        hashLua(&hasher, style_dir);
-    }
-    return hasher.final();
-}
-
-/// The most entries `stamp` reads from one folder. It runs each time the
-/// window opens, on the main thread: a folder of a million files (a
-/// mistaken copy into extensions/) must not hold the window that long.
-/// Past it, edits to the files left out do not reload anything.
-const stamp_entries_max = 1024;
-
-/// The .lua files directly in `folder`.
-fn hashLua(hasher: *std.hash.Wyhash, folder: [:0]const u8) void {
-    hasher.update(folder);
-    const folder_handle = c.g_dir_open(folder.ptr, 0, null) orelse return;
-    defer c.g_dir_close(folder_handle);
-    var entries_count: usize = 0;
-    while (c.g_dir_read_name(folder_handle)) |file_name_c| : (entries_count += 1) {
-        if (entries_count == stamp_entries_max) break;
-        const file_name = std.mem.span(file_name_c);
-        if (!std.mem.endsWith(u8, file_name, ".lua")) continue;
-        var path_buffer: [4096]u8 = undefined;
-        const path = std.mem.printSentinel(&path_buffer, "{s}/{s}", .{ folder, file_name }, 0) catch
-            continue;
-        hashFile(hasher, path);
-    }
-}
-
-/// The .lua files in each folder of <config>/<kind>.
-fn hashFolders(hasher: *std.hash.Wyhash, config_dir: []const u8, kind: []const u8) void {
-    var top_buffer: [4096]u8 = undefined;
-    const top = std.mem.printSentinel(&top_buffer, "{s}/{s}", .{ config_dir, kind }, 0) catch
-        return;
-    const folder_handle = c.g_dir_open(top.ptr, 0, null) orelse return;
-    defer c.g_dir_close(folder_handle);
-    var entries_count: usize = 0;
-    while (c.g_dir_read_name(folder_handle)) |folder_name_c| : (entries_count += 1) {
-        if (entries_count == stamp_entries_max) break;
-        const folder_name = std.mem.span(folder_name_c);
-        var folder_buffer: [4096]u8 = undefined;
-        const folder = std.mem.printSentinel(
-            &folder_buffer,
-            "{s}/{s}",
-            .{ top, folder_name },
-            0,
-        ) catch continue;
-        hashLua(hasher, folder);
-    }
-}
-
-fn hashFile(hasher: *std.hash.Wyhash, path: [:0]const u8) void {
-    hasher.update(path);
-    const file_stamp = os.Stamp.of(path.ptr);
-    hasher.update(std.mem.asBytes(&.{ file_stamp.mtime_s, file_stamp.size, file_stamp.inode }));
-    hasher.update(std.mem.asBytes(&file_stamp.mtime_subsecond_ns));
 }
 
 // ---------------------------------------------------------------- tests
@@ -1916,6 +573,9 @@ test "request generations skip none, which the window keeps for nothing pending"
 
 test {
     _ = generation_mod;
+    _ = loading;
+    _ = requests;
+    _ = stamp_mod;
 }
 
 test "extensions load, list, search and run actions" {
@@ -2346,7 +1006,7 @@ test "rows are kept to a size, and lumen.exec's strings outlive its options" {
     _ = host.list(registry.generation, .from(0), "");
     const big = try probe.take("list");
     defer big.destroy(testing.allocator);
-    try testing.expectEqualStrings(rows_too_big, big.error_message.?);
+    try testing.expectEqualStrings(requests.rows_too_big, big.error_message.?);
 
     _ = host.list(registry.generation, .from(1), "");
     const long = try probe.take("list");
