@@ -1,5 +1,13 @@
 //! Extensions in the window: their commands in the root search, the list a
 //! command shows, its actions, keymaps, and reloading edited files.
+//!
+//! Lua runs on the extension host's thread (ext/Host.zig). This file asks
+//! it for things (a reload, a command's rows, root-search rows, an action),
+//! and the answers come back on the GTK main loop through the four
+//! callbacks below. Each request is remembered (`Ui.ext_list`,
+//! `Ui.ext_root_search`, `Ui.ext_act_generation`) and an answer to one that
+//! is no longer current is dropped. Rows point into the answers and the
+//! registry, so those are freed only once the rows built from them are gone.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -99,16 +107,7 @@ fn registryCallback(registry: *Host.Registry, context: ?*anyopaque) void {
     // freeing it. A theme from init.lua may be the one in use, and lumen.set
     // may have changed (or stopped changing) settings.
     config.reloadSettings(ui);
-    // A style just chosen: its lumen.set as the new values.
-    if (ui.style_defaults_pending) {
-        ui.style_defaults_pending = false;
-        var changed = false;
-        for (registry.style_settings) |style_setting| {
-            if (config.overridden(ui, style_setting.key)) continue;
-            changed = ui.settings.set(style_setting.key, style_setting.value) or changed;
-        }
-        if (changed) config.saveSettings(ui);
-    }
+    if (ui.style_defaults_pending) applyStyleDefaults(ui, registry);
     if (lost or (ui.view == .ext and command(ui) == null)) {
         ui.setView(.root);
     } else if (ui.view == .ext) {
@@ -126,6 +125,19 @@ fn registryCallback(registry: *Host.Registry, context: ?*anyopaque) void {
         ui.after_reload_pending = false;
         ui.showFailure(ui.after_reload.slice());
     }
+}
+
+/// A style just chosen: its lumen.set become the settings' new values,
+/// except what init.lua fixes.
+fn applyStyleDefaults(ui: *Ui, registry: *const Host.Registry) void {
+    assert(ui.style_defaults_pending);
+    ui.style_defaults_pending = false;
+    var changed = false;
+    for (registry.style_settings) |style_setting| {
+        if (config.overridden(ui, style_setting.key)) continue;
+        changed = ui.settings.set(style_setting.key, style_setting.value) or changed;
+    }
+    if (changed) config.saveSettings(ui);
 }
 
 fn rootCallback(answer: *Host.RootResult, context: ?*anyopaque) void {
