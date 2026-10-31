@@ -37,6 +37,7 @@ const Settings = settings_mod.Settings;
 const widgets = @import("widgets.zig");
 const labels = @import("labels.zig");
 const settings_view = @import("settings_view.zig");
+const choose_view = @import("choose_view.zig");
 const file_results = @import("file_results.zig");
 const detail_pane = @import("detail_pane.zig");
 const backdrop = @import("backdrop.zig");
@@ -719,7 +720,7 @@ pub fn perform(self: *Ui, operation: item_mod.Operation) void {
         .setting => |setting_action| {
             settings_view.performSetting(self, setting_action.setting, setting_action.operation);
         },
-        .choose_app => |path| settings_view.chooseAppFor(self, path),
+        .choose_app => |path| choose_view.chooseAppFor(self, path),
         .failed => |message| self.showFailure(message),
     }
 }
@@ -764,6 +765,7 @@ test {
     _ = @import("config.zig");
     _ = @import("dump.zig");
     _ = @import("ActionPanel.zig");
+    _ = @import("choose_view.zig");
 }
 
 test "Navigation forgets the oldest view when it is full" {

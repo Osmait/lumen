@@ -26,6 +26,7 @@ const labels = @import("labels.zig");
 const prefs_view = @import("prefs_view.zig");
 const row_list = @import("row_list.zig");
 const settings_view = @import("settings_view.zig");
+const choose_view = @import("choose_view.zig");
 const ContentSearch = @import("ContentSearch.zig");
 const Ui = @import("Ui.zig");
 
@@ -89,7 +90,7 @@ pub fn loadBase(ui: *Ui, arena: std.mem.Allocator) []Item {
         .settings => settings_view.settingsCandidates(ui, arena),
         .themes => settings_view.themeCandidates(ui, arena),
         .default_apps => settings_view.defaultAppsCandidates(ui, arena),
-        .choose => settings_view.chooseCandidates(ui, arena),
+        .choose => choose_view.candidates(ui, arena),
         .ext => ext_view.base(ui),
         // The rows are filtered straight from the session's lines.
         .dmenu => &.{},
