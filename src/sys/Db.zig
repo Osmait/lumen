@@ -155,6 +155,21 @@ fn bind(db: *Db, stmt: *c.sqlite3_stmt, args: anytype) Error!void {
     }
 }
 
+fn bindText(stmt: *c.sqlite3_stmt, parameter: c_int, text: []const u8) c_int {
+    // SQLITE_TRANSIENT: sqlite copies the bytes.
+    const transient: c.sqlite3_destructor_type = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
+    return c.sqlite3_bind_text64(stmt, parameter, text.ptr, text.len, transient, c.SQLITE_UTF8);
+}
+
+/// Column `column` of the current row as text; it lives until the next
+/// step or finalize.
+fn columnText(stmt: *c.sqlite3_stmt, column: c_int) []const u8 {
+    const text = c.sqlite3_column_text(stmt, column) orelse return "";
+    const text_len = c.sqlite3_column_bytes(stmt, column);
+    assert(text_len >= 0);
+    return text[0..@intCast(text_len)];
+}
+
 /// Prepares `sql`, binds `args` and runs it (no rows).
 fn execArgs(db: *Db, sql: [:0]const u8, args: anytype) Error!void {
     const stmt = try db.prepare(sql);
@@ -169,8 +184,8 @@ fn run(db: *Db, stmt: *c.sqlite3_stmt) Error!void {
     if (step_result != c.SQLITE_DONE) return db.stepFailed(step_result);
 }
 
-/// The next row, or null once the statement is done (a failure is an
-/// error, never a short result).
+/// Steps to the next row: false once the statement is done (a failure is
+/// an error, never a short result).
 fn nextRow(db: *Db, stmt: *c.sqlite3_stmt) Error!bool {
     return switch (c.sqlite3_step(stmt)) {
         c.SQLITE_ROW => true,
@@ -363,19 +378,6 @@ pub fn deleteClip(db: *Db, id: ClipId) Error!void {
 
 pub fn clearClips(db: *Db) Error!void {
     try db.exec("DELETE FROM clipboard");
-}
-
-fn bindText(stmt: *c.sqlite3_stmt, parameter: c_int, text: []const u8) c_int {
-    // SQLITE_TRANSIENT: sqlite copies the bytes.
-    const transient: c.sqlite3_destructor_type = @ptrFromInt(@as(usize, @bitCast(@as(isize, -1))));
-    return c.sqlite3_bind_text64(stmt, parameter, text.ptr, text.len, transient, c.SQLITE_UTF8);
-}
-
-fn columnText(stmt: *c.sqlite3_stmt, column: c_int) []const u8 {
-    const text = c.sqlite3_column_text(stmt, column) orelse return "";
-    const text_len = c.sqlite3_column_bytes(stmt, column);
-    assert(text_len >= 0);
-    return text[0..@intCast(text_len)];
 }
 
 test "clipboard dedupes and orders by recency" {
