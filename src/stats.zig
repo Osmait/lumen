@@ -239,15 +239,15 @@ fn reportContentIndex(
     try writer.print("  {d} checks, {d} of them listings (last {d:.0} ms; ", .{
         status.checks,
         status.listings,
-        msFromNs(status.last_list_ns),
+        msFromNs(status.list_ns_last),
     });
-    try writer.print("indexed files only: {d:.0} ms), ", .{msFromNs(status.last_stat_ns)});
+    try writer.print("indexed files only: {d:.0} ms), ", .{msFromNs(status.stat_ns_last)});
     try writer.print("{d} builds, {d} of them updates (last {d:.0} ms, ", .{
         status.builds,
         status.updates,
-        msFromNs(status.last_build_ns),
+        msFromNs(status.build_ns_last),
     });
-    try writer.print("extraction {d:.0} ms)\n\n", .{msFromNs(status.last_extract_ns)});
+    try writer.print("extraction {d:.0} ms)\n\n", .{msFromNs(status.extract_ns_last)});
 }
 
 fn reportLatency(writer: *std.Io.Writer) ReportError!void {

@@ -228,7 +228,7 @@ const DocColumns = struct {
 };
 
 pub const Index = struct {
-    buf: Bytes,
+    bytes: Bytes,
     backing: format.Backing,
     docs_count: usize,
     segments_count: usize,
@@ -249,7 +249,7 @@ pub const Index = struct {
     bytes_live: usize,
 
     pub fn deinit(index: *Index, gpa: std.mem.Allocator) void {
-        format.release(index.buf, index.backing, gpa);
+        format.release(index.bytes, index.backing, gpa);
         index.* = undefined;
     }
 
@@ -354,7 +354,7 @@ pub const Index = struct {
         }
 
         return .{
-            .buf = whole,
+            .bytes = whole,
             .backing = backing,
             .docs_count = docs_count,
             .segments_count = segments_count,
@@ -373,7 +373,7 @@ pub const Index = struct {
 
     /// Writes the index to `path_z` atomically (see `sys.writeFileAtomic`).
     pub fn save(index: *const Index, path_z: [:0]const u8) sys.Error!void {
-        try sys.writeFileAtomic(path_z, index.buf);
+        try sys.writeFileAtomic(path_z, index.bytes);
     }
 
     pub fn open(path_z: [:0]const u8) (sys.Error || error{BadIndex})!Index {
@@ -386,7 +386,7 @@ pub const Index = struct {
     /// absent).
     fn list(index: *const Index, segment_index: usize, key: u32) []const u8 {
         const segment = index.segments[segment_index];
-        const keys = sliceAt(u32, index.buf, segment.keys_offset, segment.keys_count);
+        const keys = sliceAt(u32, index.bytes, segment.keys_offset, segment.keys_count);
         var low: usize = 0;
         var high: usize = keys.len;
         while (low < high) {
@@ -395,9 +395,9 @@ pub const Index = struct {
         }
         if (low == keys.len) return &.{};
         if (keys[low] != key) return &.{};
-        const offsets = sliceAt(u32, index.buf, segment.offsets_offset, segment.keys_count + 1);
+        const offsets = sliceAt(u32, index.bytes, segment.offsets_offset, segment.keys_count + 1);
         const postings_offset = segment.postings_offset;
-        return index.buf[postings_offset + offsets[low] .. postings_offset + offsets[low + 1]];
+        return index.bytes[postings_offset + offsets[low] .. postings_offset + offsets[low + 1]];
     }
 
     /// Documents containing every trigram of every word, folded (words of 3+
@@ -664,7 +664,7 @@ pub const TextFn = *const fn (
 /// A `TextFn` and the context it is called with.
 pub const TextReader = struct {
     read: TextFn,
-    ctx: *anyopaque,
+    context: *anyopaque,
     /// Most bytes of text `read` gives for an extracted document (its text
     /// is not the size of the file, the size of the cached text is). When it
     /// is null, `extracted_bytes_max`.
@@ -676,7 +676,7 @@ pub const TextReader = struct {
         const text_size = switch (doc.source) {
             .plain => @min(doc.size, text_bytes_max),
             .extracted => if (reader.extracted_bytes) |extracted_bytes|
-                @min(extracted_bytes(reader.ctx, doc), extracted_bytes_max)
+                @min(extracted_bytes(reader.context, doc), extracted_bytes_max)
             else
                 extracted_bytes_max,
         };
@@ -754,7 +754,7 @@ fn extractTaskOrFail(round: *ExtractRound, task: usize) std.mem.Allocator.Error!
             .start = start,
             .count = out.items.len - start,
         };
-        if (!try round.text.read(round.text.ctx, round.docs[doc], &text, gpa)) continue;
+        if (!try round.text.read(round.text.context, round.docs[doc], &text, gpa)) continue;
         if (seen.bit_length == 0) seen = try .initEmpty(gpa, trigrams_count);
         keys.clearRetainingCapacity();
         var trigrams: Trigrams = .{ .text = text.items };
@@ -773,7 +773,7 @@ pub const BuildStats = struct {
     docs_indexed: usize = 0,
     pairs: usize = 0,
     segments: usize = 0,
-    ns: u64 = 0,
+    elapsed_ns: u64 = 0,
 };
 
 pub const BuildError = std.mem.Allocator.Error || error{
@@ -881,7 +881,7 @@ pub fn appendFile(
     path_z: [:0]const u8,
     stats: ?*BuildStats,
 ) FileError!?Index {
-    var file = (try sys.AppendFile.open(path_z, old.buf.len)) orelse return null;
+    var file = (try sys.AppendFile.open(path_z, old.bytes.len)) orelse return null;
     defer file.deinit();
     var sink: Sink = .{ .gpa = gpa, .append_file = &file, .written_bytes = file.len };
     defer sink.deinit();
@@ -1004,10 +1004,10 @@ fn segmentPairs(
     out: *std.ArrayList(u64),
 ) std.mem.Allocator.Error!void {
     const keys_count: usize = @intCast(segment.keys_count);
-    const keys = sliceAt(u32, index.buf, @intCast(segment.keys_offset), keys_count);
-    const offsets = sliceAt(u32, index.buf, @intCast(segment.offsets_offset), keys_count + 1);
+    const keys = sliceAt(u32, index.bytes, @intCast(segment.keys_offset), keys_count);
+    const offsets = sliceAt(u32, index.bytes, @intCast(segment.offsets_offset), keys_count + 1);
     const postings_offset: usize = @intCast(segment.postings_offset);
-    const postings = index.buf[postings_offset..][0..@intCast(segment.postings_size)];
+    const postings = index.bytes[postings_offset..][0..@intCast(segment.postings_size)];
     for (keys, 0..) |key, key_index| {
         var reader: ListReader = .{
             .list_encoded = postings[offsets[key_index]..offsets[key_index + 1]],
@@ -1146,7 +1146,7 @@ fn updateInto(
         .header = .reserve,
         .path_offsets_reused = &.{},
     });
-    for (old.segments) |segment| try copySegment(sink, &directory, old.buf, segment);
+    for (old.segments) |segment| try copySegment(sink, &directory, old.bytes, segment);
     try indexDocs(sink, pool, &directory, docs, old.docs_count, text, &build_stats, &.{});
     build_stats.docs_indexed = added.len;
     return finish(sink, directory.items, docs.len, table, start_ns, &build_stats, stats);
@@ -1375,7 +1375,7 @@ fn finish(
     const directory_offset = sink.position();
     try sink.append(std.mem.sliceAsBytes(directory));
     const size_total = sink.position();
-    build_stats.ns = sys.monotonicNs() - start_ns;
+    build_stats.elapsed_ns = sys.monotonicNs() - start_ns;
     if (stats) |out| out.* = build_stats.*;
 
     assert(docs_count <= std.math.maxInt(u32));
@@ -1862,7 +1862,7 @@ test "candidates equal a brute-force scan, across segments, after save/open" {
     const pool = try Pool.create(gpa, testing.io, 3);
     defer pool.destroy();
     var test_docs: TestDocs = .{ .texts = texts.items };
-    const reader: TextReader = .{ .read = TestDocs.readText, .ctx = &test_docs };
+    const reader: TextReader = .{ .read = TestDocs.readText, .context = &test_docs };
     var index = try build(gpa, pool, docs.items, reader, null);
     defer index.deinit(gpa);
 
@@ -1909,7 +1909,7 @@ test "update: edited and deleted documents leave, new ones join, old ids keep th
         .{ .path = "1", .mtime = 1, .size = 1 },
         .{ .path = "2", .mtime = 1, .size = 1 },
     };
-    var index = try build(gpa, pool, &docs, .{ .read = TestDocs.readText, .ctx = &before }, null);
+    var index = try build(gpa, pool, &docs, .{ .read = TestDocs.readText, .context = &before }, null);
     defer index.deinit(gpa);
 
     // "1" edited, "2" deleted, "3" new. TestDocs reads a path's number as
@@ -1932,7 +1932,7 @@ test "update: edited and deleted documents leave, new ones join, old ids keep th
         &index,
         &.{ 1, 2 },
         &added,
-        .{ .read = TestDocs.readText, .ctx = &after },
+        .{ .read = TestDocs.readText, .context = &after },
         &stats,
     );
     defer updated.deinit(gpa);
@@ -1973,25 +1973,25 @@ test "update: edited and deleted documents leave, new ones join, old ids keep th
         gpa,
         pool,
         &docs,
-        .{ .read = TestDocs.readText, .ctx = &before },
+        .{ .read = TestDocs.readText, .context = &before },
         streamed_path,
         null,
     );
     defer built.deinit(gpa);
     try testing.expect(built.backing == .mapped);
-    try testing.expectEqualSlices(u8, index.buf, built.buf);
+    try testing.expectEqualSlices(u8, index.bytes, built.bytes);
     var streamed = try updateFile(
         gpa,
         pool,
         &built,
         &.{ 1, 2 },
         &added,
-        .{ .read = TestDocs.readText, .ctx = &after },
+        .{ .read = TestDocs.readText, .context = &after },
         streamed_path,
         null,
     );
     defer streamed.deinit(gpa);
-    try testing.expectEqualSlices(u8, updated.buf, streamed.buf);
+    try testing.expectEqualSlices(u8, updated.bytes, streamed.bytes);
     try testing.expectEqualStrings("0", built.path(0));
 
     // Updated again, with only a removal: no new segment.
@@ -2001,7 +2001,7 @@ test "update: edited and deleted documents leave, new ones join, old ids keep th
         &mapped,
         &.{0},
         &.{},
-        .{ .read = TestDocs.readText, .ctx = &after },
+        .{ .read = TestDocs.readText, .context = &after },
         null,
     );
     defer again.deinit(gpa);
@@ -2035,7 +2035,7 @@ test "appended updates: same results as rewritten ones, old mappings stay good, 
         "india zanzibar",
     };
     var test_docs: TestDocs = .{ .texts = &texts };
-    const reader: TextReader = .{ .read = TestDocs.readText, .ctx = &test_docs };
+    const reader: TextReader = .{ .read = TestDocs.readText, .context = &test_docs };
     var first = [_]DocIn{
         .{ .path = "0", .mtime = 1, .size = 1 },
         .{ .path = "1", .mtime = 1, .size = 1 },
@@ -2101,7 +2101,7 @@ test "appended updates: same results as rewritten ones, old mappings stay good, 
     }
     // Six updates of tiny segments: merged, not six more segments.
     try testing.expect(current.segments_count < in_memory.segments_count);
-    try testing.expect(current.buf.len > current.bytes_live);
+    try testing.expect(current.bytes.len > current.bytes_live);
 
     // An append whose header never got written (a crash): the file still
     // opens as it was.
@@ -2171,7 +2171,7 @@ pub const SearchOptions = struct {
     limit: usize,
     /// Where each document's text is read from, and its context.
     text_path: PathFn,
-    text_ctx: *anyopaque,
+    text_context: *anyopaque,
     /// Set by another thread once the answer is not wanted any more (a
     /// newer query waits): verification stops at the next candidate, and
     /// the matches so far are returned.
@@ -2405,7 +2405,7 @@ pub fn search(
 ) std.mem.Allocator.Error!void {
     const limit = options.limit;
     const text_path = options.text_path;
-    const text_context = options.text_ctx;
+    const text_context = options.text_context;
     out.clearRetainingCapacity();
     if (limit == 0) return;
     const words = try splitWords(arena, query);
@@ -2634,7 +2634,7 @@ test "search: the top matches equal reading every document and ranking them all"
     const pool = try Pool.create(gpa, testing.io, 3);
     defer pool.destroy();
     var dummy: u8 = 0;
-    var index = try build(gpa, pool, &docs, .{ .read = FileDocs.readText, .ctx = &dummy }, null);
+    var index = try build(gpa, pool, &docs, .{ .read = FileDocs.readText, .context = &dummy }, null);
     defer index.deinit(gpa);
 
     var out: std.ArrayList(Match) = .empty;
@@ -2653,7 +2653,7 @@ test "search: the top matches equal reading every document and ranking them all"
             arena,
             pool,
             query,
-            .{ .limit = limit, .text_path = plainPath, .text_ctx = &dummy },
+            .{ .limit = limit, .text_path = plainPath, .text_context = &dummy },
             &out,
         );
         // Every document read and ranked.
@@ -2707,7 +2707,7 @@ test "search: unaccented and capital queries find accented text" {
     const pool = try Pool.create(gpa, testing.io, 2);
     defer pool.destroy();
     var dummy: u8 = 0;
-    var index = try build(gpa, pool, &docs, .{ .read = FileDocs.readText, .ctx = &dummy }, null);
+    var index = try build(gpa, pool, &docs, .{ .read = FileDocs.readText, .context = &dummy }, null);
     defer index.deinit(gpa);
 
     var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -2729,7 +2729,7 @@ test "search: unaccented and capital queries find accented text" {
             arena.allocator(),
             pool,
             case.query,
-            .{ .limit = 10, .text_path = plainPath, .text_ctx = &dummy },
+            .{ .limit = 10, .text_path = plainPath, .text_context = &dummy },
             &out,
         );
         try testing.expectEqual(@as(usize, 1), out.items.len);
@@ -2743,7 +2743,7 @@ test "search: unaccented and capital queries find accented text" {
         arena.allocator(),
         pool,
         "×yz",
-        .{ .limit = 10, .text_path = plainPath, .text_ctx = &dummy },
+        .{ .limit = 10, .text_path = plainPath, .text_context = &dummy },
         &out,
     );
     try testing.expectEqual(@as(usize, 0), out.items.len);
@@ -2755,7 +2755,7 @@ test "search: unaccented and capital queries find accented text" {
         arena.allocator(),
         pool,
         "accion",
-        .{ .limit = 10, .text_path = plainPath, .text_ctx = &dummy, .stop = &stop },
+        .{ .limit = 10, .text_path = plainPath, .text_context = &dummy, .stop = &stop },
         &out,
     );
     try testing.expectEqual(@as(usize, 0), out.items.len);
@@ -2803,7 +2803,7 @@ fn smallIndex(gpa: std.mem.Allocator) !Index {
     const pool = try Pool.create(gpa, testing.io, 1);
     defer pool.destroy();
     var test_docs: TestDocs = .{ .texts = &texts };
-    return build(gpa, pool, &docs, .{ .read = TestDocs.readText, .ctx = &test_docs }, null);
+    return build(gpa, pool, &docs, .{ .read = TestDocs.readText, .context = &test_docs }, null);
 }
 
 /// Touches everything a reader of an index may touch: must never crash on
@@ -2837,7 +2837,7 @@ test "corrupt content indexes are rejected, not trusted" {
     const gpa = testing.allocator;
     var index = try smallIndex(gpa);
     defer index.deinit(gpa);
-    const good = index.buf;
+    const good = index.bytes;
     try exerciseIndex(&index, gpa);
 
     const bad = try gpa.alignedAlloc(u8, .@"8", good.len);
@@ -2961,13 +2961,13 @@ test "malformed posting lists end, never over-read" {
     var index = try smallIndex(gpa);
     defer index.deinit(gpa);
     const segment = index.segments[0];
-    const offsets = sliceAt(u32, index.buf, segment.offsets_offset, segment.keys_count + 1);
+    const offsets = sliceAt(u32, index.bytes, segment.offsets_offset, segment.keys_count + 1);
     for (offsets[1..]) |offset| {
-        if (offset > 0) index.buf[segment.postings_offset + offset - 1] |= 0x80;
+        if (offset > 0) index.bytes[segment.postings_offset + offset - 1] |= 0x80;
     }
     try exerciseIndex(&index, gpa);
     // And with garbage postings: ids past the documents never come out.
-    @memset(index.buf[segment.postings_offset..][0..segment.postings_size], 0x7f);
+    @memset(index.bytes[segment.postings_offset..][0..segment.postings_size], 0x7f);
     try exerciseIndex(&index, gpa);
 }
 
@@ -2996,7 +2996,7 @@ fn segmentedIndex(gpa: std.mem.Allocator, pool: *Pool) !Index {
         }};
         const next = try update(gpa, pool, &index, &.{}, &added, .{
             .read = TestDocs.readText,
-            .ctx = &test_docs,
+            .context = &test_docs,
         }, null);
         index.deinit(gpa);
         index = next;
@@ -3013,14 +3013,14 @@ fn appendMemory(
     added: []const DocIn,
     text: TextReader,
 ) !Index {
-    var sink: Sink = .{ .gpa = gpa, .written_bytes = old.buf.len };
+    var sink: Sink = .{ .gpa = gpa, .written_bytes = old.bytes.len };
     defer sink.deinit();
     const header = appendInto(&sink, pool, old, gone, added, text, null) catch |err|
         return memoryOnly(err);
-    const bytes = try gpa.alignedAlloc(u8, .@"8", old.buf.len + sink.bytes.items.len);
+    const bytes = try gpa.alignedAlloc(u8, .@"8", old.bytes.len + sink.bytes.items.len);
     errdefer gpa.free(bytes);
-    @memcpy(bytes[0..old.buf.len], old.buf);
-    @memcpy(bytes[old.buf.len..], sink.bytes.items);
+    @memcpy(bytes[0..old.bytes.len], old.bytes);
+    @memcpy(bytes[old.bytes.len..], sink.bytes.items);
     @memcpy(bytes[0..header_size], &header.encode());
     return Index.parse(bytes, .heap);
 }
@@ -3030,7 +3030,7 @@ fn appendMemory(
 /// one that parses and answers.
 fn exerciseUpdates(index: *const Index, gpa: std.mem.Allocator, pool: *Pool) !void {
     var test_docs: TestDocs = .{ .texts = &update_texts };
-    const reader: TextReader = .{ .read = TestDocs.readText, .ctx = &test_docs };
+    const reader: TextReader = .{ .read = TestDocs.readText, .context = &test_docs };
     const added = [_]DocIn{
         .{ .path = "0", .mtime = 200, .size = 1 },
         .{ .path = "3", .mtime = 200, .size = 1 },
@@ -3056,8 +3056,8 @@ test "segments that repeat or reorder doc ids (a damaged file): queries, updates
     // parser"): "arena" lists 61 in segment 2 and again in segment 4, and
     // "zig" lists 62 in segment 3, then 61. Nothing `parse` checks.
     const last = index.segments[4];
-    @memset(index.buf[@intCast(last.postings_offset)..][0..@intCast(last.postings_size)], 61);
-    _ = try Index.parse(index.buf, .heap);
+    @memset(index.bytes[@intCast(last.postings_offset)..][0..@intCast(last.postings_size)], 61);
+    _ = try Index.parse(index.bytes, .heap);
 
     var got: std.ArrayList(u32) = .empty;
     defer got.deinit(gpa);
@@ -3085,7 +3085,7 @@ test "segments that repeat or reorder doc ids (a damaged file): queries, updates
         &mapped,
         &.{},
         &added,
-        .{ .read = TestDocs.readText, .ctx = &test_docs },
+        .{ .read = TestDocs.readText, .context = &test_docs },
         index_path,
         null,
     )).?;
@@ -3153,7 +3153,7 @@ const PeakAllocator = struct {
 
 test "a round reads no more than round_pairs_max of possible text, one document at least" {
     var dummy: u8 = 0;
-    const reader: TextReader = .{ .read = TestDocs.readText, .ctx = &dummy };
+    const reader: TextReader = .{ .read = TestDocs.readText, .context = &dummy };
     var docs: [2000]DocIn = undefined;
     for (&docs) |*doc| doc.* = .{ .path = "", .mtime = 0, .size = 4096 };
     // Small files: `round_docs_max` a round, and what is left at the end.
@@ -3208,7 +3208,7 @@ test "building high-entropy text: memory stays bounded by rounds and segments" {
     defer test_dir.deinit();
     var index_path_buffer: paths.Buffer = undefined;
     const index_path = try test_dir.path(&index_path_buffer, "content.idx");
-    const reader: TextReader = .{ .read = TestDocs.readText, .ctx = &test_docs };
+    const reader: TextReader = .{ .read = TestDocs.readText, .context = &test_docs };
     var index = try buildFile(gpa, pool, &docs, reader, index_path, &stats);
     defer index.deinit(gpa);
     try testing.expect(stats.pairs > 20 << 20);
@@ -3225,13 +3225,13 @@ test "random byte flips in a content index never crash, nor updating it" {
     defer pool.destroy();
     var index = try segmentedIndex(gpa, pool);
     defer index.deinit(gpa);
-    const bad = try gpa.alignedAlloc(u8, .@"8", index.buf.len);
+    const bad = try gpa.alignedAlloc(u8, .@"8", index.bytes.len);
     defer gpa.free(bad);
     var prng = std.Random.DefaultPrng.init(23);
     const random = prng.random();
     var accepted: usize = 0;
     for (0..3000) |_| {
-        @memcpy(bad, index.buf);
+        @memcpy(bad, index.bytes);
         for (0..random.intRangeAtMost(usize, 1, 4)) |_| {
             bad[random.uintLessThan(usize, bad.len)] = random.int(u8);
         }
@@ -3296,7 +3296,7 @@ test "fuzz: parsing arbitrary bytes as a content index never crashes" {
     const gpa = testing.allocator;
     var index = try smallIndex(gpa);
     defer index.deinit(gpa);
-    const seed = try corpusEntry(gpa, index.buf);
+    const seed = try corpusEntry(gpa, index.bytes);
     defer gpa.free(seed);
     try testing.fuzz({}, fuzzParseBytes, .{ .corpus = &.{seed} });
 }
@@ -3328,7 +3328,7 @@ test "fuzz: a real content index with random damage never crashes, nor updating 
     defer pool.destroy();
     var index = try segmentedIndex(gpa, pool);
     defer index.deinit(gpa);
-    try testing.fuzz(FlipsContext{ .good = index.buf, .pool = pool }, fuzzFlips, .{});
+    try testing.fuzz(FlipsContext{ .good = index.bytes, .pool = pool }, fuzzFlips, .{});
 }
 
 fn fuzzFindFold(_: void, smith: *testing.Smith) anyerror!void {

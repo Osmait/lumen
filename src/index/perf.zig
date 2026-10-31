@@ -324,7 +324,7 @@ fn contents(gpa: std.mem.Allocator, pool: *index.Pool, directory: []const u8) !v
 
     var reader_context: u8 = 0;
     var start_ns = sys.monotonicNs();
-    const reader: content.TextReader = .{ .read = plainText, .ctx = &reader_context };
+    const reader: content.TextReader = .{ .read = plainText, .context = &reader_context };
     var built = try content.build(gpa, pool, documents.items, reader, null);
     defer built.deinit(gpa);
     check("build", ms(sys.monotonicNs() - start_ns), 1500);
@@ -347,7 +347,7 @@ fn contents(gpa: std.mem.Allocator, pool: *index.Pool, directory: []const u8) !v
             arena,
             pool,
             query,
-            .{ .limit = 50, .text_path = content.plainPath, .text_ctx = &reader_context },
+            .{ .limit = 50, .text_path = content.plainPath, .text_context = &reader_context },
             &matches,
         );
         var label: [64]u8 = undefined;

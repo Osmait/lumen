@@ -294,16 +294,16 @@ fn contentBench(
     defer temporary.remove();
     var index_path_buffer: index.paths.Buffer = undefined;
     const index_path = try temporary.file(&index_path_buffer, "content.idx");
-    const reader: index.content.TextReader = .{ .read = plainText, .ctx = &reader_context };
+    const reader: index.content.TextReader = .{ .read = plainText, .context = &reader_context };
     var built = try index.content.buildFile(gpa, pool, documents, reader, index_path, &build_stats);
     defer built.deinit(gpa);
     std.debug.print(
         "build     {d:>8.1} ms  {d} pairs, {d} segments, index {d:.1} MB (postings {d:.1} MB)\n",
         .{
-            ms(build_stats.ns),
+            ms(build_stats.elapsed_ns),
             build_stats.pairs,
             build_stats.segments,
-            @as(f64, @floatFromInt(built.buf.len)) / 1e6,
+            @as(f64, @floatFromInt(built.bytes.len)) / 1e6,
             @as(f64, @floatFromInt(built.postingBytes())) / 1e6,
         },
     );
@@ -350,7 +350,7 @@ fn contentQueries(
             arena,
             pool,
             query,
-            .{ .limit = 50, .text_path = index.content.plainPath, .text_ctx = &path_context },
+            .{ .limit = 50, .text_path = index.content.plainPath, .text_context = &path_context },
             &matches,
         );
         std.debug.print("{s:<20} {d:>9} {d:>9} {d:>9.2}\n", .{

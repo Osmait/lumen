@@ -83,12 +83,12 @@ pub const Counters = struct {
     /// Documents whose text was extracted (a child process each).
     extractions: std.atomic.Value(u32) = .init(0),
     /// When the last check started, for the rate limit of `poke`.
-    last_check_ns: std.atomic.Value(u64) = .init(0),
-    last_list_ns: std.atomic.Value(u64) = .init(0),
+    check_ns_last: std.atomic.Value(u64) = .init(0),
+    list_ns_last: std.atomic.Value(u64) = .init(0),
     /// The last check that looked at indexed files only.
-    last_stat_ns: std.atomic.Value(u64) = .init(0),
-    last_build_ns: std.atomic.Value(u64) = .init(0),
-    last_extract_ns: std.atomic.Value(u64) = .init(0),
+    stat_ns_last: std.atomic.Value(u64) = .init(0),
+    build_ns_last: std.atomic.Value(u64) = .init(0),
+    extract_ns_last: std.atomic.Value(u64) = .init(0),
 };
 
 /// State only the service thread reads or writes, so it needs no lock and no
@@ -204,10 +204,10 @@ pub const Status = struct {
     checks: u32 = 0,
     /// Documents whose text was extracted (a child process each).
     extractions: u32 = 0,
-    last_list_ns: u64 = 0,
-    last_stat_ns: u64 = 0,
-    last_build_ns: u64 = 0,
-    last_extract_ns: u64 = 0,
+    list_ns_last: u64 = 0,
+    stat_ns_last: u64 = 0,
+    build_ns_last: u64 = 0,
+    extract_ns_last: u64 = 0,
 };
 
 pub fn status(service: *ContentService) Status {
@@ -220,16 +220,16 @@ pub fn status(service: *ContentService) Status {
         .ready = index != null,
         .extracted = if (index) |present| present.extractedCount() else 0,
         .segments = if (index) |present| present.segments_count else 0,
-        .index_bytes = if (index) |present| present.buf.len else 0,
+        .index_bytes = if (index) |present| present.bytes.len else 0,
         .builds = service.counters.builds.load(.acquire),
         .updates = service.counters.updates.load(.acquire),
         .listings = service.counters.listings.load(.acquire),
         .checks = service.counters.checks.load(.acquire),
         .extractions = service.counters.extractions.load(.acquire),
-        .last_list_ns = service.counters.last_list_ns.load(.monotonic),
-        .last_stat_ns = service.counters.last_stat_ns.load(.monotonic),
-        .last_build_ns = service.counters.last_build_ns.load(.monotonic),
-        .last_extract_ns = service.counters.last_extract_ns.load(.monotonic),
+        .list_ns_last = service.counters.list_ns_last.load(.monotonic),
+        .stat_ns_last = service.counters.stat_ns_last.load(.monotonic),
+        .build_ns_last = service.counters.build_ns_last.load(.monotonic),
+        .extract_ns_last = service.counters.extract_ns_last.load(.monotonic),
     };
 }
 
@@ -277,7 +277,7 @@ pub fn searchUntil(
         arena,
         service.search_pool,
         query,
-        .{ .limit = limit, .text_path = pathOf, .text_ctx = service, .stop = stop },
+        .{ .limit = limit, .text_path = pathOf, .text_context = service, .stop = stop },
         &matches,
     );
     for (matches.items) |match| try out.append(arena, .{
@@ -604,7 +604,7 @@ fn listAll(
         if (err != error.Canceled) log.warn("listing files: {t}", .{err});
         return null;
     };
-    service.counters.last_list_ns.store(sys.monotonicNs() - start_ns, .monotonic);
+    service.counters.list_ns_last.store(sys.monotonicNs() - start_ns, .monotonic);
     _ = service.counters.listings.fetchAdd(1, .release);
     service.worker.listed_name_changes = name_changes;
     service.worker.listed_at_ns = start_ns;
@@ -668,7 +668,7 @@ fn assertWorkerThread(service: *const ContentService) void {
 
 fn refresh(service: *ContentService) void {
     service.assertWorkerThread();
-    service.counters.last_check_ns.store(sys.monotonicNs(), .release);
+    service.counters.check_ns_last.store(sys.monotonicNs(), .release);
     // Counted when done, so `checks` going up means its result is visible.
     defer _ = service.counters.checks.fetchAdd(1, .release);
     var arena_state: std.heap.ArenaAllocator = .init(service.gpa);
@@ -698,14 +698,14 @@ fn refresh(service: *ContentService) void {
     } else {
         changed.added = service.extractMissing(arena, changed.added) orelse return;
     }
-    service.counters.last_extract_ns.store(sys.monotonicNs() - start_ns, .monotonic);
+    service.counters.extract_ns_last.store(sys.monotonicNs() - start_ns, .monotonic);
     if (service.stop.load(.acquire)) return;
     // Only documents to retry, which failed again.
     if (!whole and changed.gone.len == 0 and changed.added.len == 0) return;
     start_ns = sys.monotonicNs();
     const input: BuildInput = if (whole) .{ .whole = docs.? } else .{ .update = changed };
     const fresh = service.buildNext(input) orelse return;
-    service.counters.last_build_ns.store(sys.monotonicNs() - start_ns, .monotonic);
+    service.counters.build_ns_last.store(sys.monotonicNs() - start_ns, .monotonic);
     _ = service.counters.builds.fetchAdd(1, .release);
     if (!whole) _ = service.counters.updates.fetchAdd(1, .release);
 
@@ -738,7 +738,7 @@ fn changes(
         return service.diff(arena, docs.*.?) catch null;
     }
     const changed = service.indexedChanges(arena) catch return null;
-    service.counters.last_stat_ns.store(sys.monotonicNs() - start_ns, .monotonic);
+    service.counters.stat_ns_last.store(sys.monotonicNs() - start_ns, .monotonic);
     return changed;
 }
 
@@ -773,7 +773,7 @@ fn wantsWhole(service: *const ContentService, changed: Diff) bool {
     const docs_count = index.docs_count + changed.added.len;
     if (removed_count * 100 > docs_count * service.options.removed_percent_max) return true;
     if (index.segments_count >= service.options.segments_max) return true;
-    return index.buf.len * 100 > index.bytes_live * (100 + garbage_percent_max);
+    return index.bytes.len * 100 > index.bytes_live * (100 + garbage_percent_max);
 }
 
 /// What the next index is made from.
@@ -815,7 +815,7 @@ fn buildNext(service: *ContentService, input: BuildInput) ?content.Index {
     if (input == .update) assert(service.index != null);
     const reader: content.TextReader = .{
         .read = textOf,
-        .ctx = service,
+        .context = service,
         .extracted_bytes = cachedTextBytes,
     };
     if (std.mem.findScalarLast(u8, service.cache_path, '/')) |slash| {
@@ -1013,14 +1013,14 @@ fn run(service: *ContentService) void {
         // never comes (this thread is joined, never canceled); waking early
         // for any reason is harmless, since the loop looks at `stop` and
         // the clock either way.
-        const since_check_ns = sys.monotonicNs() - service.counters.last_check_ns.load(.acquire);
+        const since_check_ns = sys.monotonicNs() - service.counters.check_ns_last.load(.acquire);
         const due_ns = service.options.refresh_interval_ns -| since_check_ns;
         service.io.futexWaitTimeout(u32, &service.wake.raw, seen, .{ .duration = .{
             .raw = .fromNanoseconds(@max(due_ns, std.time.ns_per_s)),
             .clock = .awake,
         } }) catch {};
         if (service.stop.load(.acquire)) return;
-        const since_ns = sys.monotonicNs() - service.counters.last_check_ns.load(.acquire);
+        const since_ns = sys.monotonicNs() - service.counters.check_ns_last.load(.acquire);
         const wake_now = service.wake.load(.acquire);
         const poked = wake_now != seen;
         seen = wake_now;
@@ -1514,7 +1514,7 @@ test "content service: a document whose extraction failed in passing is left out
     try testing.expect(std.mem.endsWith(u8, kept[0].path, "/b.txt"));
     try testing.expectEqual(@as(usize, 1), service.worker.retry.len);
     try testing.expectEqualStrings(pdf, service.worker.retry[0].path);
-    const reader: content.TextReader = .{ .read = textOf, .ctx = &service };
+    const reader: content.TextReader = .{ .read = textOf, .context = &service };
     service.index = try content.build(testing.allocator, pool, kept, reader, null);
     defer service.index.?.deinit(testing.allocator);
 
