@@ -11,15 +11,31 @@
 //! older registry (the files were reloaded since) is answered with an
 //! error, never run against the wrong command.
 //!
-//! A request goes: `list` (main thread) → `run` (the worker's loop) →
-//! `listExecute` → `ListContext.run` (inside Lua) → `deliver` →
-//! `deliverCallback` (main loop) → `Callbacks.list` (the UI). `act`,
-//! `submit`, `root` and `reload` go the same way.
+//! This file is the host's public side and its thread: the types the
+//! window receives, the requests it posts (main thread), the worker's loop
+//! that takes them, and the delivery of answers to the main loop. What the
+//! worker does with a request is in files of its own:
+//!
+//!   loading.zig    reload: each file in a new Lua state, a new registry
+//!   spec.zig       what `lumen.extension { ... }` returns, read into a Load
+//!   Load.zig       what a reload collects; undone for a file that fails
+//!   Extension.zig  one file's Lua state, and running Lua in it
+//!   requests.zig   list, root search, act and submit, run in that state
+//!   api.zig        the `lumen` module the files call
+//!   rows.zig       rows Lua returns, read into Items
+//!   registry.zig   what the window gets from a reload
+//!   stamp.zig      whether the files changed (the window asks, main thread)
+//!
+//! A request goes: `list` (main thread) → `post` → `run` (the worker's
+//! loop) → `requests.listExecute` → `ListContext.run` (inside Lua) →
+//! `deliver` → `deliverCallback` (main loop) → `Callbacks.list_callback`
+//! (the UI). `act`, `submit` and `root` go the same way; `reload` runs
+//! `loading.reloadExecute`.
 
 const std = @import("std");
 const c = @import("c");
-const lua = @import("luart").lua;
-const api = @import("api.zig");
+const os = @import("os");
+const core = @import("core");
 const rows_mod = @import("rows.zig");
 const registry_mod = @import("registry.zig");
 const generation_mod = @import("generation.zig");
@@ -28,13 +44,8 @@ const requests = @import("requests.zig");
 const loading = @import("loading.zig");
 pub const Extension = @import("Extension.zig");
 pub const Load = @import("Load.zig");
-const os = @import("os");
-const core = @import("core");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
-const themes = @import("../ui/themes.zig");
-const layout_mod = @import("../layout.zig");
-const styles = @import("styles");
 
 const Host = @This();
 
@@ -158,11 +169,10 @@ pub const RootResult = struct {
 
 pub const RootSection = struct { command: CommandIndex, items: []Item };
 
-/// Called on the GTK main loop; each takes ownership of its result.
 /// Each request's answer is handed to its callback on the GTK main loop,
-/// with `context`: `reload` to `registry_callback`, `list` to
-/// `list_callback`, `act` and `submit` to `act_callback`, `root` to
-/// `root_callback`.
+/// with `context`, and the callback owns it from then on: `reload`'s to
+/// `registry_callback`, `list`'s to `list_callback`, `act`'s and `submit`'s
+/// to `act_callback`, `root`'s to `root_callback`.
 pub const Callbacks = struct {
     context: ?*anyopaque,
     registry_callback: *const fn (*Registry, ?*anyopaque) void,
@@ -261,12 +271,7 @@ pub fn setStyle(host: *Host, name: []const u8) bool {
 
 /// Loads every file again; the new registry arrives through the callback.
 pub fn reload(host: *Host) void {
-    {
-        host.lock.lockUncancelable(host.io);
-        defer host.lock.unlock(host.io);
-        host.pending.reload = true;
-    }
-    host.wake();
+    _ = host.post(.reload, true);
 }
 
 /// Asks for command `command`'s rows (`query` for search commands; longer
@@ -286,12 +291,7 @@ pub fn list(
         .query = .{},
     };
     request.query.set(query);
-    {
-        host.lock.lockUncancelable(host.io);
-        defer host.lock.unlock(host.io);
-        host.pending.list = request;
-    }
-    host.wake();
+    _ = host.post(.list, request);
     return request_generation;
 }
 
@@ -318,15 +318,8 @@ pub fn submit(
         log.warn("submit: out of memory, not sent", .{});
         return request_generation;
     };
-    const replaced = blk: {
-        host.lock.lockUncancelable(host.io);
-        defer host.lock.unlock(host.io);
-        const replaced = host.pending.submit;
-        host.pending.submit = request;
-        break :blk replaced;
-    };
-    if (replaced) |old_request| old_request.destroy(host.gpa);
-    host.wake();
+    // The request it replaces never ran, and nothing else frees it.
+    if (host.post(.submit, request)) |replaced| replaced.destroy(host.gpa);
     return request_generation;
 }
 
@@ -344,12 +337,7 @@ pub fn root(
         .query = .{},
     };
     request.query.set(query);
-    {
-        host.lock.lockUncancelable(host.io);
-        defer host.lock.unlock(host.io);
-        host.pending.root_search = request;
-    }
-    host.wake();
+    _ = host.post(.root_search, request);
     return request_generation;
 }
 
@@ -365,17 +353,12 @@ pub fn act(
     target: ActTarget,
 ) RequestGeneration {
     const request_generation = host.requestGenerationNext();
-    {
-        host.lock.lockUncancelable(host.io);
-        defer host.lock.unlock(host.io);
-        host.pending.act = .{
-            .registry_generation = registry_generation,
-            .command = command,
-            .request_generation = request_generation,
-            .target = target,
-        };
-    }
-    host.wake();
+    _ = host.post(.act, .{
+        .registry_generation = registry_generation,
+        .command = command,
+        .request_generation = request_generation,
+        .target = target,
+    });
     return request_generation;
 }
 
@@ -384,6 +367,25 @@ pub fn act(
 fn requestGenerationNext(host: *Host) RequestGeneration {
     host.request_generation_last = host.request_generation_last.next();
     return host.request_generation_last;
+}
+
+/// Hands `request` to the worker as the pending request of its kind, and
+/// wakes it. Returns the request it replaced (one the worker had not taken
+/// yet), if any.
+fn post(
+    host: *Host,
+    comptime kind: std.meta.FieldEnum(requests.Pending),
+    request: @FieldType(requests.Pending, @tagName(kind)),
+) @FieldType(requests.Pending, @tagName(kind)) {
+    const replaced = blk: {
+        host.lock.lockUncancelable(host.io);
+        defer host.lock.unlock(host.io);
+        const replaced = @field(host.pending, @tagName(kind));
+        @field(host.pending, @tagName(kind)) = request;
+        break :blk replaced;
+    };
+    host.wake();
+    return replaced;
 }
 
 /// Wakes the worker: bumps the sequence it sleeps on.
