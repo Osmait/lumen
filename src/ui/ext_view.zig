@@ -472,7 +472,7 @@ pub fn perform(ui: *Ui, action_index: u8) void {
     const row = item.action.ext_item;
     if (action_index >= row.actions.len) return;
     if (item.confirm and action_index == 0 and ui.needsConfirm(item)) return;
-    ui.closePanel();
+    ui.panel.close();
     switch (row.actions[action_index]) {
         .lua => {
             const host = ui.ext_host orelse return;
@@ -564,7 +564,7 @@ pub fn openTarget(ui: *Ui, target: []const u8, text: ?[*:0]const u8) bool {
             ui.showWith(.ext, text);
         } else {
             ui.navigate(.ext);
-            if (text) |t| c.gtk_editable_set_text(gtk.editable(ui.entry), t);
+            if (text) |t| c.gtk_editable_set_text(gtk.editable(ui.search_bar.entry), t);
         }
         return true;
     };

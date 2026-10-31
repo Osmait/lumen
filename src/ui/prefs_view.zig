@@ -245,8 +245,8 @@ pub fn editValue(ui: *Ui, target: Ui.Edited, preference: *const Host.Pref, value
             // After the view change, which clears the search bar.
             const value_z = ui.gpa.dupeSentinel(u8, value, 0) catch return;
             defer ui.gpa.free(value_z);
-            c.gtk_editable_set_text(gtk.editable(ui.entry), value_z.ptr);
-            c.gtk_editable_set_position(gtk.editable(ui.entry), -1);
+            c.gtk_editable_set_text(gtk.editable(ui.search_bar.entry), value_z.ptr);
+            c.gtk_editable_set_position(gtk.editable(ui.search_bar.entry), -1);
         },
     }
 }
