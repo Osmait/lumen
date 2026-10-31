@@ -179,42 +179,42 @@ pub fn choiceOptions(
 ) []const Option {
     _ = ui;
     return switch (choice) {
-        .text_size => &.{
-            .{ .value = "small", .label = "Small" },
-            .{ .value = "default", .label = "Default" },
-            .{ .value = "large", .label = "Large" },
-        },
-        .position => &.{ .{ .value = "upper_third", .label = "Upper Third" }, .{
-            .value = "center",
-            .label = "Center",
-        } },
-        .width => &.{
-            .{ .value = "narrow", .label = "Narrow" },
-            .{ .value = "default", .label = "Default" },
-            .{ .value = "wide", .label = "Wide" },
-        },
-        .height => &.{
-            .{ .value = "short", .label = "Short" },
-            .{ .value = "default", .label = "Default" },
-            .{ .value = "tall", .label = "Tall" },
-        },
-        .density => &.{
-            .{ .value = "compact", .label = "Compact" },
-            .{ .value = "default", .label = "Default" },
-            .{ .value = "comfortable", .label = "Comfortable" },
-        },
-        .opacity => &.{
-            .{ .value = "100", .label = "100% (Opaque)" },
-            .{ .value = "97", .label = "97%" },
-            .{ .value = "90", .label = "90%" },
-            .{ .value = "80", .label = "80%" },
-        },
-        .clipboard_keep => &.{
-            .{ .value = "100", .label = "100 entries" },
-            .{ .value = "500", .label = "500 entries" },
-            .{ .value = "1000", .label = "1,000 entries" },
-            .{ .value = "5000", .label = "5,000 entries" },
-        },
+        .text_size => enumOptions(settings_mod.TextSize, .{
+            .small = "Small",
+            .default = "Default",
+            .large = "Large",
+        }),
+        .position => enumOptions(settings_mod.Position, .{
+            .upper_third = "Upper Third",
+            .center = "Center",
+        }),
+        .width => enumOptions(settings_mod.Width, .{
+            .narrow = "Narrow",
+            .default = "Default",
+            .wide = "Wide",
+        }),
+        .height => enumOptions(settings_mod.Height, .{
+            .short = "Short",
+            .default = "Default",
+            .tall = "Tall",
+        }),
+        .density => enumOptions(settings_mod.Density, .{
+            .compact = "Compact",
+            .default = "Default",
+            .comfortable = "Comfortable",
+        }),
+        .opacity => numberOptions(&.{
+            .{ .value = 100, .label = "100% (Opaque)" },
+            .{ .value = 97, .label = "97%" },
+            .{ .value = 90, .label = "90%" },
+            .{ .value = 80, .label = "80%" },
+        }),
+        .clipboard_keep => numberOptions(&.{
+            .{ .value = 100, .label = "100 entries" },
+            .{ .value = 500, .label = "500 entries" },
+            .{ .value = 1000, .label = "1,000 entries" },
+            .{ .value = 5000, .label = "5,000 entries" },
+        }),
         .icon_theme => iconThemes(arena),
         .terminal, .editor => blk: {
             var out: std.ArrayList(Option) = .empty;
@@ -240,6 +240,54 @@ pub fn choiceOptions(
             break :blk out.items;
         },
     };
+}
+
+/// The options of a setting stored as one of `Enum`'s tags, in the tags'
+/// order. The values are the tags' own names, so they cannot drift from
+/// what Settings parses; each tag needs a label.
+fn enumOptions(
+    comptime Enum: type,
+    comptime option_labels: std.enums.EnumFieldStruct(Enum, [:0]const u8, null),
+) []const Option {
+    const options = comptime blk: {
+        const tags = std.enums.values(Enum);
+        var built: [tags.len]Option = undefined;
+        for (tags, &built) |tag, *option| {
+            option.* = .{ .value = @tagName(tag), .label = @field(option_labels, @tagName(tag)) };
+        }
+        break :blk built;
+    };
+    return &options;
+}
+
+const NumberOption = struct { value: u32, label: [:0]const u8 };
+
+/// The options of a numeric setting, its values written as Settings reads
+/// them back.
+fn numberOptions(comptime numbers: []const NumberOption) []const Option {
+    const options = comptime blk: {
+        var built: [numbers.len]Option = undefined;
+        for (numbers, &built) |number, *option| {
+            option.* = .{
+                .value = std.fmt.comptimePrint("{d}", .{number.value}),
+                .label = number.label,
+            };
+        }
+        break :blk built;
+    };
+    return &options;
+}
+
+/// Folders under the icon directories that are not themes to pick:
+/// hicolor is every theme's fallback, and "default" is the cursor theme's
+/// alias.
+const icon_folders_not_themes = [_][]const u8{ "hicolor", "default" };
+
+fn notAnIconTheme(name: []const u8) bool {
+    for (icon_folders_not_themes) |folder| {
+        if (std.mem.eql(u8, name, folder)) return true;
+    }
+    return false;
 }
 
 /// "Automatic", then the icon themes installed (folders under the icon
@@ -269,7 +317,7 @@ fn iconThemes(arena: std.mem.Allocator) []const Option {
         defer c.g_dir_close(dir);
         while (c.g_dir_read_name(dir)) |name_c| {
             const name = std.mem.span(name_c);
-            if (std.mem.eql(u8, name, "hicolor") or std.mem.eql(u8, name, "default")) continue;
+            if (notAnIconTheme(name)) continue;
             var dup = false;
             for (out.items) |option| dup = dup or std.mem.eql(u8, option.value, name);
             if (dup) continue;
@@ -755,7 +803,7 @@ pub fn chooseAppFor(ui: *Ui, path: [:0]const u8) void {
     defer if (guessed) |guessed_type| c.g_free(guessed_type);
     const mime = ui.gpa.dupeSentinel(
         u8,
-        if (guessed) |guessed_type| std.mem.span(guessed_type) else "application/octet-stream",
+        if (guessed) |guessed_type| std.mem.span(guessed_type) else labels.mime_unknown,
         0,
     ) catch return;
     const owned = ui.gpa.dupeSentinel(u8, path, 0) catch {
@@ -765,4 +813,19 @@ pub fn chooseAppFor(ui: *Ui, path: [:0]const u8) void {
     setChoosing(ui, .{ .file = .{ .path = owned, .mime = mime } });
     ui.reselect.clear();
     ui.navigate(.choose);
+}
+
+test "every listed choice is a value Settings accepts" {
+    var settings = Settings.init(std.testing.allocator);
+    defer settings.deinit();
+    const fixed_choices = [_]settings_mod.Choice{
+        .text_size, .opacity, .position, .width, .height, .density, .clipboard_keep,
+    };
+    for (fixed_choices) |choice| {
+        const options = choiceOptions(undefined, std.testing.allocator, choice);
+        try std.testing.expect(options.len > 0);
+        for (options) |option| {
+            try std.testing.expect(settings.setChoice(choice, option.value));
+        }
+    }
 }

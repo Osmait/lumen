@@ -14,6 +14,11 @@ const Ui = @import("Ui.zig");
 const widgets = @import("widgets.zig");
 const labels = @import("labels.zig");
 
+/// Content types (MIME) the detail pane tells apart.
+const mime_directory = "inode/directory";
+const mime_image_any = "image/*";
+const mime_image_prefix = "image/";
+
 /// An Information value asks GTK for at most this many characters of
 /// width; longer values are ellipsized at the start (a path keeps its end).
 const meta_value_width_chars_max = 30;
@@ -168,12 +173,12 @@ pub fn showFileDetail(ui: *Ui, item: *const Item) void {
 
     const ctype = if (file.is_dir) null else c.g_content_type_guess(file.path, null, 0, null);
     defer if (ctype) |type_name| c.g_free(type_name);
-    const content_type: [*:0]const u8 = if (ctype) |type_name| type_name else "inode/directory";
+    const content_type: [*:0]const u8 = if (ctype) |type_name| type_name else mime_directory;
 
     // Only regular files: a FIFO named *.png is no picture (and the decoder
     // checks again on the descriptor it reads).
-    const image_type = c.g_content_type_is_a(content_type, "image/*") != 0 or
-        std.mem.startsWith(u8, std.mem.span(content_type), "image/");
+    const image_type = c.g_content_type_is_a(content_type, mime_image_any) != 0 or
+        std.mem.startsWith(u8, std.mem.span(content_type), mime_image_prefix);
     const image = image_type and os.isRegular(file.path);
     const info = os.info(file.path);
     gtk.setVisible(ui.detail.picture, image);

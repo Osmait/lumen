@@ -146,6 +146,12 @@ const filtered_detail_bytes_max = 2000;
 const frecency_score_scale = 1000;
 /// Bytes of an extension query kept with its request (`Inflight.asked`).
 const ext_query_bytes_max = 256;
+/// The keys that open the action panel and run the selection, as the
+/// search bar's chip, the footer and the rows show them.
+const actions_keys_text = "Ctrl K";
+const enter_key_text = "↵";
+/// The footer's two labels: what Enter does, and "Actions".
+const footer_action_class = "footer-action";
 /// An extension's id, with room to spare: Host refuses ids over 40 bytes.
 const extension_id_bytes_max = 64;
 /// A message kept for the row after a reload (a failed install's reason).
@@ -319,7 +325,7 @@ const Footer = struct {
     /// What Enter does on the selected row, or a warning waiting for Enter.
     fn setAction(footer: *const Footer, text: [:0]const u8, warn: bool) void {
         c.gtk_label_set_text(footer.action, text.ptr);
-        gtk.setClass(footer.action, "warn", warn);
+        gtk.setClass(footer.action, widgets.css_class.warn, warn);
         const any = text.len > 0;
         gtk.setVisible(footer.action, any);
         gtk.setVisible(footer.enter, any and !warn);
@@ -369,7 +375,7 @@ const ActionPanel = struct {
             gtk.setHexpand(label_widget, true);
             gtk.append(box, label_widget);
             if (entry.keys.len > 0) {
-                const keys_label = widgets.label(entry.keys, "kbd");
+                const keys_label = widgets.label(entry.keys, widgets.css_class.keys);
                 gtk.setValign(keys_label, c.GTK_ALIGN_CENTER);
                 gtk.append(box, keys_label);
             }
@@ -504,7 +510,7 @@ comptime {
     // first frame's, or an idle callback would take a frame of its own.
     assert(pending_rows_per_idle <= eager_rows + 2);
     assert(position_upper_third_tenths < position_center_tenths);
-    assert(position_center_tenths <= 10);
+    assert(position_center_tenths <= 10); // Tenths: 10 is the whole room.
     assert(content_query_bytes_min <= ContentSearch.query_bytes_max);
 }
 
@@ -653,7 +659,7 @@ fn buildSearchBar(self: *Ui, column: *c.GtkBox) void {
     gtk.setValign(self.search_bar.entry, c.GTK_ALIGN_CENTER);
     gtk.append(search, self.search_bar.entry);
     widgets.connect(self.search_bar.entry, "changed", &onChanged, self);
-    const key_chip = widgets.label("Ctrl K", "kbd");
+    const key_chip = widgets.label(actions_keys_text, widgets.css_class.keys);
     self.search_bar.key_chip = gtk.widget(key_chip);
     gtk.setValign(key_chip, c.GTK_ALIGN_CENTER);
     c.gtk_widget_set_tooltip_text(gtk.widget(key_chip), "Actions");
@@ -718,16 +724,16 @@ fn buildFooter(self: *Ui, column: *c.GtkBox) void {
     c.gtk_label_set_xalign(self.footer.title, 0);
     c.gtk_label_set_ellipsize(self.footer.title, c.PANGO_ELLIPSIZE_END);
     gtk.append(self.footer.box, self.footer.title);
-    self.footer.action = widgets.label("", "footer-action");
+    self.footer.action = widgets.label("", footer_action_class);
     gtk.append(self.footer.box, self.footer.action);
-    self.footer.enter = widgets.label("↵", "kbd");
+    self.footer.enter = widgets.label(enter_key_text, widgets.css_class.keys);
     gtk.setValign(self.footer.enter, c.GTK_ALIGN_CENTER);
     gtk.append(self.footer.box, self.footer.enter);
     self.footer.separator = widgets.label("", "footer-sep");
     gtk.setValign(self.footer.separator, c.GTK_ALIGN_CENTER);
     gtk.append(self.footer.box, self.footer.separator);
-    gtk.append(self.footer.box, widgets.label("Actions", "footer-action"));
-    const actions_key_label = widgets.label("Ctrl K", "kbd");
+    gtk.append(self.footer.box, widgets.label("Actions", footer_action_class));
+    const actions_key_label = widgets.label(actions_keys_text, widgets.css_class.keys);
     gtk.setValign(actions_key_label, c.GTK_ALIGN_CENTER);
     gtk.append(self.footer.box, actions_key_label);
     gtk.setVisible(self.footer.box, false);
@@ -923,16 +929,28 @@ pub fn reloadSettings(self: *Ui) void {
 fn applyIconTheme(self: *Ui) void {
     const gtk_settings = c.gtk_settings_get_default() orelse return;
     if (self.settings.icon_theme.len == 0) {
-        return c.gtk_settings_reset_property(gtk_settings, "gtk-icon-theme-name");
+        return c.gtk_settings_reset_property(gtk_settings, gtk_icon_theme_property);
     }
-    var buf: [128]u8 = undefined;
+    var buf: [icon_theme_name_bytes_max]u8 = undefined;
     const name = std.mem.printSentinel(&buf, "{s}", .{self.settings.icon_theme}, 0) catch return;
-    c.g_object_set(gtk_settings, "gtk-icon-theme-name", name.ptr, @as(?*anyopaque, null));
+    c.g_object_set(gtk_settings, gtk_icon_theme_property, name.ptr, @as(?*anyopaque, null));
+}
+
+/// GtkSettings' property the Icon Theme setting sets for Lumen's process.
+const gtk_icon_theme_property = "gtk-icon-theme-name";
+/// An icon theme's folder name; a longer one is left to GTK's default.
+const icon_theme_name_bytes_max = 128;
+
+/// Keys init.lua can fix at once: more than Settings has.
+const kept_keys_max = 32;
+
+comptime {
+    assert(@typeInfo(Settings).@"struct".field_names.len <= kept_keys_max);
 }
 
 /// Writes the settings; what init.lua fixes keeps its value in the file.
 pub fn saveSettings(self: *Ui) void {
-    var kept: [32][]const u8 = undefined;
+    var kept: [kept_keys_max][]const u8 = undefined;
     var kept_count: usize = 0;
     if (self.ext_registry) |registry| {
         for (registry.settings) |override| {
@@ -959,12 +977,20 @@ pub fn applyOverrides(self: *Ui) void {
     for (registry.settings) |override| _ = self.settings.set(override.key, override.value);
 }
 
+/// The settings lumen.layout can fix with its own pixels and place.
+const LayoutSetting = enum { width, height, position };
+
 /// Set by init.lua: Settings shows it but cannot change it.
 pub fn overridden(self: *const Ui, key: []const u8) bool {
     // lumen.layout's pixels and place win over these.
-    if (std.mem.eql(u8, key, "width") and self.layout.width != null) return true;
-    if (std.mem.eql(u8, key, "height") and self.layout.height != null) return true;
-    if (std.mem.eql(u8, key, "position") and self.layout.position != null) return true;
+    if (std.meta.stringToEnum(LayoutSetting, key)) |layout_setting| {
+        const fixed = switch (layout_setting) {
+            .width => self.layout.width != null,
+            .height => self.layout.height != null,
+            .position => self.layout.position != null,
+        };
+        if (fixed) return true;
+    }
     const registry = self.ext_registry orelse return false;
     for (registry.settings) |override| if (std.mem.eql(u8, override.key, key)) return true;
     return false;
@@ -1059,37 +1085,47 @@ fn userCssChanged(self: *Ui) bool {
     return !settings_mod.Stamp.of(style.ptr).eql(self.appearance.style_css_stamp);
 }
 
-/// The desktop's light/dark preference (dark when it cannot be read).
 /// init.lua's and the style's themes (`lumen.theme`), from the registry.
 pub fn customThemes(self: *const Ui) []const themes.Theme {
     const registry = self.ext_registry orelse return &.{};
     return registry.themes;
 }
 
+/// Where the desktop keeps its light or dark preference.
+const interface_schema = "org.gnome.desktop.interface";
+const color_scheme_key = "color-scheme";
+/// The values `color_scheme_key` takes. "default" is the desktop's own
+/// default, which is light.
+const ColorScheme = enum { default, @"prefer-dark", @"prefer-light" };
+
+/// The desktop's light/dark preference (dark when it cannot be read, or
+/// says something new).
 pub fn preferDark(self: *Ui) bool {
     const interface_settings = self.appearance.interface_settings orelse return true;
-    const color_scheme = c.g_settings_get_string(interface_settings, "color-scheme");
-    defer c.g_free(color_scheme);
-    return !std.mem.eql(
-        u8,
-        std.mem.span(color_scheme),
-        "prefer-light",
-    ) and !std.mem.eql(u8, std.mem.span(color_scheme), "default");
+    const value = c.g_settings_get_string(interface_settings, color_scheme_key);
+    defer c.g_free(value);
+    const color_scheme = std.meta.stringToEnum(ColorScheme, std.mem.span(value)) orelse {
+        return true;
+    };
+    return switch (color_scheme) {
+        .@"prefer-dark" => true,
+        .default, .@"prefer-light" => false,
+    };
 }
 
 fn watchColorScheme(self: *Ui) void {
     const source = c.g_settings_schema_source_get_default() orelse return;
     // Looking the schema up first: g_settings_new aborts on a missing one.
-    const schema = c.g_settings_schema_source_lookup(
-        source,
-        "org.gnome.desktop.interface",
-        1,
-    ) orelse return;
+    const recursive = 1;
+    const schema = c.g_settings_schema_source_lookup(source, interface_schema, recursive) orelse {
+        return;
+    };
     defer c.g_settings_schema_unref(schema);
-    if (c.g_settings_schema_has_key(schema, "color-scheme") == 0) return;
-    const interface_settings = c.g_settings_new("org.gnome.desktop.interface");
+    if (c.g_settings_schema_has_key(schema, color_scheme_key) == 0) return;
+    const interface_settings = c.g_settings_new(interface_schema);
     self.appearance.interface_settings = interface_settings;
-    widgets.connect(interface_settings, "changed::color-scheme", &onColorScheme, self);
+    const signal = "changed::" ++ color_scheme_key;
+    widgets.connect(interface_settings, signal, &onColorScheme, self);
 }
 
 fn onColorScheme(_: *c.GSettings, _: [*:0]const u8, data: ?*anyopaque) callconv(.c) void {
@@ -2067,10 +2103,7 @@ fn setHint(self: *Ui, text: []const u8, warn: bool) void {
     ) catch return;
     const text_z = self.query_arena.allocator().dupeSentinel(u8, shown, 0) catch return;
     c.gtk_label_set_text(@ptrCast(hint), text_z.ptr);
-    if (warn) gtk.addClass(hint, "warn") else c.gtk_widget_remove_css_class(
-        hint,
-        "warn",
-    );
+    gtk.setClass(hint, widgets.css_class.warn, warn);
     gtk.setVisible(hint, true);
 }
 

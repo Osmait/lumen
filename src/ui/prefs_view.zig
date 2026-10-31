@@ -145,6 +145,15 @@ pub fn iconOf(kind: Host.PrefKind) item_mod.Icon {
     };
 }
 
+/// A toggle's value as preferences and form fields keep it: the JSON
+/// spelling, which is also what a toggle's `default` is written as.
+const toggle_on = "true";
+const toggle_off = "false";
+
+fn toggleIsOn(value: []const u8) bool {
+    return std.mem.eql(u8, value, toggle_on);
+}
+
 /// A text preference shows this much of its value on its row.
 const text_value_bytes_shown = 40;
 
@@ -155,7 +164,7 @@ pub fn display(
     value: []const u8,
 ) [:0]const u8 {
     return switch (preference.kind) {
-        .toggle => if (std.mem.eql(u8, value, "true")) "On" else "Off",
+        .toggle => if (toggleIsOn(value)) "On" else "Off",
         .choice => for (preference.choices) |choice| {
             if (std.mem.eql(u8, choice.value, value)) break choice.label;
         } else arena.dupeSentinel(u8, value, 0) catch "",
@@ -225,11 +234,11 @@ pub fn edit(ui: *Ui, i: u16) void {
 pub fn editValue(ui: *Ui, target: Ui.Edited, preference: *const Host.Pref, value: []const u8) void {
     switch (preference.kind) {
         .toggle => {
-            const on = !std.mem.eql(u8, value, "true");
+            const on = !toggleIsOn(value);
             switch (target) {
                 // The value was not saved; the row's hint already says why.
                 .pref => if (!save(ui, preference, .{ .bool = on })) return,
-                .field => |i| form_view.setValue(ui, i, if (on) "true" else "false"),
+                .field => |i| form_view.setValue(ui, i, if (on) toggle_on else toggle_off),
             }
             // Row keys are "pref:<name>" and "field:<name>".
             ui.setReselect("{t}:{s}", .{ target, preference.name });

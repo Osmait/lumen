@@ -438,7 +438,8 @@ pub fn placeholder(ui: *Ui, buf: []u8) [*:0]const u8 {
     const cmd = command(ui) orelse return "Search...";
     if (cmd.placeholder.len > 0) return cmd.placeholder;
     // "Search Emoji" reads "Search Emoji...", not "Search Search Emoji...".
-    const verb = if (std.mem.startsWith(u8, cmd.title, "Search ")) "" else "Search ";
+    const search_verb = "Search ";
+    const verb = if (std.mem.startsWith(u8, cmd.title, search_verb)) "" else search_verb;
     const text = std.mem.printSentinel(
         buf,
         "{s}{s}...",
@@ -498,10 +499,18 @@ pub fn perform(ui: *Ui, action_index: u8) void {
     ui.hide();
 }
 
+/// What makes a target of lumen.action.open a URL (any scheme with "//",
+/// and mailto, which has none), and a path in the home folder.
+const url_scheme_separator = "://";
+const mailto_scheme = "mailto:";
+const home_prefix = "~/";
+
 /// A URL in the default app; a path ("~/" allowed) the way Lumen opens
 /// files, Default Apps included.
 fn open(ui: *Ui, target: [:0]const u8) void {
-    if (std.mem.find(u8, target, "://") != null or std.mem.startsWith(u8, target, "mailto:")) {
+    const is_url = std.mem.find(u8, target, url_scheme_separator) != null or
+        std.mem.startsWith(u8, target, mailto_scheme);
+    if (is_url) {
         const lctx = proc.launchContext() orelse return;
         defer c.g_object_unref(lctx);
         var err: ?*c.GError = null;
@@ -510,11 +519,11 @@ fn open(ui: *Ui, target: [:0]const u8) void {
         return;
     }
     var buf: [4096]u8 = undefined;
-    const path = if (std.mem.startsWith(u8, target, "~/"))
+    const path = if (std.mem.startsWith(u8, target, home_prefix))
         std.mem.printSentinel(
             &buf,
             "{s}/{s}",
-            .{ std.mem.span(c.g_get_home_dir()), target[2..] },
+            .{ std.mem.span(c.g_get_home_dir()), target[home_prefix.len..] },
             0,
         ) catch return
     else

@@ -112,6 +112,13 @@ pub fn appendEscaped(arena: std.mem.Allocator, out: *std.ArrayList(u8), s: []con
     out.appendSlice(arena, std.mem.span(e)) catch {};
 }
 
+/// Content types GLib gives files it guesses wrong: media for source
+/// files that share an extension with a video (.mts), and octet-stream,
+/// GLib's "no idea" (no shared-mime-info data, for example).
+const mime_video_prefix = "video/";
+const mime_audio_prefix = "audio/";
+pub const mime_unknown = "application/octet-stream";
+
 /// "Kind" in the detail pane. GLib guesses from the extension and is wrong
 /// for some source files: .zig is "unknown", .mts is a video ("MPEG-2
 /// transport stream"). A file with a code badge is named after it then.
@@ -129,15 +136,9 @@ pub fn kindLabel(
     if (core.file_badge.of(name, &upper)) |b| {
         const t = if (ctype) |t| std.mem.span(t) else "";
         // octet-stream is GLib's "no idea" (e.g. no shared-mime-info data).
-        const media = std.mem.startsWith(
-            u8,
-            t,
-            "video/",
-        ) or std.mem.startsWith(u8, t, "audio/") or std.mem.eql(
-            u8,
-            t,
-            "application/octet-stream",
-        );
+        const media = std.mem.startsWith(u8, t, mime_video_prefix) or
+            std.mem.startsWith(u8, t, mime_audio_prefix) or
+            std.mem.eql(u8, t, mime_unknown);
         const unknown = desc == null or std.ascii.eqlIgnoreCase(std.mem.span(desc.?), "unknown");
         if (media or unknown) return arena.printSentinel("{s} file", .{b.text}, 0) catch "File";
     }
@@ -154,15 +155,20 @@ pub fn firstLines(text: []const u8, n: usize) []const u8 {
     return text;
 }
 
+/// A size for people: bytes up to a KB, then KB, MB... (binary, as file
+/// managers on Linux show them) with one decimal.
 pub fn formatSize(arena: std.mem.Allocator, bytes: u64) [:0]const u8 {
     const units = [_][]const u8{ "bytes", "KB", "MB", "GB", "TB" };
-    var v: f64 = @floatFromInt(bytes);
-    var u: usize = 0;
-    while (v >= 1024 and u + 1 < units.len) : (u += 1) v /= 1024;
-    return (if (u == 0)
+    const unit_bytes = 1024;
+    var amount: f64 = @floatFromInt(bytes);
+    var unit_index: usize = 0;
+    while (amount >= unit_bytes and unit_index + 1 < units.len) : (unit_index += 1) {
+        amount /= unit_bytes;
+    }
+    return (if (unit_index == 0)
         arena.printSentinel("{d} bytes", .{bytes}, 0)
     else
-        arena.printSentinel("{d:.1} {s}", .{ v, units[u] }, 0)) catch "";
+        arena.printSentinel("{d:.1} {s}", .{ amount, units[unit_index] }, 0)) catch "";
 }
 
 pub fn now() i64 {

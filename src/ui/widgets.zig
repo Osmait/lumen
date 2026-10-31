@@ -91,6 +91,16 @@ const swatch = struct {
     }
 };
 
+/// CSS classes style.css styles and more than one file sets.
+pub const css_class = struct {
+    /// A key or key combination shown as a chip ("Ctrl K", "↵").
+    pub const keys = "kbd";
+    /// A destructive action waiting for its second Enter.
+    pub const warn = "warn";
+    /// An application's icon (its own shadow and size).
+    pub const app_icon = "app-icon";
+};
+
 /// Icons decoded from files, and grid pictures, kept for the next build:
 /// the same few show again and again.
 const file_icons_cached = 128;
@@ -370,7 +380,7 @@ pub fn iconWidget(look: *const RowLook, icon: item_mod.Icon, size: c_int) *c.Gtk
         .gicon => |gicon| {
             const img = gtk.imageFromGicon(gicon);
             c.gtk_image_set_pixel_size(img, size);
-            gtk.addClass(img, "app-icon");
+            gtk.addClass(img, css_class.app_icon);
             return gtk.widget(img);
         },
         .tile => |tile| {
@@ -396,7 +406,7 @@ pub fn iconWidget(look: *const RowLook, icon: item_mod.Icon, size: c_int) *c.Gtk
             if (look.renamed.get(name)) |path| return iconWidget(look, .{ .file = path }, size);
             const img = gtk.imageFromIconName(name);
             c.gtk_image_set_pixel_size(img, size);
-            gtk.addClass(img, "app-icon");
+            gtk.addClass(img, css_class.app_icon);
             return gtk.widget(img);
         },
         .swatch => |sw| {

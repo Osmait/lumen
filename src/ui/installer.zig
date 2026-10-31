@@ -45,19 +45,29 @@ fn extDir(ui: *Ui, buf: []u8, name: []const u8) ?[:0]const u8 {
     return std.mem.printSentinel(buf, "{s}/extensions/{s}", .{ ui.config_dir, name }, 0) catch null;
 }
 
+/// What a repository's name carries that its extension's name does not:
+/// git's suffix, and the project's name before or after it. The prefixes
+/// go longest first, so "lumen-ext-x" loses "lumen-ext-", not "lumen-".
+const git_suffix = ".git";
+const repository_prefixes = [_][]const u8{ "lumen-ext-", "lumen-extension-", "lumen-" };
+const repository_suffix = "-lumen";
+
 /// "https://github.com/me/lumen-weather.git" → "weather".
 pub fn nameFromUrl(buf: []u8, url: []const u8) []const u8 {
     var trimmed = std.mem.trimEnd(u8, url, "/");
-    if (std.mem.endsWith(u8, trimmed, ".git")) trimmed = trimmed[0 .. trimmed.len - 4];
+    if (std.mem.endsWith(u8, trimmed, git_suffix)) {
+        trimmed = trimmed[0 .. trimmed.len - git_suffix.len];
+    }
     if (std.mem.findLastAny(u8, trimmed, "/:")) |i| trimmed = trimmed[i + 1 ..];
-    for ([_][]const u8{ "lumen-ext-", "lumen-extension-", "lumen-" }) |prefix| {
+    for (repository_prefixes) |prefix| {
         if (std.mem.startsWith(u8, trimmed, prefix) and trimmed.len > prefix.len) {
             trimmed = trimmed[prefix.len..];
             break;
         }
     }
-    if (std.mem.endsWith(u8, trimmed, "-lumen") and trimmed.len > 6) {
-        trimmed = trimmed[0 .. trimmed.len - 6];
+    const with_suffix = std.mem.endsWith(u8, trimmed, repository_suffix);
+    if (with_suffix and trimmed.len > repository_suffix.len) {
+        trimmed = trimmed[0 .. trimmed.len - repository_suffix.len];
     }
     const length = @min(trimmed.len, buf.len);
     for (trimmed[0..length], buf[0..length]) |ch, *o| {

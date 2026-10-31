@@ -285,10 +285,16 @@ pub fn hex(buf: *[8]u8, color: u24) [:0]const u8 {
 
 /// WCAG contrast ratio between two colours (1 to 21).
 pub fn contrast(x: u24, y: u24) f64 {
-    const lx = luminance(x);
-    const ly = luminance(y);
-    return (@max(lx, ly) + 0.05) / (@min(lx, ly) + 0.05);
+    const luminance_x = luminance(x);
+    const luminance_y = luminance(y);
+    const lighter = @max(luminance_x, luminance_y) + wcag_flare;
+    const darker = @min(luminance_x, luminance_y) + wcag_flare;
+    return lighter / darker;
 }
+
+/// WCAG 2's allowance for ambient light on the screen, added to both
+/// luminances so black on black is a ratio of 1, not a division by zero.
+const wcag_flare = 0.05;
 
 fn luminance(color: u24) f64 {
     var sum: f64 = 0;
