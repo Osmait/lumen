@@ -32,10 +32,10 @@ pub const Backing = enum {
 };
 
 /// Gives back an index's buffer.
-pub fn release(buf: Bytes, backing: Backing, gpa: std.mem.Allocator) void {
+pub fn release(bytes: Bytes, backing: Backing, gpa: std.mem.Allocator) void {
     switch (backing) {
-        .mapped => sys.unmap(buf),
-        .heap => gpa.free(buf),
+        .mapped => sys.unmap(bytes),
+        .heap => gpa.free(bytes),
     }
 }
 

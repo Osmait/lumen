@@ -13,42 +13,46 @@ const sys = @import("os");
 const store_mod = index.store;
 const content = index.content;
 
-var failures: usize = 0;
+var failures_count: usize = 0;
 var scale: f64 = 1;
 
-fn ms(ns: u64) f64 {
-    return @as(f64, @floatFromInt(ns)) / 1e6;
+fn ms(duration_ns: u64) f64 {
+    return @as(f64, @floatFromInt(duration_ns)) / 1e6;
 }
 
 fn check(name: []const u8, got_ms: f64, limit_ms: f64) void {
-    const limit = limit_ms * scale;
-    const ok = got_ms <= limit;
-    if (!ok) failures += 1;
+    const limit_scaled_ms = limit_ms * scale;
+    const ok = got_ms <= limit_scaled_ms;
+    if (!ok) failures_count += 1;
+    const verdict = if (ok) "ok  " else "FAIL";
     std.debug.print("  {s} {s:<44} {d:>9.3} ms  (limit {d:.1})\n", .{
-        if (ok) "ok  " else "FAIL",
+        verdict,
         name,
         got_ms,
-        limit,
+        limit_scaled_ms,
     });
 }
 
-fn checkMB(name: []const u8, got: f64, limit: f64) void {
-    const ok = got <= limit * scale;
-    if (!ok) failures += 1;
+fn checkMB(name: []const u8, got_mb: f64, limit_mb: f64) void {
+    const limit_scaled_mb = limit_mb * scale;
+    const ok = got_mb <= limit_scaled_mb;
+    if (!ok) failures_count += 1;
+    const verdict = if (ok) "ok  " else "FAIL";
     std.debug.print("  {s} {s:<44} {d:>9.1} MB  (limit {d:.0})\n", .{
-        if (ok) "ok  " else "FAIL",
+        verdict,
         name,
-        got,
-        limit * scale,
+        got_mb,
+        limit_scaled_mb,
     });
 }
 
 fn peakRssMB() f64 {
-    var buf: index.paths.Buffer = undefined;
-    const status = sys.readHead("/proc/self/status", &buf);
-    const at = std.mem.find(u8, status, "VmHWM:") orelse return 0;
-    var it = std.mem.tokenizeAny(u8, status[at + 6 ..], " \t");
-    return @as(f64, @floatFromInt(std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0)) / 1024;
+    var status_text: index.paths.Buffer = undefined;
+    const status = sys.readHead("/proc/self/status", &status_text);
+    const peak_at = std.mem.find(u8, status, "VmHWM:") orelse return 0;
+    var fields = std.mem.tokenizeAny(u8, status[peak_at + "VmHWM:".len ..], " \t");
+    const peak_kb = std.fmt.parseInt(u64, fields.next() orelse "0", 10) catch 0;
+    return @as(f64, @floatFromInt(peak_kb)) / 1024;
 }
 
 const words = [_][]const u8{
@@ -77,141 +81,173 @@ const words = [_][]const u8{
     "invoice",
     "report",
 };
-const exts = [_][]const u8{ ".toml", ".rs", ".md", ".zig", ".json", ".png", ".go", ".ts", "" };
+const extensions = [_][]const u8{
+    ".toml", ".rs", ".md", ".zig", ".json", ".png", ".go", ".ts", "",
+};
 
 /// ~1M entries: 25k directories over three levels, 40 files each.
 fn syntheticNames(gpa: std.mem.Allocator) !store_mod.Store {
     var prng = std.Random.DefaultPrng.init(1);
-    const r = prng.random();
-    var b: store_mod.Builder = .empty;
-    const root = try b.push(gpa, "/home/perf", store_mod.no_parent, store_mod.flag_dir, 0);
+    const random = prng.random();
+    var builder: store_mod.Builder = .empty;
+    const root = try builder.push(gpa, "/home/perf", store_mod.no_parent, store_mod.flag_dir, 0);
     var level: std.ArrayList(u32) = .empty;
     defer level.deinit(gpa);
     try level.append(gpa, root);
-    var nb: [64]u8 = undefined;
+    var name_text: [64]u8 = undefined;
     // Directories level by level (BFS order, as the scanner produces).
-    var all_dirs: std.ArrayList(u32) = .empty;
-    defer all_dirs.deinit(gpa);
+    var directories: std.ArrayList(u32) = .empty;
+    defer directories.deinit(gpa);
     for ([_]usize{ 30, 30, 28 }, 1..) |fan, depth| {
         var next: std.ArrayList(u32) = .empty;
         for (level.items) |parent| {
             for (0..fan) |i| {
-                const n = try std.mem.print(&nb, "{s}-{d}", .{
-                    words[r.uintLessThan(usize, words.len)],
+                const name = try std.mem.print(&name_text, "{s}-{d}", .{
+                    words[random.uintLessThan(usize, words.len)],
                     i,
                 });
-                try next.append(gpa, try b.push(
+                try next.append(gpa, try builder.push(
                     gpa,
-                    n,
+                    name,
                     parent,
                     store_mod.flag_dir,
                     @intCast(depth),
                 ));
             }
         }
-        try all_dirs.appendSlice(gpa, next.items);
+        try directories.appendSlice(gpa, next.items);
         level.deinit(gpa);
         level = next;
     }
-    for (all_dirs.items) |d| {
+    for (directories.items) |directory| {
         for (0..40) |_| {
-            const n = try std.mem.print(&nb, "{s}_{s}{s}", .{
-                words[r.uintLessThan(usize, words.len)],
-                words[r.uintLessThan(usize, words.len)],
-                exts[r.uintLessThan(usize, exts.len)],
+            const name = try std.mem.print(&name_text, "{s}_{s}{s}", .{
+                words[random.uintLessThan(usize, words.len)],
+                words[random.uintLessThan(usize, words.len)],
+                extensions[random.uintLessThan(usize, extensions.len)],
             });
-            _ = try b.push(gpa, n, d, 0, 4);
+            _ = try builder.push(gpa, name, directory, 0, 4);
         }
     }
-    return b.finish(gpa);
+    return builder.finish(gpa);
 }
 
-fn names(gpa: std.mem.Allocator, pool: *index.Pool, dir: []const u8) !void {
+fn names(gpa: std.mem.Allocator, pool: *index.Pool, directory: []const u8) !void {
     std.debug.print("name index\n", .{});
-    var t = sys.monotonicNs();
-    var s = try syntheticNames(gpa);
-    defer s.deinit(gpa);
+    var start_ns = sys.monotonicNs();
+    var built = try syntheticNames(gpa);
+    defer built.deinit(gpa);
     std.debug.print("       {d} entries built in {d:.0} ms\n", .{
-        s.len(),
-        ms(sys.monotonicNs() - t),
+        built.len(),
+        ms(sys.monotonicNs() - start_ns),
     });
 
-    var pbuf: index.paths.Buffer = undefined;
-    const path = try std.mem.printSentinel(&pbuf, "{s}/names.idx", .{dir}, 0);
-    try s.save(path);
-    t = sys.monotonicNs();
-    var m = try store_mod.Store.open(path);
-    defer m.deinit(gpa);
-    check("open (mmap + validate)", ms(sys.monotonicNs() - t), 25);
+    var index_path_buffer: index.paths.Buffer = undefined;
+    const index_path = try std.mem.printSentinel(
+        &index_path_buffer,
+        "{s}/names.idx",
+        .{directory},
+        0,
+    );
+    try built.save(index_path);
+    start_ns = sys.monotonicNs();
+    var mapped = try store_mod.Store.open(index_path);
+    defer mapped.deinit(gpa);
+    check("open (mmap + validate)", ms(sys.monotonicNs() - start_ns), 25);
 
+    try coldQueries(gpa, pool, &mapped);
+    // Typing: each keystroke refines the previous candidates.
+    var engine: index.search.Engine = .empty;
+    defer engine.deinit(gpa);
+    var hits: std.ArrayList(index.search.Hit) = .empty;
+    defer hits.deinit(gpa);
+    const typed = "handler.rs";
+    var keystroke_ns_max: u64 = 0;
+    for (1..typed.len + 1) |typed_count| {
+        start_ns = sys.monotonicNs();
+        const options: index.search.Options = .{ .limit = 60, .recency = false };
+        try engine.search(gpa, pool, &mapped, typed[0..typed_count], options, &hits);
+        keystroke_ns_max = @max(keystroke_ns_max, sys.monotonicNs() - start_ns);
+    }
+    check("typing \"handler.rs\", worst keystroke", ms(keystroke_ns_max), 25);
+}
+
+/// Each query on a fresh engine: timed, and checked against the exhaustive
+/// reference.
+fn coldQueries(gpa: std.mem.Allocator, pool: *index.Pool, mapped: *const store_mod.Store) !void {
     var hits: std.ArrayList(index.search.Hit) = .empty;
     defer hits.deinit(gpa);
     var want: std.ArrayList(index.search.Hit) = .empty;
     defer want.deinit(gpa);
     // Worst cases are 1-2 letters (almost everything passes the mask).
-    const cold = [_]struct { []const u8, f64 }{ .{ "c", 20 }, .{ "ca", 25 }, .{ "cargo", 15 }, .{
-        "cargo.toml",
-        10,
-    }, .{ "hndlr", 15 } };
-    for (cold) |q| {
-        var e: index.search.Engine = .empty;
-        defer e.deinit(gpa);
-        t = sys.monotonicNs();
-        try e.search(gpa, pool, &m, q[0], .{ .limit = 60, .recency = false }, &hits);
+    const cold = [_]struct { []const u8, f64 }{
+        .{ "c", 20 },
+        .{ "ca", 25 },
+        .{ "cargo", 15 },
+        .{ "cargo.toml", 10 },
+        .{ "hndlr", 15 },
+    };
+    for (cold) |case| {
+        const query, const limit_ms = case;
+        var engine: index.search.Engine = .empty;
+        defer engine.deinit(gpa);
+        const start_ns = sys.monotonicNs();
+        try engine.search(gpa, pool, mapped, query, .{ .limit = 60, .recency = false }, &hits);
         var label: [64]u8 = undefined;
         check(
-            try std.mem.print(&label, "cold query \"{s}\"", .{q[0]}),
-            ms(sys.monotonicNs() - t),
-            q[1],
+            try std.mem.print(&label, "cold query \"{s}\"", .{query}),
+            ms(sys.monotonicNs() - start_ns),
+            limit_ms,
         );
         // Recall against the exhaustive reference: exact, not timed.
-        try index.search.searchExhaustive(gpa, &m, q[0], 60, &want);
-        var same = want.items.len == hits.items.len;
-        if (same) for (want.items, hits.items) |w, h| {
-            if (w.score != h.score) same = false;
-        };
-        if (!same) {
-            failures += 1;
-            var found: usize = 0;
-            for (want.items) |w| {
-                for (hits.items) |h| if (h.id == w.id) {
-                    found += 1;
-                    break;
-                };
-            }
-            std.debug.print("  FAIL recall for \"{s}\": {d}/{d} of the exhaustive top found\n", .{
-                q[0],
-                found,
-                want.items.len,
-            });
-            for (want.items[0..@min(5, want.items.len)], 0..) |w, i| {
-                var b1: [256]u8 = undefined;
-                var b2: [256]u8 = undefined;
-                std.debug.print("       want {d} {s}   got {d} {s}\n", .{
-                    w.score,
-                    m.name(w.id),
-                    if (i < hits.items.len) hits.items[i].score else 0,
-                    if (i < hits.items.len) m.name(hits.items[i].id) else "",
-                });
-                _ = &b1;
-                _ = &b2;
+        try index.search.searchExhaustive(gpa, mapped, query, 60, &want);
+        checkRecall(mapped, query, want.items, hits.items);
+    }
+}
+
+/// Fails the run unless `got` scores exactly as `want`, and says what was
+/// missed.
+fn checkRecall(
+    mapped: *const store_mod.Store,
+    query: []const u8,
+    want: []const index.search.Hit,
+    got: []const index.search.Hit,
+) void {
+    var same = want.len == got.len;
+    if (same) {
+        for (want, got) |wanted, hit| {
+            if (wanted.score != hit.score) same = false;
+        }
+    }
+    if (same) return;
+    failures_count += 1;
+    var found: usize = 0;
+    for (want) |wanted| {
+        for (got) |hit| {
+            if (hit.id == wanted.id) {
+                found += 1;
+                break;
             }
         }
     }
-    // Typing: each keystroke refines the previous candidates.
-    var e: index.search.Engine = .empty;
-    defer e.deinit(gpa);
-    const typed = "handler.rs";
-    var worst: u64 = 0;
-    for (1..typed.len + 1) |n| {
-        t = sys.monotonicNs();
-        try e.search(gpa, pool, &m, typed[0..n], .{ .limit = 60, .recency = false }, &hits);
-        worst = @max(worst, sys.monotonicNs() - t);
+    std.debug.print("  FAIL recall for \"{s}\": {d}/{d} of the exhaustive top found\n", .{
+        query,
+        found,
+        want.len,
+    });
+    for (want[0..@min(5, want.len)], 0..) |wanted, i| {
+        const got_score = if (i < got.len) got[i].score else 0;
+        const got_name = if (i < got.len) mapped.name(got[i].id) else "";
+        std.debug.print("       want {d} {s}   got {d} {s}\n", .{
+            wanted.score,
+            mapped.name(wanted.id),
+            got_score,
+            got_name,
+        });
     }
-    check("typing \"handler.rs\", worst keystroke", ms(worst), 25);
 }
 
-const vocab = [_][]const u8{
+const vocabulary = [_][]const u8{
     "const",
     "return",
     "struct",
@@ -245,108 +281,113 @@ const vocab = [_][]const u8{
 
 fn plainText(
     _: *anyopaque,
-    d: content.DocIn,
-    buf: *std.ArrayList(u8),
+    document: content.DocIn,
+    text: *std.ArrayList(u8),
     gpa: std.mem.Allocator,
 ) std.mem.Allocator.Error!bool {
-    return content.readPlain(gpa, d.path, buf);
+    return content.readPlain(gpa, document.path, text);
 }
 
-fn contents(gpa: std.mem.Allocator, pool: *index.Pool, dir: []const u8) !void {
+fn contents(gpa: std.mem.Allocator, pool: *index.Pool, directory: []const u8) !void {
     std.debug.print("content index\n", .{});
     var prng = std.Random.DefaultPrng.init(2);
-    const r = prng.random();
+    const random = prng.random();
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
-    const a = arena_state.allocator();
-    var docs: std.ArrayList(content.DocIn) = .empty;
+    const arena = arena_state.allocator();
+    var documents: std.ArrayList(content.DocIn) = .empty;
     var text: std.ArrayList(u8) = .empty;
-    var total: usize = 0;
+    var text_bytes: usize = 0;
     for (0..3000) |i| {
         text.clearRetainingCapacity();
-        const lines = r.intRangeAtMost(usize, 20, 400);
+        const lines = random.intRangeAtMost(usize, 20, 400);
         for (0..lines) |_| {
-            for (0..r.intRangeAtMost(usize, 3, 12)) |_| {
-                try text.appendSlice(a, vocab[r.uintLessThan(usize, vocab.len)]);
-                try text.append(a, ' ');
+            for (0..random.intRangeAtMost(usize, 3, 12)) |_| {
+                try text.appendSlice(arena, vocabulary[random.uintLessThan(usize, vocabulary.len)]);
+                try text.append(arena, ' ');
             }
-            try text.append(a, '\n');
+            try text.append(arena, '\n');
         }
-        const p = try a.printSentinel("{s}/doc{d:0>5}.txt", .{ dir, i }, 0);
-        try sys.writeFile(p, text.items);
-        total += text.items.len;
-        try docs.append(a, .{
-            .path = p,
+        const document_path = try arena.printSentinel("{s}/doc{d:0>5}.txt", .{ directory, i }, 0);
+        try sys.writeFile(document_path, text.items);
+        text_bytes += text.items.len;
+        try documents.append(arena, .{
+            .path = document_path,
             .mtime = 1_700_000_000 + @as(i64, @intCast(i)),
             .size = text.items.len,
         });
     }
     std.debug.print("       {d} documents, {d:.1} MB of text\n", .{
-        docs.items.len,
-        @as(f64, @floatFromInt(total)) / 1e6,
+        documents.items.len,
+        @as(f64, @floatFromInt(text_bytes)) / 1e6,
     });
 
-    var dummy: u8 = 0;
-    var t = sys.monotonicNs();
-    var ix = try content.build(gpa, pool, docs.items, .{ .read = plainText, .ctx = &dummy }, null);
-    defer ix.deinit(gpa);
-    check("build", ms(sys.monotonicNs() - t), 1500);
+    var reader_context: u8 = 0;
+    var start_ns = sys.monotonicNs();
+    const reader: content.TextReader = .{ .read = plainText, .ctx = &reader_context };
+    var built = try content.build(gpa, pool, documents.items, reader, null);
+    defer built.deinit(gpa);
+    check("build", ms(sys.monotonicNs() - start_ns), 1500);
 
     var matches: std.ArrayList(content.Match) = .empty;
-    const queries = [_]struct { []const u8, f64 }{ .{
-        "zebrafish",
-        30,
-    }, .{ "allocator", 40 }, .{ "the", 40 }, .{
-        "useState return",
-        40,
-    }, .{
-        "SELECT FROM WHERE",
-        50,
-    }, .{ "nothinghere", 5 } };
-    for (queries) |q| {
-        t = sys.monotonicNs();
+    const queries = [_]struct { []const u8, f64 }{
+        .{ "zebrafish", 30 },
+        .{ "allocator", 40 },
+        .{ "the", 40 },
+        .{ "useState return", 40 },
+        .{ "SELECT FROM WHERE", 50 },
+        .{ "nothinghere", 5 },
+    };
+    for (queries) |case| {
+        const query, const limit_ms = case;
+        start_ns = sys.monotonicNs();
         try content.search(
-            &ix,
+            &built,
             gpa,
-            a,
+            arena,
             pool,
-            q[0],
-            .{ .limit = 50, .text_path = content.plainPath, .text_ctx = &dummy },
+            query,
+            .{ .limit = 50, .text_path = content.plainPath, .text_ctx = &reader_context },
             &matches,
         );
         var label: [64]u8 = undefined;
         check(
-            try std.mem.print(&label, "search \"{s}\" ({d} hits)", .{ q[0], matches.items.len }),
-            ms(sys.monotonicNs() - t),
-            q[1],
+            try std.mem.print(&label, "search \"{s}\" ({d} hits)", .{ query, matches.items.len }),
+            ms(sys.monotonicNs() - start_ns),
+            limit_ms,
         );
     }
 }
 
 pub fn main(init: std.process.Init) !void {
     const gpa = std.heap.c_allocator;
-    if (init.environ_map.get("PERF_SCALE")) |s| scale = std.fmt.parseFloat(f64, s) catch 1;
+    if (init.environ_map.get("PERF_SCALE")) |scale_text| {
+        scale = std.fmt.parseFloat(f64, scale_text) catch 1;
+    }
     const pool = try index.Pool.create(gpa, init.io, index.Pool.allCores());
     defer pool.destroy();
 
-    var dbuf: [256]u8 = undefined;
-    const dir = try std.mem.print(&dbuf, "/tmp/lumen-perf-{d}", .{std.os.linux.getpid()});
-    try sys.mkdirP(dir);
+    var directory_buffer: [256]u8 = undefined;
+    const pid = std.os.linux.getpid();
+    const directory = try std.mem.print(&directory_buffer, "/tmp/lumen-perf-{d}", .{pid});
+    try sys.mkdirP(directory);
     defer {
-        const argv = [_][]const u8{ "rm", "-rf", dir };
-        if (std.process.run(gpa, init.io, .{ .argv = &argv })) |res| {
-            gpa.free(res.stdout);
-            gpa.free(res.stderr);
-        } else |_| {}
+        const argv = [_][]const u8{ "rm", "-rf", directory };
+        if (std.process.run(gpa, init.io, .{ .argv = &argv })) |result| {
+            gpa.free(result.stdout);
+            gpa.free(result.stderr);
+        } else |err| {
+            std.debug.print("could not delete {s}: {t}\n", .{ directory, err });
+        }
     }
 
-    try names(gpa, pool, dir);
-    try contents(gpa, pool, dir);
+    try names(gpa, pool, directory);
+    try contents(gpa, pool, directory);
     std.debug.print("memory\n", .{});
     checkMB("peak RSS of the whole run", peakRssMB(), 1200);
 
-    if (failures > 0) {
-        std.debug.print("\n{d} performance check(s) failed\n", .{failures});
+    if (failures_count > 0) {
+        std.debug.print("\n{d} performance check(s) failed\n", .{failures_count});
         std.process.exit(1);
     }
     std.debug.print("\nall performance checks passed\n", .{});

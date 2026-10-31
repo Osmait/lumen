@@ -30,17 +30,17 @@ const chunk_entries = 8192;
 /// `limit` per chunk guarantees the global top-`limit` by cheap score is
 /// never lost (an item in the global top-`limit` is beaten by at most
 /// `limit-1` others, so it is in its own chunk's top-`limit`).
-const per_chunk_mul = 1;
+const per_chunk_factor = 1;
 /// Finalists that reach the fine scorer, in multiples of `limit`. The Rust
 /// version measured 100% recall with 16 on its author's disk; `zig build
 /// perf` (1M synthetic names built from 24 words, full of near-ties) found
 /// "hndlr" at 3/20 with 16, 8/20 with 32 and 20/20 with 64, for ~0.3 ms
 /// more per query. Near-ties are where cheap and fine scores disagree most.
-const finalist_mul = 64;
+const finalist_factor = 64;
 /// Recency `stat` cap, in multiples of `limit`.
-const recency_mul = 16;
+const recency_factor = 16;
 /// Candidate sets larger than this are not cached for refinement.
-const cache_max = 100_000;
+const cache_entries_max = 100_000;
 /// Shorter queries are not cached: with one or two letters almost every
 /// name matches.
 const cache_query_bytes_min = 3;
@@ -75,8 +75,8 @@ const Pair = struct {
 
     /// Higher score first, then lower id: a total order, so results are
     /// deterministic.
-    fn better(a: Pair, b: Pair) bool {
-        return a.score > b.score or (a.score == b.score and a.id < b.id);
+    fn better(pair: Pair, other: Pair) bool {
+        return pair.score > other.score or (pair.score == other.score and pair.id < other.id);
     }
 };
 
@@ -119,21 +119,21 @@ pub const Engine = struct {
         gpa: std.mem.Allocator,
         pool: *Pool,
         store: *const Store,
-        query_in: []const u8,
-        opts: Options,
+        query: []const u8,
+        options: Options,
         out: *std.ArrayList(Hit),
     ) std.mem.Allocator.Error!void {
-        const limit = opts.limit;
+        const limit = options.limit;
         out.clearRetainingCapacity();
-        var packed_buf: [query_bytes_max]u8 = undefined;
-        const query = packQuery(query_in, &packed_buf);
-        if (query.len == 0 or limit == 0 or store.len() == 0) {
+        var query_packed_buffer: [query_bytes_max]u8 = undefined;
+        const query_packed = packQuery(query, &query_packed_buffer);
+        if (query_packed.len == 0 or limit == 0 or store.len() == 0) {
             engine.reset();
             return;
         }
         // Everything below compares folded bytes: "Español" -> "espanol".
         var query_folded_buffer: [query_bytes_max]u8 = undefined;
-        const query_folded = fold.foldInto(&query_folded_buffer, query);
+        const query_folded = fold.foldInto(&query_folded_buffer, query_packed);
         const query_mask = store_mod.charMask(query_folded);
         // With 1-2 letters almost everything matches: caching half a million
         // ids would not speed anything up.
@@ -156,41 +156,50 @@ pub const Engine = struct {
         var hits: std.ArrayList(Pair) = .empty;
         defer hits.deinit(gpa);
         try hits.resize(gpa, finalists.items.len);
-        var fine_context: FineCtx = .{
+        var fine_context: FineContext = .{
             .store = store,
-            .q = query_folded,
-            .in = finalists.items,
-            .out = hits.items,
+            .query_folded = query_folded,
+            .finalists = finalists.items,
+            .hits = hits.items,
         };
-        pool.runBlocks(finalists.items.len, fine_block, &fine_context, FineCtx.block);
+        pool.runBlocks(finalists.items.len, fine_block_entries, &fine_context, FineContext.block);
         std.mem.sort(Pair, hits.items, {}, lessThan);
 
-        if (opts.recency) byRecency(pool, store, hits.items, limit, opts.no_stat);
+        if (options.recency) byRecency(pool, store, hits.items, limit, options.no_stat);
 
         const take = @min(limit, hits.items.len);
         try out.ensureTotalCapacity(gpa, take);
-        for (hits.items[0..take]) |hit| out.appendAssumeCapacity(.{ .id = hit.id, .score = hit.score });
-        // Best first, the recency bonus included: `byRecency` re-sorts the
-        // head, and nothing below its cut can climb past it.
-        assert(out.items.len <= limit);
-        for (out.items) |hit| assert(hit.id < store.len());
-        if (out.items.len > 1) {
-            for (out.items[0 .. out.items.len - 1], out.items[1..]) |better, worse| {
-                assert(better.score >= worse.score);
-            }
+        for (hits.items[0..take]) |hit| {
+            out.appendAssumeCapacity(.{ .id = hit.id, .score = hit.score });
         }
+        assertRanked(out.items, store, limit);
 
-        if (cacheable and !sifted.overflow and sifted.candidates.items.len <= cache_max) {
-            engine.last_query.clearRetainingCapacity();
-            try engine.last_query.appendSlice(gpa, query_folded);
-            engine.last_candidates.clearRetainingCapacity();
-            try engine.last_candidates.appendSlice(gpa, sifted.candidates.items);
-            engine.cache_valid = true;
+        const candidates_fit = sifted.candidates.items.len <= cache_entries_max;
+        if (cacheable and !sifted.overflow and candidates_fit) {
+            try engine.remember(gpa, query_folded, sifted.candidates.items);
         } else engine.cache_valid = false;
     }
 
+    /// Keeps `candidates`, the matches of `query_folded`, to refine on the
+    /// next keystroke.
+    fn remember(
+        engine: *Engine,
+        gpa: std.mem.Allocator,
+        query_folded: []const u8,
+        candidates: []const u32,
+    ) std.mem.Allocator.Error!void {
+        // Invalid until both are in: a failed append must not leave the
+        // previous query's flag on a half-written cache.
+        engine.cache_valid = false;
+        engine.last_query.clearRetainingCapacity();
+        try engine.last_query.appendSlice(gpa, query_folded);
+        engine.last_candidates.clearRetainingCapacity();
+        try engine.last_candidates.appendSlice(gpa, candidates);
+        engine.cache_valid = true;
+    }
+
     const SiftOptions = struct {
-        /// Hits the search returns; `limit * finalist_mul` finalists are kept.
+        /// Hits the search returns; `limit * finalist_factor` finalists are kept.
         limit: usize,
         /// Sift the last query's candidates instead of the whole store.
         refine: bool,
@@ -199,7 +208,7 @@ pub const Engine = struct {
     };
 
     const Sifted = struct {
-        /// The best `limit * finalist_mul` by cheap score.
+        /// The best `limit * finalist_factor` by cheap score.
         finalists: std.ArrayList(Pair) = .empty,
         /// Every entry that matched, for refining the next keystroke.
         candidates: std.ArrayList(u32) = .empty,
@@ -226,49 +235,51 @@ pub const Engine = struct {
         const limit = options.limit;
         const refine = options.refine;
         const cacheable = options.cacheable;
-        const keep = limit * finalist_mul;
-        const source_len: usize = if (refine) engine.last_candidates.items.len else store.len();
+        const keep = limit * finalist_factor;
+        const source_count: usize = if (refine) engine.last_candidates.items.len else store.len();
         // Fewer chunks when refining: split the finalist budget among them,
         // or the incremental case runs short of finalists (recall fell to
         // 52% with a fixed K in the Rust version).
-        const n_chunks = @max(std.math.divCeil(usize, source_len, chunk_entries) catch 1, 1);
-        const per_chunk = @max(
-            limit * per_chunk_mul,
-            std.math.divCeil(usize, keep, n_chunks) catch keep,
+        const chunks_count = @max(std.math.divCeil(usize, source_count, chunk_entries) catch 1, 1);
+        const kept_max = @max(
+            limit * per_chunk_factor,
+            std.math.divCeil(usize, keep, chunks_count) catch keep,
         );
-        const partials = try gpa.alloc(Partial, n_chunks);
+        const partials = try gpa.alloc(Partial, chunks_count);
         defer {
             for (partials) |*partial| partial.deinit(gpa);
             gpa.free(partials);
         }
         for (partials) |*partial| partial.* = .{};
-        var ctx: SiftCtx = .{
+        var context: SiftContext = .{
             .gpa = gpa,
             .store = store,
             .ids = if (refine) engine.last_candidates.items else null,
-            .source_len = source_len,
+            .source_count = source_count,
             .query_mask = query_mask,
-            .q = query_folded,
-            .per_chunk = per_chunk,
-            .cache_cap = if (cacheable) cache_max else 0,
+            .query_folded = query_folded,
+            .kept_max = kept_max,
+            .candidates_max = if (cacheable) cache_entries_max else 0,
             .partials = partials,
         };
-        pool.runBlocks(source_len, chunk_entries, &ctx, siftChunk);
+        pool.runBlocks(source_count, chunk_entries, &context, siftChunkCallback);
 
-        var out: Sifted = .{};
-        errdefer out.deinit(gpa);
+        var sifted: Sifted = .{};
+        errdefer sifted.deinit(gpa);
         for (partials) |*partial| {
-            try out.finalists.appendSlice(gpa, partial.top.items);
-            out.overflow = out.overflow or partial.overflow;
+            try sifted.finalists.appendSlice(gpa, partial.top.items);
+            sifted.overflow = sifted.overflow or partial.overflow;
         }
-        if (cacheable and !out.overflow) {
-            for (partials) |*partial| try out.candidates.appendSlice(gpa, partial.candidates.items);
+        if (cacheable and !sifted.overflow) {
+            for (partials) |*partial| {
+                try sifted.candidates.appendSlice(gpa, partial.candidates.items);
+            }
         }
-        if (out.finalists.items.len > keep) {
-            selectTop(out.finalists.items, keep);
-            out.finalists.shrinkRetainingCapacity(keep);
+        if (sifted.finalists.items.len > keep) {
+            selectTop(sifted.finalists.items, keep);
+            sifted.finalists.shrinkRetainingCapacity(keep);
         }
-        return out;
+        return sifted;
     }
 };
 
@@ -276,15 +287,28 @@ pub const Engine = struct {
 /// becomes "cargotoml", a subsequence of "Cargo.toml" (the Rust version
 /// matched the space literally, so multi-word queries found nothing).
 /// Longer than `query_bytes_max`: nothing (no name can match it).
-fn packQuery(query: []const u8, buf: *[query_bytes_max]u8) []const u8 {
+fn packQuery(query: []const u8, query_packed: *[query_bytes_max]u8) []const u8 {
     var packed_count: usize = 0;
     for (query) |byte| {
         if (byte == ' ' or byte == '\t') continue;
-        if (packed_count == buf.len) return buf[0..0];
-        buf[packed_count] = byte;
+        if (packed_count == query_packed.len) return query_packed[0..0];
+        query_packed[packed_count] = byte;
         packed_count += 1;
     }
-    return buf[0..packed_count];
+    return query_packed[0..packed_count];
+}
+
+/// What `Engine.search` returns: at most `limit` hits of `store`, best
+/// first, the recency bonus included (`byRecency` re-sorts the head, and
+/// nothing below its cut can climb past it).
+fn assertRanked(hits: []const Hit, store: *const Store, limit: usize) void {
+    assert(hits.len <= limit);
+    for (hits) |hit| assert(hit.id < store.len());
+    if (hits.len > 1) {
+        for (hits[0 .. hits.len - 1], hits[1..]) |better, worse| {
+            assert(better.score >= worse.score);
+        }
+    }
 }
 
 fn lessThan(_: void, a: Pair, b: Pair) bool {
@@ -302,25 +326,25 @@ const Partial = struct {
     }
 };
 
-const SiftCtx = struct {
+const SiftContext = struct {
     gpa: std.mem.Allocator,
     store: *const Store,
     /// Candidate ids when refining; null = every entry.
     ids: ?[]const u32,
-    source_len: usize,
+    source_count: usize,
     query_mask: u64,
-    q: []const u8,
-    per_chunk: usize,
-    cache_cap: usize,
+    query_folded: []const u8,
+    kept_max: usize,
+    candidates_max: usize,
     partials: []Partial,
 };
 
-fn siftChunk(ctx: *SiftCtx, lo: usize, hi: usize) void {
-    const chunk_index = lo / chunk_entries;
+fn siftChunkCallback(context: *SiftContext, start: usize, end: usize) void {
+    const chunk_index = start / chunk_entries;
     // Out of memory: the chunk's candidates are incomplete, so they must not
     // be refined on the next keystroke as if they were all of them.
-    sift(ctx, chunk_index, lo, hi) catch {
-        ctx.partials[chunk_index].overflow = true;
+    siftChunk(context, chunk_index, start, end) catch {
+        context.partials[chunk_index].overflow = true;
     };
 }
 
@@ -328,22 +352,31 @@ fn siftChunk(ctx: *SiftCtx, lo: usize, hi: usize) void {
 /// can still fight for the chunk's top-K is pushed (the Rust profile showed
 /// unselective queries spending their time pushing entries to throw away
 /// 99.98% of them).
-fn sift(ctx: *SiftCtx, chunk_index: usize, lo: usize, hi: usize) !void {
-    const partial = &ctx.partials[chunk_index];
-    const masks = ctx.store.masks();
-    const kept_max = ctx.per_chunk;
+fn siftChunk(
+    context: *SiftContext,
+    chunk_index: usize,
+    start: usize,
+    end: usize,
+) std.mem.Allocator.Error!void {
+    const partial = &context.partials[chunk_index];
+    const masks = context.store.masks();
+    const kept_max = context.kept_max;
     const compact_at = kept_max * 2;
-    try partial.top.ensureTotalCapacity(ctx.gpa, compact_at);
+    try partial.top.ensureTotalCapacity(context.gpa, compact_at);
     // Room for the chunk's candidates at once, not grown one by one.
-    if (ctx.cache_cap > 0) try partial.candidates.ensureTotalCapacity(ctx.gpa, @min(hi - lo, ctx.cache_cap));
+    if (context.candidates_max > 0) {
+        const candidates_room = @min(end - start, context.candidates_max);
+        try partial.candidates.ensureTotalCapacity(context.gpa, candidates_room);
+    }
     var threshold: i32 = std.math.minInt(i32);
 
-    var idx = lo;
-    while (idx < hi) : (idx += 1) {
-        const id: u32 = if (ctx.ids) |ids| ids[idx] else @intCast(idx);
-        if (masks[id] & ctx.query_mask != ctx.query_mask) continue;
-        const cheap = cheapScoreMasked(ctx.store.name(id), ctx.q, masks[id]) orelse continue;
-        const score = adjust(ctx.store, id, cheap);
+    var position = start;
+    while (position < end) : (position += 1) {
+        const id: u32 = if (context.ids) |ids| ids[position] else @intCast(position);
+        if (masks[id] & context.query_mask != context.query_mask) continue;
+        const name = context.store.name(id);
+        const cheap = cheapScoreMasked(name, context.query_folded, masks[id]) orelse continue;
+        const score = adjust(context.store, id, cheap);
         // `>=`: on equal scores the id breaks the tie, so an equal can still
         // displace the k-th.
         if (score >= threshold) {
@@ -354,9 +387,9 @@ fn sift(ctx: *SiftCtx, chunk_index: usize, lo: usize, hi: usize) !void {
                 threshold = worst(partial.top.items).score;
             }
         }
-        if (ctx.cache_cap > 0) {
-            if (partial.candidates.items.len < ctx.cache_cap) {
-                try partial.candidates.append(ctx.gpa, id);
+        if (context.candidates_max > 0) {
+            if (partial.candidates.items.len < context.candidates_max) {
+                try partial.candidates.append(context.gpa, id);
             } else {
                 partial.overflow = true;
             }
@@ -376,13 +409,13 @@ fn worst(items: []const Pair) Pair {
     return result;
 }
 
-/// Reorders `items` so its first `k` are the best `k` (in any order):
-/// quickselect, linear on average.
-fn selectTop(items: []Pair, k: usize) void {
-    if (k == 0 or k >= items.len) return;
+/// Reorders `items` so its first `count` are the best `count` (in any
+/// order): quickselect, linear on average.
+fn selectTop(items: []Pair, count: usize) void {
+    if (count == 0 or count >= items.len) return;
     var lo: usize = 0;
     var hi: usize = items.len - 1;
-    const target = k - 1;
+    const target = count - 1;
     while (lo < hi) {
         // Median of three as the pivot.
         const mid = lo + (hi - lo) / 2;
@@ -410,42 +443,42 @@ fn selectTop(items: []Pair, k: usize) void {
 /// boundaries. It does not find the best alignment (the fine layer does);
 /// it only has to be cheap and not lose good candidates.
 ///
-/// `q` is folded (`core.fold`); the name is compared folded. Pure ASCII
+/// `query` is folded (`core.fold`); the name is compared folded. Pure ASCII
 /// names (nearly all of them) are lowercased on the fly; the first byte
 /// >= 0x80 sends the name to a folded copy that keeps the original case
 /// for camelCase. Both give the same score on an ASCII name.
-pub fn cheapScore(name: []const u8, q: []const u8) ?i32 {
-    if (name.len < q.len) return null;
-    return cheapCore(.ascii, name, &.{}, q) catch cheapFolded(name, q);
+pub fn cheapScore(name: []const u8, query: []const u8) ?i32 {
+    if (name.len < query.len) return null;
+    return cheapCore(.ascii, name, &.{}, query) catch cheapFolded(name, query);
 }
 
 /// `cheapScore` with the name's mask from the store: its `mask_non_ascii`
 /// says which path to take, so an ASCII name never has its tail checked
 /// after the match (measurable on "c", where nearly every name matches at
 /// its first letters).
-pub fn cheapScoreMasked(name: []const u8, q: []const u8, mask: u64) ?i32 {
-    if (name.len < q.len) return null;
-    if (mask & store_mod.mask_non_ascii != 0) return cheapFolded(name, q);
+pub fn cheapScoreMasked(name: []const u8, query: []const u8, mask: u64) ?i32 {
+    if (name.len < query.len) return null;
+    if (mask & store_mod.mask_non_ascii != 0) return cheapFolded(name, query);
     // The same loop as before folding existed. A damaged mapped mask could
     // only score a non-ASCII name as plain bytes: never unsafe.
     return cheapCore(
         .known_ascii,
         name,
         &.{},
-        q,
+        query,
     ) catch unreachable; // NonAscii comes only from .ascii mode
 }
 
 // Out of line: its 2 KB of buffers stay off the hot loop's stack frame.
-noinline fn cheapFolded(name: []const u8, q: []const u8) ?i32 {
-    var buf: [folded_bytes_max]u8 = undefined;
+noinline fn cheapFolded(name: []const u8, query: []const u8) ?i32 {
+    var name_folded: [folded_bytes_max]u8 = undefined;
     var upper: [folded_bytes_max]bool = undefined;
-    const folded_count = fold.foldCase(&buf, &upper, name);
+    const folded_count = fold.foldCase(&name_folded, &upper, name);
     return cheapCore(
         .folded,
-        buf[0..folded_count],
+        name_folded[0..folded_count],
         upper[0..folded_count],
-        q,
+        query,
     ) catch unreachable; // NonAscii comes only from .ascii mode
 }
 
@@ -517,53 +550,54 @@ fn cheapCore(
     comptime mode: CheapMode,
     name: []const u8,
     upper: []const bool,
-    q: []const u8,
+    query: []const u8,
 ) error{NonAscii}!?i32 {
     const ascii = mode != .folded;
-    var qi: usize = 0;
-    var s: i32 = 0;
-    var prev_hit: usize = std.math.maxInt(usize);
-    var first_hit: usize = std.math.maxInt(usize);
+    var query_index: usize = 0;
+    var score: i32 = 0;
+    var hit_previous: usize = std.math.maxInt(usize);
+    var hit_first: usize = std.math.maxInt(usize);
     // A `for`, not a `while` over an index: measured 8% faster on "ca"
     // over 1.6M names.
     var seen = name.len;
     for (name, 0..) |raw, i| {
-        if (qi == q.len) {
+        if (query_index == query.len) {
             seen = i;
             break;
         }
         if (mode == .ascii and !std.ascii.isAscii(raw)) return error.NonAscii;
-        const h = if (ascii) std.ascii.toLower(raw) else raw;
-        if (h != q[qi]) continue;
-        if (first_hit == std.math.maxInt(usize)) first_hit = i;
-        if (prev_hit +% 1 == i) s += cheap_weight.consecutive;
+        const letter = if (ascii) std.ascii.toLower(raw) else raw;
+        if (letter != query[query_index]) continue;
+        if (hit_first == std.math.maxInt(usize)) hit_first = i;
+        if (hit_previous +% 1 == i) score += cheap_weight.consecutive;
         if (i == 0) {
-            s += cheap_weight.name_start;
+            score += cheap_weight.name_start;
         } else {
-            const prev = name[i - 1];
+            const before = name[i - 1];
             const camel_boundary = if (ascii)
-                std.ascii.isLower(prev) and std.ascii.isUpper(raw)
+                std.ascii.isLower(before) and std.ascii.isUpper(raw)
             else
-                std.ascii.isLower(prev) and !upper[i - 1] and upper[i];
-            if (isWordSeparator(prev)) {
-                s += cheap_weight.word_start;
+                std.ascii.isLower(before) and !upper[i - 1] and upper[i];
+            if (isWordSeparator(before)) {
+                score += cheap_weight.word_start;
             } else if (camel_boundary) {
-                s += cheap_weight.camel_start;
+                score += cheap_weight.camel_start;
             }
         }
-        prev_hit = i;
-        qi += 1;
+        hit_previous = i;
+        query_index += 1;
     }
-    if (qi < q.len) return null;
+    if (query_index < query.len) return null;
     // The lengths below are folded lengths: an unseen tail must be ASCII
     // too for the original's to be the same.
     if (mode == .ascii and !fold.isAscii(name[seen..])) return error.NonAscii;
-    const before_first: i32 = @intCast(@min(first_hit, cheap_weight.before_first_bytes_max));
-    s -= before_first * cheap_weight.before_first_per_byte;
-    s -= @as(i32, @intCast(name.len / cheap_weight.name_bytes_per_point));
-    const stem_len = std.mem.findScalarLast(u8, name, '.') orelse name.len;
-    if (name.len == q.len or (stem_len > 0 and stem_len == q.len)) s += cheap_weight.whole_name;
-    return s;
+    const before_first: i32 = @intCast(@min(hit_first, cheap_weight.before_first_bytes_max));
+    score -= before_first * cheap_weight.before_first_per_byte;
+    score -= @as(i32, @intCast(name.len / cheap_weight.name_bytes_per_point));
+    const stem_length = std.mem.findScalarLast(u8, name, '.') orelse name.len;
+    const stem_is_query = stem_length > 0 and stem_length == query.len;
+    if (name.len == query.len or stem_is_query) score += cheap_weight.whole_name;
+    return score;
 }
 
 /// Metadata adjustments, shared by the cascade and the exhaustive reference
@@ -572,37 +606,42 @@ fn adjust(store: *const Store, id: u32, cheap: i32) i32 {
     const entry_flags = store.flags()[id];
     var score = cheap;
     if (entry_flags & store_mod.flag_dir != 0) score += metadata_weight.directory;
-    if (entry_flags & store_mod.flag_hidden != 0) score -= recency_max + metadata_weight.hidden_beyond_recency;
+    if (entry_flags & store_mod.flag_hidden != 0) {
+        score -= recency_max + metadata_weight.hidden_beyond_recency;
+    }
     return score - @as(i32, store.depths()[id]) * metadata_weight.per_depth;
 }
 
 /// Finalists per pool task for the fine scorer and the recency stats.
-const fine_block = 256;
-const recency_block = 64;
+const fine_block_entries = 256;
+const recency_block_entries = 64;
 
-const FineCtx = struct {
+const FineContext = struct {
     store: *const Store,
-    q: []const u8,
-    in: []const Pair,
-    out: []Pair,
+    query_folded: []const u8,
+    finalists: []const Pair,
+    hits: []Pair,
 
-    fn block(ctx: *FineCtx, lo: usize, hi: usize) void {
-        for (ctx.in[lo..hi], ctx.out[lo..hi]) |f, *h| {
-            const fs = fine.score(ctx.store.name(f.id), ctx.q) orelse 0;
-            h.* = .{ .score = fs * fine_weight + f.score, .id = f.id };
+    fn block(context: *FineContext, start: usize, end: usize) void {
+        for (context.finalists[start..end], context.hits[start..end]) |finalist, *hit| {
+            const name = context.store.name(finalist.id);
+            const fine_score = fine.score(name, context.query_folded) orelse 0;
+            hit.* = .{ .score = fine_score * fine_weight + finalist.score, .id = finalist.id };
         }
     }
 };
 
-const RecencyCtx = struct {
+const RecencyContext = struct {
     store: *const Store,
     hits: []Pair,
     now: i64,
     no_stat: []const []const u8,
 
-    fn block(ctx: *RecencyCtx, lo: usize, hi: usize) void {
-        var buf: paths.Buffer = undefined;
-        for (ctx.hits[lo..hi]) |*h| h.score += recencyBonus(ctx, h.id, &buf);
+    fn block(context: *RecencyContext, start: usize, end: usize) void {
+        var path_buffer: paths.Buffer = undefined;
+        for (context.hits[start..end]) |*hit| {
+            hit.score += recencyBonus(context, hit.id, &path_buffer);
+        }
     }
 };
 
@@ -623,33 +662,33 @@ fn byRecency(
     const floor = cut -| recency_max;
     var stat_count: usize = 0;
     while (stat_count < hits.len and hits[stat_count].score >= floor) stat_count += 1;
-    stat_count = @min(stat_count, limit * recency_mul);
+    stat_count = @min(stat_count, limit * recency_factor);
     // Up to 960 path rebuilds and stats for the UI's 60: on the pool.
-    var recency_context: RecencyCtx = .{
+    var recency_context: RecencyContext = .{
         .store = store,
         .hits = hits[0..stat_count],
         .now = sys.nowSeconds(),
         .no_stat = no_stat,
     };
-    pool.runBlocks(stat_count, recency_block, &recency_context, RecencyCtx.block);
+    pool.runBlocks(stat_count, recency_block_entries, &recency_context, RecencyContext.block);
     std.mem.sort(Pair, hits[0..stat_count], {}, lessThan);
 }
 
-/// Whether `path` is folder `dir` or below it ("/a/bc" is not below "/a/b").
-pub fn isUnder(path: []const u8, dir: []const u8) bool {
-    if (!std.mem.startsWith(u8, path, dir)) return false;
-    if (path.len == dir.len) return true;
-    return path[dir.len] == paths.separator or std.mem.endsWith(u8, dir, paths.separator_str);
+/// Whether `path` is folder `folder` or below it ("/a/bc" is not below "/a/b").
+pub fn isUnder(path: []const u8, folder: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, folder)) return false;
+    if (path.len == folder.len) return true;
+    return path[folder.len] == paths.separator or std.mem.endsWith(u8, folder, paths.separator_str);
 }
 
 /// Coarse on purpose: today vs this month vs old.
-fn recencyBonus(ctx: *const RecencyCtx, id: u32, buf: *paths.Buffer) i32 {
-    const now = ctx.now;
-    const path = ctx.store.path(id, buf[0 .. buf.len - 1]) orelse return 0;
+fn recencyBonus(context: *const RecencyContext, id: u32, path_buffer: *paths.Buffer) i32 {
+    const now = context.now;
+    const path = context.store.path(id, path_buffer[0 .. path_buffer.len - 1]) orelse return 0;
     if (path.len == 0) return 0;
-    for (ctx.no_stat) |dir| if (isUnder(path, dir)) return 0;
-    buf[path.len] = 0;
-    const mtime = sys.mtime(buf[0..path.len :0]) orelse return 0;
+    for (context.no_stat) |folder| if (isUnder(path, folder)) return 0;
+    path_buffer[path.len] = 0;
+    const mtime = sys.mtime(path_buffer[0..path.len :0]) orelse return 0;
     // Saturating: an mtime is whatever the file system says.
     return recency.bonus(now -| mtime);
 }
@@ -659,16 +698,16 @@ fn recencyBonus(ctx: *const RecencyCtx, id: u32, buf: *paths.Buffer) i32 {
 pub fn searchExhaustive(
     gpa: std.mem.Allocator,
     store: *const Store,
-    query_in: []const u8,
+    query: []const u8,
     limit: usize,
     out: *std.ArrayList(Hit),
 ) std.mem.Allocator.Error!void {
     out.clearRetainingCapacity();
-    var packed_buf: [query_bytes_max]u8 = undefined;
-    const query = packQuery(query_in, &packed_buf);
-    if (query.len == 0) return;
+    var query_packed_buffer: [query_bytes_max]u8 = undefined;
+    const query_packed = packQuery(query, &query_packed_buffer);
+    if (query_packed.len == 0) return;
     var query_folded_buffer: [query_bytes_max]u8 = undefined;
-    const query_folded = fold.foldInto(&query_folded_buffer, query);
+    const query_folded = fold.foldInto(&query_folded_buffer, query_packed);
     const query_mask = store_mod.charMask(query_folded);
     var all: std.ArrayList(Pair) = .empty;
     defer all.deinit(gpa);
@@ -693,10 +732,10 @@ const testing = std.testing;
 
 test "selectTop keeps the best k" {
     var prng = std.Random.DefaultPrng.init(7);
-    const r = prng.random();
+    const random = prng.random();
     var items: [500]Pair = undefined;
-    for (&items, 0..) |*it, i| it.* = .{
-        .score = r.intRangeAtMost(i32, -50, 50),
+    for (&items, 0..) |*item, i| item.* = .{
+        .score = random.intRangeAtMost(i32, -50, 50),
         .id = @intCast(i),
     };
     var sorted = items;
@@ -706,8 +745,8 @@ test "selectTop keeps the best k" {
     try testing.expectEqualSlices(Pair, sorted[0..37], items[0..37]);
 }
 
-fn synthetic(gpa: std.mem.Allocator, n_dirs: usize) !Store {
-    var b: store_mod.Builder = .empty;
+fn synthetic(gpa: std.mem.Allocator, directories_count: usize) !Store {
+    var builder: store_mod.Builder = .empty;
     const words = [_][]const u8{
         "cargo", "config", "main", "readme", "notes", "src", "test", "build", "lib", "index", "photo", "draft",
         "Configuración",
@@ -716,43 +755,44 @@ fn synthetic(gpa: std.mem.Allocator, n_dirs: usize) !Store {
         "über",
         "AñoNuevo",
     };
-    const exts = [_][]const u8{ ".toml", ".rs", ".md", ".zig", ".json", ".png", "" };
+    const extensions = [_][]const u8{ ".toml", ".rs", ".md", ".zig", ".json", ".png", "" };
     var prng = std.Random.DefaultPrng.init(42);
-    const r = prng.random();
-    const root = try b.push(gpa, "/r", store_mod.no_parent, store_mod.flag_dir, 0);
+    const random = prng.random();
+    const root = try builder.push(gpa, "/r", store_mod.no_parent, store_mod.flag_dir, 0);
     // Level 1 dirs, then files under each: BFS order, parents sorted.
-    var dirs: std.ArrayList(u32) = .empty;
-    defer dirs.deinit(gpa);
-    for (0..n_dirs) |i| {
-        var nb: [32]u8 = undefined;
-        const nm = try std.mem.print(&nb, "{s}{d}", .{
-            words[r.uintLessThan(usize, words.len)],
+    var directories: std.ArrayList(u32) = .empty;
+    defer directories.deinit(gpa);
+    for (0..directories_count) |i| {
+        var name_text: [32]u8 = undefined;
+        const entry_name = try std.mem.print(&name_text, "{s}{d}", .{
+            words[random.uintLessThan(usize, words.len)],
             i,
         });
-        try dirs.append(gpa, try b.push(gpa, nm, root, store_mod.flag_dir, 1));
+        try directories.append(gpa, try builder.push(gpa, entry_name, root, store_mod.flag_dir, 1));
     }
-    for (dirs.items) |d| {
+    for (directories.items) |directory| {
         for (0..40) |_| {
-            var nb: [48]u8 = undefined;
-            const nm = try std.mem.print(&nb, "{s}_{s}{s}", .{
-                words[r.uintLessThan(usize, words.len)],
-                words[r.uintLessThan(usize, words.len)],
-                exts[r.uintLessThan(usize, exts.len)],
+            var name_text: [48]u8 = undefined;
+            const entry_name = try std.mem.print(&name_text, "{s}_{s}{s}", .{
+                words[random.uintLessThan(usize, words.len)],
+                words[random.uintLessThan(usize, words.len)],
+                extensions[random.uintLessThan(usize, extensions.len)],
             });
-            _ = try b.push(gpa, nm, d, 0, 2);
+            _ = try builder.push(gpa, entry_name, directory, 0, 2);
         }
     }
-    return b.finish(gpa);
+    return builder.finish(gpa);
 }
 
 test "cascade matches the exhaustive reference (recall 100%)" {
     const gpa = testing.allocator;
-    var s = try synthetic(gpa, 2000); // ~82k entries: several chunks
-    defer s.deinit(gpa);
+    // About 82k entries: several chunks.
+    var store = try synthetic(gpa, 2000);
+    defer store.deinit(gpa);
     const pool = try Pool.create(gpa, testing.io, 3);
     defer pool.destroy();
-    var e: Engine = .empty;
-    defer e.deinit(gpa);
+    var engine: Engine = .empty;
+    defer engine.deinit(gpa);
     var got: std.ArrayList(Hit) = .empty;
     defer got.deinit(gpa);
     var want: std.ArrayList(Hit) = .empty;
@@ -789,34 +829,41 @@ test "cascade matches the exhaustive reference (recall 100%)" {
             "uber",     "an",            "anonuevo",
             "ÜBER_ÑAN",
         };
-    for (queries) |q| {
-        try e.search(gpa, pool, &s, q, .{ .limit = 20, .recency = false }, &got);
-        try searchExhaustive(gpa, &s, q, 20, &want);
+    for (queries) |query| {
+        try engine.search(gpa, pool, &store, query, .{ .limit = 20, .recency = false }, &got);
+        try searchExhaustive(gpa, &store, query, 20, &want);
         try testing.expectEqual(want.items.len, got.items.len);
-        for (want.items, got.items) |w, g| try testing.expectEqual(w.score, g.score);
+        for (want.items, got.items) |wanted, found| {
+            try testing.expectEqual(wanted.score, found.score);
+        }
     }
 }
 
 fn smallStore(gpa: std.mem.Allocator, names: []const []const u8) !Store {
-    var b: store_mod.Builder = .empty;
-    const root = try b.push(gpa, "/r", store_mod.no_parent, store_mod.flag_dir, 0);
-    for (names) |n| _ = try b.push(gpa, n, root, 0, 1);
-    return b.finish(gpa);
+    var builder: store_mod.Builder = .empty;
+    const root = try builder.push(gpa, "/r", store_mod.no_parent, store_mod.flag_dir, 0);
+    for (names) |name| _ = try builder.push(gpa, name, root, 0, 1);
+    return builder.finish(gpa);
 }
 
-fn topName(gpa: std.mem.Allocator, pool: *Pool, s: *const Store, q: []const u8) ![]const u8 {
-    var e: Engine = .empty;
-    defer e.deinit(gpa);
+fn topName(
+    gpa: std.mem.Allocator,
+    pool: *Pool,
+    store: *const Store,
+    query: []const u8,
+) ![]const u8 {
+    var engine: Engine = .empty;
+    defer engine.deinit(gpa);
     var got: std.ArrayList(Hit) = .empty;
     defer got.deinit(gpa);
-    try e.search(gpa, pool, s, q, .{ .limit = 10, .recency = false }, &got);
+    try engine.search(gpa, pool, store, query, .{ .limit = 10, .recency = false }, &got);
     if (got.items.len == 0) return "";
-    return s.name(got.items[0].id);
+    return store.name(got.items[0].id);
 }
 
 test "accents and case fold both ways in name search" {
     const gpa = testing.allocator;
-    var s = try smallStore(gpa, &.{
+    var store = try smallStore(gpa, &.{
         "notes.md",    "espanol.txt", "configuration.txt",
         "Configuración.md",
         "español-viejo.txt",
@@ -825,30 +872,31 @@ test "accents and case fold both ways in name search" {
         "3×4.md",
         "x.md",
     });
-    defer s.deinit(gpa);
+    defer store.deinit(gpa);
     const pool = try Pool.create(gpa, testing.io, 1);
     defer pool.destroy();
-    try testing.expectEqualStrings("espanol.txt", try topName(gpa, pool, &s, "español"));
-    try testing.expectEqualStrings("espanol.txt", try topName(gpa, pool, &s, "ESPANOL"));
+    try testing.expectEqualStrings("espanol.txt", try topName(gpa, pool, &store, "español"));
+    try testing.expectEqualStrings("espanol.txt", try topName(gpa, pool, &store, "ESPANOL"));
     try testing.expectEqualStrings("español-viejo.txt", try topName(
         gpa,
         pool,
-        &s,
+        &store,
         "espanol viejo",
     ));
-    try testing.expectEqualStrings("Configuración.md", try topName(gpa, pool, &s, "configuracion"));
-    try testing.expectEqualStrings("Configuración.md", try topName(gpa, pool, &s, "CONFIGURACIÓN"));
-    try testing.expectEqualStrings("Ñandú.png", try topName(gpa, pool, &s, "nandu"));
+    for ([_][]const u8{ "configuracion", "CONFIGURACIÓN" }) |query| {
+        try testing.expectEqualStrings("Configuración.md", try topName(gpa, pool, &store, query));
+    }
+    try testing.expectEqualStrings("Ñandú.png", try topName(gpa, pool, &store, "nandu"));
     // A symbol is not a letter: "×" is not an "x".
-    try testing.expectEqualStrings("x.md", try topName(gpa, pool, &s, "x"));
-    try testing.expectEqualStrings("3×4.md", try topName(gpa, pool, &s, "3×4"));
+    try testing.expectEqualStrings("x.md", try topName(gpa, pool, &store, "x"));
+    try testing.expectEqualStrings("3×4.md", try topName(gpa, pool, &store, "3×4"));
     var got: std.ArrayList(Hit) = .empty;
     defer got.deinit(gpa);
-    try searchExhaustive(gpa, &s, "x", 10, &got);
-    for (got.items) |h| try testing.expect(!std.mem.eql(u8, s.name(h.id), "3×4.md"));
-    try searchExhaustive(gpa, &s, "×", 10, &got);
+    try searchExhaustive(gpa, &store, "x", 10, &got);
+    for (got.items) |hit| try testing.expect(!std.mem.eql(u8, store.name(hit.id), "3×4.md"));
+    try searchExhaustive(gpa, &store, "×", 10, &got);
     try testing.expectEqual(@as(usize, 1), got.items.len);
-    try testing.expectEqualStrings("3×4.md", s.name(got.items[0].id));
+    try testing.expectEqualStrings("3×4.md", store.name(got.items[0].id));
 }
 
 test "cheap score: an ASCII name scores the same down both paths" {
@@ -859,18 +907,19 @@ test "cheap score: an ASCII name scores the same down both paths" {
         "my_report.md",
         "a.b-c d/e",
     };
-    const qs = [_][]const u8{ "c", "cargo", "fm", "readme", "mr", "abcde", "zz" };
-    for (names) |n| for (qs) |q| {
-        var buf: [64]u8 = undefined;
-        var up: [64]bool = undefined;
-        const len = fold.foldCase(&buf, &up, n);
-        try testing.expectEqual(try cheapCore(.ascii, n, &.{}, q), try cheapCore(
+    const queries = [_][]const u8{ "c", "cargo", "fm", "readme", "mr", "abcde", "zz" };
+    for (names) |name| for (queries) |query| {
+        var folded: [64]u8 = undefined;
+        var upper: [64]bool = undefined;
+        const folded_length = fold.foldCase(&folded, &upper, name);
+        try testing.expectEqual(try cheapCore(.ascii, name, &.{}, query), try cheapCore(
             .folded,
-            buf[0..len],
-            up[0..len],
-            q,
+            folded[0..folded_length],
+            upper[0..folded_length],
+            query,
         ));
-        try testing.expectEqual(cheapScore(n, q), cheapScoreMasked(n, q, store_mod.charMask(n)));
+        const mask = store_mod.charMask(name);
+        try testing.expectEqual(cheapScore(name, query), cheapScoreMasked(name, query, mask));
     };
     // Same letters with accents: same score as the unaccented name.
     try testing.expectEqual(cheapScore("ArbolEpico.md", "ae"), cheapScore("ÁrbolÉpico.md", "ae"));
@@ -891,55 +940,62 @@ test "a 100-character name is found and ranked first by its full name" {
     const gpa = testing.allocator;
     const long = "a_rather_long_file_name_that_someone_typed_in_full_to_find_it_again_quickly_2026_final_version_2.txt";
     try testing.expectEqual(@as(usize, 100), long.len);
-    var s = try smallStore(gpa, &.{
+    var store = try smallStore(gpa, &.{
         "notes.md",
         long ++ ".bak",
         "x" ++ long,
         long,
         "a_rather_long_file_name.txt",
     });
-    defer s.deinit(gpa);
+    defer store.deinit(gpa);
     const pool = try Pool.create(gpa, testing.io, 1);
     defer pool.destroy();
-    try testing.expectEqualStrings(long, try topName(gpa, pool, &s, long));
+    try testing.expectEqualStrings(long, try topName(gpa, pool, &store, long));
     var upper: [long.len]u8 = undefined;
     try testing.expectEqualStrings(long, try topName(
         gpa,
         pool,
-        &s,
+        &store,
         std.ascii.upperString(&upper, long),
     ));
     // Longer than any file name: nothing, not a crash.
-    try testing.expectEqualStrings("", try topName(gpa, pool, &s, long ++ long ++ long));
+    try testing.expectEqualStrings("", try topName(gpa, pool, &store, long ++ long ++ long));
 }
 
 test "recency: nothing under a slow mount is stat'ed" {
     const gpa = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dbuf: paths.Buffer = undefined;
-    const dir = try sys.tmpDirAbs(&tmp, &dbuf);
-    var pbuf: paths.Buffer = undefined;
-    try sys.writeFile(try std.mem.printSentinel(&pbuf, "{s}/recent_note.txt", .{dir}, 0), "x");
-    var b: store_mod.Builder = .empty;
-    const root = try b.push(gpa, dir, store_mod.no_parent, store_mod.flag_dir, 0);
-    _ = try b.push(gpa, "recent_note.txt", root, 0, 1);
-    var s = try b.finish(gpa);
-    defer s.deinit(gpa);
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory_buffer: paths.Buffer = undefined;
+    const directory = try sys.tmpDirAbs(&temporary, &directory_buffer);
+    var path_buffer: paths.Buffer = undefined;
+    const note_path = try std.mem.printSentinel(
+        &path_buffer,
+        "{s}/recent_note.txt",
+        .{directory},
+        0,
+    );
+    try sys.writeFile(note_path, "x");
+    var builder: store_mod.Builder = .empty;
+    const root = try builder.push(gpa, directory, store_mod.no_parent, store_mod.flag_dir, 0);
+    _ = try builder.push(gpa, "recent_note.txt", root, 0, 1);
+    var store = try builder.finish(gpa);
+    defer store.deinit(gpa);
     const pool = try Pool.create(gpa, testing.io, 1);
     defer pool.destroy();
-    var e: Engine = .empty;
-    defer e.deinit(gpa);
+    var engine: Engine = .empty;
+    defer engine.deinit(gpa);
     var got: std.ArrayList(Hit) = .empty;
     defer got.deinit(gpa);
 
-    try e.search(gpa, pool, &s, "recent_note", .{ .limit = 5, .recency = false }, &got);
+    try engine.search(gpa, pool, &store, "recent_note", .{ .limit = 5, .recency = false }, &got);
     const plain = got.items[0].score;
-    e.reset();
-    try e.search(gpa, pool, &s, "recent_note", .{ .limit = 5 }, &got);
+    engine.reset();
+    try engine.search(gpa, pool, &store, "recent_note", .{ .limit = 5 }, &got);
     try testing.expectEqual(plain + recency_max, got.items[0].score);
-    e.reset();
-    try e.search(gpa, pool, &s, "recent_note", .{ .limit = 5, .no_stat = &.{dir} }, &got);
+    engine.reset();
+    const slow = &.{directory};
+    try engine.search(gpa, pool, &store, "recent_note", .{ .limit = 5, .no_stat = slow }, &got);
     try testing.expectEqual(plain, got.items[0].score);
 
     try testing.expect(isUnder("/h/u/nfs", "/h/u/nfs"));

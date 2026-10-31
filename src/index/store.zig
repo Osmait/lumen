@@ -105,21 +105,21 @@ pub const mask_non_ascii: u64 = 1 << mask_non_ascii_bit;
 /// other way round). Plus `mask_non_ascii`, which is why a query's mask
 /// must be taken from the folded query.
 pub fn charMask(name: []const u8) u64 {
-    var m: u64 = 0;
+    var mask: u64 = 0;
     // ASCII as is (`char_bit` already maps A-Z like a-z): one pass, as fast
     // as before folding, for nearly every name.
-    for (name, 0..) |b, i| {
-        if (!std.ascii.isAscii(b)) return m | mask_non_ascii | foldedMask(name[i..]);
-        m |= @as(u64, 1) << char_bit[b];
+    for (name, 0..) |byte, i| {
+        if (!std.ascii.isAscii(byte)) return mask | mask_non_ascii | foldedMask(name[i..]);
+        mask |= @as(u64, 1) << char_bit[byte];
     }
-    return m;
+    return mask;
 }
 
-fn foldedMask(s: []const u8) u64 {
-    var m: u64 = 0;
+fn foldedMask(name: []const u8) u64 {
+    var mask: u64 = 0;
     var i: usize = 0;
-    while (i < s.len) m |= @as(u64, 1) << char_bit[fold.step(s, &i)];
-    return m;
+    while (i < name.len) mask |= @as(u64, 1) << char_bit[fold.step(name, &i)];
+    return mask;
 }
 
 /// Offset of each array inside the buffer. Computed the same way when
@@ -164,12 +164,12 @@ const Layout = struct {
 
 /// Immutable path index: built with `Builder` or mapped with `open`.
 pub const Store = struct {
-    buf: Bytes,
+    bytes: Bytes,
     backing: format.Backing,
     layout: Layout,
 
     pub fn deinit(store: *Store, gpa: std.mem.Allocator) void {
-        format.release(store.buf, store.backing, gpa);
+        format.release(store.bytes, store.backing, gpa);
         store.* = undefined;
     }
 
@@ -177,22 +177,22 @@ pub const Store = struct {
         return @intCast(store.layout.entries_count);
     }
 
-    fn arr(store: *const Store, comptime T: type, off: usize) []T {
-        const items: [*]T = @ptrCast(@alignCast(store.buf.ptr + off));
+    fn column(store: *const Store, comptime T: type, offset: usize) []T {
+        const items: [*]T = @ptrCast(@alignCast(store.bytes.ptr + offset));
         return items[0..store.layout.entries_count];
     }
 
     pub fn masks(store: *const Store) []u64 {
-        return store.arr(u64, store.layout.masks_offset);
+        return store.column(u64, store.layout.masks_offset);
     }
     pub fn parents(store: *const Store) []u32 {
-        return store.arr(u32, store.layout.parents_offset);
+        return store.column(u32, store.layout.parents_offset);
     }
     pub fn depths(store: *const Store) []u16 {
-        return store.arr(u16, store.layout.depths_offset);
+        return store.column(u16, store.layout.depths_offset);
     }
     pub fn flags(store: *const Store) []u8 {
-        return store.arr(u8, store.layout.flags_offset);
+        return store.column(u8, store.layout.flags_offset);
     }
 
     /// Checked again on every use, not only by `validate`: a private mapping
@@ -200,11 +200,11 @@ pub const Store = struct {
     /// copied), and a bad offset read past the buffer.
     pub fn name(store: *const Store, id: u32) []const u8 {
         assert(id < store.layout.entries_count);
-        const name_offset = store.arr(u32, store.layout.name_offsets_offset)[id];
-        const name_size = store.arr(u16, store.layout.name_sizes_offset)[id];
+        const name_offset = store.column(u32, store.layout.name_offsets_offset)[id];
+        const name_size = store.column(u16, store.layout.name_sizes_offset)[id];
         if (@as(usize, name_offset) + name_size > store.layout.names_size) return "";
         const start = store.layout.names_offset + name_offset;
-        return store.buf[start .. start + name_size];
+        return store.bytes[start .. start + name_size];
     }
 
     pub fn isDir(store: *const Store, id: u32) bool {
@@ -284,26 +284,26 @@ pub const Store = struct {
         return roots_count;
     }
 
-    /// Range of the direct children of `dir`. The level-by-level scan leaves
+    /// Range of the direct children of `directory`. The level-by-level scan leaves
     /// the parent array non-decreasing, so children are contiguous and a
     /// binary search finds them with zero extra memory. Valid only for
     /// stores built by `scan`.
-    pub fn children(store: *const Store, dir: u32) struct { lo: u32, hi: u32 } {
-        assert(dir < store.layout.entries_count);
+    pub fn children(store: *const Store, directory: u32) struct { lo: u32, hi: u32 } {
+        assert(directory < store.layout.entries_count);
         const from = store.rootsCount();
         const tail = store.parents()[from..];
-        const lo = from + lowerBound(tail, dir);
-        const hi = from + upperBound(tail, dir);
+        const lo = from + lowerBound(tail, directory);
+        const hi = from + upperBound(tail, directory);
         assert(lo <= hi);
         assert(hi <= store.layout.entries_count);
         return .{ .lo = @intCast(lo), .hi = @intCast(hi) };
     }
 
-    /// Child of `dir` named `child_name`: two binary searches, one for the
-    /// children and one among them by name (scan-built stores only: the scan
-    /// sorts each directory's entries).
-    pub fn findChild(store: *const Store, dir: u32, child_name: []const u8) ?u32 {
-        const range = store.children(dir);
+    /// Child of `directory` named `child_name`: two binary searches, one for
+    /// the children and one among them by name (scan-built stores only: the
+    /// scan sorts each directory's entries).
+    pub fn findChild(store: *const Store, directory: u32, child_name: []const u8) ?u32 {
+        const range = store.children(directory);
         var lo = range.lo;
         var hi = range.hi;
         while (lo < hi) {
@@ -312,7 +312,7 @@ pub const Store = struct {
                 .lt => lo = mid + 1,
                 .gt => hi = mid,
                 .eq => {
-                    assert(store.parents()[mid] == dir);
+                    assert(store.parents()[mid] == directory);
                     return if (store.isTombstoned(mid)) null else mid;
                 },
             }
@@ -321,10 +321,10 @@ pub const Store = struct {
     }
 
     /// Same by linear scan: for stores not built level by level (the delta).
-    pub fn findChildScan(store: *const Store, dir: u32, child_name: []const u8) ?u32 {
+    pub fn findChildScan(store: *const Store, directory: u32, child_name: []const u8) ?u32 {
         for (store.parents(), 0..) |parent, entry| {
             const id: u32 = @intCast(entry);
-            if (parent != dir) continue;
+            if (parent != directory) continue;
             if (store.isTombstoned(id)) continue;
             if (std.mem.eql(u8, store.name(id), child_name)) return id;
         }
@@ -334,8 +334,8 @@ pub const Store = struct {
     pub fn parentsSorted(store: *const Store) bool {
         const tail = store.parents()[store.rootsCount()..];
         if (tail.len < 2) return true;
-        for (tail[0 .. tail.len - 1], tail[1..]) |a, b| {
-            if (a > b) return false;
+        for (tail[0 .. tail.len - 1], tail[1..]) |parent, parent_next| {
+            if (parent > parent_next) return false;
         }
         return true;
     }
@@ -349,18 +349,18 @@ pub const Store = struct {
     /// Writes the buffer as is to `path_z`, atomically (a temporary file,
     /// then rename: a crash midway never leaves a corrupt index in place).
     pub fn save(store: *const Store, path_z: [:0]const u8) sys.Error!void {
-        try sys.writeFileAtomic(path_z, store.buf);
+        try sys.writeFileAtomic(path_z, store.bytes);
     }
 
     /// Maps an index file. PROT_WRITE with MAP_PRIVATE is copy-on-write, so
     /// tombstones never reach the file.
     pub fn open(path_z: [:0]const u8) (sys.Error || error{BadIndex})!Store {
-        const buf = try sys.mapPrivate(path_z);
-        errdefer sys.unmap(buf);
-        return parse(buf, .mapped);
+        const bytes = try sys.mapPrivate(path_z);
+        errdefer sys.unmap(bytes);
+        return parse(bytes, .mapped);
     }
 
-    /// Checks that `buf` is a well-formed index and wraps it without copying.
+    /// Checks that `bytes` is a well-formed index and wraps it without copying.
     /// `backing` says how `deinit` releases it (munmap, or free with the
     /// allocator it is given).
     ///
@@ -370,8 +370,8 @@ pub const Store = struct {
     /// the header and layout fit the buffer exactly, every name lies inside
     /// the names blob, and every parent is `no_parent` (roots, first) or an
     /// earlier entry, so walking up from any entry ends at a root.
-    pub fn parse(buf: Bytes, backing: format.Backing) error{BadIndex}!Store {
-        return .{ .buf = buf, .backing = backing, .layout = try validate(buf) };
+    pub fn parse(bytes: Bytes, backing: format.Backing) error{BadIndex}!Store {
+        return .{ .bytes = bytes, .backing = backing, .layout = try validate(bytes) };
     }
 };
 
@@ -384,25 +384,25 @@ comptime {
     assert(entry_size == 21);
 }
 
-fn validate(buf: BytesConst) error{BadIndex}!Layout {
-    if (buf.len < @sizeOf(Header)) return error.BadIndex;
-    const header = Header.decode(buf[0..@sizeOf(Header)]);
+fn validate(bytes: BytesConst) error{BadIndex}!Layout {
+    if (bytes.len < @sizeOf(Header)) return error.BadIndex;
+    const header = Header.decode(bytes[0..@sizeOf(Header)]);
     if (!std.mem.eql(u8, &header.magic, magic)) return error.BadIndex;
     // Bound both before any arithmetic on them, so the layout cannot
     // overflow. Ids are u32 and `no_parent` is reserved.
-    if (header.entries_count > (buf.len - @sizeOf(Header)) / entry_size) return error.BadIndex;
+    if (header.entries_count > (bytes.len - @sizeOf(Header)) / entry_size) return error.BadIndex;
     if (header.entries_count >= no_parent) return error.BadIndex;
-    if (header.names_size > buf.len) return error.BadIndex;
+    if (header.names_size > bytes.len) return error.BadIndex;
     const layout = Layout.init(@intCast(header.entries_count), @intCast(header.names_size));
-    if (layout.size_total != buf.len) return error.BadIndex;
+    if (layout.size_total != bytes.len) return error.BadIndex;
 
     const entries_count = layout.entries_count;
-    const name_offsets = viewConst(u32, buf, layout.name_offsets_offset, entries_count);
-    const name_sizes = viewConst(u16, buf, layout.name_sizes_offset, entries_count);
+    const name_offsets = viewConst(u32, bytes, layout.name_offsets_offset, entries_count);
+    const name_sizes = viewConst(u16, bytes, layout.name_sizes_offset, entries_count);
     for (name_offsets, name_sizes) |name_offset, name_size| {
         if (@as(u64, name_offset) + name_size > layout.names_size) return error.BadIndex;
     }
-    const parents = viewConst(u32, buf, layout.parents_offset, entries_count);
+    const parents = viewConst(u32, bytes, layout.parents_offset, entries_count);
     var roots_count: usize = 0;
     while (roots_count < entries_count and parents[roots_count] == no_parent) roots_count += 1;
     for (parents[roots_count..], roots_count..) |parent, id| {
@@ -412,27 +412,29 @@ fn validate(buf: BytesConst) error{BadIndex}!Layout {
     return layout;
 }
 
-fn viewConst(comptime T: type, buf: BytesConst, off: usize, n: usize) []const T {
-    const items: [*]const T = @ptrCast(@alignCast(buf.ptr + off));
-    return items[0..n];
+fn viewConst(comptime T: type, bytes: BytesConst, offset: usize, count: usize) []const T {
+    const items: [*]const T = @ptrCast(@alignCast(bytes.ptr + offset));
+    return items[0..count];
 }
 
-fn lowerBound(xs: []const u32, v: u32) usize {
+/// The first position in `sorted` whose value is not below `value`.
+fn lowerBound(sorted: []const u32, value: u32) usize {
     var lo: usize = 0;
-    var hi: usize = xs.len;
+    var hi: usize = sorted.len;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        if (xs[mid] < v) lo = mid + 1 else hi = mid;
+        if (sorted[mid] < value) lo = mid + 1 else hi = mid;
     }
     return lo;
 }
 
-fn upperBound(xs: []const u32, v: u32) usize {
+/// The first position in `sorted` whose value is above `value`.
+fn upperBound(sorted: []const u32, value: u32) usize {
     var lo: usize = 0;
-    var hi: usize = xs.len;
+    var hi: usize = sorted.len;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        if (xs[mid] <= v) lo = mid + 1 else hi = mid;
+        if (sorted[mid] <= value) lo = mid + 1 else hi = mid;
     }
     return lo;
 }
@@ -519,29 +521,29 @@ pub const Builder = struct {
         const layout = Layout.init(builder.len(), builder.names.items.len);
         assert(layout.entries_count < no_parent);
         assert(layout.names_size <= std.math.maxInt(u32));
-        const buf = try gpa.alignedAlloc(u8, .@"8", layout.size_total);
+        const bytes = try gpa.alignedAlloc(u8, .@"8", layout.size_total);
         defer builder.deinit(gpa);
-        @memset(buf, 0);
+        @memset(bytes, 0);
         const header: Header = .{
             .magic = magic.*,
             .entries_count = layout.entries_count,
             .names_size = layout.names_size,
         };
-        @memcpy(buf[0..@sizeOf(Header)], &header.encode());
-        put(buf, layout.masks_offset, builder.masks.items);
-        put(buf, layout.name_offsets_offset, builder.name_offsets.items);
-        put(buf, layout.parents_offset, builder.parents.items);
-        put(buf, layout.depths_offset, builder.depths.items);
-        put(buf, layout.name_sizes_offset, builder.name_sizes.items);
-        put(buf, layout.flags_offset, builder.flags.items);
-        put(buf, layout.names_offset, builder.names.items);
-        return .{ .buf = buf, .backing = .heap, .layout = layout };
+        @memcpy(bytes[0..@sizeOf(Header)], &header.encode());
+        put(bytes, layout.masks_offset, builder.masks.items);
+        put(bytes, layout.name_offsets_offset, builder.name_offsets.items);
+        put(bytes, layout.parents_offset, builder.parents.items);
+        put(bytes, layout.depths_offset, builder.depths.items);
+        put(bytes, layout.name_sizes_offset, builder.name_sizes.items);
+        put(bytes, layout.flags_offset, builder.flags.items);
+        put(bytes, layout.names_offset, builder.names.items);
+        return .{ .bytes = bytes, .backing = .heap, .layout = layout };
     }
 };
 
-fn put(buf: []u8, off: usize, src: anytype) void {
-    const bytes = std.mem.sliceAsBytes(src);
-    @memcpy(buf[off .. off + bytes.len], bytes);
+fn put(destination: []u8, offset: usize, column: anytype) void {
+    const source = std.mem.sliceAsBytes(column);
+    @memcpy(destination[offset .. offset + source.len], source);
 }
 
 // ---------------------------------------------------------------- tests
@@ -549,13 +551,13 @@ fn put(buf: []u8, off: usize, src: anytype) void {
 const testing = std.testing;
 
 fn sample(gpa: std.mem.Allocator) !Store {
-    var b: Builder = .empty;
-    const root = try b.push(gpa, "/home/u", no_parent, flag_dir, 0);
-    const proj = try b.push(gpa, "proj", root, flag_dir, 1);
-    _ = try b.push(gpa, "notes.md", root, 0, 1);
-    _ = try b.push(gpa, "Cargo.toml", proj, 0, 2);
-    _ = try b.push(gpa, "src", proj, flag_dir, 2);
-    return b.finish(gpa);
+    var builder: Builder = .empty;
+    const root = try builder.push(gpa, "/home/u", no_parent, flag_dir, 0);
+    const project = try builder.push(gpa, "proj", root, flag_dir, 1);
+    _ = try builder.push(gpa, "notes.md", root, 0, 1);
+    _ = try builder.push(gpa, "Cargo.toml", project, 0, 2);
+    _ = try builder.push(gpa, "src", project, flag_dir, 2);
+    return builder.finish(gpa);
 }
 
 test "char_bit gives every byte the bit files.idx 03 was written with" {
@@ -580,94 +582,97 @@ test "char_bit gives every byte the bit files.idx 03 was written with" {
 }
 
 test "paths are rebuilt from parents" {
-    var s = try sample(testing.allocator);
-    defer s.deinit(testing.allocator);
-    var buf: [256]u8 = undefined;
-    try testing.expectEqualStrings("/home/u/proj/Cargo.toml", s.path(3, &buf).?);
-    try testing.expectEqualStrings("/home/u", s.path(0, &buf).?);
+    var store = try sample(testing.allocator);
+    defer store.deinit(testing.allocator);
+    var path_buffer: [256]u8 = undefined;
+    try testing.expectEqualStrings("/home/u/proj/Cargo.toml", store.path(3, &path_buffer).?);
+    try testing.expectEqualStrings("/home/u", store.path(0, &path_buffer).?);
 }
 
 test "children by binary search and tombstones" {
-    var s = try sample(testing.allocator);
-    defer s.deinit(testing.allocator);
-    try testing.expect(s.parentsSorted());
-    const r = s.children(1);
-    try testing.expectEqual(@as(u32, 3), r.lo);
-    try testing.expectEqual(@as(u32, 5), r.hi);
-    try testing.expectEqual(@as(?u32, 4), s.findChild(1, "src"));
-    s.tombstone(4);
-    try testing.expectEqual(@as(?u32, null), s.findChild(1, "src"));
-    try testing.expectEqual(@as(usize, 4), s.liveCount());
+    var store = try sample(testing.allocator);
+    defer store.deinit(testing.allocator);
+    try testing.expect(store.parentsSorted());
+    const range = store.children(1);
+    try testing.expectEqual(@as(u32, 3), range.lo);
+    try testing.expectEqual(@as(u32, 5), range.hi);
+    try testing.expectEqual(@as(?u32, 4), store.findChild(1, "src"));
+    store.tombstone(4);
+    try testing.expectEqual(@as(?u32, null), store.findChild(1, "src"));
+    try testing.expectEqual(@as(usize, 4), store.liveCount());
 }
 
 test "findChild: a binary search among a directory's sorted children" {
     const gpa = testing.allocator;
-    var b: Builder = .empty;
-    const root = try b.push(gpa, "/r", no_parent, flag_dir, 0);
-    const a = try b.push(gpa, "a", root, flag_dir, 1);
+    var builder: Builder = .empty;
+    const root = try builder.push(gpa, "/r", no_parent, flag_dir, 0);
+    const subdirectory = try builder.push(gpa, "a", root, flag_dir, 1);
     const names = [_][]const u8{ "Z", "b", "c.txt", "d", "e", "f", "g" };
-    for (names) |n| _ = try b.push(gpa, n, root, 0, 1);
-    for (names) |n| _ = try b.push(gpa, n, a, 0, 2);
-    var s = try b.finish(gpa);
-    defer s.deinit(gpa);
-    for (names) |n| {
-        const id = s.findChild(root, n).?;
-        try testing.expectEqualStrings(n, s.name(id));
-        try testing.expectEqual(root, s.parents()[id]);
-        try testing.expectEqual(a, s.parents()[s.findChild(a, n).?]);
+    for (names) |child_name| _ = try builder.push(gpa, child_name, root, 0, 1);
+    for (names) |child_name| _ = try builder.push(gpa, child_name, subdirectory, 0, 2);
+    var store = try builder.finish(gpa);
+    defer store.deinit(gpa);
+    for (names) |child_name| {
+        const id = store.findChild(root, child_name).?;
+        try testing.expectEqualStrings(child_name, store.name(id));
+        try testing.expectEqual(root, store.parents()[id]);
+        const nested = store.findChild(subdirectory, child_name).?;
+        try testing.expectEqual(subdirectory, store.parents()[nested]);
     }
-    try testing.expectEqual(@as(?u32, null), s.findChild(root, "c"));
-    try testing.expectEqual(@as(?u32, null), s.findChild(root, "zz"));
-    s.tombstone(s.findChild(a, "e").?);
-    try testing.expectEqual(@as(?u32, null), s.findChild(a, "e"));
+    try testing.expectEqual(@as(?u32, null), store.findChild(root, "c"));
+    try testing.expectEqual(@as(?u32, null), store.findChild(root, "zz"));
+    store.tombstone(store.findChild(subdirectory, "e").?);
+    try testing.expectEqual(@as(?u32, null), store.findChild(subdirectory, "e"));
 }
 
 test "a mapping written to after it was checked never hangs or reads out of bounds" {
     // What `validate` accepted, changed underneath (a private mapping shows
     // writes to pages it has not copied yet).
-    var s = try sample(testing.allocator);
-    defer s.deinit(testing.allocator);
-    var buf: [256]u8 = undefined;
-    const parents = s.parents();
-    parents[1] = 3; // proj -> Cargo.toml -> proj: a cycle
-    try testing.expectEqual(@as(?[]const u8, null), s.path(3, &buf));
-    parents[1] = 99; // out of range
-    try testing.expectEqual(@as(?[]const u8, null), s.path(3, &buf));
+    var store = try sample(testing.allocator);
+    defer store.deinit(testing.allocator);
+    var path_buffer: [256]u8 = undefined;
+    const parents = store.parents();
+    // proj -> Cargo.toml -> proj: a cycle.
+    parents[1] = 3;
+    try testing.expectEqual(@as(?[]const u8, null), store.path(3, &path_buffer));
+    // Out of range.
+    parents[1] = 99;
+    try testing.expectEqual(@as(?[]const u8, null), store.path(3, &path_buffer));
     parents[1] = 0;
-    s.arr(u32, s.layout.name_offsets_offset)[2] = std.math.maxInt(u32);
-    try testing.expectEqualStrings("", s.name(2));
-    try testing.expectEqualStrings("/home/u/proj/Cargo.toml", s.path(3, &buf).?);
+    store.column(u32, store.layout.name_offsets_offset)[2] = std.math.maxInt(u32);
+    try testing.expectEqualStrings("", store.name(2));
+    try testing.expectEqualStrings("/home/u/proj/Cargo.toml", store.path(3, &path_buffer).?);
     // Too long for the buffer: no path, not an empty one.
-    try testing.expectEqual(@as(?[]const u8, null), s.path(3, buf[0..10]));
+    try testing.expectEqual(@as(?[]const u8, null), store.path(3, path_buffer[0..10]));
 }
 
 test "save and map give the same index; tombstones stay in memory" {
-    var s = try sample(testing.allocator);
-    defer s.deinit(testing.allocator);
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dir_buf: paths.Buffer = undefined;
-    const dir = try sys.tmpDirPath(&tmp, &dir_buf);
-    var p_buf: paths.Buffer = undefined;
-    const p = try std.mem.printSentinel(&p_buf, "{s}/idx", .{dir}, 0);
-    try s.save(p);
+    var store = try sample(testing.allocator);
+    defer store.deinit(testing.allocator);
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory_buffer: paths.Buffer = undefined;
+    const directory = try sys.tmpDirPath(&temporary, &directory_buffer);
+    var index_path_buffer: paths.Buffer = undefined;
+    const index_path = try std.mem.printSentinel(&index_path_buffer, "{s}/idx", .{directory}, 0);
+    try store.save(index_path);
 
-    var m = try Store.open(p);
-    defer m.deinit(testing.allocator);
-    try testing.expectEqual(s.len(), m.len());
-    var buf: [256]u8 = undefined;
-    try testing.expectEqualStrings("/home/u/proj/Cargo.toml", m.path(3, &buf).?);
-    m.tombstone(3);
+    var mapped = try Store.open(index_path);
+    defer mapped.deinit(testing.allocator);
+    try testing.expectEqual(store.len(), mapped.len());
+    var path_buffer: [256]u8 = undefined;
+    try testing.expectEqualStrings("/home/u/proj/Cargo.toml", mapped.path(3, &path_buffer).?);
+    mapped.tombstone(3);
 
-    var again = try Store.open(p);
+    var again = try Store.open(index_path);
     defer again.deinit(testing.allocator);
     try testing.expect(!again.isTombstoned(3));
 }
 
 test "mask prefilter" {
-    const q = charMask("cgo");
-    try testing.expect(charMask("Cargo.toml") & q == q);
-    try testing.expect(charMask("README") & q != q);
+    const query_mask = charMask("cgo");
+    try testing.expect(charMask("Cargo.toml") & query_mask == query_mask);
+    try testing.expect(charMask("README") & query_mask != query_mask);
 }
 
 test "mask prefilter folds accents and case, both ways" {
@@ -676,15 +681,15 @@ test "mask prefilter folds accents and case, both ways" {
     try testing.expectEqual(charMask("configuracion") | mask_non_ascii, charMask("CONFIGURACIÓN"));
     try testing.expect(charMask("español.txt") & charMask("espanol") == charMask("espanol"));
     // Queries are folded first (as `search` does): "ñu" -> "nu".
-    var qb: [8]u8 = undefined;
-    const q = charMask(fold.foldInto(&qb, "ñu"));
-    try testing.expect(charMask("Ñandú") & q == q);
-    try testing.expect(charMask("nandu") & q == q);
+    var query_folded: [8]u8 = undefined;
+    const query_mask = charMask(fold.foldInto(&query_folded, "ñu"));
+    try testing.expect(charMask("Ñandú") & query_mask == query_mask);
+    try testing.expect(charMask("nandu") & query_mask == query_mask);
     // A symbol is not a letter: "×" does not set the bit of 'x'.
     try testing.expect(charMask("3×4") & charMask("x") != charMask("x"));
     try testing.expect(charMask("español") & mask_non_ascii != 0);
     try testing.expect(charMask("espanol") & mask_non_ascii == 0);
-    for (0..256) |b| try testing.expect(char_bit[b] != 63);
+    for (0..256) |byte| try testing.expect(char_bit[byte] != 63);
 }
 
 // ------------------------------------------------- corrupt indexes, fuzzing
@@ -692,23 +697,25 @@ test "mask prefilter folds accents and case, both ways" {
 /// Touches everything a reader of a store may touch: must never crash on a
 /// store that `parse` accepted.
 fn exercise(store: *const Store) void {
-    var buf: [512]u8 = undefined;
+    var path_buffer: [512]u8 = undefined;
     var sum: usize = store.rootsCount() + @intFromBool(store.parentsSorted()) + store.liveCount();
     for (0..store.len()) |i| {
         const id: u32 = @intCast(i);
-        const plen = if (store.path(id, &buf)) |p| p.len else 0;
-        sum +%= store.name(id).len + plen + @intFromBool(store.isDir(id));
-        const r = store.children(id);
-        std.debug.assert(r.lo <= r.hi and r.hi <= store.len());
-        if (store.findChild(id, "x")) |c| sum +%= c;
-        if (store.findChildScan(id, "x")) |c| sum +%= c;
+        const path_length = if (store.path(id, &path_buffer)) |path| path.len else 0;
+        sum +%= store.name(id).len + path_length + @intFromBool(store.isDir(id));
+        const range = store.children(id);
+        assert(range.lo <= range.hi);
+        assert(range.hi <= store.len());
+        if (store.findChild(id, "x")) |child| sum +%= child;
+        if (store.findChildScan(id, "x")) |child| sum +%= child;
     }
     std.mem.doNotOptimizeAway(sum);
 }
 
 fn sampleBytes(gpa: std.mem.Allocator) !Bytes {
-    const s = try sample(gpa);
-    return s.buf; // owned by the caller now
+    const store = try sample(gpa);
+    // Owned by the caller now.
+    return store.bytes;
 }
 
 test "corrupt indexes are rejected, not trusted" {
@@ -762,9 +769,10 @@ test "corrupt indexes are rejected, not trusted" {
         .{ .id = 1, .parent = 1 },
         .{ .id = 1, .parent = 3 },
         .{ .id = 2, .parent = no_parent },
-    }) |c| {
+    }) |corruption| {
         @memcpy(bad, good);
-        std.mem.writeInt(u32, bad[layout.parents_offset + 4 * c.id ..][0..4], c.parent, .little);
+        const parent_at = layout.parents_offset + 4 * corruption.id;
+        std.mem.writeInt(u32, bad[parent_at..][0..4], corruption.parent, .little);
         try testing.expectError(error.BadIndex, Store.parse(bad, .heap));
     }
 }
@@ -773,16 +781,16 @@ test "a truncated index file fails to open" {
     const gpa = testing.allocator;
     const good = try sampleBytes(gpa);
     defer gpa.free(good);
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dir_buf: paths.Buffer = undefined;
-    const dir = try sys.tmpDirPath(&tmp, &dir_buf);
-    var p_buf: paths.Buffer = undefined;
-    const p = try std.mem.printSentinel(&p_buf, "{s}/idx", .{dir}, 0);
-    try sys.writeFile(p, good[0 .. good.len - 5]);
-    try testing.expectError(error.BadIndex, Store.open(p));
-    try sys.writeFile(p, "not an index at all, just text");
-    try testing.expectError(error.BadIndex, Store.open(p));
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory_buffer: paths.Buffer = undefined;
+    const directory = try sys.tmpDirPath(&temporary, &directory_buffer);
+    var index_path_buffer: paths.Buffer = undefined;
+    const index_path = try std.mem.printSentinel(&index_path_buffer, "{s}/idx", .{directory}, 0);
+    try sys.writeFile(index_path, good[0 .. good.len - 5]);
+    try testing.expectError(error.BadIndex, Store.open(index_path));
+    try sys.writeFile(index_path, "not an index at all, just text");
+    try testing.expectError(error.BadIndex, Store.open(index_path));
 }
 
 test "random byte flips never crash" {
@@ -792,14 +800,17 @@ test "random byte flips never crash" {
     const bad = try gpa.alignedAlloc(u8, .@"8", good.len);
     defer gpa.free(bad);
     var prng = std.Random.DefaultPrng.init(17);
-    const r = prng.random();
+    const random = prng.random();
     var accepted: usize = 0;
     for (0..20_000) |_| {
         @memcpy(bad, good);
-        for (0..r.intRangeAtMost(usize, 1, 4)) |_| bad[r.uintLessThan(usize, bad.len)] = r.int(u8);
-        const cut = if (r.uintLessThan(u8, 8) == 0) r.uintAtMost(usize, bad.len) else bad.len;
-        if (Store.parse(bad[0..cut], .heap)) |s| {
-            exercise(&s);
+        for (0..random.intRangeAtMost(usize, 1, 4)) |_| {
+            bad[random.uintLessThan(usize, bad.len)] = random.int(u8);
+        }
+        const cut_short = random.uintLessThan(u8, 8) == 0;
+        const cut = if (cut_short) random.uintAtMost(usize, bad.len) else bad.len;
+        if (Store.parse(bad[0..cut], .heap)) |store| {
+            exercise(&store);
             accepted += 1;
         } else |_| {}
     }
@@ -808,18 +819,19 @@ test "random byte flips never crash" {
 }
 
 fn fuzzParse(_: void, smith: *testing.Smith) anyerror!void {
-    var buf: [1024]u8 align(format.alignment_bytes) = undefined;
-    const b = buf[0..smith.slice(&buf)];
+    var input: [1024]u8 align(format.alignment_bytes) = undefined;
+    const bytes = input[0..smith.slice(&input)];
     // Often give it a plausible header, so the fuzzer gets past the magic
     // and the length check to the per-entry ones.
-    if (b.len >= @sizeOf(Header) and smith.value(bool)) {
-        @memcpy(b[0..8], magic);
-        const n = smith.valueRangeAtMost(u32, 0, @intCast((b.len - @sizeOf(Header)) / entry_size));
-        const fixed = Layout.init(n, 0).size_total;
-        std.mem.writeInt(u64, b[8..16], n, .little);
-        std.mem.writeInt(u64, b[16..24], b.len -| fixed, .little);
+    if (bytes.len >= @sizeOf(Header) and smith.value(bool)) {
+        @memcpy(bytes[0..8], magic);
+        const entries_fit = (bytes.len - @sizeOf(Header)) / entry_size;
+        const entries_count = smith.valueRangeAtMost(u32, 0, @intCast(entries_fit));
+        const fixed = Layout.init(entries_count, 0).size_total;
+        std.mem.writeInt(u64, bytes[8..16], entries_count, .little);
+        std.mem.writeInt(u64, bytes[16..24], bytes.len -| fixed, .little);
     }
-    if (Store.parse(b, .heap)) |s| exercise(&s) else |_| {}
+    if (Store.parse(bytes, .heap)) |store| exercise(&store) else |_| {}
 }
 
 test "fuzz: parsing arbitrary bytes never crashes" {
@@ -833,27 +845,27 @@ test "fuzz: parsing arbitrary bytes never crashes" {
 
 fn fuzzBuilt(_: void, smith: *testing.Smith) anyerror!void {
     const gpa = testing.allocator;
-    var b: Builder = .empty;
-    defer b.deinit(gpa);
+    var builder: Builder = .empty;
+    defer builder.deinit(gpa);
     const roots = smith.valueRangeAtMost(u8, 1, 3);
-    for (0..roots) |_| _ = try b.push(gpa, "/r", no_parent, flag_dir, 0);
-    var nb: [40]u8 = undefined;
-    while (b.len() < 300 and !smith.eosWeightedSimple(15, 1)) {
-        const n = nb[0..smith.slice(&nb)];
-        const parent = smith.valueRangeLessThan(u32, 0, b.len());
-        _ = try b.push(gpa, n, parent, smith.value(u8), smith.value(u16));
+    for (0..roots) |_| _ = try builder.push(gpa, "/r", no_parent, flag_dir, 0);
+    var name_letters: [40]u8 = undefined;
+    while (builder.len() < 300 and !smith.eosWeightedSimple(15, 1)) {
+        const entry_name = name_letters[0..smith.slice(&name_letters)];
+        const parent = smith.valueRangeLessThan(u32, 0, builder.len());
+        _ = try builder.push(gpa, entry_name, parent, smith.value(u8), smith.value(u16));
     }
-    var s = try b.finish(gpa);
-    defer s.deinit(gpa);
+    var built = try builder.finish(gpa);
+    defer built.deinit(gpa);
     // What the builder writes, the validator must accept, unchanged.
-    const m = try Store.parse(s.buf, .heap);
-    var p1: paths.Buffer = undefined;
-    var p2: paths.Buffer = undefined;
-    for (0..s.len()) |i| try testing.expectEqualStrings(
-        s.path(@intCast(i), &p1) orelse "",
-        m.path(@intCast(i), &p2) orelse "",
+    const parsed = try Store.parse(built.bytes, .heap);
+    var path_built: paths.Buffer = undefined;
+    var path_parsed: paths.Buffer = undefined;
+    for (0..built.len()) |i| try testing.expectEqualStrings(
+        built.path(@intCast(i), &path_built) orelse "",
+        parsed.path(@intCast(i), &path_parsed) orelse "",
     );
-    exercise(&m);
+    exercise(&parsed);
 }
 
 test "fuzz: every index the builder writes is accepted" {

@@ -12,6 +12,7 @@
 const std = @import("std");
 const paths = @import("paths.zig");
 const Io = std.Io;
+const assert = std.debug.assert;
 const store_mod = @import("store.zig");
 const Store = store_mod.Store;
 const scan = @import("scan.zig");
@@ -27,7 +28,7 @@ const Service = @This();
 const log = std.log.scoped(.files);
 
 /// Watches per batch: ~2.3 us each, so a search waits ~4.6 ms at worst.
-const arm_batch = 2_000;
+const arm_batch_watches = 2_000;
 /// No eventfd for `shutdown` (`wake_fd`): the thread then waits at most
 /// 100 ms at a time on inotify, to look at `stop`.
 const no_fd: i32 = -1;
@@ -59,7 +60,7 @@ scan_pool: *Pool,
 /// measured).
 content_search_pool: *Pool,
 content_build_pool: *Pool,
-cfg: scan.Config,
+config: scan.Config,
 roots: [1][]const u8,
 cache_path: [:0]u8,
 /// Names created, removed or moved outside hidden files and directories,
@@ -97,7 +98,7 @@ pub fn start(
 }
 
 /// Fills `service` in place, with no thread yet. In place because the
-/// fields point at each other: `cfg` at `roots`, and `live` at `cfg`. On
+/// fields point at each other: `config` at `roots`, and `live` at `config`. On
 /// error nothing is left to free.
 fn init(
     service: *Service,
@@ -116,15 +117,15 @@ fn init(
     service.* = .{
         .gpa = gpa,
         .io = io,
-        // Set right below: Live keeps a pointer to `cfg`, and reads it while
-        // it starts, so `cfg` must be in its place first.
+        // Set right below: Live keeps a pointer to `config`, and reads it
+        // while it starts, so `config` must be in its place first.
         .live = undefined,
         .search_pool = pools.search,
         .scan_pool = pools.scan,
         .content_search_pool = pools.content_search,
         .content_build_pool = pools.content_build,
         .roots = .{root_copy},
-        .cfg = .{ .roots = &service.roots },
+        .config = .{ .roots = &service.roots },
         .cache_path = cache,
     };
     var base = Store.open(service.cache_path) catch blk: {
@@ -134,7 +135,7 @@ fn init(
     service.live = Live.initUnarmed(
         gpa,
         base,
-        &service.cfg,
+        &service.config,
         service.cache_path,
         service.scan_pool,
     ) catch |err| {
@@ -144,9 +145,10 @@ fn init(
     // A saved index is a photo: nobody watched while Lumen was off.
     service.live.pending_resync = true;
 
-    const event_fd = std.os.linux.eventfd(0, std.os.linux.EFD.CLOEXEC | std.os.linux.EFD.NONBLOCK);
+    const linux = std.os.linux;
+    const event_fd = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
     // Without one, `pause` looks at `stop` every 100 ms instead.
-    if (std.os.linux.errno(event_fd) == .SUCCESS) service.wake_fd = @intCast(event_fd);
+    if (linux.errno(event_fd) == .SUCCESS) service.wake_fd = @intCast(event_fd);
 }
 
 /// The pools the content index runs on, lent for the service's lifetime.
@@ -214,7 +216,10 @@ pub fn shutdown(service: *Service) void {
     if (service.wake_fd != no_fd) {
         // An eventfd takes exactly one u64, the amount to add.
         const one: u64 = 1;
-        _ = std.os.linux.write(service.wake_fd, std.mem.asBytes(&one), @sizeOf(u64));
+        const written = std.os.linux.write(service.wake_fd, std.mem.asBytes(&one), @sizeOf(u64));
+        // Unwoken, the thread waits on inotify until the next event.
+        const errno = std.os.linux.errno(written);
+        if (errno != .SUCCESS) log.warn("waking the file index thread: {t}", .{errno});
     }
     if (service.thread) |thread| thread.join();
     if (service.live.dirty or service.live.pending_resync) service.saveOnShutdown();
@@ -278,7 +283,8 @@ fn saveOnShutdown(service: *Service) void {
 }
 
 fn prepareCompaction(service: *Service) !Live.Replaced {
-    return Live.prepareCompaction(service.gpa, service.scan_pool, &service.cfg, service.cache_path);
+    const pool = service.scan_pool;
+    return Live.prepareCompaction(service.gpa, pool, &service.config, service.cache_path);
 }
 
 fn freeReplaced(gpa: std.mem.Allocator, old: Live.Replaced) void {
@@ -305,10 +311,11 @@ fn concernsContent(service: *Service, change: Watcher.Change) bool {
         else => return true,
     };
     if (name.len > 0 and name[0] == '.') return false;
-    var buf: paths.Buffer = undefined;
-    const dir = service.live.pathOf(.fromRaw(parent), &buf) orelse return true;
+    var path_buffer: paths.Buffer = undefined;
+    const directory = service.live.pathOf(.fromRaw(parent), &path_buffer) orelse return true;
     const root = service.roots[0];
-    const relative = if (std.mem.startsWith(u8, dir, root)) dir[root.len..] else dir;
+    const in_root = std.mem.startsWith(u8, directory, root);
+    const relative = if (in_root) directory[root.len..] else directory;
     var parts = std.mem.tokenizeScalar(u8, relative, '/');
     while (parts.next()) |part| {
         if (part[0] == '.') return false;
@@ -409,11 +416,11 @@ fn applyEvents(service: *Service, arena: std.mem.Allocator) bool {
         };
         if (!service.live.scansPending()) return service.rescanDue();
         scans = service.live.takeScans();
-        entries_max = service.live.limits.delta_max;
+        entries_max = service.live.limits.delta_entries_max;
     }
     // New directories are read without the lock: a large tree moved in
     // held it, and every search with it, for as long as reading took.
-    Live.readScans(service.gpa, service.scan_pool, &service.cfg, scans.items, entries_max);
+    Live.readScans(service.gpa, service.scan_pool, &service.config, scans.items, entries_max);
     service.lock.lockUncancelable(service.io);
     defer service.lock.unlock(service.io);
     service.live.addScans(&scans) catch |err| {
@@ -423,7 +430,7 @@ fn applyEvents(service: *Service, arena: std.mem.Allocator) bool {
     return service.rescanDue();
 }
 
-/// Under the lock.
+/// Called with the lock held.
 fn rescanDue(service: *const Service) bool {
     if (service.live.pending_resync) return true;
     return service.live.needsCompaction();
@@ -445,7 +452,7 @@ fn run(service: *Service) void {
 
         // Phase 1: finish arming, yielding the index between batches.
         service.lock.lockUncancelable(service.io);
-        const more = service.live.armProgress(arm_batch);
+        const more = service.live.armProgress(arm_batch_watches);
         service.lock.unlock(service.io);
         if (more) {
             sys.sleepUs(arm_yield_us);
@@ -467,10 +474,10 @@ fn run(service: *Service) void {
 
 const testing = std.testing;
 
-fn touch(dir: []const u8, name: []const u8) !void {
-    var buf: paths.Buffer = undefined;
-    const p = try std.mem.printSentinel(&buf, "{s}/{s}", .{ dir, name }, 0);
-    try sys.writeFile(p, "x");
+fn touch(directory: []const u8, name: []const u8) !void {
+    var path_buffer: paths.Buffer = undefined;
+    const path = try std.mem.printSentinel(&path_buffer, "{s}/{s}", .{ directory, name }, 0);
+    try sys.writeFile(path, "x");
 }
 
 /// Ceilings, not expectations: the whole test suite runs at once, every
@@ -489,53 +496,61 @@ fn waitFor(service: *Service, arena: std.mem.Allocator, query: []const u8, want:
 
 test "live: new, nested and deleted files show up without a rescan" {
     const gpa = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var abs_buf: paths.Buffer = undefined;
-    const abs = try sys.tmpDirAbs(&tmp, &abs_buf);
-    try touch(abs, "first_note.md");
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var temporary_path_buffer: paths.Buffer = undefined;
+    const temporary_path = try sys.tmpDirAbs(&temporary, &temporary_path_buffer);
+    try touch(temporary_path, "first_note.md");
 
-    var idx_buf: paths.Buffer = undefined;
-    const idx = try std.mem.print(&idx_buf, "{s}/../lumen-test-{s}.idx", .{ abs, tmp.sub_path });
-    const s = try Service.start(gpa, testing.io, abs, idx);
-    defer s.shutdown();
+    var index_path_buffer: paths.Buffer = undefined;
+    const index_name = .{ temporary_path, temporary.sub_path };
+    const index_path = try std.mem.printSentinel(
+        &index_path_buffer,
+        "{s}/../lumen-test-{s}.idx",
+        index_name,
+        0,
+    );
+    // Deferred before the shutdown, so it runs after it: the shutdown saves
+    // the index again.
+    defer {
+        const unlinked = std.os.linux.errno(std.os.linux.unlink(index_path));
+        assert(unlinked == .SUCCESS or unlinked == .NOENT);
+    }
+    const service = try Service.start(gpa, testing.io, temporary_path, index_path);
+    defer service.shutdown();
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     // The initial rescan finds what was there.
-    try testing.expect(try waitFor(s, arena, "first_note", true));
-    while (!s.status().armed or s.status().rescanning) sys.sleepUs(5_000);
+    try testing.expect(try waitFor(service, arena, "first_note", true));
+    while (!service.status().armed or service.status().rescanning) sys.sleepUs(5_000);
 
     // A new file arrives through inotify.
-    try touch(abs, "zebra_quarterly.txt");
-    try testing.expect(try waitFor(s, arena, "zebra_quarterly", true));
+    try touch(temporary_path, "zebra_quarterly.txt");
+    try testing.expect(try waitFor(service, arena, "zebra_quarterly", true));
 
     // A new directory with content inside (scanned whole on creation).
-    var dbuf: paths.Buffer = undefined;
-    const sub = try std.mem.printSentinel(&dbuf, "{s}/fresh_dir", .{abs}, 0);
-    _ = std.os.linux.mkdir(sub, 0o755);
+    try makeDirectory(temporary_path, "fresh_dir");
+    var directory_buffer: paths.Buffer = undefined;
+    const sub = try std.mem.printSentinel(&directory_buffer, "{s}/fresh_dir", .{temporary_path}, 0);
     try touch(sub, "inner_walrus.txt");
-    try testing.expect(try waitFor(s, arena, "inner_walrus", true));
+    try testing.expect(try waitFor(service, arena, "inner_walrus", true));
 
     // Deleting the base file and the delta file removes both.
-    var fbuf: paths.Buffer = undefined;
-    _ = std.os.linux.unlink(try std.mem.printSentinel(&fbuf, "{s}/first_note.md", .{abs}, 0));
-    try testing.expect(try waitFor(s, arena, "first_note", false));
-    _ = std.os.linux.unlink(try std.mem.printSentinel(&fbuf, "{s}/inner_walrus.txt", .{sub}, 0));
-    try testing.expect(try waitFor(s, arena, "inner_walrus", false));
-
-    var cbuf: paths.Buffer = undefined;
-    _ = std.os.linux.unlink(try std.mem.printSentinel(&cbuf, "{s}", .{idx}, 0));
+    try deleteFile(temporary_path, "first_note.md");
+    try testing.expect(try waitFor(service, arena, "first_note", false));
+    try deleteFile(sub, "inner_walrus.txt");
+    try testing.expect(try waitFor(service, arena, "inner_walrus", false));
 }
 
-const tmpAbs = sys.tmpDirAbs;
+const temporaryPath = sys.tmpDirAbs;
 
 /// Waits until the thread has nothing pending: armed and not rescanning.
 fn settle(service: *Service) !void {
     for (0..wait_tries) |_| {
-        const st = service.status();
-        if (st.armed and !st.rescanning) return;
+        const status_now = service.status();
+        if (status_now.armed and !status_now.rescanning) return;
         sys.sleepUs(20_000);
     }
     return error.NeverSettled;
@@ -544,7 +559,9 @@ fn settle(service: *Service) !void {
 fn has(service: *Service, arena: std.mem.Allocator, query: []const u8, suffix: []const u8) !bool {
     var hits: std.ArrayList(Live.Hit) = .empty;
     try service.search(arena, query, 50, &hits);
-    for (hits.items) |h| if (std.mem.endsWith(u8, h.path, suffix)) return true;
+    for (hits.items) |hit| {
+        if (std.mem.endsWith(u8, hit.path, suffix)) return true;
+    }
     return false;
 }
 
@@ -561,185 +578,198 @@ fn waitHas(
     return false;
 }
 
-fn mkdirAbs(dir: []const u8, name: []const u8) !void {
-    var buf: paths.Buffer = undefined;
-    _ = std.os.linux.mkdir(try std.mem.printSentinel(&buf, "{s}/{s}", .{ dir, name }, 0), 0o755);
+fn makeDirectory(directory: []const u8, name: []const u8) !void {
+    var path_buffer: paths.Buffer = undefined;
+    const path = try std.mem.printSentinel(&path_buffer, "{s}/{s}", .{ directory, name }, 0);
+    const linux = std.os.linux;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.mkdir(path, 0o755)));
+}
+
+fn deleteFile(directory: []const u8, name: []const u8) !void {
+    var path_buffer: paths.Buffer = undefined;
+    const path = try std.mem.printSentinel(&path_buffer, "{s}/{s}", .{ directory, name }, 0);
+    const linux = std.os.linux;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.unlink(path)));
 }
 
 test "service: a flooded queue ends in a rescan that finds everything" {
     const gpa = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var qbuf: [32]u8 = undefined;
-    const queued_max = std.fmt.parseInt(
-        usize,
-        std.mem.trim(u8, sys.readHead("/proc/sys/fs/inotify/max_queued_events", &qbuf), " \n"),
-        10,
-    ) catch 16384;
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var queued_text: [32]u8 = undefined;
+    const queued_read = sys.readHead("/proc/sys/fs/inotify/max_queued_events", &queued_text);
+    const queued_trimmed = std.mem.trim(u8, queued_read, " \n");
+    const queued_max = std.fmt.parseInt(usize, queued_trimmed, 10) catch 16384;
     if (queued_max > 100_000) return error.SkipZigTest;
 
-    var dbuf: paths.Buffer = undefined;
-    const dir = try tmpAbs(&tmp, &dbuf);
-    try mkdirAbs(dir, "root");
-    var rbuf: paths.Buffer = undefined;
-    const root = try std.mem.print(&rbuf, "{s}/root", .{dir});
-    try mkdirAbs(root, "flood");
-    var ibuf: paths.Buffer = undefined;
-    const s = try Service.start(gpa, testing.io, root, try std.mem.print(
-        &ibuf,
+    var directory_buffer: paths.Buffer = undefined;
+    const directory = try temporaryPath(&temporary, &directory_buffer);
+    try makeDirectory(directory, "root");
+    var root_buffer: paths.Buffer = undefined;
+    const root = try std.mem.print(&root_buffer, "{s}/root", .{directory});
+    try makeDirectory(root, "flood");
+    var index_path_buffer: paths.Buffer = undefined;
+    const service = try Service.start(gpa, testing.io, root, try std.mem.print(
+        &index_path_buffer,
         "{s}/files.idx",
-        .{dir},
+        .{directory},
     ));
-    defer s.shutdown();
+    defer service.shutdown();
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    try settle(s);
-    const rescans = s.status().rescans;
+    try settle(service);
+    const rescans = service.status().rescans;
 
     // Holding the index stalls the thread before it drains: the queue
     // overflows for real.
-    var fbuf: paths.Buffer = undefined;
-    const flood = try std.mem.print(&fbuf, "{s}/flood", .{root});
-    const n = queued_max + 1_000;
-    s.lock.lockUncancelable(s.io);
-    for (0..n) |i| {
-        var nb: [32]u8 = undefined;
-        touch(flood, try std.mem.print(&nb, "n{d:0>5}.txt", .{i})) catch |e| {
-            s.lock.unlock(s.io);
-            return e;
+    var file_path_buffer: paths.Buffer = undefined;
+    const flood = try std.mem.print(&file_path_buffer, "{s}/flood", .{root});
+    const files_count = queued_max + 1_000;
+    service.lock.lockUncancelable(service.io);
+    for (0..files_count) |i| {
+        var name_text: [32]u8 = undefined;
+        touch(flood, try std.mem.print(&name_text, "n{d:0>5}.txt", .{i})) catch |err| {
+            service.lock.unlock(service.io);
+            return err;
         };
     }
-    s.lock.unlock(s.io);
+    service.lock.unlock(service.io);
 
     for (0..2_000) |_| {
-        if (s.status().rescans > rescans) break;
+        if (service.status().rescans > rescans) break;
         sys.sleepUs(5_000);
     }
-    try settle(s);
-    s.lock.lockSharedUncancelable(s.io);
-    const resyncs = s.live.stats.resyncs;
-    s.lock.unlockShared(s.io);
+    try settle(service);
+    service.lock.lockSharedUncancelable(service.io);
+    const resyncs = service.live.stats.resyncs;
+    service.lock.unlockShared(service.io);
     try testing.expect(resyncs >= 1);
-    try testing.expect(s.status().entries >= n + 2);
-    try testing.expect(try has(s, arena, "n00000", "/flood/n00000.txt"));
-    try testing.expect(try has(s, arena, "n08191", "/flood/n08191.txt"));
+    try testing.expect(service.status().entries >= files_count + 2);
+    try testing.expect(try has(service, arena, "n00000", "/flood/n00000.txt"));
+    try testing.expect(try has(service, arena, "n08191", "/flood/n08191.txt"));
     var last: [32]u8 = undefined;
     try testing.expect(try has(
-        s,
+        service,
         arena,
-        try std.mem.print(&last, "n{d:0>5}", .{n - 1}),
-        try arena.print("/flood/n{d:0>5}.txt", .{n - 1}),
+        try std.mem.print(&last, "n{d:0>5}", .{files_count - 1}),
+        try arena.print("/flood/n{d:0>5}.txt", .{files_count - 1}),
     ));
 }
 
 test "service: files created while the first rescan runs are not lost" {
     const gpa = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dbuf: paths.Buffer = undefined;
-    const dir = try tmpAbs(&tmp, &dbuf);
-    try mkdirAbs(dir, "root");
-    var rbuf: paths.Buffer = undefined;
-    const root = try std.mem.print(&rbuf, "{s}/root", .{dir});
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory_buffer: paths.Buffer = undefined;
+    const directory = try temporaryPath(&temporary, &directory_buffer);
+    try makeDirectory(directory, "root");
+    var root_buffer: paths.Buffer = undefined;
+    const root = try std.mem.print(&root_buffer, "{s}/root", .{directory});
     // Enough to keep the scan busy a few levels deep.
     for (0..40) |i| {
-        var p: paths.Buffer = undefined;
-        const sub = try std.mem.print(&p, "{s}/d{d}", .{ root, i });
+        var sub_buffer: paths.Buffer = undefined;
+        const sub = try std.mem.print(&sub_buffer, "{s}/d{d}", .{ root, i });
         try sys.mkdirP(sub);
-        var q: paths.Buffer = undefined;
-        try sys.mkdirP(try std.mem.print(&q, "{s}/deep/deeper", .{sub}));
+        var deeper_buffer: paths.Buffer = undefined;
+        try sys.mkdirP(try std.mem.print(&deeper_buffer, "{s}/deep/deeper", .{sub}));
         for (0..40) |j| {
-            var nb: [32]u8 = undefined;
-            try touch(sub, try std.mem.print(&nb, "old_{d}.txt", .{j}));
+            var name_text: [32]u8 = undefined;
+            try touch(sub, try std.mem.print(&name_text, "old_{d}.txt", .{j}));
         }
     }
-    var ibuf: paths.Buffer = undefined;
-    const s = try Service.start(gpa, testing.io, root, try std.mem.print(
-        &ibuf,
+    var index_path_buffer: paths.Buffer = undefined;
+    const service = try Service.start(gpa, testing.io, root, try std.mem.print(
+        &index_path_buffer,
         "{s}/files.idx",
-        .{dir},
+        .{directory},
     ));
-    defer s.shutdown();
+    defer service.shutdown();
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     // Right away, while the thread scans: before, during and after each
     // directory is read.
-    const n = 200;
-    for (0..n) |i| {
-        var p: paths.Buffer = undefined;
-        var nb: [32]u8 = undefined;
+    const files_count = 200;
+    for (0..files_count) |i| {
+        var deeper_buffer: paths.Buffer = undefined;
+        var name_text: [32]u8 = undefined;
         try touch(
-            try std.mem.print(&p, "{s}/d{d}/deep/deeper", .{ root, i % 40 }),
-            try std.mem.print(&nb, "late_{d}.txt", .{i}),
+            try std.mem.print(&deeper_buffer, "{s}/d{d}/deep/deeper", .{ root, i % 40 }),
+            try std.mem.print(&name_text, "late_{d}.txt", .{i}),
         );
     }
-    try settle(s);
-    for (0..n) |i| {
-        const q = try arena.print("late_{d}", .{i});
+    try settle(service);
+    for (0..files_count) |i| {
+        const query = try arena.print("late_{d}", .{i});
         const want = try arena.print("/d{d}/deep/deeper/late_{d}.txt", .{ i % 40, i });
-        try testing.expect(try waitHas(s, arena, q, want));
+        try testing.expect(try waitHas(service, arena, query, want));
     }
 }
 
 test "service: shutdown saves what was learned and the next start maps it" {
     const gpa = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dbuf: paths.Buffer = undefined;
-    const dir = try tmpAbs(&tmp, &dbuf);
-    try mkdirAbs(dir, "root");
-    var rbuf: paths.Buffer = undefined;
-    const root = try std.mem.print(&rbuf, "{s}/root", .{dir});
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory_buffer: paths.Buffer = undefined;
+    const directory = try temporaryPath(&temporary, &directory_buffer);
+    try makeDirectory(directory, "root");
+    var root_buffer: paths.Buffer = undefined;
+    const root = try std.mem.print(&root_buffer, "{s}/root", .{directory});
     try touch(root, "Cargo.toml");
-    var ibuf: paths.Buffer = undefined;
-    const idx = try std.mem.printSentinel(&ibuf, "{s}/files.idx", .{dir}, 0);
+    var index_path_buffer: paths.Buffer = undefined;
+    const index_path = try std.mem.printSentinel(
+        &index_path_buffer,
+        "{s}/files.idx",
+        .{directory},
+        0,
+    );
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     {
-        const s = try Service.start(gpa, testing.io, root, idx);
-        defer s.shutdown();
-        try settle(s);
+        const service = try Service.start(gpa, testing.io, root, index_path);
+        defer service.shutdown();
+        try settle(service);
         try touch(root, "de_la_sesion.rs");
-        try testing.expect(try waitHas(s, arena, "de_la_sesion", "/de_la_sesion.rs"));
+        try testing.expect(try waitHas(service, arena, "de_la_sesion", "/de_la_sesion.rs"));
         // Learned through inotify only: in the delta, not yet in the file.
-        s.lock.lockSharedUncancelable(s.io);
-        const dirty = s.live.dirty;
-        s.lock.unlockShared(s.io);
+        service.lock.lockSharedUncancelable(service.io);
+        const dirty = service.live.dirty;
+        service.lock.unlockShared(service.io);
         try testing.expect(dirty);
     }
 
     // The file alone has it.
-    var saved = try Store.open(idx);
+    var saved = try Store.open(index_path);
     defer saved.deinit(gpa);
     const pool = try Pool.create(gpa, testing.io, 0);
     defer pool.destroy();
-    var e: engine.Engine = .empty;
-    defer e.deinit(gpa);
+    var engine_saved: engine.Engine = .empty;
+    defer engine_saved.deinit(gpa);
     var hits: std.ArrayList(engine.Hit) = .empty;
     defer hits.deinit(gpa);
-    try e.search(gpa, pool, &saved, "de_la_sesion", .{ .limit = 10, .recency = false }, &hits);
-    var pbuf: paths.Buffer = undefined;
-    try testing.expect(hits.items.len > 0 and std.mem.endsWith(
-        u8,
-        saved.path(hits.items[0].id, &pbuf).?,
-        "/de_la_sesion.rs",
-    ));
+    const options: engine.Options = .{ .limit = 10, .recency = false };
+    try engine_saved.search(gpa, pool, &saved, "de_la_sesion", options, &hits);
+    var path_buffer: paths.Buffer = undefined;
+    try testing.expect(hits.items.len > 0);
+    const top_path = saved.path(hits.items[0].id, &path_buffer).?;
+    try testing.expect(std.mem.endsWith(u8, top_path, "/de_la_sesion.rs"));
 
     // And a new start finds it on its first search, before any rescan.
-    const s2 = try Service.start(gpa, testing.io, root, idx);
-    defer s2.shutdown();
-    try testing.expect(try has(s2, arena, "de_la_sesion", "/de_la_sesion.rs"));
+    const service_again = try Service.start(gpa, testing.io, root, index_path);
+    defer service_again.shutdown();
+    try testing.expect(try has(service_again, arena, "de_la_sesion", "/de_la_sesion.rs"));
 }
 
 /// Waits until `nameChanges` differs from `from` (or, `from` null, is known).
 pub fn waitNames(service: *Service, from: ?u64) error{NoNameChange}!u64 {
     for (0..wait_tries) |_| {
-        if (service.nameChanges()) |n| if (from == null or n != from.?) return n;
+        if (service.nameChanges()) |changes| {
+            if (from == null or changes != from.?) return changes;
+        }
         sys.sleepUs(10_000);
     }
     return error.NoNameChange;
@@ -747,85 +777,91 @@ pub fn waitNames(service: *Service, from: ?u64) error{NoNameChange}!u64 {
 
 test "service: name changes are counted outside hidden files and folders" {
     const gpa = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dbuf: paths.Buffer = undefined;
-    const dir = try tmpAbs(&tmp, &dbuf);
-    try mkdirAbs(dir, "root");
-    var rbuf: paths.Buffer = undefined;
-    const root = try std.mem.print(&rbuf, "{s}/root", .{dir});
-    try mkdirAbs(root, ".hidden");
-    var hbuf: paths.Buffer = undefined;
-    const hidden = try std.mem.print(&hbuf, "{s}/.hidden", .{root});
-    var ibuf: paths.Buffer = undefined;
-    const idx = try std.mem.printSentinel(&ibuf, "{s}/files.idx", .{dir}, 0);
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory_buffer: paths.Buffer = undefined;
+    const directory = try temporaryPath(&temporary, &directory_buffer);
+    try makeDirectory(directory, "root");
+    var root_buffer: paths.Buffer = undefined;
+    const root = try std.mem.print(&root_buffer, "{s}/root", .{directory});
+    try makeDirectory(root, ".hidden");
+    var hidden_buffer: paths.Buffer = undefined;
+    const hidden = try std.mem.print(&hidden_buffer, "{s}/.hidden", .{root});
+    var index_path_buffer: paths.Buffer = undefined;
+    const index_path = try std.mem.printSentinel(
+        &index_path_buffer,
+        "{s}/files.idx",
+        .{directory},
+        0,
+    );
 
-    const s = try Service.start(gpa, testing.io, root, idx);
-    defer s.shutdown();
-    try settle(s);
-    const before = try waitNames(s, null);
+    const service = try Service.start(gpa, testing.io, root, index_path);
+    defer service.shutdown();
+    try settle(service);
+    const before = try waitNames(service, null);
     try touch(root, ".dotfile");
     try touch(hidden, "inside.txt");
     sys.sleepUs(300_000);
-    try testing.expectEqual(before, s.nameChanges().?);
+    try testing.expectEqual(before, service.nameChanges().?);
     try touch(root, "visible.txt");
-    _ = try waitNames(s, before);
+    _ = try waitNames(service, before);
 }
 
 test "service: the delta threshold triggers a compaction" {
     const gpa = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dbuf: paths.Buffer = undefined;
-    const dir = try tmpAbs(&tmp, &dbuf);
-    try mkdirAbs(dir, "root");
-    var rbuf: paths.Buffer = undefined;
-    const root = try std.mem.print(&rbuf, "{s}/root", .{dir});
-    var ibuf: paths.Buffer = undefined;
-    const s = try Service.start(gpa, testing.io, root, try std.mem.print(
-        &ibuf,
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory_buffer: paths.Buffer = undefined;
+    const directory = try temporaryPath(&temporary, &directory_buffer);
+    try makeDirectory(directory, "root");
+    var root_buffer: paths.Buffer = undefined;
+    const root = try std.mem.print(&root_buffer, "{s}/root", .{directory});
+    var index_path_buffer: paths.Buffer = undefined;
+    const service = try Service.start(gpa, testing.io, root, try std.mem.print(
+        &index_path_buffer,
         "{s}/files.idx",
-        .{dir},
+        .{directory},
     ));
-    defer s.shutdown();
+    defer service.shutdown();
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    try settle(s);
+    try settle(service);
 
-    s.lock.lockUncancelable(s.io);
-    s.live.limits.delta_max = 3;
-    s.lock.unlock(s.io);
-    const rescans = s.status().rescans;
+    service.lock.lockUncancelable(service.io);
+    service.live.limits.delta_entries_max = 3;
+    service.lock.unlock(service.io);
+    const rescans = service.status().rescans;
     for (0..5) |i| {
-        var nb: [32]u8 = undefined;
-        try touch(root, try std.mem.print(&nb, "umbral_{d}.txt", .{i}));
+        var name_text: [32]u8 = undefined;
+        try touch(root, try std.mem.print(&name_text, "umbral_{d}.txt", .{i}));
     }
     for (0..wait_tries) |_| {
-        if (s.status().rescans > rescans) break;
+        if (service.status().rescans > rescans) break;
         sys.sleepUs(20_000);
     }
-    try settle(s);
-    try testing.expect(s.status().rescans > rescans);
+    try settle(service);
+    try testing.expect(service.status().rescans > rescans);
     for (0..5) |i| {
-        const q = try arena.print("umbral_{d}", .{i});
-        try testing.expect(try waitHas(s, arena, q, try arena.print("/umbral_{d}.txt", .{i})));
+        const query = try arena.print("umbral_{d}", .{i});
+        const want = try arena.print("/umbral_{d}.txt", .{i});
+        try testing.expect(try waitHas(service, arena, query, want));
     }
-    s.lock.lockSharedUncancelable(s.io);
-    const delta_live = s.live.delta.store.liveCount();
-    s.lock.unlockShared(s.io);
+    service.lock.lockSharedUncancelable(service.io);
+    const delta_live = service.live.delta.store.liveCount();
+    service.lock.unlockShared(service.io);
     try testing.expect(delta_live < 5);
 }
 
 test "service: rescans asked for in a row wait longer each time" {
-    const s = std.time.ns_per_s;
+    const second = std.time.ns_per_s;
     // The first one, and any after a quiet minute: at once.
     try testing.expectEqual(0, backoffFor(0, std.math.maxInt(u64)));
-    try testing.expectEqual(0, backoffFor(8 * s, 61 * s));
+    try testing.expectEqual(0, backoffFor(8 * second, 61 * second));
     // In a row: 1, 2, 4... seconds, never past a minute.
     var wait: u64 = 0;
     for ([_]u64{ 1, 2, 4, 8, 16, 32, 60, 60 }) |want| {
         wait = backoffFor(wait, 0);
-        try testing.expectEqual(want * s, wait);
+        try testing.expectEqual(want * second, wait);
     }
 }

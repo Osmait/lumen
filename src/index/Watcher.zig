@@ -23,10 +23,11 @@ const Watcher = @This();
 const log = std.log.scoped(.watcher);
 
 fd: i32,
-wd_to_id: std.AutoHashMapUnmanaged(i32, u32) = .empty,
+/// Watch descriptor -> the index entry its events are attributed to.
+watch_ids: std.AutoHashMapUnmanaged(i32, u32) = .empty,
 /// Directories left unwatched because the inotify limit was reached.
 unwatched: u32 = 0,
-buf: [64 * 1024]u8 align(@alignOf(linux.inotify_event)) = undefined,
+events_buffer: [64 * 1024]u8 align(@alignOf(linux.inotify_event)) = undefined,
 
 /// IN_DONT_FOLLOW: a folder swapped for a link to another folder of the
 /// tree re-pointed that folder's watch to the link's entry, and its events
@@ -50,9 +51,9 @@ pub const Change = union(enum) {
 pub const CreateError = error{Inotify} || std.mem.Allocator.Error;
 
 pub fn create(gpa: std.mem.Allocator) CreateError!*Watcher {
-    const rc = linux.inotify_init1(linux.IN.NONBLOCK | linux.IN.CLOEXEC);
-    if (linux.errno(rc) != .SUCCESS) return error.Inotify;
-    const fd: i32 = @intCast(rc);
+    const result = linux.inotify_init1(linux.IN.NONBLOCK | linux.IN.CLOEXEC);
+    if (linux.errno(result) != .SUCCESS) return error.Inotify;
+    const fd: i32 = @intCast(result);
     errdefer sys.close(fd);
     const watcher = try gpa.create(Watcher);
     watcher.* = .{ .fd = fd };
@@ -63,12 +64,12 @@ pub fn create(gpa: std.mem.Allocator) CreateError!*Watcher {
 /// callers do it outside any lock searches wait on.
 pub fn destroy(watcher: *Watcher, gpa: std.mem.Allocator) void {
     sys.close(watcher.fd);
-    watcher.wd_to_id.deinit(gpa);
+    watcher.watch_ids.deinit(gpa);
     gpa.destroy(watcher);
 }
 
 pub fn count(watcher: *const Watcher) usize {
-    return watcher.wd_to_id.count();
+    return watcher.watch_ids.count();
 }
 
 pub const WatchError = error{ WatchLimit, Watch, OutOfMemory };
@@ -132,9 +133,9 @@ fn add(
 ) WatchError!void {
     // Room first: a watch the kernel made but the map could not hold would
     // report events nobody can attribute.
-    try watcher.wd_to_id.ensureUnusedCapacity(gpa, 1);
-    const rc = linux.inotify_add_watch(watcher.fd, path, events);
-    switch (linux.errno(rc)) {
+    try watcher.watch_ids.ensureUnusedCapacity(gpa, 1);
+    const result = linux.inotify_add_watch(watcher.fd, path, events);
+    switch (linux.errno(result)) {
         .SUCCESS => {},
         .NOSPC => {
             if (watcher.unwatched == 0) {
@@ -149,7 +150,7 @@ fn add(
         // Gone since it was listed, or not ours to read: nothing to watch.
         else => return error.Watch,
     }
-    watcher.wd_to_id.putAssumeCapacity(@intCast(rc), id);
+    watcher.watch_ids.putAssumeCapacity(@intCast(result), id);
 }
 
 /// Stops watching every directory whose entry `alive` rejects. A directory
@@ -158,21 +159,25 @@ fn add(
 pub fn prune(
     watcher: *Watcher,
     gpa: std.mem.Allocator,
-    ctx: anytype,
-    comptime alive: fn (@TypeOf(ctx), u32) bool,
+    context: anytype,
+    comptime alive: fn (@TypeOf(context), u32) bool,
 ) void {
     var dead: std.ArrayList(i32) = .empty;
     defer dead.deinit(gpa);
-    var watches = watcher.wd_to_id.iterator();
+    var watches = watcher.watch_ids.iterator();
     while (watches.next()) |entry| {
-        if (alive(ctx, entry.value_ptr.*)) continue;
+        if (alive(context, entry.value_ptr.*)) continue;
         // Out of memory: what is not pruned now is at the next rescan.
         dead.append(gpa, entry.key_ptr.*) catch break;
     }
-    for (dead.items) |wd| {
-        // Its IN_IGNORED comes later and finds nothing to forget.
-        _ = linux.inotify_rm_watch(watcher.fd, wd);
-        _ = watcher.wd_to_id.remove(wd);
+    for (dead.items) |descriptor| {
+        // Its IN_IGNORED comes later and finds nothing to forget. EINVAL:
+        // the kernel dropped the watch already (its folder was deleted).
+        const removed = linux.errno(linux.inotify_rm_watch(watcher.fd, descriptor));
+        if (removed != .SUCCESS and removed != .INVAL) {
+            log.warn("removing a watch: {t}", .{removed});
+        }
+        _ = watcher.watch_ids.remove(descriptor);
     }
 }
 
@@ -185,21 +190,24 @@ pub fn drain(
     out: *std.ArrayList(Change),
 ) DrainError!void {
     while (true) {
-        const rc = linux.read(watcher.fd, &watcher.buf, watcher.buf.len);
-        switch (linux.errno(rc)) {
+        const events_buffer = &watcher.events_buffer;
+        const bytes_read = linux.read(watcher.fd, events_buffer, events_buffer.len);
+        switch (linux.errno(bytes_read)) {
             .SUCCESS => {},
             .AGAIN => return,
             .INTR => continue,
             else => return error.Read,
         }
-        if (rc == 0) return;
-        assert(rc <= watcher.buf.len);
-        try watcher.parse(arena, rc, out);
+        if (bytes_read == 0) return;
+        assert(bytes_read <= watcher.events_buffer.len);
+        try watcher.parse(arena, bytes_read, out);
         // read() returns whole events only, so a full queue rarely fills the
-        // buffer to the byte: `rc < buf.len` stopped after one read, and an
-        // overflow at the end of the queue was seen thousands of (wasted)
-        // changes later. Stop once there clearly was room for more.
-        if (rc + @sizeOf(linux.inotify_event) + linux.NAME_MAX + 1 < watcher.buf.len) return;
+        // buffer to the byte: `bytes_read < events_buffer.len` stopped after
+        // one read, and an overflow at the end of the queue was seen
+        // thousands of (wasted) changes later. Stop once there clearly was
+        // room for more.
+        const event_bytes_max = @sizeOf(linux.inotify_event) + linux.NAME_MAX + 1;
+        if (bytes_read + event_bytes_max < watcher.events_buffer.len) return;
     }
 }
 
@@ -212,7 +220,7 @@ fn parse(
     const event_head_size = @sizeOf(linux.inotify_event);
     var offset: usize = 0;
     while (offset + event_head_size <= bytes_read) {
-        const event: *align(1) const linux.inotify_event = @ptrCast(&watcher.buf[offset]);
+        const event: *align(1) const linux.inotify_event = @ptrCast(&watcher.events_buffer[offset]);
         const name_start = offset + event_head_size;
         if (name_start + event.len > bytes_read) break;
         defer offset = name_start + event.len;
@@ -224,17 +232,17 @@ fn parse(
         // The kernel dropped the watch (directory deleted): forget it, or
         // `count` kept growing with every directory ever removed.
         if (event.mask & linux.IN.IGNORED != 0) {
-            _ = watcher.wd_to_id.remove(event.wd);
+            _ = watcher.watch_ids.remove(event.wd);
             continue;
         }
-        const id = watcher.wd_to_id.get(event.wd) orelse continue;
+        const id = watcher.watch_ids.get(event.wd) orelse continue;
         if (event.mask & (linux.IN.DELETE_SELF | linux.IN.MOVE_SELF) != 0) {
             try out.append(arena, .{ .dir_gone = id });
             continue;
         }
         if (event.len == 0) continue;
         // The name is NUL-padded up to `len`.
-        const name_padded = watcher.buf[name_start .. name_start + event.len];
+        const name_padded = watcher.events_buffer[name_start .. name_start + event.len];
         const name = std.mem.sliceTo(name_padded, 0);
         if (name.len == 0) continue;
         const owned = try arena.dupe(u8, name);
@@ -254,119 +262,132 @@ fn parse(
 
 const testing = std.testing;
 
-const tmpAbs = sys.tmpDirAbs;
+const temporaryPath = sys.tmpDirAbs;
+
+/// A syscall's result, which must be a success.
+fn expectSuccess(result: usize) !void {
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(result));
+}
 
 test "watcher: events become changes attributed to the watched entry" {
     const gpa = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dbuf: paths.Buffer = undefined;
-    const dir = try tmpAbs(&tmp, &dbuf);
-    const w = try create(gpa);
-    defer w.destroy(gpa);
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory_buffer: paths.Buffer = undefined;
+    const directory = try temporaryPath(&temporary, &directory_buffer);
+    const watcher = try create(gpa);
+    defer watcher.destroy(gpa);
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var b1: paths.Buffer = undefined;
-    var b2: paths.Buffer = undefined;
-    try w.watch(gpa, try std.mem.printSentinel(&b1, "{s}", .{dir}, 0), 7);
-    try sys.writeFile(try std.mem.printSentinel(&b1, "{s}/f", .{dir}, 0), "x");
-    const d = try std.mem.printSentinel(&b2, "{s}/d", .{dir}, 0);
-    _ = linux.mkdir(d, 0o755);
+    var path_buffer: paths.Buffer = undefined;
+    var other_path_buffer: paths.Buffer = undefined;
+    try watcher.watch(gpa, try std.mem.printSentinel(&path_buffer, "{s}", .{directory}, 0), 7);
+    try sys.writeFile(try std.mem.printSentinel(&path_buffer, "{s}/f", .{directory}, 0), "x");
+    const sub = try std.mem.printSentinel(&other_path_buffer, "{s}/d", .{directory}, 0);
+    try expectSuccess(linux.mkdir(sub, 0o755));
     try sys.rename(
-        try std.mem.printSentinel(&b1, "{s}/f", .{dir}, 0),
-        try std.mem.printSentinel(&b2, "{s}/g", .{dir}, 0),
+        try std.mem.printSentinel(&path_buffer, "{s}/f", .{directory}, 0),
+        try std.mem.printSentinel(&other_path_buffer, "{s}/g", .{directory}, 0),
     );
-    _ = linux.unlink(try std.mem.printSentinel(&b1, "{s}/g", .{dir}, 0));
+    const renamed = try std.mem.printSentinel(&path_buffer, "{s}/g", .{directory}, 0);
+    try expectSuccess(linux.unlink(renamed));
 
     var changes: std.ArrayList(Change) = .empty;
-    try w.drain(arena, &changes);
+    try watcher.drain(arena, &changes);
     try testing.expectEqual(5, changes.items.len);
-    const c = changes.items;
-    try testing.expect(c[0] == .created and c[0].created.parent == 7 and !c[0].created.is_dir);
-    try testing.expectEqualStrings("f", c[0].created.name);
-    try testing.expect(c[1] == .created and c[1].created.is_dir);
-    try testing.expectEqualStrings("d", c[1].created.name);
-    try testing.expect(c[2] == .removed and c[2].removed.parent == 7);
-    try testing.expectEqualStrings("f", c[2].removed.name);
-    try testing.expect(c[3] == .created);
-    try testing.expectEqualStrings("g", c[3].created.name);
-    try testing.expect(c[4] == .removed);
-    try testing.expectEqualStrings("g", c[4].removed.name);
+    const seen = changes.items;
+    try testing.expect(seen[0] == .created);
+    try testing.expectEqual(7, seen[0].created.parent);
+    try testing.expect(!seen[0].created.is_dir);
+    try testing.expectEqualStrings("f", seen[0].created.name);
+    try testing.expect(seen[1] == .created);
+    try testing.expect(seen[1].created.is_dir);
+    try testing.expectEqualStrings("d", seen[1].created.name);
+    try testing.expect(seen[2] == .removed);
+    try testing.expectEqual(7, seen[2].removed.parent);
+    try testing.expectEqualStrings("f", seen[2].removed.name);
+    try testing.expect(seen[3] == .created);
+    try testing.expectEqualStrings("g", seen[3].created.name);
+    try testing.expect(seen[4] == .removed);
+    try testing.expectEqualStrings("g", seen[4].removed.name);
 
     // The directory itself going away, and its watch with it.
-    try w.watch(gpa, try std.mem.printSentinel(&b2, "{s}/d", .{dir}, 0), 8);
-    try testing.expectEqual(2, w.count());
-    _ = linux.rmdir(try std.mem.printSentinel(&b2, "{s}/d", .{dir}, 0));
+    const sub_path = try std.mem.printSentinel(&other_path_buffer, "{s}/d", .{directory}, 0);
+    try watcher.watch(gpa, sub_path, 8);
+    try testing.expectEqual(2, watcher.count());
+    const sub_again = try std.mem.printSentinel(&other_path_buffer, "{s}/d", .{directory}, 0);
+    try expectSuccess(linux.rmdir(sub_again));
     changes.clearRetainingCapacity();
-    try w.drain(arena, &changes);
+    try watcher.drain(arena, &changes);
     var gone = false;
-    for (changes.items) |ch| gone = gone or (ch == .dir_gone and ch.dir_gone == 8);
+    for (changes.items) |change| gone = gone or (change == .dir_gone and change.dir_gone == 8);
     try testing.expect(gone);
-    try testing.expectEqual(1, w.count());
+    try testing.expectEqual(1, watcher.count());
 
     // Watching an inode again re-points it: one watch, the new id.
-    try w.watch(gpa, try std.mem.printSentinel(&b1, "{s}", .{dir}, 0), 9);
-    try testing.expectEqual(1, w.count());
-    try sys.writeFile(try std.mem.printSentinel(&b1, "{s}/h", .{dir}, 0), "x");
+    try watcher.watch(gpa, try std.mem.printSentinel(&path_buffer, "{s}", .{directory}, 0), 9);
+    try testing.expectEqual(1, watcher.count());
+    try sys.writeFile(try std.mem.printSentinel(&path_buffer, "{s}/h", .{directory}, 0), "x");
     changes.clearRetainingCapacity();
-    try w.drain(arena, &changes);
-    try testing.expect(changes.items.len == 1 and changes.items[0].created.parent == 9);
+    try watcher.drain(arena, &changes);
+    try testing.expectEqual(1, changes.items.len);
+    try testing.expectEqual(9, changes.items[0].created.parent);
 }
 
 test "watcher: links are never followed below a root, and prune drops watches" {
     const gpa = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dbuf: paths.Buffer = undefined;
-    const dir = try tmpAbs(&tmp, &dbuf);
-    var b1: paths.Buffer = undefined;
-    var b2: paths.Buffer = undefined;
-    const real = try std.mem.printSentinel(&b1, "{s}/real", .{dir}, 0);
-    _ = linux.mkdir(real, 0o755);
-    const link = try std.mem.printSentinel(&b2, "{s}/link", .{dir}, 0);
-    _ = linux.symlink("real", link);
-    const w = try create(gpa);
-    defer w.destroy(gpa);
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory_buffer: paths.Buffer = undefined;
+    const directory = try temporaryPath(&temporary, &directory_buffer);
+    var path_buffer: paths.Buffer = undefined;
+    var other_path_buffer: paths.Buffer = undefined;
+    const real = try std.mem.printSentinel(&path_buffer, "{s}/real", .{directory}, 0);
+    try expectSuccess(linux.mkdir(real, 0o755));
+    const link = try std.mem.printSentinel(&other_path_buffer, "{s}/link", .{directory}, 0);
+    try expectSuccess(linux.symlink("real", link));
+    const watcher = try create(gpa);
+    defer watcher.destroy(gpa);
 
     // Through the link: refused, and `real` keeps the id it was given.
-    try w.watch(gpa, real, 1);
-    try testing.expectError(error.Watch, w.watch(gpa, link, 2));
-    try testing.expectEqual(1, w.count());
-    var it = w.wd_to_id.valueIterator();
-    try testing.expectEqual(1, it.next().?.*);
+    try watcher.watch(gpa, real, 1);
+    try testing.expectError(error.Watch, watcher.watch(gpa, link, 2));
+    try testing.expectEqual(1, watcher.count());
+    var ids = watcher.watch_ids.valueIterator();
+    try testing.expectEqual(1, ids.next().?.*);
     // A root may be a link: followed.
-    try w.watchRoot(gpa, link, 3);
-    try testing.expectEqual(1, w.count());
-    it = w.wd_to_id.valueIterator();
-    try testing.expectEqual(3, it.next().?.*);
+    try watcher.watchRoot(gpa, link, 3);
+    try testing.expectEqual(1, watcher.count());
+    ids = watcher.watch_ids.valueIterator();
+    try testing.expectEqual(3, ids.next().?.*);
 
     // Pruned: gone from the map and from the kernel (no more events).
-    w.prune(gpa, @as(u32, 3), struct {
+    watcher.prune(gpa, @as(u32, 3), struct {
         fn alive(dead_id: u32, id: u32) bool {
             return id != dead_id;
         }
     }.alive);
-    try testing.expectEqual(0, w.count());
-    try sys.writeFile(try std.mem.printSentinel(&b1, "{s}/real/f", .{dir}, 0), "x");
+    try testing.expectEqual(0, watcher.count());
+    try sys.writeFile(try std.mem.printSentinel(&path_buffer, "{s}/real/f", .{directory}, 0), "x");
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     var changes: std.ArrayList(Change) = .empty;
-    try w.drain(arena_state.allocator(), &changes);
+    try watcher.drain(arena_state.allocator(), &changes);
     try testing.expectEqual(0, changes.items.len);
 }
 
 test "watcher: best effort skips what cannot be watched and reports only running out of memory" {
     const gpa = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dir_buffer: paths.Buffer = undefined;
-    const dir = try tmpAbs(&tmp, &dir_buffer);
-    var dir_z_buffer: paths.Buffer = undefined;
-    const dir_z = try std.mem.printSentinel(&dir_z_buffer, "{s}", .{dir}, 0);
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory_buffer: paths.Buffer = undefined;
+    const directory = try temporaryPath(&temporary, &directory_buffer);
+    var directory_z_buffer: paths.Buffer = undefined;
+    const directory_z = try std.mem.printSentinel(&directory_z_buffer, "{s}", .{directory}, 0);
     var gone_buffer: paths.Buffer = undefined;
-    const gone = try std.mem.printSentinel(&gone_buffer, "{s}/gone", .{dir}, 0);
+    const gone = try std.mem.printSentinel(&gone_buffer, "{s}/gone", .{directory}, 0);
     const watcher = try create(gpa);
     defer watcher.destroy(gpa);
 
@@ -375,7 +396,7 @@ test "watcher: best effort skips what cannot be watched and reports only running
     var failing: std.testing.FailingAllocator = .init(gpa, .{ .fail_index = 0 });
     try testing.expectError(
         error.OutOfMemory,
-        watcher.watchBestEffort(failing.allocator(), dir_z, 2, .root),
+        watcher.watchBestEffort(failing.allocator(), directory_z, 2, .root),
     );
     try testing.expectEqual(0, watcher.count());
 
@@ -383,43 +404,51 @@ test "watcher: best effort skips what cannot be watched and reports only running
     try watcher.watchBestEffort(gpa, gone, 1, .below_root);
     try testing.expectEqual(0, watcher.count());
 
-    try watcher.watchBestEffort(gpa, dir_z, 3, .root);
+    try watcher.watchBestEffort(gpa, directory_z, 3, .root);
     try testing.expectEqual(1, watcher.count());
 }
 
 test "watcher: a flooded queue reports the overflow in one drain" {
     const gpa = testing.allocator;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dbuf: paths.Buffer = undefined;
-    const dir = try tmpAbs(&tmp, &dbuf);
-    var qbuf: [32]u8 = undefined;
-    const queued_max = std.fmt.parseInt(
-        usize,
-        std.mem.trim(u8, sys.readHead("/proc/sys/fs/inotify/max_queued_events", &qbuf), " \n"),
-        10,
-    ) catch 16384;
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory_buffer: paths.Buffer = undefined;
+    const directory = try temporaryPath(&temporary, &directory_buffer);
+    var queued_text: [32]u8 = undefined;
+    const queued_read = sys.readHead("/proc/sys/fs/inotify/max_queued_events", &queued_text);
+    const queued_trimmed = std.mem.trim(u8, queued_read, " \n");
+    const queued_max = std.fmt.parseInt(usize, queued_trimmed, 10) catch 16384;
     if (queued_max > 200_000) return error.SkipZigTest;
 
-    const w = try create(gpa);
-    defer w.destroy(gpa);
-    var a: paths.Buffer = undefined;
-    var b: paths.Buffer = undefined;
-    try w.watch(gpa, try std.mem.printSentinel(&a, "{s}", .{dir}, 0), 0);
+    const watcher = try create(gpa);
+    defer watcher.destroy(gpa);
+    var path_a_buffer: paths.Buffer = undefined;
+    var path_b_buffer: paths.Buffer = undefined;
+    try watcher.watch(gpa, try std.mem.printSentinel(&path_a_buffer, "{s}", .{directory}, 0), 0);
     // 48-byte events: 64 KiB is not a whole number of them, so read() never
     // fills the buffer to the byte.
-    const pa = try std.mem.printSentinel(&a, "{s}/rename_target_a_xx", .{dir}, 0);
-    const pb = try std.mem.printSentinel(&b, "{s}/rename_target_b_xx", .{dir}, 0);
-    try sys.writeFile(pa, "x");
+    const path_a = try std.mem.printSentinel(
+        &path_a_buffer,
+        "{s}/rename_target_a_xx",
+        .{directory},
+        0,
+    );
+    const path_b = try std.mem.printSentinel(
+        &path_b_buffer,
+        "{s}/rename_target_b_xx",
+        .{directory},
+        0,
+    );
+    try sys.writeFile(path_a, "x");
     // Two events per rename, never coalesced (different cookies).
     for (0..queued_max / 2 + 100) |i| {
-        if (i % 2 == 0) try sys.rename(pa, pb) else try sys.rename(pb, pa);
+        if (i % 2 == 0) try sys.rename(path_a, path_b) else try sys.rename(path_b, path_a);
     }
 
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     var changes: std.ArrayList(Change) = .empty;
-    try w.drain(arena_state.allocator(), &changes);
+    try watcher.drain(arena_state.allocator(), &changes);
     try testing.expect(changes.items.len >= queued_max - 1);
     try testing.expect(changes.items[changes.items.len - 1] == .overflow);
 }

@@ -1,7 +1,8 @@
 //! Parallel-for over a fixed set of worker threads: Zig's stand-in for the
-//! rayon calls of the Rust index. `run(n, ctx, f)` calls `f(ctx, i)` for every
-//! `i < n`, spread over the workers and the calling thread, and returns when
-//! all are done. Workers sleep on a futex between runs.
+//! rayon calls of the Rust index. `run(count, context, callback)` calls
+//! `callback(context, i)` for every `i < count`, spread over the workers and
+//! the calling thread, and returns when all are done. Workers sleep on a
+//! futex between runs.
 //!
 //! Two pools exist in the service on purpose: searches get every core, the
 //! background rescan only half. Measured in the Rust version, a rescan on all
@@ -26,13 +27,13 @@ next: std.atomic.Value(u32) = .init(0),
 done: std.atomic.Value(u32) = .init(0),
 /// Workers that have finished the current generation. A run returns only
 /// once every worker has, so none is still inside `work` (reading `total`,
-/// `ctx`, `func`) when the next run rewrites them.
+/// `context`, `callback`) when the next run rewrites them.
 acked: std.atomic.Value(u32) = .init(0),
 total: u32 = 0,
-ctx: *anyopaque = undefined,
-func: *const fn (*anyopaque, usize) void = undefined,
+context: *anyopaque = undefined,
+callback: *const fn (*anyopaque, usize) void = undefined,
 stopping: std.atomic.Value(bool) = .init(false),
-/// One run at a time.
+/// Held by the run in progress: one run at a time.
 run_lock: Io.Mutex = .init,
 
 pub const CreateError = std.mem.Allocator.Error || std.Thread.SpawnError;
@@ -67,8 +68,8 @@ comptime {
 /// /proc and top.
 pub fn nameThreads(pool: *Pool, prefix: []const u8) void {
     for (pool.threads, 0..) |thread, worker_index| {
-        var buf: [thread_name_bytes_max + 1]u8 = undefined;
-        const name = std.mem.print(&buf, "{s}-{d}", .{
+        var name_text: [thread_name_bytes_max + 1]u8 = undefined;
+        const name = std.mem.print(&name_text, "{s}-{d}", .{
             prefix[0..@min(prefix.len, thread_name_prefix_bytes_max)],
             worker_index,
         }) catch continue;
@@ -107,47 +108,49 @@ fn stop(pool: *Pool, started: []std.Thread) void {
     for (started) |thread| thread.join();
 }
 
-/// `run` over `count` items in blocks of `block_size`: `f(ctx, lo, hi)` for
-/// each.
+/// `run` over `count` items in blocks of `block_size`: `callback(context,
+/// start, end)` for each.
 pub fn runBlocks(
     pool: *Pool,
     count: usize,
     comptime block_size: usize,
-    ctx: anytype,
-    comptime f: fn (@TypeOf(ctx), usize, usize) void,
+    context: anytype,
+    comptime callback: fn (@TypeOf(context), usize, usize) void,
 ) void {
     comptime assert(block_size > 0);
     const Blocks = struct {
-        ctx: @TypeOf(ctx),
+        context: @TypeOf(context),
         count: usize,
 
         fn one(blocks: *const @This(), block_index: usize) void {
-            const lo = block_index * block_size;
-            assert(lo < blocks.count);
-            f(blocks.ctx, lo, @min(lo + block_size, blocks.count));
+            const start = block_index * block_size;
+            assert(start < blocks.count);
+            const end = @min(start + block_size, blocks.count);
+            callback(blocks.context, start, end);
         }
     };
-    const blocks: Blocks = .{ .ctx = ctx, .count = count };
-    pool.run(std.math.divCeil(usize, count, block_size) catch unreachable, &blocks, Blocks.one);
+    const blocks: Blocks = .{ .context = context, .count = count };
+    const blocks_count = std.math.divCeil(usize, count, block_size) catch unreachable;
+    pool.run(blocks_count, &blocks, Blocks.one);
 }
 
-/// Calls `f(ctx, i)` for every `i < count` and returns when all calls are
-/// done. Callers on other threads wait their turn.
+/// Calls `callback(context, i)` for every `i < count` and returns when all
+/// calls are done. Callers on other threads wait their turn.
 pub fn run(
     pool: *Pool,
     count: usize,
-    ctx: anytype,
-    comptime f: fn (@TypeOf(ctx), usize) void,
+    context: anytype,
+    comptime callback: fn (@TypeOf(context), usize) void,
 ) void {
     if (count == 0) return;
-    const Ctx = @TypeOf(ctx);
-    const Wrap = struct {
-        fn call(ctx_erased: *anyopaque, i: usize) void {
-            f(@as(Ctx, @ptrCast(@alignCast(ctx_erased))), i);
+    const Context = @TypeOf(context);
+    const Erased = struct {
+        fn call(context_erased: *anyopaque, i: usize) void {
+            callback(@as(Context, @ptrCast(@alignCast(context_erased))), i);
         }
     };
     if (pool.threads.len == 0 or count == 1) {
-        for (0..count) |i| f(ctx, i);
+        for (0..count) |i| callback(context, i);
         return;
     }
     // `total`, `next` and `done` are u32.
@@ -155,8 +158,8 @@ pub fn run(
     pool.run_lock.lockUncancelable(pool.io);
     defer pool.run_lock.unlock(pool.io);
 
-    pool.ctx = @ptrCast(@constCast(ctx));
-    pool.func = Wrap.call;
+    pool.context = @ptrCast(@constCast(context));
+    pool.callback = Erased.call;
     pool.total = @intCast(count);
     pool.done.store(0, .seq_cst);
     pool.next.store(0, .seq_cst);
@@ -189,7 +192,7 @@ fn work(pool: *Pool) void {
     while (true) {
         const item = pool.next.fetchAdd(1, .seq_cst);
         if (item >= pool.total) return;
-        pool.func(pool.ctx, item);
+        pool.callback(pool.context, item);
         if (pool.done.fetchAdd(1, .seq_cst) + 1 == pool.total) {
             pool.io.futexWake(u32, &pool.done.raw, 1);
         }
@@ -215,15 +218,15 @@ test "every index runs exactly once" {
     const pool = try Pool.create(std.testing.allocator, std.testing.io, 3);
     defer pool.destroy();
     var hits: [1000]std.atomic.Value(u32) = undefined;
-    for (&hits) |*h| h.* = .init(0);
+    for (&hits) |*hit| hit.* = .init(0);
     for (0..20) |_| {
         pool.run(hits.len, &hits, struct {
-            fn f(h: *[1000]std.atomic.Value(u32), i: usize) void {
-                _ = h[i].fetchAdd(1, .monotonic);
+            fn count(counts: *[1000]std.atomic.Value(u32), i: usize) void {
+                _ = counts[i].fetchAdd(1, .monotonic);
             }
-        }.f);
+        }.count);
     }
-    for (hits) |h| try std.testing.expectEqual(@as(u32, 20), h.load(.monotonic));
+    for (hits) |hit| try std.testing.expectEqual(@as(u32, 20), hit.load(.monotonic));
 }
 
 test "runs from two threads back to back never overlap" {
@@ -236,20 +239,20 @@ test "runs from two threads back to back never overlap" {
     const rounds = 3000;
     const Job = struct {
         hits: []std.atomic.Value(u32),
-        fn f(j: *@This(), i: usize) void {
-            _ = j.hits[i].fetchAdd(1, .monotonic);
+        fn count(job: *@This(), i: usize) void {
+            _ = job.hits[i].fetchAdd(1, .monotonic);
         }
-        fn loop(p: *Pool, j: *@This()) void {
-            for (0..rounds) |_| p.run(j.hits.len, j, f);
+        fn loop(pool_shared: *Pool, job: *@This()) void {
+            for (0..rounds) |_| pool_shared.run(job.hits.len, job, count);
         }
     };
     var small: [3]std.atomic.Value(u32) = @splat(.init(0));
     var big: [256]std.atomic.Value(u32) = @splat(.init(0));
-    var a: Job = .{ .hits = &small };
-    var b: Job = .{ .hits = &big };
-    const t = try std.Thread.spawn(.{}, Job.loop, .{ pool, &a });
-    Job.loop(pool, &b);
-    t.join();
-    for (small) |x| try std.testing.expectEqual(@as(u32, rounds), x.load(.monotonic));
-    for (big) |x| try std.testing.expectEqual(@as(u32, rounds), x.load(.monotonic));
+    var small_job: Job = .{ .hits = &small };
+    var big_job: Job = .{ .hits = &big };
+    const thread = try std.Thread.spawn(.{}, Job.loop, .{ pool, &small_job });
+    Job.loop(pool, &big_job);
+    thread.join();
+    for (small) |hit| try std.testing.expectEqual(@as(u32, rounds), hit.load(.monotonic));
+    for (big) |hit| try std.testing.expectEqual(@as(u32, rounds), hit.load(.monotonic));
 }
