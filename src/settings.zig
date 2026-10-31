@@ -45,8 +45,10 @@ pub const keep_choices = [_]u32{ 100, 500, 1000, 5000 };
 
 /// What a hand-edited file may set beyond the choices Settings offers.
 const opacity_percent_min = 50;
+const opacity_percent_default = 97;
 const opacity_percent_max = 100;
 const clipboard_keep_min = 10;
+const clipboard_keep_default = 1000;
 const clipboard_keep_max = 100_000;
 /// A value written back into the file: a word, not a paragraph.
 const token_bytes_max = 200;
@@ -62,6 +64,9 @@ comptime {
         assert(choice >= clipboard_keep_min);
         assert(choice <= clipboard_keep_max);
     }
+    // The defaults are among the choices Settings offers.
+    assert(std.mem.findScalar(u8, &opacity_choices, opacity_percent_default) != null);
+    assert(std.mem.findScalar(u32, &keep_choices, clipboard_keep_default) != null);
 }
 
 /// Terminal emulators and editors offered when installed: each is its
@@ -97,7 +102,7 @@ pub const Settings = struct {
     theme: []const u8 = default_theme,
     text_size: TextSize = .default,
     /// Window background opacity, percent.
-    opacity: u8 = 97,
+    opacity: u8 = opacity_percent_default,
     position: Position = .upper_third,
     width: Width = .default,
     height: Height = .default,
@@ -105,7 +110,7 @@ pub const Settings = struct {
     files_in_root: bool = true,
     suggestions: bool = true,
     clipboard: bool = true,
-    clipboard_keep: u32 = 1000,
+    clipboard_keep: u32 = clipboard_keep_default,
     /// Command names; empty is automatic ($TERMINAL / $EDITOR, then the
     /// first one installed).
     terminal: []const u8 = "",

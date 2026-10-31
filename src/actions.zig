@@ -494,11 +494,16 @@ fn system(context: Ctx, system_action: item_mod.System) void {
             "wpctl",
             "set-volume",
             "-l",
-            "1.5",
+            volume_limit,
             "@DEFAULT_AUDIO_SINK@",
-            "5%+",
+            volume_step ++ "+",
         }),
-        .volume_down => proc.spawn(&.{ "wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "5%-" }),
+        .volume_down => proc.spawn(&.{
+            "wpctl",
+            "set-volume",
+            "@DEFAULT_AUDIO_SINK@",
+            volume_step ++ "-",
+        }),
         .volume_mute => proc.spawn(&.{ "wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle" }),
         .mic_mute => proc.spawn(&.{ "wpctl", "set-mute", "@DEFAULT_AUDIO_SOURCE@", "toggle" }),
         .play_pause => proc.spawn(&.{ "playerctl", "play-pause" }),
@@ -556,11 +561,21 @@ pub fn copy(text: []const u8) void {
 }
 
 /// Copies, then sends Ctrl+V to whatever gets focus once the window hides:
-/// as soon as Hyprland says the focus moved (~2 ms), else after 120 ms.
+/// as soon as Hyprland says the focus moved (~2 ms), else after
+/// `paste_focus_wait_ms`.
 pub fn pasteText(text: []const u8) void {
     copy(text);
-    hypr.afterFocusChange(&pasteNow, 120);
+    hypr.afterFocusChange(&pasteNow, paste_focus_wait_ms);
 }
+
+/// How much Volume Up and Down change the volume, and how loud Volume Up
+/// may go (1.5 is 150 %, as wpctl's -l takes it).
+const volume_step = "5%";
+const volume_limit = "1.5";
+const paste_focus_wait_ms = 120;
+/// hyprctl's answer for one window is a few KB; a larger one is parsed as
+/// unknown, which pastes with Ctrl+V.
+const active_window_answer_bytes_max = 64 * 1024;
 
 fn pasteNow() void {
     _ = sendPaste(null);
@@ -570,9 +585,7 @@ fn pasteNow() void {
 /// window decides the chord (terminals paste with Ctrl+Shift+V; Ctrl+V there
 /// is a literal ^V or a terminal's own binding).
 fn sendPaste(_: ?*anyopaque) callconv(.c) c.gboolean {
-    // hyprctl's answer for one window is a few KB; larger and it is parsed
-    // as unknown, which pastes with Ctrl+V.
-    var buffer: [64 * 1024]u8 = undefined;
+    var buffer: [active_window_answer_bytes_max]u8 = undefined;
     var fixed: std.heap.FixedBufferAllocator = .init(&buffer);
     const class = if (hypr.activeWindow(fixed.allocator())) |window| window.class else "";
     switch (pasteChord(class)) {

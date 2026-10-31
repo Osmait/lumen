@@ -130,10 +130,8 @@ fn opensSafely(path: [*:0]const u8) bool {
     return switch (stx.mode & linux.S.IFMT) {
         linux.S.IFREG, linux.S.IFDIR => true,
         // The memory devices: null, zero, full, random and urandom.
-        linux.S.IFCHR => stx.rdev_major == 1 and switch (stx.rdev_minor) {
-            3, 5, 7, 8, 9 => true,
-            else => false,
-        },
+        linux.S.IFCHR => stx.rdev_major == memory_device_major and
+            std.enums.fromInt(MemoryDevice, stx.rdev_minor) != null,
         else => false,
     };
 }
@@ -468,6 +466,11 @@ pub fn pushString(L: *State, text: []const u8) void {
 /// A `raise` (longjmp) skips the defers, `restore` included. That is safe
 /// inside `protect`: it sets the stack back to its own entry height, which
 /// is below every mark taken in the handler.
+/// Linux's memory devices (major 1) that Lua's file functions may open,
+/// by minor number (Documentation/admin-guide/devices.txt).
+const memory_device_major = 1;
+const MemoryDevice = enum(u32) { null = 3, zero = 5, full = 7, random = 8, urandom = 9 };
+
 pub const StackMark = struct {
     top: c_int,
 

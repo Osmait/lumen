@@ -453,9 +453,11 @@ pub fn parseIcon(
         lua.c.LUA_TSTRING => {
             const text = lua.toSlice(L, icon).?;
             // "~/icons/x.svg": a file in the home folder.
-            const in_home = std.mem.startsWith(u8, text, "~/");
+            const home_prefix = "~/";
+            const in_home = std.mem.startsWith(u8, text, home_prefix);
+            const home = std.mem.span(c.g_get_home_dir());
             const copy = if (in_home)
-                arena.printSentinel("{s}/{s}", .{ std.mem.span(c.g_get_home_dir()), text[2..] }, 0)
+                arena.printSentinel("{s}/{s}", .{ home, text[home_prefix.len..] }, 0)
             else
                 arena.dupeSentinel(u8, text, 0);
             const name = copy catch lua.oom(L);

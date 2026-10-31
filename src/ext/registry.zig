@@ -8,6 +8,9 @@ const item_mod = @import("../item.zig");
 const themes = @import("../ui/themes.zig");
 const layout_mod = @import("../layout.zig");
 
+/// Cells to a line in a grid command that does not say.
+pub const grid_columns_default = 5;
+
 /// The extension id init.lua runs as.
 pub const config_extension_id = "config";
 /// The extension id the chosen style's file runs as.
@@ -57,7 +60,7 @@ pub const Command = struct {
     submit_title: [:0]const u8 = "Submit",
     /// Rows as a grid of cells (`grid = true`), this many to a line.
     grid: bool = false,
-    columns: u8 = 5,
+    columns: u8 = grid_columns_default,
 };
 
 pub const Keymap = struct {

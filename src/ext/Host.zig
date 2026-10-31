@@ -75,6 +75,8 @@ const grid_columns_max = 10;
 comptime {
     assert(root_search_items_max <= items_max);
     assert(grid_columns_min <= grid_columns_max);
+    assert(registry_mod.grid_columns_default >= grid_columns_min);
+    assert(registry_mod.grid_columns_default <= grid_columns_max);
     assert(grid_columns_max <= std.math.maxInt(@FieldType(Command, "columns")));
 }
 
@@ -679,7 +681,9 @@ fn loadAll(host: *Host, load: *Load) void {
     if (style.len > 0) host.loadStyle(load, style);
 
     if (worker_arena.printSentinel("{s}/init.lua", .{host.config_dir}, 0)) |path| {
-        if (os.info(path) != null) host.loadSource(load, config_extension_id, host.config_dir, path, null);
+        if (os.info(path) != null) {
+            host.loadSource(load, config_extension_id, host.config_dir, path, null);
+        }
     } else |_| {
         problem(load, config_extension_id, "out of memory");
     }
@@ -1227,7 +1231,7 @@ fn parseCommand(
     const columns = lua.fieldNumberIn(L, command_table, "columns", where, .{
         .min = grid_columns_min,
         .max = grid_columns_max,
-    }) orelse 5;
+    }) orelse registry_mod.grid_columns_default;
 
     const command: Command = .{
         .id = id,
