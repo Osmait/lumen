@@ -373,6 +373,75 @@ const testing = std.testing;
 const content_testing = @import("content_testing.zig");
 const smallIndex = content_testing.smallIndex;
 const exerciseIndex = content_testing.exerciseIndex;
+const TestDocs = content_testing.TestDocs;
+const paths = @import("paths.zig");
+const Pool = @import("Pool.zig");
+const build = @import("content_build.zig").build;
+const TextReader = @import("content_build.zig").TextReader;
+const findCI = @import("content_find.zig").findCI;
+
+test "candidates equal a brute-force scan, across segments, after save/open" {
+    const gpa = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(9);
+    const random = prng.random();
+    const vocab = [_][]const u8{
+        "arena", "allocator", "Config", "trigram", "posting", "lumen", "zig", "parser", "token", "Hyprland", "window",
+        "élan",
+    };
+    var texts: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (texts.items) |text| gpa.free(text);
+        texts.deinit(gpa);
+    }
+    var docs: std.ArrayList(DocIn) = .empty;
+    defer {
+        for (docs.items) |doc| gpa.free(doc.path);
+        docs.deinit(gpa);
+    }
+    for (0..3000) |i| {
+        var text: std.ArrayList(u8) = .empty;
+        for (0..random.intRangeAtMost(usize, 1, 30)) |_| {
+            try text.appendSlice(gpa, vocab[random.uintLessThan(usize, vocab.len)]);
+            try text.append(gpa, if (random.boolean()) ' ' else '\n');
+        }
+        try texts.append(gpa, try text.toOwnedSlice(gpa));
+        try docs.append(gpa, .{ .path = try gpa.print("{d}", .{i}), .mtime = 0, .size = 0 });
+    }
+    const pool = try Pool.create(gpa, testing.io, 3);
+    defer pool.destroy();
+    var test_docs: TestDocs = .{ .texts = texts.items };
+    const reader: TextReader = .{ .read = TestDocs.readText, .context = &test_docs };
+    var index = try build(gpa, pool, docs.items, reader, null);
+    defer index.deinit(gpa);
+
+    var test_dir = try sys.TestDir.init();
+    defer test_dir.deinit();
+    var index_path_buffer: paths.Buffer = undefined;
+    const index_path = try test_dir.path(&index_path_buffer, "content.idx");
+    try index.save(index_path);
+    var mapped = try ContentIndex.open(index_path);
+    defer mapped.deinit(gpa);
+    try testing.expectEqualStrings("2999", mapped.path(2999));
+
+    const queries = [_][]const []const u8{
+        &.{"arena"},        &.{"ALLOC"}, &.{ "trigram", "lumen" }, &.{"hyprland window"},
+        &.{"élan"},
+        &.{"nothing here"},
+    };
+    var got: std.ArrayList(u32) = .empty;
+    defer got.deinit(gpa);
+    for (queries) |words| {
+        try mapped.candidates(gpa, words, &got);
+        // Every true match must be a candidate (no false negatives).
+        for (texts.items, 0..) |text, i| {
+            var all = true;
+            for (words) |word| {
+                if (findCI(text, word, 0) == null) all = false;
+            }
+            if (all) try testing.expect(std.mem.findScalar(u32, got.items, @intCast(i)) != null);
+        }
+    }
+}
 
 test "corrupt content indexes are rejected, not trusted" {
     const gpa = testing.allocator;
