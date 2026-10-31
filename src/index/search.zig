@@ -674,19 +674,12 @@ fn byRecency(
     std.mem.sort(Pair, hits[0..stat_count], {}, lessThan);
 }
 
-/// Whether `path` is folder `folder` or below it ("/a/bc" is not below "/a/b").
-pub fn isUnder(path: []const u8, folder: []const u8) bool {
-    if (!std.mem.startsWith(u8, path, folder)) return false;
-    if (path.len == folder.len) return true;
-    return path[folder.len] == paths.separator or std.mem.endsWith(u8, folder, paths.separator_str);
-}
-
 /// Coarse on purpose: today vs this month vs old.
 fn recencyBonus(context: *const RecencyContext, id: u32, path_buffer: *paths.Buffer) i32 {
     const now = context.now;
     const path = context.store.path(id, path_buffer[0 .. path_buffer.len - 1]) orelse return 0;
     if (path.len == 0) return 0;
-    for (context.no_stat) |folder| if (isUnder(path, folder)) return 0;
+    for (context.no_stat) |folder| if (paths.isUnder(path, folder)) return 0;
     path_buffer[path.len] = 0;
     const mtime = sys.mtime(path_buffer[0..path.len :0]) orelse return 0;
     // Saturating: an mtime is whatever the file system says.
@@ -997,9 +990,4 @@ test "recency: nothing under a slow mount is stat'ed" {
     const slow = &.{directory};
     try engine.search(gpa, pool, &store, "recent_note", .{ .limit = 5, .no_stat = slow }, &got);
     try testing.expectEqual(plain, got.items[0].score);
-
-    try testing.expect(isUnder("/h/u/nfs", "/h/u/nfs"));
-    try testing.expect(isUnder("/h/u/nfs/a", "/h/u/nfs"));
-    try testing.expect(!isUnder("/h/u/nfs2/a", "/h/u/nfs"));
-    try testing.expect(isUnder("/a", "/"));
 }

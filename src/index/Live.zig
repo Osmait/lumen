@@ -481,7 +481,7 @@ fn tombstoneDeltaUnder(live: *Live, directory: u32) usize {
     defer gone.deinit(live.gpa);
     var roots = live.delta.roots.iterator();
     while (roots.next()) |root| {
-        if (!engine.isUnder(root.key_ptr.*, dir_path)) continue;
+        if (!paths.isUnder(root.key_ptr.*, dir_path)) continue;
         if (live.delta.kids.get(root.value_ptr.*)) |kids| {
             for (kids.items) |kid| tombstoned_count += live.tombstoneDeltaTree(kid);
         }
