@@ -109,6 +109,9 @@ const answer_timeout_ns = std.time.ns_per_s;
 const answer_bytes_max = 16 << 20;
 /// How much more room the answer gets each time it fills up.
 const answer_chunk_bytes = 16 << 10;
+/// Room for the event lines read and not yet ended by a newline. An event
+/// is one short line ("activewindow>>class,title").
+const events_buffer_bytes = 4096;
 /// The answer to dispatches is only read to its end, never kept: "ok" per
 /// dispatch.
 const ok_answer_bytes_max = 256;
@@ -346,7 +349,7 @@ const FocusWaiter = struct {
     watch_source: c_uint = 0,
     timer_source: c_uint = 0,
     /// Events read so far; a line may arrive in pieces.
-    events_buffer: [4096]u8 = undefined,
+    events_buffer: [events_buffer_bytes]u8 = undefined,
     events_len: usize = 0,
 
     fn waiting(waiter: *const FocusWaiter) bool {

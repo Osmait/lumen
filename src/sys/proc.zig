@@ -45,6 +45,8 @@ pub fn shell(cmd: [:0]const u8) void {
 
 /// How long `output` waits for a program's output: it runs on the main loop.
 const output_timeout_ms = 2000;
+/// What one read of that output takes (hyprctl's JSON is a few KB).
+const output_chunk_bytes = 16 << 10;
 
 /// What `output` allocates with.
 const alloc = std.heap.c_allocator;
@@ -86,7 +88,7 @@ fn outputWithin(argv: []const [:0]const u8, timeout_ms: u64) ?[:0]u8 {
     defer out.deinit(alloc);
     const deadline_ns = os.monotonicNs() + timeout_ms * std.time.ns_per_ms;
     while (true) {
-        var chunk: [16 * 1024]u8 = undefined;
+        var chunk: [output_chunk_bytes]u8 = undefined;
         const chunk_len = os.unix.readSome(out_fd, &chunk, deadline_ns) catch |read_err| {
             switch (read_err) {
                 error.Timeout => {

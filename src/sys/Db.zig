@@ -82,7 +82,7 @@ fn makePrivate(path: [:0]const u8) void {
         _ = linux.close(fd);
     }
     for ([_][]const u8{ "-wal", "-shm" }) |suffix| {
-        var buf: [4096]u8 = undefined;
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const side = std.mem.printSentinel(&buf, "{s}{s}", .{ path, suffix }, 0) catch continue;
         _ = linux.chmod(side, 0o600);
     }
@@ -394,7 +394,7 @@ test "the database and its -wal and -shm are owner-only" {
     const linux = std.os.linux;
     var dir: @import("os").TestDir = try .init();
     defer dir.deinit();
-    var buf: [4096]u8 = undefined;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     // Made world-readable, as earlier versions left it.
     try dir.write("lumen.db", "");
     _ = linux.chmod(try dir.path(&buf, "lumen.db"), 0o644);

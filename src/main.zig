@@ -85,6 +85,14 @@ const Start = struct { gpa: std.mem.Allocator, io: std.Io };
 extern fn mallopt(param: c_int, value: c_int) c_int;
 const M_MMAP_THRESHOLD: c_int = -3;
 const M_ARENA_MAX: c_int = -8;
+/// Blocks this large or larger come from mmap and go back on free (see
+/// `main`).
+const mmap_threshold_bytes = 256 << 10;
+/// glibc makes one arena per thread by default; fewer fragment less.
+const malloc_arenas_max = 4;
+/// `--clip-store` reads the copy through this; the copy itself may be up to
+/// Db.clip_bytes_max.
+const stdin_buffer_bytes = 16 << 10;
 
 pub fn main(init: std.process.Init) !void {
     stats.started_ns = stats.now();
@@ -93,8 +101,8 @@ pub fn main(init: std.process.Init) !void {
     // heap and is never returned (measured: 133 MB free but kept). A fixed
     // threshold keeps big buffers in mmap, released on free. Fewer arenas
     // (one per thread by default, 24 threads here) fragment less.
-    _ = mallopt(M_MMAP_THRESHOLD, 256 * 1024);
-    _ = mallopt(M_ARENA_MAX, 4);
+    _ = mallopt(M_MMAP_THRESHOLD, mmap_threshold_bytes);
+    _ = mallopt(M_ARENA_MAX, malloc_arenas_max);
     var argv: std.ArrayList(?[*:0]const u8) = .empty;
     defer argv.deinit(init.gpa);
     var args_iterator = init.minimal.args.iterate();
@@ -508,7 +516,7 @@ const content_results_max = 50;
 fn startFileIndex(ui: *Ui) void {
     const home = std.mem.span(c.g_get_home_dir());
     const cache_home = std.mem.span(c.g_get_user_cache_dir());
-    var buf: [4096]u8 = undefined;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const index_path = std.mem.print(&buf, "{s}/lumen/files.idx", .{cache_home}) catch return;
     const file_service = index.Service.start(ui.gpa, ui.io, home, index_path) catch |err| {
         log.warn("file index: {t}", .{err});
@@ -564,7 +572,7 @@ fn startClipboardWatcher() void {
     assert(!watcher.running());
     const self_exe = c.g_file_read_link("/proc/self/exe", null) orelse return;
     defer c.g_free(self_exe);
-    var client_buffer: [4096]u8 = undefined;
+    var client_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var argv = [_:null]?[*:0]const u8{
         "wl-paste",
         "--type",
@@ -678,7 +686,7 @@ fn clipStore(init: std.process.Init) !void {
     if (init.environ_map.get(ipc.env.clipboard_state)) |state| {
         if (!ipc.keepsCopy(state)) return;
     }
-    var buf: [16 * 1024]u8 = undefined;
+    var buf: [stdin_buffer_bytes]u8 = undefined;
     var stdin = std.Io.File.stdin().reader(init.io, &buf);
     // Larger copies are not kept (images, huge selections).
     const content = stdin.interface.allocRemaining(
@@ -693,7 +701,7 @@ fn clipStore(init: std.process.Init) !void {
     if (!std.unicode.utf8ValidateSlice(content)) return;
 
     // History off in Settings (a copy can race the watcher being stopped).
-    var settings_path_buffer: [4096]u8 = undefined;
+    var settings_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const settings_path = try std.mem.printSentinel(
         &settings_path_buffer,
         "{s}/lumen/settings.conf",

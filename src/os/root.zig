@@ -45,11 +45,16 @@ pub fn close(fd: i32) void {
     _ = linux.close(fd);
 }
 
+/// What getdents64 fills per call: a few hundred entries.
+const dir_entries_buffer_bytes = 32 << 10;
+/// How much more room `readUpTo` makes each time its buffer fills.
+const read_chunk_bytes = 64 << 10;
+
 /// Entries of an open directory, from the kernel's getdents64 buffer: name and
 /// d_type come for free, no stat per entry.
 pub const DirIter = struct {
     fd: i32,
-    buf: [32 * 1024]u8 align(8) = undefined,
+    buf: [dir_entries_buffer_bytes]u8 align(8) = undefined,
     pos: usize = 0,
     end: usize = 0,
 
@@ -248,6 +253,9 @@ pub fn readHead(path: [*:0]const u8, buf: []u8) []const u8 {
     return buf[0..bytes_read];
 }
 
+/// mountinfo is a line per mount: a few hundred of them take ~50 KB.
+const mountinfo_bytes_max = 4 << 20;
+
 /// Mount points at or below `under` whose file system can hang a `stat`:
 /// network file systems and FUSE (sshfs, rclone), where a server that stops
 /// answering blocks every call into the mount. From /proc/self/mountinfo;
@@ -257,7 +265,7 @@ pub fn slowMounts(gpa: std.mem.Allocator, under: []const u8) std.mem.Allocator.E
     defer close(fd);
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(gpa);
-    try readUpTo(gpa, fd, &text, 4 << 20);
+    try readUpTo(gpa, fd, &text, mountinfo_bytes_max);
     var out: std.ArrayList([]u8) = .empty;
     errdefer {
         for (out.items) |mount| gpa.free(mount);
@@ -414,7 +422,7 @@ pub fn readUpTo(
     bytes_max: usize,
 ) std.mem.Allocator.Error!void {
     while (buf.items.len < bytes_max) {
-        try buf.ensureUnusedCapacity(gpa, 64 * 1024);
+        try buf.ensureUnusedCapacity(gpa, read_chunk_bytes);
         const spare = buf.unusedCapacitySlice();
         const bytes_read = linux.read(fd, spare.ptr, spare.len);
         switch (linux.errno(bytes_read)) {
@@ -447,8 +455,8 @@ pub fn writeFileAtomic(path: []const u8, data: []const u8) Error!void {
 /// a failed commit) leaves `path` as it was.
 pub const AtomicFile = struct {
     fd: i32,
-    tmp: [4096]u8 = undefined,
-    final: [4096]u8 = undefined,
+    tmp: [std.Io.Dir.max_path_bytes]u8 = undefined,
+    final: [std.Io.Dir.max_path_bytes]u8 = undefined,
     tmp_len: usize = 0,
     final_len: usize = 0,
 
@@ -555,7 +563,7 @@ pub const AppendFile = struct {
 
 /// Creates missing directories, owner-only (existing ones are untouched).
 pub fn mkdirP(path: []const u8) void {
-    var buf: [4096]u8 = undefined;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     if (path.len >= buf.len) return;
     // Each prefix that ends a component, the whole path last. A mkdir that
     // fails (it exists, or a parent could not be made) is left for the
@@ -573,7 +581,7 @@ pub fn mkdirP(path: []const u8) void {
 /// Makes an existing directory of Lumen's owner-only: caches made by
 /// earlier versions were 0755, with world-readable files inside.
 pub fn makePrivate(path: []const u8) void {
-    var buf: [4096]u8 = undefined;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path_z = std.mem.printSentinel(&buf, "{s}", .{path}, 0) catch return;
     _ = linux.chmod(path_z, 0o700);
 }
@@ -628,14 +636,14 @@ pub const TestDir = struct {
 
     /// Writes `name` (creating parent dirs) with `data`.
     pub fn write(test_dir: *const TestDir, name: []const u8, data: []const u8) !void {
-        var buf: [4096]u8 = undefined;
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const file_path = try test_dir.path(&buf, name);
         if (std.mem.findScalarLast(u8, file_path, '/')) |slash| mkdirP(file_path[0..slash]);
         try writeFile(file_path, data);
     }
 
     pub fn mkdir(test_dir: *const TestDir, name: []const u8) !void {
-        var buf: [4096]u8 = undefined;
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         mkdirP(try test_dir.path(&buf, name));
     }
 };
@@ -717,9 +725,9 @@ test "subdirs: folders and links to them, sorted, filtered" {
 test "special files are refused without blocking" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
+    var dbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir = try tmpDirPath(&tmp, &dbuf);
-    var pbuf: [4096]u8 = undefined;
+    var pbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const fifo = try std.mem.printSentinel(&pbuf, "{s}/pipe", .{dir}, 0);
     _ = linux.mknodat(linux.AT.FDCWD, fifo, linux.S.IFIFO | 0o600, 0);
     var buf: [64]u8 = undefined;
@@ -734,14 +742,14 @@ test "special files are refused without blocking" {
 test "atomic writes replace the file and leave no temporary behind" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
+    var dbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir = try tmpDirPath(&tmp, &dbuf);
-    var pbuf: [4096]u8 = undefined;
+    var pbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const p = try std.mem.print(&pbuf, "{s}/f.conf", .{dir});
     try writeFileAtomic(p, "old");
     try writeFileAtomic(p, "new");
     var rbuf: [16]u8 = undefined;
-    var zbuf: [4096]u8 = undefined;
+    var zbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     try std.testing.expectEqualStrings("new", readHead(
         try std.mem.printSentinel(&zbuf, "{s}", .{p}, 0),
         &rbuf,
@@ -755,16 +763,16 @@ test "atomic writes replace the file and leave no temporary behind" {
 test "atomic writes never write through a temporary left in the way" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
+    var dbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir = try tmpDirPath(&tmp, &dbuf);
-    var pbuf: [4096]u8 = undefined;
+    var pbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const p = try std.mem.print(&pbuf, "{s}/f.idx", .{dir});
-    var tbuf: [4096]u8 = undefined;
+    var tbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const t = try std.mem.printSentinel(&tbuf, "{s}.tmp", .{p}, 0);
-    var vbuf: [4096]u8 = undefined;
+    var vbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const victim = try std.mem.printSentinel(&vbuf, "{s}/victim", .{dir}, 0);
     var rbuf: [16]u8 = undefined;
-    var zbuf: [4096]u8 = undefined;
+    var zbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const pz = try std.mem.printSentinel(&zbuf, "{s}", .{p}, 0);
 
     // A link to someone else's file: replaced, the file untouched.
@@ -785,12 +793,12 @@ test "atomic writes never write through a temporary left in the way" {
 test "openDirNoFollow refuses a link to a folder, openDir follows it" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
+    var dbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir = try tmpDirPath(&tmp, &dbuf);
-    var abuf: [4096]u8 = undefined;
+    var abuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const real = try std.mem.printSentinel(&abuf, "{s}/real", .{dir}, 0);
     mkdirP(real);
-    var lbuf: [4096]u8 = undefined;
+    var lbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const link = try std.mem.printSentinel(&lbuf, "{s}/link", .{dir}, 0);
     _ = linux.symlink("real", link);
     close(try openDirNoFollow(real));
@@ -804,12 +812,12 @@ test "openDirNoFollow refuses a link to a folder, openDir follows it" {
 test "Lumen's files and directories are owner-only" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
+    var dbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir = try tmpDirPath(&tmp, &dbuf);
-    var pbuf: [4096]u8 = undefined;
+    var pbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const sub = try std.mem.print(&pbuf, "{s}/cache/lumen", .{dir});
     mkdirP(sub);
-    var fbuf: [4096]u8 = undefined;
+    var fbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const f = try std.mem.printSentinel(&fbuf, "{s}/x.idx", .{sub}, 0);
     try writeFile(f, "data");
     const mode = struct {
@@ -819,7 +827,7 @@ test "Lumen's files and directories are owner-only" {
             return stx.mode & 0o777;
         }
     }.of;
-    var zbuf: [4096]u8 = undefined;
+    var zbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     try std.testing.expectEqual(@as(u32, 0o700), mode(
         try std.mem.printSentinel(&zbuf, "{s}", .{sub}, 0),
     ));

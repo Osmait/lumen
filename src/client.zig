@@ -187,8 +187,8 @@ fn failedAnswer(message: []const u8) ipc.Answer {
 /// lumen-gtk beside this file, else on PATH.
 fn runFull(argv: []const [*:0]const u8, envp: [*:null]const ?[*:0]const u8) noreturn {
     const argv_z: [*:null]const ?[*:0]const u8 = @ptrCast(argv.ptr);
-    var self_path_buffer: [4096]u8 = undefined;
-    var candidate_buffer: [4096]u8 = undefined;
+    var self_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var candidate_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     // An execve that returns failed: the next place is tried.
     const self_path_len = linux.readlink("/proc/self/exe", &self_path_buffer, self_path_buffer.len);
     if (failed(self_path_len) == null and self_path_len < self_path_buffer.len) {
@@ -212,8 +212,11 @@ fn runFull(argv: []const [*:0]const u8, envp: [*:null]const ?[*:0]const u8) nore
         }
     }
     _ = writeAll(2, "lumen: cannot find lumen-gtk (it is installed beside lumen)\n");
-    linux.exit_group(127);
+    linux.exit_group(exit_command_not_found);
 }
+
+/// The shell's status for a program it cannot find.
+const exit_command_not_found = 127;
 
 test "what goes over the socket" {
     const ok = [_][*:0]const u8{ "--view", "clipboard", "--query", "" };

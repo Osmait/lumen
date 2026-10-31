@@ -24,13 +24,16 @@ pub const Monitor = struct {
     /// (checked where the numbers come in: Hyprland's reply).
     pub const pixels_max = 1 << 16;
     pub const position_max = 1 << 20;
+    /// Hyprland's own range for a monitor's scale.
+    pub const scale_min = 0.1;
+    pub const scale_max = 16;
 
     /// Whether the numbers are within what a real monitor reports. Checked
     /// where they come in (`hypr.findMonitor`) and asserted where they are
     /// used (`usable`).
     pub fn plausible(monitor: Monitor) bool {
         // Written so that a NaN scale fails too.
-        if (!(monitor.scale >= 0.1 and monitor.scale <= 16)) return false;
+        if (!(monitor.scale >= scale_min and monitor.scale <= scale_max)) return false;
         if (!inRange(monitor.width, 1, pixels_max)) return false;
         if (!inRange(monitor.height, 1, pixels_max)) return false;
         if (@abs(monitor.x) > position_max) return false;

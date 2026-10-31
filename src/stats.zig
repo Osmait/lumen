@@ -45,7 +45,7 @@ pub const Ring = struct {
         return .{
             .n = ring.total,
             .p50 = msFromNs(sorted[ring.len / 2]),
-            .p95 = msFromNs(sorted[@min(last, ring.len * 95 / 100)]),
+            .p95 = msFromNs(sorted[@min(last, ring.len * 95 / percent)]),
             .max = msFromNs(sorted[last]),
         };
     }
@@ -114,8 +114,12 @@ const MallInfo2 = extern struct {
 };
 extern fn mallinfo2() MallInfo2;
 
+const percent = 100;
+const bytes_per_mib = 1 << 20;
+const kib_per_mib = 1 << 10;
+
 fn mbFromBytes(bytes: usize) f64 {
-    return @as(f64, @floatFromInt(bytes)) / (1024 * 1024);
+    return @as(f64, @floatFromInt(bytes)) / bytes_per_mib;
 }
 
 /// `VmRSS:  1234 kB` style fields of /proc/self/status, in MB.
@@ -123,7 +127,7 @@ fn procField(status: []const u8, key: []const u8) f64 {
     const at = std.mem.find(u8, status, key) orelse return 0;
     var tokens = std.mem.tokenizeAny(u8, status[at + key.len ..], " \t:");
     const kb = std.fmt.parseInt(u64, tokens.next() orelse "0", 10) catch 0;
-    return @as(f64, @floatFromInt(kb)) / 1024;
+    return @as(f64, @floatFromInt(kb)) / kib_per_mib;
 }
 
 /// The text of a field of /proc/self/status (`Threads:   24`), or "?".
@@ -149,8 +153,8 @@ pub fn report(
     try writer.print("Lumen {s}  pid {d}  up {d}h{d:0>2}m  started in {d:.0} ms\n\n", .{
         version,
         std.os.linux.getpid(),
-        up_s / 3600,
-        up_s / 60 % 60,
+        up_s / std.time.s_per_hour,
+        (up_s % std.time.s_per_hour) / std.time.s_per_min,
         msFromNs(startup_ns),
     });
     try reportMemory(writer);
@@ -160,8 +164,12 @@ pub fn report(
     return out.toOwnedSliceSentinel(0);
 }
 
+/// /proc/self/status is ~1.5 KB; VmRSS and the lines `report` reads come
+/// early in it.
+const proc_status_bytes_max = 4096;
+
 fn reportMemory(writer: *std.Io.Writer) ReportError!void {
-    var status_buf: [4096]u8 = undefined;
+    var status_buf: [proc_status_bytes_max]u8 = undefined;
     const status = os.readHead("/proc/self/status", &status_buf);
     const malloc_info = mallinfo2();
     try writer.print("Memory\n", .{});

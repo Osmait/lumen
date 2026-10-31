@@ -6,6 +6,10 @@ const script_meta = @import("core").script_meta;
 const os = @import("os");
 const Item = @import("../item.zig").Item;
 
+/// How much of a script is read for its metadata: script_meta reads at most
+/// 40 lines of header comments, which fit in it.
+const script_header_bytes_max = 4096;
+
 /// ~/.config/lumen/scripts, in `arena`; null only when out of memory.
 pub fn dir(arena: std.mem.Allocator) ?[:0]const u8 {
     const config = std.mem.span(c.g_get_user_config_dir());
@@ -73,7 +77,7 @@ fn stamp(path: [:0]const u8) FolderStamp {
     const dir_handle = c.g_dir_open(path.ptr, 0, null) orelse return .missing;
     defer c.g_dir_close(dir_handle);
     var hasher: std.hash.Wyhash = .init(0);
-    var path_buffer: [4096]u8 = undefined;
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     while (c.g_dir_read_name(dir_handle)) |name_c| {
         const name = std.mem.span(name_c);
         hasher.update(name);
@@ -121,9 +125,8 @@ fn itemOf(
     name: []const u8,
 ) std.mem.Allocator.Error!?Item {
     const file_path = try arena.printSentinel("{s}/{s}", .{ path, name }, 0);
-    // Only the first 4 KB is read: script metadata lives in the header
-    // comments.
-    var head_buf: [4096]u8 = undefined;
+    // Only the header is read: script metadata lives in its comments.
+    var head_buf: [script_header_bytes_max]u8 = undefined;
     const head = os.readHead(file_path.ptr, &head_buf);
     const meta = script_meta.parse(head) orelse return null;
     const subtitle = if (meta.package_name.len > 0) meta.package_name else "Script Command";
@@ -152,7 +155,7 @@ fn looksLikeEmoji(icon: []const u8) bool {
 test "a missing folder and an empty one stamp differently, and edits show" {
     var test_dir = try os.TestDir.init();
     defer test_dir.deinit();
-    var path_buffer: [4096]u8 = undefined;
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
 
     const missing = try test_dir.path(&path_buffer, "scripts");
     try std.testing.expectEqual(FolderStamp.missing, stamp(missing));
