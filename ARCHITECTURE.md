@@ -35,25 +35,37 @@ src/core/         pure logic, unit tested: fuzzy matching, accent folding,
                   calculator and units, frecency, window geometry, script
                   headers, UTF-8 cuts
 src/os/           the Linux calls Lumen makes itself (std only, no libc, so
-                  the client uses it too): files, sockets with deadlines
+                  the client uses it too), one file per topic, mapped in
+                  root.zig: stat, folder, file (atomic and append files,
+                  mappings), mounts, time, wait, sockets with deadlines
                   (unix.zig), programs run to a deadline (child.zig)
-src/index/        file index (std + os): store, scan, search, live updates,
-                  service; content index: content, content_list, extract,
-                  ContentService
+src/index/        file index (std + os): store, scan, search (cheap and
+                  fine scores in cheap.zig, fine.zig), Live and its Delta,
+                  Watcher, Service; content index: content.zig (the map),
+                  content_format, content_write, content_build,
+                  ContentIndex, content_search, content_find, content_list,
+                  extract, TextCache, ContentService
 src/sys/          SQLite store (Db.zig), process spawning (GLib), hyprctl,
                   the daemon's end of the socket (ipc_server.zig)
 src/providers/    apps (GIO), built-in commands, script commands
 src/luart/        Lua 5.4 as a library: lua.zig (the C API and its rules),
                   json.zig (both ways)
-src/ext/          Lua extensions: Host.zig (the worker thread and the
-                  registry), api.zig (the `lumen` module)
-src/ui/           the window: Ui.zig (state and flow), widgets, labels,
-                  settings_view, file_results, detail_pane, backdrop, keyboard,
+src/ext/          Lua extensions: Host.zig (requests, the worker thread,
+                  delivery), requests.zig (list, root, act, submit on the
+                  worker), loading.zig and spec.zig (reload, reading
+                  lumen.extension), Extension.zig (one file's Lua state),
+                  Load.zig, registry, rows, api.zig (the `lumen` module)
+src/ui/           the window: Ui.zig (state and flow), window_layout
+                  (widgets, lumen.layout, sizes, placement), row_list (rows,
+                  selection, scrolling), search (each view's candidates),
+                  config (settings, init.lua, CSS, icons), ActionPanel, dump
+                  (for tests), widgets, labels, settings_view, choose_view,
+                  file_results, detail_pane, backdrop, keyboard,
                   ext_view (extensions in the window), prefs_view (their
                   preferences, the input view), form_view, dmenu (lumen
                   --dmenu), installer (extensions from git), pictures (image
-                  files: sizes read from headers, decoded one at a time on
-                  a worker), themes, the stylesheet
+                  files decoded one at a time on a worker; image_size reads
+                  their sizes from headers), themes, the stylesheet
 src/actions.zig   what each action does to the system
 src/settings.zig  the settings file
 src/c.zig         hand-written GTK/GLib/gtk4-layer-shell bindings
@@ -147,8 +159,8 @@ stdin with GIO's async reads, so lines show as they arrive; git runs as a
   one too. Links are never followed below the root (`O_NOFOLLOW`,
   `IN_DONT_FOLLOW`); the root itself may be one.
 - **Cascaded search**: incremental refinement → 64-bit character mask →
-  greedy cheap score with a per-chunk top-K → optimal alignment (fzf-style,
-  in `fine.zig`) on the finalists → recency (`statx`) on the head of the list
+  greedy cheap score (`cheap.zig`) with a per-chunk top-K → optimal
+  alignment (fzf-style, in `fine.zig`) on the finalists → recency (`statx`) on the head of the list
   only.
 - **Live**: inotify watches armed in batches, deletes are a zeroed mask,
   additions go to a small delta, rescans build unlocked on half the cores and
