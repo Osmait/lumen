@@ -759,7 +759,8 @@ test "fuzz: evaluate never crashes and only returns finite values" {
 
 fn fuzzFormat(_: void, smith: *std.testing.Smith) anyerror!void {
     const value: f64 = switch (smith.valueRangeAtMost(u8, 0, 3)) {
-        0 => smith.value(f64), // any bit pattern: nan, inf, subnormals, -0
+        // Any bit pattern: nan, inf, subnormals and -0 among them.
+        0 => smith.value(f64),
         1 => @floatFromInt(smith.value(i64)),
         2 => @as(f64, @floatFromInt(smith.value(i32))) / 10000.0,
         else => blk: {
