@@ -81,6 +81,8 @@ pub fn start(allocator: std.mem.Allocator, app_id: []const u8, handler: Handler)
     };
 }
 
+/// `start` in `runtime_dir` (the tests pass a folder of their own): the
+/// socket's folder made and checked, then the socket.
 fn listenIn(
     allocator: std.mem.Allocator,
     runtime_dir: []const u8,
@@ -100,6 +102,15 @@ fn listenIn(
     const socket_path = ipc.socketPath(&server.path_buffer, runtime_dir, app_id) orelse {
         return error.PathTooLong;
     };
+    server.listen_fd = try listenAt(socket_path);
+    server.path = socket_path;
+    server.handler = handler;
+    server.gpa = allocator;
+    watchSocket();
+}
+
+/// A non-blocking socket listening at `socket_path`, owner-only.
+fn listenAt(socket_path: [:0]const u8) ListenError!linux.fd_t {
     const socket_result = linux.socket(
         linux.AF.UNIX,
         linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
@@ -130,11 +141,7 @@ fn listenIn(
     if (failed(linux.chmod(socket_path.ptr, 0o600))) |errno| {
         log.warn("could not make {s} owner-only: {t}", .{ socket_path, errno });
     }
-    server.path = socket_path;
-    server.listen_fd = fd;
-    server.handler = handler;
-    server.gpa = allocator;
-    watchSocket();
+    return fd;
 }
 
 /// Closes the socket and removes its file; the connections still open end
