@@ -8,7 +8,8 @@ window.lumen {
 }
 
 /* The margin is room for the shadows: cut at the surface's edge they show
-   as a grey rectangle. Keep it in step with shell_margin in Ui.zig. */
+   as a grey rectangle. Ui.zig computes with it (style_css.shell_margin_px);
+   a test there fails when the two differ. */
 .shell {
   margin: 48px;
   color: var(--fg);

@@ -107,7 +107,7 @@ pub fn fileItems(self: *Ui, arena: std.mem.Allocator, query: []const u8, limit: 
         const slash = std.mem.findScalarLast(u8, hit.path, '/') orelse 0;
         const where = labels.homeRelative(arena, hit.path[0..slash]);
         out.append(arena, .{
-            .key = arena.print("file:{s}", .{hit.path}) catch "",
+            .key = arena.print(file_key_prefix ++ "{s}", .{hit.path}) catch "",
             .title = labels.displayText(arena, hit.path[slash + 1 ..]),
             .subtitle = where,
             .icon = fileIcon(self, path, hit.is_dir),
@@ -118,20 +118,29 @@ pub fn fileItems(self: *Ui, arena: std.mem.Allocator, query: []const u8, limit: 
     return out.items;
 }
 
+/// A file's item key is this and its path; lumen.icons names file types
+/// with it too: this and "folder", or this and an extension. An extension
+/// is looked up only when it is this short, dot included (a dot late in a
+/// long name does not start an extension).
+const file_key_prefix = "file:";
+const extension_bytes_max = 16;
+
 /// Icon for a file's type, guessed from its name (no I/O): the extension
 /// badge for code and text, the theme's icon for the rest.
 pub fn fileIcon(ui: *Ui, path: [:0]const u8, is_dir: bool) item_mod.Icon {
     if (is_dir) {
-        if (ui.keyIcon("file:folder")) |icon| return icon;
+        if (ui.keyIcon(file_key_prefix ++ "folder")) |icon| return icon;
     } else {
         const slash = std.mem.findScalarLast(u8, path, '/');
         const name = if (slash) |slash_index| path[slash_index + 1 ..] else path;
         // lumen.icons { ["file:pdf"] = ... }, by extension.
-        if (std.mem.findScalarLast(u8, name, '.')) |dot| if (name.len - dot <= 16) {
-            var buf: [24]u8 = undefined;
-            const key = std.mem.print(&buf, "file:{s}", .{name[dot + 1 ..]}) catch "";
+        const dot = std.mem.findScalarLast(u8, name, '.');
+        if (dot != null and name.len - dot.? <= extension_bytes_max) {
+            var buf: [file_key_prefix.len + extension_bytes_max]u8 = undefined;
+            const extension = name[dot.? + 1 ..];
+            const key = std.mem.print(&buf, file_key_prefix ++ "{s}", .{extension}) catch "";
             if (ui.keyIcon(std.ascii.lowerString(buf[0..key.len], key))) |icon| return icon;
-        };
+        }
         if (core.file_badge.logoOf(name)) |logo| return .{ .logo = logo };
         var upper: [4]u8 = undefined;
         if (core.file_badge.of(name, &upper)) |badge| {

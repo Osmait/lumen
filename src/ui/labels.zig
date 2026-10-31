@@ -191,7 +191,7 @@ pub fn formatWhen(arena: std.mem.Allocator, unix: i64) [:0]const u8 {
     const today = startOfToday();
     const fmt: [*:0]const u8 = if (unix >= today)
         "Today at %H:%M"
-    else if (unix >= today - 86400)
+    else if (unix >= today - std.time.s_per_day)
         "Yesterday at %H:%M"
     else
         "%b %e at %H:%M";
@@ -200,6 +200,9 @@ pub fn formatWhen(arena: std.mem.Allocator, unix: i64) [:0]const u8 {
     return arena.dupeSentinel(u8, std.mem.span(s), 0) catch "";
 }
 
+/// A clipboard row's title is its first line, cut to this.
+const clipboard_title_bytes_max = 120;
+
 /// First non-blank line, collapsed and capped, for a clipboard row title
 /// (made safe like a file name: copied text can hold anything).
 pub fn firstLine(arena: std.mem.Allocator, text: []const u8) [:0]const u8 {
@@ -207,7 +210,8 @@ pub fn firstLine(arena: std.mem.Allocator, text: []const u8) [:0]const u8 {
     while (lines.next()) |l| {
         const t = std.mem.trim(u8, l, " \t\r");
         if (t.len == 0) continue;
-        return displayText(arena, core.utf8.validPrefix(t[0..@min(t.len, 120)]));
+        const title = t[0..@min(t.len, clipboard_title_bytes_max)];
+        return displayText(arena, core.utf8.validPrefix(title));
     }
     return "";
 }

@@ -52,8 +52,7 @@ pub const onContentResult = file_results.onContentResult;
 
 const log = std.log.scoped(.ui);
 
-/// The window's pieces: lumen.layout's pixels, else the Width and Height
-/// settings.
+/// The pieces' width in px: lumen.layout's, else the Width setting's.
 fn panelW(self: *const Ui) c_int {
     if (self.layout.width) |width_px| return width_px;
     return switch (self.settings.width) {
@@ -62,6 +61,8 @@ fn panelW(self: *const Ui) c_int {
         .wide => 920,
     };
 }
+
+/// The pieces' height in px: lumen.layout's, else the Height setting's.
 fn panelH(self: *const Ui) c_int {
     if (self.layout.height) |height_px| return height_px;
     return switch (self.settings.height) {
@@ -70,17 +71,55 @@ fn panelH(self: *const Ui) c_int {
         .tall => 640,
     };
 }
-/// The list's height limit: what is left beside the search bar (56), the
-/// results' padding and border (14), the footer (40) and the gaps between
-/// pieces (10, none in a single panel).
+
+/// The list's height limit: what is left beside the search bar, the
+/// results' padding and border, the footer and the gaps between pieces
+/// (none in a single panel).
 fn listMaxH(self: *const Ui) c_int {
-    const gap: c_int = if (self.layout.panels == .split) 10 else 0;
-    const footer: c_int = if (self.layout.footer) footer_h + gap else 0;
-    return self.panelH() - 56 - 14 - gap - footer;
+    const gap_px: c_int = if (self.layout.panels == .split) pieces_gap_px else 0;
+    const footer_px: c_int = if (self.layout.footer) footer_height_px + gap_px else 0;
+    const results_frame_px = 2 * (style_css.results_padding_px + style_css.results_border_px);
+    return self.panelH() - style_css.search_height_px - results_frame_px - gap_px - footer_px;
 }
-const footer_h = 40;
-/// Clear space around the pieces for their shadows (`.shell` in style.css).
-const shell_margin = 48;
+
+/// Sizes style.css sets that the window's arithmetic depends on. The test
+/// "style.css has the sizes Ui computes with" reads the stylesheet and
+/// fails when one side changes without the other.
+const style_css = struct {
+    /// `.search { min-height }`.
+    const search_height_px = 56;
+    /// `.results-island { padding; border }`, on each side.
+    const results_padding_px = 6;
+    const results_border_px = 1;
+    /// `.shell { margin }`: clear space around the pieces for their shadows.
+    const shell_margin_px = 48;
+    /// `.grid > flowboxchild { padding }`, on the left and on the right.
+    const grid_cell_padding_px = 6;
+    /// The undershoot fade at the list's edges (`background-size`).
+    const results_fade_px = 20;
+};
+
+/// Between the pieces of a split layout: the column's spacing.
+const pieces_gap_px = 10;
+/// The footer bar's height (lumen.layout's footer).
+const footer_height_px = 40;
+/// Between the grid's cells, across and down.
+const grid_spacing_px = 6;
+/// What the grid loses to the island's and its own padding, both sides.
+const grid_frame_px = 24;
+/// Room kept above the selection when scrolling up, so the section title
+/// over the first item of a section stays in view.
+const scroll_section_title_px = 30;
+/// How close to the top edge a row may be before the list scrolls up.
+const scroll_top_slack_px = 4;
+/// Frames to wait for a new row's place before giving up scrolling to it.
+const scroll_frames_max = 10;
+/// Rows built per idle callback after the first frame (see `eager_rows`).
+const pending_rows_per_idle = 16;
+/// The app monitor fires in bursts (an install touches many .desktop files):
+/// the list is read once this long after the last one.
+const apps_reload_delay_ms = 500;
+
 /// Rows a search shows at most, per view. More would only cost building
 /// them: nobody scrolls past the first screens of a ranked list.
 const root_results_max = 60;
@@ -91,6 +130,32 @@ const filtered_results_max = 200;
 /// Files in the root search, after this many of the best other results.
 const root_files_max = 5;
 const root_results_before_files_max = 6;
+/// The most used items shown with nothing typed.
+const suggestions_max = 6;
+/// Files join the root search from this many bytes typed: shorter queries
+/// match half the disk.
+const root_files_query_bytes_min = 3;
+/// A content query needs a whole trigram: the content index looks up
+/// three-character pieces.
+const content_query_bytes_min = 3;
+/// How much of a clipboard entry's text the filter scores. Each keystroke
+/// scores every entry on the main thread.
+const filtered_detail_bytes_max = 2000;
+/// Frecency is a small float (core.frecency); scores are integers. Scaled
+/// by this, suggestions keep three decimals of their order.
+const frecency_score_scale = 1000;
+/// Bytes of an extension query kept with its request (`Inflight.asked`).
+const ext_query_bytes_max = 256;
+/// An extension's id, with room to spare: Host refuses ids over 40 bytes.
+const extension_id_bytes_max = 64;
+/// A message kept for the row after a reload (a failed install's reason).
+const after_reload_message_bytes_max = 160;
+/// The choose view's title ("Open Markdown With", a setting's name).
+const choose_title_bytes_max = 96;
+/// Where Center and Upper Third put the pieces: the room above them, in
+/// tenths of the room the monitor leaves above and below.
+const position_center_tenths = 5;
+const position_upper_third_tenths = 3;
 
 gpa: std.mem.Allocator,
 io: std.Io,
@@ -196,13 +261,13 @@ ext_cmd: u16 = 0,
 /// Lists asked of `ext_cmd` and their answers. The visible items point
 /// into the latest one, so it is destroyed only after the rows are built
 /// again.
-ext_list: Inflight(ExtHost.ListResult, 256) = .{},
+ext_list: Inflight(ExtHost.ListResult, ext_query_bytes_max) = .{},
 /// Extension rows asked for the root search, and their answers.
-ext_root_search: Inflight(ExtHost.RootResult, 256) = .{},
+ext_root_search: Inflight(ExtHost.RootResult, ext_query_bytes_max) = .{},
 /// The Lua action running (0: none); its answer decides what happens.
 ext_act_gen: u32 = 0,
 /// The extension whose preferences the prefs view lists.
-prefs_ext: core.FixedStr(64) = .{},
+prefs_ext: core.FixedStr(extension_id_bytes_max) = .{},
 /// What the input view edits: a preference (index in the registry) or a
 /// field of the open form.
 input: Edited = .{ .pref = 0 },
@@ -215,7 +280,7 @@ row_look: widgets.RowLook = .{},
 icon_arena: ?std.heap.ArenaAllocator = null,
 /// A message to show on the selected row after the next extension reload.
 /// The reload rebuilds every row, so a message set before it would be lost.
-after_reload: core.FixedStr(160) = .{},
+after_reload: core.FixedStr(after_reload_message_bytes_max) = .{},
 /// True while `after_reload` waits for the next reload. The text itself is
 /// never cleared, only replaced, because the row may still point at it.
 after_reload_pending: bool = false,
@@ -223,7 +288,7 @@ after_reload_pending: bool = false,
 picker: ?*dmenu.Session = null,
 /// What the choose view lists values for.
 choosing: Choosing = .none,
-choose_title: [96:0]u8 = @splat(0),
+choose_title: [choose_title_bytes_max:0]u8 = @splat(0),
 /// Views to go back to (Escape, Backspace, the back arrow).
 navigation: Navigation = .{},
 /// Row to select once the view is built (by its item key).
@@ -434,6 +499,13 @@ comptime {
     assert(root_results_before_files_max <= root_results_max);
     assert(root_files_max <= file_results_max);
     assert(Navigation.capacity > 0);
+    assert(suggestions_max <= root_results_max);
+    // Rows built after the first frame come in smaller batches than the
+    // first frame's, or an idle callback would take a frame of its own.
+    assert(pending_rows_per_idle <= eager_rows + 2);
+    assert(position_upper_third_tenths < position_center_tenths);
+    assert(position_center_tenths <= 10);
+    assert(content_query_bytes_min <= ContentSearch.query_bytes_max);
 }
 
 /// What the view and query arenas keep for next time when reset. They kept
@@ -526,8 +598,8 @@ fn buildWindow(self: *Ui) *c.GtkOverlay {
     // natural size (a large image preview, a long path).
     c.gtk_window_set_default_size(
         win,
-        self.panelW() + 2 * shell_margin,
-        self.panelH() + 2 * shell_margin,
+        self.panelW() + 2 * style_css.shell_margin_px,
+        self.panelH() + 2 * style_css.shell_margin_px,
     );
 
     const window = win;
@@ -618,8 +690,8 @@ fn buildResults(self: *Ui, column: *c.GtkBox) void {
     c.gtk_flow_box_set_selection_mode(self.grid, c.GTK_SELECTION_SINGLE);
     c.gtk_flow_box_set_homogeneous(self.grid, 1);
     c.gtk_flow_box_set_activate_on_single_click(self.grid, 1);
-    c.gtk_flow_box_set_row_spacing(self.grid, 6);
-    c.gtk_flow_box_set_column_spacing(self.grid, 6);
+    c.gtk_flow_box_set_row_spacing(self.grid, grid_spacing_px);
+    c.gtk_flow_box_set_column_spacing(self.grid, grid_spacing_px);
     gtk.setFocusable(self.grid, false);
     gtk.setValign(self.grid, c.GTK_ALIGN_START);
     gtk.setVisible(self.grid, false);
@@ -640,7 +712,7 @@ fn buildResults(self: *Ui, column: *c.GtkBox) void {
 fn buildFooter(self: *Ui, column: *c.GtkBox) void {
     self.footer.box = widgets.hbox(8);
     gtk.addClass(self.footer.box, "footer");
-    gtk.setSizeRequest(self.footer.box, -1, footer_h);
+    gtk.setSizeRequest(self.footer.box, -1, footer_height_px);
     self.footer.title = widgets.label("Lumen", "footer-title");
     gtk.setHexpand(self.footer.title, true);
     c.gtk_label_set_xalign(self.footer.title, 0);
@@ -748,7 +820,7 @@ pub fn applyStructure(self: *Ui) void {
         layout.show.search_icon and layout.searchbar.has(.icon),
     ));
     const column_box: *c.GtkBox = self.column;
-    c.gtk_box_set_spacing(column_box, if (layout.panels == .single) 0 else 10);
+    c.gtk_box_set_spacing(column_box, if (layout.panels == .single) 0 else pieces_gap_px);
     gtk.setClass(self.column, "single", layout.panels == .single);
     gtk.setClass(self.column, "search-bottom", layout.search == .bottom);
     gtk.setClass(self.column, "with-footer", layout.footer);
@@ -794,11 +866,7 @@ pub fn applyStructure(self: *Ui) void {
 /// Width, height and density from the settings. A layer surface takes its
 /// size when it is mapped: a change while it shows maps it again.
 fn applyLayout(self: *Ui) void {
-    self.row_look.icon_px = switch (self.settings.density) {
-        .compact => 26,
-        .default => 32,
-        .comfortable => 38,
-    };
+    self.row_look.icon_px = themes.densitySizes(self.settings.density).icon_px;
     if (!self.built) return;
     const width_px = self.panelW();
     const height_px = self.panelH();
@@ -810,8 +878,8 @@ fn applyLayout(self: *Ui) void {
     gtk.setSizeRequest(self.column, width_px, height_px);
     c.gtk_window_set_default_size(
         self.window,
-        width_px + 2 * shell_margin,
-        height_px + 2 * shell_margin,
+        width_px + 2 * style_css.shell_margin_px,
+        height_px + 2 * style_css.shell_margin_px,
     );
     if (gtk.isVisible(self.window)) {
         gtk.setVisible(self.window, false);
@@ -1164,22 +1232,21 @@ fn placeOnFocusedMonitor(self: *Ui) void {
         };
         const position = self.layout.position orelse chosen;
         const offset_px: c_int = self.layout.offset;
-        // The pieces sit `shell_margin` inside the surface (room for shadows).
+        // The pieces sit `style_css.shell_margin_px` inside the surface, room
+        // for their shadows, so the margin is the pieces' place minus that.
         const at_bottom = position == .bottom;
         c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_TOP, @intFromBool(!at_bottom));
         c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_BOTTOM, @intFromBool(at_bottom));
+        const room_px = geometry.height - self.panelH();
+        const room_above_tenths: c_int = switch (position) {
+            .center => position_center_tenths,
+            .upper_third => position_upper_third_tenths,
+            .top, .bottom => 0,
+        };
+        const room_above_px = @divTrunc(room_px * room_above_tenths, 10);
         const margin: c_int = switch (position) {
-            .top, .bottom => offset_px - shell_margin,
-            .upper_third, .center => @max(
-                @divTrunc(
-                    (geometry.height - self.panelH()) * @as(
-                        c_int,
-                        if (position == .center) 5 else 3,
-                    ),
-                    10,
-                ) - shell_margin,
-                0,
-            ) + offset_px,
+            .top, .bottom => offset_px - style_css.shell_margin_px,
+            .upper_third, .center => @max(room_above_px - style_css.shell_margin_px, 0) + offset_px,
         };
         c.gtk_layer_set_margin(
             window,
@@ -1503,7 +1570,7 @@ fn answerPending(self: *Ui, start_ns: u64) bool {
     // Contents: the rows on screen are the last result's.
     if (self.view != .contents) return false;
     const content_search = self.content_search orelse return false;
-    if (query_text.len < 3) return false;
+    if (query_text.len < content_query_bytes_min) return false;
     if (!self.content_query.showingLatest()) return false;
     const latest = self.content_query.latest.?;
     if (std.mem.eql(u8, latest.query, ContentSearch.clip(query_text))) return false;
@@ -1523,7 +1590,9 @@ fn fill(self: *Ui, arena: std.mem.Allocator, query_text: []const u8, start_ns: u
                 self.addItem(item);
             }
         },
-        .contents => if (query_text.len >= 3) self.fillContents(arena, query_text, start_ns),
+        .contents => if (query_text.len >= content_query_bytes_min) {
+            self.fillContents(arena, query_text, start_ns);
+        },
         .settings, .themes, .default_apps, .choose => self.fillSectioned(arena, query_text),
         // A search command is asked for the query; a list command's rows are
         // filtered here.
@@ -1652,15 +1721,15 @@ fn fillSectioned(self: *Ui, arena: std.mem.Allocator, query_text: []const u8) vo
 fn fillSuggestions(self: *Ui, arena: std.mem.Allocator) void {
     var used: std.ArrayList(Item) = .empty;
     for (self.base) |item| {
-        const v = self.frec.get(item.key) orelse continue;
+        const frecency = self.frec.get(item.key) orelse continue;
         var copy = item;
-        copy.score = std.math.lossyCast(i32, v * 1000);
+        copy.score = std.math.lossyCast(i32, frecency * frecency_score_scale);
         used.append(arena, copy) catch break;
     }
     sortByScore(used.items);
     if (used.items.len > 0 and self.settings.suggestions) {
         self.addSection("Suggestions");
-        for (used.items[0..@min(used.items.len, 6)]) |item| self.addItem(item);
+        for (used.items[0..@min(used.items.len, suggestions_max)]) |item| self.addItem(item);
     }
     self.addSection("Commands");
     for (self.base) |item| {
@@ -1705,7 +1774,8 @@ fn fillRoot(self: *Ui, arena: std.mem.Allocator, query_text: []const u8) void {
     self.search_ns += stats.now() - t_search;
     // Files from 3 letters on, right after the best few results so they are
     // visible without scrolling; the rest of the results follow.
-    const files_wanted = query_text.len >= 3 and self.settings.files_in_root;
+    const files_wanted = query_text.len >= root_files_query_bytes_min and
+        self.settings.files_in_root;
     const files = if (files_wanted) file_results.fileItems(
         self,
         arena,
@@ -1749,10 +1819,8 @@ fn fillFiltered(self: *Ui, arena: std.mem.Allocator, query_text: []const u8, by_
     const t_search = stats.now();
     var hits: std.ArrayList(Item) = .empty;
     for (self.base) |item| {
-        const text = if (item.detail.len > 0) item.detail[0..@min(
-            item.detail.len,
-            2000,
-        )] else item.title;
+        const detail_scored = item.detail[0..@min(item.detail.len, filtered_detail_bytes_max)];
+        const text = if (item.detail.len > 0) detail_scored else item.title;
         const fields = [_][]const u8{ text, item.subtitle };
         const score = core.fuzzy.scoreFields(query_text, &fields);
         if (score == core.fuzzy.no_match) continue;
@@ -1830,7 +1898,7 @@ fn buildPending(self: *Ui, count: usize) void {
 /// comes meanwhile is not kept waiting (it drops them).
 fn onPendingRows(data: ?*anyopaque) callconv(.c) c.gboolean {
     const self: *Ui = @ptrCast(@alignCast(data));
-    self.buildPending(16);
+    self.buildPending(pending_rows_per_idle);
     if (self.pending.items.len > 0) return 1;
     self.pending_idle = 0;
     return 0;
@@ -1876,8 +1944,9 @@ fn buildItemRow(self: *Ui, item_index: usize) void {
     // row's index (and `onRowActivated` would select the wrong item).
     self.rows.ensureUnusedCapacity(arena, 1) catch return;
     if (self.grid_mode) {
-        const gap = 6 * (self.grid_columns - 1) + 24;
-        const cell_width_px = @divTrunc(self.panelW() - gap, self.grid_columns) - 12;
+        const gaps_px = grid_spacing_px * (self.grid_columns - 1) + grid_frame_px;
+        const cell_px = @divTrunc(self.panelW() - gaps_px, self.grid_columns);
+        const cell_width_px = cell_px - 2 * style_css.grid_cell_padding_px;
         const cell = widgets.gridCell(&self.row_look, item, cell_width_px);
         c.gtk_flow_box_append(self.grid, cell);
         const child = c.gtk_flow_box_get_child_at_index(
@@ -2034,10 +2103,11 @@ fn scrollTo(self: *Ui, row: *c.GtkWidget) void {
     const bottom: f64 = top + bounds.size.height;
     // Keep a section header above the first item visible, and the selection
     // clear of the fade at the bottom edge (style.css, undershoot).
-    if (top < value + 4) {
-        c.gtk_adjustment_set_value(adjustment, @max(top - 30, 0));
-    } else if (bottom > value + page - 20) {
-        c.gtk_adjustment_set_value(adjustment, bottom - page + 20);
+    const fade_px = style_css.results_fade_px;
+    if (top < value + scroll_top_slack_px) {
+        c.gtk_adjustment_set_value(adjustment, @max(top - scroll_section_title_px, 0));
+    } else if (bottom > value + page - fade_px) {
+        c.gtk_adjustment_set_value(adjustment, bottom - page + fade_px);
     }
 }
 
@@ -2059,7 +2129,7 @@ fn onScrollTick(_: ?*c.GtkWidget, _: ?*c.GdkFrameClock, data: ?*anyopaque) callc
         if (self.grid_mode) gtk.widget(self.grid) else gtk.widget(self.list),
         &bounds,
     ) != 0 and bounds.size.height > 0;
-    if (!placed and self.scroll.tries < 10) return 1;
+    if (!placed and self.scroll.tries < scroll_frames_max) return 1;
     self.scroll.tick = 0;
     if (placed) self.scrollTo(row);
     return 0;
@@ -2232,7 +2302,7 @@ fn onBackClicked(
 fn onAppsChanged(_: *c.GAppInfoMonitor, data: ?*anyopaque) callconv(.c) void {
     const self: *Ui = @ptrCast(@alignCast(data));
     if (self.apps_reload_timer == 0) {
-        self.apps_reload_timer = c.g_timeout_add(500, &reloadApps, self);
+        self.apps_reload_timer = c.g_timeout_add(apps_reload_delay_ms, &reloadApps, self);
     }
 }
 
@@ -2414,7 +2484,7 @@ pub fn dump(
 fn emptyText(self: *Ui, arena: std.mem.Allocator) [:0]const u8 {
     const query_text = std.mem.trim(u8, self.query(), " ");
     if (self.view == .files and query_text.len == 0) return file_results.filesHint(self, arena);
-    if (self.view == .contents and query_text.len < 3) {
+    if (self.view == .contents and query_text.len < content_query_bytes_min) {
         return file_results.contentsHint(self, arena, query_text.len);
     }
     if (self.view == .contents and self.content_query.pending) return "Searching...";
@@ -2459,4 +2529,67 @@ test "Navigation forgets the oldest view when it is full" {
         );
     }
     try std.testing.expectEqual(views.len - Navigation.capacity, expected);
+}
+
+test "style.css has the sizes Ui computes with" {
+    const stylesheet = @embedFile("style.css");
+    const Check = struct { selector: []const u8, property: []const u8, value: []const u8 };
+    const checks = [_]Check{
+        .{
+            .selector = ".search {",
+            .property = "min-height",
+            .value = pxText(style_css.search_height_px),
+        },
+        .{
+            .selector = ".results-island {",
+            .property = "padding",
+            .value = pxText(style_css.results_padding_px),
+        },
+        .{
+            .selector = ".shell {",
+            .property = "margin",
+            .value = pxText(style_css.shell_margin_px),
+        },
+        .{
+            .selector = ".grid > flowboxchild {",
+            .property = "padding",
+            .value = "8px " ++ pxText(style_css.grid_cell_padding_px),
+        },
+        .{
+            .selector = "> undershoot.bottom {",
+            .property = "background-size",
+            .value = "100% " ++ pxText(style_css.results_fade_px),
+        },
+    };
+    for (checks) |check| {
+        const value = cssValue(stylesheet, check.selector, check.property) orelse {
+            std.debug.print("style.css: no {s} in {s}\n", .{ check.property, check.selector });
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expectEqualStrings(check.value, value);
+    }
+    const border = cssValue(stylesheet, ".results-island {", "border").?;
+    const border_width = pxText(style_css.results_border_px) ++ " ";
+    try std.testing.expect(std.mem.startsWith(u8, border, border_width));
+}
+
+inline fn pxText(comptime px: comptime_int) []const u8 {
+    return std.fmt.comptimePrint("{d}px", .{px});
+}
+
+/// The value of `property` in the first rule whose selector ends in
+/// `selector` ("... {"), for the test above.
+fn cssValue(stylesheet: []const u8, selector: []const u8, property: []const u8) ?[]const u8 {
+    const rule_start = std.mem.find(u8, stylesheet, selector) orelse return null;
+    const body_start = rule_start + selector.len;
+    const body_end = std.mem.findScalarPos(u8, stylesheet, body_start, '}') orelse return null;
+    var declarations = std.mem.splitScalar(u8, stylesheet[body_start..body_end], ';');
+    while (declarations.next()) |declaration| {
+        const colon = std.mem.findScalar(u8, declaration, ':') orelse continue;
+        const name = std.mem.trim(u8, declaration[0..colon], " \t\n");
+        if (std.mem.eql(u8, name, property)) {
+            return std.mem.trim(u8, declaration[colon + 1 ..], " \t\n");
+        }
+    }
+    return null;
 }

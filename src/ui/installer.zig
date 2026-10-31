@@ -18,15 +18,19 @@ const proc = @import("../sys/proc.zig");
 
 const Kind = enum { install, update, uninstall };
 
+/// The name an extension is installed under (its folder), with room to
+/// spare: Host refuses ids over 40 bytes.
+const extension_name_bytes_max = 64;
+
 const Job = struct {
     ui: *Ui,
     /// Null when started from Settings.
     cmdline: ?*c.GApplicationCommandLine,
     sp: *c.GSubprocess,
     kind: Kind,
-    name: core.FixedStr(64) = .{},
+    name: core.FixedStr(extension_name_bytes_max) = .{},
     /// What removeTree deletes on failure: whole, never cut (see `start`).
-    dir: core.FixedStr(4096) = .{},
+    dir: core.FixedStr(std.Io.Dir.max_path_bytes) = .{},
 
     fn nameSlice(j: *const Job) []const u8 {
         return j.name.slice();

@@ -4,6 +4,7 @@
 //! calls the command's `submit(values)` on the extension thread.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const c = @import("c");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
@@ -113,12 +114,17 @@ pub fn pick(ui: *Ui, i: u16, field_value: []const u8) void {
     ui.goBack();
 }
 
+/// Fields a form has at most. Host refuses a command with more when it
+/// loads the files (its `form_fields_max`), so `submit` never runs out.
+const form_fields_max = 20;
+
 /// The Submit row: required fields first, then the extension's submit.
 pub fn submit(ui: *Ui) void {
     const cmd = command(ui) orelse return;
     const host = ui.ext_host orelse return;
     const registry = ui.ext_registry orelse return;
-    var buf: [20]Host.FormValue = undefined;
+    var buf: [form_fields_max]Host.FormValue = undefined;
+    assert(cmd.fields.len <= buf.len);
     for (cmd.fields, 0..) |*form_field, i| {
         const field_value = value(ui, i);
         if (form_field.required and field_value.len == 0) {

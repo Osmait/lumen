@@ -5,6 +5,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const c = @import("c");
 const gtk = @import("gtk.zig");
+const core = @import("core");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
 const Host = @import("../ext/Host.zig");
@@ -333,10 +334,14 @@ fn sameFields(fields_old: []const Host.Pref, fields_new: []const Host.Pref) bool
     return true;
 }
 
-/// The first line of an error (the rest is the traceback), in `a`.
-fn firstLine(arena: std.mem.Allocator, msg: []const u8) [:0]const u8 {
-    const end = std.mem.findScalar(u8, msg, '\n') orelse msg.len;
-    return arena.dupeSentinel(u8, msg[0..@min(end, 200)], 0) catch "Failed";
+/// An error shown on a row is cut to this: the row has one line for it.
+const error_line_bytes_max = 200;
+
+/// The first line of an error (the rest is the traceback), in `arena`.
+fn firstLine(arena: std.mem.Allocator, message: []const u8) [:0]const u8 {
+    const end = std.mem.findScalar(u8, message, '\n') orelse message.len;
+    const line = message[0..@min(end, error_line_bytes_max)];
+    return arena.dupeSentinel(u8, core.utf8.validPrefix(line), 0) catch "Failed";
 }
 
 // ----------------------------------------------------------------- rows

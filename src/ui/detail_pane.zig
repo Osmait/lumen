@@ -14,6 +14,10 @@ const Ui = @import("Ui.zig");
 const widgets = @import("widgets.zig");
 const labels = @import("labels.zig");
 
+/// An Information value asks GTK for at most this many characters of
+/// width; longer values are ellipsized at the start (a path keeps its end).
+const meta_value_width_chars_max = 30;
+
 pub fn buildDetail(ui: *Ui) void {
     ui.detail.box = widgets.vbox(0);
     gtk.addClass(ui.detail.box, "detail");
@@ -63,7 +67,7 @@ pub fn buildDetail(ui: *Ui) void {
         c.gtk_label_set_ellipsize(ui.detail.meta_values[i], c.PANGO_ELLIPSIZE_START);
         // The layer surface grows to its content's natural width; a long path
         // here would widen the whole window.
-        c.gtk_label_set_max_width_chars(ui.detail.meta_values[i], 30);
+        c.gtk_label_set_max_width_chars(ui.detail.meta_values[i], meta_value_width_chars_max);
         gtk.append(line, ui.detail.meta_values[i]);
         gtk.append(meta, line);
     }

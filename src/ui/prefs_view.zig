@@ -6,6 +6,7 @@
 const std = @import("std");
 const c = @import("c");
 const gtk = @import("gtk.zig");
+const core = @import("core");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
 const Host = @import("../ext/Host.zig");
@@ -144,6 +145,9 @@ pub fn iconOf(kind: Host.PrefKind) item_mod.Icon {
     };
 }
 
+/// A text preference shows this much of its value on its row.
+const text_value_bytes_shown = 40;
+
 /// How a value shows on the right of its row.
 pub fn display(
     arena: std.mem.Allocator,
@@ -157,7 +161,7 @@ pub fn display(
         } else arena.dupeSentinel(u8, value, 0) catch "",
         .text => if (value.len == 0) "Not set" else arena.dupeSentinel(
             u8,
-            value[0..@min(value.len, 40)],
+            core.utf8.validPrefix(value[0..@min(value.len, text_value_bytes_shown)]),
             0,
         ) catch "",
         .password => if (value.len == 0) "Not set" else "••••••••",
