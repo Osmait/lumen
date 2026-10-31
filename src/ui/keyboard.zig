@@ -46,7 +46,7 @@ pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
         ui.goBack();
         return 1;
     }
-    // Keymaps from init.lua and extensions.
+    // Then the keymaps from init.lua and extensions.
     if (Ui.ext_view.keymap(ui, keyval, state)) return 1;
     return 0;
 }
@@ -170,8 +170,8 @@ fn itemShortcut(ui: *Ui, key: KeyPress) bool {
     if (!key.ctrl or key.keyval > ascii_max) return false;
     if (!std.ascii.isAlphabetic(@intCast(key.keyval))) return false;
     const letter = std.ascii.toUpper(@intCast(key.keyval));
-    var buf: ["Ctrl Shift X".len]u8 = undefined;
-    const chord = std.mem.print(&buf, "Ctrl {s}{c}", .{
+    var chord_bytes: ["Ctrl Shift X".len]u8 = undefined;
+    const chord = std.mem.print(&chord_bytes, "Ctrl {s}{c}", .{
         if (key.shift) "Shift " else "",
         letter,
     }) catch return false;

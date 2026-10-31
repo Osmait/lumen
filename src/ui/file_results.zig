@@ -16,35 +16,37 @@ const labels = @import("labels.zig");
 // ------------------------------------------------------------- contents
 
 /// Files whose text contains the query, with the matching line.
-pub fn contentItems(self: *Ui, arena: std.mem.Allocator, query: []const u8, limit: usize) []Item {
-    const t0 = stats.now();
-    defer self.search_ns += stats.now() - t0;
-    const service = self.contents orelse return &.{};
+pub fn contentItems(ui: *Ui, arena: std.mem.Allocator, query: []const u8, limit: usize) []Item {
+    const search_start_ns = stats.now();
+    defer ui.search_ns += stats.now() - search_start_ns;
+    const service = ui.contents orelse return &.{};
     var hits: std.ArrayList(index.ContentService.Hit) = .empty;
     service.search(arena, query, limit, &hits) catch return &.{};
-    return itemsFromHits(self, arena, hits.items);
+    return itemsFromHits(ui, arena, hits.items);
 }
 
 /// A content result arrived from the worker (on the GTK main loop).
-pub fn onContentResult(result: *Ui.ContentSearch.Result, ctx: ?*anyopaque) void {
-    const self: *Ui = @ptrCast(@alignCast(ctx.?));
-    if (!self.content_query.current(result)) {
-        result.destroy(self.gpa);
+pub fn onContentResult(result: *Ui.ContentSearch.Result, context: ?*anyopaque) void {
+    const ui: *Ui = @ptrCast(@alignCast(context.?));
+    if (!ui.content_query.current(result)) {
+        result.destroy(ui.gpa);
         return;
     }
     if (result.err) |err| log.warn("content search for \"{s}\": {t}", .{ result.query, err });
-    const old = self.content_query.take(result);
-    if (self.view == .contents) {
-        self.refresh();
+    const replaced = ui.content_query.take(result);
+    if (ui.view == .contents) {
+        ui.refresh();
         // Latency from the keystroke that asked, not from this rebuild.
         if (stats.pending) |*pending_stats| {
             pending_stats.start_ns = result.start_ns;
             pending_stats.search_ns = result.search_ns;
         }
     }
-    if (old) |old_result| old_result.destroy(self.gpa);
+    if (replaced) |replaced_result| replaced_result.destroy(ui.gpa);
 }
 
+/// A row per content hit: the file's name, the matching line and how many
+/// lines match.
 pub fn itemsFromHits(
     ui: *Ui,
     arena: std.mem.Allocator,
@@ -89,23 +91,24 @@ const type_more_hint = std.fmt.comptimePrint(
     .{Ui.content_query_bytes_min},
 );
 
-pub fn contentsHint(ui: *Ui, arena: std.mem.Allocator, typed: usize) [:0]const u8 {
+/// The contents view's empty row, by how much is typed (`typed_bytes`).
+pub fn contentsHint(ui: *Ui, arena: std.mem.Allocator, typed_bytes: usize) [:0]const u8 {
     const service = ui.contents orelse return "Content index unavailable";
     const status = service.status();
     if (!status.ready) return "Indexing the text of your files...";
-    if (typed > 0) return type_more_hint;
-    var buf: [32]u8 = undefined;
-    const count_text = core.calc.formatDisplay(&buf, @floatFromInt(status.docs));
+    if (typed_bytes > 0) return type_more_hint;
+    var count_bytes: [32]u8 = undefined;
+    const count_text = core.calc.formatDisplay(&count_bytes, @floatFromInt(status.docs));
     return arena.printSentinel("Search inside {s} files", .{count_text}, 0) catch "";
 }
 
 // ---------------------------------------------------------------- files
 
-/// Files matching `q`, from the index, as rows.
-pub fn fileItems(self: *Ui, arena: std.mem.Allocator, query: []const u8, limit: usize) []Item {
-    const t0 = stats.now();
-    defer self.search_ns += stats.now() - t0;
-    const service = self.files orelse return &.{};
+/// Files matching `query`, from the index, as rows.
+pub fn fileItems(ui: *Ui, arena: std.mem.Allocator, query: []const u8, limit: usize) []Item {
+    const search_start_ns = stats.now();
+    defer ui.search_ns += stats.now() - search_start_ns;
+    const service = ui.files orelse return &.{};
     var hits: std.ArrayList(index.Live.Hit) = .empty;
     service.search(arena, query, limit, &hits) catch return &.{};
     var out: std.ArrayList(Item) = .empty;
@@ -117,7 +120,7 @@ pub fn fileItems(self: *Ui, arena: std.mem.Allocator, query: []const u8, limit: 
             .key = arena.print(file_key_prefix ++ "{s}", .{hit.path}) catch "",
             .title = labels.displayText(arena, hit.path[slash + 1 ..]),
             .subtitle = where,
-            .icon = fileIcon(self, path, hit.is_dir),
+            .icon = fileIcon(ui, path, hit.is_dir),
             .action = .{ .file = .{ .path = path, .is_dir = hit.is_dir } },
             .score = hit.score,
         }) catch break;
@@ -134,8 +137,8 @@ const extension_bytes_max = 16;
 
 /// Icon for a file's type, guessed from its name (no I/O): the extension
 /// badge for code and text, the theme's icon for the rest.
-pub fn fileIcon(ui: *Ui, path: [:0]const u8, is_dir: bool) item_mod.Icon {
-    if (is_dir) {
+pub fn fileIcon(ui: *Ui, path: [:0]const u8, is_directory: bool) item_mod.Icon {
+    if (is_directory) {
         if (ui.keyIcon(file_key_prefix ++ "folder")) |icon| return icon;
     } else {
         const slash = std.mem.findScalarLast(u8, path, '/');
@@ -143,14 +146,14 @@ pub fn fileIcon(ui: *Ui, path: [:0]const u8, is_dir: bool) item_mod.Icon {
         // lumen.icons { ["file:pdf"] = ... }, by extension.
         const dot = std.mem.findScalarLast(u8, name, '.');
         if (dot != null and name.len - dot.? <= extension_bytes_max) {
-            var buf: [file_key_prefix.len + extension_bytes_max]u8 = undefined;
+            var key_bytes: [file_key_prefix.len + extension_bytes_max]u8 = undefined;
             const extension = name[dot.? + 1 ..];
-            const key = std.mem.print(&buf, file_key_prefix ++ "{s}", .{extension}) catch "";
-            if (ui.keyIcon(std.ascii.lowerString(buf[0..key.len], key))) |icon| return icon;
+            const key = std.mem.print(&key_bytes, file_key_prefix ++ "{s}", .{extension}) catch "";
+            if (ui.keyIcon(std.ascii.lowerString(key_bytes[0..key.len], key))) |icon| return icon;
         }
         if (core.file_badge.logoOf(name)) |logo| return .{ .logo = logo };
-        var upper: [4]u8 = undefined;
-        if (core.file_badge.of(name, &upper)) |badge| {
+        var badge_text: [4]u8 = undefined;
+        if (core.file_badge.of(name, &badge_text)) |badge| {
             const text = ui.query_arena.allocator().dupeSentinel(
                 u8,
                 badge.text,
@@ -159,21 +162,20 @@ pub fn fileIcon(ui: *Ui, path: [:0]const u8, is_dir: bool) item_mod.Icon {
             return .{ .badge = .{ .text = text, .color = badge.color } };
         }
     }
-    const ctype = if (is_dir) null else c.g_content_type_guess(path, null, 0, null);
-    defer if (ctype) |type_name| c.g_free(type_name);
-    return .{ .gicon = typeIcon(
-        if (ctype) |type_name| type_name else "inode/directory",
-    ) orelse return .none };
+    const guessed_type = if (is_directory) null else c.g_content_type_guess(path, null, 0, null);
+    defer if (guessed_type) |type_name| c.g_free(type_name);
+    const content_type = guessed_type orelse "inode/directory";
+    return .{ .gicon = typeIcon(content_type) orelse return .none };
 }
 
 /// One GIcon per content type, kept for good (a few dozen): the files view
 /// made a new one for every row of every keystroke.
 var type_icons: std.StringHashMapUnmanaged(*c.GIcon) = .empty;
 
-fn typeIcon(ctype: [*:0]const u8) ?*c.GIcon {
-    const key = std.mem.span(ctype);
+fn typeIcon(content_type: [*:0]const u8) ?*c.GIcon {
+    const key = std.mem.span(content_type);
     if (type_icons.get(key)) |icon| return icon;
-    const icon = c.g_content_type_get_icon(ctype);
+    const icon = c.g_content_type_get_icon(content_type);
     const gpa = std.heap.c_allocator;
     const owned = gpa.dupe(u8, key) catch return null;
     type_icons.put(gpa, owned, icon) catch {
@@ -184,11 +186,12 @@ fn typeIcon(ctype: [*:0]const u8) ?*c.GIcon {
     return icon;
 }
 
+/// The files view's empty row with nothing typed.
 pub fn filesHint(ui: *Ui, arena: std.mem.Allocator) [:0]const u8 {
     const service = ui.files orelse return "File index unavailable";
     const status = service.status();
     if (status.entries == 0) return "Indexing your files...";
-    var buf: [32]u8 = undefined;
-    const count_text = core.calc.formatDisplay(&buf, @floatFromInt(status.entries));
+    var count_bytes: [32]u8 = undefined;
+    const count_text = core.calc.formatDisplay(&count_bytes, @floatFromInt(status.entries));
     return arena.printSentinel("Type to search {s} files", .{count_text}, 0) catch "";
 }

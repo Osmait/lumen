@@ -28,7 +28,7 @@ pub fn buildDetail(ui: *Ui) void {
     gtk.addClass(ui.detail.box, "detail");
     gtk.setHexpand(ui.detail.box, true);
 
-    // Image previews (files view).
+    // The picture shows image previews (files view).
     ui.detail.picture = gtk.picture();
     c.gtk_picture_set_content_fit(ui.detail.picture, c.GTK_CONTENT_FIT_SCALE_DOWN);
     gtk.setVexpand(ui.detail.picture, true);
@@ -95,23 +95,26 @@ pub fn showContentDetail(ui: *Ui, item: *const Item) void {
         file.path,
         if (info) |file_info| file_info.mtime else 0,
         if (file.extracted) .extracted else .plain,
-        file.line + labels.context_after,
+        file.line + labels.context_lines_after,
     ) orelse item.detail;
     const words = index.content.splitWords(arena, ui.query()) catch return;
     // The theme's accent behind matches, its text colour on top.
-    const hl_open = arena.print("<span background=\"{s}\" bgalpha=\"40%\" foreground=\"{s}\">", .{
-        std.mem.sliceTo(&ui.appearance.highlight_bg, 0),
-        std.mem.sliceTo(&ui.appearance.highlight_fg, 0),
-    }) catch return;
+    const highlight_open = arena.print(
+        "<span background=\"{s}\" bgalpha=\"40%\" foreground=\"{s}\">",
+        .{
+            std.mem.sliceTo(&ui.appearance.highlight_background, 0),
+            std.mem.sliceTo(&ui.appearance.highlight_foreground, 0),
+        },
+    ) catch return;
     c.gtk_label_set_markup(
         ui.detail.text,
-        labels.contextMarkup(arena, text, file.line, words, hl_open).ptr,
+        labels.contextMarkup(arena, text, file.line, words, highlight_open).ptr,
     );
 
-    const ctype = c.g_content_type_guess(file.path, null, 0, null);
-    defer if (ctype) |type_name| c.g_free(type_name);
+    const guessed_type = c.g_content_type_guess(file.path, null, 0, null);
+    defer if (guessed_type) |type_name| c.g_free(type_name);
     setMeta(&ui.detail, .{
-        labels.kindLabel(arena, file.path, false, ctype),
+        labels.kindLabel(arena, file.path, false, guessed_type),
         item.fact,
         if (info) |file_info| labels.formatWhen(arena, file_info.mtime) else no_value,
         item.where,
@@ -128,13 +131,13 @@ const preview_px = 2048;
 /// `picture_limits`, one at a time, a request the selection has left
 /// behind dropped before it is decoded), and not again for the same file.
 fn showImage(detail: *Ui.DetailPane, path: [:0]const u8, mtime: i64) void {
-    const shown_path = detail.image_path[0..detail.image_path_len];
+    const shown_path = detail.image_path[0..detail.image_path_length];
     const same_image = detail.image_mtime == mtime and std.mem.eql(u8, shown_path, path);
     if (same_image) return;
     forgetImage(detail);
     if (path.len > detail.image_path.len) return;
     @memcpy(detail.image_path[0..path.len], path);
-    detail.image_path_len = path.len;
+    detail.image_path_length = path.len;
     detail.image_mtime = mtime;
     pictures.requestPicture(
         path,
@@ -142,7 +145,7 @@ fn showImage(detail: *Ui.DetailPane, path: [:0]const u8, mtime: i64) void {
         preview_px,
         &pictures.preview_lane,
         .front,
-        &onImageLoaded,
+        &requestPictureCallback,
         detail,
     );
 }
@@ -151,11 +154,11 @@ fn showImage(detail: *Ui.DetailPane, path: [:0]const u8, mtime: i64) void {
 /// has not started).
 fn forgetImage(detail: *Ui.DetailPane) void {
     pictures.preview_lane.forget();
-    detail.image_path_len = 0;
+    detail.image_path_length = 0;
     c.gtk_picture_set_paintable(gtk.widget(detail.picture), null);
 }
 
-fn onImageLoaded(context: ?*anyopaque, decoded: ?*c.GdkPixbuf, current: bool) void {
+fn requestPictureCallback(context: ?*anyopaque, decoded: ?*c.GdkPixbuf, current: bool) void {
     const detail: *Ui.DetailPane = @ptrCast(@alignCast(context.?));
     if (!current) return;
     const pixbuf = decoded orelse return;
@@ -170,9 +173,12 @@ pub fn showFileDetail(ui: *Ui, item: *const Item) void {
     defer arena_instance.deinit();
     const arena = arena_instance.allocator();
 
-    const ctype = if (file.is_dir) null else c.g_content_type_guess(file.path, null, 0, null);
-    defer if (ctype) |type_name| c.g_free(type_name);
-    const content_type: [*:0]const u8 = if (ctype) |type_name| type_name else mime_directory;
+    const guessed_type = if (file.is_dir)
+        null
+    else
+        c.g_content_type_guess(file.path, null, 0, null);
+    defer if (guessed_type) |type_name| c.g_free(type_name);
+    const content_type: [*:0]const u8 = guessed_type orelse mime_directory;
 
     // Only regular files: a FIFO named *.png is no picture (and the decoder
     // checks again on the descriptor it reads).
@@ -254,11 +260,12 @@ fn showExtDetail(ui: *Ui, item: ?*const Item) void {
     }
     const meta = if (item) |shown| shown.meta else &.{};
     gtk.setVisible(ui.detail.meta, meta.len > 0);
-    for (ui.detail.meta_lines, ui.detail.meta_keys, ui.detail.meta_values, 0..) |line, k, v, i| {
+    const detail = &ui.detail;
+    for (detail.meta_lines, detail.meta_keys, detail.meta_values, 0..) |line, key, value, i| {
         gtk.setVisible(line, i < meta.len);
         if (i >= meta.len) continue;
-        c.gtk_label_set_text(k, meta[i].label.ptr);
-        c.gtk_label_set_text(v, meta[i].value.ptr);
+        c.gtk_label_set_text(key, meta[i].label.ptr);
+        c.gtk_label_set_text(value, meta[i].value.ptr);
     }
 }
 
@@ -270,10 +277,12 @@ fn setMeta(detail: *Ui.DetailPane, values: [item_mod.meta_max][:0]const u8) void
     }
 }
 
+/// What the detail pane shows for the selected `item` in the current view.
 pub fn showDetail(ui: *Ui, item: ?*const Item) void {
     if (ui.view == .files or ui.view == .contents) {
-        if (item) |i| if (i.action == .file) {
-            return if (ui.view == .contents) showContentDetail(ui, i) else showFileDetail(ui, i);
+        if (item) |shown| if (shown.action == .file) {
+            if (ui.view == .contents) return showContentDetail(ui, shown);
+            return showFileDetail(ui, shown);
         };
         gtk.setVisible(ui.detail.picture, false);
         c.gtk_label_set_text(ui.detail.text, "");
@@ -282,7 +291,7 @@ pub fn showDetail(ui: *Ui, item: ?*const Item) void {
     }
     if (ui.view == .ext) return showExtDetail(ui, item);
     if (ui.view != .clipboard) return;
-    const i = item orelse {
+    const shown = item orelse {
         c.gtk_label_set_text(ui.detail.text, "");
         setMeta(&ui.detail, @splat(""));
         return;
@@ -291,23 +300,23 @@ pub fn showDetail(ui: *Ui, item: ?*const Item) void {
     defer arena_instance.deinit();
     const arena = arena_instance.allocator();
     // The row holds the head of the entry; the counts are of all of it.
-    const content = if (i.action == .clip)
-        (ui.db.clipContent(arena, i.action.clip) catch null) orelse i.detail
+    const content = if (shown.action == .clip)
+        (ui.db.clipContent(arena, shown.action.clip) catch null) orelse shown.detail
     else
-        i.detail;
+        shown.detail;
     const text = content[0..@min(content.len, detail_text_bytes_max)];
     c.gtk_label_set_text(
         ui.detail.text,
         (arena.dupeSentinel(u8, core.utf8.validPrefix(text), 0) catch return).ptr,
     );
-    const chars = std.unicode.utf8CountCodepoints(content) catch content.len;
-    var words: usize = 0;
-    var tok = std.mem.tokenizeAny(u8, content, " \t\r\n");
-    while (tok.next()) |_| words += 1;
+    const character_count = std.unicode.utf8CountCodepoints(content) catch content.len;
+    var word_count: usize = 0;
+    var words = std.mem.tokenizeAny(u8, content, " \t\r\n");
+    while (words.next()) |_| word_count += 1;
     setMeta(&ui.detail, .{
         "Text",
-        arena.printSentinel("{d}", .{chars}, 0) catch "",
-        arena.printSentinel("{d}", .{words}, 0) catch "",
-        labels.formatWhen(arena, i.time_s),
+        arena.printSentinel("{d}", .{character_count}, 0) catch "",
+        arena.printSentinel("{d}", .{word_count}, 0) catch "",
+        labels.formatWhen(arena, shown.time_s),
     });
 }

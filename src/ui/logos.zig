@@ -84,6 +84,6 @@ pub fn texture(name: []const u8) ?*c.GdkTexture {
 }
 
 test "every logo the mapping names is embedded" {
-    for (core.file_badge.logos) |l| try std.testing.expect(svg(l[1].name) != null);
-    for (core.file_badge.logo_names) |l| try std.testing.expect(svg(l[1].name) != null);
+    for (core.file_badge.logos) |entry| try std.testing.expect(svg(entry[1].name) != null);
+    for (core.file_badge.logo_names) |entry| try std.testing.expect(svg(entry[1].name) != null);
 }

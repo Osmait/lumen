@@ -22,8 +22,8 @@ const log = std.log.scoped(.ext);
 /// Starts the extension thread and loads the files. Main thread, once the
 /// window exists.
 pub fn start(ui: *Ui) void {
-    var buf: [4096]u8 = undefined;
-    const data_dir = std.mem.print(&buf, "{s}/lumen", .{
+    var data_dir_bytes: [4096]u8 = undefined;
+    const data_dir = std.mem.print(&data_dir_bytes, "{s}/lumen", .{
         std.mem.span(c.g_get_user_data_dir()),
     }) catch return;
     ui.ext_host = Host.start(ui.gpa, ui.io, ui.config_dir, data_dir, .{
@@ -71,24 +71,25 @@ pub fn reload(ui: *Ui) void {
     host.reload();
 }
 
+/// The command the ext view shows, while the registry still has it.
 pub fn command(ui: *Ui) ?*const Host.Command {
     const registry = ui.ext_registry orelse return null;
-    return registry.command(ui.ext_cmd);
+    return registry.command(ui.ext_command);
 }
 
 // ------------------------------------------------------------- results
 
-fn registryCallback(registry: *Host.Registry, ctx: ?*anyopaque) void {
-    const ui: *Ui = @ptrCast(@alignCast(ctx.?));
-    const old = ui.ext_registry;
+fn registryCallback(registry: *Host.Registry, context: ?*anyopaque) void {
+    const ui: *Ui = @ptrCast(@alignCast(context.?));
+    const old_registry = ui.ext_registry;
     ui.ext_registry = registry;
     // Answers still in flight come from the old files: forgetting the
     // requests drops them when they arrive.
-    const old_result = ui.ext_list.forget();
+    const old_list = ui.ext_list.forget();
     const old_root = ui.ext_root_search.forget();
     // What the views point at by index, found again by id (before anything
     // rebuilds them): the open view may have lost it.
-    const lost = if (old) |old_value| remap(ui, old_value, registry) else false;
+    const lost = if (old_registry) |old| remap(ui, old, registry) else false;
     ui.layout = registry.layout;
     ui.applyStructure();
     // Rows and theme names point into the old registry: rebuild before
@@ -99,9 +100,9 @@ fn registryCallback(registry: *Host.Registry, ctx: ?*anyopaque) void {
     if (ui.style_defaults_pending) {
         ui.style_defaults_pending = false;
         var changed = false;
-        for (registry.style_settings) |old_value| {
-            if (ui.overridden(old_value.key)) continue;
-            changed = ui.settings.set(old_value.key, old_value.value) or changed;
+        for (registry.style_settings) |style_setting| {
+            if (ui.overridden(style_setting.key)) continue;
+            changed = ui.settings.set(style_setting.key, style_setting.value) or changed;
         }
         if (changed) ui.saveSettings();
     }
@@ -114,9 +115,9 @@ fn registryCallback(registry: *Host.Registry, ctx: ?*anyopaque) void {
         ui.keepSelection();
         ui.rebuild();
     }
-    if (old_result) |result| result.destroy(ui.gpa);
+    if (old_list) |result| result.destroy(ui.gpa);
     if (old_root) |result| result.destroy(ui.gpa);
-    if (old) |old_registry| old_registry.destroy(ui.gpa);
+    if (old_registry) |old| old.destroy(ui.gpa);
     // What an update or removal from Settings said, over the rebuilt rows.
     if (ui.after_reload_pending) {
         ui.after_reload_pending = false;
@@ -124,8 +125,8 @@ fn registryCallback(registry: *Host.Registry, ctx: ?*anyopaque) void {
     }
 }
 
-fn rootCallback(answer: *Host.RootResult, ctx: ?*anyopaque) void {
-    const ui: *Ui = @ptrCast(@alignCast(ctx.?));
+fn rootCallback(answer: *Host.RootResult, context: ?*anyopaque) void {
+    const ui: *Ui = @ptrCast(@alignCast(context.?));
     if (!ui.ext_root_search.current(answer)) {
         answer.destroy(ui.gpa);
         return;
@@ -134,18 +135,14 @@ fn rootCallback(answer: *Host.RootResult, ctx: ?*anyopaque) void {
         answer.destroy(ui.gpa);
         return;
     };
-    for (answer.sections) |sec| for (sec.items) |*item| {
+    for (answer.sections) |section| for (section.items) |*item| {
         if (item.icon != .none) continue;
-        if (registry.command(sec.command)) |section_command| item.icon = section_command.icon;
+        if (registry.command(section.command)) |section_command| item.icon = section_command.icon;
     };
-    const last = ui.ext_root_search.latest;
+    const latest = ui.ext_root_search.latest;
     const typed: ?[]const u8 = if (ui.view == .root) std.mem.trim(u8, ui.query(), " ") else null;
-    const decision = rootAnswer(
-        typed,
-        if (last) |last_answer| last_answer.query else null,
-        answer.query,
-        answer.sections.len > 0,
-    );
+    const latest_query = if (latest) |latest_answer| latest_answer.query else null;
+    const decision = rootAnswer(typed, latest_query, answer.query, answer.sections.len > 0);
     switch (decision) {
         .show, .keep => {
             const replaced = ui.ext_root_search.take(answer);
@@ -203,10 +200,10 @@ pub fn addRootSections(ui: *Ui, query: []const u8) void {
     for (registry.commands) |command_entry| any = any or command_entry.answers_root_search;
     if (!any or query.len < root_query_bytes_min) return;
     if (ui.ext_root_search.latest) |answer| if (std.mem.eql(u8, answer.query, query)) {
-        for (answer.sections) |sec| {
-            const section_command = registry.command(sec.command) orelse continue;
+        for (answer.sections) |section| {
+            const section_command = registry.command(section.command) orelse continue;
             ui.addSection(section_command.title);
-            for (sec.items) |item| ui.addItem(item);
+            for (section.items) |item| ui.addItem(item);
         }
         return;
     };
@@ -214,33 +211,34 @@ pub fn addRootSections(ui: *Ui, query: []const u8) void {
     ui.ext_root_search.sent(host.root(registry.gen, query), query);
 }
 
-fn listCallback(answer: *Host.ListResult, ctx: ?*anyopaque) void {
-    const ui: *Ui = @ptrCast(@alignCast(ctx.?));
+fn listCallback(answer: *Host.ListResult, context: ?*anyopaque) void {
+    const ui: *Ui = @ptrCast(@alignCast(context.?));
     if (!ui.ext_list.current(answer)) {
         answer.destroy(ui.gpa);
         return;
     }
+    const open_command = command(ui);
     if (answer.err) |message| {
-        log.warn("{s}: {s}", .{ if (command(ui)) |cmd| cmd.id else "?", message });
+        log.warn("{s}: {s}", .{ if (open_command) |listed| listed.id else "?", message });
     }
     // Rows without an icon take their command's. The icon points into the
     // registry, which outlives the result: a reload destroys results first.
-    if (command(ui)) |cmd| for (answer.items) |*item| {
-        if (item.icon == .none) item.icon = cmd.icon;
+    if (open_command) |listed| for (answer.items) |*item| {
+        if (item.icon == .none) item.icon = listed.icon;
     };
-    const old = ui.ext_list.take(answer);
+    const replaced = ui.ext_list.take(answer);
     if (ui.view == .ext) {
         ui.keepSelection();
         ui.rebuild();
     }
-    if (old) |old_value| old_value.destroy(ui.gpa);
+    if (replaced) |replaced_answer| replaced_answer.destroy(ui.gpa);
 }
 
-fn actCallback(answer: *Host.ActResult, ctx: ?*anyopaque) void {
-    const ui: *Ui = @ptrCast(@alignCast(ctx.?));
+fn actCallback(answer: *Host.ActResult, context: ?*anyopaque) void {
+    const ui: *Ui = @ptrCast(@alignCast(context.?));
     defer answer.destroy(ui.gpa);
-    if (answer.gen != ui.ext_act_gen) return;
-    ui.ext_act_gen = .none;
+    if (answer.gen != ui.ext_act_generation) return;
+    ui.ext_act_generation = .none;
     if (answer.err) |message| {
         log.warn("action: {s}", .{message});
         ui.showFailure(firstLine(ui.query_arena.allocator(), message));
@@ -260,8 +258,11 @@ fn actCallback(answer: *Host.ActResult, ctx: ?*anyopaque) void {
     }
 }
 
+/// The command with `id` in `registry`.
 fn find(registry: *const Host.Registry, id: []const u8) ?Host.CommandIndex {
-    for (registry.commands, 0..) |cmd, i| if (std.mem.eql(u8, cmd.id, id)) return .from(i);
+    for (registry.commands, 0..) |candidate, i| {
+        if (std.mem.eql(u8, candidate.id, id)) return .from(i);
+    }
     return null;
 }
 
@@ -270,31 +271,35 @@ fn find(registry: *const Host.Registry, id: []const u8) ?Host.CommandIndex {
 /// save into another extension's preferences, or submit another form).
 /// True when the open view lost what it shows. Call with `new` in place.
 fn remap(ui: *Ui, old: *const Host.Registry, new: *const Host.Registry) bool {
-    ui.ext_cmd = sameCommand(old, new, ui.ext_cmd) orelse .gone;
-    const form = sameCommand(old, new, ui.form_cmd);
+    ui.ext_command = sameCommand(old, new, ui.ext_command) orelse .gone;
+    const form = sameCommand(old, new, ui.form_command);
     // A form whose fields changed starts over: values are kept by position.
     const same_form = if (form) |form_index|
-        sameFields(old.command(ui.form_cmd).?.fields, new.command(form_index).?.fields)
+        sameFields(old.command(ui.form_command).?.fields, new.command(form_index).?.fields)
     else
         false;
-    ui.form_cmd = form orelse .gone;
+    ui.form_command = form orelse .gone;
     if (form != null and !same_form) form_view.reset(ui);
     switch (ui.input) {
-        .pref => |pref_index| ui.input = .{ .pref = samePref(old, new, pref_index) orelse .gone },
+        .pref => |pref_index| {
+            ui.input = .{ .pref = samePref(old, new, pref_index) orelse .gone };
+        },
         .field => if (!same_form) {
             ui.input = .{ .field = .gone };
         },
     }
     switch (ui.choosing) {
-        .pref => |pref_index| ui.choosing = .{ .pref = samePref(old, new, pref_index) orelse .gone },
+        .pref => |pref_index| {
+            ui.choosing = .{ .pref = samePref(old, new, pref_index) orelse .gone };
+        },
         .field => if (!same_form) {
             ui.choosing = .{ .field = .gone };
         },
         else => {},
     }
     return switch (ui.view) {
-        .ext => ui.ext_cmd == .gone,
-        .form => ui.form_cmd == .gone,
+        .ext => ui.ext_command == .gone,
+        .form => ui.form_command == .gone,
         .input => switch (ui.input) {
             .pref => |pref_index| pref_index == .gone,
             .field => |field_index| field_index == .gone,
@@ -325,21 +330,20 @@ fn samePref(
     index: Host.PrefIndex,
 ) ?Host.PrefIndex {
     const preference = (old.pref(index) orelse return null).*;
-    for (new.prefs, 0..) |query, j| {
-        if (std.mem.eql(u8, query.ext, preference.ext) and std.mem.eql(
-            u8,
-            query.name,
-            preference.name,
-        ) and
-            query.kind == preference.kind) return .from(j);
+    for (new.prefs, 0..) |candidate, j| {
+        const same_extension = std.mem.eql(u8, candidate.ext, preference.ext);
+        const same_name = std.mem.eql(u8, candidate.name, preference.name);
+        if (same_extension and same_name and candidate.kind == preference.kind) return .from(j);
     }
     return null;
 }
 
+/// Whether a form's fields are the same names and kinds, in the same order.
 fn sameFields(fields_old: []const Host.Pref, fields_new: []const Host.Pref) bool {
     if (fields_old.len != fields_new.len) return false;
-    for (fields_old, fields_new) |x, y| {
-        if (!std.mem.eql(u8, x.name, y.name) or x.kind != y.kind) return false;
+    for (fields_old, fields_new) |field_old, field_new| {
+        if (!std.mem.eql(u8, field_old.name, field_new.name)) return false;
+        if (field_old.kind != field_new.kind) return false;
     }
     return true;
 }
@@ -360,16 +364,18 @@ fn firstLine(arena: std.mem.Allocator, message: []const u8) [:0]const u8 {
 pub fn rootItems(ui: *Ui, arena: std.mem.Allocator) []const Item {
     const registry = ui.ext_registry orelse return &.{};
     var out: std.ArrayList(Item) = .empty;
-    for (registry.commands, 0..) |cmd, i| {
-        if (cmd.mode == .provider) continue;
+    for (registry.commands, 0..) |command_entry, i| {
+        if (command_entry.mode == .provider) continue;
         out.append(arena, .{
-            .key = arena.print("ext:{s}", .{cmd.id}) catch continue,
-            .title = cmd.title,
-            .subtitle = cmd.subtitle,
+            .key = arena.print("ext:{s}", .{command_entry.id}) catch continue,
+            .title = command_entry.title,
+            .subtitle = command_entry.subtitle,
             .accessory = "Command",
-            .icon = cmd.icon,
-            .keywords = cmd.keywords,
-            .action = .{ .ext_command = .{ .index = .from(i), .run = cmd.mode == .run } },
+            .icon = command_entry.icon,
+            .keywords = command_entry.keywords,
+            .action = .{
+                .ext_command = .{ .index = .from(i), .run = command_entry.mode == .run },
+            },
         }) catch break;
     }
     for (registry.problems) |problem| {
@@ -392,25 +398,25 @@ pub fn rootItems(ui: *Ui, arena: std.mem.Allocator) []const Item {
 /// The open command's rows before filtering.
 pub fn base(ui: *Ui) []Item {
     const answer = ui.ext_list.latest orelse return &.{};
-    return if (answer.command == ui.ext_cmd and answer.err == null) answer.items else &.{};
+    return if (answer.command == ui.ext_command and answer.err == null) answer.items else &.{};
 }
 
 /// Before the ext view shows: list commands are asked once here.
 pub fn enter(ui: *Ui) void {
-    const cmd = command(ui) orelse return;
-    if (cmd.mode == .list) ask(ui, "");
+    const open_command = command(ui) orelse return;
+    if (open_command.mode == .list) ask(ui, "");
 }
 
 /// A search command's next keystroke: while its answer is on its way, the
 /// rows on screen are the last answer's and stay as they are (rebuilding
-/// them cost a frame per keystroke; `listCallback` rebuilds when it comes). True
-/// when the request is made and nothing else is to be done.
+/// them cost a frame per keystroke; `listCallback` rebuilds when it comes).
+/// True when the request is made and nothing else is to be done.
 pub fn waitingForSearch(ui: *Ui, query: []const u8) bool {
-    const cmd = command(ui) orelse return false;
-    if (cmd.mode != .search) return false;
+    const open_command = command(ui) orelse return false;
+    if (open_command.mode != .search) return false;
     if (!ui.ext_list.showingLatest()) return false;
     const answer = ui.ext_list.latest.?;
-    if (answer.command == ui.ext_cmd and std.mem.eql(u8, answer.query, query)) return false;
+    if (answer.command == ui.ext_command and std.mem.eql(u8, answer.query, query)) return false;
     _ = prepare(ui, query);
     return true;
 }
@@ -419,44 +425,48 @@ pub fn waitingForSearch(ui: *Ui, query: []const u8) bool {
 /// already answered or on its way. True when the rows are local (filtered
 /// by Lumen).
 pub fn prepare(ui: *Ui, query: []const u8) bool {
-    const cmd = command(ui) orelse return true;
-    if (cmd.mode != .search) return true;
+    const open_command = command(ui) orelse return true;
+    if (open_command.mode != .search) return true;
     const answered = if (ui.ext_list.latest) |result|
-        result.command == ui.ext_cmd and std.mem.eql(u8, result.query, query)
+        result.command == ui.ext_command and std.mem.eql(u8, result.query, query)
     else
         false;
     if (!answered and !ui.ext_list.asking(query)) ask(ui, query);
     return false;
 }
 
+/// Asks the open command for its rows for `query`.
 fn ask(ui: *Ui, query: []const u8) void {
     const host = ui.ext_host orelse return;
     const registry = ui.ext_registry orelse return;
-    ui.ext_list.sent(host.list(registry.gen, ui.ext_cmd, query), query);
+    ui.ext_list.sent(host.list(registry.gen, ui.ext_command, query), query);
 }
 
+/// The ext view's empty row: the command's error, Loading, or a hint.
 pub fn emptyText(ui: *Ui, arena: std.mem.Allocator, query: []const u8) [:0]const u8 {
-    const cmd = command(ui) orelse return "No Results";
+    const open_command = command(ui) orelse return "No Results";
     if (ui.ext_list.latest) |answer| {
-        if (answer.command == ui.ext_cmd) if (answer.err) |message| {
+        if (answer.command == ui.ext_command) if (answer.err) |message| {
             return arena.printSentinel("Error: {s}", .{firstLine(arena, message)}, 0) catch "Error";
         };
     }
     if (ui.ext_list.pending) return "Loading...";
-    if (cmd.mode == .search and query.len == 0) return "Type to search";
+    if (open_command.mode == .search and query.len == 0) return "Type to search";
     return "No Results";
 }
 
-pub fn placeholder(ui: *Ui, buf: []u8) [*:0]const u8 {
-    const cmd = command(ui) orelse return "Search...";
-    if (cmd.placeholder.len > 0) return cmd.placeholder;
+/// The search bar's text while empty, written to `out` when it is made up.
+pub fn placeholder(ui: *Ui, out: []u8) [*:0]const u8 {
+    const open_command = command(ui) orelse return "Search...";
+    if (open_command.placeholder.len > 0) return open_command.placeholder;
     // "Search Emoji" reads "Search Emoji...", not "Search Search Emoji...".
     const search_verb = "Search ";
-    const verb = if (std.mem.startsWith(u8, cmd.title, search_verb)) "" else search_verb;
+    const titled_search = std.mem.startsWith(u8, open_command.title, search_verb);
+    const verb = if (titled_search) "" else search_verb;
     const text = std.mem.printSentinel(
-        buf,
+        out,
         "{s}{s}...",
-        .{ verb, cmd.title },
+        .{ verb, open_command.title },
         0,
     ) catch return "Search...";
     return text.ptr;
@@ -465,19 +475,19 @@ pub fn placeholder(ui: *Ui, buf: []u8) [*:0]const u8 {
 // -------------------------------------------------------------- actions
 
 /// Enter on a command in the root search: opens its list, or runs it.
-pub fn activate(ui: *Ui, i: Host.CommandIndex) void {
+pub fn activate(ui: *Ui, command_index: Host.CommandIndex) void {
     const registry = ui.ext_registry orelse return;
-    const activated = registry.command(i) orelse return;
+    const activated = registry.command(command_index) orelse return;
     switch (activated.mode) {
         .run => {
             const host = ui.ext_host orelse return;
-            ui.ext_act_gen = host.act(registry.gen, i, .command_run);
+            ui.ext_act_generation = host.act(registry.gen, command_index, .command_run);
             ui.showRunning();
         },
-        .form => form_view.open(ui, i),
+        .form => form_view.open(ui, command_index),
         .provider => {},
         .list, .search => {
-            ui.ext_cmd = i;
+            ui.ext_command = command_index;
             ui.navigate(.ext);
         },
     }
@@ -495,7 +505,7 @@ pub fn perform(ui: *Ui, action_index: u8) void {
         .lua => {
             const host = ui.ext_host orelse return;
             const registry = ui.ext_registry orelse return;
-            ui.ext_act_gen = host.act(registry.gen, row.command, .{ .row_action = .{
+            ui.ext_act_generation = host.act(registry.gen, row.command, .{ .row_action = .{
                 .from_root_search = row.from_root_search,
                 .list_gen = row.list_generation,
                 .row_index = row.row_index,
@@ -524,17 +534,18 @@ fn open(ui: *Ui, target: [:0]const u8) void {
     const is_url = std.mem.find(u8, target, url_scheme_separator) != null or
         std.mem.startsWith(u8, target, mailto_scheme);
     if (is_url) {
-        const lctx = proc.launchContext() orelse return;
-        defer c.g_object_unref(lctx);
+        const launch_context = proc.launchContext() orelse return;
+        defer c.g_object_unref(launch_context);
         var err: ?*c.GError = null;
-        if (c.g_app_info_launch_default_for_uri(target.ptr, lctx, &err) == 0)
+        if (c.g_app_info_launch_default_for_uri(target.ptr, launch_context, &err) == 0) {
             proc.warnError(.ext, err, "open {s}", .{target});
+        }
         return;
     }
-    var buf: [4096]u8 = undefined;
+    var path_bytes: [4096]u8 = undefined;
     const path = if (std.mem.startsWith(u8, target, home_prefix))
         std.mem.printSentinel(
-            &buf,
+            &path_bytes,
             "{s}/{s}",
             .{ std.mem.span(c.g_get_home_dir()), target[home_prefix.len..] },
             0,
@@ -545,7 +556,7 @@ fn open(ui: *Ui, target: [:0]const u8) void {
         log.warn("open {s}: no such file", .{path});
         return;
     };
-    run.openFile(ui.actionCtx(), path, if (info.is_dir) .folder else .file);
+    run.openFile(ui.actionContext(), path, if (info.is_dir) .folder else .file);
 }
 
 // --------------------------------------------------------------- keymaps
@@ -571,26 +582,26 @@ pub fn keymap(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) bool {
 /// Opens a command by id ("github.prs") or a built-in view by name, with
 /// `text` typed. False when there is no such thing.
 pub fn openTarget(ui: *Ui, target: []const u8, text: ?[*:0]const u8) bool {
-    if (ui.ext_registry) |registry| if (find(registry, target)) |i| {
-        switch (registry.command(i).?.mode) {
+    if (ui.ext_registry) |registry| if (find(registry, target)) |command_index| {
+        switch (registry.command(command_index).?.mode) {
             .provider => return false,
             .run => {
-                activate(ui, i);
+                activate(ui, command_index);
                 return true;
             },
             .form => {
                 if (!gtk.isVisible(ui.window)) ui.show();
-                form_view.open(ui, i);
+                form_view.open(ui, command_index);
                 return true;
             },
             .list, .search => {},
         }
-        ui.ext_cmd = i;
+        ui.ext_command = command_index;
         if (!gtk.isVisible(ui.window)) {
             ui.showWith(.ext, text);
         } else {
             ui.navigate(.ext);
-            if (text) |t| c.gtk_editable_set_text(gtk.editable(ui.search_bar.entry), t);
+            if (text) |typed| c.gtk_editable_set_text(gtk.editable(ui.search_bar.entry), typed);
         }
         return true;
     };
@@ -655,13 +666,13 @@ fn testPref(ext: [:0]const u8, name: [:0]const u8, kind: Host.PrefKind) Host.Pre
 test "indexes into the registry follow their ids across a reload" {
     const name = [_]Host.Pref{testPref("notes", "name", .text)};
     const renamed = [_]Host.Pref{testPref("notes", "title", .text)};
-    const old_cmds = [_]Host.Command{
+    const old_commands = [_]Host.Command{
         testCommand("a.list", &.{}),
         testCommand("notes.new", &name),
         testCommand("b.gone", &.{}),
     };
     // An extension added before them shifts every index.
-    const new_cmds = [_]Host.Command{
+    const new_commands = [_]Host.Command{
         testCommand("aaa.first", &.{}),
         testCommand("a.list", &.{}),
         testCommand("notes.new", &renamed),
@@ -677,13 +688,13 @@ test "indexes into the registry follow their ids across a reload" {
     };
     const old: Host.Registry = .{
         .gen = @fromBackingInt(@as(u32, 1)),
-        .commands = &old_cmds,
+        .commands = &old_commands,
         .prefs = &old_prefs,
         .arena = undefined,
     };
     const new: Host.Registry = .{
         .gen = @fromBackingInt(@as(u32, 2)),
-        .commands = &new_cmds,
+        .commands = &new_commands,
         .prefs = &new_prefs,
         .arena = undefined,
     };

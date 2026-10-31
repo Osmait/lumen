@@ -25,6 +25,7 @@ const form_view = @import("form_view.zig");
 const log = std.log.scoped(.ui);
 const labels = @import("labels.zig");
 
+/// The item key of the Settings row for setting `name`.
 pub fn settingKey(arena: std.mem.Allocator, name: []const u8) []const u8 {
     return arena.print("set:{s}", .{name}) catch "";
 }
@@ -91,11 +92,11 @@ fn settingRow(
                 defaultAppsSummary(ui, arena),
                 .{ .go = .default_apps },
             },
-            .choice => |choice| .{ @tagName(choice), choiceLabel(
-                ui,
-                arena,
-                choice,
-            ), .{ .choose = choice } },
+            .choice => |choice| .{
+                @tagName(choice),
+                choiceLabel(ui, arena, choice),
+                .{ .choose = choice },
+            },
             .toggle => |toggle| .{
                 @tagName(toggle),
                 if (ui.settings.get(toggle)) "On" else "Off",
@@ -113,11 +114,15 @@ fn settingRow(
     };
 }
 
+/// The Settings view: `setting_rows`, the extensions, then Lumen's own rows.
 pub fn settingsCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
     var out: std.ArrayList(Item) = .empty;
-    for (setting_rows) |sec| for (sec[2]) |row| {
-        out.append(arena, settingRow(ui, arena, sec[0], sec[1], row)) catch break;
-    };
+    for (setting_rows) |section| {
+        const section_title, const color, const rows = section;
+        for (rows) |row| {
+            out.append(arena, settingRow(ui, arena, section_title, color, row)) catch break;
+        }
+    }
     prefs_view.extensionRows(ui, arena, &out);
     appendRow(Item, arena, &out, .{
         .key = settingKey(arena, "open_file"),
@@ -146,8 +151,8 @@ pub fn settingsCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
 }
 
 /// The settings.conf key a Settings row changes, if any.
-fn settingName(s: item_mod.Setting) ?[]const u8 {
-    return switch (s) {
+fn settingName(setting: item_mod.Setting) ?[]const u8 {
+    return switch (setting) {
         .toggle => |toggle| @tagName(toggle),
         .choose => |choice| @tagName(choice),
         else => null,
@@ -156,7 +161,8 @@ fn settingName(s: item_mod.Setting) ?[]const u8 {
 
 const Option = Host.PrefChoice;
 
-/// A row of the choose view: `o`, checked when it is the `current` value.
+/// A row of the choose view: `option`, checked when it is the `current`
+/// value.
 pub fn pickRow(
     arena: std.mem.Allocator,
     option: Option,
@@ -184,12 +190,7 @@ fn appendRow(
 }
 
 /// The values a choice can take, in the order they are listed.
-pub fn choiceOptions(
-    ui: *Ui,
-    arena: std.mem.Allocator,
-    choice: settings_mod.Choice,
-) []const Option {
-    _ = ui;
+pub fn choiceOptions(arena: std.mem.Allocator, choice: settings_mod.Choice) []const Option {
     return switch (choice) {
         .text_size => enumOptions(settings_mod.TextSize, .{
             .small = "Small",
@@ -228,34 +229,37 @@ pub fn choiceOptions(
             "5,000 entries",
         }),
         .icon_theme => iconThemes(arena),
-        .terminal, .editor => blk: {
-            var out: std.ArrayList(Option) = .empty;
-            const terminal = choice == .terminal;
-            const list: []const settings_mod.Program = if (terminal)
-                &settings_mod.terminals
-            else
-                &settings_mod.editors;
-            const auto_cmd: []const u8 = if (terminal) run.autoTerminal() else run.autoEditor();
-            const auto_base = std.Io.Dir.path.basename(auto_cmd);
-            var auto_name: []const u8 = auto_base;
-            for (list) |program| if (std.mem.eql(u8, program.command, auto_base)) {
-                auto_name = program.title;
-            };
-            appendRow(Option, arena, &out, .{
-                .value = "",
-                .label = arena.printSentinel("Automatic ({s})", .{auto_name}, 0) catch "Automatic",
-            });
-            for (list) |program| {
-                if (proc.have(program.command)) {
-                    appendRow(Option, arena, &out, .{
-                        .value = program.command,
-                        .label = program.title,
-                    });
-                }
-            }
-            break :blk out.items;
-        },
+        .terminal => programOptions(arena, &settings_mod.terminals, run.autoTerminal()),
+        .editor => programOptions(arena, &settings_mod.editors, run.autoEditor()),
     };
+}
+
+/// "Automatic" with the program it finds (`automatic_command`), then the
+/// programs of `programs` that are installed.
+fn programOptions(
+    arena: std.mem.Allocator,
+    programs: []const settings_mod.Program,
+    automatic_command: []const u8,
+) []const Option {
+    var out: std.ArrayList(Option) = .empty;
+    const automatic_base = std.Io.Dir.path.basename(automatic_command);
+    var automatic_name: []const u8 = automatic_base;
+    for (programs) |program| if (std.mem.eql(u8, program.command, automatic_base)) {
+        automatic_name = program.title;
+    };
+    appendRow(Option, arena, &out, .{
+        .value = "",
+        .label = arena.printSentinel("Automatic ({s})", .{automatic_name}, 0) catch "Automatic",
+    });
+    for (programs) |program| {
+        if (proc.have(program.command)) {
+            appendRow(Option, arena, &out, .{
+                .value = program.command,
+                .label = program.title,
+            });
+        }
+    }
+    return out.items;
 }
 
 /// The options of a setting stored as one of `Enum`'s tags, in the tags'
@@ -298,6 +302,7 @@ fn numberOptions(
 /// alias.
 const icon_folders_not_themes = [_][]const u8{ "hicolor", "default" };
 
+/// Whether the icon folder `name` is one of `icon_folders_not_themes`.
 fn notAnIconTheme(name: []const u8) bool {
     for (icon_folders_not_themes) |folder| {
         if (std.mem.eql(u8, name, folder)) return true;
@@ -328,25 +333,26 @@ fn iconThemes(arena: std.mem.Allocator) []const Option {
     }
     for (roots.items) |root| {
         const root_z = arena.dupeSentinel(u8, root, 0) catch continue;
-        const dir = c.g_dir_open(root_z.ptr, 0, null) orelse continue;
-        defer c.g_dir_close(dir);
-        while (c.g_dir_read_name(dir)) |name_c| {
-            const name = std.mem.span(name_c);
+        const folder = c.g_dir_open(root_z.ptr, 0, null) orelse continue;
+        defer c.g_dir_close(folder);
+        while (c.g_dir_read_name(folder)) |name_z| {
+            const name = std.mem.span(name_z);
             if (notAnIconTheme(name)) continue;
-            var dup = false;
-            for (out.items) |option| dup = dup or std.mem.eql(u8, option.value, name);
-            if (dup) continue;
+            var listed = false;
+            for (out.items) |option| listed = listed or std.mem.eql(u8, option.value, name);
+            if (listed) continue;
             const index_path = arena.printSentinel(
                 "{s}/{s}/index.theme",
                 .{ root, name },
                 0,
             ) catch continue;
-            var buf: [8192]u8 = undefined;
-            const text = os.readHead(index_path.ptr, &buf);
+            var index_head: [8192]u8 = undefined;
+            const text = os.readHead(index_path.ptr, &index_head);
             if (std.mem.find(u8, text, "\nDirectories=") == null) continue;
             var label: []const u8 = name;
-            if (std.mem.find(u8, text, "\nName=")) |at| {
-                const rest = text[at + 6 ..];
+            const name_key = "\nName=";
+            if (std.mem.find(u8, text, name_key)) |name_at| {
+                const rest = text[name_at + name_key.len ..];
                 label = rest[0 .. std.mem.findScalar(u8, rest, '\n') orelse rest.len];
             }
             out.append(arena, .{
@@ -360,15 +366,16 @@ fn iconThemes(arena: std.mem.Allocator) []const Option {
 
 /// The current value of a choice, as shown.
 pub fn choiceLabel(ui: *Ui, arena: std.mem.Allocator, choice: settings_mod.Choice) [:0]const u8 {
-    var buf: [32]u8 = undefined;
-    const value = ui.settings.choiceValue(choice, &buf);
-    for (choiceOptions(ui, arena, choice)) |option| {
+    var value_bytes: [32]u8 = undefined;
+    const value = ui.settings.choiceValue(choice, &value_bytes);
+    for (choiceOptions(arena, choice)) |option| {
         if (std.mem.eql(u8, option.value, value)) return option.label;
     }
     // Set by hand to something not offered (not installed, unusual value).
     return arena.dupeSentinel(u8, value, 0) catch "";
 }
 
+/// The choose view's title for a setting: the setting's row title.
 pub fn chooseTitle(choice: settings_mod.Choice) []const u8 {
     return switch (choice) {
         .text_size => "Text Size",
@@ -384,6 +391,7 @@ pub fn chooseTitle(choice: settings_mod.Choice) []const u8 {
     };
 }
 
+/// The choose view's title for what it lists values for.
 fn writeChooseTitle(
     ui: *Ui,
     writer: *std.Io.Writer,
@@ -405,6 +413,7 @@ fn writeChooseTitle(
     }
 }
 
+/// What the choose view lists values for next; frees the file it chose for.
 pub fn setChoosing(ui: *Ui, next: Ui.Choosing) void {
     if (ui.choosing == .file) {
         ui.gpa.free(ui.choosing.file.path);
@@ -416,21 +425,22 @@ pub fn setChoosing(ui: *Ui, next: Ui.Choosing) void {
     // than dropped, because an empty title tells the user nothing: the
     // writer is full, and what it holds is kept.
     writeChooseTitle(ui, &writer, next) catch {};
-    const title_len = core.utf8.validPrefix(writer.buffered()).len;
-    ui.choose_title[title_len] = 0;
+    const title_length = core.utf8.validPrefix(writer.buffered()).len;
+    ui.choose_title[title_length] = 0;
 }
 
+/// The choose view's rows: the values of what it was opened for.
 pub fn chooseCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
     var out: std.ArrayList(Item) = .empty;
     switch (ui.choosing) {
         .none => {},
         .setting => |choice| {
-            var buf: [32]u8 = undefined;
-            const current = ui.settings.choiceValue(choice, &buf);
-            for (choiceOptions(ui, arena, choice)) |option| out.append(
-                arena,
-                pickRow(arena, option, current) catch break,
-            ) catch break;
+            var value_bytes: [32]u8 = undefined;
+            const current = ui.settings.choiceValue(choice, &value_bytes);
+            for (choiceOptions(arena, choice)) |option| {
+                const row = pickRow(arena, option, current) catch break;
+                out.append(arena, row) catch break;
+            }
         },
         .kind => |kind| appOptions(
             ui,
@@ -451,7 +461,7 @@ pub fn chooseCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
 /// app can be told to open anything). `open_now`: rows open the file
 /// instead of saving a choice.
 pub fn appOptions(
-    self: *Ui,
+    ui: *Ui,
     arena: std.mem.Allocator,
     out: *std.ArrayList(Item),
     mime: [:0]const u8,
@@ -459,13 +469,12 @@ pub fn appOptions(
     open_now: bool,
 ) void {
     if (!open_now) {
-        const def = c.g_app_info_get_default_for_type(mime, 0);
-        defer if (def) |default_app| c.g_object_unref(default_app);
-        const name: [:0]const u8 = if (def) |default_app| (arena.dupeSentinel(
-            u8,
-            std.mem.span(c.g_app_info_get_display_name(default_app) orelse ""),
-            0,
-        ) catch "") else "none set";
+        const system_default = c.g_app_info_get_default_for_type(mime, 0);
+        defer if (system_default) |app_info| c.g_object_unref(app_info);
+        const name: [:0]const u8 = if (system_default) |app_info| blk: {
+            const display_name = c.g_app_info_get_display_name(app_info) orelse "";
+            break :blk arena.dupeSentinel(u8, std.mem.span(display_name), 0) catch "";
+        } else "none set";
         out.append(arena, .{
             .key = "pick:",
             .title = "System Default",
@@ -480,21 +489,20 @@ pub fn appOptions(
         defer c.g_list_free_full(list, &c.g_object_unref);
         var node: ?*c.GList = list;
         while (node) |list_node| : (node = list_node.next) {
-            const info: *c.GAppInfo = @ptrCast(@alignCast(list_node.data));
-            const id = arena.dupe(u8, std.mem.span(
-                c.g_app_info_get_id(info) orelse continue,
-            )) catch continue;
+            const app_info: *c.GAppInfo = @ptrCast(@alignCast(list_node.data));
+            const app_id = c.g_app_info_get_id(app_info) orelse continue;
+            const id = arena.dupe(u8, std.mem.span(app_id)) catch continue;
             declared.put(arena, id, {}) catch {
                 log.warn("out of memory: an app may list under Other Apps", .{});
             };
         }
     }
     for ([_]bool{ true, false }) |want_declared| {
-        for (self.apps.items) |app| {
-            const info = app.action.app;
-            const id = std.mem.span(c.g_app_info_get_id(info) orelse continue);
+        for (ui.apps.items) |app| {
+            const app_info = app.action.app;
+            const id = std.mem.span(c.g_app_info_get_id(app_info) orelse continue);
             if (declared.contains(id) != want_declared) continue;
-            const idz = arena.dupeSentinel(u8, id, 0) catch continue;
+            const id_z = arena.dupeSentinel(u8, id, 0) catch continue;
             out.append(arena, .{
                 .key = arena.print("pick:{s}", .{id}) catch "",
                 .section = if (want_declared) "Recommended" else "Other Apps",
@@ -503,53 +511,59 @@ pub fn appOptions(
                 .accessory = if (current != null and std.mem.eql(u8, current.?, id)) "✓" else "",
                 .icon = app.icon,
                 .keywords = app.keywords,
-                .action = .{ .setting = if (open_now) .{ .open_with = idz } else .{ .pick = idz } },
+                .action = .{
+                    .setting = if (open_now) .{ .open_with = id_z } else .{ .pick = id_z },
+                },
             }) catch return;
         }
     }
 }
 
+/// The name of the app with desktop id `id`, else the id itself.
 pub fn appName(ui: *Ui, arena: std.mem.Allocator, id: []const u8) [:0]const u8 {
     for (ui.apps.items) |app| {
-        const aid = std.mem.span(c.g_app_info_get_id(app.action.app) orelse continue);
-        if (std.mem.eql(u8, aid, id)) return app.title;
+        const app_id = std.mem.span(c.g_app_info_get_id(app.action.app) orelse continue);
+        if (std.mem.eql(u8, app_id, id)) return app.title;
     }
     return arena.dupeSentinel(u8, id, 0) catch "";
 }
 
+/// The Default Apps row's value: how many kinds have an app chosen.
 pub fn defaultAppsSummary(ui: *Ui, arena: std.mem.Allocator) [:0]const u8 {
     const count = ui.settings.open_with.count();
     if (count == 0) return "System Defaults";
     return arena.printSentinel("{d} chosen", .{count}, 0) catch "";
 }
 
+/// The Default Apps view: a row per file kind, then the extensions the
+/// settings file names.
 pub fn defaultAppsCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
     var out: std.ArrayList(Item) = .empty;
-    for (std.enums.values(Kind)) |k| {
-        const chosen = ui.settings.open_with.get(@tagName(k));
+    for (std.enums.values(Kind)) |kind| {
+        const chosen = ui.settings.open_with.get(@tagName(kind));
         const accessory: [:0]const u8 = if (chosen) |id| appName(ui, arena, id) else blk: {
-            const def = c.g_app_info_get_default_for_type(
-                k.sampleMime(),
-                0,
-            ) orelse break :blk "System Default";
-            defer c.g_object_unref(def);
+            const mime = kind.sampleMime();
+            const system_default = c.g_app_info_get_default_for_type(mime, 0) orelse {
+                break :blk "System Default";
+            };
+            defer c.g_object_unref(system_default);
             break :blk arena.printSentinel(
                 "System: {s}",
-                .{c.g_app_info_get_display_name(def) orelse ""},
+                .{c.g_app_info_get_display_name(system_default) orelse ""},
                 0,
             ) catch "";
         };
         out.append(arena, .{
-            .key = arena.print("kind:{t}", .{k}) catch "",
+            .key = arena.print("kind:{t}", .{kind}) catch "",
             .section = "File Kinds",
-            .title = k.title(),
+            .title = kind.title(),
             .accessory = accessory,
             .icon = .{ .tile = .{
-                .name = k.icon(),
+                .name = kind.icon(),
                 .color = if (chosen != null) .blue else .gray,
             } },
-            .keywords = @tagName(k),
-            .action = .{ .setting = .{ .kind = k } },
+            .keywords = @tagName(kind),
+            .action = .{ .setting = .{ .kind = kind } },
         }) catch break;
     }
     // Extensions set by hand in the file: shown, changed there.
@@ -567,6 +581,7 @@ pub fn defaultAppsCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
     return out.items;
 }
 
+/// The Change Theme view: the styles, Automatic, then the themes by section.
 pub fn themeCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
     var out: std.ArrayList(Item) = .empty;
     styleCandidates(ui, arena, &out);
@@ -618,10 +633,10 @@ fn styleCandidates(ui: *Ui, arena: std.mem.Allocator, out: *std.ArrayList(Item))
         ) catch return;
     }
     for (custom) |name| {
-        const sub = arena.printSentinel("~/.config/lumen/styles/{s}", .{name}, 0) catch "";
+        const subtitle = arena.printSentinel("~/.config/lumen/styles/{s}", .{name}, 0) catch "";
         out.append(
             arena,
-            styleItem(arena, name, titleOf(arena, name), sub, "Custom", current),
+            styleItem(arena, name, titleOf(arena, name), subtitle, "Custom", current),
         ) catch return;
     }
 }
@@ -634,18 +649,19 @@ fn styleTitle(arena: std.mem.Allocator, id: []const u8) [:0]const u8 {
     return titleOf(arena, id);
 }
 
+/// A folder name as a title: "my-style" is "My Style".
 fn titleOf(arena: std.mem.Allocator, name: []const u8) [:0]const u8 {
     const out = arena.allocSentinel(u8, name.len, 0) catch return "";
     var start = true;
-    for (name, 0..) |choice, i| {
-        out[i] = if (choice == '-' or choice == '_') ' ' else if (start) std.ascii.toUpper(
-            choice,
-        ) else choice;
-        start = choice == '-' or choice == '_';
+    for (name, 0..) |character, i| {
+        const separator = character == '-' or character == '_';
+        out[i] = if (separator) ' ' else if (start) std.ascii.toUpper(character) else character;
+        start = separator;
     }
     return out;
 }
 
+/// Whether `name` is one of `names`.
 fn has(names: []const [:0]const u8, name: []const u8) bool {
     for (names) |known| if (std.mem.eql(u8, known, name)) return true;
     return false;
@@ -692,6 +708,7 @@ fn themeItem(
     };
 }
 
+/// A theme's colours as a row icon.
 pub fn swatchOf(theme: *const themes.Theme) item_mod.Icon {
     return .{ .swatch = .{
         .id = theme.id,
@@ -701,7 +718,6 @@ pub fn swatchOf(theme: *const themes.Theme) item_mod.Icon {
     } };
 }
 
-/// Applies what a settings row does.
 /// A value picked in the choose view, for what it was opened for.
 fn pick(ui: *Ui, value: [:0]const u8) void {
     switch (ui.choosing) {
@@ -734,11 +750,11 @@ fn openWith(ui: *Ui, id: [:0]const u8, choice: OpenWithChoice) void {
     const file = ui.choosing.file;
     if (choice == .as_default) {
         const name = std.Io.Dir.path.basename(file.path);
-        var extension_buf: [16]u8 = undefined;
+        var extension_bytes: [16]u8 = undefined;
         const key: []const u8 = if (core.file_kind.of(file.mime, name, .file)) |kind|
             @tagName(kind)
         else
-            core.file_kind.extKey(&extension_buf, name);
+            core.file_kind.extKey(&extension_bytes, name);
         if (key.len > 0) {
             if (ui.settings.setOpenWith(key, id)) {
                 ui.saveSettings();
@@ -751,13 +767,19 @@ fn openWith(ui: *Ui, id: [:0]const u8, choice: OpenWithChoice) void {
     ui.hide();
 }
 
-pub fn performSetting(ui: *Ui, setting: item_mod.Setting, op: item_mod.Op) void {
-    const locked: ?[]const u8 = switch (setting) {
+/// The settings key a row changes, when it changes one: init.lua may have
+/// fixed it.
+fn lockKey(setting: item_mod.Setting) ?[]const u8 {
+    return switch (setting) {
         .theme => @tagName(settings_mod.Text.theme),
         .style => @tagName(settings_mod.Text.style),
         else => settingName(setting),
     };
-    if (locked) |key| if (ui.overridden(key)) return ui.showFailure("Set in init.lua");
+}
+
+/// Applies what a settings row does.
+pub fn performSetting(ui: *Ui, setting: item_mod.Setting, operation: item_mod.Op) void {
+    if (lockKey(setting)) |key| if (ui.overridden(key)) return ui.showFailure("Set in init.lua");
     switch (setting) {
         .toggle => |toggle| {
             ui.settings.setToggle(toggle, !ui.settings.get(toggle));
@@ -767,8 +789,8 @@ pub fn performSetting(ui: *Ui, setting: item_mod.Setting, op: item_mod.Op) void 
         },
         .choose => |choice| {
             setChoosing(ui, .{ .setting = choice });
-            var buf: [32]u8 = undefined;
-            ui.setReselect("pick:{s}", .{ui.settings.choiceValue(choice, &buf)});
+            var value_bytes: [32]u8 = undefined;
+            ui.setReselect("pick:{s}", .{ui.settings.choiceValue(choice, &value_bytes)});
             ui.navigate(.choose);
         },
         .kind => |kind| {
@@ -795,11 +817,13 @@ pub fn performSetting(ui: *Ui, setting: item_mod.Setting, op: item_mod.Op) void 
             ui.setReselect("style:{s}", .{id});
             ui.rebuild();
         },
-        .open_with => |id| openWith(ui, id, if (op == .always_use) .as_default else .once),
+        .open_with => |id| {
+            openWith(ui, id, if (operation == .always_use) .as_default else .once);
+        },
         .open_file => {
             // Write the defaults first: an empty editor helps nobody.
             if (os.info(ui.settings_path.ptr) == null) ui.saveSettings();
-            run.openFile(ui.actionCtx(), ui.settings_path, .file);
+            run.openFile(ui.actionContext(), ui.settings_path, .file);
             ui.hide();
         },
         .ext_prefs => |id| prefs_view.open(ui, id),
@@ -807,8 +831,8 @@ pub fn performSetting(ui: *Ui, setting: item_mod.Setting, op: item_mod.Op) void 
         .save_input => prefs_view.saveInput(ui),
         .field => |field_index| form_view.edit(ui, field_index),
         .submit_form => form_view.submit(ui),
-        .ext_open => |dir| {
-            run.openFile(ui.actionCtx(), dir, .folder);
+        .ext_open => |folder| {
+            run.openFile(ui.actionContext(), folder, .folder);
             ui.hide();
         },
         .ext_update => |id| {
@@ -816,15 +840,18 @@ pub fn performSetting(ui: *Ui, setting: item_mod.Setting, op: item_mod.Op) void 
             Ui.installer.update(ui, null, id);
         },
         .ext_uninstall => |id| Ui.installer.uninstall(ui, null, id),
-        .reset => {
-            ui.settings.deinit();
-            ui.settings = Settings.init(ui.gpa);
-            ui.applyOverrides();
-            ui.saveSettings();
-            ui.setReselect("set:reset", .{});
-            ui.rebuild();
-        },
+        .reset => resetSettings(ui),
     }
+}
+
+/// Every setting back to its default, but for what init.lua fixes.
+fn resetSettings(ui: *Ui) void {
+    ui.settings.deinit();
+    ui.settings = Settings.init(ui.gpa);
+    ui.applyOverrides();
+    ui.saveSettings();
+    ui.setReselect("set:reset", .{});
+    ui.rebuild();
 }
 
 /// Open With for a file from the files or contents view.
@@ -852,7 +879,7 @@ test "every listed choice is a value Settings accepts" {
         .text_size, .opacity, .position, .width, .height, .density, .clipboard_keep,
     };
     for (fixed_choices) |choice| {
-        const options = choiceOptions(undefined, std.testing.allocator, choice);
+        const options = choiceOptions(std.testing.allocator, choice);
         try std.testing.expect(options.len > 0);
         for (options) |option| {
             try std.testing.expect(settings.setChoice(choice, option.value));

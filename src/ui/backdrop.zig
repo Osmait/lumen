@@ -78,7 +78,7 @@ pub fn hideBackdrops(ui: *Ui) void {
     for (ui.backdrops) |slot| if (slot) |backdrop| gtk.setVisible(backdrop, false);
 }
 
-/// Whether the window point (x, y) falls on `w` (shown).
+/// Whether the window point (x, y) falls on `piece`, when it shows.
 pub fn isOn(ui: *Ui, piece: anytype, x: f64, y: f64) bool {
     const widget = gtk.widget(piece);
     if (!gtk.isVisible(widget)) return false;

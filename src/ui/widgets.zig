@@ -17,36 +17,36 @@ const layout_mod = @import("../layout.zig");
 /// A small picture of a theme: its background, two lines of text and an
 /// accent dot. Each set of colours is drawn once and cached, init.lua's
 /// themes included, until the cache is full.
-pub fn swatchTexture(bg: u24, fg: u24, accent: u24) ?*c.GdkTexture {
+pub fn swatchTexture(background: u24, foreground: u24, accent: u24) ?*c.GdkTexture {
     const Cache = struct {
         var ring: TextureRing(swatch.cache_entries, u72) = .{};
     };
-    const colors = (@as(u72, bg) << 48) | (@as(u72, fg) << 24) | accent;
+    const colors = (@as(u72, background) << 48) | (@as(u72, foreground) << 24) | accent;
     if (Cache.ring.get(colors)) |texture| return texture;
-    const size = swatch.size_px;
-    var pixels: [size * size * swatch.bytes_per_pixel]u8 = undefined;
+    const side_px = swatch.size_px;
+    var pixels: [side_px * side_px * swatch.bytes_per_pixel]u8 = undefined;
     const radius = swatch.corner_radius_px;
-    for (0..size) |y| for (0..size) |x| {
+    for (0..side_px) |y| for (0..side_px) |x| {
         const center_x: f32 = @as(f32, @floatFromInt(x)) + 0.5;
         const center_y: f32 = @as(f32, @floatFromInt(y)) + 0.5;
         // Rounded square: distance outside the inner rectangle.
-        const outside_x = @max(@max(radius - center_x, center_x - (size - radius)), 0);
-        const outside_y = @max(@max(radius - center_y, center_y - (size - radius)), 0);
+        const outside_x = @max(@max(radius - center_x, center_x - (side_px - radius)), 0);
+        const outside_y = @max(@max(radius - center_y, center_y - (side_px - radius)), 0);
         const distance = @sqrt(outside_x * outside_x + outside_y * outside_y);
         const coverage = std.math.clamp(radius - distance + 0.5, 0, 1);
         const edge = distance > radius - swatch.outline_px;
-        var color = bg;
+        var color = background;
         for (swatch.line_tops_px, swatch.line_rights_px) |top, right| {
             const on_line = y >= top and y < top + swatch.line_height_px and
                 x >= swatch.line_left_px and x < right;
-            if (on_line) color = fg;
+            if (on_line) color = foreground;
         }
         const dot_x = center_x - swatch.dot_center_x_px;
         const dot_y = center_y - swatch.dot_center_y_px;
         if (dot_x * dot_x + dot_y * dot_y <= swatch.dot_radius_px * swatch.dot_radius_px) {
             color = accent;
         }
-        const offset = (y * size + x) * swatch.bytes_per_pixel;
+        const offset = (y * side_px + x) * swatch.bytes_per_pixel;
         pixels[offset] = @intCast(color >> 16);
         pixels[offset + 1] = @intCast((color >> 8) & 0xff);
         pixels[offset + 2] = @intCast(color & 0xff);
@@ -61,8 +61,9 @@ pub fn swatchTexture(bg: u24, fg: u24, accent: u24) ?*c.GdkTexture {
     };
     const bytes = c.g_bytes_new(&pixels, pixels.len);
     defer c.g_bytes_unref(bytes);
-    const stride = size * swatch.bytes_per_pixel;
-    const texture = c.gdk_memory_texture_new(size, size, c.GDK_MEMORY_R8G8B8A8, bytes, stride);
+    const stride = side_px * swatch.bytes_per_pixel;
+    const format = c.GDK_MEMORY_R8G8B8A8;
+    const texture = c.gdk_memory_texture_new(side_px, side_px, format, bytes, stride);
     Cache.ring.put(colors, texture);
     return texture;
 }
@@ -104,8 +105,8 @@ pub const css_class = struct {
 
 /// Icons decoded from files, and grid pictures, kept for the next build:
 /// the same few show again and again.
-const file_icons_cached = 128;
-const grid_pictures_cached = 128;
+const file_icon_cache_entries = 128;
+const grid_picture_cache_entries = 128;
 /// A row's title and subtitle ask GTK for at most this many characters of
 /// width. The layer surface grows to its content's natural width, so an
 /// unbounded label would widen the whole window for one long title.
@@ -125,7 +126,7 @@ fn TextureRing(comptime capacity: usize, comptime Key: type) type {
     return struct {
         keys: [capacity]Key = undefined,
         textures: [capacity]?*c.GdkTexture = @splat(null),
-        len: usize = 0,
+        count: usize = 0,
         /// Next slot to reuse once full.
         next: usize = 0,
 
@@ -133,7 +134,7 @@ fn TextureRing(comptime capacity: usize, comptime Key: type) type {
 
         /// Null: not in the ring; null inside: known not to load.
         fn get(ring: *const Ring, key: Key) ??*c.GdkTexture {
-            for (ring.keys[0..ring.len], ring.textures[0..ring.len]) |slot_key, texture| {
+            for (ring.keys[0..ring.count], ring.textures[0..ring.count]) |slot_key, texture| {
                 if (slot_key == key) return texture;
             }
             return null;
@@ -141,10 +142,10 @@ fn TextureRing(comptime capacity: usize, comptime Key: type) type {
 
         /// Takes `texture`'s reference.
         fn put(ring: *Ring, key: Key, texture: ?*c.GdkTexture) void {
-            assert(ring.len <= capacity);
-            const slot = if (ring.len < capacity) ring.len else ring.next;
-            if (ring.len < capacity) {
-                ring.len += 1;
+            assert(ring.count <= capacity);
+            const slot = if (ring.count < capacity) ring.count else ring.next;
+            if (ring.count < capacity) {
+                ring.count += 1;
             } else {
                 ring.next = (ring.next + 1) % capacity;
             }
@@ -192,16 +193,16 @@ pub const RowLook = struct {
     parts: layout_mod.Parts(layout_mod.RowPart) = .{},
 };
 
-/// An image file as an icon, decoded at twice `size` (sharp on HiDPI) and
+/// An image file as an icon, decoded at twice `size_px` (sharp on HiDPI) and
 /// kept until the file changes: the same few icons show again and again.
 /// Decoded on the UI thread, so within the small `pictures.icon_limits`.
-fn fileTexture(path: [:0]const u8, size: c_int) ?*c.GdkTexture {
+fn fileTexture(path: [:0]const u8, size_px: c_int) ?*c.GdkTexture {
     const Cache = struct {
-        var ring: TextureRing(file_icons_cached, u64) = .{};
+        var ring: TextureRing(file_icon_cache_entries, u64) = .{};
     };
-    const key = fileKey(path.ptr, size * 2, size * 2) orelse return null;
+    const key = fileKey(path.ptr, size_px * 2, size_px * 2) orelse return null;
     if (Cache.ring.get(key)) |texture| return texture;
-    const decoded = pictures.decodeImage(path.ptr, size * 2, size * 2, pictures.icon_limits);
+    const decoded = pictures.decodeImage(path.ptr, size_px * 2, size_px * 2, pictures.icon_limits);
     defer if (decoded) |pixbuf| c.g_object_unref(pixbuf);
     const texture = if (decoded) |pixbuf| c.gdk_texture_new_for_pixbuf(pixbuf) else null;
     Cache.ring.put(key, texture);
@@ -227,10 +228,10 @@ pub fn itemRow(look: *const RowLook, item: Item, parts: *RowParts) *c.GtkListBox
             c.gtk_label_set_max_width_chars(title, row_text_width_chars_max);
             gtk.append(text, title);
             if (item.subtitle.len > 0 and look.show.subtitles) {
-                const sub = shortLabel(item.subtitle, "subtitle");
-                c.gtk_label_set_ellipsize(sub, c.PANGO_ELLIPSIZE_END);
-                c.gtk_label_set_max_width_chars(sub, row_text_width_chars_max);
-                gtk.append(text, sub);
+                const subtitle = shortLabel(item.subtitle, "subtitle");
+                c.gtk_label_set_ellipsize(subtitle, c.PANGO_ELLIPSIZE_END);
+                c.gtk_label_set_max_width_chars(subtitle, row_text_width_chars_max);
+                gtk.append(text, subtitle);
             }
             gtk.append(box, text);
         },
@@ -249,7 +250,7 @@ pub fn itemRow(look: *const RowLook, item: Item, parts: *RowParts) *c.GtkListBox
 }
 
 /// A grid cell: a picture (an image file, scaled down as it is decoded) or
-/// a large icon, and the title under it. `w` is the cell's width.
+/// a large icon, and the title under it. `width_px` is the cell's width.
 pub fn gridCell(look: *const RowLook, item: Item, width_px: c_int) *c.GtkWidget {
     // Ui keeps a cell at least a pixel wide, however narrow the layout.
     assert(width_px > 0);
@@ -264,10 +265,9 @@ pub fn gridCell(look: *const RowLook, item: Item, width_px: c_int) *c.GtkWidget 
     else
         null;
     const cached = if (key) |cache_key| GridPictures.ring.get(cache_key) else null;
-    const top = if (cached) |cached_texture| (if (cached_texture) |tex| cellPicture(
-        tex,
-        picture_height_px,
-    ) else null) else null;
+    // Cached as null: the picture did not decode, and the icon shows instead.
+    const cached_texture = cached orelse null;
+    const top = if (cached_texture) |texture| cellPicture(texture, picture_height_px) else null;
     const decode = key != null and cached == null;
     const shown = top orelse blk: {
         const icon = iconWidget(look, item.icon, @min(@divTrunc(width_px, 2), grid_icon_px_max));
@@ -293,12 +293,13 @@ pub fn gridCell(look: *const RowLook, item: Item, width_px: c_int) *c.GtkWidget 
     return gtk.widget(box);
 }
 
-fn cellPicture(tex: *c.GdkTexture, height_px: c_int) *c.GtkWidget {
-    const pic = gtk.pictureFromPaintable(tex);
-    c.gtk_picture_set_content_fit(pic, c.GTK_CONTENT_FIT_COVER);
-    gtk.setSizeRequest(pic, -1, height_px);
-    c.gtk_widget_set_overflow(gtk.widget(pic), c.GTK_OVERFLOW_HIDDEN);
-    return gtk.widget(pic);
+/// A grid cell's picture: `texture` cropped to fill the cell's width.
+fn cellPicture(texture: *c.GdkTexture, height_px: c_int) *c.GtkWidget {
+    const picture = gtk.pictureFromPaintable(texture);
+    c.gtk_picture_set_content_fit(picture, c.GTK_CONTENT_FIT_COVER);
+    gtk.setSizeRequest(picture, -1, height_px);
+    c.gtk_widget_set_overflow(gtk.widget(picture), c.GTK_OVERFLOW_HIDDEN);
+    return gtk.widget(picture);
 }
 
 /// Grid pictures. Every cell decoded its image on the UI thread, uncached,
@@ -308,7 +309,7 @@ fn cellPicture(tex: *c.GdkTexture, height_px: c_int) *c.GtkWidget {
 /// for the next build. A new build drops what the last one asked for and
 /// was not decoded yet.
 const GridPictures = struct {
-    var ring: TextureRing(grid_pictures_cached, u64) = .{};
+    var ring: TextureRing(grid_picture_cache_entries, u64) = .{};
 
     /// A cell waiting for its picture; its widgets are referenced until then.
     const Wait = struct { key: u64, height_px: c_int, box: *c.GtkBox, icon: *c.GtkWidget };
@@ -326,10 +327,10 @@ const GridPictures = struct {
         _ = c.g_object_ref(icon);
         wait.* = .{ .key = key, .height_px = height_px, .box = box, .icon = icon };
         const lane = &pictures.grid_lane;
-        pictures.requestPicture(path, width_px, height_px, lane, .back, &done, wait);
+        pictures.requestPicture(path, width_px, height_px, lane, .back, &requestCallback, wait);
     }
 
-    fn done(context: ?*anyopaque, decoded: ?*c.GdkPixbuf, current: bool) void {
+    fn requestCallback(context: ?*anyopaque, decoded: ?*c.GdkPixbuf, current: bool) void {
         const wait: *Wait = @ptrCast(@alignCast(context.?));
         defer {
             c.g_object_unref(wait.box);
@@ -364,10 +365,10 @@ pub fn calcRow(item: Item) *c.GtkListBoxRow {
     const box = hbox(0);
     c.gtk_box_set_homogeneous(box, 1);
 
-    var buf: [80:0]u8 = undefined;
+    var answer_bytes: [80:0]u8 = undefined;
     const value = std.fmt.parseFloat(f64, item.detail) catch 0;
-    const shown = core.calc.formatDisplay(&buf, value);
-    buf[shown.len] = 0;
+    const answer = core.calc.formatDisplay(&answer_bytes, value);
+    answer_bytes[answer.len] = 0;
 
     const left_tag: [:0]const u8 = if (item.subtitle.len > 0) item.subtitle else "Expression";
     const right_tag: [:0]const u8 = if (item.accessory.len > 0) item.accessory else "Answer";
@@ -375,7 +376,7 @@ pub fn calcRow(item: Item) *c.GtkListBoxRow {
     const arrow = label("→", "calc-arrow");
     c.gtk_label_set_xalign(arrow, 0.5);
     gtk.append(box, arrow);
-    gtk.append(box, calcSide(buf[0..shown.len :0], right_tag));
+    gtk.append(box, calcSide(answer_bytes[0..answer.len :0], right_tag));
     c.gtk_list_box_row_set_child(row, gtk.widget(box));
     return row;
 }
@@ -393,87 +394,97 @@ pub fn calcSide(value: [:0]const u8, tag: [:0]const u8) *c.GtkWidget {
     return gtk.widget(side);
 }
 
-pub fn iconWidget(look: *const RowLook, icon: item_mod.Icon, size: c_int) *c.GtkWidget {
+pub fn iconWidget(look: *const RowLook, icon: item_mod.Icon, size_px: c_int) *c.GtkWidget {
     switch (icon) {
         .logo => |logo| {
-            const texture = logos.texture(logo.name) orelse return iconWidget(look, .none, size);
-            const img = gtk.imageFromPaintable(texture);
-            c.gtk_image_set_pixel_size(img, if (logo.on_light) size - 6 else size);
-            gtk.addClass(img, if (logo.on_light) "logo-plate" else "logo");
-            gtk.setValign(img, c.GTK_ALIGN_CENTER);
-            return gtk.widget(img);
+            const texture = logos.texture(logo.name) orelse return iconWidget(look, .none, size_px);
+            const image = gtk.imageFromPaintable(texture);
+            c.gtk_image_set_pixel_size(image, if (logo.on_light) size_px - 6 else size_px);
+            gtk.addClass(image, if (logo.on_light) "logo-plate" else "logo");
+            gtk.setValign(image, c.GTK_ALIGN_CENTER);
+            return gtk.widget(image);
         },
         .gicon => |gicon| {
-            const img = gtk.imageFromGicon(gicon);
-            c.gtk_image_set_pixel_size(img, size);
-            gtk.addClass(img, css_class.app_icon);
-            return gtk.widget(img);
+            const image = gtk.imageFromGicon(gicon);
+            c.gtk_image_set_pixel_size(image, size_px);
+            gtk.addClass(image, css_class.app_icon);
+            return gtk.widget(image);
         },
         .tile => |tile| {
             if (look.renamed.get(tile.name)) |path| {
-                return iconWidget(look, .{ .file = path }, size);
+                return iconWidget(look, .{ .file = path }, size_px);
             }
-            const img = gtk.imageFromIconName(tile.name);
-            c.gtk_image_set_pixel_size(img, @divTrunc(size, 2) + 2);
-            gtk.addClass(img, "tile");
-            var cls: [24:0]u8 = undefined;
-            const name = std.mem.printSentinel(
-                &cls,
-                "tile-{t}",
-                .{tile.color},
-                0,
-            ) catch "tile-gray";
-            gtk.addClass(img, name.ptr);
-            gtk.setValign(img, c.GTK_ALIGN_CENTER);
-            return gtk.widget(img);
+            return tileIcon(tile, size_px);
         },
         .emoji => |emoji| return gtk.widget(label(emoji, "emoji")),
         .named => |name| {
-            if (look.renamed.get(name)) |path| return iconWidget(look, .{ .file = path }, size);
-            const img = gtk.imageFromIconName(name);
-            c.gtk_image_set_pixel_size(img, size);
-            gtk.addClass(img, css_class.app_icon);
-            return gtk.widget(img);
+            if (look.renamed.get(name)) |path| return iconWidget(look, .{ .file = path }, size_px);
+            const image = gtk.imageFromIconName(name);
+            c.gtk_image_set_pixel_size(image, size_px);
+            gtk.addClass(image, css_class.app_icon);
+            return gtk.widget(image);
         },
         .swatch => |colors| {
             const texture = swatchTexture(colors.bg, colors.fg, colors.accent) orelse {
-                return iconWidget(look, .none, size);
+                return iconWidget(look, .none, size_px);
             };
-            const img = gtk.imageFromPaintable(texture);
-            c.gtk_image_set_pixel_size(img, size);
-            gtk.setValign(img, c.GTK_ALIGN_CENTER);
-            return gtk.widget(img);
+            const image = gtk.imageFromPaintable(texture);
+            c.gtk_image_set_pixel_size(image, size_px);
+            gtk.setValign(image, c.GTK_ALIGN_CENTER);
+            return gtk.widget(image);
         },
-        .badge => |badge| {
-            const badge_label = label(badge.text, "badge");
-            c.gtk_label_set_xalign(badge_label, 0.5);
-            var cls: [24:0]u8 = undefined;
-            const name = std.mem.printSentinel(
-                &cls,
-                "badge-{t}",
-                .{badge.color},
-                0,
-            ) catch "badge-gray";
-            gtk.addClass(badge_label, name.ptr);
-            // Longer extensions get a smaller font so the tile keeps its size.
-            if (badge.text.len >= 4) gtk.addClass(badge_label, "badge-long");
-            gtk.setValign(badge_label, c.GTK_ALIGN_CENTER);
-            return gtk.widget(badge_label);
-        },
+        .badge => |badge| return badgeIcon(badge),
         .file => |path| {
-            const tex = fileTexture(path, size) orelse return iconWidget(look, .none, size);
-            const img = gtk.imageFromPaintable(tex);
-            c.gtk_image_set_pixel_size(img, size);
-            gtk.addClass(img, "file-icon");
-            gtk.setValign(img, c.GTK_ALIGN_CENTER);
-            return gtk.widget(img);
+            const texture = fileTexture(path, size_px) orelse {
+                return iconWidget(look, .none, size_px);
+            };
+            const image = gtk.imageFromPaintable(texture);
+            c.gtk_image_set_pixel_size(image, size_px);
+            gtk.addClass(image, "file-icon");
+            gtk.setValign(image, c.GTK_ALIGN_CENTER);
+            return gtk.widget(image);
         },
         .none => {
-            const img = gtk.imageFromIconName("application-x-executable");
-            c.gtk_image_set_pixel_size(img, size);
-            return gtk.widget(img);
+            const image = gtk.imageFromIconName("application-x-executable");
+            c.gtk_image_set_pixel_size(image, size_px);
+            return gtk.widget(image);
         },
     }
+}
+
+/// A symbolic icon on a tile of the tile's colour, half the icon's size.
+fn tileIcon(tile: @FieldType(item_mod.Icon, "tile"), size_px: c_int) *c.GtkWidget {
+    const image = gtk.imageFromIconName(tile.name);
+    c.gtk_image_set_pixel_size(image, @divTrunc(size_px, 2) + 2);
+    gtk.addClass(image, "tile");
+    var class_bytes: [24:0]u8 = undefined;
+    const class = std.mem.printSentinel(
+        &class_bytes,
+        "tile-{t}",
+        .{tile.color},
+        0,
+    ) catch "tile-gray";
+    gtk.addClass(image, class.ptr);
+    gtk.setValign(image, c.GTK_ALIGN_CENTER);
+    return gtk.widget(image);
+}
+
+/// A file extension's text on a tile of the badge's colour.
+fn badgeIcon(badge: @FieldType(item_mod.Icon, "badge")) *c.GtkWidget {
+    const badge_label = label(badge.text, "badge");
+    c.gtk_label_set_xalign(badge_label, 0.5);
+    var class_bytes: [24:0]u8 = undefined;
+    const class = std.mem.printSentinel(
+        &class_bytes,
+        "badge-{t}",
+        .{badge.color},
+        0,
+    ) catch "badge-gray";
+    gtk.addClass(badge_label, class.ptr);
+    // Longer extensions get a smaller font so the tile keeps its size.
+    if (badge.text.len >= 4) gtk.addClass(badge_label, "badge-long");
+    gtk.setValign(badge_label, c.GTK_ALIGN_CENTER);
+    return gtk.widget(badge_label);
 }
 
 // -------------------------------------------------------------- helpers
@@ -489,7 +500,7 @@ pub const vbox = gtk.vbox;
 pub fn label(text: [*:0]const u8, css: ?[*:0]const u8) *c.GtkLabel {
     const label_widget = gtk.label(text);
     c.gtk_label_set_xalign(label_widget, 0);
-    if (css) |cls| gtk.addClass(label_widget, cls);
+    if (css) |class| gtk.addClass(label_widget, class);
     return label_widget;
 }
 
@@ -502,11 +513,11 @@ pub const row_text_bytes_max = 512;
 /// A label for row text, cut to `row_text_bytes_max` bytes on a character boundary.
 fn shortLabel(text: [:0]const u8, css: ?[*:0]const u8) *c.GtkLabel {
     if (text.len <= row_text_bytes_max) return label(text, css);
-    var buf: [row_text_bytes_max + 1]u8 = undefined;
+    var shown: [row_text_bytes_max + 1]u8 = undefined;
     const length = core.utf8.floorBoundary(text, row_text_bytes_max);
-    @memcpy(buf[0..length], text[0..length]);
-    buf[length] = 0;
-    return label(buf[0..length :0], css);
+    @memcpy(shown[0..length], text[0..length]);
+    shown[length] = 0;
+    return label(shown[0..length :0], css);
 }
 
 test {

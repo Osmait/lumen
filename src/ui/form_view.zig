@@ -15,15 +15,16 @@ const settings_view = @import("settings_view.zig");
 
 const log = std.log.scoped(.ext);
 
+/// The open form's command, while it is still a form in the registry.
 fn command(ui: *Ui) ?*const Host.Command {
     const registry = ui.ext_registry orelse return null;
-    const cmd = registry.command(ui.form_cmd) orelse return null;
-    return if (cmd.mode == .form) cmd else null;
+    const form = registry.command(ui.form_command) orelse return null;
+    return if (form.mode == .form) form else null;
 }
 
 /// Opens form `index` with its fields at their defaults.
 pub fn open(ui: *Ui, index: Host.CommandIndex) void {
-    ui.form_cmd = index;
+    ui.form_command = index;
     reset(ui);
     ui.navigate(.form);
 }
@@ -31,8 +32,8 @@ pub fn open(ui: *Ui, index: Host.CommandIndex) void {
 /// Every field back to its default.
 pub fn reset(ui: *Ui) void {
     clear(ui);
-    const cmd = command(ui) orelse return;
-    for (cmd.fields) |form_field| {
+    const form = command(ui) orelse return;
+    for (form.fields) |form_field| {
         const field_value = ui.gpa.dupeSentinel(u8, form_field.default, 0) catch return;
         ui.form_values.append(ui.gpa, field_value) catch {
             ui.gpa.free(field_value);
@@ -61,25 +62,25 @@ pub fn setValue(ui: *Ui, field_index: Host.FieldIndex, field_value: []const u8) 
 }
 
 pub fn title(ui: *Ui) [*:0]const u8 {
-    const cmd = command(ui) orelse return "Form";
-    return cmd.title.ptr;
+    const form = command(ui) orelse return "Form";
+    return form.title.ptr;
 }
 
 pub fn field(ui: *Ui, field_index: Host.FieldIndex) ?*const Host.Pref {
-    const cmd = command(ui) orelse return null;
-    return cmd.field(field_index);
+    const form = command(ui) orelse return null;
+    return form.field(field_index);
 }
 
+/// A row per field with its value, then the Submit row.
 pub fn candidates(ui: *Ui, arena: std.mem.Allocator) []Item {
-    const cmd = command(ui) orelse return &.{};
+    const form = command(ui) orelse return &.{};
     var out: std.ArrayList(Item) = .empty;
-    for (cmd.fields, 0..) |*form_field, i| {
+    for (form.fields, 0..) |*form_field, i| {
         // A required field is marked with a star after its title.
-        const field_title = if (form_field.required) arena.printSentinel(
-            "{s} *",
-            .{form_field.title},
-            0,
-        ) catch form_field.title else form_field.title;
+        const field_title = if (form_field.required)
+            arena.printSentinel("{s} *", .{form_field.title}, 0) catch form_field.title
+        else
+            form_field.title;
         out.append(arena, .{
             .key = arena.print("field:{s}", .{form_field.name}) catch continue,
             .title = field_title,
@@ -93,7 +94,7 @@ pub fn candidates(ui: *Ui, arena: std.mem.Allocator) []Item {
     // (the next keystroke builds the rows again).
     out.append(arena, .{
         .key = "form:submit",
-        .title = cmd.submit_title,
+        .title = form.submit_title,
         .icon = .{ .tile = .{ .name = "document-send-symbolic", .color = .blue } },
         .action = .{ .setting = .submit_form },
     }) catch log.warn("out of memory: the form has no Submit row", .{});
@@ -131,27 +132,28 @@ const form_fields_max = Host.form_fields_max;
 
 /// The Submit row: required fields first, then the extension's submit.
 pub fn submit(ui: *Ui) void {
-    const cmd = command(ui) orelse return;
+    const form = command(ui) orelse return;
     const host = ui.ext_host orelse return;
     const registry = ui.ext_registry orelse return;
-    var buf: [form_fields_max]Host.FormValue = undefined;
-    assert(cmd.fields.len <= buf.len);
-    for (cmd.fields, 0..) |*form_field, i| {
+    var values: [form_fields_max]Host.FormValue = undefined;
+    assert(form.fields.len <= values.len);
+    for (form.fields, 0..) |*form_field, i| {
         const field_value = value(ui, .from(i));
         if (form_field.required and field_value.len == 0) {
-            const msg = ui.query_arena.allocator().printSentinel(
+            const message = ui.query_arena.allocator().printSentinel(
                 "Fill in {s} first",
                 .{form_field.title},
                 0,
             ) catch "Fill in the required fields";
-            return ui.showFailure(msg);
+            return ui.showFailure(message);
         }
-        buf[i] = .{
+        values[i] = .{
             .name = form_field.name,
             .value = field_value,
             .toggle = form_field.kind == .toggle,
         };
     }
-    ui.ext_act_gen = host.submit(registry.gen, ui.form_cmd, buf[0..cmd.fields.len]);
+    const form_values = values[0..form.fields.len];
+    ui.ext_act_generation = host.submit(registry.gen, ui.form_command, form_values);
     ui.showRunning();
 }

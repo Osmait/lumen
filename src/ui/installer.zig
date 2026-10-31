@@ -29,25 +29,26 @@ comptime {
 
 const Job = struct {
     ui: *Ui,
-    /// Null when started from Settings.
-    cmdline: ?*c.GApplicationCommandLine,
+    /// The caller's command line; null when started from Settings.
+    caller: ?*c.GApplicationCommandLine,
     subprocess: *c.GSubprocess,
     kind: Kind,
     name: core.FixedStr(extension_name_bytes_max) = .{},
     /// What removeTree deletes on failure: whole, never cut (see `start`).
-    dir: core.FixedStr(std.Io.Dir.max_path_bytes) = .{},
+    folder: core.FixedStr(std.Io.Dir.max_path_bytes) = .{},
 
-    fn nameSlice(j: *const Job) []const u8 {
-        return j.name.slice();
+    fn nameSlice(job: *const Job) []const u8 {
+        return job.name.slice();
     }
-    fn dirZ(j: *Job) [:0]const u8 {
-        return j.dir.slice();
+
+    fn folderPath(job: *Job) [:0]const u8 {
+        return job.folder.slice();
     }
 };
 
-/// The folder an extension `name` lives in, in `buf`.
-fn extDir(ui: *Ui, buf: []u8, name: []const u8) ?[:0]const u8 {
-    return std.mem.printSentinel(buf, "{s}/extensions/{s}", .{ ui.config_dir, name }, 0) catch null;
+/// The folder an extension `name` lives in, written to `out`.
+fn extensionFolder(ui: *Ui, out: []u8, name: []const u8) ?[:0]const u8 {
+    return std.mem.printSentinel(out, "{s}/extensions/{s}", .{ ui.config_dir, name }, 0) catch null;
 }
 
 /// What a repository's name carries that its extension's name does not:
@@ -58,7 +59,7 @@ const repository_prefixes = [_][]const u8{ "lumen-ext-", "lumen-extension-", "lu
 const repository_suffix = "-lumen";
 
 /// "https://github.com/me/lumen-weather.git" → "weather".
-pub fn nameFromUrl(buf: []u8, url: []const u8) []const u8 {
+pub fn nameFromUrl(out: []u8, url: []const u8) []const u8 {
     var trimmed = std.mem.trimEnd(u8, url, "/");
     if (std.mem.endsWith(u8, trimmed, git_suffix)) {
         trimmed = trimmed[0 .. trimmed.len - git_suffix.len];
@@ -74,27 +75,28 @@ pub fn nameFromUrl(buf: []u8, url: []const u8) []const u8 {
     if (with_suffix and trimmed.len > repository_suffix.len) {
         trimmed = trimmed[0 .. trimmed.len - repository_suffix.len];
     }
-    const length = @min(trimmed.len, buf.len);
-    for (trimmed[0..length], buf[0..length]) |ch, *o| {
-        const lower = std.ascii.toLower(ch);
-        o.* = if (std.ascii.isAlphanumeric(lower) or lower == '-' or lower == '_') lower else '-';
+    const length = @min(trimmed.len, out.len);
+    for (trimmed[0..length], out[0..length]) |character, *name_character| {
+        const lower = std.ascii.toLower(character);
+        const kept = std.ascii.isAlphanumeric(lower) or lower == '-' or lower == '_';
+        name_character.* = if (kept) lower else '-';
     }
-    return buf[0..length];
+    return out[0..length];
 }
 
-/// `fmt` in `buf`, cut to what fits, as valid UTF-8: it goes to the caller
-/// over D-Bus, whose strings must be.
-fn format(buf: []u8, comptime fmt: []const u8, args: anytype) [:0]const u8 {
-    var writer: std.Io.Writer = .fixed(buf[0 .. buf.len - 1]);
+/// `fmt` written to `out`, cut to what fits, as valid UTF-8: it goes to the
+/// caller over D-Bus, whose strings must be.
+fn format(out: []u8, comptime fmt: []const u8, args: anytype) [:0]const u8 {
+    var writer: std.Io.Writer = .fixed(out[0 .. out.len - 1]);
     // Full: what fits is kept, which is the cut this function promises.
     writer.print(fmt, args) catch {};
-    const valid_len = core.utf8.validPrefix(writer.buffered()).len;
-    buf[valid_len] = 0;
-    return buf[0..valid_len :0];
+    const valid_length = core.utf8.validPrefix(writer.buffered()).len;
+    out[valid_length] = 0;
+    return out[0..valid_length :0];
 }
 
-/// The end of `s` in at most `max` bytes, from a character on, after "..."
-/// when cut: the last lines git prints say why it failed. Formats as two
+/// The end of `text` in at most `bytes_max` bytes, from a character on,
+/// after "..." when cut: the last lines git prints say why it failed. Formats as two
 /// strings: `"{s}{s}"`.
 fn tail(text: []const u8, bytes_max: usize) struct { []const u8, []const u8 } {
     assert(bytes_max > 0);
@@ -108,21 +110,22 @@ fn tail(text: []const u8, bytes_max: usize) struct { []const u8, []const u8 } {
 /// A failure: to the caller's stderr (exit 1), or on the selected row.
 fn fail(
     ui: *Ui,
-    cmdline: ?*c.GApplicationCommandLine,
+    caller: ?*c.GApplicationCommandLine,
     comptime fmt: []const u8,
     args: anytype,
 ) void {
-    var buf: [failure_bytes_max]u8 = undefined;
-    const msg = format(&buf, fmt, args);
-    const command_line = cmdline orelse return note(ui, msg);
-    c.g_application_command_line_printerr(command_line, "lumen: %s\n", msg.ptr);
+    var message_bytes: [failure_bytes_max]u8 = undefined;
+    const message = format(&message_bytes, fmt, args);
+    const command_line = caller orelse return note(ui, message);
+    c.g_application_command_line_printerr(command_line, "lumen: %s\n", message.ptr);
     c.g_application_command_line_set_exit_status(command_line, 1);
 }
 
-/// The first line of `msg` on the selected row (Settings has no caller),
-/// now and again once the extensions have reloaded.
-fn note(ui: *Ui, msg: []const u8) void {
-    const line = std.mem.trim(u8, msg[0 .. std.mem.findScalar(u8, msg, '\n') orelse msg.len], " ");
+/// The first line of `message` on the selected row (Settings has no
+/// caller), now and again once the extensions have reloaded.
+fn note(ui: *Ui, message: []const u8) void {
+    const line_end = std.mem.findScalar(u8, message, '\n') orelse message.len;
+    const line = std.mem.trim(u8, message[0..line_end], " ");
     ui.after_reload.set(line);
     ui.after_reload_pending = true;
     ui.showFailure(ui.after_reload.slice());
@@ -130,16 +133,16 @@ fn note(ui: *Ui, msg: []const u8) void {
 
 pub fn install(
     ui: *Ui,
-    cmdline: ?*c.GApplicationCommandLine,
+    caller: ?*c.GApplicationCommandLine,
     url: []const u8,
-    as: ?[]const u8,
+    name_given: ?[]const u8,
 ) void {
-    var nbuf: [64]u8 = undefined;
-    const name = as orelse nameFromUrl(&nbuf, url);
+    var name_bytes: [64]u8 = undefined;
+    const name = name_given orelse nameFromUrl(&name_bytes, url);
     if (!Host.validId(name)) {
         return fail(
             ui,
-            cmdline,
+            caller,
             "\"{s}\" cannot be an extension name (a-z, 0-9, - and _); pick one with --as NAME",
             .{name},
         );
@@ -147,57 +150,58 @@ pub fn install(
     if (Host.reservedId(name)) {
         return fail(
             ui,
-            cmdline,
+            caller,
             "\"{s}\" is taken (init.lua and the style run as it); pick another with --as NAME",
             .{name},
         );
     }
-    var dbuf: [4096]u8 = undefined;
-    const dir = extDir(ui, &dbuf, name) orelse return fail(ui, cmdline, "path too long", .{});
-    if (os.info(dir) != null) {
-        return fail(ui, cmdline, "{s} already exists: lumen --update {s}, or --as another name", .{
-            dir,
+    var folder_bytes: [4096]u8 = undefined;
+    const folder = extensionFolder(ui, &folder_bytes, name) orelse {
+        return fail(ui, caller, "path too long", .{});
+    };
+    if (os.info(folder) != null) {
+        return fail(ui, caller, "{s} already exists: lumen --update {s}, or --as another name", .{
+            folder,
             name,
         });
     }
-    const parent = dir[0 .. std.mem.findScalarLast(u8, dir, '/') orelse dir.len];
+    const parent = folder[0 .. std.mem.findScalarLast(u8, folder, '/') orelse folder.len];
     os.mkdirP(parent) catch |err| {
-        return fail(ui, cmdline, "Could not make {s}: {t}", .{ parent, err });
+        return fail(ui, caller, "Could not make {s}: {t}", .{ parent, err });
     };
     var url_buffer: [2048]u8 = undefined;
     const url_z = std.mem.printSentinel(&url_buffer, "{s}", .{url}, 0) catch {
-        return fail(ui, cmdline, "URL too long", .{});
+        return fail(ui, caller, "URL too long", .{});
     };
     // "--": a URL starting with "-" is not an option.
-    var argv = [_:null]?[*:0]const u8{ "git", "clone", "--depth", "1", "--", url_z.ptr, dir.ptr };
-    start(ui, cmdline, .install, name, dir, &argv);
+    var argv = [_:null]?[*:0]const u8{
+        "git", "clone", "--depth", "1", "--", url_z.ptr, folder.ptr,
+    };
+    start(ui, caller, .install, name, folder, &argv);
 }
 
-pub fn update(ui: *Ui, cmdline: ?*c.GApplicationCommandLine, name: ?[]const u8) void {
-    var dbuf: [4096]u8 = undefined;
+pub fn update(ui: *Ui, caller: ?*c.GApplicationCommandLine, name: ?[]const u8) void {
+    var folder_bytes: [4096]u8 = undefined;
     if (name) |extension_name| {
         if (!Host.validId(extension_name)) {
-            return fail(ui, cmdline, "no extension named \"{s}\"", .{extension_name});
+            return fail(ui, caller, "no extension named \"{s}\"", .{extension_name});
         }
-        const dir = extDir(ui, &dbuf, extension_name) orelse return fail(
-            ui,
-            cmdline,
-            "path too long",
-            .{},
-        );
-        if (os.info(dir) == null) {
-            return fail(ui, cmdline, "no extension named \"{s}\"", .{extension_name});
+        const folder = extensionFolder(ui, &folder_bytes, extension_name) orelse {
+            return fail(ui, caller, "path too long", .{});
+        };
+        if (os.info(folder) == null) {
+            return fail(ui, caller, "no extension named \"{s}\"", .{extension_name});
         }
-        var argv = [_:null]?[*:0]const u8{ "git", "-C", dir.ptr, "pull", "--ff-only" };
-        return start(ui, cmdline, .update, extension_name, dir, &argv);
+        var argv = [_:null]?[*:0]const u8{ "git", "-C", folder.ptr, "pull", "--ff-only" };
+        return start(ui, caller, .update, extension_name, folder, &argv);
     }
     // Every extension that is a git checkout.
-    const dir = std.mem.printSentinel(
-        &dbuf,
+    const folder = std.mem.printSentinel(
+        &folder_bytes,
         "{s}/extensions",
         .{ui.config_dir},
         0,
-    ) catch return fail(ui, cmdline, "path too long", .{});
+    ) catch return fail(ui, caller, "path too long", .{});
     var argv = [_:null]?[*:0]const u8{
         "sh",           "-c",
         \\cd "$1" || exit 1
@@ -209,28 +213,30 @@ pub fn update(ui: *Ui, cmdline: ?*c.GApplicationCommandLine, name: ?[]const u8) 
         \\done
         \\exit $status
         ,
-        "lumen-update", dir.ptr,
+        "lumen-update", folder.ptr,
     };
-    start(ui, cmdline, .update, "", dir, &argv);
+    start(ui, caller, .update, "", folder, &argv);
 }
 
-pub fn uninstall(ui: *Ui, cmdline: ?*c.GApplicationCommandLine, name: []const u8) void {
-    if (!Host.validId(name)) return fail(ui, cmdline, "no extension named \"{s}\"", .{name});
-    var dbuf: [4096]u8 = undefined;
-    const dir = extDir(ui, &dbuf, name) orelse return fail(ui, cmdline, "path too long", .{});
-    if (os.info(dir) == null) {
-        return fail(ui, cmdline, "no extension named \"{s}\"", .{name});
+pub fn uninstall(ui: *Ui, caller: ?*c.GApplicationCommandLine, name: []const u8) void {
+    if (!Host.validId(name)) return fail(ui, caller, "no extension named \"{s}\"", .{name});
+    var folder_bytes: [4096]u8 = undefined;
+    const folder = extensionFolder(ui, &folder_bytes, name) orelse {
+        return fail(ui, caller, "path too long", .{});
+    };
+    if (os.info(folder) == null) {
+        return fail(ui, caller, "no extension named \"{s}\"", .{name});
     }
-    var argv = [_:null]?[*:0]const u8{ "rm", "-rf", "--", dir.ptr };
-    start(ui, cmdline, .uninstall, name, dir, &argv);
+    var argv = [_:null]?[*:0]const u8{ "rm", "-rf", "--", folder.ptr };
+    start(ui, caller, .uninstall, name, folder, &argv);
 }
 
 fn start(
     ui: *Ui,
-    cmdline: ?*c.GApplicationCommandLine,
+    caller: ?*c.GApplicationCommandLine,
     kind: Kind,
     name: []const u8,
-    dir: []const u8,
+    folder: []const u8,
     argv: [*:null]?[*:0]const u8,
 ) void {
     var err: ?*c.GError = null;
@@ -239,25 +245,25 @@ fn start(
         c.G_SUBPROCESS_FLAGS_STDOUT_PIPE | c.G_SUBPROCESS_FLAGS_STDERR_MERGE,
         &err,
     ) orelse {
-        const msg: []const u8 = if (err) |gerror| std.mem.span(gerror.message) else "cannot start";
-        fail(ui, cmdline, "{s}: {s}", .{ std.mem.span(argv[0].?), msg });
+        const reason = if (err) |gerror| std.mem.span(gerror.message) else "cannot start";
+        fail(ui, caller, "{s}: {s}", .{ std.mem.span(argv[0].?), reason });
         if (err) |gerror| c.g_error_free(gerror);
         return;
     };
     const job = ui.gpa.create(Job) catch {
         c.g_object_unref(subprocess);
-        return fail(ui, cmdline, "out of memory", .{});
+        return fail(ui, caller, "out of memory", .{});
     };
     job.* = .{
         .ui = ui,
-        .cmdline = if (cmdline) |command_line| @ptrCast(c.g_object_ref(command_line)) else null,
+        .caller = if (caller) |command_line| @ptrCast(c.g_object_ref(command_line)) else null,
         .subprocess = subprocess,
         .kind = kind,
     };
     job.name.set(name);
-    // extDir builds it in a buffer of this size: it always fits.
-    std.debug.assert(dir.len <= @TypeOf(job.dir).capacity);
-    job.dir.set(dir);
+    // extensionFolder builds it in a buffer of this size: it always fits.
+    std.debug.assert(folder.len <= @TypeOf(job.folder).capacity);
+    job.folder.set(folder);
     // As bytes: git prints file names and messages in any encoding, and the
     // UTF-8 variant fails on the first byte that is not.
     c.g_subprocess_communicate_async(subprocess, null, null, &onDone, job);
@@ -266,12 +272,10 @@ fn start(
 /// What the job printed, as UTF-8 (U+FFFD for what is not, NUL included):
 /// it goes to the caller over D-Bus and onto a row. Free with g_free.
 fn outputText(bytes: ?*c.GBytes) [:0]u8 {
-    var len: usize = 0;
-    const data: [*]const u8 = if (bytes) |data_bytes| c.g_bytes_get_data(
-        data_bytes,
-        &len,
-    ) orelse "" else "";
-    return std.mem.span(c.g_utf8_make_valid(data, @intCast(len)));
+    var length: usize = 0;
+    const received = if (bytes) |output| c.g_bytes_get_data(output, &length) else null;
+    const data: [*]const u8 = received orelse "";
+    return std.mem.span(c.g_utf8_make_valid(data, @intCast(length)));
 }
 
 /// What git says last on a failure, in bytes: the message has to fit 1 KB.
@@ -280,11 +284,11 @@ const failure_output_bytes_max = 800;
 fn onDone(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) void {
     const job: *Job = @ptrCast(@alignCast(data.?));
     const ui = job.ui;
-    const cmdline = job.cmdline;
+    const caller = job.caller;
     defer {
         c.g_object_unref(job.subprocess);
         // The caller's `lumen --install` returns once this is released.
-        if (cmdline) |command_line| c.g_object_unref(command_line);
+        if (caller) |command_line| c.g_object_unref(command_line);
         ui.gpa.destroy(job);
     }
     var out: ?*c.GBytes = null;
@@ -308,48 +312,60 @@ fn onDone(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
     if (!succeeded) {
         // A failed clone can leave half a folder behind, and the next
         // install would find it there.
-        if (job.kind == .install) removeTree(job.dirZ());
-        const why = if (err) |gerror| std.mem.span(gerror.message) else std.mem.trim(
-            u8,
-            output,
-            " \n",
-        );
+        if (job.kind == .install) removeTree(job.folderPath());
+        const why = if (err) |gerror|
+            std.mem.span(gerror.message)
+        else
+            std.mem.trim(u8, output, " \n");
         const end = tail(why, failure_output_bytes_max);
-        return fail(ui, cmdline, "{s} failed:\n{s}{s}", .{ @tagName(job.kind), end[0], end[1] });
+        return fail(ui, caller, "{s} failed:\n{s}{s}", .{ @tagName(job.kind), end[0], end[1] });
     }
+    reportSuccess(job, output);
+}
+
+/// The outcome of a job that succeeded: to the caller, or on the selected
+/// row.
+fn reportSuccess(job: *Job, output: [:0]const u8) void {
+    const ui = job.ui;
+    const caller = job.caller;
     switch (job.kind) {
         .install => {
-            var buf: [4200]u8 = undefined;
-            const init = std.mem.printSentinel(&buf, "{s}/init.lua", .{job.dirZ()}, 0) catch "";
-            if (os.info(init) == null) {
-                removeTree(job.dirZ());
+            var init_path_bytes: [4200]u8 = undefined;
+            const init_path = std.mem.printSentinel(
+                &init_path_bytes,
+                "{s}/init.lua",
+                .{job.folderPath()},
+                0,
+            ) catch "";
+            if (os.info(init_path) == null) {
+                removeTree(job.folderPath());
                 return fail(
                     ui,
-                    cmdline,
+                    caller,
                     "{s} has no init.lua: it is not a Lumen extension",
                     .{job.nameSlice()},
                 );
             }
             print(
                 ui,
-                cmdline,
+                caller,
                 "Installed {s} in {s}\nExtensions run as you: read its init.lua to know what it does.\n",
-                .{ job.nameSlice(), job.dirZ() },
+                .{ job.nameSlice(), job.folderPath() },
             );
         },
-        .update => if (cmdline != null) {
+        .update => if (caller != null) {
             const end = tail(if (output.len > 0) output else "Up to date\n", print_bytes_max - 8);
-            print(ui, cmdline, "{s}{s}", .{ end[0], end[1] });
+            print(ui, caller, "{s}{s}", .{ end[0], end[1] });
         } else {
-            // git's own lines are too long for a row: a summary.
+            // git's own lines are too long for a row: a summary shows instead.
             const none = output.len == 0 or std.mem.find(u8, output, "Already up to date") != null;
             note(ui, if (none) "Already up to date" else "Updated");
         },
-        .uninstall => print(ui, cmdline, "Removed {s}\n", .{job.nameSlice()}),
+        .uninstall => print(ui, caller, "Removed {s}\n", .{job.nameSlice()}),
     }
-    if (cmdline) |command_line| c.g_application_command_line_set_exit_status(command_line, 0);
+    if (caller) |command_line| c.g_application_command_line_set_exit_status(command_line, 0);
     // From Settings: the removed extension's page has nothing left to show.
-    if (cmdline == null and job.kind == .uninstall and ui.view == .prefs) ui.goBack();
+    if (caller == null and job.kind == .uninstall and ui.view == .prefs) ui.goBack();
 }
 
 /// What an install, update or removal prints: the success line and git's
@@ -360,21 +376,22 @@ const failure_bytes_max = 1024;
 /// Success: to the caller's stdout, or on the selected row.
 fn print(
     ui: *Ui,
-    cmdline: ?*c.GApplicationCommandLine,
+    caller: ?*c.GApplicationCommandLine,
     comptime fmt: []const u8,
     args: anytype,
 ) void {
-    var buf: [print_bytes_max]u8 = undefined;
-    const msg = format(&buf, fmt, args);
-    const command_line = cmdline orelse return note(ui, msg);
-    c.g_application_command_line_print(command_line, "%s", msg.ptr);
+    var message_bytes: [print_bytes_max]u8 = undefined;
+    const message = format(&message_bytes, fmt, args);
+    const command_line = caller orelse return note(ui, message);
+    c.g_application_command_line_print(command_line, "%s", message.ptr);
 }
 
-/// rm -rf, waited for (a fresh clone: small and local).
-fn removeTree(dir: [:0]const u8) void {
-    var argv = [_:null]?[*:0]const u8{ "rm", "-rf", "--", dir.ptr };
+/// Removes `folder` like rm -rf and waits for it: a fresh clone is small
+/// and local.
+fn removeTree(folder: [:0]const u8) void {
+    var argv = [_:null]?[*:0]const u8{ "rm", "-rf", "--", folder.ptr };
     var err: ?*c.GError = null;
-    if (c.g_spawn_sync(
+    const spawned = c.g_spawn_sync(
         null,
         @ptrCast(&argv),
         null,
@@ -385,9 +402,8 @@ fn removeTree(dir: [:0]const u8) void {
         null,
         null,
         &err,
-    ) == 0) {
-        proc.warnError(.install, err, "rm {s}", .{dir});
-    }
+    );
+    if (spawned == 0) proc.warnError(.install, err, "rm {s}", .{folder});
 }
 
 test "long output keeps its end, and messages stay valid UTF-8" {
@@ -398,26 +414,29 @@ test "long output keeps its end, and messages stay valid UTF-8" {
     const cut = tail("aaaaé fatal", 7);
     try std.testing.expectEqualStrings("...", cut[0]);
     try std.testing.expectEqualStrings(" fatal", cut[1]);
-    var buf: [8]u8 = undefined;
+    var message_bytes: [8]u8 = undefined;
     // Too long: what fits, never half a character.
-    try std.testing.expectEqualStrings("abcdé", format(&buf, "{s}", .{"abcdéé"}));
-    try std.testing.expectEqualStrings("ok", format(&buf, "{s}", .{"ok"}));
+    try std.testing.expectEqualStrings("abcdé", format(&message_bytes, "{s}", .{"abcdéé"}));
+    try std.testing.expectEqualStrings("ok", format(&message_bytes, "{s}", .{"ok"}));
 }
 
 test "extension names come from the repository" {
-    var buf: [64]u8 = undefined;
+    var name_bytes: [64]u8 = undefined;
     try std.testing.expectEqualStrings("weather", nameFromUrl(
-        &buf,
+        &name_bytes,
         "https://github.com/me/lumen-weather.git",
     ));
     try std.testing.expectEqualStrings("github", nameFromUrl(
-        &buf,
+        &name_bytes,
         "git@github.com:me/lumen-ext-github",
     ));
     try std.testing.expectEqualStrings("todo", nameFromUrl(
-        &buf,
+        &name_bytes,
         "https://codeberg.org/x/todo-lumen/",
     ));
-    try std.testing.expectEqualStrings("my-tool", nameFromUrl(&buf, "/home/me/src/My.Tool"));
-    try std.testing.expectEqualStrings("lumen", nameFromUrl(&buf, "https://github.com/x/lumen"));
+    try std.testing.expectEqualStrings("my-tool", nameFromUrl(&name_bytes, "/home/me/src/My.Tool"));
+    try std.testing.expectEqualStrings("lumen", nameFromUrl(
+        &name_bytes,
+        "https://github.com/x/lumen",
+    ));
 }
