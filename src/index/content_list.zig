@@ -65,7 +65,7 @@ pub fn list(
         "--no-messages",
         "--no-ignore-parent",
     });
-    for (excludes) |g| try argv.appendSlice(arena, &.{ "-g", g });
+    for (excludes) |glob| try argv.appendSlice(arena, &.{ "-g", glob });
     // Run inside the root and list ".": rg matches globs against the path it
     // prints, so with the root as argument a root below any excluded name
     // (a home in /srv/build, the tests' .zig-cache/tmp) listed nothing.
@@ -75,9 +75,9 @@ pub fn list(
 
     const sep = paths.separatorAfter(root);
     var docs: std.ArrayList(content.DocIn) = .empty;
-    var it = std.mem.tokenizeScalar(u8, out, 0);
+    var lines = std.mem.tokenizeScalar(u8, out, 0);
     var path_buffer: paths.Buffer = undefined;
-    while (it.next()) |line| {
+    while (lines.next()) |line| {
         const path_relative = if (std.mem.startsWith(u8, line, "./")) line[2..] else line;
         const path_z = std.mem.printSentinel(
             &path_buffer,
@@ -137,9 +137,9 @@ fn runLister(
         reader.fill(list_read_bytes_min, slice) catch |err| switch (err) {
             error.EndOfStream => break,
             error.Timeout => {},
-            else => |e| return e,
+            else => |other| return other,
         };
-        if (stop) |s| if (s.load(.acquire)) return error.Canceled;
+        if (stop) |stop_flag| if (stop_flag.load(.acquire)) return error.Canceled;
         if (sys.monotonicNs() >= deadline) return error.Timeout;
         if (reader.reader(0).buffered().len > list_output_bytes_max) return error.StreamTooLong;
     }
@@ -232,7 +232,7 @@ fn binaryByName(path: []const u8) bool {
         ".fbx",
         ".mov",
     };
-    for (exts) |e| if (std.ascii.endsWithIgnoreCase(path, e)) return true;
+    for (exts) |extension| if (std.ascii.endsWithIgnoreCase(path, extension)) return true;
     return false;
 }
 

@@ -171,7 +171,7 @@ pub fn startWith(
 pub fn shutdown(service: *ContentService) void {
     service.stop.store(true, .release);
     service.poke();
-    if (service.thread) |t| t.join();
+    if (service.thread) |thread| thread.join();
     if (service.index) |*index| index.deinit(service.gpa);
     service.worker.retry_arena.deinit();
     service.gpa.free(service.root);
@@ -970,8 +970,10 @@ fn run(service: *ContentService) void {
     service.refresh();
     while (!service.stop.load(.acquire)) {
         // Sleep until the next periodic check; `poke` and `shutdown` wake
-        // the thread sooner. The wait cannot be canceled: this thread is
-        // joined, never canceled.
+        // the thread sooner. The wait's only error is cancelation, which
+        // never comes (this thread is joined, never canceled); waking early
+        // for any reason is harmless, since the loop looks at `stop` and
+        // the clock either way.
         const since_check_ns = sys.monotonicNs() - service.counters.last_check_ns.load(.acquire);
         const due_ns = service.opts.refresh_interval_ns -| since_check_ns;
         service.io.futexWaitTimeout(u32, &service.wake.raw, seen, .{ .duration = .{

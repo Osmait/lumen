@@ -145,20 +145,20 @@ pub fn scan(
     watcher: ?*Watcher,
     stats: ?*Stats,
 ) std.mem.Allocator.Error!Store {
-    const t0 = sys.monotonicNs();
-    var st: Stats = .{};
-    var b: Builder = .empty;
-    errdefer b.deinit(gpa);
+    const start_ns = sys.monotonicNs();
+    var totals: Stats = .{};
+    var builder: Builder = .empty;
+    errdefer builder.deinit(gpa);
 
     var frontier: std.ArrayList(Frontier) = .empty;
     defer {
-        for (frontier.items) |f| gpa.free(f.path);
+        for (frontier.items) |folder| gpa.free(folder.path);
         frontier.deinit(gpa);
     }
     // Level 0: the roots, whose "name" is their absolute path.
     for (cfg.roots) |root| {
-        const id = try b.push(gpa, root, store_mod.no_parent, store_mod.flag_dir, 0);
-        st.dirs += 1;
+        const id = try builder.push(gpa, root, store_mod.no_parent, store_mod.flag_dir, 0);
+        totals.dirs += 1;
         try frontier.append(gpa, .{
             .id = id,
             .path = try gpa.dupeSentinel(u8, root, 0),
@@ -169,19 +169,19 @@ pub fn scan(
     var depth: u16 = 1;
     while (frontier.items.len > 0 and depth <= cfg.depth_max) : (depth +|= 1) {
         const follow = depth == 1 and cfg.follow_roots;
-        if (watcher) |w| {
+        if (watcher) |inotify| {
             const placement: Watcher.Placement = if (follow) .root else .below_root;
             for (frontier.items) |folder| {
-                try w.watchBestEffort(gpa, folder.path, folder.id, placement);
+                try inotify.watchBestEffort(gpa, folder.path, folder.id, placement);
             }
         }
 
         const batches = try gpa.alloc(Batch, frontier.items.len);
         defer {
-            for (batches) |*bt| bt.deinit(gpa);
+            for (batches) |*batch| batch.deinit(gpa);
             gpa.free(batches);
         }
-        for (batches) |*bt| bt.* = .{};
+        for (batches) |*batch| batch.* = .{};
         var ctx: LevelCtx = .{
             .gpa = gpa,
             .cfg = cfg,
@@ -193,23 +193,23 @@ pub fn scan(
 
         var next: std.ArrayList(Frontier) = .empty;
         errdefer {
-            for (next.items) |f| gpa.free(f.path);
+            for (next.items) |folder| gpa.free(folder.path);
             next.deinit(gpa);
         }
         const level: Level = .{ .depth = depth, .descend = depth < cfg.depth_max };
-        try addLevel(gpa, &b, frontier.items, batches, level, &next, &st);
-        for (frontier.items) |f| gpa.free(f.path);
+        try addLevel(gpa, &builder, frontier.items, batches, level, &next, &totals);
+        for (frontier.items) |folder| gpa.free(folder.path);
         frontier.deinit(gpa);
         frontier = next;
-        if (b.len() > cfg.entries_max) {
-            st.truncated = true;
+        if (builder.len() > cfg.entries_max) {
+            totals.truncated = true;
             break;
         }
     }
 
-    st.ns = sys.monotonicNs() - t0;
-    if (stats) |s| s.* = st;
-    return b.finish(gpa);
+    totals.ns = sys.monotonicNs() - start_ns;
+    if (stats) |stats_out| stats_out.* = totals;
+    return builder.finish(gpa);
 }
 
 fn readOne(ctx: *LevelCtx, i: usize) void {
@@ -228,8 +228,8 @@ fn readOne(ctx: *LevelCtx, i: usize) void {
 /// per inotify event, under the lock) is a binary search instead of a walk
 /// over every sibling (100k names per event in a folder of 100k files).
 fn sortBatch(gpa: std.mem.Allocator, batch: *Batch) std.mem.Allocator.Error!void {
-    const n = batch.ends.items.len;
-    if (n < 2) return;
+    const names_count = batch.ends.items.len;
+    if (names_count < 2) return;
     const Order = struct {
         b: *const Batch,
         fn name(o: @This(), i: u32) []const u8 {
@@ -242,17 +242,17 @@ fn sortBatch(gpa: std.mem.Allocator, batch: *Batch) std.mem.Allocator.Error!void
     };
     const o: Order = .{ .b = batch };
     var sorted = true;
-    for (1..n) |i| sorted = sorted and !o.lt(@intCast(i), @intCast(i - 1));
+    for (1..names_count) |i| sorted = sorted and !o.lt(@intCast(i), @intCast(i - 1));
     if (sorted) return;
-    const perm = try gpa.alloc(u32, n);
+    const perm = try gpa.alloc(u32, names_count);
     defer gpa.free(perm);
     for (perm, 0..) |*p, i| p.* = @intCast(i);
     std.mem.sort(u32, perm, o, Order.lt);
     var out: Batch = .{ .errors = batch.errors };
     errdefer out.deinit(gpa);
     try out.names.ensureTotalCapacity(gpa, batch.names.items.len);
-    try out.ends.ensureTotalCapacity(gpa, n);
-    try out.flags.ensureTotalCapacity(gpa, n);
+    try out.ends.ensureTotalCapacity(gpa, names_count);
+    try out.flags.ensureTotalCapacity(gpa, names_count);
     for (perm) |i| {
         out.names.appendSliceAssumeCapacity(o.name(i));
         out.ends.appendAssumeCapacity(@intCast(out.names.items.len));
@@ -275,15 +275,15 @@ fn readDir(
         return;
     };
     defer sys.close(fd);
-    var it: sys.DirIter = .{ .fd = fd };
-    while (try it.next()) |e| {
-        var kind = e.kind;
+    var entries: sys.DirIter = .{ .fd = fd };
+    while (try entries.next()) |entry| {
+        var kind = entry.kind;
         if (kind == sys.Kind.unknown) {
             var buf: paths.Buffer = undefined;
             const full = std.mem.printSentinel(
                 &buf,
                 "{s}/{s}",
-                .{ path, e.name },
+                .{ path, entry.name },
                 0,
             ) catch continue;
             kind = sys.kindOf(full);
@@ -292,11 +292,11 @@ fn readDir(
         // Dot-dirs and caches are noise: searchable, ranked low, and the
         // flag is inherited by everything below ("~/orca/skein-zig-pkg-cache"
         // READMEs outranked the user's own).
-        if (hiddenByName(e.name)) flags |= store_mod.flag_hidden;
+        if (hiddenByName(entry.name)) flags |= store_mod.flag_hidden;
         if (kind == sys.Kind.symlink) flags |= store_mod.flag_symlink;
         // A skipped directory is still indexed (searchable), just not opened.
-        if (kind == sys.Kind.dir and shouldDescend(path, e.name, cfg)) flags |= store_mod.flag_dir;
-        try batch.names.appendSlice(gpa, e.name);
+        if (kind == sys.Kind.dir and shouldDescend(path, entry.name, cfg)) flags |= store_mod.flag_dir;
+        try batch.names.appendSlice(gpa, entry.name);
         try batch.ends.append(gpa, @intCast(batch.names.items.len));
         try batch.flags.append(gpa, flags);
     }

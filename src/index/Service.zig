@@ -812,7 +812,7 @@ test "service: the delta threshold triggers a compaction" {
         try testing.expect(try waitHas(s, arena, q, try arena.print("/umbral_{d}.txt", .{i})));
     }
     s.lock.lockSharedUncancelable(s.io);
-    const delta_live = s.live.delta.store.liveLen();
+    const delta_live = s.live.delta.store.liveCount();
     s.lock.unlockShared(s.io);
     try testing.expect(delta_live < 5);
 }

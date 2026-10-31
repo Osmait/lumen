@@ -146,7 +146,7 @@ fn runTool(
         .cancel = cancel,
     }) catch |err| return switch (err) {
         error.FileNotFound => error.ToolMissing,
-        else => |e| e,
+        else => |other| other,
     };
     gpa.free(result.stderr);
     errdefer gpa.free(result.stdout);
@@ -177,8 +177,8 @@ fn gapOf(local: []const u8) Gap {
         "table-row", "line-break", "page", "list-item",
     };
     const space = [_][]const u8{ "tab", "tc", "table-cell", "s", "c" };
-    for (newline) |n| if (std.mem.eql(u8, local, n)) return .newline;
-    for (space) |n| if (std.mem.eql(u8, local, n)) return .space;
+    for (newline) |element| if (std.mem.eql(u8, local, element)) return .newline;
+    for (space) |element| if (std.mem.eql(u8, local, element)) return .space;
     return .none;
 }
 
@@ -187,7 +187,7 @@ fn gapOf(local: []const u8) Gap {
 /// change tracking.
 fn skipped(local: []const u8) bool {
     const names = [_][]const u8{ "instrText", "delText", "Fallback", "rPh", "tracked-changes" };
-    for (names) |n| if (std.mem.eql(u8, local, n)) return true;
+    for (names) |skipped_name| if (std.mem.eql(u8, local, skipped_name)) return true;
     return false;
 }
 
@@ -200,15 +200,15 @@ fn xmlToText(gpa: std.mem.Allocator, xml: []const u8) ![]u8 {
     errdefer out.deinit(gpa);
     // A guess that saves most regrowth: text is a fraction of its markup.
     try out.ensureTotalCapacity(gpa, xml.len / xml_per_text_guess + 16);
-    var w: TextOut = .{ .out = &out, .gpa = gpa };
+    var text_out: TextOut = .{ .out = &out, .gpa = gpa };
     var skip: Skip = .{};
     var i: usize = 0;
     while (i < xml.len) {
         if (xml[i] != '<') {
-            i = try w.charData(xml, i, skip.name != null);
+            i = try text_out.charData(xml, i, skip.name != null);
             continue;
         }
-        if (try w.markup(xml, i, skip.name != null)) |next| {
+        if (try text_out.markup(xml, i, skip.name != null)) |next| {
             i = next;
             continue;
         }
@@ -219,7 +219,7 @@ fn xmlToText(gpa: std.mem.Allocator, xml: []const u8) ![]u8 {
             skip = .{ .name = tag.name, .depth = 1 };
             continue;
         }
-        w.sep(gapOf(tag.local));
+        text_out.sep(gapOf(tag.local));
     }
     return out.toOwnedSlice(gpa);
 }
@@ -271,13 +271,13 @@ const TextOut = struct {
         if (!skipping) {
             if (entity.len == 0) {
                 try text_out.text("&");
-            } else if (entity.cp) |cp| switch (cp) {
+            } else if (entity.cp) |code_point| switch (code_point) {
                 '\n' => text_out.sep(.newline),
                 ' ', '\t', '\r' => text_out.sep(.space),
                 else => {
                     var buf: [4]u8 = undefined;
                     // decodeEntity returns only encodable code points.
-                    try text_out.text(buf[0 .. std.unicode.utf8Encode(cp, &buf) catch unreachable]);
+                    try text_out.text(buf[0 .. std.unicode.utf8Encode(code_point, &buf) catch unreachable]);
                 },
             };
         }
@@ -344,7 +344,7 @@ const Tag = struct {
         const name = xml[name_start..name_end];
         return .{
             .name = name,
-            .local = name[if (std.mem.findScalarLast(u8, name, ':')) |c| c + 1 else 0..],
+            .local = name[if (std.mem.findScalarLast(u8, name, ':')) |colon| colon + 1 else 0..],
             .closing = closing,
             .self_closing = xml[tag_end - 1] == '/',
             .end = tag_end,

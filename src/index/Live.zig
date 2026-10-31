@@ -191,7 +191,7 @@ pub fn initUnarmed(
         .scan_pool = scan_pool,
         .arm_cursor = 0,
         .last_compact_ns = sys.monotonicNs(),
-        .graves = base.len() - base.liveLen(),
+        .graves = base.len() - base.liveCount(),
     };
 }
 
@@ -243,7 +243,7 @@ pub fn fullyArmed(live: *const Live) bool {
 /// Entries a search can find, in the base and the delta. The delta's
 /// scaffolding and its own tombstones are not counted.
 pub fn entriesLive(live: *const Live) usize {
-    return live.base.liveLen() + live.delta.store.liveLen();
+    return live.base.liveCount() + live.delta.store.liveCount();
 }
 
 /// Bytes the two stores take, mapped or in memory.
@@ -808,6 +808,12 @@ pub fn search(
         kept_count += 1;
     }
     out.shrinkRetainingCapacity(@min(kept_count, limit));
+    assert(out.items.len <= limit);
+    if (out.items.len > 1) {
+        for (out.items[0 .. out.items.len - 1], out.items[1..]) |better, worse| {
+            assert(!hitBefore({}, worse, better));
+        }
+    }
 }
 
 /// Best score first; equal scores by path, so the order is stable.
@@ -828,7 +834,7 @@ pub fn adopt(live: *Live, base: Store, watcher: *Watcher) std.mem.Allocator.Erro
     const delta: Delta = try .init(live.gpa);
     const old: Replaced = .{ .base = live.base, .watcher = live.watcher };
     live.base = base;
-    live.graves = base.len() - base.liveLen();
+    live.graves = base.len() - base.liveCount();
     live.watcher = watcher;
     live.stats.watches = watcher.count();
     // A rescan's watcher was armed as it scanned.
@@ -844,9 +850,9 @@ pub fn adopt(live: *Live, base: Store, watcher: *Watcher) std.mem.Allocator.Erro
     live.engine_base.reset();
     // A few lines of /proc: what was mounted since the last rescan. Out of
     // memory, the old list stays.
-    if (slowMountsOf(live.gpa, live.cfg)) |m| {
+    if (slowMountsOf(live.gpa, live.cfg)) |mounts| {
         sys.freeList(live.gpa, live.slow_mounts);
-        live.slow_mounts = m;
+        live.slow_mounts = mounts;
     } else |_| {}
     return old;
 }
@@ -855,14 +861,14 @@ pub fn adopt(live: *Live, base: Store, watcher: *Watcher) std.mem.Allocator.Erro
 fn slowMountsOf(gpa: std.mem.Allocator, cfg: *const scan.Config) std.mem.Allocator.Error![][]u8 {
     var all: std.ArrayList([]u8) = .empty;
     errdefer {
-        for (all.items) |m| gpa.free(m);
+        for (all.items) |mount| gpa.free(mount);
         all.deinit(gpa);
     }
-    for (cfg.roots) |r| {
-        const list = try sys.slowMounts(gpa, r);
+    for (cfg.roots) |root| {
+        const list = try sys.slowMounts(gpa, root);
         defer gpa.free(list);
         all.ensureUnusedCapacity(gpa, list.len) catch |err| {
-            for (list) |m| gpa.free(m);
+            for (list) |mount| gpa.free(mount);
             return err;
         };
         all.appendSliceAssumeCapacity(list);
@@ -1320,7 +1326,7 @@ test "live: adopt leaves a clean index that finds the same" {
     _ = try t.sync();
     try testing.expect(t.live.dirty);
     try testing.expect(t.live.delta.store.len() > 0);
-    try testing.expect(t.live.base.liveLen() < t.live.base.len());
+    try testing.expect(t.live.base.liveCount() < t.live.base.len());
 
     const arena = t.arena.allocator();
     var before: std.ArrayList([]const u8) = .empty;
@@ -1331,7 +1337,7 @@ test "live: adopt leaves a clean index that finds the same" {
     try t.compact();
 
     try testing.expectEqual(0, t.live.delta.store.len());
-    try testing.expectEqual(t.live.base.len(), t.live.base.liveLen());
+    try testing.expectEqual(t.live.base.len(), t.live.base.liveCount());
     try testing.expect(!t.live.dirty);
     try testing.expect(t.live.fullyArmed());
     const after = try t.searchOpts("rs", .{ .limit = 50, .recency = false });
@@ -1413,13 +1419,13 @@ test "live: tombstones on a mapped index never reach the file" {
     t.mv("root/modulo", "outside/modulo");
     _ = try t.sync();
     try testing.expect(!try t.found("cargo", "Cargo.toml"));
-    try testing.expect(t.live.base.liveLen() < t.live.base.len());
+    try testing.expect(t.live.base.liveCount() < t.live.base.len());
 
     var after_buf: [64 * 1024]u8 = undefined;
     try testing.expectEqualSlices(u8, before, sys.readHead(idx, &after_buf));
     var again = try Store.open(idx);
     defer again.deinit(gpa);
-    try testing.expectEqual(again.len(), again.liveLen());
+    try testing.expectEqual(again.len(), again.liveCount());
 }
 
 test "live: recency on a file deleted but not yet applied" {

@@ -254,15 +254,18 @@ pub const Index = struct {
     }
 
     pub fn path(index: *const Index, doc: u32) []const u8 {
+        assert(doc < index.docs_count);
         return index.file[index.path_offsets[doc]..][0..index.path_sizes[doc]];
     }
 
     pub fn removed(index: *const Index, doc: u32) bool {
+        assert(doc < index.docs_count);
         return index.flags[doc] & flag_removed != 0;
     }
 
     /// Documents a query can find.
     pub fn live(index: *const Index) usize {
+        assert(index.docs_removed_count <= index.docs_count);
         return index.docs_count - index.docs_removed_count;
     }
 
@@ -283,6 +286,7 @@ pub const Index = struct {
     }
 
     pub fn docIn(index: *const Index, doc: u32) DocIn {
+        assert(doc < index.docs_count);
         return .{
             .path = index.path(doc),
             .mtime = index.mtimes[doc],
@@ -457,6 +461,8 @@ pub const Index = struct {
             std.mem.sort(u32, out.items, {}, std.sort.asc(u32));
             out.shrinkRetainingCapacity(dedupSorted(u32, out.items).len);
         }
+        assert(strictlyAscending(u32, out.items));
+        if (out.getLastOrNull()) |doc_last| assert(doc_last < index.docs_count);
     }
 
     pub fn postingBytes(index: *const Index) usize {
@@ -1033,8 +1039,8 @@ const Sink = struct {
     }
 
     fn put(sink: *Sink, bytes: []const u8) FileError!void {
-        if (sink.file) |f| return f.write(bytes);
-        if (sink.app) |f| return f.write(bytes);
+        if (sink.file) |file| return file.write(bytes);
+        if (sink.app) |file| return file.write(bytes);
     }
 
     fn zeros(sink: *Sink, n: usize) FileError!void {
@@ -1059,7 +1065,7 @@ const Sink = struct {
 /// A sink without a file never fails to write one.
 fn memoryOnly(err: FileError) BuildError {
     return switch (err) {
-        error.OutOfMemory, error.BadIndex, error.IndexTooLarge => |e| e,
+        error.OutOfMemory, error.BadIndex, error.IndexTooLarge => |kept| kept,
         else => unreachable,
     };
 }

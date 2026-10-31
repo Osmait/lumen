@@ -178,8 +178,8 @@ pub const Store = struct {
     }
 
     fn arr(store: *const Store, comptime T: type, off: usize) []T {
-        const p: [*]T = @ptrCast(@alignCast(store.buf.ptr + off));
-        return p[0..store.layout.entries_count];
+        const items: [*]T = @ptrCast(@alignCast(store.buf.ptr + off));
+        return items[0..store.layout.entries_count];
     }
 
     pub fn masks(store: *const Store) []u64 {
@@ -199,6 +199,7 @@ pub const Store = struct {
     /// still shows what others write to the file afterwards (pages not yet
     /// copied), and a bad offset read past the buffer.
     pub fn name(store: *const Store, id: u32) []const u8 {
+        assert(id < store.layout.entries_count);
         const name_offset = store.arr(u32, store.layout.name_offsets_offset)[id];
         const name_size = store.arr(u16, store.layout.name_sizes_offset)[id];
         if (@as(usize, name_offset) + name_size > store.layout.names_size) return "";
@@ -207,6 +208,7 @@ pub const Store = struct {
     }
 
     pub fn isDir(store: *const Store, id: u32) bool {
+        assert(id < store.layout.entries_count);
         return store.flags()[id] & flag_dir != 0;
     }
 
@@ -262,15 +264,18 @@ pub const Store = struct {
     /// Free on the hot path. On a mapping this writes copy-on-write pages;
     /// the file on disk is untouched.
     pub fn tombstone(store: *Store, id: u32) void {
+        assert(id < store.layout.entries_count);
         store.masks()[id] = 0;
+        assert(store.isTombstoned(id));
     }
 
     pub fn isTombstoned(store: *const Store, id: u32) bool {
+        assert(id < store.layout.entries_count);
         return store.masks()[id] == 0;
     }
 
     /// Roots come first, with `no_parent`.
-    pub fn nRoots(store: *const Store) u32 {
+    pub fn rootsCount(store: *const Store) u32 {
         var roots_count: u32 = 0;
         for (store.parents()) |parent| {
             if (parent != no_parent) break;
@@ -284,10 +289,13 @@ pub const Store = struct {
     /// binary search finds them with zero extra memory. Valid only for
     /// stores built by `scan`.
     pub fn children(store: *const Store, dir: u32) struct { lo: u32, hi: u32 } {
-        const from = store.nRoots();
+        assert(dir < store.layout.entries_count);
+        const from = store.rootsCount();
         const tail = store.parents()[from..];
         const lo = from + lowerBound(tail, dir);
         const hi = from + upperBound(tail, dir);
+        assert(lo <= hi);
+        assert(hi <= store.layout.entries_count);
         return .{ .lo = @intCast(lo), .hi = @intCast(hi) };
     }
 
@@ -303,7 +311,10 @@ pub const Store = struct {
             switch (std.mem.order(u8, store.name(mid), child_name)) {
                 .lt => lo = mid + 1,
                 .gt => hi = mid,
-                .eq => return if (store.isTombstoned(mid)) null else mid,
+                .eq => {
+                    assert(store.parents()[mid] == dir);
+                    return if (store.isTombstoned(mid)) null else mid;
+                },
             }
         }
         return null;
@@ -321,7 +332,7 @@ pub const Store = struct {
     }
 
     pub fn parentsSorted(store: *const Store) bool {
-        const tail = store.parents()[store.nRoots()..];
+        const tail = store.parents()[store.rootsCount()..];
         if (tail.len < 2) return true;
         for (tail[0 .. tail.len - 1], tail[1..]) |a, b| {
             if (a > b) return false;
@@ -329,7 +340,7 @@ pub const Store = struct {
         return true;
     }
 
-    pub fn liveLen(store: *const Store) usize {
+    pub fn liveCount(store: *const Store) usize {
         var live_count: usize = 0;
         for (store.masks()) |mask| live_count += @intFromBool(mask != 0);
         return live_count;
@@ -402,8 +413,8 @@ fn validate(buf: BytesConst) error{BadIndex}!Layout {
 }
 
 fn viewConst(comptime T: type, buf: BytesConst, off: usize, n: usize) []const T {
-    const p: [*]const T = @ptrCast(@alignCast(buf.ptr + off));
-    return p[0..n];
+    const items: [*]const T = @ptrCast(@alignCast(buf.ptr + off));
+    return items[0..n];
 }
 
 fn lowerBound(xs: []const u32, v: u32) usize {
@@ -586,7 +597,7 @@ test "children by binary search and tombstones" {
     try testing.expectEqual(@as(?u32, 4), s.findChild(1, "src"));
     s.tombstone(4);
     try testing.expectEqual(@as(?u32, null), s.findChild(1, "src"));
-    try testing.expectEqual(@as(usize, 4), s.liveLen());
+    try testing.expectEqual(@as(usize, 4), s.liveCount());
 }
 
 test "findChild: a binary search among a directory's sorted children" {
@@ -682,7 +693,7 @@ test "mask prefilter folds accents and case, both ways" {
 /// store that `parse` accepted.
 fn exercise(store: *const Store) void {
     var buf: [512]u8 = undefined;
-    var sum: usize = store.nRoots() + @intFromBool(store.parentsSorted()) + store.liveLen();
+    var sum: usize = store.rootsCount() + @intFromBool(store.parentsSorted()) + store.liveCount();
     for (0..store.len()) |i| {
         const id: u32 = @intCast(i);
         const plen = if (store.path(id, &buf)) |p| p.len else 0;
