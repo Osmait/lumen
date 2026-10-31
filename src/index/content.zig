@@ -24,7 +24,6 @@
 
 const std = @import("std");
 const paths = @import("paths.zig");
-const builtin = @import("builtin");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const Pool = @import("Pool.zig");
@@ -42,13 +41,28 @@ const content_find = @import("content_find.zig");
 pub const Span = content_find.Span;
 pub const findFold = content_find.findFold;
 pub const findCI = content_find.findCI;
-
-/// 02: trigrams of folded text (accents and case, `core.fold`).
-/// 03: a flags column (documents removed by an incremental update).
-/// 04: path offsets are positions in the file, so an appended doc table
-/// refers to the paths already there instead of writing them all again.
-const magic = "LUMCTX04";
-const header_size = 64;
+const content_format = @import("content_format.zig");
+const magic = content_format.magic;
+const header_size = content_format.header_size;
+const Header = content_format.Header;
+const SegmentEntry = content_format.SegmentEntry;
+const doc_size = content_format.doc_size;
+const flag_removed = content_format.flag_removed;
+pub const path_bytes_max = content_format.path_bytes_max;
+pub const Source = content_format.Source;
+pub const DocIn = content_format.DocIn;
+const Trigrams = content_format.Trigrams;
+pub const trigram_chars = content_format.trigram_chars;
+const trigram_bits = content_format.trigram_bits;
+const trigram_mask = content_format.trigram_mask;
+const trigrams_count = content_format.trigrams_count;
+const ListReader = content_format.ListReader;
+const writeVarint = content_format.writeVarint;
+const decodeAll = content_format.decodeAll;
+const intersect = content_format.intersect;
+const sliceAt = content_format.sliceAt;
+const dedupSorted = content_format.dedupSorted;
+const strictlyAscending = content_format.strictlyAscending;
 
 /// Plain text files above this are not indexed (logs, dumps, data).
 pub const text_bytes_max = 1 << 20;
@@ -66,118 +80,6 @@ const round_docs_max = 1024;
 /// pairs, 8 GB, and as much again to sort them. Ordinary text gives a pair
 /// per ~9 bytes, so a round still reads hundreds of files.
 const round_pairs_max = segment_pairs_max;
-
-/// The doc table stores each path's length as a u16.
-pub const path_bytes_max = std.math.maxInt(u16);
-
-/// Where a document's text comes from: the file itself, or text extracted
-/// from it (PDF, Office) and cached on disk.
-pub const Source = enum(u8) { plain = 0, extracted = 1 };
-
-pub const DocIn = struct {
-    /// At most `path_bytes_max` bytes (Linux paths stop at 4096).
-    path: []const u8,
-    mtime: i64,
-    size: u64,
-    source: Source = .plain,
-};
-
-/// Trigrams of folded text, packed in 24 bits each: "Acción" gives "acc",
-/// "cci", "cio", "ion", the same as "accion" or "ACCION". A folded character
-/// is one byte, so a trigram is three folded characters.
-const Trigrams = struct {
-    text: []const u8,
-    position: usize = 0,
-    window: u32 = 0,
-    /// Folded characters in `window` so far, until it holds three.
-    seen: u2 = 0,
-
-    fn next(trigrams: *Trigrams) ?u32 {
-        while (trigrams.position < trigrams.text.len) {
-            const folded = fold.step(trigrams.text, &trigrams.position);
-            trigrams.window = (trigrams.window << @bitSizeOf(u8) | folded) & trigram_mask;
-            if (trigrams.seen == trigram_chars - 1) return trigrams.window;
-            trigrams.seen += 1;
-        }
-        return null;
-    }
-};
-
-/// A trigram is this many folded characters of one byte each: queries
-/// shorter than that cannot be narrowed by the index.
-pub const trigram_chars = 3;
-const trigram_bits = trigram_chars * @bitSizeOf(u8);
-const trigram_mask: u32 = (1 << trigram_bits) - 1;
-/// Every possible trigram: the most distinct (trigram, doc) pairs a single
-/// document can give.
-const trigrams_count = trigram_mask + 1;
-
-/// The first bytes of the file. The doc table's columns and the segments'
-/// arrays are read in place, in the host's byte order, and so is this: the
-/// format is little-endian, and so must the host be (asserted).
-const Header = extern struct {
-    magic: [8]u8,
-    docs_count: u64,
-    segments_count: u64,
-    /// Bytes of the paths the doc table added (an appended table refers to
-    /// the paths already in the file and adds only its new documents').
-    paths_size: u64,
-    docs_offset: u64,
-    /// Where the segment directory starts: `segments_count` entries.
-    directory_offset: u64,
-    /// Bytes the header refers to. An update appends, then points the
-    /// header at what it added: bytes past this are an update whose header
-    /// never got written.
-    size_total: u64,
-    reserved: [8]u8,
-
-    comptime {
-        assert(builtin.cpu.arch.endian() == .little);
-        assert(@sizeOf(Header) == header_size);
-        assert(@offsetOf(Header, "docs_count") == 8);
-        assert(@offsetOf(Header, "segments_count") == 16);
-        assert(@offsetOf(Header, "paths_size") == 24);
-        assert(@offsetOf(Header, "docs_offset") == 32);
-        assert(@offsetOf(Header, "directory_offset") == 40);
-        assert(@offsetOf(Header, "size_total") == 48);
-    }
-
-    fn encode(header: Header) [header_size]u8 {
-        assert(std.mem.eql(u8, &header.magic, magic));
-        return std.mem.toBytes(header);
-    }
-
-    fn decode(bytes: *const [header_size]u8) Header {
-        return std.mem.bytesToValue(Header, bytes);
-    }
-};
-
-/// One segment's arrays, as the segment directory lists them.
-const SegmentEntry = extern struct {
-    keys_count: u64,
-    /// `keys_count` trigrams, u32, strictly ascending.
-    keys_offset: u64,
-    /// `keys_count + 1` u32 offsets into the postings, one list per key.
-    offsets_offset: u64,
-    postings_offset: u64,
-    postings_size: u64,
-
-    comptime {
-        assert(@sizeOf(SegmentEntry) == 5 * @sizeOf(u64));
-    }
-};
-
-/// The doc table's columns, one after another, each `docs_count` long:
-/// mtime, size, path offset, path size, source, flags. `writeDocs` writes
-/// them in this order and `DocColumns.parse` reads them back.
-const doc_size = @sizeOf(i64) + @sizeOf(u64) + @sizeOf(u32) + @sizeOf(u16) + 1 + 1;
-
-comptime {
-    // The columns go from the widest to the narrowest, so each one stays
-    // aligned whatever `docs_count` is, as long as the table starts
-    // 8-aligned.
-    assert(doc_size == 24);
-}
 
 /// The doc table of an index file, checked: every path inside the file,
 /// every source a known kind, no unknown flag.
@@ -477,9 +379,6 @@ pub const Index = struct {
     }
 };
 
-/// A document whose old version an update replaced, or that is gone.
-const flag_removed: u8 = 1;
-
 /// Checks that `count` items of `size` bytes at `offset` fit in a buffer of
 /// `buffer_size` bytes, with `offset` a multiple of `alignment`; returns
 /// `offset`. Done in u64 with overflow checks: every operand comes from the
@@ -515,141 +414,6 @@ fn checkSegment(file: BytesConst, segment: SegmentEntry) error{BadIndex}!void {
         offset_previous = offset;
     }
     if (offsets[keys_count] > segment.postings_size) return error.BadIndex;
-}
-
-fn sliceAt(comptime T: type, bytes: Bytes, offset: usize, count: usize) []T {
-    assert(offset % @alignOf(T) == 0);
-    assert(offset + count * @sizeOf(T) <= bytes.len);
-    const items: [*]T = @ptrCast(@alignCast(bytes.ptr + offset));
-    return items[0..count];
-}
-
-fn dedupSorted(comptime T: type, items: []T) []T {
-    if (items.len == 0) return items;
-    var unique_count: usize = 1;
-    for (items[1..]) |item| {
-        if (item != items[unique_count - 1]) {
-            items[unique_count] = item;
-            unique_count += 1;
-        }
-    }
-    return items[0..unique_count];
-}
-
-fn strictlyAscending(comptime T: type, items: []const T) bool {
-    if (items.len < 2) return true;
-    for (items[0 .. items.len - 1], items[1..]) |item, item_next| {
-        if (item >= item_next) return false;
-    }
-    return true;
-}
-
-/// Varints are unsigned LEB128: seven bits of the number per byte, low bits
-/// first, the high bit set on every byte but the last.
-const varint_payload_bits = 7;
-const varint_payload_mask: u8 = (1 << varint_payload_bits) - 1;
-const varint_continues: u8 = 1 << varint_payload_bits;
-/// A u32 takes five bytes at most; the fifth carries the top four bits.
-const varint_last_shift = 4 * varint_payload_bits;
-const varint_last_payload_max: u8 = (1 << (@bitSizeOf(u32) - varint_last_shift)) - 1;
-
-/// Next varint of `bytes` from `position`, or null at the end of the list or
-/// on a malformed one: cut off by the end of the list (continuation bit on
-/// the last byte) or longer than a u32 needs. Never reads past `bytes`.
-fn readVarint(bytes: []const u8, position: *usize) ?u32 {
-    var value: u32 = 0;
-    var shift: u5 = 0;
-    var i = position.*;
-    while (i < bytes.len) : (i += 1) {
-        const byte = bytes[i];
-        if (shift == varint_last_shift and byte > varint_last_payload_max) return null;
-        value |= @as(u32, byte & varint_payload_mask) << shift;
-        if (byte & varint_continues == 0) {
-            position.* = i + 1;
-            return value;
-        }
-        shift += varint_payload_bits;
-    }
-    return null;
-}
-
-/// Decodes a posting list (first id, then deltas). A list from a damaged
-/// file ends at the first id that is malformed, not increasing, overflowing
-/// or not a document of the index: what comes out is always strictly
-/// ascending and below `docs_count`, so callers can index the doc table
-/// with it.
-const ListReader = struct {
-    list_encoded: []const u8,
-    docs_count: usize,
-    position: usize = 0,
-    doc: u32 = 0,
-    started: bool = false,
-
-    fn next(reader: *ListReader) ?u32 {
-        const delta = readVarint(reader.list_encoded, &reader.position) orelse return reader.stop();
-        if (reader.started) {
-            if (delta == 0) return reader.stop();
-            reader.doc = std.math.add(u32, reader.doc, delta) catch return reader.stop();
-        } else {
-            reader.doc = delta;
-            reader.started = true;
-        }
-        if (reader.doc >= reader.docs_count) return reader.stop();
-        return reader.doc;
-    }
-
-    fn stop(reader: *ListReader) ?u32 {
-        reader.position = reader.list_encoded.len;
-        return null;
-    }
-};
-
-fn writeVarint(gpa: std.mem.Allocator, out: *std.ArrayList(u8), value: u32) !void {
-    var rest = value;
-    while (rest >= varint_continues) {
-        try out.append(gpa, @as(u8, @intCast(rest & varint_payload_mask)) | varint_continues);
-        rest >>= varint_payload_bits;
-    }
-    try out.append(gpa, @intCast(rest));
-}
-
-fn decodeAll(
-    gpa: std.mem.Allocator,
-    list_encoded: []const u8,
-    docs_count: usize,
-    out: *std.ArrayList(u32),
-) !void {
-    var reader: ListReader = .{ .list_encoded = list_encoded, .docs_count = docs_count };
-    while (reader.next()) |doc| try out.append(gpa, doc);
-}
-
-/// `docs_sorted` ∩ `list_encoded`, decoded on the fly.
-fn intersect(
-    gpa: std.mem.Allocator,
-    docs_sorted: []const u32,
-    list_encoded: []const u8,
-    docs_count: usize,
-    out: *std.ArrayList(u32),
-) !void {
-    var reader: ListReader = .{ .list_encoded = list_encoded, .docs_count = docs_count };
-    var doc_listed: u32 = 0;
-    var i: usize = 0;
-    var have_listed = false;
-    while (i < docs_sorted.len) {
-        if (!have_listed) {
-            doc_listed = reader.next() orelse return;
-            have_listed = true;
-        }
-        if (docs_sorted[i] < doc_listed) {
-            i += 1;
-        } else if (docs_sorted[i] > doc_listed) {
-            have_listed = false;
-        } else {
-            try out.append(gpa, doc_listed);
-            i += 1;
-            have_listed = false;
-        }
-    }
 }
 
 // --------------------------------------------------------------- building
@@ -1632,6 +1396,7 @@ const testing = std.testing;
 
 test {
     _ = content_find;
+    _ = content_format;
 }
 
 /// Texts by document: a document's path is the index of its text.
@@ -1651,27 +1416,6 @@ const TestDocs = struct {
         return true;
     }
 };
-
-test "varint round trip and intersection" {
-    const gpa = testing.allocator;
-    var encoded: std.ArrayList(u8) = .empty;
-    defer encoded.deinit(gpa);
-    const ids = [_]u32{ 3, 4, 200, 70000, 70001, 5_000_000 };
-    var id_previous: u32 = 0;
-    for (ids) |id| {
-        try writeVarint(gpa, &encoded, id - id_previous);
-        id_previous = id;
-    }
-    var decoded: std.ArrayList(u32) = .empty;
-    defer decoded.deinit(gpa);
-    try decodeAll(gpa, encoded.items, 10_000_000, &decoded);
-    try testing.expectEqualSlices(u32, &ids, decoded.items);
-    var intersection: std.ArrayList(u32) = .empty;
-    defer intersection.deinit(gpa);
-    const ids_wanted = [_]u32{ 1, 4, 70000, 5_000_000, 6_000_000 };
-    try intersect(gpa, &ids_wanted, encoded.items, 10_000_000, &intersection);
-    try testing.expectEqualSlices(u32, &.{ 4, 70000, 5_000_000 }, intersection.items);
-}
 
 test "candidates equal a brute-force scan, across segments, after save/open" {
     const gpa = testing.allocator;
@@ -2659,55 +2403,10 @@ test "corrupt content indexes are rejected, not trusted" {
     }
 }
 
-test "malformed posting lists end, never over-read" {
+test "malformed posting lists in a real index end, never over-read" {
     const gpa = testing.allocator;
-    var position: usize = 0;
-    // Continuation bit on the last byte of a list.
-    try testing.expectEqual(@as(?u32, null), readVarint(&.{0x80}, &position));
-    position = 0;
-    try testing.expectEqual(@as(?u32, 5), readVarint(&.{ 0x05, 0xff }, &position));
-    try testing.expectEqual(@as(?u32, null), readVarint(&.{ 0x05, 0xff }, &position));
-    try testing.expectEqual(@as(usize, 1), position);
-    // Longer than a u32, or a 5th byte with more than 4 bits.
-    position = 0;
-    try testing.expectEqual(@as(?u32, null), readVarint(
-        &.{ 0xff, 0xff, 0xff, 0xff, 0x1f },
-        &position,
-    ));
-    position = 0;
-    try testing.expectEqual(@as(?u32, null), readVarint(
-        &.{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x00 },
-        &position,
-    ));
-    position = 0;
-    try testing.expectEqual(@as(?u32, std.math.maxInt(u32)), readVarint(
-        &.{ 0xff, 0xff, 0xff, 0xff, 0x0f },
-        &position,
-    ));
-    try testing.expectEqual(@as(usize, 5), position);
-
-    var out: std.ArrayList(u32) = .empty;
-    defer out.deinit(gpa);
-    // Truncated last id: the ids before it survive.
-    try decodeAll(gpa, &.{ 3, 4, 0x80 }, 100, &out);
-    try testing.expectEqualSlices(u32, &.{ 3, 7 }, out.items);
-    // A delta that overflows u32, a zero delta (not increasing), an id past
-    // the documents: the list ends there.
-    for ([_][]const u8{
-        &.{ 3, 0xff, 0xff, 0xff, 0xff, 0x0f, 1 },
-        &.{ 3, 0, 1 },
-        &.{ 3, 98, 1 },
-    }) |list| {
-        out.clearRetainingCapacity();
-        try decodeAll(gpa, list, 100, &out);
-        try testing.expectEqualSlices(u32, &.{3}, out.items);
-        out.clearRetainingCapacity();
-        try intersect(gpa, &.{ 3, 4, 5, 99, 100, 101 }, list, 100, &out);
-        try testing.expectEqualSlices(u32, &.{3}, out.items);
-    }
-
-    // The same inside a real index: every posting list's last byte gets
-    // its continuation bit (each list now ends in a truncated varint).
+    // Every posting list's last byte gets its continuation bit (each list
+    // now ends in a truncated varint).
     var index = try smallIndex(gpa);
     defer index.deinit(gpa);
     const segment = index.segments[0];
@@ -3016,30 +2715,6 @@ fn fuzzParseBytes(_: void, smith: *testing.Smith) anyerror!void {
     }
     const index = Index.parse(input, .heap) catch return;
     try exerciseIndex(&index, testing.allocator);
-}
-
-test "content: the header struct lays out the bytes LUMCTX04 always had" {
-    const header: Header = .{
-        .magic = magic.*,
-        .docs_count = 1,
-        .segments_count = 2,
-        .paths_size = 3,
-        .docs_offset = 4,
-        .directory_offset = 5,
-        .size_total = 6,
-        .reserved = @splat(0),
-    };
-    // The layout as it was written field by field before `Header` existed.
-    var expected: [header_size]u8 = @splat(0);
-    @memcpy(expected[0..8], magic);
-    std.mem.writeInt(u64, expected[8..16], 1, .little);
-    std.mem.writeInt(u64, expected[16..24], 2, .little);
-    std.mem.writeInt(u64, expected[24..32], 3, .little);
-    std.mem.writeInt(u64, expected[32..40], 4, .little);
-    std.mem.writeInt(u64, expected[40..48], 5, .little);
-    std.mem.writeInt(u64, expected[48..56], 6, .little);
-    try testing.expectEqualSlices(u8, &expected, &header.encode());
-    try testing.expectEqual(header, Header.decode(&expected));
 }
 
 test "fuzz: parsing arbitrary bytes as a content index never crashes" {
