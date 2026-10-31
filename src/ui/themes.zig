@@ -190,45 +190,79 @@ pub fn displayName(
 
 /// The variables block `style.css` is painted with.
 pub fn css(
-    w: *std.Io.Writer,
-    t: *const Theme,
-    s: *const settings.Settings,
+    writer: *std.Io.Writer,
+    theme: *const Theme,
+    settings_now: *const settings.Settings,
 ) std.Io.Writer.Error!void {
-    const scale: f32 = switch (s.text_size) {
+    const scale = textScale(settings_now.text_size);
+    const opacity = @as(f32, @floatFromInt(settings_now.opacity)) / 100;
+    try writer.writeAll(":root {\n");
+    try rgba(writer, "bg", theme.bg, opacity);
+    try rgba(writer, "surface", theme.surface, @min(1, opacity + surface_opacity_extra));
+    try rgba(writer, "fg", theme.fg, 1);
+    try rgba(writer, "ink", theme.ink, 1);
+    try rgba(writer, "accent", theme.accent, 1);
+    try rgba(writer, "accent-soft", theme.accent, accent_soft_opacity);
+    try rgba(writer, "on-accent", onAccent(theme), 1);
+    const shadow_opacity = if (theme.dark) shadow_opacity_dark else shadow_opacity_light;
+    try rgba(writer, "shadow", 0, shadow_opacity);
+    for (font_sizes) |font| {
+        try writer.print("  --{s}: {d:.1}px;\n", .{ font.variable, font.size_px * scale });
+    }
+    const density = densitySizes(settings_now.density);
+    try writer.print(
+        "  --row-h: {d}px;\n  --icon: {d}px;\n",
+        .{ density.row_height_px, density.icon_px },
+    );
+    try writer.writeAll("}\n");
+}
+
+/// The surface (the detail pane, chips) is a shade more opaque than the
+/// background it sits on, so it reads as a layer of its own when the window
+/// is translucent.
+const surface_opacity_extra: f32 = 0.01;
+/// The selection's soft tint and the shadows, as opacities.
+const accent_soft_opacity: f32 = 0.35;
+const shadow_opacity_dark: f32 = 0.45;
+const shadow_opacity_light: f32 = 0.18;
+
+/// The font sizes style.css uses, at the default text size.
+const font_sizes = [_]struct { variable: []const u8, size_px: f32 }{
+    .{ .variable = "font", .size_px = 14 },
+    .{ .variable = "font-query", .size_px = 18 },
+    .{ .variable = "font-small", .size_px = 13 },
+    .{ .variable = "font-tiny", .size_px = 12 },
+    .{ .variable = "font-mono", .size_px = 12.5 },
+    .{ .variable = "font-calc", .size_px = 26 },
+    .{ .variable = "font-emoji", .size_px = 17 },
+};
+
+/// How much the Text Size setting scales every font size.
+fn textScale(text_size: @FieldType(settings.Settings, "text_size")) f32 {
+    return switch (text_size) {
         .small => 0.9,
         .default => 1,
         .large => 1.15,
     };
-    const alpha = @as(f32, @floatFromInt(s.opacity)) / 100;
-    try w.writeAll(":root {\n");
-    try rgba(w, "bg", t.bg, alpha);
-    try rgba(w, "surface", t.surface, @min(1, alpha + 0.01));
-    try rgba(w, "fg", t.fg, 1);
-    try rgba(w, "ink", t.ink, 1);
-    try rgba(w, "accent", t.accent, 1);
-    try rgba(w, "accent-soft", t.accent, 0.35);
-    try rgba(w, "on-accent", onAccent(t), 1);
-    try rgba(w, "shadow", 0, if (t.dark) 0.45 else 0.18);
-    const sizes = [_]struct { []const u8, f32 }{ .{ "font", 14 }, .{
-        "font-query",
-        18,
-    }, .{ "font-small", 13 }, .{ "font-tiny", 12 }, .{
-        "font-mono",
-        12.5,
-    }, .{ "font-calc", 26 }, .{ "font-emoji", 17 } };
-    for (sizes) |sz| try w.print("  --{s}: {d:.1}px;\n", .{ sz[0], sz[1] * scale });
-    // Density: row height and icon size (the Density setting).
-    const row_h: u8, const icon: u8 = switch (s.density) {
-        .compact => .{ 40, 26 },
-        .default => .{ 48, 32 },
-        .comfortable => .{ 58, 38 },
-    };
-    try w.print("  --row-h: {d}px;\n  --icon: {d}px;\n", .{ row_h, icon });
-    try w.writeAll("}\n");
 }
 
-fn rgba(w: *std.Io.Writer, name: []const u8, color: u24, alpha: f32) !void {
-    try w.print("  --{s}: rgba({d}, {d}, {d}, {d:.2});\n", .{
+pub const Density = @FieldType(settings.Settings, "density");
+
+/// A result row's height and its icon's size for the Density setting. The
+/// stylesheet gets them as `--row-h` and `--icon`, and the row builders ask
+/// GTK for icons of `icon_px`.
+pub const DensitySizes = struct { row_height_px: u8, icon_px: u8 };
+
+pub fn densitySizes(density: Density) DensitySizes {
+    return switch (density) {
+        .compact => .{ .row_height_px = 40, .icon_px = 26 },
+        .default => .{ .row_height_px = 48, .icon_px = 32 },
+        .comfortable => .{ .row_height_px = 58, .icon_px = 38 },
+    };
+}
+
+fn rgba(writer: *std.Io.Writer, name: []const u8, color: u24, alpha: f32) !void {
+    try writer.print("  --{s}: rgba({d}, {d}, {d}, {d:.2});\n", .{
         name,
         color >> 16,
         (color >> 8) & 0xff,
@@ -239,9 +273,11 @@ fn rgba(w: *std.Io.Writer, name: []const u8, color: u24, alpha: f32) !void {
 
 /// Text on an accent fill (the selected row): near-black or white,
 /// whichever reads better.
-pub fn onAccent(t: *const Theme) u24 {
-    const dark: u24 = 0x10131a;
-    return if (contrast(t.accent, dark) >= contrast(t.accent, 0xffffff)) dark else 0xffffff;
+pub fn onAccent(theme: *const Theme) u24 {
+    const near_black: u24 = 0x10131a;
+    const white: u24 = 0xffffff;
+    const black_contrast = contrast(theme.accent, near_black);
+    return if (black_contrast >= contrast(theme.accent, white)) near_black else white;
 }
 
 /// "#rrggbb" for Pango markup.
@@ -251,21 +287,35 @@ pub fn hex(buf: *[8]u8, color: u24) [:0]const u8 {
 
 /// WCAG contrast ratio between two colours (1 to 21).
 pub fn contrast(x: u24, y: u24) f64 {
-    const lx = luminance(x);
-    const ly = luminance(y);
-    return (@max(lx, ly) + 0.05) / (@min(lx, ly) + 0.05);
+    const luminance_x = luminance(x);
+    const luminance_y = luminance(y);
+    const lighter = @max(luminance_x, luminance_y) + wcag_flare;
+    const darker = @min(luminance_x, luminance_y) + wcag_flare;
+    return lighter / darker;
 }
 
+/// WCAG 2's allowance for ambient light on the screen, added to both
+/// luminances so black on black is a ratio of 1, not a division by zero.
+const wcag_flare = 0.05;
+
+/// WCAG 2's relative luminance: each sRGB channel made linear, then
+/// weighted (red, green, blue) by how bright the eye sees it.
 fn luminance(color: u24) f64 {
-    var sum: f64 = 0;
     const weights = [_]f64{ 0.2126, 0.7152, 0.0722 };
-    for (weights, 0..) |wt, i| {
-        const shift: u5 = @intCast(16 - 8 * i);
-        const v = @as(f64, @floatFromInt((color >> shift) & 0xff)) / 255;
-        const lin = if (v <= 0.03928) v / 12.92 else std.math.pow(f64, (v + 0.055) / 1.055, 2.4);
-        sum += wt * lin;
+    var sum: f64 = 0;
+    for (weights, 0..) |weight, channel_index| {
+        const shift: u5 = @intCast(16 - 8 * channel_index);
+        const channel = @as(f64, @floatFromInt((color >> shift) & 0xff)) / 255;
+        sum += weight * srgbToLinear(channel);
     }
     return sum;
+}
+
+/// The sRGB transfer function undone, with WCAG 2's constants.
+fn srgbToLinear(channel: f64) f64 {
+    const linear_segment_end = 0.03928;
+    if (channel <= linear_segment_end) return channel / 12.92;
+    return std.math.pow(f64, (channel + 0.055) / 1.055, 2.4);
 }
 
 test "every theme is readable" {

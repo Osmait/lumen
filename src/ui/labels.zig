@@ -2,6 +2,7 @@
 //! highlighted context lines.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const c = @import("c");
 const core = @import("core");
 const item_mod = @import("../item.zig");
@@ -27,29 +28,37 @@ pub fn homeRelative(arena: std.mem.Allocator, dir: []const u8) [:0]const u8 {
 pub fn displayText(arena: std.mem.Allocator, raw: []const u8) [:0]const u8 {
     var out: std.ArrayList(u8) = .empty;
     out.ensureTotalCapacity(arena, raw.len + 1) catch return "";
-    var i: usize = 0;
-    while (i < raw.len) {
-        const n = std.unicode.utf8ByteSequenceLength(raw[i]) catch 0;
-        if (n == 0 or i + n > raw.len or !std.unicode.utf8ValidateSlice(raw[i .. i + n])) {
+    var at: usize = 0;
+    while (at < raw.len) {
+        const sequence_bytes = std.unicode.utf8ByteSequenceLength(raw[at]) catch 0;
+        const sequence_end = at + sequence_bytes;
+        const valid = sequence_bytes > 0 and sequence_end <= raw.len and
+            std.unicode.utf8ValidateSlice(raw[at..sequence_end]);
+        if (!valid) {
             out.appendSlice(arena, "\u{FFFD}") catch return "";
-            i += 1;
+            at += 1;
             continue;
         }
-        if (n == 1 and (raw[i] < 0x20 or raw[i] == 0x7f)) {
+        const control = sequence_bytes == 1 and (raw[at] < ascii_space or raw[at] == ascii_delete);
+        if (control) {
             out.append(arena, ' ') catch return "";
-        } else if (!isBidiControl(std.unicode.utf8Decode(raw[i .. i + n]) catch 0)) {
-            out.appendSlice(arena, raw[i .. i + n]) catch return "";
+        } else if (!isBidiControl(std.unicode.utf8Decode(raw[at..sequence_end]) catch 0)) {
+            out.appendSlice(arena, raw[at..sequence_end]) catch return "";
         }
-        i += n;
+        at = sequence_end;
     }
     return out.toOwnedSliceSentinel(arena, 0) catch "";
 }
 
+/// ASCII's control characters: below the space, and DEL.
+const ascii_space = 0x20;
+const ascii_delete = 0x7f;
+
 /// Embeddings and overrides (U+202A–202E), isolates (U+2066–2069) and the
 /// marks (U+200E, U+200F, U+061C): they reorder or place the text around
 /// them and draw nothing.
-fn isBidiControl(cp: u21) bool {
-    return switch (cp) {
+fn isBidiControl(code_point: u21) bool {
+    return switch (code_point) {
         0x202a...0x202e, 0x2066...0x2069, 0x200e, 0x200f, 0x061c => true,
         else => false,
     };
@@ -58,6 +67,14 @@ fn isBidiControl(cp: u21) bool {
 /// Lines shown after the matching one in a content preview.
 pub const context_after = 14;
 
+/// Lines shown above the matching line in a content preview.
+const context_before = 6;
+/// A line of the preview is cut to this: a minified file's one line would
+/// make Pango lay out megabytes.
+const context_line_bytes_max = 240;
+/// The line numbers are dimmed to this opacity.
+const line_number_alpha = "45%";
+
 /// Pango markup of the lines around `line` (1-based), with line numbers and
 /// every occurrence of `words` highlighted.
 pub fn contextMarkup(
@@ -65,52 +82,65 @@ pub fn contextMarkup(
     text: []const u8,
     line: u32,
     words: []const []const u8,
-    hl_open: []const u8,
+    highlight_open: []const u8,
 ) [:0]const u8 {
-    const before = 6;
-    const after = context_after;
-    const first = if (line > before) line - before else 1;
+    const first = if (line > context_before) line - context_before else 1;
     var out: std.ArrayList(u8) = .empty;
-    var n: u32 = 1;
+    var line_number: u32 = 1;
     var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |raw| : (n += 1) {
-        if (n < first) continue;
-        if (n > line + after) break;
-        const l = core.utf8.validPrefix(raw[0..@min(raw.len, 240)]);
-        const num = arena.print("<span alpha=\"45%\">{d: >4}  </span>", .{n}) catch return "";
-        out.appendSlice(arena, num) catch return "";
-        if (n == line) out.appendSlice(arena, "<b>") catch return "";
+    while (lines.next()) |raw| : (line_number += 1) {
+        if (line_number < first) continue;
+        if (line_number > line + context_after) break;
+        const shown = core.utf8.validPrefix(raw[0..@min(raw.len, context_line_bytes_max)]);
+        const number = arena.print(
+            "<span alpha=\"" ++ line_number_alpha ++ "\">{d: >4}  </span>",
+            .{line_number},
+        ) catch return "";
+        out.appendSlice(arena, number) catch return "";
+        if (line_number == line) out.appendSlice(arena, "<b>") catch return "";
         // Escape piece by piece, wrapping each hit.
-        var pos: usize = 0;
-        while (pos < l.len) {
+        var position: usize = 0;
+        while (position < shown.len) {
             // Folded matches: "accion" highlights "ACCIÓN", whose length differs.
             var hit: ?index.content.Span = null;
-            for (words) |w| {
-                if (index.content.findFold(l, w, pos)) |m| {
-                    if (hit == null or m.start < hit.?.start) hit = m;
+            for (words) |word| {
+                if (index.content.findFold(shown, word, position)) |match| {
+                    if (hit == null or match.start < hit.?.start) hit = match;
                 }
             }
-            const end = if (hit) |m| m.start else l.len;
-            appendEscaped(arena, &out, l[pos..end]);
-            if (hit) |m| {
-                out.appendSlice(arena, hl_open) catch return "";
-                appendEscaped(arena, &out, l[m.start..m.end]);
+            const end = if (hit) |match| match.start else shown.len;
+            appendEscaped(arena, &out, shown[position..end]) catch return "";
+            if (hit) |match| {
+                out.appendSlice(arena, highlight_open) catch return "";
+                appendEscaped(arena, &out, shown[match.start..match.end]) catch return "";
                 out.appendSlice(arena, "</span>") catch return "";
-                pos = m.end;
-            } else pos = l.len;
+                position = match.end;
+            } else position = shown.len;
         }
-        if (n == line) out.appendSlice(arena, "</b>") catch return "";
+        if (line_number == line) out.appendSlice(arena, "</b>") catch return "";
         out.append(arena, '\n') catch return "";
     }
     return arena.dupeSentinel(u8, out.items, 0) catch "";
 }
 
-pub fn appendEscaped(arena: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) void {
-    if (s.len == 0) return;
-    const e = c.g_markup_escape_text(s.ptr, @intCast(s.len));
-    defer c.g_free(e);
-    out.appendSlice(arena, std.mem.span(e)) catch {};
+/// `text` escaped for Pango markup, appended to `out`.
+pub fn appendEscaped(
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    text: []const u8,
+) std.mem.Allocator.Error!void {
+    if (text.len == 0) return;
+    const escaped = c.g_markup_escape_text(text.ptr, @intCast(text.len));
+    defer c.g_free(escaped);
+    try out.appendSlice(arena, std.mem.span(escaped));
 }
+
+/// Content types GLib gives files it guesses wrong: media for source
+/// files that share an extension with a video (.mts), and octet-stream,
+/// GLib's "no idea" (no shared-mime-info data, for example).
+const mime_video_prefix = "video/";
+const mime_audio_prefix = "audio/";
+pub const mime_unknown = "application/octet-stream";
 
 /// "Kind" in the detail pane. GLib guesses from the extension and is wrong
 /// for some source files: .zig is "unknown", .mts is a video ("MPEG-2
@@ -122,47 +152,57 @@ pub fn kindLabel(
     ctype: ?[*:0]const u8,
 ) [:0]const u8 {
     if (is_dir) return "Folder";
-    const desc = if (ctype) |t| c.g_content_type_get_description(t) else null;
-    defer if (desc) |d| c.g_free(d);
-    const name = if (std.mem.findScalarLast(u8, path, '/')) |s| path[s + 1 ..] else path;
+    const description = if (ctype) |content_type|
+        c.g_content_type_get_description(content_type)
+    else
+        null;
+    defer if (description) |text| c.g_free(text);
+    const slash = std.mem.findScalarLast(u8, path, '/');
+    const name = if (slash) |slash_index| path[slash_index + 1 ..] else path;
     var upper: [4]u8 = undefined;
-    if (core.file_badge.of(name, &upper)) |b| {
-        const t = if (ctype) |t| std.mem.span(t) else "";
-        // octet-stream is GLib's "no idea" (e.g. no shared-mime-info data).
-        const media = std.mem.startsWith(
-            u8,
-            t,
-            "video/",
-        ) or std.mem.startsWith(u8, t, "audio/") or std.mem.eql(
-            u8,
-            t,
-            "application/octet-stream",
-        );
-        const unknown = desc == null or std.ascii.eqlIgnoreCase(std.mem.span(desc.?), "unknown");
-        if (media or unknown) return arena.printSentinel("{s} file", .{b.text}, 0) catch "File";
+    if (core.file_badge.of(name, &upper)) |badge| {
+        const content_type = if (ctype) |content_type| std.mem.span(content_type) else "";
+        const media = std.mem.startsWith(u8, content_type, mime_video_prefix) or
+            std.mem.startsWith(u8, content_type, mime_audio_prefix) or
+            std.mem.eql(u8, content_type, mime_unknown);
+        const unknown = description == null or
+            std.ascii.eqlIgnoreCase(std.mem.span(description.?), "unknown");
+        if (media or unknown) {
+            return arena.printSentinel("{s} file", .{badge.text}, 0) catch "File";
+        }
     }
-    return if (desc) |d| arena.dupeSentinel(u8, std.mem.span(d), 0) catch "File" else "File";
+    const text = description orelse return "File";
+    return arena.dupeSentinel(u8, std.mem.span(text), 0) catch "File";
 }
 
-pub fn firstLines(text: []const u8, n: usize) []const u8 {
-    var count: usize = 0;
-    for (text, 0..) |ch, i| {
-        if (ch != '\n') continue;
-        count += 1;
-        if (count == n) return text[0..i];
+/// The first `lines_wanted` lines of `text`, without the newline ending
+/// the last one.
+pub fn firstLines(text: []const u8, lines_wanted: usize) []const u8 {
+    // Zero lines would be every line: the loop below never reaches 0.
+    assert(lines_wanted > 0);
+    var lines_count: usize = 0;
+    for (text, 0..) |character, i| {
+        if (character != '\n') continue;
+        lines_count += 1;
+        if (lines_count == lines_wanted) return text[0..i];
     }
     return text;
 }
 
+/// A size for people: bytes up to a KB, then KB, MB... (binary, as file
+/// managers on Linux show them) with one decimal.
 pub fn formatSize(arena: std.mem.Allocator, bytes: u64) [:0]const u8 {
     const units = [_][]const u8{ "bytes", "KB", "MB", "GB", "TB" };
-    var v: f64 = @floatFromInt(bytes);
-    var u: usize = 0;
-    while (v >= 1024 and u + 1 < units.len) : (u += 1) v /= 1024;
-    return (if (u == 0)
+    const unit_bytes = 1024;
+    var amount: f64 = @floatFromInt(bytes);
+    var unit_index: usize = 0;
+    while (amount >= unit_bytes and unit_index + 1 < units.len) : (unit_index += 1) {
+        amount /= unit_bytes;
+    }
+    return (if (unit_index == 0)
         arena.printSentinel("{d} bytes", .{bytes}, 0)
     else
-        arena.printSentinel("{d:.1} {s}", .{ v, units[u] }, 0)) catch "";
+        arena.printSentinel("{d:.1} {s}", .{ amount, units[unit_index] }, 0)) catch "";
 }
 
 pub fn now() i64 {
@@ -171,12 +211,12 @@ pub fn now() i64 {
 
 pub fn startOfToday() i64 {
     // Null only for a date GLib cannot represent: then everything is "Earlier".
-    const dt = c.g_date_time_new_now_local() orelse return std.math.maxInt(i64);
-    defer c.g_date_time_unref(dt);
+    const date_time = c.g_date_time_new_now_local() orelse return std.math.maxInt(i64);
+    defer c.g_date_time_unref(date_time);
     const midnight = c.g_date_time_new_local(
-        c.g_date_time_get_year(dt),
-        c.g_date_time_get_month(dt),
-        c.g_date_time_get_day_of_month(dt),
+        c.g_date_time_get_year(date_time),
+        c.g_date_time_get_month(date_time),
+        c.g_date_time_get_day_of_month(date_time),
         0,
         0,
         0,
@@ -186,28 +226,32 @@ pub fn startOfToday() i64 {
 }
 
 pub fn formatWhen(arena: std.mem.Allocator, unix: i64) [:0]const u8 {
-    const dt = c.g_date_time_new_from_unix_local(unix) orelse return "";
-    defer c.g_date_time_unref(dt);
+    const date_time = c.g_date_time_new_from_unix_local(unix) orelse return "";
+    defer c.g_date_time_unref(date_time);
     const today = startOfToday();
-    const fmt: [*:0]const u8 = if (unix >= today)
+    const format: [*:0]const u8 = if (unix >= today)
         "Today at %H:%M"
-    else if (unix >= today - 86400)
+    else if (unix >= today - std.time.s_per_day)
         "Yesterday at %H:%M"
     else
         "%b %e at %H:%M";
-    const s = c.g_date_time_format(dt, fmt) orelse return "";
-    defer c.g_free(s);
-    return arena.dupeSentinel(u8, std.mem.span(s), 0) catch "";
+    const formatted = c.g_date_time_format(date_time, format) orelse return "";
+    defer c.g_free(formatted);
+    return arena.dupeSentinel(u8, std.mem.span(formatted), 0) catch "";
 }
+
+/// A clipboard row's title is its first line, cut to this.
+const clipboard_title_bytes_max = 120;
 
 /// First non-blank line, collapsed and capped, for a clipboard row title
 /// (made safe like a file name: copied text can hold anything).
 pub fn firstLine(arena: std.mem.Allocator, text: []const u8) [:0]const u8 {
     var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |l| {
-        const t = std.mem.trim(u8, l, " \t\r");
-        if (t.len == 0) continue;
-        return displayText(arena, core.utf8.validPrefix(t[0..@min(t.len, 120)]));
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        const title = trimmed[0..@min(trimmed.len, clipboard_title_bytes_max)];
+        return displayText(arena, core.utf8.validPrefix(title));
     }
     return "";
 }

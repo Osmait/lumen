@@ -5,6 +5,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const c = @import("c");
 const gtk = @import("gtk.zig");
+const core = @import("core");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
 const Host = @import("../ext/Host.zig");
@@ -114,9 +115,9 @@ fn onRegistry(registry: *Host.Registry, ctx: ?*anyopaque) void {
         ui.keepSelection();
         ui.rebuild();
     }
-    if (old_result) |r| r.destroy(ui.gpa);
-    if (old_root) |r| r.destroy(ui.gpa);
-    if (old) |r| r.destroy(ui.gpa);
+    if (old_result) |result| result.destroy(ui.gpa);
+    if (old_root) |result| result.destroy(ui.gpa);
+    if (old) |old_registry| old_registry.destroy(ui.gpa);
     // What an update or removal from Settings said, over the rebuilt rows.
     if (ui.after_reload_pending) {
         ui.after_reload_pending = false;
@@ -190,16 +191,20 @@ fn rootAnswer(
     return if (last_shown) .drop else .keep;
 }
 
-/// Extension rows for the root search `q`: shown when they answer `q`,
+/// Extensions are asked for root rows from this many bytes typed: one
+/// letter would wake every extension's `root` for each first keystroke.
+const root_query_bytes_min = 2;
+
+/// Extension rows for the root search `query`: shown when they answer it,
 /// asked for otherwise (they arrive with onRoot).
 pub fn addRootSections(ui: *Ui, query: []const u8) void {
     const registry = ui.ext_registry orelse return;
     const host = ui.ext_host orelse return;
     var any = false;
     for (registry.commands) |cmd| any = any or cmd.root;
-    if (!any or query.len < 2) return;
-    if (ui.ext_root_search.latest) |r| if (std.mem.eql(u8, r.query, query)) {
-        for (r.sections) |sec| {
+    if (!any or query.len < root_query_bytes_min) return;
+    if (ui.ext_root_search.latest) |answer| if (std.mem.eql(u8, answer.query, query)) {
+        for (answer.sections) |sec| {
             if (sec.command >= registry.commands.len) continue;
             ui.addSection(registry.commands[sec.command].title);
             for (sec.items) |item| ui.addItem(item);
@@ -216,7 +221,9 @@ fn onList(answer: *Host.ListResult, ctx: ?*anyopaque) void {
         answer.destroy(ui.gpa);
         return;
     }
-    if (answer.err) |e| log.warn("{s}: {s}", .{ if (command(ui)) |cmd| cmd.id else "?", e });
+    if (answer.err) |message| {
+        log.warn("{s}: {s}", .{ if (command(ui)) |cmd| cmd.id else "?", message });
+    }
     // Rows without an icon take their command's. The icon points into the
     // registry, which outlives the result: a reload destroys results first.
     if (command(ui)) |cmd| for (answer.items) |*item| {
@@ -235,9 +242,9 @@ fn onAct(answer: *Host.ActResult, ctx: ?*anyopaque) void {
     defer answer.destroy(ui.gpa);
     if (answer.gen != ui.ext_act_gen) return;
     ui.ext_act_gen = 0;
-    if (answer.err) |e| {
-        log.warn("action: {s}", .{e});
-        ui.showFailure(firstLine(ui.query_arena.allocator(), e));
+    if (answer.err) |message| {
+        log.warn("action: {s}", .{message});
+        ui.showFailure(firstLine(ui.query_arena.allocator(), message));
         return;
     }
     switch (answer.outcome) {
@@ -278,13 +285,13 @@ fn remap(ui: *Ui, old: *const Host.Registry, new: *const Host.Registry) bool {
     ui.form_cmd = form orelse gone;
     if (form != null and !same_form) form_view.reset(ui);
     switch (ui.input) {
-        .pref => |i| ui.input = .{ .pref = samePref(old, new, i) orelse gone },
+        .pref => |pref_index| ui.input = .{ .pref = samePref(old, new, pref_index) orelse gone },
         .field => if (!same_form) {
             ui.input = .{ .field = gone };
         },
     }
     switch (ui.choosing) {
-        .pref => |i| ui.choosing = .{ .pref = samePref(old, new, i) orelse gone },
+        .pref => |pref_index| ui.choosing = .{ .pref = samePref(old, new, pref_index) orelse gone },
         .field => if (!same_form) {
             ui.choosing = .{ .field = gone };
         },
@@ -294,10 +301,10 @@ fn remap(ui: *Ui, old: *const Host.Registry, new: *const Host.Registry) bool {
         .ext => ui.ext_cmd == gone,
         .form => ui.form_cmd == gone,
         .input => switch (ui.input) {
-            .pref, .field => |i| i == gone,
+            .pref, .field => |index| index == gone,
         },
         .choose => switch (ui.choosing) {
-            .pref, .field => |i| i == gone,
+            .pref, .field => |index| index == gone,
             else => false,
         },
         else => false,
@@ -333,10 +340,14 @@ fn sameFields(fields_old: []const Host.Pref, fields_new: []const Host.Pref) bool
     return true;
 }
 
-/// The first line of an error (the rest is the traceback), in `a`.
-fn firstLine(arena: std.mem.Allocator, msg: []const u8) [:0]const u8 {
-    const end = std.mem.findScalar(u8, msg, '\n') orelse msg.len;
-    return arena.dupeSentinel(u8, msg[0..@min(end, 200)], 0) catch "Failed";
+/// An error shown on a row is cut to this: the row has one line for it.
+const error_line_bytes_max = 200;
+
+/// The first line of an error (the rest is the traceback), in `arena`.
+fn firstLine(arena: std.mem.Allocator, message: []const u8) [:0]const u8 {
+    const end = std.mem.findScalar(u8, message, '\n') orelse message.len;
+    const line = message[0..@min(end, error_line_bytes_max)];
+    return arena.dupeSentinel(u8, core.utf8.validPrefix(line), 0) catch "Failed";
 }
 
 // ----------------------------------------------------------------- rows
@@ -376,8 +387,8 @@ pub fn rootItems(ui: *Ui, arena: std.mem.Allocator) []const Item {
 
 /// The open command's rows before filtering.
 pub fn base(ui: *Ui) []Item {
-    const r = ui.ext_list.latest orelse return &.{};
-    return if (r.command == ui.ext_cmd and r.err == null) r.items else &.{};
+    const answer = ui.ext_list.latest orelse return &.{};
+    return if (answer.command == ui.ext_cmd and answer.err == null) answer.items else &.{};
 }
 
 /// Before the ext view shows: list commands are asked once here.
@@ -394,8 +405,8 @@ pub fn waitingForSearch(ui: *Ui, query: []const u8) bool {
     const cmd = command(ui) orelse return false;
     if (cmd.mode != .search) return false;
     if (!ui.ext_list.showingLatest()) return false;
-    const r = ui.ext_list.latest.?;
-    if (r.command == ui.ext_cmd and std.mem.eql(u8, r.query, query)) return false;
+    const answer = ui.ext_list.latest.?;
+    if (answer.command == ui.ext_cmd and std.mem.eql(u8, answer.query, query)) return false;
     _ = prepare(ui, query);
     return true;
 }
@@ -422,8 +433,11 @@ fn ask(ui: *Ui, query: []const u8) void {
 
 pub fn emptyText(ui: *Ui, arena: std.mem.Allocator, query: []const u8) [:0]const u8 {
     const cmd = command(ui) orelse return "No Results";
-    if (ui.ext_list.latest) |r| if (r.command == ui.ext_cmd) if (r.err) |e|
-        return arena.printSentinel("Error: {s}", .{firstLine(arena, e)}, 0) catch "Error";
+    if (ui.ext_list.latest) |answer| {
+        if (answer.command == ui.ext_cmd) if (answer.err) |message| {
+            return arena.printSentinel("Error: {s}", .{firstLine(arena, message)}, 0) catch "Error";
+        };
+    }
     if (ui.ext_list.pending) return "Loading...";
     if (cmd.mode == .search and query.len == 0) return "Type to search";
     return "No Results";
@@ -433,7 +447,8 @@ pub fn placeholder(ui: *Ui, buf: []u8) [*:0]const u8 {
     const cmd = command(ui) orelse return "Search...";
     if (cmd.placeholder.len > 0) return cmd.placeholder;
     // "Search Emoji" reads "Search Emoji...", not "Search Search Emoji...".
-    const verb = if (std.mem.startsWith(u8, cmd.title, "Search ")) "" else "Search ";
+    const search_verb = "Search ";
+    const verb = if (std.mem.startsWith(u8, cmd.title, search_verb)) "" else search_verb;
     const text = std.mem.printSentinel(
         buf,
         "{s}{s}...",
@@ -493,10 +508,18 @@ pub fn perform(ui: *Ui, action_index: u8) void {
     ui.hide();
 }
 
+/// What makes a target of lumen.action.open a URL (any scheme with "//",
+/// and mailto, which has none), and a path in the home folder.
+const url_scheme_separator = "://";
+const mailto_scheme = "mailto:";
+const home_prefix = "~/";
+
 /// A URL in the default app; a path ("~/" allowed) the way Lumen opens
 /// files, Default Apps included.
 fn open(ui: *Ui, target: [:0]const u8) void {
-    if (std.mem.find(u8, target, "://") != null or std.mem.startsWith(u8, target, "mailto:")) {
+    const is_url = std.mem.find(u8, target, url_scheme_separator) != null or
+        std.mem.startsWith(u8, target, mailto_scheme);
+    if (is_url) {
         const lctx = proc.launchContext() orelse return;
         defer c.g_object_unref(lctx);
         var err: ?*c.GError = null;
@@ -505,11 +528,11 @@ fn open(ui: *Ui, target: [:0]const u8) void {
         return;
     }
     var buf: [4096]u8 = undefined;
-    const path = if (std.mem.startsWith(u8, target, "~/"))
+    const path = if (std.mem.startsWith(u8, target, home_prefix))
         std.mem.printSentinel(
             &buf,
             "{s}/{s}",
-            .{ std.mem.span(c.g_get_home_dir()), target[2..] },
+            .{ std.mem.span(c.g_get_home_dir()), target[home_prefix.len..] },
             0,
         ) catch return
     else

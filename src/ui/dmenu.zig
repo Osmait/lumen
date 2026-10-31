@@ -19,8 +19,22 @@ const Ui = @import("Ui.zig");
 
 const log = std.log.scoped(.dmenu);
 
+/// The row options rofi reads after a line's NUL, as key and value pairs
+/// separated by `rofi_option_separator` (rofi's "\x1f").
+const RofiOption = enum { icon, meta, nonselectable };
+const rofi_option_separator = 0x1f;
+const rofi_true = "true";
+
 const lines_max = 200_000;
 const bytes_max = 64 << 20;
+/// Bytes asked of stdin per read.
+const read_chunk_bytes = 256 * 1024;
+/// While lines arrive, the list is rebuilt this often (ms), and less often
+/// past `rebuild_slow_lines`: with a query typed, a rebuild scores every
+/// line read so far.
+const rebuild_delay_ms = 50;
+const rebuild_slow_delay_ms = 250;
+const rebuild_slow_lines = 10_000;
 /// Rows listed with nothing typed, and best matches listed when filtering.
 const shown_all = 500;
 const shown_matches = 200;
@@ -61,7 +75,7 @@ pub const Session = struct {
 
     fn destroy(session: *Session) void {
         if (session.rebuild_timer != 0) _ = c.g_source_remove(session.rebuild_timer);
-        if (session.stream) |st| c.g_object_unref(st);
+        if (session.stream) |stream| c.g_object_unref(stream);
         c.g_object_unref(session.cancel);
         session.partial.deinit(session.gpa);
         session.arena.deinit();
@@ -100,7 +114,7 @@ fn readMore(session: *Session) void {
     session.reading = true;
     c.g_input_stream_read_bytes_async(
         session.stream.?,
-        256 * 1024,
+        read_chunk_bytes,
         0,
         session.cancel,
         &onRead,
@@ -156,8 +170,9 @@ fn onRead(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
             session.done_reading = true;
         } else readMore(session);
     }
-    // The first lines at once, the end at once, the rest now and then.
-    if (session.done_reading or session.lines.items.len <= 500) {
+    // The first screens at once (as many lines as the list shows with
+    // nothing typed), the end at once, the rest now and then.
+    if (session.done_reading or session.lines.items.len <= shown_all) {
         if (session.rebuild_timer != 0) _ = c.g_source_remove(session.rebuild_timer);
         session.rebuild_timer = 0;
         showLines(session);
@@ -167,10 +182,9 @@ fn onRead(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
     }
 }
 
-/// Milliseconds between rebuilds while lines arrive. With a query typed a
-/// rebuild scores every line read so far: past 10 000 lines, less often.
-fn rebuildDelay(lines: usize) c_uint {
-    return if (lines > 10_000) 250 else 50;
+/// Milliseconds between rebuilds while `lines_count` lines have arrived.
+fn rebuildDelay(lines_count: usize) c_uint {
+    return if (lines_count > rebuild_slow_lines) rebuild_slow_delay_ms else rebuild_delay_ms;
 }
 
 fn onRebuildTimer(data: ?*anyopaque) callconv(.c) c.gboolean {
@@ -196,18 +210,21 @@ fn addLine(session: *Session, raw: []const u8) void {
     var line: Line = .{ .text = "" };
     // rofi's options: text, NUL, then key\x1fvalue pairs.
     if (std.mem.findScalar(u8, text, 0)) |nul| {
-        var opts = std.mem.splitScalar(u8, text[nul + 1 ..], 0x1f);
-        while (opts.next()) |key| {
-            const value = opts.next() orelse break;
-            if (std.mem.eql(u8, key, "icon")) {
-                const name = arena.dupeSentinel(u8, value, 0) catch continue;
-                line.icon = if (value.len > 0 and value[0] >= 0x80) .{
-                    .emoji = name,
-                } else .byName(name);
-            } else if (std.mem.eql(u8, key, "meta")) {
-                line.meta = arena.dupe(u8, value) catch "";
-            } else if (std.mem.eql(u8, key, "nonselectable")) {
-                line.selectable = !std.mem.eql(u8, value, "true");
+        var options = std.mem.splitScalar(u8, text[nul + 1 ..], rofi_option_separator);
+        while (options.next()) |key| {
+            const value = options.next() orelse break;
+            // An option Lumen does not know is skipped, as rofi does.
+            const option = std.meta.stringToEnum(RofiOption, key) orelse continue;
+            switch (option) {
+                .icon => {
+                    const name = arena.dupeSentinel(u8, value, 0) catch continue;
+                    // A first byte past ASCII starts a character, not an icon name.
+                    line.icon = if (value.len > 0 and value[0] >= 0x80) .{
+                        .emoji = name,
+                    } else .byName(name);
+                },
+                .meta => line.meta = arena.dupe(u8, value) catch "",
+                .nonselectable => line.selectable = !std.mem.eql(u8, value, rofi_true),
             }
         }
         text = text[0..nul];

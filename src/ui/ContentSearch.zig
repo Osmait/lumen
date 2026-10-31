@@ -87,6 +87,7 @@ pub fn start(
         .ctx = ctx,
     };
     content_search.thread = try std.Thread.spawn(.{}, run, .{content_search});
+    // The name only shows in tools like top: a thread without one works.
     content_search.thread.setName(io, "lm-csearch") catch {};
     return content_search;
 }
