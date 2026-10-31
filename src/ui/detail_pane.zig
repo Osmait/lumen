@@ -173,7 +173,10 @@ pub fn showFileDetail(ui: *Ui, item: *const Item) void {
     defer arena_instance.deinit();
     const arena = arena_instance.allocator();
 
-    const guessed_type = if (file.is_dir) null else c.g_content_type_guess(file.path, null, 0, null);
+    const guessed_type = if (file.is_dir)
+        null
+    else
+        c.g_content_type_guess(file.path, null, 0, null);
     defer if (guessed_type) |type_name| c.g_free(type_name);
     const content_type: [*:0]const u8 = guessed_type orelse mime_directory;
 

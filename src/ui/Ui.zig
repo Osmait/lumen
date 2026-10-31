@@ -1182,7 +1182,7 @@ pub fn setReselect(self: *Ui, comptime fmt: []const u8, args: anytype) void {
     self.reselect.print(fmt, args);
 }
 
-pub fn actionCtx(self: *Ui) run.Ctx {
+pub fn actionContext(self: *Ui) run.Ctx {
     return .{ .gpa = self.gpa, .db = &self.db, .settings = &self.settings };
 }
 
@@ -1203,7 +1203,8 @@ pub fn showWith(self: *Ui, view: View, text: ?[*:0]const u8) void {
     const was_hidden = !gtk.isVisible(self.window);
     _ = self.frecency_arena.reset(.retain_capacity);
     // Without it, results are ranked by match quality alone.
-    self.frecency = self.db.loadFrecency(self.frecency_arena.allocator(), labels.now()) catch .empty;
+    const frecency_arena = self.frecency_arena.allocator();
+    self.frecency = self.db.loadFrecency(frecency_arena, labels.now()) catch .empty;
     if (!gtk.isVisible(self.window)) {
         // The settings file may have been edited by hand since the window
         // last opened.
@@ -2320,7 +2321,7 @@ pub fn perform(self: *Ui, op: item_mod.Op) void {
         const content = self.db.clipContent(clip_arena.allocator(), item.action.clip) catch null;
         whole.detail = content orelse return self.showFailure("Could not read the entry");
     }
-    const outcome = run.perform(self.actionCtx(), &whole, op);
+    const outcome = run.perform(self.actionContext(), &whole, op);
     switch (outcome) {
         .hide => self.hide(),
         .stay => {},
