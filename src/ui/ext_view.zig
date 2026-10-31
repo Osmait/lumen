@@ -73,7 +73,7 @@ pub fn reload(ui: *Ui) void {
 
 pub fn command(ui: *Ui) ?*const Host.Command {
     const registry = ui.ext_registry orelse return null;
-    return registry.command(ui.ext_cmd);
+    return registry.command(ui.ext_command);
 }
 
 // ------------------------------------------------------------- results
@@ -239,8 +239,8 @@ fn listCallback(answer: *Host.ListResult, ctx: ?*anyopaque) void {
 fn actCallback(answer: *Host.ActResult, ctx: ?*anyopaque) void {
     const ui: *Ui = @ptrCast(@alignCast(ctx.?));
     defer answer.destroy(ui.gpa);
-    if (answer.gen != ui.ext_act_gen) return;
-    ui.ext_act_gen = .none;
+    if (answer.gen != ui.ext_act_generation) return;
+    ui.ext_act_generation = .none;
     if (answer.err) |message| {
         log.warn("action: {s}", .{message});
         ui.showFailure(firstLine(ui.query_arena.allocator(), message));
@@ -270,14 +270,14 @@ fn find(registry: *const Host.Registry, id: []const u8) ?Host.CommandIndex {
 /// save into another extension's preferences, or submit another form).
 /// True when the open view lost what it shows. Call with `new` in place.
 fn remap(ui: *Ui, old: *const Host.Registry, new: *const Host.Registry) bool {
-    ui.ext_cmd = sameCommand(old, new, ui.ext_cmd) orelse .gone;
-    const form = sameCommand(old, new, ui.form_cmd);
+    ui.ext_command = sameCommand(old, new, ui.ext_command) orelse .gone;
+    const form = sameCommand(old, new, ui.form_command);
     // A form whose fields changed starts over: values are kept by position.
     const same_form = if (form) |form_index|
-        sameFields(old.command(ui.form_cmd).?.fields, new.command(form_index).?.fields)
+        sameFields(old.command(ui.form_command).?.fields, new.command(form_index).?.fields)
     else
         false;
-    ui.form_cmd = form orelse .gone;
+    ui.form_command = form orelse .gone;
     if (form != null and !same_form) form_view.reset(ui);
     switch (ui.input) {
         .pref => |pref_index| {
@@ -297,8 +297,8 @@ fn remap(ui: *Ui, old: *const Host.Registry, new: *const Host.Registry) bool {
         else => {},
     }
     return switch (ui.view) {
-        .ext => ui.ext_cmd == .gone,
-        .form => ui.form_cmd == .gone,
+        .ext => ui.ext_command == .gone,
+        .form => ui.form_command == .gone,
         .input => switch (ui.input) {
             .pref => |pref_index| pref_index == .gone,
             .field => |field_index| field_index == .gone,
@@ -393,7 +393,7 @@ pub fn rootItems(ui: *Ui, arena: std.mem.Allocator) []const Item {
 /// The open command's rows before filtering.
 pub fn base(ui: *Ui) []Item {
     const answer = ui.ext_list.latest orelse return &.{};
-    return if (answer.command == ui.ext_cmd and answer.err == null) answer.items else &.{};
+    return if (answer.command == ui.ext_command and answer.err == null) answer.items else &.{};
 }
 
 /// Before the ext view shows: list commands are asked once here.
@@ -411,7 +411,7 @@ pub fn waitingForSearch(ui: *Ui, query: []const u8) bool {
     if (cmd.mode != .search) return false;
     if (!ui.ext_list.showingLatest()) return false;
     const answer = ui.ext_list.latest.?;
-    if (answer.command == ui.ext_cmd and std.mem.eql(u8, answer.query, query)) return false;
+    if (answer.command == ui.ext_command and std.mem.eql(u8, answer.query, query)) return false;
     _ = prepare(ui, query);
     return true;
 }
@@ -423,7 +423,7 @@ pub fn prepare(ui: *Ui, query: []const u8) bool {
     const cmd = command(ui) orelse return true;
     if (cmd.mode != .search) return true;
     const answered = if (ui.ext_list.latest) |result|
-        result.command == ui.ext_cmd and std.mem.eql(u8, result.query, query)
+        result.command == ui.ext_command and std.mem.eql(u8, result.query, query)
     else
         false;
     if (!answered and !ui.ext_list.asking(query)) ask(ui, query);
@@ -433,13 +433,13 @@ pub fn prepare(ui: *Ui, query: []const u8) bool {
 fn ask(ui: *Ui, query: []const u8) void {
     const host = ui.ext_host orelse return;
     const registry = ui.ext_registry orelse return;
-    ui.ext_list.sent(host.list(registry.gen, ui.ext_cmd, query), query);
+    ui.ext_list.sent(host.list(registry.gen, ui.ext_command, query), query);
 }
 
 pub fn emptyText(ui: *Ui, arena: std.mem.Allocator, query: []const u8) [:0]const u8 {
     const cmd = command(ui) orelse return "No Results";
     if (ui.ext_list.latest) |answer| {
-        if (answer.command == ui.ext_cmd) if (answer.err) |message| {
+        if (answer.command == ui.ext_command) if (answer.err) |message| {
             return arena.printSentinel("Error: {s}", .{firstLine(arena, message)}, 0) catch "Error";
         };
     }
@@ -472,13 +472,13 @@ pub fn activate(ui: *Ui, i: Host.CommandIndex) void {
     switch (activated.mode) {
         .run => {
             const host = ui.ext_host orelse return;
-            ui.ext_act_gen = host.act(registry.gen, i, .command_run);
+            ui.ext_act_generation = host.act(registry.gen, i, .command_run);
             ui.showRunning();
         },
         .form => form_view.open(ui, i),
         .provider => {},
         .list, .search => {
-            ui.ext_cmd = i;
+            ui.ext_command = i;
             ui.navigate(.ext);
         },
     }
@@ -496,7 +496,7 @@ pub fn perform(ui: *Ui, action_index: u8) void {
         .lua => {
             const host = ui.ext_host orelse return;
             const registry = ui.ext_registry orelse return;
-            ui.ext_act_gen = host.act(registry.gen, row.command, .{ .row_action = .{
+            ui.ext_act_generation = host.act(registry.gen, row.command, .{ .row_action = .{
                 .from_root_search = row.from_root_search,
                 .list_gen = row.list_generation,
                 .row_index = row.row_index,
@@ -587,7 +587,7 @@ pub fn openTarget(ui: *Ui, target: []const u8, text: ?[*:0]const u8) bool {
             },
             .list, .search => {},
         }
-        ui.ext_cmd = i;
+        ui.ext_command = i;
         if (!gtk.isVisible(ui.window)) {
             ui.showWith(.ext, text);
         } else {

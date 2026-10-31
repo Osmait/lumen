@@ -167,8 +167,8 @@ pub const all = [_]Theme{
 /// theme removed) get the default. `auto` resolves with `prefer_dark`.
 pub fn find(id: []const u8, prefer_dark: bool, custom: []const Theme) *const Theme {
     if (std.mem.eql(u8, id, auto_id)) return if (prefer_dark) &all[0] else &all[1];
-    for (&all) |*t| if (std.mem.eql(u8, t.id, id)) return t;
-    for (custom) |*t| if (std.mem.eql(u8, t.id, id)) return t;
+    for (&all) |*theme| if (std.mem.eql(u8, theme.id, id)) return theme;
+    for (custom) |*theme| if (std.mem.eql(u8, theme.id, id)) return theme;
     return &all[0];
 }
 
@@ -282,8 +282,8 @@ pub fn onAccent(theme: *const Theme) u24 {
 }
 
 /// "#rrggbb" for Pango markup.
-pub fn hex(buf: *[8]u8, color: u24) [:0]const u8 {
-    return std.mem.printSentinel(buf, "#{x:0>6}", .{color}, 0) catch "#ffffff";
+pub fn hex(out: *[8]u8, color: u24) [:0]const u8 {
+    return std.mem.printSentinel(out, "#{x:0>6}", .{color}, 0) catch "#ffffff";
 }
 
 /// WCAG contrast ratio between two colours (1 to 21).
@@ -320,34 +320,36 @@ fn srgbToLinear(channel: f64) f64 {
 }
 
 test "every theme is readable" {
-    for (all) |t| {
+    for (all) |theme| {
         // Body text: WCAG AA for normal text.
-        try std.testing.expect(contrast(t.fg, t.bg) >= 4.5);
+        try std.testing.expect(contrast(theme.fg, theme.bg) >= 4.5);
         // The selected row is an accent fill with text on it.
-        try std.testing.expect(contrast(onAccent(&t), t.accent) >= 4.5);
+        try std.testing.expect(contrast(onAccent(&theme), theme.accent) >= 4.5);
         // The caret and highlights must stand out from the background.
-        try std.testing.expect(contrast(t.accent, t.bg) >= 2.5);
+        try std.testing.expect(contrast(theme.accent, theme.bg) >= 2.5);
         // Secondary text is ink at 42%: it must still be legible.
-        try std.testing.expect(contrast(mix(t.ink, t.bg, 0.42), t.bg) >= 2.4);
-        try std.testing.expect(t.dark == (luminance(t.bg) < 0.2));
+        try std.testing.expect(contrast(mix(theme.ink, theme.bg, 0.42), theme.bg) >= 2.4);
+        try std.testing.expect(theme.dark == (luminance(theme.bg) < 0.2));
     }
 }
 
+/// `top` at opacity `alpha` over `under`.
 fn mix(top: u24, under: u24, alpha: f64) u24 {
     var out: u24 = 0;
     for (0..3) |i| {
         const shift: u5 = @intCast(16 - 8 * i);
-        const x: f64 = @floatFromInt((top >> shift) & 0xff);
-        const y: f64 = @floatFromInt((under >> shift) & 0xff);
-        out |= @as(u24, @intFromFloat(@round(x * alpha + y * (1 - alpha)))) << shift;
+        const top_channel: f64 = @floatFromInt((top >> shift) & 0xff);
+        const under_channel: f64 = @floatFromInt((under >> shift) & 0xff);
+        const channel = @round(top_channel * alpha + under_channel * (1 - alpha));
+        out |= @as(u24, @intFromFloat(channel)) << shift;
     }
     return out;
 }
 
 test "ids are unique and lookups fall back" {
-    for (all, 0..) |x, i| for (all[i + 1 ..]) |y| try std.testing.expect(
-        !std.mem.eql(u8, x.id, y.id),
-    );
+    for (all, 0..) |first, i| for (all[i + 1 ..]) |second| {
+        try std.testing.expect(!std.mem.eql(u8, first.id, second.id));
+    };
     try std.testing.expectEqualStrings("nord", find("nord", true, &.{}).id);
     try std.testing.expectEqualStrings("lumen-dark", find("no-such-theme", false, &.{}).id);
     try std.testing.expectEqualStrings("lumen-dark", find(auto_id, true, &.{}).id);
@@ -355,26 +357,26 @@ test "ids are unique and lookups fall back" {
 }
 
 test "style.css only uses variables the themes define" {
-    var s = settings.Settings.init(std.testing.allocator);
-    defer s.deinit();
+    var settings_default = settings.Settings.init(std.testing.allocator);
+    defer settings_default.deinit();
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try css(&out.writer, &all[0], &s);
-    const vars = out.written();
+    try css(&out.writer, &all[0], &settings_default);
+    const variables = out.written();
     const style = @embedFile("style.css");
-    var pos: usize = 0;
+    var position: usize = 0;
     var used: usize = 0;
-    while (std.mem.findPos(u8, style, pos, "var(--")) |at| {
+    while (std.mem.findPos(u8, style, position, "var(--")) |at| {
         const start = at + 4;
         const end = std.mem.findScalarPos(u8, style, start, ')') orelse break;
-        var buf: [64]u8 = undefined;
-        const decl = try std.mem.print(&buf, "{s}:", .{style[start..end]});
-        if (std.mem.find(u8, vars, decl) == null) {
+        var declaration_bytes: [64]u8 = undefined;
+        const declaration = try std.mem.print(&declaration_bytes, "{s}:", .{style[start..end]});
+        if (std.mem.find(u8, variables, declaration) == null) {
             std.debug.print("style.css uses undefined {s}\n", .{style[start..end]});
             return error.UndefinedVariable;
         }
         used += 1;
-        pos = end;
+        position = end;
     }
     try std.testing.expect(used > 20);
     // No hard-coded text colours left behind: they would ignore the theme.
@@ -382,13 +384,13 @@ test "style.css only uses variables the themes define" {
 }
 
 test "text size and opacity reach the CSS" {
-    var s = settings.Settings.init(std.testing.allocator);
-    defer s.deinit();
-    s.text_size = .large;
-    s.opacity = 80;
+    var settings_large = settings.Settings.init(std.testing.allocator);
+    defer settings_large.deinit();
+    settings_large.text_size = .large;
+    settings_large.opacity = 80;
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try css(&out.writer, find("nord", true, &.{}), &s);
+    try css(&out.writer, find("nord", true, &.{}), &settings_large);
     try std.testing.expect(
         std.mem.find(u8, out.written(), "--bg: rgba(46, 52, 64, 0.80);") != null,
     );

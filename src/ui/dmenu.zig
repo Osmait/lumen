@@ -25,24 +25,25 @@ const RofiOption = enum { icon, meta, nonselectable };
 const rofi_option_separator = 0x1f;
 const rofi_true = "true";
 
+/// Reading stops after this many lines, or this many bytes, of input.
 const lines_max = 200_000;
-const bytes_max = 64 << 20;
+const input_bytes_max = 64 << 20;
 /// Bytes asked of stdin per read.
 const read_chunk_bytes = 256 * 1024;
 /// While lines arrive, the list is rebuilt this often (ms), and less often
-/// past `rebuild_slow_lines`: with a query typed, a rebuild scores every
-/// line read so far.
+/// past `rebuild_slow_lines_min`: with a query typed, a rebuild scores
+/// every line read so far.
 const rebuild_delay_ms = 50;
 const rebuild_slow_delay_ms = 250;
-const rebuild_slow_lines = 10_000;
+const rebuild_slow_lines_min = 10_000;
 /// Rows listed with nothing typed, and best matches listed when filtering.
-const shown_all = 500;
-const shown_matches = 200;
+const rows_unfiltered_max = 500;
+const rows_filtered_max = 200;
 /// Bytes of a line, and of its meta, that filtering matches against. Each
 /// keystroke scores every line on the main thread, and one multi-MB line
 /// cost as much as thousands of short ones. Rows show less still
 /// (`widgets.row_text_bytes_max`); the whole line is what gets printed.
-const match_bytes = 1024;
+const match_bytes_max = 1024;
 
 const Line = struct {
     text: [:0]const u8,
@@ -53,15 +54,16 @@ const Line = struct {
 
 pub const Session = struct {
     gpa: std.mem.Allocator,
-    cmdline: *c.GApplicationCommandLine,
+    /// The caller's command line, referenced until it has its answer.
+    caller: *c.GApplicationCommandLine,
     stream: ?*c.GInputStream,
-    cancel: *c.GCancellable,
+    cancellable: *c.GCancellable,
     /// Lines and their text.
     arena: std.heap.ArenaAllocator,
     lines: std.ArrayList(Line) = .empty,
     /// The end of the input not yet ended by a newline.
     partial: std.ArrayList(u8) = .empty,
-    bytes: usize = 0,
+    bytes_read: usize = 0,
     prompt: [:0]const u8,
     /// A read is in flight; the session is freed when it returns.
     reading: bool = false,
@@ -76,30 +78,30 @@ pub const Session = struct {
     fn destroy(session: *Session) void {
         if (session.rebuild_timer != 0) _ = c.g_source_remove(session.rebuild_timer);
         if (session.stream) |stream| c.g_object_unref(stream);
-        c.g_object_unref(session.cancel);
+        c.g_object_unref(session.cancellable);
         session.partial.deinit(session.gpa);
         session.arena.deinit();
         session.gpa.destroy(session);
     }
 };
 
-/// Starts a session for `cmdline` and shows it. Main thread.
+/// Starts a session for `caller` and shows it. Main thread.
 pub fn start(
     ui: *Ui,
-    cmdline: *c.GApplicationCommandLine,
+    caller: *c.GApplicationCommandLine,
     prompt: ?[]const u8,
     query: ?[*:0]const u8,
 ) void {
     if (ui.picker != null) finish(ui, null);
     const session = ui.gpa.create(Session) catch {
-        c.g_application_command_line_set_exit_status(cmdline, 1);
+        c.g_application_command_line_set_exit_status(caller, 1);
         return;
     };
     session.* = .{
         .gpa = ui.gpa,
-        .cmdline = @ptrCast(c.g_object_ref(cmdline)),
-        .stream = c.g_application_command_line_get_stdin(cmdline),
-        .cancel = c.g_cancellable_new(),
+        .caller = @ptrCast(c.g_object_ref(caller)),
+        .stream = c.g_application_command_line_get_stdin(caller),
+        .cancellable = c.g_cancellable_new(),
         .arena = .init(ui.gpa),
         .prompt = "",
         .ui = ui,
@@ -116,7 +118,7 @@ fn readMore(session: *Session) void {
         session.stream.?,
         read_chunk_bytes,
         0,
-        session.cancel,
+        session.cancellable,
         &onRead,
         session,
     );
@@ -127,8 +129,8 @@ fn onRead(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
     session.reading = false;
     var err: ?*c.GError = null;
     const bytes = c.g_input_stream_read_bytes_finish(session.stream.?, async_result, &err);
-    defer if (bytes) |bytes_some| c.g_bytes_unref(bytes_some);
-    if (err) |err_some| c.g_error_free(err_some);
+    defer if (bytes) |received| c.g_bytes_unref(received);
+    if (err) |gerror| c.g_error_free(gerror);
     if (session.finished) return session.destroy();
 
     var length: usize = 0;
@@ -140,37 +142,39 @@ fn onRead(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
         session.partial.clearRetainingCapacity();
         session.done_reading = true;
     } else {
-        session.bytes += chunk.len;
+        session.bytes_read += chunk.len;
         var rest = chunk;
         // Out of memory, a line would be cut and could be picked and printed
         // as it is not: reading stops at the last whole line instead.
-        var oom = false;
-        while (std.mem.findScalar(u8, rest, '\n')) |nl| {
+        var out_of_memory = false;
+        while (std.mem.findScalar(u8, rest, '\n')) |newline| {
             if (session.partial.items.len > 0) {
-                session.partial.appendSlice(session.gpa, rest[0..nl]) catch {
-                    oom = true;
+                session.partial.appendSlice(session.gpa, rest[0..newline]) catch {
+                    out_of_memory = true;
                     break;
                 };
                 addLine(session, session.partial.items);
                 session.partial.clearRetainingCapacity();
-            } else addLine(session, rest[0..nl]);
-            rest = rest[nl + 1 ..];
+            } else addLine(session, rest[0..newline]);
+            rest = rest[newline + 1 ..];
         }
-        if (!oom) session.partial.appendSlice(session.gpa, rest) catch {
-            oom = true;
-        };
-        if (oom) {
+        if (!out_of_memory) {
+            session.partial.appendSlice(session.gpa, rest) catch {
+                out_of_memory = true;
+            };
+        }
+        if (out_of_memory) {
             log.warn("out of memory: stopped reading after {d} lines", .{session.lines.items.len});
             session.partial.clearRetainingCapacity();
             session.done_reading = true;
-        } else if (session.lines.items.len >= lines_max or session.bytes >= bytes_max) {
+        } else if (session.lines.items.len >= lines_max or session.bytes_read >= input_bytes_max) {
             log.warn("stopped reading after {d} lines", .{session.lines.items.len});
             session.done_reading = true;
         } else readMore(session);
     }
     // The first screens at once (as many lines as the list shows with
     // nothing typed), the end at once, the rest now and then.
-    if (session.done_reading or session.lines.items.len <= shown_all) {
+    if (session.done_reading or session.lines.items.len <= rows_unfiltered_max) {
         if (session.rebuild_timer != 0) _ = c.g_source_remove(session.rebuild_timer);
         session.rebuild_timer = 0;
         showLines(session);
@@ -180,9 +184,9 @@ fn onRead(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
     }
 }
 
-/// Milliseconds between rebuilds while `lines_count` lines have arrived.
-fn rebuildDelay(lines_count: usize) c_uint {
-    return if (lines_count > rebuild_slow_lines) rebuild_slow_delay_ms else rebuild_delay_ms;
+/// Milliseconds between rebuilds while `line_count` lines have arrived.
+fn rebuildDelay(line_count: usize) c_uint {
+    return if (line_count > rebuild_slow_lines_min) rebuild_slow_delay_ms else rebuild_delay_ms;
 }
 
 fn onRebuildTimer(data: ?*anyopaque) callconv(.c) c.gboolean {
@@ -207,8 +211,8 @@ fn addLine(session: *Session, raw: []const u8) void {
     if (text.len > 0 and text[text.len - 1] == '\r') text = text[0 .. text.len - 1];
     var line: Line = .{ .text = "" };
     // rofi's options: text, NUL, then key\x1fvalue pairs.
-    if (std.mem.findScalar(u8, text, 0)) |nul| {
-        var options = std.mem.splitScalar(u8, text[nul + 1 ..], rofi_option_separator);
+    if (std.mem.findScalar(u8, text, 0)) |nul_index| {
+        var options = std.mem.splitScalar(u8, text[nul_index + 1 ..], rofi_option_separator);
         while (options.next()) |key| {
             const value = options.next() orelse break;
             // An option Lumen does not know is skipped, as rofi does.
@@ -224,7 +228,7 @@ fn addLine(session: *Session, raw: []const u8) void {
                 .nonselectable => line.selectable = !std.mem.eql(u8, value, rofi_true),
             }
         }
-        text = text[0..nul];
+        text = text[0..nul_index];
     }
     if (!std.unicode.utf8ValidateSlice(text)) return;
     line.text = arena.dupeSentinel(u8, text, 0) catch return addLineOutOfMemory();
@@ -242,19 +246,19 @@ pub fn finish(ui: *Ui, choice: ?[]const u8) void {
     ui.picker = null;
     if (choice) |choice_text| {
         c.g_application_command_line_print(
-            session.cmdline,
+            session.caller,
             "%.*s\n",
             @as(c_int, @intCast(@min(choice_text.len, std.math.maxInt(c_int)))),
             choice_text.ptr,
         );
-        c.g_application_command_line_set_exit_status(session.cmdline, 0);
-    } else c.g_application_command_line_set_exit_status(session.cmdline, 1);
+        c.g_application_command_line_set_exit_status(session.caller, 0);
+    } else c.g_application_command_line_set_exit_status(session.caller, 1);
     // The caller's `lumen --dmenu` returns once this is released.
-    c.g_object_unref(session.cmdline);
+    c.g_object_unref(session.caller);
     session.finished = true;
     // The rows point into the session's lines.
     if (ui.view == .dmenu) ui.clearRows();
-    if (session.reading) c.g_cancellable_cancel(session.cancel) else session.destroy();
+    if (session.reading) c.g_cancellable_cancel(session.cancellable) else session.destroy();
 }
 
 /// Enter on a row.
@@ -283,61 +287,61 @@ pub fn emptyText(ui: *Ui) [:0]const u8 {
     return "No matches: Ctrl ↵ uses what you typed";
 }
 
-/// The rows for `q`: the first lines in order, or the best matches.
+/// The rows for `query`: the first lines in order, or the best matches.
 pub fn fill(ui: *Ui, arena: std.mem.Allocator, query: []const u8) void {
     const session = ui.picker orelse return;
     const lines = session.lines.items;
     if (query.len == 0) {
-        for (lines[0..@min(lines.len, shown_all)], 0..) |line, i| ui.addItem(
-            itemOf(arena, line, @intCast(i)),
-        );
+        for (lines[0..@min(lines.len, rows_unfiltered_max)], 0..) |line, i| {
+            ui.addItem(itemOf(arena, line, @intCast(i)));
+        }
         return;
     }
-    const Hit = struct { score: i32, i: u32 };
+    const Hit = struct { score: i32, line_index: u32 };
     var hits: std.ArrayList(Hit) = .empty;
     for (lines, 0..) |line, i| {
         const fields = [_][]const u8{ matched(line.text), matched(line.meta) };
         const score = core.fuzzy.scoreFields(query, &fields);
         if (score == core.fuzzy.no_match) continue;
-        hits.append(arena, .{ .score = score, .i = @intCast(i) }) catch break;
+        hits.append(arena, .{ .score = score, .line_index = @intCast(i) }) catch break;
     }
     // Best first; ties keep the input's order.
     std.mem.sort(Hit, hits.items, {}, struct {
-        fn gt(_: void, x: Hit, y: Hit) bool {
-            return if (x.score != y.score) x.score > y.score else x.i < y.i;
+        fn better(_: void, x: Hit, y: Hit) bool {
+            if (x.score != y.score) return x.score > y.score;
+            return x.line_index < y.line_index;
         }
-    }.gt);
-    for (hits.items[0..@min(
-        hits.items.len,
-        shown_matches,
-    )]) |hit| ui.addItem(itemOf(arena, lines[hit.i], hit.i));
+    }.better);
+    const best = hits.items[0..@min(hits.items.len, rows_filtered_max)];
+    for (best) |hit| ui.addItem(itemOf(arena, lines[hit.line_index], hit.line_index));
 }
 
-/// The part of `s` filtering looks at.
+/// The part of `text` filtering looks at.
 fn matched(text: []const u8) []const u8 {
-    return text[0..core.utf8.floorBoundary(text, match_bytes)];
+    return text[0..core.utf8.floorBoundary(text, match_bytes_max)];
 }
 
 test "a long line is matched by its head and printed whole" {
-    var long: [3 * match_bytes]u8 = @splat('a');
+    var long: [3 * match_bytes_max]u8 = @splat('a');
     @memcpy(long[long.len - 6 ..], "needle");
-    try std.testing.expectEqual(match_bytes, matched(&long).len);
+    try std.testing.expectEqual(match_bytes_max, matched(&long).len);
     const score = core.fuzzy.scoreFields("needle", &.{matched(&long)});
     try std.testing.expect(score == core.fuzzy.no_match);
     try std.testing.expectEqualStrings("short", matched("short"));
     // Never half a character.
-    var accents: [match_bytes + 1]u8 = undefined;
+    var accents: [match_bytes_max + 1]u8 = undefined;
     accents[0] = 'x';
-    for (0..match_bytes / 2) |i| @memcpy(accents[1 + 2 * i ..][0..2], "é");
-    try std.testing.expectEqual(match_bytes - 1, matched(&accents).len);
+    for (0..match_bytes_max / 2) |i| @memcpy(accents[1 + 2 * i ..][0..2], "é");
+    try std.testing.expectEqual(match_bytes_max - 1, matched(&accents).len);
 }
 
-fn itemOf(arena: std.mem.Allocator, line: Line, i: u32) Item {
+/// The row for line `line_index` of the input.
+fn itemOf(arena: std.mem.Allocator, line: Line, line_index: u32) Item {
     return .{
-        .key = arena.print("d:{d}", .{i}) catch "",
+        .key = arena.print("d:{d}", .{line_index}) catch "",
         .title = line.text,
         .icon = line.icon,
         .keywords = line.meta,
-        .action = .{ .pick = .{ .index = i, .selectable = line.selectable } },
+        .action = .{ .pick = .{ .index = line_index, .selectable = line.selectable } },
     };
 }

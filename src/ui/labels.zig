@@ -9,12 +9,13 @@ const item_mod = @import("../item.zig");
 const index = @import("index");
 const widgets = @import("widgets.zig");
 
-pub fn homeRelative(arena: std.mem.Allocator, dir: []const u8) [:0]const u8 {
+/// `path` with the home folder as "~", fit for a label.
+pub fn homeRelative(arena: std.mem.Allocator, path: []const u8) [:0]const u8 {
     const home = std.mem.span(c.g_get_home_dir());
-    const shown = (if (std.mem.startsWith(u8, dir, home))
-        arena.print("~{s}", .{dir[home.len..]})
+    const shown = (if (std.mem.startsWith(u8, path, home))
+        arena.print("~{s}", .{path[home.len..]})
     else
-        arena.dupe(u8, dir)) catch return "";
+        arena.dupe(u8, path)) catch return "";
     return displayText(arena, shown);
 }
 
@@ -65,10 +66,10 @@ fn isBidiControl(code_point: u21) bool {
 }
 
 /// Lines shown after the matching one in a content preview.
-pub const context_after = 14;
+pub const context_lines_after = 14;
 
 /// Lines shown above the matching line in a content preview.
-const context_before = 6;
+const context_lines_before = 6;
 /// A line of the preview is cut to this: a minified file's one line would
 /// make Pango lay out megabytes.
 const context_line_bytes_max = 240;
@@ -84,13 +85,13 @@ pub fn contextMarkup(
     words: []const []const u8,
     highlight_open: []const u8,
 ) [:0]const u8 {
-    const first = if (line > context_before) line - context_before else 1;
+    const first = if (line > context_lines_before) line - context_lines_before else 1;
     var out: std.ArrayList(u8) = .empty;
     var line_number: u32 = 1;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw| : (line_number += 1) {
         if (line_number < first) continue;
-        if (line_number > line + context_after) break;
+        if (line_number > line + context_lines_after) break;
         const shown = core.utf8.validPrefix(raw[0..@min(raw.len, context_line_bytes_max)]);
         const number = arena.print(
             "<span alpha=\"" ++ line_number_alpha ++ "\">{d: >4}  </span>",
@@ -148,23 +149,23 @@ pub const mime_unknown = "application/octet-stream";
 pub fn kindLabel(
     arena: std.mem.Allocator,
     path: []const u8,
-    is_dir: bool,
-    ctype: ?[*:0]const u8,
+    is_directory: bool,
+    content_type: ?[*:0]const u8,
 ) [:0]const u8 {
-    if (is_dir) return "Folder";
-    const description = if (ctype) |content_type|
-        c.g_content_type_get_description(content_type)
+    if (is_directory) return "Folder";
+    const description = if (content_type) |content_type_z|
+        c.g_content_type_get_description(content_type_z)
     else
         null;
     defer if (description) |text| c.g_free(text);
     const slash = std.mem.findScalarLast(u8, path, '/');
     const name = if (slash) |slash_index| path[slash_index + 1 ..] else path;
-    var upper: [4]u8 = undefined;
-    if (core.file_badge.of(name, &upper)) |badge| {
-        const content_type = if (ctype) |content_type| std.mem.span(content_type) else "";
-        const media = std.mem.startsWith(u8, content_type, mime_video_prefix) or
-            std.mem.startsWith(u8, content_type, mime_audio_prefix) or
-            std.mem.eql(u8, content_type, mime_unknown);
+    var badge_text: [4]u8 = undefined;
+    if (core.file_badge.of(name, &badge_text)) |badge| {
+        const mime = if (content_type) |content_type_z| std.mem.span(content_type_z) else "";
+        const media = std.mem.startsWith(u8, mime, mime_video_prefix) or
+            std.mem.startsWith(u8, mime, mime_audio_prefix) or
+            std.mem.eql(u8, mime, mime_unknown);
         const unknown = description == null or
             std.ascii.eqlIgnoreCase(std.mem.span(description.?), "unknown");
         if (media or unknown) {
@@ -175,16 +176,16 @@ pub fn kindLabel(
     return arena.dupeSentinel(u8, std.mem.span(text), 0) catch "File";
 }
 
-/// The first `lines_wanted` lines of `text`, without the newline ending
-/// the last one.
-pub fn firstLines(text: []const u8, lines_wanted: usize) []const u8 {
+/// The first `line_count_wanted` lines of `text`, without the newline
+/// ending the last one.
+pub fn firstLines(text: []const u8, line_count_wanted: usize) []const u8 {
     // Zero lines would be every line: the loop below never reaches 0.
-    assert(lines_wanted > 0);
-    var lines_count: usize = 0;
+    assert(line_count_wanted > 0);
+    var line_count: usize = 0;
     for (text, 0..) |character, i| {
         if (character != '\n') continue;
-        lines_count += 1;
-        if (lines_count == lines_wanted) return text[0..i];
+        line_count += 1;
+        if (line_count == line_count_wanted) return text[0..i];
     }
     return text;
 }
@@ -205,10 +206,12 @@ pub fn formatSize(arena: std.mem.Allocator, bytes: u64) [:0]const u8 {
         arena.printSentinel("{d:.1} {s}", .{ amount, units[unit_index] }, 0)) catch "";
 }
 
+/// The time now, in seconds since the Unix epoch.
 pub fn now() i64 {
     return @divTrunc(c.g_get_real_time(), std.time.us_per_s);
 }
 
+/// Today's midnight, local time, in seconds since the Unix epoch.
 pub fn startOfToday() i64 {
     // Null only for a date GLib cannot represent: then everything is "Earlier".
     const date_time = c.g_date_time_new_now_local() orelse return std.math.maxInt(i64);
@@ -225,13 +228,15 @@ pub fn startOfToday() i64 {
     return c.g_date_time_to_unix(midnight);
 }
 
-pub fn formatWhen(arena: std.mem.Allocator, unix: i64) [:0]const u8 {
-    const date_time = c.g_date_time_new_from_unix_local(unix) orelse return "";
+/// "Today at 09:30", "Yesterday at 18:05" or "Mar 3 at 12:00" for a time
+/// in seconds since the Unix epoch.
+pub fn formatWhen(arena: std.mem.Allocator, time_s: i64) [:0]const u8 {
+    const date_time = c.g_date_time_new_from_unix_local(time_s) orelse return "";
     defer c.g_date_time_unref(date_time);
-    const today = startOfToday();
-    const format: [*:0]const u8 = if (unix >= today)
+    const today_s = startOfToday();
+    const format: [*:0]const u8 = if (time_s >= today_s)
         "Today at %H:%M"
-    else if (unix >= today - std.time.s_per_day)
+    else if (time_s >= today_s - std.time.s_per_day)
         "Yesterday at %H:%M"
     else
         "%b %e at %H:%M";

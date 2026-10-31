@@ -207,8 +207,8 @@ data_arena: std.heap.ArenaAllocator,
 /// Lives until the next keystroke: the visible items and rows.
 query_arena: std.heap.ArenaAllocator,
 /// Frecency values, reloaded each time the window opens.
-frec_arena: std.heap.ArenaAllocator,
-frec: std.StringHashMapUnmanaged(f64) = .empty,
+frecency_arena: std.heap.ArenaAllocator,
+frecency: std.StringHashMapUnmanaged(f64) = .empty,
 
 /// Candidates of the current view before filtering.
 base: []Item = &.{},
@@ -246,22 +246,22 @@ ext_registry: ?*ExtHost.Registry = null,
 /// The files as last loaded (ExtHost.stamp).
 ext_stamp: u64 = 0,
 /// The command the ext view shows (its index in the registry).
-ext_cmd: ExtHost.CommandIndex = .from(0),
-/// Lists asked of `ext_cmd` and their answers. The visible items point
+ext_command: ExtHost.CommandIndex = .from(0),
+/// Lists asked of `ext_command` and their answers. The visible items point
 /// into the latest one, so it is destroyed only after the rows are built
 /// again.
 ext_list: Inflight(ExtHost.ListResult, ext_query_bytes_max) = .{},
 /// Extension rows asked for the root search, and their answers.
 ext_root_search: Inflight(ExtHost.RootResult, ext_query_bytes_max) = .{},
 /// The Lua action running (0: none); its answer decides what happens.
-ext_act_gen: ExtHost.RequestGeneration = .none,
+ext_act_generation: ExtHost.RequestGeneration = .none,
 /// The extension whose preferences the prefs view lists.
 prefs_ext: core.FixedStr(extension_id_bytes_max) = .{},
 /// What the input view edits: a preference (index in the registry) or a
 /// field of the open form.
 input: Edited = .{ .pref = .from(0) },
 /// The open form (index in the registry) and its fields' values (gpa).
-form_cmd: ExtHost.CommandIndex = .from(0),
+form_command: ExtHost.CommandIndex = .from(0),
 form_values: std.ArrayList([:0]u8) = .empty,
 /// How result rows look, for the row builders in widgets.zig.
 row_look: widgets.RowLook = .{},
@@ -331,7 +331,7 @@ pub const DetailPane = struct {
     meta_values: [item_mod.meta_max]*c.GtkLabel = undefined,
     /// The image the picture shows or is loading (see detail_pane.showImage).
     image_path: [std.Io.Dir.max_path_bytes]u8 = undefined,
-    image_path_len: usize = 0,
+    image_path_length: usize = 0,
     image_mtime: i64 = 0,
 };
 
@@ -394,8 +394,8 @@ const Appearance = struct {
     /// The style folder's style.css, likewise (built-in styles have none).
     style_css_stamp: settings_mod.Stamp = .none,
     /// Search highlight colours of the theme, for Pango markup.
-    highlight_fg: [8]u8 = "#ffffff\x00".*,
-    highlight_bg: [8]u8 = "#ff6363\x00".*,
+    highlight_foreground: [8]u8 = "#ffffff\x00".*,
+    highlight_background: [8]u8 = "#ff6363\x00".*,
     /// org.gnome.desktop.interface, for the "Automatic" theme.
     interface_settings: ?*c.GSettings = null,
 };
@@ -582,7 +582,7 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, app: *c.GtkApplication, db: Db) 
         .settings = .init(gpa),
         .data_arena = .init(gpa),
         .query_arena = .init(gpa),
-        .frec_arena = .init(gpa),
+        .frecency_arena = .init(gpa),
     };
 }
 
@@ -1053,8 +1053,8 @@ pub fn applyAppearance(self: *Ui, preview: ?*const themes.Theme) void {
     self.appendUserCss(&out.writer) catch return;
     out.writer.writeByte(0) catch return;
     const text = out.written();
-    _ = themes.hex(&self.appearance.highlight_fg, theme.fg);
-    _ = themes.hex(&self.appearance.highlight_bg, theme.accent);
+    _ = themes.hex(&self.appearance.highlight_foreground, theme.fg);
+    _ = themes.hex(&self.appearance.highlight_background, theme.accent);
     const hash = std.hash.Wyhash.hash(0, text);
     if (hash == self.appearance.css_hash) return;
     self.appearance.css_hash = hash;
@@ -1201,9 +1201,9 @@ pub fn showWith(self: *Ui, view: View, text: ?[*:0]const u8) void {
     assert(self.built);
     const show_start_ns = stats.now();
     const was_hidden = !gtk.isVisible(self.window);
-    _ = self.frec_arena.reset(.retain_capacity);
+    _ = self.frecency_arena.reset(.retain_capacity);
     // Without it, results are ranked by match quality alone.
-    self.frec = self.db.loadFrecency(self.frec_arena.allocator(), labels.now()) catch .empty;
+    self.frecency = self.db.loadFrecency(self.frecency_arena.allocator(), labels.now()) catch .empty;
     if (!gtk.isVisible(self.window)) {
         // The settings file may have been edited by hand since the window
         // last opened.
@@ -1797,7 +1797,7 @@ fn fillSectioned(self: *Ui, arena: std.mem.Allocator, query_text: []const u8) vo
 fn fillSuggestions(self: *Ui, arena: std.mem.Allocator) void {
     var used: std.ArrayList(Item) = .empty;
     for (self.base) |item| {
-        const frecency = self.frec.get(item.key) orelse continue;
+        const frecency = self.frecency.get(item.key) orelse continue;
         var copy = item;
         copy.score = std.math.lossyCast(i32, frecency * frecency_score_scale);
         used.append(arena, copy) catch break;
@@ -1843,7 +1843,7 @@ fn fillRoot(self: *Ui, arena: std.mem.Allocator, query_text: []const u8) void {
         const score = core.fuzzy.scoreFields(query_text, &fields);
         if (score == core.fuzzy.no_match) continue;
         var copy = item;
-        copy.score = score + core.frecency.boost(self.frec.get(item.key) orelse 0);
+        copy.score = score + core.frecency.boost(self.frecency.get(item.key) orelse 0);
         hits.append(arena, copy) catch break;
     }
     sortByScore(hits.items);
