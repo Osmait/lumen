@@ -472,14 +472,14 @@ const ActRequest = struct {
     request_gen: u32,
     target: Target,
 
-    const Target = union(enum) {
+    pub const Target = union(enum) {
         /// The command's own `run`.
         command_run,
         /// An action of a row the command listed.
         row_action: RowAction,
     };
 
-    const RowAction = struct {
+    pub const RowAction = struct {
         /// The row came from the root search, not from the command's list.
         from_root_search: bool,
         /// The list the row came from.
@@ -673,25 +673,13 @@ pub fn root(host: *Host, registry_gen: u32, query: []const u8) u32 {
     return request_gen;
 }
 
-/// Runs a Lua action: action `action` of row `item` of the list with
-/// generation `list_gen` (the command's root rows when `root_rows`), or
-/// the command's own `run` when `item` is null.
-pub fn act(
-    host: *Host,
-    registry_gen: u32,
-    command: u16,
-    root_rows: bool,
-    list_gen: u32,
-    item: ?u32,
-    action: u8,
-) u32 {
+/// What `act` runs: a command's own `run`, or one action of a row the
+/// command listed (in its list or in the root search).
+pub const ActTarget = ActRequest.Target;
+
+/// Runs a Lua action of `command`; see `ActTarget`.
+pub fn act(host: *Host, registry_gen: u32, command: u16, target: ActTarget) u32 {
     const request_gen = host.requestGenNext();
-    const target: ActRequest.Target = if (item) |row_index| .{ .row_action = .{
-        .from_root_search = root_rows,
-        .list_gen = list_gen,
-        .row_index = row_index,
-        .action_index = action,
-    } } else .command_run;
     {
         host.lock.lockUncancelable(host.io);
         defer host.lock.unlock(host.io);
@@ -2501,7 +2489,12 @@ test "extensions load, list, search and run actions" {
 
     // Its Lua action runs against that list, and changes state other
     // commands of the extension see.
-    const ga = h.act(reg.gen, 1, false, fruits.gen, 1, 1);
+    const ga = h.act(reg.gen, 1, .{ .row_action = .{
+        .from_root_search = false,
+        .list_gen = fruits.gen,
+        .row_index = 1,
+        .action_index = 1,
+    } });
     const done = try probe.take("act");
     defer done.destroy(testing.allocator);
     try testing.expectEqual(ga, done.gen);
@@ -2509,7 +2502,12 @@ test "extensions load, list, search and run actions" {
     try testing.expectEqual(Outcome.close, done.outcome);
     // The action took its row's actions away: pressing it again is an
     // error, not a read of whatever `row.actions` is now.
-    _ = h.act(reg.gen, 1, false, fruits.gen, 1, 1);
+    _ = h.act(reg.gen, 1, .{ .row_action = .{
+        .from_root_search = false,
+        .list_gen = fruits.gen,
+        .row_index = 1,
+        .action_index = 1,
+    } });
     const again = try probe.take("act");
     defer again.destroy(testing.allocator);
     try testing.expect(std.mem.find(u8, again.err.?, "no actions") != null);
@@ -2526,7 +2524,7 @@ test "extensions load, list, search and run actions" {
     try testing.expectEqualStrings("you typed it's \"quoted\"", echo.items[0].title);
 
     // A run command's return value.
-    _ = h.act(reg.gen, 0, false, 0, null, 0);
+    _ = h.act(reg.gen, 0, .command_run);
     const hello = try probe.take("act");
     defer hello.destroy(testing.allocator);
     try testing.expectEqual(Outcome.stay, hello.outcome);
@@ -2541,7 +2539,12 @@ test "extensions load, list, search and run actions" {
     const doubled = r21.sections[0].items[0];
     try testing.expectEqualStrings("42", doubled.title);
     try testing.expect(doubled.action.ext_item.root);
-    _ = h.act(reg.gen, 4, true, doubled.action.ext_item.gen, 0, 0);
+    _ = h.act(reg.gen, 4, .{ .row_action = .{
+        .from_root_search = true,
+        .list_gen = doubled.action.ext_item.gen,
+        .row_index = 0,
+        .action_index = 0,
+    } });
     (try probe.take("act")).destroy(testing.allocator);
     _ = h.list(reg.gen, 3, "");
     const noted = try probe.take("res");
@@ -2555,7 +2558,12 @@ test "extensions load, list, search and run actions" {
     // An action against a list that has been replaced is refused.
     _ = h.list(reg.gen, 1, "");
     (try probe.take("res")).destroy(testing.allocator);
-    _ = h.act(reg.gen, 1, false, fruits.gen, 1, 1);
+    _ = h.act(reg.gen, 1, .{ .row_action = .{
+        .from_root_search = false,
+        .list_gen = fruits.gen,
+        .row_index = 1,
+        .action_index = 1,
+    } });
     const stale = try probe.take("act");
     defer stale.destroy(testing.allocator);
     try testing.expect(std.mem.find(u8, stale.err.?, "changed") != null);
@@ -2632,7 +2640,7 @@ test "errors in extensions come back as messages" {
     defer badrow.destroy(testing.allocator);
     try testing.expect(std.mem.find(u8, badrow.err.?, "items[1].title is missing") != null);
 
-    _ = h.act(reg.gen, 3, false, 0, null, 0);
+    _ = h.act(reg.gen, 3, .command_run);
     const badret = try probe.take("act");
     defer badret.destroy(testing.allocator);
     try testing.expect(std.mem.find(u8, badret.err.?, "must return") != null);
@@ -2690,9 +2698,9 @@ test "preferences read Settings' file over their defaults; storage persists" {
     try testing.expect(before.err == null);
     for (want, before.items) |w, it| try testing.expectEqualStrings(w, it.title);
 
-    _ = h.act(reg.gen, 1, false, 0, null, 0);
+    _ = h.act(reg.gen, 1, .command_run);
     (try probe.take("act")).destroy(testing.allocator);
-    _ = h.act(reg.gen, 1, false, 0, null, 0);
+    _ = h.act(reg.gen, 1, .command_run);
     (try probe.take("act")).destroy(testing.allocator);
     // Storage outlives a reload (a new Lua state reads the file).
     probe.reg = null;

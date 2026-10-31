@@ -468,7 +468,7 @@ pub fn activate(ui: *Ui, i: u16) void {
     switch (registry.commands[i].mode) {
         .run => {
             const host = ui.ext_host orelse return;
-            ui.ext_act_gen = host.act(registry.gen, i, false, 0, null, 0);
+            ui.ext_act_gen = host.act(registry.gen, i, .command_run);
             ui.showRunning();
         },
         .form => form_view.open(ui, i),
@@ -480,19 +480,24 @@ pub fn activate(ui: *Ui, i: u16) void {
     }
 }
 
-/// Action `index` of the selected extension row.
-pub fn perform(ui: *Ui, index_: u8) void {
+/// Action `action_index` of the selected extension row.
+pub fn perform(ui: *Ui, action_index: u8) void {
     const item = ui.selectedItem() orelse return;
     if (item.action != .ext_item) return;
-    const x = item.action.ext_item;
-    if (index_ >= x.actions.len) return;
-    if (item.confirm and index_ == 0 and ui.needsConfirm(item)) return;
+    const row = item.action.ext_item;
+    if (action_index >= row.actions.len) return;
+    if (item.confirm and action_index == 0 and ui.needsConfirm(item)) return;
     ui.closePanel();
-    switch (x.actions[index_]) {
+    switch (row.actions[action_index]) {
         .lua => {
             const host = ui.ext_host orelse return;
             const registry = ui.ext_registry orelse return;
-            ui.ext_act_gen = host.act(registry.gen, x.command, x.root, x.gen, x.index, index_);
+            ui.ext_act_gen = host.act(registry.gen, row.command, .{ .row_action = .{
+                .from_root_search = row.root,
+                .list_gen = row.gen,
+                .row_index = row.index,
+                .action_index = action_index,
+            } });
             ui.showRunning();
             return;
         },
