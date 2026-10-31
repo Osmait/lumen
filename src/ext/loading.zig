@@ -71,7 +71,7 @@ fn loadAll(host: *Host, load: *Load) void {
 
     if (worker_arena.printSentinel("{s}/init.lua", .{host.config_dir}, 0)) |path| {
         if (os.info(path) != null) {
-            loadSource(host, load, config_extension_id, host.config_dir, path, null);
+            loadSource(host, load, config_extension_id, host.config_dir, .{ .file = path });
         }
     } else |_| {
         load.problem(config_extension_id, "out of memory");
@@ -106,30 +106,7 @@ fn loadExtension(host: *Host, load: *Load, id: [:0]const u8) void {
         load.problem(id, "no init.lua in the extension's folder");
         return;
     }
-    loadSource(host, load, id, folder, path, null);
-}
-
-/// Hands what the files defined to the registry. A command reaches the UI
-/// only with a worker command to run it.
-fn registryFill(host: *Host, registry: *Registry, load: *Load) void {
-    assert(load.worker_commands.items.len == load.commands.items.len);
-    host.worker_commands = host.gpa.dupe(WorkerCommand, load.worker_commands.items) catch blk: {
-        log.warn("reload: out of memory, extension commands left out", .{});
-        load.commands.clearRetainingCapacity();
-        break :blk &.{};
-    };
-    assert(host.worker_commands.len == load.commands.items.len);
-    registry.commands = load.commands.items;
-    registry.themes = load.themes.items;
-    registry.keymaps = load.keymaps.items;
-    registry.settings = load.settings.items;
-    registry.preferences = load.preferences.items;
-    registry.icons = load.icons.items;
-    registry.extensions = load.extensions.items;
-    registry.style_settings = load.style_settings.items;
-    registry.layout = load.layout;
-    registry.has_layout = load.has_layout;
-    registry.problems = load.problems.items;
+    loadSource(host, load, id, folder, .{ .file = path });
 }
 
 /// Names of the folders under extensions/, sorted, in `arena`.
@@ -150,25 +127,28 @@ fn loadStyle(host: *Host, load: *Load, name: []const u8) void {
         return;
     const path = worker_arena.printSentinel("{s}/init.lua", .{folder}, 0) catch return;
     if (os.info(path) != null) {
-        loadSource(host, load, style_extension_id, folder, path, null);
+        loadSource(host, load, style_extension_id, folder, .{ .file = path });
     } else if (os.info(folder) != null) {
         // A style folder may hold only a style.css.
     } else if (styles.find(name)) |built_in| {
-        loadSource(host, load, style_extension_id, host.config_dir, "=style", built_in.lua);
+        const code: Code = .{ .built_in = .{ .name = "=style", .lua = built_in.lua } };
+        loadSource(host, load, style_extension_id, host.config_dir, code);
     } else {
         load.problem(style_extension_id, "no such style");
     }
 }
 
-/// Runs a file (`path`), or `source` (then `path` names it in errors).
-fn loadSource(
-    host: *Host,
-    load: *Load,
-    id: []const u8,
-    folder: []const u8,
-    path: [:0]const u8,
-    source: ?[:0]const u8,
-) void {
+/// The Lua a file runs.
+const Code = union(enum) {
+    /// The path of a file to read.
+    file: [:0]const u8,
+    /// Code built into Lumen (a style), and the name errors give it.
+    built_in: struct { name: [:0]const u8, lua: [:0]const u8 },
+};
+
+/// Runs `code` as extension `id`, in a new state, and keeps the state if
+/// it ran; reports a problem and leaves nothing behind if it failed.
+fn loadSource(host: *Host, load: *Load, id: []const u8, folder: []const u8, code: Code) void {
     const extension = Extension.create(host, id, folder) orelse {
         load.problem(id, "out of memory");
         return;
@@ -178,8 +158,7 @@ fn loadSource(
     var context: LoadContext = .{
         .extension = extension,
         .load = load,
-        .path = path,
-        .source = source,
+        .code = code,
         .extension_index = @intCast(host.extensions.items.len),
     };
     const failure = extension.run(
@@ -206,12 +185,12 @@ fn loadSource(
     extension.destroy();
 }
 
+/// A file's run in its state: what it runs, where what it defines goes,
+/// and the title it gave (spec.zig reads it).
 pub const LoadContext = struct {
     extension: *Extension,
     load: *Load,
-    path: [:0]const u8,
-    /// Code to run instead of the file (a built-in style).
-    source: ?[:0]const u8 = null,
+    code: Code,
     extension_index: u16,
     /// lumen.extension's title, once parsed.
     title: [:0]const u8 = "",
@@ -219,10 +198,16 @@ pub const LoadContext = struct {
     fn run(L: *lua.State, context: *LoadContext) void {
         lua.openLibs(L);
         api.install(L, context.extension);
-        const loaded = if (context.source) |source|
-            lua.c.luaL_loadbufferx(L, source.ptr, source.len, context.path.ptr, "t")
-        else
-            lua.c.luaL_loadfilex(L, context.path.ptr, "t");
+        const loaded = switch (context.code) {
+            .file => |path| lua.c.luaL_loadfilex(L, path.ptr, "t"),
+            .built_in => |built_in| lua.c.luaL_loadbufferx(
+                L,
+                built_in.lua.ptr,
+                built_in.lua.len,
+                built_in.name.ptr,
+                "t",
+            ),
+        };
         if (loaded != lua.c.LUA_OK) _ = lua.c.lua_error(L);
         lua.c.lua_callk(L, 0, 1, 0, null);
         switch (lua.c.lua_type(L, -1)) {
@@ -239,3 +224,26 @@ pub const LoadContext = struct {
         }
     }
 };
+
+/// Hands what the files defined to the registry. A command reaches the UI
+/// only with a worker command to run it.
+fn registryFill(host: *Host, registry: *Registry, load: *Load) void {
+    assert(load.worker_commands.items.len == load.commands.items.len);
+    host.worker_commands = host.gpa.dupe(WorkerCommand, load.worker_commands.items) catch blk: {
+        log.warn("reload: out of memory, extension commands left out", .{});
+        load.commands.clearRetainingCapacity();
+        break :blk &.{};
+    };
+    assert(host.worker_commands.len == load.commands.items.len);
+    registry.commands = load.commands.items;
+    registry.themes = load.themes.items;
+    registry.keymaps = load.keymaps.items;
+    registry.settings = load.settings.items;
+    registry.preferences = load.preferences.items;
+    registry.icons = load.icons.items;
+    registry.extensions = load.extensions.items;
+    registry.style_settings = load.style_settings.items;
+    registry.layout = load.layout;
+    registry.has_layout = load.has_layout;
+    registry.problems = load.problems.items;
+}
