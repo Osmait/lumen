@@ -29,9 +29,6 @@ const log = std.log.scoped(.files);
 
 /// Watches per batch: ~2.3 us each, so a search waits ~4.6 ms at worst.
 const arm_batch_watches = 2_000;
-/// No eventfd for `shutdown` (`wake_fd`): the thread then waits at most
-/// 100 ms at a time on inotify, to look at `stop`.
-const no_fd: i32 = -1;
 /// Pause between arming batches: without it the thread re-takes the lock at
 /// once and a reader can starve for the whole arming (149 ms measured).
 const arm_yield_us = 300;
@@ -47,9 +44,11 @@ io: Io,
 live: Live,
 lock: Io.RwLock = .init,
 stop: std.atomic.Value(bool) = .init(false),
-/// Written by `shutdown`: the thread waits on inotify and this, with no
-/// timeout (it used to wake every 100 ms to look at `stop`).
-wake_fd: i32 = no_fd,
+/// An eventfd written by `shutdown`: the thread waits on inotify and this,
+/// with no timeout (it used to wake every 100 ms to look at `stop`). Null
+/// when none could be made: the thread then waits at most 100 ms at a time
+/// on inotify, to look at `stop`.
+wake_fd: ?i32 = null,
 thread: ?std.Thread = null,
 search_pool: *Pool,
 scan_pool: *Pool,
@@ -132,13 +131,7 @@ fn init(
         var empty: store_mod.Builder = .empty;
         break :blk try empty.finish(gpa);
     };
-    service.live = Live.initUnarmed(
-        gpa,
-        base,
-        &service.config,
-        service.cache_path,
-        service.scan_pool,
-    ) catch |err| {
+    service.live = Live.initUnarmed(gpa, base, &service.config, service.scan_pool) catch |err| {
         base.deinit(gpa);
         return err;
     };
@@ -158,7 +151,7 @@ pub fn contentPools(service: *const Service) ContentService.Pools {
 
 /// Frees what `init` made. The thread must have stopped (or never started).
 fn deinit(service: *Service) void {
-    if (service.wake_fd != no_fd) sys.close(service.wake_fd);
+    if (service.wake_fd) |wake_fd| sys.close(wake_fd);
     service.live.deinit();
     const pools: Pools = .{
         .search = service.search_pool,
@@ -213,10 +206,10 @@ const Pools = struct {
 /// The flush is what makes today's files still be there tomorrow.
 pub fn shutdown(service: *Service) void {
     service.stop.store(true, .release);
-    if (service.wake_fd != no_fd) {
+    if (service.wake_fd) |wake_fd| {
         // An eventfd takes exactly one u64, the amount to add.
         const one: u64 = 1;
-        const written = std.os.linux.write(service.wake_fd, std.mem.asBytes(&one), @sizeOf(u64));
+        const written = std.os.linux.write(wake_fd, std.mem.asBytes(&one), @sizeOf(u64));
         // Unwoken, the thread waits on inotify until the next event.
         const errno = std.os.linux.errno(written);
         if (errno != .SUCCESS) log.warn("waking the file index thread: {t}", .{errno});
@@ -340,8 +333,8 @@ fn pause(service: *Service, duration_ns: u64) bool {
         // `shutdown` writes the eventfd and nothing reads it: once written
         // it stays readable. Without one, a look at `stop` every 100 ms.
         const slice_ms: i32 = @intCast(@min(left_ns / std.time.ns_per_ms + 1, 100));
-        if (service.wake_fd != no_fd) {
-            _ = sys.waitReadable(service.wake_fd, slice_ms);
+        if (service.wake_fd) |wake_fd| {
+            _ = sys.waitReadable(wake_fd, slice_ms);
         } else {
             sys.sleepUs(@as(u64, @intCast(slice_ms)) * std.time.us_per_ms);
         }
@@ -463,7 +456,8 @@ fn run(service: *Service) void {
         service.lock.lockSharedUncancelable(service.io);
         const fd = service.live.watcher.fd;
         service.lock.unlockShared(service.io);
-        if (!sys.waitEvents(fd, service.wake_fd)) continue;
+        // A negative descriptor is one `poll` ignores.
+        if (!sys.waitEvents(fd, service.wake_fd orelse -1)) continue;
 
         _ = arena_state.reset(.retain_capacity);
         if (service.applyEvents(arena_state.allocator())) service.rescan();

@@ -9,7 +9,8 @@
 //!   1. Incremental refinement: "carg" -> "cargo" only rescans the hits of
 //!      "carg" (a longer query matches a subset).
 //!   2. Mask prefilter: one AND rejects names missing a query character.
-//!   3. Cheap score: one greedy pass, keeping a top-K per chunk.
+//!   3. Cheap score (`cheap.zig`, one greedy pass), keeping a top-K per
+//!      chunk.
 //!   4. Fine score (`fine.zig`, fzf-style alignment) over the finalists only.
 //!   + Recency: mtime of the head of the list breaks ties among equals.
 
@@ -19,6 +20,7 @@ const assert = std.debug.assert;
 const store_mod = @import("store.zig");
 const Store = store_mod.Store;
 const Pool = @import("Pool.zig");
+const cheap = @import("cheap.zig");
 const fine = @import("fine.zig");
 const sys = @import("os");
 const fold = @import("core").fold;
@@ -360,6 +362,7 @@ fn siftChunk(
 ) std.mem.Allocator.Error!void {
     const partial = &context.partials[chunk_index];
     const masks = context.store.masks();
+    const query_folded = context.query_folded;
     const kept_max = context.kept_max;
     const compact_at = kept_max * 2;
     try partial.top.ensureTotalCapacity(context.gpa, compact_at);
@@ -375,8 +378,8 @@ fn siftChunk(
         const id: u32 = if (context.ids) |ids| ids[position] else @intCast(position);
         if (masks[id] & context.query_mask != context.query_mask) continue;
         const name = context.store.name(id);
-        const cheap = cheapScoreMasked(name, context.query_folded, masks[id]) orelse continue;
-        const score = adjust(context.store, id, cheap);
+        const cheap_score = cheap.scoreMasked(name, query_folded, masks[id]) orelse continue;
+        const score = adjust(context.store, id, cheap_score);
         // `>=`: on equal scores the id breaks the tie, so an equal can still
         // displace the k-th.
         if (score >= threshold) {
@@ -439,83 +442,6 @@ fn selectTop(items: []Pair, count: usize) void {
     }
 }
 
-/// One pass over the name: greedy subsequence with bonuses for runs and word
-/// boundaries. It does not find the best alignment (the fine layer does);
-/// it only has to be cheap and not lose good candidates.
-///
-/// `query` is folded (`core.fold`); the name is compared folded. Pure ASCII
-/// names (nearly all of them) are lowercased on the fly; the first byte
-/// >= 0x80 sends the name to a folded copy that keeps the original case
-/// for camelCase. Both give the same score on an ASCII name.
-pub fn cheapScore(name: []const u8, query: []const u8) ?i32 {
-    if (name.len < query.len) return null;
-    return cheapCore(.ascii, name, &.{}, query) catch cheapFolded(name, query);
-}
-
-/// `cheapScore` with the name's mask from the store: its `mask_non_ascii`
-/// says which path to take, so an ASCII name never has its tail checked
-/// after the match (measurable on "c", where nearly every name matches at
-/// its first letters).
-pub fn cheapScoreMasked(name: []const u8, query: []const u8, mask: u64) ?i32 {
-    if (name.len < query.len) return null;
-    if (mask & store_mod.mask_non_ascii != 0) return cheapFolded(name, query);
-    // The same loop as before folding existed. A damaged mapped mask could
-    // only score a non-ASCII name as plain bytes: never unsafe.
-    return cheapCore(
-        .known_ascii,
-        name,
-        &.{},
-        query,
-    ) catch unreachable; // NonAscii comes only from .ascii mode
-}
-
-// Out of line: its 2 KB of buffers stay off the hot loop's stack frame.
-noinline fn cheapFolded(name: []const u8, query: []const u8) ?i32 {
-    var name_folded: [folded_bytes_max]u8 = undefined;
-    var upper: [folded_bytes_max]bool = undefined;
-    const folded_count = fold.foldCase(&name_folded, &upper, name);
-    return cheapCore(
-        .folded,
-        name_folded[0..folded_count],
-        upper[0..folded_count],
-        query,
-    ) catch unreachable; // NonAscii comes only from .ascii mode
-}
-
-/// Longest name folded for `cheapScore`; a longer non-ASCII name is scored
-/// on its first `folded_bytes_max` characters (Linux names stop at 255 bytes).
-const folded_bytes_max = 1024;
-
-/// What each property of a match is worth to the cheap scorer. Together
-/// they order the names the fine scorer then looks at.
-const cheap_weight = struct {
-    /// A matched character right after the previous match.
-    const consecutive = 30;
-    /// A match on the name's first character.
-    const name_start = 45;
-    /// A match right after a separator (`isWordSeparator`).
-    const word_start = 28;
-    /// A match on a camelCase boundary.
-    const camel_start = 22;
-    /// Taken per byte before the first match, up to `before_first_bytes_max`.
-    const before_first_per_byte = 2;
-    const before_first_bytes_max = 64;
-    /// One point taken per this many bytes of name: shorter names first.
-    const name_bytes_per_point = 4;
-    /// The name is the query, with or without its extension: people type
-    /// "readme" for README.md as much as for README.
-    const whole_name = 120;
-};
-
-/// Whether a match right after `byte` starts a word. A switch, not a
-/// search in a string: it runs once per matched byte of every candidate.
-inline fn isWordSeparator(byte: u8) bool {
-    return switch (byte) {
-        '_', '-', '.', ' ', '/' => true,
-        else => false,
-    };
-}
-
 /// What the entry's metadata adds to its cheap score (`adjust`).
 const metadata_weight = struct {
     const directory = 15;
@@ -536,75 +462,11 @@ comptime {
     assert(metadata_weight.hidden_beyond_recency > 0);
 }
 
-const CheapMode = enum {
-    /// `name` is the original, known to be ASCII (its mask says so):
-    /// lowercased on the fly.
-    known_ascii,
-    /// Same, but fails on any non-ASCII byte, before or after the match.
-    ascii,
-    /// `name` is already folded; `upper` says which characters were capitals.
-    folded,
-};
-
-fn cheapCore(
-    comptime mode: CheapMode,
-    name: []const u8,
-    upper: []const bool,
-    query: []const u8,
-) error{NonAscii}!?i32 {
-    const ascii = mode != .folded;
-    var query_index: usize = 0;
-    var score: i32 = 0;
-    var hit_previous: usize = std.math.maxInt(usize);
-    var hit_first: usize = std.math.maxInt(usize);
-    // A `for`, not a `while` over an index: measured 8% faster on "ca"
-    // over 1.6M names.
-    var seen = name.len;
-    for (name, 0..) |raw, i| {
-        if (query_index == query.len) {
-            seen = i;
-            break;
-        }
-        if (mode == .ascii and !std.ascii.isAscii(raw)) return error.NonAscii;
-        const letter = if (ascii) std.ascii.toLower(raw) else raw;
-        if (letter != query[query_index]) continue;
-        if (hit_first == std.math.maxInt(usize)) hit_first = i;
-        if (hit_previous +% 1 == i) score += cheap_weight.consecutive;
-        if (i == 0) {
-            score += cheap_weight.name_start;
-        } else {
-            const before = name[i - 1];
-            const camel_boundary = if (ascii)
-                std.ascii.isLower(before) and std.ascii.isUpper(raw)
-            else
-                std.ascii.isLower(before) and !upper[i - 1] and upper[i];
-            if (isWordSeparator(before)) {
-                score += cheap_weight.word_start;
-            } else if (camel_boundary) {
-                score += cheap_weight.camel_start;
-            }
-        }
-        hit_previous = i;
-        query_index += 1;
-    }
-    if (query_index < query.len) return null;
-    // The lengths below are folded lengths: an unseen tail must be ASCII
-    // too for the original's to be the same.
-    if (mode == .ascii and !fold.isAscii(name[seen..])) return error.NonAscii;
-    const before_first: i32 = @intCast(@min(hit_first, cheap_weight.before_first_bytes_max));
-    score -= before_first * cheap_weight.before_first_per_byte;
-    score -= @as(i32, @intCast(name.len / cheap_weight.name_bytes_per_point));
-    const stem_length = std.mem.findScalarLast(u8, name, '.') orelse name.len;
-    const stem_is_query = stem_length > 0 and stem_length == query.len;
-    if (name.len == query.len or stem_is_query) score += cheap_weight.whole_name;
-    return score;
-}
-
 /// Metadata adjustments, shared by the cascade and the exhaustive reference
 /// (the Rust version learned to keep them in one place the hard way).
-fn adjust(store: *const Store, id: u32, cheap: i32) i32 {
+fn adjust(store: *const Store, id: u32, cheap_score: i32) i32 {
     const entry_flags = store.flags()[id];
-    var score = cheap;
+    var score = cheap_score;
     if (entry_flags & store_mod.flag_dir != 0) score += metadata_weight.directory;
     if (entry_flags & store_mod.flag_hidden != 0) {
         score -= recency_max + metadata_weight.hidden_beyond_recency;
@@ -674,19 +536,12 @@ fn byRecency(
     std.mem.sort(Pair, hits[0..stat_count], {}, lessThan);
 }
 
-/// Whether `path` is folder `folder` or below it ("/a/bc" is not below "/a/b").
-pub fn isUnder(path: []const u8, folder: []const u8) bool {
-    if (!std.mem.startsWith(u8, path, folder)) return false;
-    if (path.len == folder.len) return true;
-    return path[folder.len] == paths.separator or std.mem.endsWith(u8, folder, paths.separator_str);
-}
-
 /// Coarse on purpose: today vs this month vs old.
 fn recencyBonus(context: *const RecencyContext, id: u32, path_buffer: *paths.Buffer) i32 {
     const now = context.now;
     const path = context.store.path(id, path_buffer[0 .. path_buffer.len - 1]) orelse return 0;
     if (path.len == 0) return 0;
-    for (context.no_stat) |folder| if (isUnder(path, folder)) return 0;
+    for (context.no_stat) |folder| if (paths.isUnder(path, folder)) return 0;
     path_buffer[path.len] = 0;
     const mtime = sys.mtime(path_buffer[0..path.len :0]) orelse return 0;
     // Saturating: an mtime is whatever the file system says.
@@ -714,9 +569,9 @@ pub fn searchExhaustive(
     for (store.masks(), 0..) |mask, i| {
         if (mask & query_mask != query_mask) continue;
         const id: u32 = @intCast(i);
-        const cheap = cheapScoreMasked(store.name(id), query_folded, mask) orelse continue;
+        const cheap_score = cheap.scoreMasked(store.name(id), query_folded, mask) orelse continue;
         const fine_score = fine.score(store.name(id), query_folded) orelse 0;
-        const score = fine_score * fine_weight + adjust(store, id, cheap);
+        const score = fine_score * fine_weight + adjust(store, id, cheap_score);
         try all.append(gpa, .{ .score = score, .id = id });
     }
     std.mem.sort(Pair, all.items, {}, lessThan);
@@ -899,43 +754,6 @@ test "accents and case fold both ways in name search" {
     try testing.expectEqualStrings("3×4.md", store.name(got.items[0].id));
 }
 
-test "cheap score: an ASCII name scores the same down both paths" {
-    const names = [_][]const u8{
-        "Cargo.toml",
-        "fileManager.rs",
-        "README",
-        "my_report.md",
-        "a.b-c d/e",
-    };
-    const queries = [_][]const u8{ "c", "cargo", "fm", "readme", "mr", "abcde", "zz" };
-    for (names) |name| for (queries) |query| {
-        var folded: [64]u8 = undefined;
-        var upper: [64]bool = undefined;
-        const folded_length = fold.foldCase(&folded, &upper, name);
-        try testing.expectEqual(try cheapCore(.ascii, name, &.{}, query), try cheapCore(
-            .folded,
-            folded[0..folded_length],
-            upper[0..folded_length],
-            query,
-        ));
-        const mask = store_mod.charMask(name);
-        try testing.expectEqual(cheapScore(name, query), cheapScoreMasked(name, query, mask));
-    };
-    // Same letters with accents: same score as the unaccented name.
-    try testing.expectEqual(cheapScore("ArbolEpico.md", "ae"), cheapScore("ÁrbolÉpico.md", "ae"));
-    try testing.expectEqual(cheapScore("configuracion.md", "configuracion"), cheapScore(
-        "Configuración.md",
-        "configuracion",
-    ));
-    // A non-ASCII byte after the match still counts in the folded length.
-    try testing.expectEqual(cheapScore("ab-ene", "ab"), cheapScore("ab-eñe", "ab"));
-    try testing.expectEqual(cheapScore("ab-eñe", "ab"), cheapScoreMasked(
-        "ab-eñe",
-        "ab",
-        store_mod.charMask("ab-eñe"),
-    ));
-}
-
 test "a 100-character name is found and ranked first by its full name" {
     const gpa = testing.allocator;
     const long = "a_rather_long_file_name_that_someone_typed_in_full_to_find_it_again_quickly_2026_final_version_2.txt";
@@ -997,9 +815,4 @@ test "recency: nothing under a slow mount is stat'ed" {
     const slow = &.{directory};
     try engine.search(gpa, pool, &store, "recent_note", .{ .limit = 5, .no_stat = slow }, &got);
     try testing.expectEqual(plain, got.items[0].score);
-
-    try testing.expect(isUnder("/h/u/nfs", "/h/u/nfs"));
-    try testing.expect(isUnder("/h/u/nfs/a", "/h/u/nfs"));
-    try testing.expect(!isUnder("/h/u/nfs2/a", "/h/u/nfs"));
-    try testing.expect(isUnder("/a", "/"));
 }

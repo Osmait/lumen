@@ -1,6 +1,7 @@
 //! Path pieces shared by the scan, the live index, the stores and the
 //! content index: the separator, how a child's path is joined to its
-//! parent's, and the buffer a whole path fits in.
+//! parent's, whether one path is below another, and the buffer a whole path
+//! fits in.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -28,6 +29,20 @@ pub fn separatorAfter(parent: []const u8) []const u8 {
 /// How many separators `path` has: its depth below "/".
 pub fn depth(path: []const u8) usize {
     return std.mem.count(u8, path, separator_str);
+}
+
+/// Whether `path` is folder `folder` or below it ("/a/bc" is not below "/a/b").
+pub fn isUnder(path: []const u8, folder: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, folder)) return false;
+    if (path.len == folder.len) return true;
+    return path[folder.len] == separator or std.mem.endsWith(u8, folder, separator_str);
+}
+
+test isUnder {
+    try std.testing.expect(isUnder("/h/u/nfs", "/h/u/nfs"));
+    try std.testing.expect(isUnder("/h/u/nfs/a", "/h/u/nfs"));
+    try std.testing.expect(!isUnder("/h/u/nfs2/a", "/h/u/nfs"));
+    try std.testing.expect(isUnder("/a", "/"));
 }
 
 test separatorAfter {
