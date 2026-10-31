@@ -22,10 +22,10 @@ pub const RowPart = enum { icon, text, accessory, hint };
 
 /// An order of parts, some of them maybe left out.
 pub fn Parts(comptime T: type) type {
-    const n = @typeInfo(T).@"enum".field_names.len;
+    const parts_count = @typeInfo(T).@"enum".field_names.len;
     return struct {
-        items: [n]T = std.enums.values(T)[0..n].*,
-        len: u8 = n,
+        items: [parts_count]T = std.enums.values(T)[0..parts_count].*,
+        len: u8 = parts_count,
 
         pub fn slice(parts: *const @This()) []const T {
             return parts.items[0..parts.len];
@@ -145,11 +145,20 @@ fn enumValue(comptime Enum: type, value: Value) SetError!Enum {
     return std.meta.stringToEnum(Enum, name) orelse error.BadValue;
 }
 
+/// The names `rows` takes in Lua. `Rows` cannot use them as tags, because
+/// `inline` is a keyword.
+const rows_names = std.StaticStringMap(Rows).initComptime(.{
+    .{ "stacked", .stacked },
+    .{ "inline", .inline_ },
+});
+
+comptime {
+    assert(rows_names.kvs.len == std.enums.values(Rows).len);
+}
+
 fn rowsValue(value: Value) SetError!Rows {
     const name = value.string orelse return error.BadValue;
-    if (std.mem.eql(u8, name, "stacked")) return .stacked;
-    if (std.mem.eql(u8, name, "inline")) return .inline_;
-    return error.BadValue;
+    return rows_names.get(name) orelse error.BadValue;
 }
 
 /// Sets one `show` flag.

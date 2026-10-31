@@ -24,6 +24,8 @@ pub const Density = enum { compact, default, comfortable };
 
 /// On/off settings.
 pub const Toggle = enum { files_in_root, suggestions, clipboard };
+/// Settings whose value is one word: a theme's or a style's id.
+pub const Text = enum { theme, style };
 /// Settings with a list of values to pick from.
 pub const Choice = enum {
     text_size,
@@ -43,11 +45,15 @@ pub const keep_choices = [_]u32{ 100, 500, 1000, 5000 };
 
 /// What a hand-edited file may set beyond the choices Settings offers.
 const opacity_percent_min = 50;
+const opacity_percent_default = 97;
 const opacity_percent_max = 100;
 const clipboard_keep_min = 10;
+const clipboard_keep_default = 1000;
 const clipboard_keep_max = 100_000;
 /// A value written back into the file: a word, not a paragraph.
 const token_bytes_max = 200;
+/// The heading of the file's second part: which app opens each kind.
+const open_with_section = "[open-with]";
 
 comptime {
     for (opacity_choices) |choice| {
@@ -58,6 +64,9 @@ comptime {
         assert(choice >= clipboard_keep_min);
         assert(choice <= clipboard_keep_max);
     }
+    // The defaults are among the choices Settings offers.
+    assert(std.mem.findScalar(u8, &opacity_choices, opacity_percent_default) != null);
+    assert(std.mem.findScalar(u32, &keep_choices, clipboard_keep_default) != null);
 }
 
 /// Terminal emulators and editors offered when installed: each is its
@@ -93,7 +102,7 @@ pub const Settings = struct {
     theme: []const u8 = default_theme,
     text_size: TextSize = .default,
     /// Window background opacity, percent.
-    opacity: u8 = 97,
+    opacity: u8 = opacity_percent_default,
     position: Position = .upper_third,
     width: Width = .default,
     height: Height = .default,
@@ -101,7 +110,7 @@ pub const Settings = struct {
     files_in_root: bool = true,
     suggestions: bool = true,
     clipboard: bool = true,
-    clipboard_keep: u32 = 1000,
+    clipboard_keep: u32 = clipboard_keep_default,
     /// Command names; empty is automatic ($TERMINAL / $EDITOR, then the
     /// first one installed).
     terminal: []const u8 = "",
@@ -142,7 +151,7 @@ pub const Settings = struct {
             const line = withoutComment(std.mem.trim(u8, raw_line, " \t\r"));
             if (line.len == 0) continue;
             if (line[0] == '[') {
-                section_open_with = std.mem.eql(u8, line, "[open-with]");
+                section_open_with = std.mem.eql(u8, line, open_with_section);
                 continue;
             }
             const equals = std.mem.findScalar(u8, line, '=') orelse continue;
@@ -187,16 +196,22 @@ pub const Settings = struct {
             _ = settings.setChoice(choice, value);
             return true;
         }
-        if (std.mem.eql(u8, key, "theme")) {
-            if (isToken(value)) settings.setText(&settings.theme, value);
-            return true;
-        }
-        if (std.mem.eql(u8, key, "style")) {
-            // Empty: Lumen's own look.
-            if (value.len == 0 or isToken(value)) settings.setText(&settings.style, value);
+        if (std.meta.stringToEnum(Text, key)) |text| {
+            if (textValid(text, value)) switch (text) {
+                inline else => |tag| settings.setText(&@field(settings, @tagName(tag)), value),
+            };
             return true;
         }
         return false;
+    }
+
+    /// Whether `value` may be written as `text`: a token. An empty style is
+    /// also valid, and means Lumen's own look.
+    fn textValid(text: Text, value: []const u8) bool {
+        return switch (text) {
+            .theme => isToken(value),
+            .style => value.len == 0 or isToken(value),
+        };
     }
 
     /// Sets `field` to a copy of `value`; out of memory, it keeps its value
@@ -316,8 +331,8 @@ pub const Settings = struct {
         }
     }
 
-    pub fn write(settings: *const Settings, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        return settings.writeKeeping(w, settings, &.{});
+    pub fn write(settings: *const Settings, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        return settings.writeKeeping(writer, settings, &.{});
     }
 
     /// Where `writeKeeping` takes each value from.
@@ -341,12 +356,12 @@ pub const Settings = struct {
     /// values from `file` (keys init.lua sets stay out of the file).
     pub fn writeKeeping(
         settings: *const Settings,
-        w: *std.Io.Writer,
+        writer: *std.Io.Writer,
         file: *const Settings,
         kept: []const []const u8,
     ) std.Io.Writer.Error!void {
         const source: Source = .{ .current = settings, .file = file, .kept_keys = kept };
-        try w.print(
+        try writer.print(
             \\# Lumen settings. Change them from Lumen (search "Settings") or here:
             \\# Lumen reads this file again when its window opens.
             \\
@@ -355,7 +370,7 @@ pub const Settings = struct {
             \\theme = {s}
             \\# small, default, large
             \\text_size = {t}
-            \\# Window background opacity, percent (50-100)
+            \\# Window background opacity, percent ({d}-{d})
             \\opacity = {d}
             \\# upper_third, center
             \\position = {t}
@@ -384,6 +399,8 @@ pub const Settings = struct {
             source.value("style"),
             source.value("theme"),
             source.value("text_size"),
+            opacity_percent_min,
+            opacity_percent_max,
             source.value("opacity"),
             source.value("position"),
             source.value("width"),
@@ -398,19 +415,17 @@ pub const Settings = struct {
             source.value("editor"),
         });
         if (settings.unknown.items.len > 0) {
-            try w.writeAll("\n# Not known to this version of Lumen\n");
-            for (settings.unknown.items) |line| try w.print("{s}\n", .{line});
+            try writer.writeAll("\n# Not known to this version of Lumen\n");
+            for (settings.unknown.items) |line| try writer.print("{s}\n", .{line});
         }
-        try w.writeAll(
-            \\
-            \\[open-with]
+        try writer.writeAll("\n" ++ open_with_section ++ "\n" ++
             \\# A file kind (folder pdf image video audio markdown html text office
             \\# archive) or an extension (.log) = the app's desktop file id
             \\
         );
         var iterator = settings.open_with.iterator();
         while (iterator.next()) |entry| {
-            try w.print("{s} = {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+            try writer.print("{s} = {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
         }
     }
 
@@ -464,11 +479,8 @@ pub const Settings = struct {
             var probe: Settings = .{ .arena = .init(fixed.allocator()) };
             return if (probe.setChoice(choice, value)) .ok else .bad_value;
         }
-        if (std.mem.eql(u8, key, "theme")) {
-            return if (isToken(value)) .ok else .bad_value;
-        }
-        if (std.mem.eql(u8, key, "style")) {
-            return if (value.len == 0 or isToken(value)) .ok else .bad_value;
+        if (std.meta.stringToEnum(Text, key)) |text| {
+            return if (textValid(text, value)) .ok else .bad_value;
         }
         return .unknown_key;
     }

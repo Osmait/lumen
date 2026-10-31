@@ -23,6 +23,10 @@ const assert = std.debug.assert;
 /// The most words a program's argv takes, in `lumen.exec` and in
 /// `lumen.action.exec`.
 pub const argv_max = 64;
+/// The longest `timeout` lumen.exec takes; a longer one is cut to it.
+const exec_timeout_s_max = 3600;
+/// A theme colour as written in Lua: "#" and six hex digits.
+const color_hex_example = "#rrggbb";
 /// A layout's prompt or placeholder: a few words in the search bar.
 const layout_text_bytes_max = 64;
 /// The longest key name GDK knows is shorter.
@@ -99,8 +103,8 @@ fn setRequirePath(L: *lua.State, dir: [:0]const u8) void {
     const mark: lua.StackMark = .init(L);
     defer mark.restore(L);
     _ = lua.c.lua_getglobal(L, "package");
-    // A folder path (at most 4096 bytes) twice, and the pattern around it.
-    var path_buffer: [2 * 4096 + 32]u8 = undefined;
+    // A folder path twice, and the pattern around it.
+    var path_buffer: [2 * std.Io.Dir.max_path_bytes + 32]u8 = undefined;
     const path = std.mem.printSentinel(
         &path_buffer,
         "{s}/?.lua;{s}/?/init.lua",
@@ -273,7 +277,7 @@ fn execArgs(L: *lua.State, argv: *[argv_max][]const u8) lua.Error!ExecArgs {
                         .{},
                     );
                 }
-                timeout_ns = @intFromFloat(@min(timeout_s, 3600) * std.time.ns_per_s);
+                timeout_ns = @intFromFloat(@min(timeout_s, exec_timeout_s_max) * std.time.ns_per_s);
             }
             lua.pop(L, 1);
         },
@@ -401,7 +405,7 @@ fn theme(L: *lua.State) lua.Error!c_int {
         .fg = foreground,
         .ink = try color(L, arena, "ink", foreground),
         .accent = try color(L, arena, "accent", null),
-        .from_style = std.mem.eql(u8, extension.id, "style"),
+        .from_style = std.mem.eql(u8, extension.id, Host.style_extension_id),
     };
     load.themes.append(arena, new_theme) catch return lua.failOom(L);
     return 0;
@@ -423,7 +427,7 @@ fn color(
 }
 
 pub fn parseHex(text: []const u8) ?u24 {
-    if (text.len != 7 or text[0] != '#') return null;
+    if (text.len != color_hex_example.len or text[0] != '#') return null;
     return std.fmt.parseInt(u24, text[1..], 16) catch null;
 }
 
@@ -508,7 +512,7 @@ fn set(L: *lua.State) lua.Error!c_int {
     const load = try loadOf(L, "lumen.set");
     const arena = load.arena;
     // A style's settings are defaults for when it is chosen; init.lua's fix them.
-    const settings = if (std.mem.eql(u8, extension.id, "style"))
+    const settings = if (std.mem.eql(u8, extension.id, Host.style_extension_id))
         &load.style_settings
     else
         &load.settings;
@@ -520,7 +524,7 @@ fn set(L: *lua.State) lua.Error!c_int {
         };
         var number_buffer: [64]u8 = undefined;
         const value: []const u8 = switch (lua.c.lua_type(L, -1)) {
-            lua.c.LUA_TBOOLEAN => if (lua.c.lua_toboolean(L, -1) != 0) "true" else "false",
+            lua.c.LUA_TBOOLEAN => Host.toggleText(lua.c.lua_toboolean(L, -1) != 0),
             lua.c.LUA_TSTRING => lua.toSlice(L, -1).?,
             lua.c.LUA_TNUMBER => blk: {
                 const integer = lua.c.lua_tointegerx(L, -1, null);
