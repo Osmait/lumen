@@ -13,6 +13,7 @@ const Host = @import("../ext/Host.zig");
 const os = @import("os");
 const Ui = @import("Ui.zig");
 const settings_view = @import("settings_view.zig");
+const choose_view = @import("choose_view.zig");
 const form_view = @import("form_view.zig");
 
 const log = std.log.scoped(.prefs);
@@ -253,7 +254,7 @@ pub fn editValue(
             ui.rebuild();
         },
         .choice => {
-            settings_view.setChoosing(ui, switch (target) {
+            choose_view.setChoosing(ui, switch (target) {
                 .pref => |pref_index| .{ .pref = pref_index },
                 .field => |field_index| .{ .field = field_index },
             });
@@ -284,7 +285,7 @@ pub fn choiceCandidates(
     const value = current(arena, preference);
     for (preference.choices) |choice| out.append(
         arena,
-        settings_view.pickRow(arena, choice, value) catch return,
+        choose_view.pickRow(arena, choice, value) catch return,
     ) catch return;
 }
 

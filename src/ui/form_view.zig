@@ -12,6 +12,7 @@ const Host = @import("../ext/Host.zig");
 const Ui = @import("Ui.zig");
 const prefs_view = @import("prefs_view.zig");
 const settings_view = @import("settings_view.zig");
+const choose_view = @import("choose_view.zig");
 
 const log = std.log.scoped(.ext);
 
@@ -117,7 +118,7 @@ pub fn choiceCandidates(
     const form_field = field(ui, field_index) orelse return;
     for (form_field.choices) |choice| out.append(
         arena,
-        settings_view.pickRow(arena, choice, value(ui, field_index)) catch return,
+        choose_view.pickRow(arena, choice, value(ui, field_index)) catch return,
     ) catch return;
 }
 

@@ -1,17 +1,19 @@
-//! The keyboard: navigation, actions, the action panel.
+//! The keyboard: navigation, actions, the action panel, and the keys
+//! `lumen --key` injects for the end-to-end tests.
 
 const std = @import("std");
 const assert = std.debug.assert;
 const c = @import("c");
 const gtk = @import("gtk.zig");
 const item_mod = @import("../item.zig");
+const row_list = @import("row_list.zig");
 const Ui = @import("Ui.zig");
 
 /// A key press, real or from `lumen --key`; true (1) when Lumen handled it.
 pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
-    const key: KeyPress = .decode(keyval, state, .{ .panel_open = ui.panel.open });
+    const key: KeyPress = .decode(keyval, state, .{ .panel_open = ui.panel.isOpen() });
 
-    if (ui.panel.open) {
+    if (ui.panel.isOpen()) {
         panelKey(ui, key);
         return 1;
     }
@@ -51,6 +53,39 @@ pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
     return 0;
 }
 
+/// `lumen --key NAME`: the same handling as a real key press, for tests.
+/// Names: down, up, enter, ctrl+enter, ctrl+k, escape, backspace, pagedown,
+/// pageup, ctrl+x, ctrl+o, left, right, and any keymap ("ctrl+g").
+pub fn injectKey(ui: *Ui, name: []const u8) bool {
+    const keys = [_]struct { []const u8, c_uint, c.GdkModifierType }{
+        .{ "down", c.GDK_KEY_Down, 0 },                 .{ "up", c.GDK_KEY_Up, 0 },
+        .{ "enter", c.GDK_KEY_Return, 0 },
+        .{
+            "ctrl+enter",
+            c.GDK_KEY_Return,
+            c.GDK_CONTROL_MASK,
+        },
+        .{ "ctrl+k", c.GDK_KEY_k, c.GDK_CONTROL_MASK }, .{ "escape", c.GDK_KEY_Escape, 0 },
+        .{ "backspace", c.GDK_KEY_BackSpace, 0 },       .{ "pagedown", c.GDK_KEY_Page_Down, 0 },
+        .{ "pageup", c.GDK_KEY_Page_Up, 0 },
+        .{
+            "ctrl+x",
+            c.GDK_KEY_x,
+            c.GDK_CONTROL_MASK,
+        },
+        .{ "ctrl+o", c.GDK_KEY_o, c.GDK_CONTROL_MASK }, .{ "left", c.GDK_KEY_Left, 0 },
+        .{ "right", c.GDK_KEY_Right, 0 },
+    };
+    for (keys) |key| if (std.mem.eql(u8, key[0], name)) {
+        _ = handleKey(ui, key[1], key[2]);
+        return true;
+    };
+    // Anything else written like a keymap ("ctrl+g").
+    const parsed = Ui.ext_view.parseKey(name) orelse return false;
+    _ = handleKey(ui, parsed.keyval, parsed.modifiers);
+    return true;
+}
+
 /// A key press decoded once: the key, the modifiers held, and what it means
 /// for moving and running. The functions below read these instead of each
 /// taking four booleans.
@@ -88,7 +123,7 @@ const KeyPress = struct {
         };
     }
 
-    /// -1 for up, +1 for down: how `Ui.nextSelectable` steps.
+    /// -1 for up, +1 for down: how `row_list.nextSelectable` steps.
     fn step(vertical: Vertical) i32 {
         return switch (vertical) {
             .up => -1,
@@ -102,7 +137,7 @@ const page_rows = 8;
 
 /// Keys while the action panel is open: they all go to it.
 fn panelKey(ui: *Ui, key: KeyPress) void {
-    assert(ui.panel.open);
+    assert(ui.panel.isOpen());
     assert(ui.panel.entries.len > 0);
     assert(ui.panel.selected < ui.panel.entries.len);
     const closes = key.keyval == c.GDK_KEY_Escape or
@@ -145,18 +180,18 @@ fn move(ui: *Ui, key: KeyPress) bool {
         else
             -1;
         const next = current + step;
-        if (next >= 0 and next < cell_count) ui.select(@intCast(next));
+        if (next >= 0 and next < cell_count) row_list.select(ui, @intCast(next));
         return true;
     }
     if (key.vertical) |vertical| {
-        ui.select(ui.nextSelectable(ui.selected, KeyPress.step(vertical)));
+        row_list.select(ui, row_list.nextSelectable(ui, ui.selected, KeyPress.step(vertical)));
         return true;
     }
     if (key.keyval == c.GDK_KEY_Page_Down or key.keyval == c.GDK_KEY_Page_Up) {
         const direction: i32 = if (key.keyval == c.GDK_KEY_Page_Down) 1 else -1;
         var target = ui.selected;
-        for (0..page_rows) |_| target = ui.nextSelectable(target, direction);
-        ui.select(target);
+        for (0..page_rows) |_| target = row_list.nextSelectable(ui, target, direction);
+        row_list.select(ui, target);
         return true;
     }
     return false;

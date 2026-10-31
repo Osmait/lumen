@@ -23,6 +23,24 @@ const mime_image_prefix = "image/";
 /// width; longer values are ellipsized at the start (a path keeps its end).
 const meta_value_width_chars_max = 30;
 
+/// The selected row's preview, picture and "Information" block.
+pub const DetailPane = struct {
+    box: *c.GtkBox = undefined,
+    text: *c.GtkLabel = undefined,
+    picture: *c.GtkPicture = undefined,
+    /// The "Information" block under the preview (hidden for extensions).
+    meta: *c.GtkBox = undefined,
+    /// One line per label and value pair; extensions show as many as they
+    /// give.
+    meta_lines: [item_mod.metadata_max]*c.GtkBox = undefined,
+    meta_keys: [item_mod.metadata_max]*c.GtkLabel = undefined,
+    meta_values: [item_mod.metadata_max]*c.GtkLabel = undefined,
+    /// The image the picture shows or is loading (see detail_pane.showImage).
+    image_path: [std.Io.Dir.max_path_bytes]u8 = undefined,
+    image_path_length: usize = 0,
+    image_mtime: i64 = 0,
+};
+
 pub fn buildDetail(ui: *Ui) void {
     ui.detail.box = widgets.vbox(0);
     gtk.addClass(ui.detail.box, "detail");
@@ -81,6 +99,29 @@ pub fn buildDetail(ui: *Ui) void {
 }
 
 /// The lines around the match, words highlighted.
+/// The pane's parts for `view`, before a row fills them: the Information
+/// block and its labels, and whether the text wraps.
+pub fn prepareFor(detail: *DetailPane, view: Ui.View) void {
+    gtk.setVisible(detail.meta, view != .ext);
+    for (detail.meta_lines) |meta_line| gtk.setVisible(meta_line, true);
+    const keys: [4][:0]const u8 = switch (view) {
+        .files => .{ "Kind", "Size", "Modified", "Where" },
+        .contents => .{ "Kind", "Matches", "Modified", "Where" },
+        else => .{ "Content type", "Characters", "Words", "Copied" },
+    };
+    for (detail.meta_keys, keys) |key_label, key| c.gtk_label_set_text(key_label, key);
+    // Code previews do not wrap, they clip long lines like an editor: a
+    // wrapping GtkLabel makes GTK lay its text out at several widths per frame
+    // (~30 ms measured with `lumen --stats`). Clipboard text is prose: wrap.
+    const wrap = view == .clipboard or view == .ext;
+    c.gtk_label_set_wrap(detail.text, @intFromBool(wrap));
+    c.gtk_label_set_ellipsize(
+        detail.text,
+        if (wrap) c.PANGO_ELLIPSIZE_NONE else c.PANGO_ELLIPSIZE_END,
+    );
+    gtk.setVisible(detail.picture, false);
+}
+
 pub fn showContentDetail(ui: *Ui, item: *const Item) void {
     const file = item.action.file;
     var arena_instance: std.heap.ArenaAllocator = .init(ui.gpa);
@@ -130,7 +171,7 @@ const preview_px = 2048;
 /// each); now on a worker (`pictures.requestPicture`: within
 /// `picture_limits`, one at a time, a request the selection has left
 /// behind dropped before it is decoded), and not again for the same file.
-fn showImage(detail: *Ui.DetailPane, path: [:0]const u8, mtime: i64) void {
+fn showImage(detail: *DetailPane, path: [:0]const u8, mtime: i64) void {
     const shown_path = detail.image_path[0..detail.image_path_length];
     const same_image = detail.image_mtime == mtime and std.mem.eql(u8, shown_path, path);
     if (same_image) return;
@@ -152,14 +193,14 @@ fn showImage(detail: *Ui.DetailPane, path: [:0]const u8, mtime: i64) void {
 
 /// No image: what is on its way is dropped (before it is decoded, if it
 /// has not started).
-fn forgetImage(detail: *Ui.DetailPane) void {
+fn forgetImage(detail: *DetailPane) void {
     pictures.preview_lane.forget();
     detail.image_path_length = 0;
     c.gtk_picture_set_paintable(gtk.widget(detail.picture), null);
 }
 
 fn requestPictureCallback(context: ?*anyopaque, decoded: ?*c.GdkPixbuf, current: bool) void {
-    const detail: *Ui.DetailPane = @ptrCast(@alignCast(context.?));
+    const detail: *DetailPane = @ptrCast(@alignCast(context.?));
     if (!current) return;
     const pixbuf = decoded orelse return;
     const texture = c.gdk_texture_new_for_pixbuf(pixbuf);
@@ -271,7 +312,7 @@ fn showExtDetail(ui: *Ui, item: ?*const Item) void {
 
 /// The four values beside the keys the view set (Kind, Size, Modified,
 /// Where for files; Content type, Characters, Words, Copied for copies).
-fn setMeta(detail: *Ui.DetailPane, values: [item_mod.metadata_max][:0]const u8) void {
+fn setMeta(detail: *DetailPane, values: [item_mod.metadata_max][:0]const u8) void {
     for (detail.meta_values, values) |value_label, value| {
         c.gtk_label_set_text(value_label, value.ptr);
     }
