@@ -4,6 +4,7 @@
 pub const store = @import("store.zig");
 pub const scan = @import("scan.zig");
 pub const search = @import("search.zig");
+pub const cheap = @import("cheap.zig");
 pub const fine = @import("fine.zig");
 pub const Pool = @import("Pool.zig");
 pub const Watcher = @import("Watcher.zig");
