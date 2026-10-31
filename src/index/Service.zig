@@ -195,12 +195,12 @@ pub fn status(service: *Service) Status {
     defer service.lock.unlockShared(service.io);
     return .{
         // Live entries: the delta also holds scaffolding and its own graves.
-        .entries = service.live.base.liveLen() + service.live.delta.liveLen(),
+        .entries = service.live.base.liveLen() + service.live.delta.store.liveLen(),
         .watches = service.live.stats.watches,
         .unwatched = service.live.watcher.unwatched,
         .armed = service.live.fullyArmed(),
         .rescanning = service.live.pending_resync,
-        .index_bytes = service.live.base.buf.len + service.live.delta.buf.len,
+        .index_bytes = service.live.base.buf.len + service.live.delta.store.buf.len,
         .rescans = service.rescans.load(.monotonic),
         .last_rescan_ns = service.last_rescan_ns.load(.monotonic),
     };
@@ -755,7 +755,7 @@ test "service: the delta threshold triggers a compaction" {
         try testing.expect(try waitHas(s, arena, q, try arena.print("/umbral_{d}.txt", .{i})));
     }
     s.lock.lockSharedUncancelable(s.io);
-    const delta_live = s.live.delta.liveLen();
+    const delta_live = s.live.delta.store.liveLen();
     s.lock.unlockShared(s.io);
     try testing.expect(delta_live < 5);
 }
