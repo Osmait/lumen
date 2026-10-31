@@ -243,8 +243,8 @@ const testing = std.testing;
 
 const TestTree = sys.TestDir;
 
-/// `list` relative to the tree, or SkipZigTest without ripgrep.
-fn listRel(arena: std.mem.Allocator, tree: *const TestTree, documents: bool) ![]content.DocIn {
+/// `list` of the whole tree, or SkipZigTest without ripgrep.
+fn listTree(arena: std.mem.Allocator, tree: *const TestTree, documents: bool) ![]content.DocIn {
     return list(
         arena,
         testing.allocator,
@@ -332,7 +332,7 @@ test "list: what is indexed and what is excluded" {
         try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.ftruncate(fd, file.size)));
     }
 
-    const got = try listRel(arena, &tree, true);
+    const got = try listTree(arena, &tree, true);
 
     var want: std.ArrayList([]const u8) = .empty;
     for (keep ++ docs) |name| try want.append(arena, try arena.print("{s}/{s}", .{ tree.abs, name }));
@@ -362,7 +362,7 @@ test "list: what is indexed and what is excluded" {
     }
 
     // Without documents: the same minus the PDF and the docx.
-    const plain = try listRel(arena, &tree, false);
+    const plain = try listTree(arena, &tree, false);
     try testing.expectEqual(got.len - docs.len, plain.len);
     for (plain) |doc| try testing.expect(doc.source == .plain);
 }
