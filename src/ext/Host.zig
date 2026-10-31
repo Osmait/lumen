@@ -915,7 +915,8 @@ fn extensionCreate(host: *Host, id: []const u8, dir: []const u8) ?*Ext {
     const dir_copy = worker_arena.dupeSentinel(u8, dir, 0) catch return null;
     const extension = host.gpa.create(Ext) catch return null;
     extension.* = .{ .host = host, .id = id_copy, .dir = dir_copy, .data = data };
-    os.mkdirP(extension.data);
+    // Without it, the extension runs; lumen.storage fails and says so.
+    os.mkdirP(extension.data) catch |err| log.warn("{s}: {t}", .{ extension.data, err });
     extension.L = lua.newState(&extension.budget) orelse {
         host.gpa.destroy(extension);
         return null;
@@ -1856,7 +1857,7 @@ const Probe = struct {
 fn writeTestFile(dir: []const u8, name: []const u8, data: []const u8) !void {
     var buffer: [4096]u8 = undefined;
     const path = try std.mem.printSentinel(&buffer, "{s}/{s}", .{ dir, name }, 0);
-    if (std.mem.findScalarLast(u8, path, '/')) |slash| os.mkdirP(path[0..slash]);
+    if (std.mem.findScalarLast(u8, path, '/')) |slash| try os.mkdirP(path[0..slash]);
     try os.writeFile(path, data);
 }
 

@@ -900,7 +900,10 @@ pub fn prepareCompaction(
     var base = try scan.scan(gpa, pool, cfg, watcher, null);
     errdefer base.deinit(gpa);
     if (cache_path) |path| {
-        if (std.mem.findScalarLast(u8, path, '/')) |slash| sys.mkdirP(path[0..slash]);
+        if (std.mem.findScalarLast(u8, path, '/')) |slash| {
+            // The save below fails and says so.
+            sys.mkdirP(path[0..slash]) catch |err| log.warn("{s}: {t}", .{ path[0..slash], err });
+        }
         base.save(path) catch |err| {
             // Served from memory; the next rescan saves again.
             log.warn("saving the file index: {t}", .{err});
@@ -992,11 +995,11 @@ const Tree = struct {
     fn mkAbs(tree: *Tree, rel: []const u8) void {
         var buf: paths.Buffer = undefined;
         if (std.mem.endsWith(u8, rel, "/")) {
-            sys.mkdirP(tree.abs(rel, &buf));
+            sys.mkdirP(tree.abs(rel, &buf)) catch unreachable;
         } else {
-            if (std.mem.findScalarLast(u8, rel, '/')) |slash| sys.mkdirP(
-                tree.abs(rel[0..slash], &buf),
-            );
+            if (std.mem.findScalarLast(u8, rel, '/')) |slash| {
+                sys.mkdirP(tree.abs(rel[0..slash], &buf)) catch unreachable;
+            }
             sys.writeFile(tree.abs(rel, &buf), "x") catch unreachable;
         }
     }

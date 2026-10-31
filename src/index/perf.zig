@@ -331,7 +331,7 @@ pub fn main(init: std.process.Init) !void {
 
     var dbuf: [256]u8 = undefined;
     const dir = try std.mem.print(&dbuf, "/tmp/lumen-perf-{d}", .{std.os.linux.getpid()});
-    sys.mkdirP(dir);
+    try sys.mkdirP(dir);
     defer {
         const argv = [_][]const u8{ "rm", "-rf", dir };
         if (std.process.run(gpa, init.io, .{ .argv = &argv })) |res| {

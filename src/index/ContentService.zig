@@ -154,7 +154,11 @@ pub fn startWith(
         .opts = opts,
         .worker = .{ .retry_arena = .init(gpa) },
     };
-    sys.mkdirP(service.text_dir);
+    // Without it, extracted text is not cached: each document is extracted
+    // again when it is needed.
+    sys.mkdirP(service.text_dir) catch |err| {
+        log.warn("{s}: {t}, extracted text is not cached", .{ service.text_dir, err });
+    };
     // Older versions made these 0755: the cache holds the text of the
     // user's documents, so close it before anything else.
     sys.makePrivate(cache_dir);
@@ -801,7 +805,10 @@ fn buildNext(service: *ContentService, input: BuildInput) ?content.Index {
         .extracted_len = textLen,
     };
     if (std.mem.findScalarLast(u8, service.cache_path, '/')) |slash| {
-        sys.mkdirP(service.cache_path[0..slash]);
+        // The save below fails and says so; the index is served from memory.
+        sys.mkdirP(service.cache_path[0..slash]) catch |err| {
+            log.warn("{s}: {t}", .{ service.cache_path[0..slash], err });
+        };
     }
     const strategy = service.buildStrategy(input);
     if (service.buildNextToFile(strategy, input, reader)) |fresh| {

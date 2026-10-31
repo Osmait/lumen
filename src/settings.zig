@@ -467,7 +467,7 @@ pub const Settings = struct {
         kept: []const []const u8,
     ) SaveError!void {
         if (settings.incomplete) return error.Incomplete;
-        if (std.mem.findScalarLast(u8, path, '/')) |slash| sys.mkdirP(path[0..slash]);
+        if (std.mem.findScalarLast(u8, path, '/')) |slash| try sys.mkdirP(path[0..slash]);
         var file = if (kept.len > 0) load(gpa, path.ptr) else Settings.init(gpa);
         defer file.deinit();
         var out: std.Io.Writer.Allocating = .init(gpa);

@@ -160,7 +160,10 @@ pub fn install(
             name,
         });
     }
-    os.mkdirP(dir[0 .. std.mem.findScalarLast(u8, dir, '/') orelse dir.len]);
+    const parent = dir[0 .. std.mem.findScalarLast(u8, dir, '/') orelse dir.len];
+    os.mkdirP(parent) catch |err| {
+        return fail(ui, cmdline, "Could not make {s}: {t}", .{ parent, err });
+    };
     var url_buffer: [2048]u8 = undefined;
     const url_z = std.mem.printSentinel(&url_buffer, "{s}", .{url}, 0) catch {
         return fail(ui, cmdline, "URL too long", .{});

@@ -562,19 +562,24 @@ pub const AppendFile = struct {
 };
 
 /// Creates missing directories, owner-only (existing ones are untouched).
-pub fn mkdirP(path: []const u8) void {
+/// Makes `path` and the folders above it that are missing, owner-only.
+/// Succeeds when `path` exists afterwards, made here or before.
+pub fn mkdirP(path: []const u8) Error!void {
     var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    if (path.len >= buf.len) return;
-    // Each prefix that ends a component, the whole path last. A mkdir that
-    // fails (it exists, or a parent could not be made) is left for the
-    // caller's next step to notice.
+    if (path.len >= buf.len) return error.NameTooLong;
+    if (path.len == 0) return error.NotFound;
+    // Each prefix that ends a component, the whole path last. A parent that
+    // cannot be made (it exists, or it is not ours to make, like /home) is
+    // not an error by itself: only the whole path's mkdir decides.
     var end: usize = 1;
     while (end <= path.len) : (end += 1) {
-        if (end == path.len or path[end] == '/') {
-            @memcpy(buf[0..end], path[0..end]);
-            buf[end] = 0;
-            _ = linux.mkdir(@ptrCast(&buf), 0o700);
-        }
+        if (end != path.len and path[end] != '/') continue;
+        @memcpy(buf[0..end], path[0..end]);
+        buf[end] = 0;
+        const rc = linux.mkdir(@ptrCast(&buf), 0o700);
+        if (end < path.len) continue;
+        if (linux.errno(rc) == .EXIST) return;
+        _ = try check(rc);
     }
 }
 
@@ -644,13 +649,13 @@ pub const TestDir = struct {
     pub fn write(test_dir: *const TestDir, name: []const u8, data: []const u8) !void {
         var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const file_path = try test_dir.path(&buf, name);
-        if (std.mem.findScalarLast(u8, file_path, '/')) |slash| mkdirP(file_path[0..slash]);
+        if (std.mem.findScalarLast(u8, file_path, '/')) |slash| try mkdirP(file_path[0..slash]);
         try writeFile(file_path, data);
     }
 
     pub fn mkdir(test_dir: *const TestDir, name: []const u8) !void {
         var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        mkdirP(try test_dir.path(&buf, name));
+        try mkdirP(try test_dir.path(&buf, name));
     }
 };
 
@@ -704,11 +709,9 @@ test "subdirs: folders and links to them, sorted, filtered" {
     var buf: [256]u8 = undefined;
     const root = try tmpDirPath(&tmp, &buf);
     var pbuf: [512]u8 = undefined;
-    for ([_][]const u8{ "b", "a", ".hidden", "skip" }) |d| mkdirP(try std.mem.print(
-        &pbuf,
-        "{s}/{s}",
-        .{ root, d },
-    ));
+    for ([_][]const u8{ "b", "a", ".hidden", "skip" }) |name| {
+        try mkdirP(try std.mem.print(&pbuf, "{s}/{s}", .{ root, name }));
+    }
     try writeFile(try std.mem.printSentinel(&pbuf, "{s}/file", .{root}, 0), "x");
     var lbuf: [512]u8 = undefined;
     _ = linux.symlink("a", try std.mem.printSentinel(&lbuf, "{s}/c", .{root}, 0));
@@ -803,7 +806,7 @@ test "openDirNoFollow refuses a link to a folder, openDir follows it" {
     const dir = try tmpDirPath(&tmp, &dbuf);
     var abuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const real = try std.mem.printSentinel(&abuf, "{s}/real", .{dir}, 0);
-    mkdirP(real);
+    try mkdirP(real);
     var lbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const link = try std.mem.printSentinel(&lbuf, "{s}/link", .{dir}, 0);
     _ = linux.symlink("real", link);
@@ -815,6 +818,24 @@ test "openDirNoFollow refuses a link to a folder, openDir follows it" {
     } else |_| {}
 }
 
+test "mkdirP makes the missing folders, and says when it could not" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try tmpDirPath(&tmp, &dir_buffer);
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const deep = try std.mem.print(&path_buffer, "{s}/a/b/c", .{dir});
+    try mkdirP(deep);
+    // Again: it exists, which is what was asked.
+    try mkdirP(deep);
+    var file_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const file = try std.mem.printSentinel(&file_buffer, "{s}/file", .{dir}, 0);
+    try writeFile(file, "x");
+    var under_file_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const under_file = try std.mem.print(&under_file_buffer, "{s}/file/sub", .{dir});
+    try std.testing.expectError(error.NotFound, mkdirP(under_file));
+}
+
 test "Lumen's files and directories are owner-only" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -822,7 +843,7 @@ test "Lumen's files and directories are owner-only" {
     const dir = try tmpDirPath(&tmp, &dbuf);
     var pbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const sub = try std.mem.print(&pbuf, "{s}/cache/lumen", .{dir});
-    mkdirP(sub);
+    try mkdirP(sub);
     var fbuf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const f = try std.mem.printSentinel(&fbuf, "{s}/x.idx", .{sub}, 0);
     try writeFile(f, "data");

@@ -81,7 +81,8 @@ fn listenIn(
     if (runtime_dir.len == 0) return error.NoRuntimeDir;
     var dir_buf: [256]u8 = undefined;
     const dir = ipc.dir(&dir_buf, runtime_dir) orelse return error.PathTooLong;
-    os.mkdirP(dir);
+    // A folder that could not be made fails the check below.
+    os.mkdirP(dir) catch |err| log.warn("{s}: {t}", .{ dir, err });
     if (!isPrivateDir(dir)) {
         log.warn("{s} is not a folder of ours alone", .{dir});
         return error.FolderNotPrivate;

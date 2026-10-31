@@ -646,9 +646,9 @@ test "service: files created while the first rescan runs are not lost" {
     for (0..40) |i| {
         var p: paths.Buffer = undefined;
         const sub = try std.mem.print(&p, "{s}/d{d}", .{ root, i });
-        sys.mkdirP(sub);
+        try sys.mkdirP(sub);
         var q: paths.Buffer = undefined;
-        sys.mkdirP(try std.mem.print(&q, "{s}/deep/deeper", .{sub}));
+        try sys.mkdirP(try std.mem.print(&q, "{s}/deep/deeper", .{sub}));
         for (0..40) |j| {
             var nb: [32]u8 = undefined;
             try touch(sub, try std.mem.print(&nb, "old_{d}.txt", .{j}));

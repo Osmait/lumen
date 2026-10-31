@@ -370,7 +370,7 @@ const ScanTree = struct {
     fn file(tree: *const ScanTree, rel: []const u8) void {
         var buf: paths.Buffer = undefined;
         const p = tree.path(&buf, rel);
-        sys.mkdirP(p[0 .. std.mem.findScalarLast(u8, p, '/') orelse 0]);
+        sys.mkdirP(p[0 .. std.mem.findScalarLast(u8, p, '/') orelse 0]) catch unreachable;
         sys.writeFile(p, "x") catch unreachable;
     }
 

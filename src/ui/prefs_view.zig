@@ -359,7 +359,11 @@ fn save(ui: *Ui, preference: *const Host.Pref, value: std.json.Value) bool {
         return false;
     };
     if (std.mem.findScalarLast(u8, preference.file, '/')) |slash| {
-        os.mkdirP(preference.file[0..slash]);
+        os.mkdirP(preference.file[0..slash]) catch |err| {
+            log.warn("{s}: {t}", .{ preference.file[0..slash], err });
+            ui.showFailure("Could not save the setting");
+            return false;
+        };
     }
     os.writeFileAtomic(preference.file, json) catch |err| {
         log.warn("{s}: {t}", .{ preference.file, err });
