@@ -207,12 +207,16 @@ pub extern fn g_list_append(list: ?*GList, data: ?*anyopaque) *GList;
 pub extern fn g_list_free(list: *GList) void;
 pub extern fn g_bytes_new(data: ?*const anyopaque, size: usize) *GBytes;
 pub const GChildWatchFunc = *const fn (GPid, c_int, ?*anyopaque) callconv(.c) void;
-pub extern fn g_child_watch_add(pid: GPid, func: GChildWatchFunc, data: ?*anyopaque) c_uint;
+pub extern fn g_child_watch_add(pid: GPid, function: GChildWatchFunc, data: ?*anyopaque) c_uint;
 pub extern fn g_spawn_close_pid(pid: GPid) void;
 pub extern fn g_main_context_iteration(context: ?*anyopaque, may_block: gboolean) gboolean;
-pub extern fn g_idle_add(func: GSourceFunc, data: ?*anyopaque) c_uint;
-pub extern fn g_timeout_add_seconds(interval: c_uint, func: GSourceFunc, data: ?*anyopaque) c_uint;
-pub extern fn g_timeout_add(interval: c_uint, func: GSourceFunc, data: ?*anyopaque) c_uint;
+pub extern fn g_idle_add(function: GSourceFunc, data: ?*anyopaque) c_uint;
+pub extern fn g_timeout_add_seconds(
+    interval_s: c_uint,
+    function: GSourceFunc,
+    data: ?*anyopaque,
+) c_uint;
+pub extern fn g_timeout_add(interval_ms: c_uint, function: GSourceFunc, data: ?*anyopaque) c_uint;
 
 pub extern fn g_spawn_async(
     working_directory: ?[*:0]const u8,
@@ -727,7 +731,7 @@ pub extern fn gdk_display_flush(display: *GdkDisplay) void;
 pub const G_PRIORITY_LOW: c_int = 300;
 pub extern fn g_idle_add_full(
     priority: c_int,
-    func: GSourceFunc,
+    function: GSourceFunc,
     data: ?*anyopaque,
     notify: ?*const anyopaque,
 ) c_uint;
@@ -749,7 +753,7 @@ pub extern fn g_task_set_task_data(
     data: ?*anyopaque,
     destroy: ?*const fn (?*anyopaque) callconv(.c) void,
 ) void;
-pub extern fn g_task_run_in_thread(task: *GTask, func: GTaskThreadFunc) void;
+pub extern fn g_task_run_in_thread(task: *GTask, function: GTaskThreadFunc) void;
 pub extern fn g_task_return_pointer(
     task: *GTask,
     result: ?*anyopaque,
