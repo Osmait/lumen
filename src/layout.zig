@@ -10,9 +10,8 @@ pub const Position = enum { top, upper_third, center, bottom };
 pub const Panels = enum { split, single };
 pub const Search = enum { top, bottom };
 pub const Detail = enum { right, left, bottom };
-/// A row's subtitle under its title, or after it on the same line. The
-/// value is "inline"; the tag is `inline_` because `inline` is a keyword.
-pub const Rows = enum { stacked, inline_ };
+/// A row's subtitle under its title, or after it on the same line.
+pub const Rows = enum { stacked, @"inline" };
 /// The search bar's pieces: the back arrow, the magnifier, the prompt, the
 /// open view's name, the text field and the "Ctrl K" chip.
 pub const BarPart = enum { back, icon, prompt, scope, entry, keys };
@@ -121,7 +120,7 @@ pub fn set(layout: *Layout, key_name: []const u8, value: Value) SetError!void {
         .panels => layout.panels = try enumValue(Panels, value),
         .search => layout.search = try enumValue(Search, value),
         .detail => layout.detail = try enumValue(Detail, value),
-        .rows => layout.rows = try rowsValue(value),
+        .rows => layout.rows = try enumValue(Rows, value),
         .footer => layout.footer = value.boolean orelse return error.BadValue,
     }
 }
@@ -143,22 +142,6 @@ fn inRange(number: f64, min: f64, max: f64) bool {
 fn enumValue(comptime Enum: type, value: Value) SetError!Enum {
     const name = value.string orelse return error.BadValue;
     return std.meta.stringToEnum(Enum, name) orelse error.BadValue;
-}
-
-/// The names `rows` takes in Lua. `Rows` cannot use them as tags, because
-/// `inline` is a keyword.
-const rows_names = std.StaticStringMap(Rows).initComptime(.{
-    .{ "stacked", .stacked },
-    .{ "inline", .inline_ },
-});
-
-comptime {
-    assert(rows_names.kvs.len == std.enums.values(Rows).len);
-}
-
-fn rowsValue(value: Value) SetError!Rows {
-    const name = value.string orelse return error.BadValue;
-    return rows_names.get(name) orelse error.BadValue;
 }
 
 /// Sets one `show` flag.
@@ -235,7 +218,7 @@ test "layout keys and values" {
     try std.testing.expectError(error.UnknownKey, set(&l, "colour", .{ .string = "red" }));
     try std.testing.expectError(error.BadValue, set(&l, "width", .{ .number = std.math.nan(f64) }));
     try set(&l, "rows", .{ .string = "inline" });
-    try std.testing.expectEqual(Rows.inline_, l.rows);
+    try std.testing.expectEqual(Rows.@"inline", l.rows);
     try std.testing.expectError(error.BadValue, set(&l, "rows", .{ .string = "inline_" }));
     try setShow(&l.show, "icons", false);
     try std.testing.expect(!l.show.icons);

@@ -1920,7 +1920,7 @@ test "extensions load, list, search and run actions" {
     try testing.expectEqual(@as(?u16, 820), registry.layout.width);
     try testing.expect(registry.layout.footer);
     try testing.expect(registry.layout.panels == .single);
-    try testing.expect(registry.layout.rows == .inline_);
+    try testing.expect(registry.layout.rows == .@"inline");
     try testing.expect(!registry.layout.show.icons and registry.layout.show.subtitles);
     const settings_expected = std.StaticStringMap([]const u8).initComptime(.{
         .{ "width", "wide" },

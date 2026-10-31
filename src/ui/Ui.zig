@@ -833,7 +833,7 @@ pub fn applyStructure(self: *Ui) void {
     assert(self.built);
     const layout = self.layout;
     self.row_look.show = layout.show;
-    self.row_look.rows_inline = layout.rows == .inline_;
+    self.row_look.rows_inline = layout.rows == .@"inline";
     self.row_look.parts = layout.row;
     // The search bar's parts in order; setView decides which of them show.
     const bar: *c.GtkBox = self.search_bar.box;
@@ -2479,13 +2479,13 @@ pub fn dump(
         "style: {s}\n",
         .{if (self.settings.style.len > 0) self.settings.style else "-"},
     );
-    try writer.print("layout: {d}x{d} panels={t} search={t} detail={t} rows={s} footer={}", .{
+    try writer.print("layout: {d}x{d} panels={t} search={t} detail={t} rows={t} footer={}", .{
         self.panelW(),
         self.panelH(),
         lay.panels,
         lay.search,
         lay.detail,
-        if (lay.rows == .inline_) "inline" else "stacked",
+        lay.rows,
         lay.footer,
     });
     try writer.writeAll(" bar=");
