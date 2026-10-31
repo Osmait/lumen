@@ -88,7 +88,7 @@ pub const GdkTexture = opaque {};
 pub const GCallback = *const fn () callconv(.c) void;
 pub const GAsyncReadyCallback = *const fn (
     source: ?*GObject,
-    res: *GAsyncResult,
+    result: *GAsyncResult,
     data: ?*anyopaque,
 ) callconv(.c) void;
 pub const GDestroyNotify = *const fn (?*anyopaque) callconv(.c) void;
@@ -166,16 +166,16 @@ pub const PR_SET_PDEATHSIG: c_int = 1;
 
 // ------------------------------------------------------------------ libc
 
-pub extern fn kill(pid: c_int, sig: c_int) c_int;
+pub extern fn kill(pid: c_int, signal: c_int) c_int;
 pub extern fn prctl(option: c_int, ...) c_int;
-pub extern fn read(fd: c_int, buf: *anyopaque, count: usize) isize;
+pub extern fn read(fd: c_int, buffer: *anyopaque, count: usize) isize;
 
 // ------------------------------------------------------------------ glib
 
-pub extern fn g_free(mem: ?*anyopaque) void;
+pub extern fn g_free(memory: ?*anyopaque) void;
 pub extern fn g_bytes_new_static(data: [*]const u8, size: usize) *GBytes;
 pub extern fn g_bytes_unref(bytes: *GBytes) void;
-pub extern fn g_strfreev(v: ?[*]?[*:0]u8) void;
+pub extern fn g_strfreev(strings: ?[*]?[*:0]u8) void;
 pub extern fn g_error_free(err: *GError) void;
 pub extern fn g_get_real_time() i64;
 pub extern fn g_get_user_config_dir() [*:0]const u8;
@@ -207,12 +207,16 @@ pub extern fn g_list_append(list: ?*GList, data: ?*anyopaque) *GList;
 pub extern fn g_list_free(list: *GList) void;
 pub extern fn g_bytes_new(data: ?*const anyopaque, size: usize) *GBytes;
 pub const GChildWatchFunc = *const fn (GPid, c_int, ?*anyopaque) callconv(.c) void;
-pub extern fn g_child_watch_add(pid: GPid, func: GChildWatchFunc, data: ?*anyopaque) c_uint;
+pub extern fn g_child_watch_add(pid: GPid, function: GChildWatchFunc, data: ?*anyopaque) c_uint;
 pub extern fn g_spawn_close_pid(pid: GPid) void;
 pub extern fn g_main_context_iteration(context: ?*anyopaque, may_block: gboolean) gboolean;
-pub extern fn g_idle_add(func: GSourceFunc, data: ?*anyopaque) c_uint;
-pub extern fn g_timeout_add_seconds(interval: c_uint, func: GSourceFunc, data: ?*anyopaque) c_uint;
-pub extern fn g_timeout_add(interval: c_uint, func: GSourceFunc, data: ?*anyopaque) c_uint;
+pub extern fn g_idle_add(function: GSourceFunc, data: ?*anyopaque) c_uint;
+pub extern fn g_timeout_add_seconds(
+    interval_s: c_uint,
+    function: GSourceFunc,
+    data: ?*anyopaque,
+) c_uint;
+pub extern fn g_timeout_add(interval_ms: c_uint, function: GSourceFunc, data: ?*anyopaque) c_uint;
 
 pub extern fn g_spawn_async(
     working_directory: ?[*:0]const u8,
@@ -246,19 +250,19 @@ pub extern fn g_date_time_new_local(
     minute: c_int,
     seconds: f64,
 ) ?*GDateTime;
-pub extern fn g_date_time_new_from_unix_local(t: i64) ?*GDateTime;
-pub extern fn g_date_time_unref(dt: *GDateTime) void;
-pub extern fn g_date_time_get_year(dt: *GDateTime) c_int;
-pub extern fn g_date_time_get_month(dt: *GDateTime) c_int;
-pub extern fn g_date_time_get_day_of_month(dt: *GDateTime) c_int;
-pub extern fn g_date_time_to_unix(dt: *GDateTime) i64;
-pub extern fn g_date_time_format(dt: *GDateTime, format: [*:0]const u8) ?[*:0]u8;
+pub extern fn g_date_time_new_from_unix_local(unix_time_s: i64) ?*GDateTime;
+pub extern fn g_date_time_unref(date_time: *GDateTime) void;
+pub extern fn g_date_time_get_year(date_time: *GDateTime) c_int;
+pub extern fn g_date_time_get_month(date_time: *GDateTime) c_int;
+pub extern fn g_date_time_get_day_of_month(date_time: *GDateTime) c_int;
+pub extern fn g_date_time_to_unix(date_time: *GDateTime) i64;
+pub extern fn g_date_time_format(date_time: *GDateTime, format: [*:0]const u8) ?[*:0]u8;
 
 // --------------------------------------------------------------- gobject
 
-pub extern fn g_object_unref(obj: ?*anyopaque) void;
-pub extern fn g_object_set_data(obj: *anyopaque, key: [*:0]const u8, data: ?*anyopaque) void;
-pub extern fn g_object_get_data(obj: *anyopaque, key: [*:0]const u8) ?*anyopaque;
+pub extern fn g_object_unref(object: ?*anyopaque) void;
+pub extern fn g_object_set_data(object: *anyopaque, key: [*:0]const u8, data: ?*anyopaque) void;
+pub extern fn g_object_get_data(object: *anyopaque, key: [*:0]const u8) ?*anyopaque;
 pub const GClosureNotify = *const fn (data: ?*anyopaque, closure: ?*anyopaque) callconv(.c) void;
 pub extern fn g_signal_connect_data(
     instance: *anyopaque,
@@ -280,7 +284,7 @@ pub extern fn g_app_info_get_default_for_type(
 pub extern fn g_app_info_launch_uris(
     info: *GAppInfo,
     uris: ?*GList,
-    ctx: ?*GAppLaunchContext,
+    context: ?*GAppLaunchContext,
     err: ?*?*GError,
 ) gboolean;
 pub extern fn g_desktop_app_info_new(desktop_id: [*:0]const u8) ?*GDesktopAppInfo;
@@ -327,34 +331,34 @@ pub extern fn g_desktop_app_info_get_keywords(info: *GDesktopAppInfo) ?[*]const 
 pub extern fn g_desktop_app_info_get_startup_wm_class(info: *GDesktopAppInfo) ?[*:0]const u8;
 pub extern fn g_desktop_app_info_get_filename(info: *GDesktopAppInfo) ?[*:0]const u8;
 
-pub extern fn g_application_run(app: *GApplication, argc: c_int, argv: ?[*]?[*:0]u8) c_int;
-pub extern fn g_application_hold(app: *GApplication) void;
+pub extern fn g_application_run(application: *GApplication, argc: c_int, argv: ?[*]?[*:0]u8) c_int;
+pub extern fn g_application_hold(application: *GApplication) void;
 pub extern fn g_application_register(
-    app: *GApplication,
+    application: *GApplication,
     cancellable: ?*anyopaque,
     err: ?*?*GError,
 ) gboolean;
-pub extern fn g_application_get_is_remote(app: *GApplication) gboolean;
-pub extern fn g_application_quit(app: *GApplication) void;
+pub extern fn g_application_get_is_remote(application: *GApplication) gboolean;
+pub extern fn g_application_quit(application: *GApplication) void;
 pub extern fn g_application_command_line_get_arguments(
-    cmdline: *GApplicationCommandLine,
+    command_line: *GApplicationCommandLine,
     argc: *c_int,
 ) [*]?[*:0]u8;
 pub extern fn g_application_command_line_print(
-    cmdline: *GApplicationCommandLine,
+    command_line: *GApplicationCommandLine,
     format: [*:0]const u8,
     ...,
 ) void;
 pub extern fn g_application_command_line_get_stdin(
-    cmdline: *GApplicationCommandLine,
+    command_line: *GApplicationCommandLine,
 ) ?*GInputStream;
 pub extern fn g_application_command_line_set_exit_status(
-    cmdline: *GApplicationCommandLine,
+    command_line: *GApplicationCommandLine,
     status: c_int,
 ) void;
-pub extern fn g_object_ref(obj: *anyopaque) *anyopaque;
+pub extern fn g_object_ref(object: *anyopaque) *anyopaque;
 pub extern fn g_cancellable_new() *GCancellable;
-pub extern fn g_cancellable_cancel(c: *GCancellable) void;
+pub extern fn g_cancellable_cancel(cancellable: *GCancellable) void;
 pub extern fn g_input_stream_read_bytes_async(
     stream: *GInputStream,
     count: usize,
@@ -365,12 +369,12 @@ pub extern fn g_input_stream_read_bytes_async(
 ) void;
 pub extern fn g_input_stream_read_bytes_finish(
     stream: *GInputStream,
-    res: *GAsyncResult,
+    result: *GAsyncResult,
     err: ?*?*GError,
 ) ?*GBytes;
 pub extern fn g_bytes_get_data(bytes: *GBytes, size: ?*usize) ?[*]const u8;
 pub extern fn g_application_command_line_printerr(
-    cmdline: *GApplicationCommandLine,
+    command_line: *GApplicationCommandLine,
     format: [*:0]const u8,
     ...,
 ) void;
@@ -383,22 +387,22 @@ pub extern fn g_subprocess_newv(
     flags: c_int,
     err: ?*?*GError,
 ) ?*GSubprocess;
-pub extern fn g_subprocess_get_stdin_pipe(sp: *GSubprocess) *GOutputStream;
+pub extern fn g_subprocess_get_stdin_pipe(subprocess: *GSubprocess) *GOutputStream;
 pub extern fn g_subprocess_communicate_utf8_async(
-    sp: *GSubprocess,
+    subprocess: *GSubprocess,
     stdin: ?[*:0]const u8,
     cancellable: ?*GCancellable,
     callback: GAsyncReadyCallback,
     data: ?*anyopaque,
 ) void;
 pub extern fn g_subprocess_communicate_utf8_finish(
-    sp: *GSubprocess,
-    res: *GAsyncResult,
+    subprocess: *GSubprocess,
+    result: *GAsyncResult,
     stdout: ?*?[*:0]u8,
     stderr: ?*?[*:0]u8,
     err: ?*?*GError,
 ) gboolean;
-pub extern fn g_subprocess_get_successful(sp: *GSubprocess) gboolean;
+pub extern fn g_subprocess_get_successful(subprocess: *GSubprocess) gboolean;
 pub extern fn g_output_stream_write_all(
     stream: *GOutputStream,
     buffer: *const anyopaque,
@@ -425,9 +429,9 @@ pub extern fn g_bus_get(
     callback: GAsyncReadyCallback,
     data: ?*anyopaque,
 ) void;
-pub extern fn g_bus_get_finish(res: *GAsyncResult, err: ?*?*GError) ?*GDBusConnection;
+pub extern fn g_bus_get_finish(result: *GAsyncResult, err: ?*?*GError) ?*GDBusConnection;
 pub extern fn g_dbus_connection_call(
-    conn: *GDBusConnection,
+    connection: *GDBusConnection,
     bus_name: ?[*:0]const u8,
     object_path: [*:0]const u8,
     interface_name: ?[*:0]const u8,
@@ -441,30 +445,30 @@ pub extern fn g_dbus_connection_call(
     data: ?*anyopaque,
 ) void;
 pub extern fn g_dbus_connection_call_finish(
-    conn: *GDBusConnection,
-    res: *GAsyncResult,
+    connection: *GDBusConnection,
+    result: *GAsyncResult,
     err: ?*?*GError,
 ) ?*GVariant;
 pub extern fn g_variant_new_strv(strv: [*]const [*:0]const u8, length: isize) *GVariant;
-pub extern fn g_variant_new_string(s: [*:0]const u8) *GVariant;
+pub extern fn g_variant_new_string(string: [*:0]const u8) *GVariant;
 pub extern fn g_variant_new_tuple(children: [*]const *GVariant, n_children: usize) *GVariant;
-pub extern fn g_variant_ref_sink(v: *GVariant) *GVariant;
-pub extern fn g_variant_unref(v: *GVariant) void;
+pub extern fn g_variant_ref_sink(variant: *GVariant) *GVariant;
+pub extern fn g_variant_unref(variant: *GVariant) void;
 pub extern fn g_subprocess_communicate_async(
-    sp: *GSubprocess,
-    stdin_buf: ?*GBytes,
+    subprocess: *GSubprocess,
+    stdin_bytes: ?*GBytes,
     cancellable: ?*GCancellable,
     callback: GAsyncReadyCallback,
     data: ?*anyopaque,
 ) void;
 pub extern fn g_subprocess_communicate_finish(
-    sp: *GSubprocess,
-    res: *GAsyncResult,
-    stdout_buf: ?*?*GBytes,
-    stderr_buf: ?*?*GBytes,
+    subprocess: *GSubprocess,
+    result: *GAsyncResult,
+    stdout_bytes: ?*?*GBytes,
+    stderr_bytes: ?*?*GBytes,
     err: ?*?*GError,
 ) gboolean;
-pub extern fn g_utf8_make_valid(str: [*]const u8, len: isize) [*:0]u8;
+pub extern fn g_utf8_make_valid(text: [*]const u8, length: isize) [*:0]u8;
 pub extern fn g_shell_parse_argv(
     command_line: [*:0]const u8,
     argcp: ?*c_int,
@@ -506,38 +510,38 @@ pub extern fn gdk_monitor_get_geometry(monitor: *GdkMonitor, geometry: *GdkRecta
 // ------------------------------------------------------------------- gtk
 
 pub extern fn gtk_application_new(id: [*:0]const u8, flags: c_int) *GtkApplication;
-pub extern fn gtk_application_window_new(app: *GtkApplication) *GtkWidget;
+pub extern fn gtk_application_window_new(application: *GtkApplication) *GtkWidget;
 
-pub extern fn gtk_window_set_title(w: *GtkWindow, title: [*:0]const u8) void;
-pub extern fn gtk_window_set_resizable(w: *GtkWindow, v: gboolean) void;
-pub extern fn gtk_window_set_decorated(w: *GtkWindow, v: gboolean) void;
-pub extern fn gtk_window_set_default_size(w: *GtkWindow, width: c_int, height: c_int) void;
-pub extern fn gtk_window_set_child(w: *GtkWindow, child: *GtkWidget) void;
+pub extern fn gtk_window_set_title(window: *GtkWindow, title: [*:0]const u8) void;
+pub extern fn gtk_window_set_resizable(window: *GtkWindow, resizable: gboolean) void;
+pub extern fn gtk_window_set_decorated(window: *GtkWindow, decorated: gboolean) void;
+pub extern fn gtk_window_set_default_size(window: *GtkWindow, width: c_int, height: c_int) void;
+pub extern fn gtk_window_set_child(window: *GtkWindow, child: *GtkWidget) void;
 pub extern fn gtk_window_new() *GtkWidget;
-pub extern fn gtk_window_present(w: *GtkWindow) void;
+pub extern fn gtk_window_present(window: *GtkWindow) void;
 
-pub extern fn gtk_widget_set_visible(w: *GtkWidget, v: gboolean) void;
-pub extern fn gtk_widget_get_visible(w: *GtkWidget) gboolean;
-pub extern fn gtk_widget_grab_focus(w: *GtkWidget) gboolean;
-pub extern fn gtk_widget_add_css_class(w: *GtkWidget, cls: [*:0]const u8) void;
-pub extern fn gtk_widget_remove_css_class(w: *GtkWidget, cls: [*:0]const u8) void;
-pub extern fn gtk_widget_set_hexpand(w: *GtkWidget, v: gboolean) void;
-pub extern fn gtk_widget_set_vexpand(w: *GtkWidget, v: gboolean) void;
-pub extern fn gtk_widget_set_halign(w: *GtkWidget, a: c_int) void;
-pub extern fn gtk_widget_set_valign(w: *GtkWidget, a: c_int) void;
-pub extern fn gtk_widget_get_size_request(w: *GtkWidget, width: ?*c_int, height: ?*c_int) void;
-pub extern fn gtk_widget_set_size_request(w: *GtkWidget, width: c_int, height: c_int) void;
-pub extern fn gtk_widget_set_margin_top(w: *GtkWidget, m: c_int) void;
-pub extern fn gtk_widget_set_margin_bottom(w: *GtkWidget, m: c_int) void;
-pub extern fn gtk_widget_set_margin_start(w: *GtkWidget, m: c_int) void;
-pub extern fn gtk_widget_set_margin_end(w: *GtkWidget, m: c_int) void;
-pub extern fn gtk_widget_set_focusable(w: *GtkWidget, v: gboolean) void;
-pub extern fn gtk_widget_get_frame_clock(w: *GtkWidget) ?*anyopaque;
-pub extern fn gtk_widget_add_controller(w: *GtkWidget, controller: *GtkEventController) void;
+pub extern fn gtk_widget_set_visible(widget: *GtkWidget, visible: gboolean) void;
+pub extern fn gtk_widget_get_visible(widget: *GtkWidget) gboolean;
+pub extern fn gtk_widget_grab_focus(widget: *GtkWidget) gboolean;
+pub extern fn gtk_widget_add_css_class(widget: *GtkWidget, class_name: [*:0]const u8) void;
+pub extern fn gtk_widget_remove_css_class(widget: *GtkWidget, class_name: [*:0]const u8) void;
+pub extern fn gtk_widget_set_hexpand(widget: *GtkWidget, hexpand: gboolean) void;
+pub extern fn gtk_widget_set_vexpand(widget: *GtkWidget, vexpand: gboolean) void;
+pub extern fn gtk_widget_set_halign(widget: *GtkWidget, alignment: c_int) void;
+pub extern fn gtk_widget_set_valign(widget: *GtkWidget, alignment: c_int) void;
+pub extern fn gtk_widget_get_size_request(widget: *GtkWidget, width: ?*c_int, height: ?*c_int) void;
+pub extern fn gtk_widget_set_size_request(widget: *GtkWidget, width: c_int, height: c_int) void;
+pub extern fn gtk_widget_set_margin_top(widget: *GtkWidget, margin: c_int) void;
+pub extern fn gtk_widget_set_margin_bottom(widget: *GtkWidget, margin: c_int) void;
+pub extern fn gtk_widget_set_margin_start(widget: *GtkWidget, margin: c_int) void;
+pub extern fn gtk_widget_set_margin_end(widget: *GtkWidget, margin: c_int) void;
+pub extern fn gtk_widget_set_focusable(widget: *GtkWidget, focusable: gboolean) void;
+pub extern fn gtk_widget_get_frame_clock(widget: *GtkWidget) ?*anyopaque;
+pub extern fn gtk_widget_add_controller(widget: *GtkWidget, controller: *GtkEventController) void;
 pub extern fn gtk_widget_compute_bounds(
-    w: *GtkWidget,
+    widget: *GtkWidget,
     target: *GtkWidget,
-    out: *graphene_rect_t,
+    bounds: *graphene_rect_t,
 ) gboolean;
 pub const GtkTickCallback = *const fn (
     ?*GtkWidget,
@@ -545,36 +549,36 @@ pub const GtkTickCallback = *const fn (
     ?*anyopaque,
 ) callconv(.c) gboolean;
 pub extern fn gtk_widget_add_tick_callback(
-    w: *GtkWidget,
-    cb: GtkTickCallback,
+    widget: *GtkWidget,
+    callback: GtkTickCallback,
     data: ?*anyopaque,
     notify: ?*const anyopaque,
 ) c_uint;
 
 pub extern fn gtk_box_new(orientation: c_int, spacing: c_int) *GtkWidget;
 pub extern fn gtk_box_append(box: *GtkBox, child: *GtkWidget) void;
-pub extern fn gtk_box_set_homogeneous(box: *GtkBox, v: gboolean) void;
+pub extern fn gtk_box_set_homogeneous(box: *GtkBox, homogeneous: gboolean) void;
 pub extern fn gtk_separator_new(orientation: c_int) *GtkWidget;
 pub extern fn gtk_overlay_new() *GtkWidget;
-pub extern fn gtk_overlay_set_child(o: *GtkOverlay, child: *GtkWidget) void;
-pub extern fn gtk_overlay_add_overlay(o: *GtkOverlay, w: *GtkWidget) void;
+pub extern fn gtk_overlay_set_child(overlay: *GtkOverlay, child: *GtkWidget) void;
+pub extern fn gtk_overlay_add_overlay(overlay: *GtkOverlay, widget: *GtkWidget) void;
 
 pub extern fn gtk_label_new(text: ?[*:0]const u8) *GtkWidget;
-pub extern fn gtk_label_set_text(l: *GtkLabel, text: [*:0]const u8) void;
-pub extern fn gtk_label_get_text(l: *GtkLabel) [*:0]const u8;
-pub extern fn gtk_label_set_markup(l: *GtkLabel, markup: [*:0]const u8) void;
-pub extern fn gtk_label_set_xalign(l: *GtkLabel, x: f32) void;
-pub extern fn gtk_label_set_yalign(l: *GtkLabel, y: f32) void;
-pub extern fn gtk_label_set_ellipsize(l: *GtkLabel, mode: c_int) void;
-pub extern fn gtk_label_set_max_width_chars(l: *GtkLabel, n: c_int) void;
-pub extern fn gtk_label_set_wrap(l: *GtkLabel, v: gboolean) void;
-pub extern fn gtk_label_set_wrap_mode(l: *GtkLabel, mode: c_int) void;
+pub extern fn gtk_label_set_text(label: *GtkLabel, text: [*:0]const u8) void;
+pub extern fn gtk_label_get_text(label: *GtkLabel) [*:0]const u8;
+pub extern fn gtk_label_set_markup(label: *GtkLabel, markup: [*:0]const u8) void;
+pub extern fn gtk_label_set_xalign(label: *GtkLabel, x: f32) void;
+pub extern fn gtk_label_set_yalign(label: *GtkLabel, y: f32) void;
+pub extern fn gtk_label_set_ellipsize(label: *GtkLabel, mode: c_int) void;
+pub extern fn gtk_label_set_max_width_chars(label: *GtkLabel, chars: c_int) void;
+pub extern fn gtk_label_set_wrap(label: *GtkLabel, wrap: gboolean) void;
+pub extern fn gtk_label_set_wrap_mode(label: *GtkLabel, mode: c_int) void;
 
 pub extern fn gtk_image_new_from_icon_name(name: ?[*:0]const u8) *GtkWidget;
 pub extern fn gtk_image_new_from_gicon(icon: *GIcon) *GtkWidget;
 pub extern fn gtk_image_new_from_paintable(paintable: ?*anyopaque) *GtkWidget;
-pub extern fn gtk_image_set_from_icon_name(img: *GtkImage, name: ?[*:0]const u8) void;
-pub extern fn gtk_image_set_pixel_size(img: *GtkImage, size: c_int) void;
+pub extern fn gtk_image_set_from_icon_name(image: *GtkImage, name: ?[*:0]const u8) void;
+pub extern fn gtk_image_set_pixel_size(image: *GtkImage, size: c_int) void;
 
 pub extern fn gtk_picture_new() *GtkWidget;
 pub extern fn gtk_picture_new_for_paintable(paintable: ?*anyopaque) *GtkWidget;
@@ -585,12 +589,12 @@ pub const GdkPixbuf = opaque {};
 pub extern fn gtk_flow_box_new() *GtkWidget;
 pub extern fn gtk_flow_box_append(box: *GtkFlowBox, child: *GtkWidget) void;
 pub extern fn gtk_flow_box_remove_all(box: *GtkFlowBox) void;
-pub extern fn gtk_flow_box_get_child_at_index(box: *GtkFlowBox, idx: c_int) ?*GtkFlowBoxChild;
+pub extern fn gtk_flow_box_get_child_at_index(box: *GtkFlowBox, index: c_int) ?*GtkFlowBoxChild;
 pub extern fn gtk_flow_box_select_child(box: *GtkFlowBox, child: *GtkFlowBoxChild) void;
 pub extern fn gtk_flow_box_unselect_all(box: *GtkFlowBox) void;
 pub extern fn gtk_flow_box_set_selection_mode(box: *GtkFlowBox, mode: c_int) void;
-pub extern fn gtk_flow_box_set_min_children_per_line(box: *GtkFlowBox, n: c_uint) void;
-pub extern fn gtk_flow_box_set_max_children_per_line(box: *GtkFlowBox, n: c_uint) void;
+pub extern fn gtk_flow_box_set_min_children_per_line(box: *GtkFlowBox, children: c_uint) void;
+pub extern fn gtk_flow_box_set_max_children_per_line(box: *GtkFlowBox, children: c_uint) void;
 pub extern fn gtk_flow_box_set_homogeneous(box: *GtkFlowBox, homogeneous: gboolean) void;
 pub extern fn gtk_flow_box_set_activate_on_single_click(box: *GtkFlowBox, single: gboolean) void;
 pub extern fn gtk_flow_box_set_row_spacing(box: *GtkFlowBox, spacing: c_uint) void;
@@ -606,18 +610,18 @@ pub extern fn gdk_pixbuf_new_from_file_at_scale(
 pub extern fn gdk_texture_new_for_pixbuf(pixbuf: *GdkPixbuf) *GdkTexture;
 pub const GDK_KEY_Left: c_uint = 0xff51;
 pub const GDK_KEY_Right: c_uint = 0xff53;
-pub extern fn gtk_picture_set_filename(p: *GtkPicture, filename: ?[*:0]const u8) void;
-pub extern fn gtk_picture_set_content_fit(p: *GtkPicture, fit: c_int) void;
+pub extern fn gtk_picture_set_filename(picture: *GtkPicture, filename: ?[*:0]const u8) void;
+pub extern fn gtk_picture_set_content_fit(picture: *GtkPicture, fit: c_int) void;
 pub const GTK_CONTENT_FIT_COVER: c_int = 2;
 pub const GTK_OVERFLOW_HIDDEN: c_int = 1;
-pub extern fn gtk_widget_set_overflow(w: *GtkWidget, overflow: c_int) void;
+pub extern fn gtk_widget_set_overflow(widget: *GtkWidget, overflow: c_int) void;
 
 pub extern fn gtk_text_new() *GtkWidget;
-pub extern fn gtk_text_set_placeholder_text(t: *GtkText, text: ?[*:0]const u8) void;
-pub extern fn gtk_text_set_visibility(t: *GtkText, visible: gboolean) void;
-pub extern fn gtk_editable_get_text(e: *GtkEditable) [*:0]const u8;
-pub extern fn gtk_editable_set_position(e: *GtkEditable, position: c_int) void;
-pub extern fn gtk_editable_set_text(e: *GtkEditable, text: [*:0]const u8) void;
+pub extern fn gtk_text_set_placeholder_text(text_entry: *GtkText, text: ?[*:0]const u8) void;
+pub extern fn gtk_text_set_visibility(text_entry: *GtkText, visible: gboolean) void;
+pub extern fn gtk_editable_get_text(editable: *GtkEditable) [*:0]const u8;
+pub extern fn gtk_editable_set_position(editable: *GtkEditable, position: c_int) void;
+pub extern fn gtk_editable_set_text(editable: *GtkEditable, text: [*:0]const u8) void;
 
 pub extern fn gtk_list_box_new() *GtkWidget;
 pub extern fn gtk_list_box_append(box: *GtkListBox, child: *GtkWidget) void;
@@ -628,28 +632,37 @@ pub extern fn gtk_list_box_set_selection_mode(box: *GtkListBox, mode: c_int) voi
 pub extern fn gtk_list_box_get_row_at_index(box: *GtkListBox, index: c_int) ?*GtkListBoxRow;
 pub extern fn gtk_list_box_row_new() *GtkWidget;
 pub extern fn gtk_list_box_row_set_child(row: *GtkListBoxRow, child: *GtkWidget) void;
-pub extern fn gtk_list_box_row_set_selectable(row: *GtkListBoxRow, v: gboolean) void;
-pub extern fn gtk_list_box_row_set_activatable(row: *GtkListBoxRow, v: gboolean) void;
+pub extern fn gtk_list_box_row_set_selectable(row: *GtkListBoxRow, selectable: gboolean) void;
+pub extern fn gtk_list_box_row_set_activatable(row: *GtkListBoxRow, activatable: gboolean) void;
 pub extern fn gtk_list_box_row_get_index(row: *GtkListBoxRow) c_int;
 
 pub extern fn gtk_scrolled_window_new() *GtkWidget;
-pub extern fn gtk_scrolled_window_set_child(sw: *GtkScrolledWindow, child: *GtkWidget) void;
-pub extern fn gtk_scrolled_window_set_policy(sw: *GtkScrolledWindow, h: c_int, v: c_int) void;
+pub extern fn gtk_scrolled_window_set_child(
+    scrolled_window: *GtkScrolledWindow,
+    child: *GtkWidget,
+) void;
+pub extern fn gtk_scrolled_window_set_policy(
+    scrolled_window: *GtkScrolledWindow,
+    horizontal: c_int,
+    vertical: c_int,
+) void;
 pub extern fn gtk_scrolled_window_set_propagate_natural_height(
-    sw: *GtkScrolledWindow,
+    scrolled_window: *GtkScrolledWindow,
     propagate: gboolean,
 ) void;
 pub extern fn gtk_scrolled_window_set_max_content_height(
-    sw: *GtkScrolledWindow,
+    scrolled_window: *GtkScrolledWindow,
     height: c_int,
 ) void;
-pub extern fn gtk_scrolled_window_get_vadjustment(sw: *GtkScrolledWindow) *GtkAdjustment;
-pub extern fn gtk_adjustment_get_value(adj: *GtkAdjustment) f64;
-pub extern fn gtk_adjustment_set_value(adj: *GtkAdjustment, v: f64) void;
-pub extern fn gtk_adjustment_get_page_size(adj: *GtkAdjustment) f64;
+pub extern fn gtk_scrolled_window_get_vadjustment(
+    scrolled_window: *GtkScrolledWindow,
+) *GtkAdjustment;
+pub extern fn gtk_adjustment_get_value(adjustment: *GtkAdjustment) f64;
+pub extern fn gtk_adjustment_set_value(adjustment: *GtkAdjustment, value: f64) void;
+pub extern fn gtk_adjustment_get_page_size(adjustment: *GtkAdjustment) f64;
 
 pub extern fn gtk_css_provider_new() *GtkCssProvider;
-pub extern fn gtk_css_provider_load_from_string(p: *GtkCssProvider, css: [*:0]const u8) void;
+pub extern fn gtk_css_provider_load_from_string(provider: *GtkCssProvider, css: [*:0]const u8) void;
 pub extern fn gtk_style_context_add_provider_for_display(
     display: *GdkDisplay,
     provider: *GtkStyleProvider,
@@ -658,17 +671,20 @@ pub extern fn gtk_style_context_add_provider_for_display(
 
 pub extern fn gtk_event_controller_key_new() *GtkEventController;
 pub extern fn gtk_gesture_click_new() *GtkEventController;
-pub extern fn gtk_widget_set_cursor_from_name(w: *GtkWidget, name: ?[*:0]const u8) void;
-pub extern fn gtk_widget_set_tooltip_text(w: *GtkWidget, text: ?[*:0]const u8) void;
-pub extern fn gtk_event_controller_set_propagation_phase(c: *GtkEventController, phase: c_int) void;
+pub extern fn gtk_widget_set_cursor_from_name(widget: *GtkWidget, name: ?[*:0]const u8) void;
+pub extern fn gtk_widget_set_tooltip_text(widget: *GtkWidget, text: ?[*:0]const u8) void;
+pub extern fn gtk_event_controller_set_propagation_phase(
+    controller: *GtkEventController,
+    phase: c_int,
+) void;
 
 // ------------------------------------------------------- gtk4-layer-shell
 
-pub extern fn gtk_layer_init_for_window(w: *GtkWindow) void;
-pub extern fn gtk_layer_set_layer(w: *GtkWindow, layer: c_int) void;
-pub extern fn gtk_layer_set_keyboard_mode(w: *GtkWindow, mode: c_int) void;
-pub extern fn gtk_layer_set_namespace(w: *GtkWindow, ns: [*:0]const u8) void;
-pub extern fn gtk_layer_set_anchor(w: *GtkWindow, edge: c_int, anchor: gboolean) void;
+pub extern fn gtk_layer_init_for_window(window: *GtkWindow) void;
+pub extern fn gtk_layer_set_layer(window: *GtkWindow, layer: c_int) void;
+pub extern fn gtk_layer_set_keyboard_mode(window: *GtkWindow, mode: c_int) void;
+pub extern fn gtk_layer_set_namespace(window: *GtkWindow, name_space: [*:0]const u8) void;
+pub extern fn gtk_layer_set_anchor(window: *GtkWindow, edge: c_int, anchor: gboolean) void;
 pub extern fn gtk_box_reorder_child_after(
     box: *GtkBox,
     child: *GtkWidget,
@@ -679,11 +695,11 @@ pub const GtkSettings = opaque {};
 pub extern fn gtk_settings_get_default() ?*GtkSettings;
 pub extern fn g_get_system_data_dirs() [*:null]const ?[*:0]const u8;
 pub extern fn gtk_settings_reset_property(settings: *GtkSettings, name: [*:0]const u8) void;
-pub extern fn g_object_set(obj: *anyopaque, first: [*:0]const u8, ...) void;
-pub extern fn gtk_orientable_set_orientation(o: *anyopaque, orientation: c_int) void;
-pub extern fn gtk_layer_set_margin(w: *GtkWindow, edge: c_int, margin: c_int) void;
-pub extern fn gtk_layer_set_monitor(w: *GtkWindow, monitor: ?*GdkMonitor) void;
-pub extern fn gtk_layer_set_exclusive_zone(w: *GtkWindow, zone: c_int) void;
+pub extern fn g_object_set(object: *anyopaque, first: [*:0]const u8, ...) void;
+pub extern fn gtk_orientable_set_orientation(orientable: *anyopaque, orientation: c_int) void;
+pub extern fn gtk_layer_set_margin(window: *GtkWindow, edge: c_int, margin: c_int) void;
+pub extern fn gtk_layer_set_monitor(window: *GtkWindow, monitor: ?*GdkMonitor) void;
+pub extern fn gtk_layer_set_exclusive_zone(window: *GtkWindow, zone: c_int) void;
 
 // ---------------------------------------------------------------- glib-unix
 
@@ -700,9 +716,9 @@ pub extern fn g_unix_fd_add(
     function: GUnixFDSourceFunc,
     data: ?*anyopaque,
 ) c_uint;
-pub extern fn gtk_widget_realize(w: *GtkWidget) void;
+pub extern fn gtk_widget_realize(widget: *GtkWidget) void;
 pub extern fn gtk_widget_measure(
-    w: *GtkWidget,
+    widget: *GtkWidget,
     orientation: c_int,
     for_size: c_int,
     minimum: ?*c_int,
@@ -715,7 +731,7 @@ pub extern fn gdk_display_flush(display: *GdkDisplay) void;
 pub const G_PRIORITY_LOW: c_int = 300;
 pub extern fn g_idle_add_full(
     priority: c_int,
-    func: GSourceFunc,
+    function: GSourceFunc,
     data: ?*anyopaque,
     notify: ?*const anyopaque,
 ) c_uint;
@@ -737,7 +753,7 @@ pub extern fn g_task_set_task_data(
     data: ?*anyopaque,
     destroy: ?*const fn (?*anyopaque) callconv(.c) void,
 ) void;
-pub extern fn g_task_run_in_thread(task: *GTask, func: GTaskThreadFunc) void;
+pub extern fn g_task_run_in_thread(task: *GTask, function: GTaskThreadFunc) void;
 pub extern fn g_task_return_pointer(
     task: *GTask,
     result: ?*anyopaque,
@@ -751,7 +767,7 @@ pub extern fn gtk_picture_set_paintable(picture: *GtkWidget, paintable: ?*anyopa
 
 pub extern fn g_memory_input_stream_new_from_data(
     data: ?*const anyopaque,
-    len: isize,
+    length: isize,
     destroy: ?*const fn (?*anyopaque) callconv(.c) void,
 ) *GInputStream;
 pub extern fn gdk_pixbuf_new_from_stream_at_scale(
@@ -764,4 +780,4 @@ pub extern fn gdk_pixbuf_new_from_stream_at_scale(
 ) ?*GdkPixbuf;
 pub extern fn gtk_box_remove(box: *GtkBox, child: *GtkWidget) void;
 pub extern fn gtk_box_prepend(box: *GtkBox, child: *GtkWidget) void;
-pub extern fn gtk_widget_get_parent(w: *GtkWidget) ?*GtkWidget;
+pub extern fn gtk_widget_get_parent(widget: *GtkWidget) ?*GtkWidget;

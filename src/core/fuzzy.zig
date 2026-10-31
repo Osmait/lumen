@@ -71,8 +71,8 @@ pub fn score(query_in: []const u8, text_in: []const u8) i32 {
 
     // A plain substring is the strongest signal (see
     // `substring_outranks_fuzzy_chars_max`), and a prefix more so.
-    if (std.mem.find(u8, text, query)) |at| {
-        const result = scoreSubstring(text, upper, query.len, at);
+    if (std.mem.find(u8, text, query)) |substring_start| {
+        const result = scoreSubstring(text, upper, query.len, substring_start);
         assert(result >= Score.substring_floor);
         return result;
     }
@@ -84,12 +84,19 @@ pub fn score(query_in: []const u8, text_in: []const u8) i32 {
     return result;
 }
 
-fn scoreSubstring(text: []const u8, upper: []const bool, query_len: usize, at: usize) i32 {
-    const position_penalty: i32 = @intCast(@min(at, Score.substring_position_penalty_max));
+fn scoreSubstring(
+    text: []const u8,
+    upper: []const bool,
+    query_len: usize,
+    substring_start: usize,
+) i32 {
+    const position_penalty: i32 = @intCast(
+        @min(substring_start, Score.substring_position_penalty_max),
+    );
     var result: i32 = Score.substring_base - position_penalty;
-    if (at == 0) {
+    if (substring_start == 0) {
         result += Score.substring_prefix_bonus;
-    } else if (isBoundary(text, upper, at)) {
+    } else if (isBoundary(text, upper, substring_start)) {
         result += Score.substring_boundary_bonus;
     }
     if (query_len == text.len) result += Score.substring_whole_bonus;
@@ -184,8 +191,9 @@ test "letters inside a word only match as a run" {
 
 test "title outranks subtitle" {
     const fields_title = [_][]const u8{ "Terminal", "Kitty" };
-    const fields_sub = [_][]const u8{ "Kitty", "Terminal" };
-    try std.testing.expect(scoreFields("term", &fields_title) > scoreFields("term", &fields_sub));
+    const fields_subtitle = [_][]const u8{ "Kitty", "Terminal" };
+    const title_score = scoreFields("term", &fields_title);
+    try std.testing.expect(title_score > scoreFields("term", &fields_subtitle));
 }
 
 test "accents and case fold both ways" {

@@ -33,13 +33,13 @@ pub fn validWindow(text: []const u8) []const u8 {
     return validPrefix(text[skip..]);
 }
 
-/// The longest length up to `max` that ends `text` between characters.
-pub fn floorBoundary(text: []const u8, max: usize) usize {
-    if (max >= text.len) return text.len;
-    var end = max;
-    // Cut before the lead byte of the character `max` falls in.
+/// The longest length up to `len_max` that ends `text` between characters.
+pub fn floorBoundary(text: []const u8, len_max: usize) usize {
+    if (len_max >= text.len) return text.len;
+    var end = len_max;
+    // Cut before the lead byte of the character `len_max` falls in.
     while (end > 0 and isContinuation(text[end])) end -= 1;
-    assert(end <= max);
+    assert(end <= len_max);
     assert(!isContinuation(text[end]));
     return end;
 }
@@ -69,17 +69,17 @@ test "validPrefix agrees with the longest valid prefix on random bytes" {
     var prng: std.Random.DefaultPrng = .init(0x7e57);
     const random = prng.random();
     const pieces = [_][]const u8{ "a", "é", "€", "😀", "\x80", "\xc3", "\xe2\x82", "\xff", "\xed\xa0\x80" };
-    var buf: [64]u8 = undefined;
+    var text_buffer: [64]u8 = undefined;
     for (0..5000) |_| {
-        var len: usize = 0;
+        var text_len: usize = 0;
         while (true) {
             const piece = pieces[random.uintLessThan(usize, pieces.len)];
-            if (len + piece.len > buf.len) break;
-            @memcpy(buf[len..][0..piece.len], piece);
-            len += piece.len;
+            if (text_len + piece.len > text_buffer.len) break;
+            @memcpy(text_buffer[text_len..][0..piece.len], piece);
+            text_len += piece.len;
             if (random.uintLessThan(u8, 8) == 0) break;
         }
-        const text = buf[0..len];
+        const text = text_buffer[0..text_len];
         try std.testing.expectEqualStrings(validPrefixNaive(text), validPrefix(text));
     }
 }
