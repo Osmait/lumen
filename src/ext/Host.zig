@@ -1252,7 +1252,7 @@ fn parseCommand(
         .placeholder = lua.fieldString(L, arena, command_table, "placeholder", where) orelse "",
         .mode = mode,
         .detail = lua.fieldBool(L, command_table, "detail", false, where),
-        .root = answers_root_search,
+        .answers_root_search = answers_root_search,
         .fields = formFields(L, context, command_table, mode == .form, where, extension_title),
         .submit_title = lua.fieldString(L, arena, command_table, "submit_title", where) orelse
             "Submit",
@@ -1906,7 +1906,8 @@ test "extensions load, list, search and run actions" {
 
     try testing.expectEqual(@as(usize, 5), registry.commands.len);
     try testing.expectEqual(Mode.provider, registry.commands[4].mode);
-    try testing.expect(registry.commands[4].root and !registry.commands[1].root);
+    try testing.expect(registry.commands[4].answers_root_search);
+    try testing.expect(!registry.commands[1].answers_root_search);
     try testing.expectEqualStrings("config.hello", registry.commands[0].id);
     try testing.expectEqual(Mode.run, registry.commands[0].mode);
     try testing.expectEqualStrings("demo.fruits", registry.commands[1].id);
@@ -2012,10 +2013,10 @@ test "extensions load, list, search and run actions" {
     try testing.expectEqual(@as(u16, 4), r21.sections[0].command);
     const doubled = r21.sections[0].items[0];
     try testing.expectEqualStrings("42", doubled.title);
-    try testing.expect(doubled.action.ext_item.root);
+    try testing.expect(doubled.action.ext_item.from_root_search);
     _ = host.act(registry.gen, 4, .{ .row_action = .{
         .from_root_search = true,
-        .list_gen = doubled.action.ext_item.gen,
+        .list_gen = doubled.action.ext_item.list_generation,
         .row_index = 0,
         .action_index = 0,
     } });

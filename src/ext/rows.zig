@@ -201,9 +201,9 @@ fn extItem(
     assert(actions.len <= actions_max);
     return .{
         .command = source.origin.command,
-        .root = source.origin.from_root_search,
-        .gen = source.origin.list_gen,
-        .index = source.row_index,
+        .from_root_search = source.origin.from_root_search,
+        .list_generation = source.origin.list_gen,
+        .row_index = source.row_index,
         .actions = actions,
         .entries = entries,
     };

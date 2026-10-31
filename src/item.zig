@@ -135,11 +135,11 @@ pub const ExtItem = struct {
     /// The extension command that listed it (index in the registry), and
     /// whether in its list or in the root search.
     command: u16,
-    root: bool = false,
+    from_root_search: bool = false,
     /// The list result it came from: its Lua actions run against that one.
-    gen: u32,
+    list_generation: u32,
     /// Position in the list the extension returned.
-    index: u32,
+    row_index: u32,
     actions: []const ExtAction,
     /// Labels and keys of `actions`, in the same order.
     entries: []const Entry,

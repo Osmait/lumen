@@ -201,7 +201,7 @@ pub fn addRootSections(ui: *Ui, query: []const u8) void {
     const registry = ui.ext_registry orelse return;
     const host = ui.ext_host orelse return;
     var any = false;
-    for (registry.commands) |cmd| any = any or cmd.root;
+    for (registry.commands) |command_entry| any = any or command_entry.answers_root_search;
     if (!any or query.len < root_query_bytes_min) return;
     if (ui.ext_root_search.latest) |answer| if (std.mem.eql(u8, answer.query, query)) {
         for (answer.sections) |sec| {
@@ -492,9 +492,9 @@ pub fn perform(ui: *Ui, action_index: u8) void {
             const host = ui.ext_host orelse return;
             const registry = ui.ext_registry orelse return;
             ui.ext_act_gen = host.act(registry.gen, row.command, .{ .row_action = .{
-                .from_root_search = row.root,
-                .list_gen = row.gen,
-                .row_index = row.index,
+                .from_root_search = row.from_root_search,
+                .list_gen = row.list_generation,
+                .row_index = row.row_index,
                 .action_index = action_index,
             } });
             ui.showRunning();
@@ -630,7 +630,7 @@ fn testCommand(id: [:0]const u8, fields: []const Host.Pref) Host.Command {
         .placeholder = "",
         .mode = if (fields.len > 0) .form else .list,
         .detail = false,
-        .root = false,
+        .answers_root_search = false,
         .fields = fields,
     };
 }

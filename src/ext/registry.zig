@@ -53,7 +53,7 @@ pub const Command = struct {
     /// Show the detail pane (the selected row's `detail`).
     detail: bool,
     /// It answers root searches too (`root = function(query)`).
-    root: bool,
+    answers_root_search: bool,
     /// A form's fields, in order (preferences' types).
     fields: []const Pref = &.{},
     /// The form's last row ("Submit").
