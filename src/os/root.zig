@@ -6,6 +6,8 @@ const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 
+const log = std.log.scoped(.os);
+
 pub const unix = @import("unix.zig");
 pub const child = @import("child.zig");
 
@@ -592,11 +594,18 @@ pub fn mkdirP(path: []const u8) Error!void {
 }
 
 /// Makes an existing directory of Lumen's owner-only: caches made by
-/// earlier versions were 0755, with world-readable files inside.
+/// earlier versions were 0755, with world-readable files inside. A failure
+/// is logged: the files written inside are owner-only all the same.
 pub fn makePrivate(path: []const u8) void {
-    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const path_z = std.mem.printSentinel(&buf, "{s}", .{path}, 0) catch return;
-    _ = linux.chmod(path_z, 0o700);
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_z = std.mem.printSentinel(&path_buffer, "{s}", .{path}, 0) catch {
+        log.warn("could not make {s} owner-only: the path is too long", .{path});
+        return;
+    };
+    switch (linux.errno(linux.chmod(path_z, 0o700))) {
+        .SUCCESS => {},
+        else => |errno| log.warn("could not make {s} owner-only: {t}", .{ path, errno }),
+    }
 }
 
 /// The alignment `mapPrivate` promises. A mapping starts on a page, far

@@ -26,7 +26,7 @@ const busy_timeout_ms = 2000;
 pub const in_memory = ":memory:";
 
 pub fn open(path: [:0]const u8) Error!Db {
-    if (!std.mem.eql(u8, path, in_memory)) makePrivate(path);
+    if (!std.mem.eql(u8, path, in_memory)) try makePrivate(path);
     var handle: ?*c.sqlite3 = null;
     if (c.sqlite3_open(path.ptr, &handle) != c.SQLITE_OK) {
         // SQLite gives a handle even when opening fails, but not when it
@@ -68,23 +68,47 @@ pub fn open(path: [:0]const u8) Error!Db {
 /// its files with the umask's mode (0644 here). The database is created
 /// owner-only before SQLite opens it, or made so if it exists; SQLite gives
 /// the -wal and -shm it creates the database's mode, and ones left by
-/// earlier versions are fixed too.
-fn makePrivate(path: [:0]const u8) void {
+/// earlier versions are fixed too. A file that cannot be made owner-only
+/// fails the open: copies would go on landing where others can read them.
+fn makePrivate(path: [:0]const u8) Error!void {
     const linux = std.os.linux;
-    const rc = linux.open(
+    const open_result = linux.open(
         path,
         .{ .ACCMODE = .RDONLY, .CREAT = true, .CLOEXEC = true, .NONBLOCK = true, .NOCTTY = true },
         0o600,
     );
-    if (linux.errno(rc) == .SUCCESS) {
-        const fd: i32 = @intCast(rc);
-        _ = linux.fchmod(fd, 0o600);
-        _ = linux.close(fd);
+    switch (linux.errno(open_result)) {
+        .SUCCESS => {},
+        else => |errno| {
+            log.warn("open {s}: {t}", .{ path, errno });
+            return error.DbOpen;
+        },
+    }
+    const fd: i32 = @intCast(open_result);
+    defer _ = linux.close(fd);
+    switch (linux.errno(linux.fchmod(fd, 0o600))) {
+        .SUCCESS => {},
+        else => |errno| {
+            log.warn("could not make {s} owner-only: {t}", .{ path, errno });
+            return error.DbOpen;
+        },
     }
     for ([_][]const u8{ "-wal", "-shm" }) |suffix| {
-        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-        const side = std.mem.printSentinel(&buf, "{s}{s}", .{ path, suffix }, 0) catch continue;
-        _ = linux.chmod(side, 0o600);
+        var side_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const side_path = std.mem.printSentinel(
+            &side_path_buffer,
+            "{s}{s}",
+            .{ path, suffix },
+            0,
+        ) catch continue;
+        switch (linux.errno(linux.chmod(side_path, 0o600))) {
+            // SQLite has not made it yet: it will, with the database's mode.
+            .SUCCESS, .NOENT => {},
+            else => |errno| {
+                log.warn("could not make {s} owner-only: {t}", .{ side_path, errno });
+                return error.DbOpen;
+            },
+        }
     }
 }
 

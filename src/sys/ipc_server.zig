@@ -115,8 +115,10 @@ fn listenIn(
         return error.Listen;
     }
     // The folder is owner-only already: a chmod that fails leaves the
-    // socket no more open than that.
-    _ = linux.chmod(socket_path.ptr, 0o600);
+    // socket no more open than that, so it is only logged.
+    if (failed(linux.chmod(socket_path.ptr, 0o600))) |errno| {
+        log.warn("could not make {s} owner-only: {t}", .{ socket_path, errno });
+    }
     server.path = socket_path;
     server.listen_fd = fd;
     server.handler = handler;
