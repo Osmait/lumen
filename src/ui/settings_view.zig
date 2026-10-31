@@ -231,23 +231,26 @@ pub fn choiceOptions(
         .terminal, .editor => blk: {
             var out: std.ArrayList(Option) = .empty;
             const terminal = choice == .terminal;
-            const list: []const [2][:0]const u8 = if (terminal)
+            const list: []const settings_mod.Program = if (terminal)
                 &settings_mod.terminals
             else
                 &settings_mod.editors;
             const auto_cmd: []const u8 = if (terminal) run.autoTerminal() else run.autoEditor();
             const auto_base = std.Io.Dir.path.basename(auto_cmd);
             var auto_name: []const u8 = auto_base;
-            for (list) |program| if (std.mem.eql(u8, program[0], auto_base)) {
-                auto_name = program[1];
+            for (list) |program| if (std.mem.eql(u8, program.command, auto_base)) {
+                auto_name = program.title;
             };
             appendRow(Option, arena, &out, .{
                 .value = "",
                 .label = arena.printSentinel("Automatic ({s})", .{auto_name}, 0) catch "Automatic",
             });
             for (list) |program| {
-                if (proc.have(program[0])) {
-                    appendRow(Option, arena, &out, .{ .value = program[0], .label = program[1] });
+                if (proc.have(program.command)) {
+                    appendRow(Option, arena, &out, .{
+                        .value = program.command,
+                        .label = program.title,
+                    });
                 }
             }
             break :blk out.items;

@@ -283,8 +283,7 @@ const editor_fallback = "nvim";
 
 fn resolveTerminal(settings: *const Settings) [:0]const u8 {
     for (settings_mod.terminals) |terminal| {
-        const command, _ = terminal;
-        if (std.mem.eql(u8, command, settings.terminal)) return command;
+        if (std.mem.eql(u8, terminal.command, settings.terminal)) return terminal.command;
     }
     return autoTerminal();
 }
@@ -294,8 +293,7 @@ fn resolveTerminal(settings: *const Settings) [:0]const u8 {
 pub fn autoTerminal() [:0]const u8 {
     if (c.g_getenv("TERMINAL")) |terminal| return std.mem.span(terminal);
     for (settings_mod.terminals) |terminal| {
-        const command, _ = terminal;
-        if (proc.have(command)) return command;
+        if (proc.have(terminal.command)) return terminal.command;
     }
     return terminal_fallback;
 }

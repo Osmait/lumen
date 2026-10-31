@@ -69,32 +69,39 @@ comptime {
     assert(std.mem.findScalar(u32, &keep_choices, clipboard_keep_default) != null);
 }
 
-/// Terminal emulators and editors offered when installed: each is its
-/// command, then the name Settings shows.
-pub const terminals = [_][2][:0]const u8{
-    .{ "ghostty", "Ghostty" },
-    .{ "kitty", "Kitty" },
-    .{ "alacritty", "Alacritty" },
-    .{ "foot", "Foot" },
-    .{ "wezterm", "WezTerm" },
-    .{ "konsole", "Konsole" },
-    .{ "gnome-terminal", "GNOME Terminal" },
-    .{ "xterm", "XTerm" },
+/// A terminal emulator or an editor Settings offers when it is installed.
+pub const Program = struct {
+    /// What is run, and what the setting's value is.
+    command: [:0]const u8,
+    /// The name Settings shows.
+    title: [:0]const u8,
 };
-pub const editors = [_][2][:0]const u8{
-    .{ "nvim", "Neovim" },
-    .{ "vim", "Vim" },
-    .{ "hx", "Helix" },
-    .{ "nano", "nano" },
-    .{ "micro", "micro" },
-    .{ "emacs", "Emacs" },
-    .{ "code", "VS Code" },
-    .{ "codium", "VSCodium" },
-    .{ "zed", "Zed" },
-    .{ "subl", "Sublime Text" },
-    .{ "kate", "Kate" },
-    .{ "gedit", "gedit" },
-    .{ "gnome-text-editor", "GNOME Text Editor" },
+
+/// Terminal emulators and editors offered when installed.
+pub const terminals = [_]Program{
+    .{ .command = "ghostty", .title = "Ghostty" },
+    .{ .command = "kitty", .title = "Kitty" },
+    .{ .command = "alacritty", .title = "Alacritty" },
+    .{ .command = "foot", .title = "Foot" },
+    .{ .command = "wezterm", .title = "WezTerm" },
+    .{ .command = "konsole", .title = "Konsole" },
+    .{ .command = "gnome-terminal", .title = "GNOME Terminal" },
+    .{ .command = "xterm", .title = "XTerm" },
+};
+pub const editors = [_]Program{
+    .{ .command = "nvim", .title = "Neovim" },
+    .{ .command = "vim", .title = "Vim" },
+    .{ .command = "hx", .title = "Helix" },
+    .{ .command = "nano", .title = "nano" },
+    .{ .command = "micro", .title = "micro" },
+    .{ .command = "emacs", .title = "Emacs" },
+    .{ .command = "code", .title = "VS Code" },
+    .{ .command = "codium", .title = "VSCodium" },
+    .{ .command = "zed", .title = "Zed" },
+    .{ .command = "subl", .title = "Sublime Text" },
+    .{ .command = "kate", .title = "Kate" },
+    .{ .command = "gedit", .title = "gedit" },
+    .{ .command = "gnome-text-editor", .title = "GNOME Text Editor" },
 };
 
 pub const Settings = struct {
