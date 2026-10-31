@@ -285,7 +285,13 @@ fn reportLatency(writer: *std.Io.Writer) ReportError!void {
     if (shown.samples_total > 0) {
         try writer.print(
             "  {s:<10} {d:>6} {d:>8.2} {d:>8.2} {d:>8.2}   (window shown -> first frame)\n",
-            .{ "show", shown.samples_total, shown.latency_ms_p50, shown.latency_ms_p95, shown.latency_ms_max },
+            .{
+                "show",
+                shown.samples_total,
+                shown.latency_ms_p50,
+                shown.latency_ms_p95,
+                shown.latency_ms_max,
+            },
         );
     }
 }
