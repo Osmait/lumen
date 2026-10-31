@@ -22,6 +22,7 @@ const row_list = @import("row_list.zig");
 const themes = @import("themes.zig");
 const widgets = @import("widgets.zig");
 const Ui = @import("Ui.zig");
+const stats = @import("../stats.zig");
 const View = Ui.View;
 
 /// Sizes style.css sets that the window's arithmetic depends on. The test
@@ -547,6 +548,7 @@ fn onKey(
     data: ?*anyopaque,
 ) callconv(.c) c.gboolean {
     const ui: *Ui = @ptrCast(@alignCast(data));
+    ui.key_ns = stats.now();
     return keyboard.handleKey(ui, keyval, state);
 }
 

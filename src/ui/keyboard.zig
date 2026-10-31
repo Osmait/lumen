@@ -50,7 +50,30 @@ pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
     }
     // Then the keymaps from init.lua and extensions.
     if (Ui.ext_view.keymap(ui, keyval, state)) return 1;
+    if (typeAltChord(ui, keyval, state)) return 1;
     return 0;
+}
+
+/// A printable key with Alt alone (no Ctrl or Super) types its character,
+/// which GTK's text field would drop: a split keyboard's thumb key held a
+/// little long sends Right Alt instead of a space, and the digits typed
+/// before it is let go were lost ("10 * 10" became "10 * ").
+fn typeAltChord(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) bool {
+    if (state & c.GDK_ALT_MASK == 0) return false;
+    if (state & (c.GDK_CONTROL_MASK | c.GDK_SUPER_MASK) != 0) return false;
+    const code_point = c.gdk_keyval_to_unicode(keyval);
+    const printable = code_point >= ' ' and code_point != 0x7f;
+    if (!printable) return false;
+    // Only into the search field: a form's own fields get keys as GTK gives them.
+    if (c.gtk_widget_has_focus(gtk.widget(ui.search_bar.entry)) == 0) return false;
+    var utf8_bytes: [4]u8 = undefined;
+    const scalar = std.math.cast(u21, code_point) orelse return false;
+    const length = std.unicode.utf8Encode(scalar, &utf8_bytes) catch return false;
+    const field = gtk.editable(ui.search_bar.entry);
+    var position = c.gtk_editable_get_position(field);
+    c.gtk_editable_insert_text(field, &utf8_bytes, @intCast(length), &position);
+    c.gtk_editable_set_position(field, position);
+    return true;
 }
 
 /// `lumen --key NAME`: the same handling as a real key press, for tests.

@@ -621,6 +621,15 @@ pub extern fn gtk_text_set_placeholder_text(text_entry: *GtkText, text: ?[*:0]co
 pub extern fn gtk_text_set_visibility(text_entry: *GtkText, visible: gboolean) void;
 pub extern fn gtk_editable_get_text(editable: *GtkEditable) [*:0]const u8;
 pub extern fn gtk_editable_set_position(editable: *GtkEditable, position: c_int) void;
+pub extern fn gtk_editable_get_position(editable: *GtkEditable) c_int;
+pub extern fn gtk_editable_insert_text(
+    editable: *GtkEditable,
+    text: [*]const u8,
+    length: c_int,
+    position: *c_int,
+) void;
+pub extern fn gdk_keyval_to_unicode(keyval: c_uint) u32;
+pub extern fn gtk_widget_has_focus(widget: *GtkWidget) gboolean;
 pub extern fn gtk_editable_set_text(editable: *GtkEditable, text: [*:0]const u8) void;
 
 pub extern fn gtk_list_box_new() *GtkWidget;

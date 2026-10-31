@@ -56,6 +56,8 @@ const ipc = @import("../ipc.zig");
 const layout_mod = @import("../layout.zig");
 const Inflight = @import("inflight.zig").Inflight;
 const ActionPanel = @import("ActionPanel.zig");
+
+const log = std.log.scoped(.ui);
 const Kind = core.file_kind.Kind;
 
 const Ui = @This();
@@ -158,6 +160,8 @@ frecency: std.StringHashMapUnmanaged(f64) = .empty,
 content_query: Inflight(ContentSearch.Result, ContentSearch.query_bytes_max) = .{},
 /// Time spent searching during the current refresh (for `lumen --stats`).
 search_ns: u64 = 0,
+/// When the last real key press reached the window (monotonic ns).
+key_ns: u64 = 0,
 
 // ------------------------------------------------- settings and looks
 
@@ -369,8 +373,24 @@ pub fn actionContext(self: *Ui) run.Context {
 
 // --------------------------------------------------------- show / hide
 
+/// How soon after a key press a toggle is taken for a chord the keyboard
+/// sent while typing, not a request to close.
+const toggle_after_key_ns_min = 500 * std.time.ns_per_ms;
+
+/// `lumen` with no arguments: the shortcut that opens the window closes it.
+/// Not while typing: a split keyboard's thumb key held a little long sends
+/// Right Alt instead of a space, the next space makes the shortcut (Alt
+/// Space), and the window closed mid-word with the rest of the typing going
+/// to the window behind it.
 pub fn toggle(self: *Ui) void {
-    if (gtk.isVisible(self.window)) self.hide() else self.show();
+    if (!gtk.isVisible(self.window)) return self.show();
+    const since_key_ns = stats.now() -| self.key_ns;
+    if (since_key_ns < toggle_after_key_ns_min) {
+        const since_key_ms = since_key_ns / std.time.ns_per_ms;
+        log.info("toggle ignored: a key came {d} ms before", .{since_key_ms});
+        return;
+    }
+    self.hide();
 }
 
 pub fn show(self: *Ui) void {
