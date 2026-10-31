@@ -121,17 +121,22 @@ fn refuseOpen(L: *State) Error!c_int {
     return 1;
 }
 
+/// Linux's memory devices (major 1) that Lua's file functions may open,
+/// by minor number (Documentation/admin-guide/devices.txt).
+const memory_device_major = 1;
+const MemoryDevice = enum(u32) { null = 3, zero = 5, full = 7, random = 8, urandom = 9 };
+
 fn opensSafely(path: [*:0]const u8) bool {
     const linux = std.os.linux;
-    var stx: linux.Statx = undefined;
-    const rc = linux.statx(linux.AT.FDCWD, path, 0, .{ .TYPE = true }, &stx);
+    var status: linux.Statx = undefined;
+    const result = linux.statx(linux.AT.FDCWD, path, 0, .{ .TYPE = true }, &status);
     // Missing, or out of reach: the open fails on its own.
-    if (linux.errno(rc) != .SUCCESS) return true;
-    return switch (stx.mode & linux.S.IFMT) {
+    if (linux.errno(result) != .SUCCESS) return true;
+    return switch (status.mode & linux.S.IFMT) {
         linux.S.IFREG, linux.S.IFDIR => true,
         // The memory devices: null, zero, full, random and urandom.
-        linux.S.IFCHR => stx.rdev_major == memory_device_major and
-            std.enums.fromInt(MemoryDevice, stx.rdev_minor) != null,
+        linux.S.IFCHR => status.rdev_major == memory_device_major and
+            std.enums.fromInt(MemoryDevice, status.rdev_minor) != null,
         else => false,
     };
 }
@@ -205,35 +210,58 @@ pub const Capped = struct {
         return false;
     }
 
-    fn cappedAlloc(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
-        const self: *Capped = @ptrCast(@alignCast(ctx));
-        if (!self.fits(0, len)) return null;
-        const block = self.child.rawAlloc(len, al, ra) orelse return null;
-        self.used_bytes += len;
+    fn cappedAlloc(
+        context: *anyopaque,
+        bytes: usize,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *Capped = @ptrCast(@alignCast(context));
+        if (!self.fits(0, bytes)) return null;
+        const block = self.child.rawAlloc(bytes, alignment, return_address) orelse return null;
+        self.used_bytes += bytes;
         return block;
     }
 
-    fn cappedResize(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, len: usize, ra: usize) bool {
-        const self: *Capped = @ptrCast(@alignCast(ctx));
-        if (!self.fits(m.len, len)) return false;
-        if (!self.child.rawResize(m, al, len, ra)) return false;
-        self.used_bytes = self.used_bytes - m.len + len;
+    fn cappedResize(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_bytes: usize,
+        return_address: usize,
+    ) bool {
+        const self: *Capped = @ptrCast(@alignCast(context));
+        if (!self.fits(memory.len, new_bytes)) return false;
+        if (!self.child.rawResize(memory, alignment, new_bytes, return_address)) return false;
+        self.used_bytes = self.used_bytes - memory.len + new_bytes;
         return true;
     }
 
-    fn cappedRemap(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
-        const self: *Capped = @ptrCast(@alignCast(ctx));
-        if (!self.fits(m.len, len)) return null;
-        const block = self.child.rawRemap(m, al, len, ra) orelse return null;
-        self.used_bytes = self.used_bytes - m.len + len;
+    fn cappedRemap(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_bytes: usize,
+        return_address: usize,
+    ) ?[*]u8 {
+        const self: *Capped = @ptrCast(@alignCast(context));
+        if (!self.fits(memory.len, new_bytes)) return null;
+        const remapped = self.child.rawRemap(memory, alignment, new_bytes, return_address);
+        const block = remapped orelse return null;
+        self.used_bytes = self.used_bytes - memory.len + new_bytes;
         return block;
     }
 
-    fn cappedFree(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, ra: usize) void {
-        const self: *Capped = @ptrCast(@alignCast(ctx));
-        assert(self.used_bytes >= m.len);
-        self.child.rawFree(m, al, ra);
-        self.used_bytes -= m.len;
+    fn cappedFree(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) void {
+        const self: *Capped = @ptrCast(@alignCast(context));
+        assert(self.used_bytes >= memory.len);
+        self.child.rawFree(memory, alignment, return_address);
+        self.used_bytes -= memory.len;
     }
 };
 
@@ -274,43 +302,44 @@ pub fn protect(
     return arena.dupeSentinel(u8, message, 0) catch "error (out of memory)";
 }
 
-/// Calls `f(L, ctx)` in protected mode with the top `nargs` values as its
-/// arguments (at stack index 2 on). On success leaves `nresults` values and
-/// returns true; on a Lua error leaves the error value and returns false.
+/// Calls `handler(L, context)` in protected mode with the top
+/// `arguments_count` values as its arguments (at stack index 2 on). On
+/// success leaves `results_count` values and returns true; on a Lua error
+/// leaves the error value and returns false.
 /// For Zig functions called from Lua that hold resources: free them, then
 /// raise the error (`return error.Raise`).
 pub fn tryCall(
     L: *State,
     comptime Context: type,
     context: *Context,
-    comptime f: fn (*State, *Context) void,
-    nargs: c_int,
-    nresults: c_int,
+    comptime handler: fn (*State, *Context) void,
+    arguments_count: c_int,
+    results_count: c_int,
 ) bool {
-    assert(nargs >= 0);
-    assert(nargs <= c.lua_gettop(L));
-    assert(nresults >= 0);
+    assert(arguments_count >= 0);
+    assert(arguments_count <= c.lua_gettop(L));
+    assert(results_count >= 0);
     if (c.lua_checkstack(L, 2) == 0) {
-        pop(L, nargs);
+        pop(L, arguments_count);
         _ = c.lua_pushstring(L, "Lua stack overflow");
         return false;
     }
-    c.lua_pushcclosure(L, &Trampoline(Context, f).call, 0);
+    c.lua_pushcclosure(L, &Trampoline(Context, handler).call, 0);
     c.lua_pushlightuserdata(L, context);
     // The function and its context go under the arguments.
-    c.lua_rotate(L, -nargs - 2, 2);
-    return c.lua_pcallk(L, nargs + 1, nresults, 0, 0, null) == c.LUA_OK;
+    c.lua_rotate(L, -arguments_count - 2, 2);
+    return c.lua_pcallk(L, arguments_count + 1, results_count, 0, 0, null) == c.LUA_OK;
 }
 
 /// The C function `protect` and `tryCall` call. Its context is its first
 /// argument, so the caller's arguments start at `trampoline_first_argument`.
-fn Trampoline(comptime Context: type, comptime f: fn (*State, *Context) void) type {
+fn Trampoline(comptime Context: type, comptime handler: fn (*State, *Context) void) type {
     return struct {
         fn call(L: ?*State) callconv(.c) c_int {
             const context: *Context = @ptrCast(@alignCast(c.lua_touserdata(L, 1)));
             const top_before = c.lua_gettop(L);
-            f(L.?, context);
-            // Results are whatever `f` left above its arguments.
+            handler(L.?, context);
+            // Results are whatever `handler` left above its arguments.
             assert(c.lua_gettop(L) >= top_before);
             return c.lua_gettop(L) - top_before;
         }
@@ -336,12 +365,12 @@ fn traceback(L: ?*State) callconv(.c) c_int {
 /// The error value (a message) is on the stack: raise it.
 pub const Error = error{Raise};
 
-/// A C function for Lua from `f`, which returns how many results it pushed
-/// or `error.Raise` with the error message on the stack.
-pub fn wrap(comptime f: fn (*State) Error!c_int) c.lua_CFunction {
+/// A C function for Lua from `function`, which returns how many results it
+/// pushed or `error.Raise` with the error message on the stack.
+pub fn wrap(comptime function: fn (*State) Error!c_int) c.lua_CFunction {
     return &struct {
         fn call(L: ?*State) callconv(.c) c_int {
-            const results_count = f(L.?) catch {
+            const results_count = function(L.?) catch {
                 // `fail` pushed the message raised.
                 assert(c.lua_gettop(L) >= 1);
                 return c.lua_error(L);
@@ -357,33 +386,33 @@ pub fn wrap(comptime f: fn (*State) Error!c_int) c.lua_CFunction {
 
 /// Pushes a message for `error.Raise`. Call it before acquiring anything
 /// that needs cleaning up: pushing can itself raise (out of memory).
-pub fn fail(L: *State, comptime fmt: []const u8, args: anytype) Error {
-    pushFmt(L, fmt, args);
+pub fn fail(L: *State, comptime format: []const u8, args: anytype) Error {
+    pushFmt(L, format, args);
     return error.Raise;
 }
 
 /// Pushes a formatted string (cut at 512 bytes).
-pub fn pushFmt(L: *State, comptime fmt: []const u8, args: anytype) void {
-    var buffer: [512]u8 = undefined;
-    const message = std.mem.print(&buffer, fmt, args) catch buffer[0..];
+pub fn pushFmt(L: *State, comptime format: []const u8, args: anytype) void {
+    var message_buffer: [512]u8 = undefined;
+    const message = std.mem.print(&message_buffer, format, args) catch message_buffer[0..];
     _ = c.lua_pushlstring(L, message.ptr, message.len);
 }
 
 /// Raises a formatted error now. Only inside `protect` handlers and from
 /// frames that own nothing.
-pub fn raise(L: *State, comptime fmt: []const u8, args: anytype) noreturn {
-    pushFmt(L, fmt, args);
+pub fn raise(L: *State, comptime format: []const u8, args: anytype) noreturn {
+    pushFmt(L, format, args);
     _ = c.lua_error(L);
     unreachable;
 }
 
 /// A function for `setFuncs`, written `.{ "name", function }` like the C
 /// API's luaL_Reg.
-pub const Fn = struct { [:0]const u8, (fn (*State) Error!c_int) };
+pub const NamedFunction = struct { [:0]const u8, (fn (*State) Error!c_int) };
 
 /// Sets each function, wrapped (`wrap`), as a field of the table on top.
-pub fn setFuncs(L: *State, comptime fns: []const Fn) void {
-    inline for (fns) |entry| {
+pub fn setFuncs(L: *State, comptime functions: []const NamedFunction) void {
+    inline for (functions) |entry| {
         const name, const function = entry;
         c.lua_pushcclosure(L, wrap(function), 0);
         c.lua_setfield(L, -2, name.ptr);
@@ -424,24 +453,24 @@ pub fn isNoneOrNil(L: *State, index: c_int) bool {
 /// value stays reachable.
 pub fn toSlice(L: *State, index: c_int) ?[:0]const u8 {
     if (c.lua_type(L, index) != c.LUA_TSTRING) return null;
-    var len: usize = 0;
-    const bytes = c.lua_tolstring(L, index, &len) orelse return null;
-    return bytes[0..len :0];
+    var length: usize = 0;
+    const bytes = c.lua_tolstring(L, index, &length) orelse return null;
+    return bytes[0..length :0];
 }
 
-pub fn argString(L: *State, arg: c_int, func: []const u8) Error![:0]const u8 {
-    return toSlice(L, arg) orelse fail(
+pub fn argString(L: *State, argument: c_int, function_name: []const u8) Error![:0]const u8 {
+    return toSlice(L, argument) orelse fail(
         L,
         "bad argument #{d} to '{s}' (string expected, got {s})",
-        .{ arg, func, typeName(L, arg) },
+        .{ argument, function_name, typeName(L, argument) },
     );
 }
 
-pub fn argTable(L: *State, arg: c_int, func: []const u8) Error!void {
-    if (c.lua_type(L, arg) == c.LUA_TTABLE) return;
-    const type_name = typeName(L, arg);
+pub fn argTable(L: *State, argument: c_int, function_name: []const u8) Error!void {
+    if (c.lua_type(L, argument) == c.LUA_TTABLE) return;
+    const type_name = typeName(L, argument);
     const format = "bad argument #{d} to '{s}' (table expected, got {s})";
-    return fail(L, format, .{ arg, func, type_name });
+    return fail(L, format, .{ argument, function_name, type_name });
 }
 
 pub fn pushString(L: *State, text: []const u8) void {
@@ -466,11 +495,6 @@ pub fn pushString(L: *State, text: []const u8) void {
 /// A `raise` (longjmp) skips the defers, `restore` included. That is safe
 /// inside `protect`: it sets the stack back to its own entry height, which
 /// is below every mark taken in the handler.
-/// Linux's memory devices (major 1) that Lua's file functions may open,
-/// by minor number (Documentation/admin-guide/devices.txt).
-const memory_device_major = 1;
-const MemoryDevice = enum(u32) { null = 3, zero = 5, full = 7, random = 8, urandom = 9 };
-
 pub const StackMark = struct {
     top: c_int,
 
@@ -547,18 +571,18 @@ pub fn fieldStringMax(
         c.LUA_TSTRING, c.LUA_TNUMBER => {},
         else => raise(L, "{s}.{s}: string expected, got {s}", .{ where, name, typeName(L, -1) }),
     }
-    var len: usize = 0;
-    const bytes = c.lua_tolstring(L, -1, &len);
-    return arena.dupeSentinel(u8, cut(bytes[0..len], bytes_max), 0) catch oom(L);
+    var length: usize = 0;
+    const bytes = c.lua_tolstring(L, -1, &length);
+    return arena.dupeSentinel(u8, cut(bytes[0..length], bytes_max), 0) catch oom(L);
 }
 
 /// `text` cut to at most `bytes_max` bytes, before the UTF-8 character
 /// `bytes_max` falls in.
 pub fn cut(text: []const u8, bytes_max: usize) []const u8 {
     if (text.len <= bytes_max) return text;
-    var len = bytes_max;
-    while (len > 0 and text[len] & 0xC0 == 0x80) len -= 1;
-    return text[0..len];
+    var length = bytes_max;
+    while (length > 0 and text[length] & 0xC0 == 0x80) length -= 1;
+    return text[0..length];
 }
 
 /// `table[name]` as a boolean (nil is `default`).
@@ -639,14 +663,14 @@ fn testState(budget: *Budget) !*State {
     const L = newState(budget) orelse return error.OutOfMemory;
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const Ctx = struct {
-        fn open(Ls: *State, _: *u8) void {
-            openLibs(Ls);
+    const Handler = struct {
+        fn open(state: *State, _: *u8) void {
+            openLibs(state);
         }
     };
-    var dummy: u8 = 0;
-    if (protect(L, arena.allocator(), u8, &dummy, Ctx.open)) |msg| {
-        std.debug.print("{s}\n", .{msg});
+    var unused: u8 = 0;
+    if (protect(L, arena.allocator(), u8, &unused, Handler.open)) |message| {
+        std.debug.print("{s}\n", .{message});
         return error.TestUnexpectedResult;
     }
     return L;
@@ -654,15 +678,15 @@ fn testState(budget: *Budget) !*State {
 
 /// Runs `code` and returns its error message (null when it succeeded).
 fn runCode(L: *State, arena: std.mem.Allocator, code: [:0]const u8) ?[:0]const u8 {
-    const Ctx = struct {
+    const Context = struct {
         code: [:0]const u8,
-        fn run(Ls: *State, ctx: *@This()) void {
-            if (c.luaL_loadstring(Ls, ctx.code.ptr) != c.LUA_OK) _ = c.lua_error(Ls);
-            c.lua_callk(Ls, 0, 0, 0, null);
+        fn run(state: *State, context: *@This()) void {
+            if (c.luaL_loadstring(state, context.code.ptr) != c.LUA_OK) _ = c.lua_error(state);
+            c.lua_callk(state, 0, 0, 0, null);
         }
     };
-    var ctx: Ctx = .{ .code = code };
-    return protect(L, arena, Ctx, &ctx, Ctx.run);
+    var context: Context = .{ .code = code };
+    return protect(L, arena, Context, &context, Context.run);
 }
 
 test "errors come back as messages, and the sandbox holds" {
@@ -760,11 +784,11 @@ test "what the time limit cannot stop is out of reach" {
 
     // A FIFO would wait for a writer forever; regular and missing files
     // behave as usual.
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dir_buffer: [512]u8 = undefined;
-    const dir = try os.tmpDirPath(&tmp, &dir_buffer);
-    const fifo = try std.fmt.allocPrintSentinel(arena, "{s}/fifo", .{dir}, 0);
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [512]u8 = undefined;
+    const dir_path = try os.tmpDirPath(&test_dir, &path_buffer);
+    const fifo = try std.fmt.allocPrintSentinel(arena, "{s}/fifo", .{dir_path}, 0);
     const linux = std.os.linux;
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(
         linux.mknodat(linux.AT.FDCWD, fifo, linux.S.IFIFO | 0o600, 0),

@@ -26,12 +26,12 @@ pub const all = [_]Style{
 };
 
 pub fn find(id: []const u8) ?*const Style {
-    for (&all) |*s| if (eql(s.id, id)) return s;
+    for (&all) |*style| if (eql(style.id, id)) return style;
     return null;
 }
 
-fn eql(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| if (x != y) return false;
+fn eql(left: []const u8, right: []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |left_byte, right_byte| if (left_byte != right_byte) return false;
     return true;
 }

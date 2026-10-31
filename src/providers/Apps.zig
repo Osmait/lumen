@@ -61,9 +61,9 @@ pub fn reload(self: *Apps) void {
     defer if (dropped > 0) log.warn("{d} apps left out: out of memory", .{dropped});
     var node = self.list;
     while (node) |list_node| : (node = list_node.next) {
-        const info: *c.GAppInfo = @ptrCast(@alignCast(list_node.data));
-        if (c.g_app_info_should_show(info) == 0) continue;
-        const item = (itemOf(arena, info) catch {
+        const app_info: *c.GAppInfo = @ptrCast(@alignCast(list_node.data));
+        if (c.g_app_info_should_show(app_info) == 0) continue;
+        const item = (itemOf(arena, app_info) catch {
             dropped += 1;
             continue;
         }) orelse continue;
@@ -75,24 +75,24 @@ pub fn reload(self: *Apps) void {
     self.items = items.toOwnedSlice(arena) catch items.items;
 }
 
-/// The row for `info`, its strings in `arena`; null for an app without an
+/// The row for `app_info`, its strings in `arena`; null for an app without an
 /// id or a name.
-fn itemOf(arena: std.mem.Allocator, info: *c.GAppInfo) std.mem.Allocator.Error!?Item {
-    const id = std.mem.span(c.g_app_info_get_id(info) orelse return null);
-    const name = std.mem.span(c.g_app_info_get_display_name(info) orelse return null);
-    const desktop_info: *c.GDesktopAppInfo = @ptrCast(info);
+fn itemOf(arena: std.mem.Allocator, app_info: *c.GAppInfo) std.mem.Allocator.Error!?Item {
+    const id = std.mem.span(c.g_app_info_get_id(app_info) orelse return null);
+    const name = std.mem.span(c.g_app_info_get_display_name(app_info) orelse return null);
+    const desktop_app_info: *c.GDesktopAppInfo = @ptrCast(app_info);
     var generic_name: [:0]const u8 = "";
-    if (c.g_desktop_app_info_get_generic_name(desktop_info)) |generic_name_z| {
-        generic_name = std.mem.span(generic_name_z);
+    if (c.g_desktop_app_info_get_generic_name(desktop_app_info)) |generic_name_terminated| {
+        generic_name = std.mem.span(generic_name_terminated);
     }
     return .{
         .key = try arena.print("app:{s}", .{id}),
         .title = name,
         .subtitle = generic_name,
         .accessory = "Application",
-        .icon = if (c.g_app_info_get_icon(info)) |icon| .{ .gicon = icon } else .none,
-        .keywords = try keywords(arena, desktop_info, info),
-        .action = .{ .app = info },
+        .icon = if (c.g_app_info_get_icon(app_info)) |icon| .{ .gicon = icon } else .none,
+        .keywords = try keywords(arena, desktop_app_info, app_info),
+        .action = .{ .app = app_info },
     };
 }
 
@@ -101,12 +101,12 @@ fn itemOf(arena: std.mem.Allocator, info: *c.GAppInfo) std.mem.Allocator.Error!?
 pub fn iconForClass(self: *const Apps, class: []const u8) ?*c.GIcon {
     if (class.len == 0) return null;
     for (self.items) |item| {
-        const info = item.action.app;
-        const desktop_info: *c.GDesktopAppInfo = @ptrCast(info);
-        if (c.g_desktop_app_info_get_startup_wm_class(desktop_info)) |wm_class| {
+        const app_info = item.action.app;
+        const desktop_app_info: *c.GDesktopAppInfo = @ptrCast(app_info);
+        if (c.g_desktop_app_info_get_startup_wm_class(desktop_app_info)) |wm_class| {
             if (std.ascii.eqlIgnoreCase(std.mem.span(wm_class), class)) return iconOf(item);
         }
-        const id = std.mem.span(c.g_app_info_get_id(info) orelse continue);
+        const id = std.mem.span(c.g_app_info_get_id(app_info) orelse continue);
         const suffix = ".desktop";
         const stem = if (std.mem.endsWith(u8, id, suffix)) id[0 .. id.len - suffix.len] else id;
         if (std.ascii.eqlIgnoreCase(stem, class)) return iconOf(item);
@@ -128,22 +128,22 @@ fn iconOf(item: Item) ?*c.GIcon {
 /// Keywords and the executable's name, space separated, in `arena`.
 fn keywords(
     arena: std.mem.Allocator,
-    desktop_info: *c.GDesktopAppInfo,
-    info: *c.GAppInfo,
+    desktop_app_info: *c.GDesktopAppInfo,
+    app_info: *c.GAppInfo,
 ) std.mem.Allocator.Error![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    if (c.g_desktop_app_info_get_keywords(desktop_info)) |keywords_z| {
+    var joined: std.ArrayList(u8) = .empty;
+    if (c.g_desktop_app_info_get_keywords(desktop_app_info)) |keywords_terminated| {
         var keyword_index: usize = 0;
-        while (keywords_z[keyword_index]) |keyword| : (keyword_index += 1) {
-            try out.appendSlice(arena, std.mem.span(keyword));
-            try out.append(arena, ' ');
+        while (keywords_terminated[keyword_index]) |keyword| : (keyword_index += 1) {
+            try joined.appendSlice(arena, std.mem.span(keyword));
+            try joined.append(arena, ' ');
         }
     }
-    if (c.g_app_info_get_executable(info)) |executable_z| {
-        const executable = std.mem.span(executable_z);
+    if (c.g_app_info_get_executable(app_info)) |executable_terminated| {
+        const executable = std.mem.span(executable_terminated);
         const slash = std.mem.findScalarLast(u8, executable, '/');
-        const base = if (slash) |at| executable[at + 1 ..] else executable;
-        try out.appendSlice(arena, base);
+        const base = if (slash) |slash_index| executable[slash_index + 1 ..] else executable;
+        try joined.appendSlice(arena, base);
     }
-    return out.items;
+    return joined.items;
 }

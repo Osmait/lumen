@@ -95,18 +95,18 @@ lock: std.Io.Mutex = .init,
 wake_sequence: std.atomic.Value(u32) = .init(0),
 stop: std.atomic.Value(bool) = .init(false),
 /// The last request number handed out. Main thread only.
-request_gen_last: RequestGeneration = .none,
+request_generation_last: RequestGeneration = .none,
 /// Under `lock`.
 pending: Pending = .{},
 /// The style to load before init.lua; empty is none. Under `lock`.
 style: core.FixedStr(64) = .{},
 
 // Worker thread only.
-extensions: std.ArrayList(*Ext) = .empty,
+extensions: std.ArrayList(*Extension) = .empty,
 /// Where the worker finds each command of the current registry, in the
 /// registry's order.
 worker_commands: []WorkerCommand = &.{},
-registry_gen: RegistryGeneration = .none,
+registry_generation: RegistryGeneration = .none,
 /// Extension ids and folders; reset on reload.
 worker_arena: std.heap.ArenaAllocator,
 
@@ -202,12 +202,12 @@ pub const FormValue = struct { name: []const u8, value: []const u8, toggle: bool
 // ------------------------------------------------- the worker's own types
 
 /// One loaded file and its Lua state. Worker thread only.
-pub const Ext = struct {
+pub const Extension = struct {
     budget: lua.Budget = .{ .bytes_max = memory_bytes_max },
     L: *lua.State = undefined,
     host: *Host,
     id: [:0]const u8,
-    dir: [:0]const u8,
+    folder: [:0]const u8,
     /// Its storage and preferences: $XDG_DATA_HOME/lumen/extensions/<id>.
     data: [:0]const u8,
     /// Set only while this extension's file runs: `lumen.theme`,
@@ -216,18 +216,18 @@ pub const Ext = struct {
     /// error.
     load: ?*Load = null,
 
-    pub fn gpa(extension: *Ext) std.mem.Allocator {
+    pub fn gpa(extension: *Extension) std.mem.Allocator {
         return extension.host.gpa;
     }
 
-    pub fn io(extension: *Ext) std.Io {
+    pub fn io(extension: *Extension) std.Io {
         return extension.host.io;
     }
 
     /// Runs `handler` in this state, protected, with `budget_ns` to finish
     /// (the instruction hook stops it past that). Its error, or null.
     fn run(
-        extension: *Ext,
+        extension: *Extension,
         arena: std.mem.Allocator,
         budget_ns: u64,
         comptime Context: type,
@@ -242,7 +242,7 @@ pub const Ext = struct {
     /// Closes its state. Closing runs the finalizers left, with the
     /// instruction hook off (Lua turns hooks off in `__gc`); extensions
     /// cannot set any (lua.openLibs), and lumen.exec gets a deadline anyway.
-    fn close(extension: *Ext) void {
+    fn close(extension: *Extension) void {
         extension.budget.deadline_ns = os.monotonicNs() + close_budget_ns;
         lua.c.lua_close(extension.L);
     }
@@ -324,7 +324,7 @@ const WorkerCommand = struct {
     /// Its file's state, in `Host.extensions`.
     extension_index: u16,
     /// The command's table (registry reference).
-    spec_ref: c_int,
+    spec_reference: c_int,
     mode: Mode,
     answers_root_search: bool,
     /// The list its last `items` or `search` returned.
@@ -337,9 +337,9 @@ const WorkerCommand = struct {
 /// later. An action for a row of another list is refused: the row it
 /// names may be gone, or another row now.
 const Kept = struct {
-    ref: c_int = c_noref,
+    reference: c_int = c_noref,
     /// The request that produced it.
-    list_gen: RequestGeneration = .none,
+    list_generation: RequestGeneration = .none,
 };
 
 /// Requests the worker has not taken yet. A newer request of a kind
@@ -354,22 +354,22 @@ const Pending = struct {
 };
 
 const ListRequest = struct {
-    registry_gen: RegistryGeneration,
+    registry_generation: RegistryGeneration,
     command: CommandIndex,
-    request_gen: RequestGeneration,
+    request_generation: RequestGeneration,
     query: core.FixedStr(query_bytes_max),
 };
 
 const RootSearchRequest = struct {
-    registry_gen: RegistryGeneration,
-    request_gen: RequestGeneration,
+    registry_generation: RegistryGeneration,
+    request_generation: RequestGeneration,
     query: core.FixedStr(query_bytes_max),
 };
 
 const ActRequest = struct {
-    registry_gen: RegistryGeneration,
+    registry_generation: RegistryGeneration,
     command: CommandIndex,
-    request_gen: RequestGeneration,
+    request_generation: RequestGeneration,
     target: Target,
 
     pub const Target = union(enum) {
@@ -391,9 +391,9 @@ const ActRequest = struct {
 
 /// A form submitted; owns copies of its values.
 const SubmitRequest = struct {
-    registry_gen: RegistryGeneration,
+    registry_generation: RegistryGeneration,
     command: CommandIndex,
-    request_gen: RequestGeneration,
+    request_generation: RequestGeneration,
     values: []FormValue,
     arena: std.heap.ArenaAllocator,
 
@@ -480,15 +480,15 @@ pub fn reload(host: *Host) void {
 /// replaces one not started yet.
 pub fn list(
     host: *Host,
-    registry_gen: RegistryGeneration,
+    registry_generation: RegistryGeneration,
     command: CommandIndex,
     query: []const u8,
 ) RequestGeneration {
-    const request_gen = host.requestGenNext();
+    const request_generation = host.requestGenerationNext();
     var request: ListRequest = .{
-        .registry_gen = registry_gen,
+        .registry_generation = registry_generation,
         .command = command,
-        .request_gen = request_gen,
+        .request_generation = request_generation,
         .query = .{},
     };
     request.query.set(query);
@@ -498,14 +498,14 @@ pub fn list(
         host.pending.list = request;
     }
     host.wake();
-    return request_gen;
+    return request_generation;
 }
 
 /// Calls form `command`'s submit with `values` (copied). Its answer comes
 /// like an action's.
 pub fn submit(
     host: *Host,
-    registry_gen: RegistryGeneration,
+    registry_generation: RegistryGeneration,
     command: CommandIndex,
     values: []const FormValue,
 ) RequestGeneration {
@@ -513,16 +513,16 @@ pub fn submit(
     // most `form_fields_max`.
     assert(values.len >= 1);
     assert(values.len <= form_fields_max);
-    const request_gen = host.requestGenNext();
+    const request_generation = host.requestGenerationNext();
     const request = submitRequestCreate(
         host.gpa,
-        registry_gen,
+        registry_generation,
         command,
-        request_gen,
+        request_generation,
         values,
     ) catch {
         log.warn("submit: out of memory, not sent", .{});
-        return request_gen;
+        return request_generation;
     };
     const replaced = blk: {
         host.lock.lockUncancelable(host.io);
@@ -533,7 +533,7 @@ pub fn submit(
     };
     if (replaced) |old_request| old_request.destroy(host.gpa);
     host.wake();
-    return request_gen;
+    return request_generation;
 }
 
 /// A submit request owning copies of `values`. All of them or none: half
@@ -541,16 +541,16 @@ pub fn submit(
 /// empty.
 fn submitRequestCreate(
     gpa: std.mem.Allocator,
-    registry_gen: RegistryGeneration,
+    registry_generation: RegistryGeneration,
     command: CommandIndex,
-    request_gen: RequestGeneration,
+    request_generation: RequestGeneration,
     values: []const FormValue,
 ) error{OutOfMemory}!*SubmitRequest {
     const request = try gpa.create(SubmitRequest);
     request.* = .{
-        .registry_gen = registry_gen,
+        .registry_generation = registry_generation,
         .command = command,
-        .request_gen = request_gen,
+        .request_generation = request_generation,
         .values = &.{},
         .arena = .init(gpa),
     };
@@ -572,13 +572,13 @@ fn submitRequestCreate(
 /// request replaces one not started yet.
 pub fn root(
     host: *Host,
-    registry_gen: RegistryGeneration,
+    registry_generation: RegistryGeneration,
     query: []const u8,
 ) RequestGeneration {
-    const request_gen = host.requestGenNext();
+    const request_generation = host.requestGenerationNext();
     var request: RootSearchRequest = .{
-        .registry_gen = registry_gen,
-        .request_gen = request_gen,
+        .registry_generation = registry_generation,
+        .request_generation = request_generation,
         .query = .{},
     };
     request.query.set(query);
@@ -588,7 +588,7 @@ pub fn root(
         host.pending.root_search = request;
     }
     host.wake();
-    return request_gen;
+    return request_generation;
 }
 
 /// What `act` runs: a command's own `run`, or one action of a row the
@@ -598,30 +598,30 @@ pub const ActTarget = ActRequest.Target;
 /// Runs a Lua action of `command`; see `ActTarget`.
 pub fn act(
     host: *Host,
-    registry_gen: RegistryGeneration,
+    registry_generation: RegistryGeneration,
     command: CommandIndex,
     target: ActTarget,
 ) RequestGeneration {
-    const request_gen = host.requestGenNext();
+    const request_generation = host.requestGenerationNext();
     {
         host.lock.lockUncancelable(host.io);
         defer host.lock.unlock(host.io);
         host.pending.act = .{
-            .registry_gen = registry_gen,
+            .registry_generation = registry_generation,
             .command = command,
-            .request_gen = request_gen,
+            .request_generation = request_generation,
             .target = target,
         };
     }
     host.wake();
-    return request_gen;
+    return request_generation;
 }
 
 /// The window keeps 0 for "no request pending" (`ext_act_gen`), so 0 is
 /// never handed out, even after the counter wraps.
-fn requestGenNext(host: *Host) RequestGeneration {
-    host.request_gen_last = host.request_gen_last.next();
-    return host.request_gen_last;
+fn requestGenerationNext(host: *Host) RequestGeneration {
+    host.request_generation_last = host.request_generation_last.next();
+    return host.request_generation_last;
 }
 
 /// Wakes the worker: bumps the sequence it sleeps on.
@@ -684,9 +684,9 @@ fn closeAll(host: *Host) void {
 
 fn reloadExecute(host: *Host) void {
     host.closeAll();
-    host.registry_gen = host.registry_gen.next();
+    host.registry_generation = host.registry_generation.next();
     const registry = host.answerCreate(Registry, "reload", .{
-        .gen = host.registry_gen,
+        .gen = host.registry_generation,
         .arena = .init(host.gpa),
     }) orelse return;
     var load: Load = .{ .arena = registry.arena.allocator() };
@@ -736,12 +736,12 @@ fn loadExtension(host: *Host, load: *Load, id: [:0]const u8) void {
         problem(load, id, message);
         return;
     }
-    const dir_format = "{s}/extensions/{s}";
-    const dir = worker_arena.printSentinel(dir_format, .{ host.config_dir, id }, 0) catch {
+    const folder_format = "{s}/extensions/{s}";
+    const folder = worker_arena.printSentinel(folder_format, .{ host.config_dir, id }, 0) catch {
         problem(load, id, "out of memory");
         return;
     };
-    const path = worker_arena.printSentinel("{s}/init.lua", .{dir}, 0) catch {
+    const path = worker_arena.printSentinel("{s}/init.lua", .{folder}, 0) catch {
         problem(load, id, "out of memory");
         return;
     };
@@ -749,7 +749,7 @@ fn loadExtension(host: *Host, load: *Load, id: [:0]const u8) void {
         problem(load, id, "no init.lua in the extension's folder");
         return;
     }
-    host.loadSource(load, id, dir, path, null);
+    host.loadSource(load, id, folder, path, null);
 }
 
 /// Hands what the files defined to the registry. A command reaches the UI
@@ -810,16 +810,20 @@ pub fn reservedId(id: []const u8) bool {
 
 /// Reports what went wrong with a file in Settings > Extensions. Out of
 /// memory, the report goes to the log instead, so it is never lost.
-fn problem(load: *Load, ext: []const u8, message: []const u8) void {
-    problemAppend(load, ext, message) catch {
-        log.warn("{s}: {s} (not shown in Settings: out of memory)", .{ ext, message });
+fn problem(load: *Load, extension_id: []const u8, message: []const u8) void {
+    problemAppend(load, extension_id, message) catch {
+        log.warn("{s}: {s} (not shown in Settings: out of memory)", .{ extension_id, message });
     };
 }
 
-fn problemAppend(load: *Load, ext: []const u8, message: []const u8) error{OutOfMemory}!void {
-    const ext_copy = try load.arena.dupeSentinel(u8, ext, 0);
+fn problemAppend(
+    load: *Load,
+    extension_id: []const u8,
+    message: []const u8,
+) error{OutOfMemory}!void {
+    const extension_id_copy = try load.arena.dupeSentinel(u8, extension_id, 0);
     const message_copy = try load.arena.dupeSentinel(u8, message, 0);
-    try load.problems.append(load.arena, .{ .ext = ext_copy, .message = message_copy });
+    try load.problems.append(load.arena, .{ .ext = extension_id_copy, .message = message_copy });
 }
 
 /// Lists an extension that loaded in Settings > Extensions. Out of memory,
@@ -849,12 +853,12 @@ fn extensionLoadedAppend(
 /// file runs as the extension "style".
 fn loadStyle(host: *Host, load: *Load, name: []const u8) void {
     const worker_arena = host.worker_arena.allocator();
-    const dir = worker_arena.printSentinel("{s}/styles/{s}", .{ host.config_dir, name }, 0) catch
+    const folder = worker_arena.printSentinel("{s}/styles/{s}", .{ host.config_dir, name }, 0) catch
         return;
-    const path = worker_arena.printSentinel("{s}/init.lua", .{dir}, 0) catch return;
+    const path = worker_arena.printSentinel("{s}/init.lua", .{folder}, 0) catch return;
     if (os.info(path) != null) {
-        host.loadSource(load, style_extension_id, dir, path, null);
-    } else if (os.info(dir) != null) {
+        host.loadSource(load, style_extension_id, folder, path, null);
+    } else if (os.info(folder) != null) {
         // A style folder may hold only a style.css.
     } else if (styles.find(name)) |built_in| {
         host.loadSource(load, style_extension_id, host.config_dir, "=style", built_in.lua);
@@ -868,11 +872,11 @@ fn loadSource(
     host: *Host,
     load: *Load,
     id: []const u8,
-    dir: []const u8,
+    folder: []const u8,
     path: [:0]const u8,
     source: ?[:0]const u8,
 ) void {
-    const extension = host.extensionCreate(id, dir) orelse {
+    const extension = host.extensionCreate(id, folder) orelse {
         problem(load, id, "out of memory");
         return;
     };
@@ -885,9 +889,15 @@ fn loadSource(
         .source = source,
         .extension_index = @intCast(host.extensions.items.len),
     };
-    const err = extension.run(load.arena, load_budget_ns, LoadContext, &context, LoadContext.run);
+    const failure = extension.run(
+        load.arena,
+        load_budget_ns,
+        LoadContext,
+        &context,
+        LoadContext.run,
+    );
     extension.load = null;
-    if (err == null) {
+    if (failure == null) {
         if (host.extensions.append(host.gpa, extension)) {
             // init.lua and the style are not extensions to list.
             if (!reservedId(id)) {
@@ -899,22 +909,22 @@ fn loadSource(
         }
     }
     load.rollback(before);
-    problem(load, id, err orelse "out of memory");
+    problem(load, id, failure orelse "out of memory");
     extension.close();
     host.gpa.destroy(extension);
 }
 
-/// A new state for the file of extension `id` in `dir`; null when out of
+/// A new state for the file of extension `id` in `folder`; null when out of
 /// memory.
-fn extensionCreate(host: *Host, id: []const u8, dir: []const u8) ?*Ext {
+fn extensionCreate(host: *Host, id: []const u8, folder: []const u8) ?*Extension {
     const worker_arena = host.worker_arena.allocator();
     // Never an empty data folder: its storage would go to "/storage.json".
     const data = worker_arena.printSentinel("{s}/extensions/{s}", .{ host.data_dir, id }, 0) catch
         return null;
     const id_copy = worker_arena.dupeSentinel(u8, id, 0) catch return null;
-    const dir_copy = worker_arena.dupeSentinel(u8, dir, 0) catch return null;
-    const extension = host.gpa.create(Ext) catch return null;
-    extension.* = .{ .host = host, .id = id_copy, .dir = dir_copy, .data = data };
+    const folder_copy = worker_arena.dupeSentinel(u8, folder, 0) catch return null;
+    const extension = host.gpa.create(Extension) catch return null;
+    extension.* = .{ .host = host, .id = id_copy, .folder = folder_copy, .data = data };
     // Without it, the extension runs; lumen.storage fails and says so.
     os.mkdirP(extension.data) catch |err| log.warn("{s}: {t}", .{ extension.data, err });
     extension.L = lua.newState(&extension.budget) orelse {
@@ -925,7 +935,7 @@ fn extensionCreate(host: *Host, id: []const u8, dir: []const u8) ?*Ext {
 }
 
 const LoadContext = struct {
-    extension: *Ext,
+    extension: *Extension,
     load: *Load,
     path: [:0]const u8,
     /// Code to run instead of the file (a built-in style).
@@ -965,9 +975,9 @@ fn parseExtension(L: *lua.State, context: *LoadContext, spec: c_int) void {
     const title = lua.fieldString(L, arena, spec, "title", "extension") orelse
         context.extension.id;
     context.title = title;
-    const default_icon = rows_mod.fieldIcon(L, arena, spec, "extension.icon") orelse addon_icon;
+    const icon_default = rows_mod.fieldIcon(L, arena, spec, "extension.icon") orelse addon_icon;
     parsePreferences(L, context, spec, title);
-    parseCommands(L, context, spec, title, default_icon);
+    parseCommands(L, context, spec, title, icon_default);
 }
 
 /// The icon of an extension's commands when neither it nor they name one.
@@ -1014,7 +1024,7 @@ fn parseCommands(
     context: *LoadContext,
     spec: c_int,
     extension_title: [:0]const u8,
-    default_icon: item_mod.Icon,
+    icon_default: item_mod.Icon,
 ) void {
     const mark: lua.StackMark = .init(L);
     defer mark.restore(L);
@@ -1031,7 +1041,7 @@ fn parseCommands(
         const where = std.mem.print(&where_buffer, "commands[{d}]", .{command_number}) catch
             "commands";
         const command_table = lua.tableAt(L, commands, command_number, where);
-        parseCommand(L, context, command_table, where, extension_title, default_icon);
+        parseCommand(L, context, command_table, where, extension_title, icon_default);
     }
 }
 
@@ -1249,7 +1259,7 @@ fn parseCommand(
     command_table: c_int,
     where: []const u8,
     extension_title: [:0]const u8,
-    default_icon: item_mod.Icon,
+    icon_default: item_mod.Icon,
 ) void {
     const arena = context.load.arena;
     const id = commandId(L, context, command_table, where);
@@ -1271,7 +1281,7 @@ fn parseCommand(
         .title = title,
         .subtitle = lua.fieldString(L, arena, command_table, "subtitle", where) orelse
             extension_title,
-        .icon = rows_mod.fieldIcon(L, arena, command_table, where) orelse default_icon,
+        .icon = rows_mod.fieldIcon(L, arena, command_table, where) orelse icon_default,
         .keywords = rows_mod.keywords(L, arena, command_table, where),
         .placeholder = lua.fieldString(L, arena, command_table, "placeholder", where) orelse "",
         .mode = mode,
@@ -1288,10 +1298,10 @@ fn parseCommand(
         lua.raise(L, "too many commands", .{});
     }
     lua.c.lua_pushvalue(L, command_table);
-    const spec_ref = lua.ref(L);
+    const spec_reference = lua.ref(L);
     context.load.worker_commands.append(arena, .{
         .extension_index = context.extension_index,
-        .spec_ref = spec_ref,
+        .spec_reference = spec_reference,
         .mode = mode,
         .answers_root_search = answers_root_search,
     }) catch lua.oom(L);
@@ -1309,10 +1319,10 @@ const reloaded = "Extensions were reloaded";
 /// gone, and may name another command now).
 fn requested(
     host: *Host,
-    registry_gen: RegistryGeneration,
+    registry_generation: RegistryGeneration,
     command: CommandIndex,
 ) ?*WorkerCommand {
-    if (registry_gen != host.registry_gen) return null;
+    if (registry_generation != host.registry_generation) return null;
     // The registry the UI holds has as many commands as there are worker
     // commands; anything past them is not a command of this registry.
     if (command.position() >= host.worker_commands.len) return null;
@@ -1322,14 +1332,14 @@ fn requested(
 }
 
 /// The extension that defined `worker_command`.
-fn extensionOf(host: *const Host, worker_command: *const WorkerCommand) *Ext {
+fn extensionOf(host: *const Host, worker_command: *const WorkerCommand) *Extension {
     assert(worker_command.extension_index < host.extensions.items.len);
     return host.extensions.items[worker_command.extension_index];
 }
 
 fn listExecute(host: *Host, request: *const ListRequest) void {
     const result = host.answerCreate(ListResult, "list", .{
-        .gen = request.request_gen,
+        .gen = request.request_generation,
         .command = request.command,
         .query = "",
         .arena = .init(host.gpa),
@@ -1342,7 +1352,7 @@ fn listExecute(host: *Host, request: *const ListRequest) void {
         result.err = "out of memory";
         return;
     };
-    const worker_command = host.requested(request.registry_gen, request.command) orelse {
+    const worker_command = host.requested(request.registry_generation, request.command) orelse {
         result.err = reloaded;
         return;
     };
@@ -1360,7 +1370,7 @@ fn listExecute(host: *Host, request: *const ListRequest) void {
 }
 
 const ListContext = struct {
-    extension: *Ext,
+    extension: *Extension,
     worker_command: *WorkerCommand,
     request: *const ListRequest,
     result: *ListResult,
@@ -1368,7 +1378,7 @@ const ListContext = struct {
     rows_arena: std.mem.Allocator,
 
     fn run(L: *lua.State, context: *ListContext) void {
-        _ = lua.pushRef(L, context.worker_command.spec_ref);
+        _ = lua.pushRef(L, context.worker_command.spec_reference);
         const spec = lua.absIndex(L, -1);
         switch (context.worker_command.mode) {
             .list => {
@@ -1389,9 +1399,9 @@ const ListContext = struct {
             lua.c.LUA_TTABLE => {},
             else => lua.raise(L, "items: a list expected, got {s}", .{lua.typeName(L, rows)}),
         }
-        keep(L, &context.worker_command.list_kept, rows, context.request.request_gen);
+        keep(L, &context.worker_command.list_kept, rows, context.request.request_generation);
         context.result.items = rows_mod.parseItems(L, context.rows_arena, rows, .{
-            .list_gen = context.request.request_gen,
+            .list_generation = context.request.request_generation,
             .command = context.request.command,
             .extension_id = context.extension.id,
         }, items_max);
@@ -1399,21 +1409,21 @@ const ListContext = struct {
 };
 
 /// Keeps the list at `rows` for its rows' actions, until the next one.
-fn keep(L: *lua.State, kept: *Kept, rows: c_int, list_gen: RequestGeneration) void {
-    if (kept.ref != c_noref) {
-        lua.unref(L, kept.ref);
-        kept.ref = c_noref;
+fn keep(L: *lua.State, kept: *Kept, rows: c_int, list_generation: RequestGeneration) void {
+    if (kept.reference != c_noref) {
+        lua.unref(L, kept.reference);
+        kept.reference = c_noref;
     }
     lua.c.lua_pushvalue(L, rows);
-    kept.ref = lua.ref(L);
-    kept.list_gen = list_gen;
+    kept.reference = lua.ref(L);
+    kept.list_generation = list_generation;
 }
 
 // ----------------------------------------------------------------- root
 
 fn rootSearchExecute(host: *Host, request: *const RootSearchRequest) void {
     const result = host.answerCreate(RootResult, "root", .{
-        .gen = request.request_gen,
+        .gen = request.request_generation,
         .query = "",
         .arena = .init(host.gpa),
     }) orelse return;
@@ -1422,7 +1432,7 @@ fn rootSearchExecute(host: *Host, request: *const RootSearchRequest) void {
     const query = request.query.slice();
     // Out of memory, no rows: an answer for "" would show no rows anyway.
     result.query = arena.dupe(u8, query) catch return;
-    if (request.registry_gen != host.registry_gen) return;
+    if (request.registry_generation != host.registry_generation) return;
     var sections: std.ArrayList(RootSection) = .empty;
     // Every provider's rows together.
     var rows: lua.Capped = .{ .child = arena, .bytes_max = rows_bytes_max };
@@ -1459,14 +1469,15 @@ fn rootSearchCommand(
         .request = request,
         .rows_arena = rows.allocator(),
     };
-    const err = extension.run(
+    const failure = extension.run(
         arena,
         root_search_budget_ns,
         RootSearchContext,
         &context,
         RootSearchContext.run,
     ) orelse return context.items;
-    log.warn("{s}: root search: {s}", .{ extension.id, if (rows.refused) rows_too_big else err });
+    const message = if (rows.refused) rows_too_big else failure;
+    log.warn("{s}: root search: {s}", .{ extension.id, message });
     rows.refused = false;
     return &.{};
 }
@@ -1478,7 +1489,7 @@ fn rootSearchSuperseded(host: *Host) bool {
 }
 
 const RootSearchContext = struct {
-    extension: *Ext,
+    extension: *Extension,
     worker_command: *WorkerCommand,
     command: CommandIndex,
     request: *const RootSearchRequest,
@@ -1486,7 +1497,7 @@ const RootSearchContext = struct {
     items: []Item = &.{},
 
     fn run(L: *lua.State, context: *RootSearchContext) void {
-        _ = lua.pushRef(L, context.worker_command.spec_ref);
+        _ = lua.pushRef(L, context.worker_command.spec_reference);
         _ = lua.getField(L, -1, "root");
         lua.pushString(L, context.request.query.slice());
         lua.c.lua_callk(L, 1, 1, 0, null);
@@ -1496,9 +1507,9 @@ const RootSearchContext = struct {
             lua.c.LUA_TTABLE => {},
             else => lua.raise(L, "root: a list expected, got {s}", .{lua.typeName(L, rows)}),
         }
-        keep(L, &context.worker_command.root_search_kept, rows, context.request.request_gen);
+        keep(L, &context.worker_command.root_search_kept, rows, context.request.request_generation);
         context.items = rows_mod.parseItems(L, context.rows_arena, rows, .{
-            .list_gen = context.request.request_gen,
+            .list_generation = context.request.request_generation,
             .command = context.command,
             .from_root_search = true,
             .extension_id = context.extension.id,
@@ -1511,11 +1522,11 @@ const RootSearchContext = struct {
 fn submitExecute(host: *Host, request: *SubmitRequest) void {
     defer request.destroy(host.gpa);
     const result = host.answerCreate(ActResult, "submit", .{
-        .gen = request.request_gen,
+        .gen = request.request_generation,
         .arena = .init(host.gpa),
     }) orelse return;
     defer host.deliver(.{ .act = result });
-    const worker_command = host.requested(request.registry_gen, request.command) orelse {
+    const worker_command = host.requested(request.registry_generation, request.command) orelse {
         result.err = reloaded;
         return;
     };
@@ -1536,7 +1547,7 @@ const SubmitContext = struct {
     result: *ActResult,
 
     fn run(L: *lua.State, context: *SubmitContext) void {
-        _ = lua.pushRef(L, context.worker_command.spec_ref);
+        _ = lua.pushRef(L, context.worker_command.spec_reference);
         if (lua.getField(L, -1, "submit") != lua.c.LUA_TFUNCTION) {
             lua.raise(L, "this command has no submit function", .{});
         }
@@ -1544,8 +1555,8 @@ const SubmitContext = struct {
         lua.c.lua_createtable(L, 0, @intCast(values.len));
         for (values) |value| {
             if (value.toggle) {
-                const on = registry_mod.toggleIsOn(value.value);
-                lua.c.lua_pushboolean(L, @intFromBool(on));
+                const is_on = registry_mod.toggleIsOn(value.value);
+                lua.c.lua_pushboolean(L, @intFromBool(is_on));
             } else {
                 lua.pushString(L, value.value);
             }
@@ -1583,11 +1594,11 @@ fn outcomeOf(L: *lua.State) Outcome {
 
 fn actExecute(host: *Host, request: ActRequest) void {
     const result = host.answerCreate(ActResult, "action", .{
-        .gen = request.request_gen,
+        .gen = request.request_generation,
         .arena = .init(host.gpa),
     }) orelse return;
     defer host.deliver(.{ .act = result });
-    const worker_command = host.requested(request.registry_gen, request.command) orelse {
+    const worker_command = host.requested(request.registry_generation, request.command) orelse {
         result.err = reloaded;
         return;
     };
@@ -1623,7 +1634,7 @@ const ActContext = struct {
 
 /// Pushes the command's `run` function.
 fn pushCommandRun(L: *lua.State, worker_command: *const WorkerCommand) void {
-    _ = lua.pushRef(L, worker_command.spec_ref);
+    _ = lua.pushRef(L, worker_command.spec_reference);
     if (lua.getField(L, -1, "run") != lua.c.LUA_TFUNCTION) {
         lua.raise(L, "this command has no run function", .{});
     }
@@ -1640,10 +1651,10 @@ fn pushRowAction(
         &worker_command.root_search_kept
     else
         &worker_command.list_kept;
-    if (kept.ref == c_noref or kept.list_gen != row_action.list_gen) {
+    if (kept.reference == c_noref or kept.list_generation != row_action.list_gen) {
         lua.raise(L, "the list changed meanwhile; try again", .{});
     }
-    _ = lua.pushRef(L, kept.ref);
+    _ = lua.pushRef(L, kept.reference);
     const rows = lua.absIndex(L, -1);
     if (lua.c.lua_rawgeti(L, rows, @intCast(row_action.row_index + 1)) != lua.c.LUA_TTABLE) {
         lua.raise(L, "that row has no actions", .{});
@@ -1752,18 +1763,18 @@ pub fn stamp(config_dir: []const u8, style: []const u8) u64 {
 /// Past it, edits to the files left out do not reload anything.
 const stamp_entries_max = 1024;
 
-/// The .lua files directly in `dir`.
-fn hashLua(hasher: *std.hash.Wyhash, dir: [:0]const u8) void {
-    hasher.update(dir);
-    const dir_handle = c.g_dir_open(dir.ptr, 0, null) orelse return;
-    defer c.g_dir_close(dir_handle);
+/// The .lua files directly in `folder`.
+fn hashLua(hasher: *std.hash.Wyhash, folder: [:0]const u8) void {
+    hasher.update(folder);
+    const folder_handle = c.g_dir_open(folder.ptr, 0, null) orelse return;
+    defer c.g_dir_close(folder_handle);
     var entries_count: usize = 0;
-    while (c.g_dir_read_name(dir_handle)) |file_name_c| : (entries_count += 1) {
+    while (c.g_dir_read_name(folder_handle)) |file_name_c| : (entries_count += 1) {
         if (entries_count == stamp_entries_max) break;
         const file_name = std.mem.span(file_name_c);
         if (!std.mem.endsWith(u8, file_name, ".lua")) continue;
         var path_buffer: [4096]u8 = undefined;
-        const path = std.mem.printSentinel(&path_buffer, "{s}/{s}", .{ dir, file_name }, 0) catch
+        const path = std.mem.printSentinel(&path_buffer, "{s}/{s}", .{ folder, file_name }, 0) catch
             continue;
         hashFile(hasher, path);
     }
@@ -1774,10 +1785,10 @@ fn hashFolders(hasher: *std.hash.Wyhash, config_dir: []const u8, kind: []const u
     var top_buffer: [4096]u8 = undefined;
     const top = std.mem.printSentinel(&top_buffer, "{s}/{s}", .{ config_dir, kind }, 0) catch
         return;
-    const dir_handle = c.g_dir_open(top.ptr, 0, null) orelse return;
-    defer c.g_dir_close(dir_handle);
+    const folder_handle = c.g_dir_open(top.ptr, 0, null) orelse return;
+    defer c.g_dir_close(folder_handle);
     var entries_count: usize = 0;
-    while (c.g_dir_read_name(dir_handle)) |folder_name_c| : (entries_count += 1) {
+    while (c.g_dir_read_name(folder_handle)) |folder_name_c| : (entries_count += 1) {
         if (entries_count == stamp_entries_max) break;
         const folder_name = std.mem.span(folder_name_c);
         var folder_buffer: [4096]u8 = undefined;
@@ -1854,17 +1865,17 @@ const Probe = struct {
     }
 };
 
-fn writeTestFile(dir: []const u8, name: []const u8, data: []const u8) !void {
+fn writeTestFile(folder: []const u8, name: []const u8, data: []const u8) !void {
     var buffer: [4096]u8 = undefined;
-    const path = try std.mem.printSentinel(&buffer, "{s}/{s}", .{ dir, name }, 0);
+    const path = try std.mem.printSentinel(&buffer, "{s}/{s}", .{ folder, name }, 0);
     if (std.mem.findScalarLast(u8, path, '/')) |slash| try os.mkdirP(path[0..slash]);
     try os.writeFile(path, data);
 }
 
-fn testHost(probe: *Probe, dir: []const u8) !*Host {
-    var buf: [4096]u8 = undefined;
-    const data = try std.mem.print(&buf, "{s}/data", .{dir});
-    return start(testing.allocator, testing.io, dir, data, .{
+fn testHost(probe: *Probe, folder: []const u8) !*Host {
+    var data_path_buffer: [4096]u8 = undefined;
+    const data = try std.mem.print(&data_path_buffer, "{s}/data", .{folder});
+    return start(testing.allocator, testing.io, folder, data, .{
         .context = probe,
         .registry_callback = &Probe.registryCallback,
         .list_callback = &Probe.listCallback,
@@ -1875,9 +1886,11 @@ fn testHost(probe: *Probe, dir: []const u8) !*Host {
 
 test "request generations skip none, which the window keeps for nothing pending" {
     var host: Host = undefined;
-    host.request_gen_last = @fromBackingInt(@intCast(std.math.maxInt(u32)));
-    try testing.expectEqual(@as(RequestGeneration, @fromBackingInt(@intCast(1))), host.requestGenNext());
-    try testing.expectEqual(@as(RequestGeneration, @fromBackingInt(@intCast(2))), host.requestGenNext());
+    host.request_generation_last = @fromBackingInt(@intCast(std.math.maxInt(u32)));
+    const first: RequestGeneration = @fromBackingInt(@intCast(1));
+    const second: RequestGeneration = @fromBackingInt(@intCast(2));
+    try testing.expectEqual(first, host.requestGenerationNext());
+    try testing.expectEqual(second, host.requestGenerationNext());
 }
 
 test {
@@ -1885,11 +1898,11 @@ test {
 }
 
 test "extensions load, list, search and run actions" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
-    const dir = try os.tmpDirPath(&tmp, &dbuf);
-    try writeTestFile(dir, "init.lua",
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const folder = try os.tmpDirPath(&test_dir, &path_buffer);
+    try writeTestFile(folder, "init.lua",
         \\lumen.theme { id = "mine", name = "Mine", bg = "#101010", fg = "#f0f0f0", accent = "#ff8800" }
         \\lumen.keymap("ctrl+g", "demo.fruits")
         \\lumen.set { width = "wide", suggestions = false, opacity = 90 }
@@ -1897,7 +1910,7 @@ test "extensions load, list, search and run actions" {
         \\lumen.layout { rows = "inline", show = { icons = false } }
         \\return lumen.extension { commands = { { name = "hello", title = "Say Hello", run = function() return "stay" end } } }
     );
-    try writeTestFile(dir, "extensions/demo/init.lua",
+    try writeTestFile(folder, "extensions/demo/init.lua",
         \\local lumen = require("lumen")
         \\local util = require("util")
         \\return lumen.extension {
@@ -1921,16 +1934,16 @@ test "extensions load, list, search and run actions" {
         \\  },
         \\}
     );
-    try writeTestFile(dir, "extensions/demo/util.lua", "return {}");
+    try writeTestFile(folder, "extensions/demo/util.lua", "return {}");
     try writeTestFile(
-        dir,
+        folder,
         "extensions/broken/init.lua",
         "return lumen.extension { commands = { { name = 'x' } } }",
     );
 
     var probe: Probe = .{};
     defer probe.deinit();
-    const host = try testHost(&probe, dir);
+    const host = try testHost(&probe, folder);
     defer host.shutdown();
     host.reload();
     try probe.wait("registry");
@@ -1975,10 +1988,10 @@ test "extensions load, list, search and run actions" {
     try testing.expect(std.mem.find(u8, registry.problems[0].message, "title is missing") != null);
 
     // A list command's rows.
-    const g1 = host.list(registry.gen, .from(1), "");
+    const fruits_generation = host.list(registry.gen, .from(1), "");
     const fruits = try probe.take("list");
     defer fruits.destroy(testing.allocator);
-    try testing.expectEqual(g1, fruits.gen);
+    try testing.expectEqual(fruits_generation, fruits.gen);
     try testing.expect(fruits.err == null);
     try testing.expectEqual(@as(usize, 2), fruits.items.len);
     try testing.expectEqualStrings("Apple", fruits.items[0].title);
@@ -1996,7 +2009,7 @@ test "extensions load, list, search and run actions" {
 
     // Its Lua action runs against that list, and changes state other
     // commands of the extension see.
-    const action_gen = host.act(registry.gen, .from(1), .{ .row_action = .{
+    const action_generation = host.act(registry.gen, .from(1), .{ .row_action = .{
         .from_root_search = false,
         .list_gen = fruits.gen,
         .row_index = 1,
@@ -2004,7 +2017,7 @@ test "extensions load, list, search and run actions" {
     } });
     const done = try probe.take("act");
     defer done.destroy(testing.allocator);
-    try testing.expectEqual(action_gen, done.gen);
+    try testing.expectEqual(action_generation, done.gen);
     try testing.expect(done.err == null);
     try testing.expectEqual(Outcome.close, done.outcome);
     // The action took its row's actions away: pressing it again is an
@@ -2037,13 +2050,13 @@ test "extensions load, list, search and run actions" {
     try testing.expectEqual(Outcome.stay, hello.outcome);
 
     // Root search: rows from providers, their Lua actions run there.
-    const root_gen = host.root(registry.gen, "21");
-    const r21 = try probe.take("root");
-    defer r21.destroy(testing.allocator);
-    try testing.expectEqual(root_gen, r21.gen);
-    try testing.expectEqual(@as(usize, 1), r21.sections.len);
-    try testing.expectEqual(CommandIndex.from(4), r21.sections[0].command);
-    const doubled = r21.sections[0].items[0];
+    const root_generation = host.root(registry.gen, "21");
+    const root_answer = try probe.take("root");
+    defer root_answer.destroy(testing.allocator);
+    try testing.expectEqual(root_generation, root_answer.gen);
+    try testing.expectEqual(@as(usize, 1), root_answer.sections.len);
+    try testing.expectEqual(CommandIndex.from(4), root_answer.sections[0].command);
+    const doubled = root_answer.sections[0].items[0];
     try testing.expectEqualStrings("42", doubled.title);
     try testing.expect(doubled.action.ext_item.from_root_search);
     _ = host.act(registry.gen, .from(4), .{ .row_action = .{
@@ -2085,11 +2098,11 @@ test "extensions load, list, search and run actions" {
 }
 
 test "errors in extensions come back as messages" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
-    const dir = try os.tmpDirPath(&tmp, &dbuf);
-    try writeTestFile(dir, "extensions/bad/init.lua",
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const folder = try os.tmpDirPath(&test_dir, &path_buffer);
+    try writeTestFile(folder, "extensions/bad/init.lua",
         \\return lumen.extension { commands = {
         \\  { name = "boom", title = "Boom", items = function() error("kaboom") end },
         \\  { name = "loop", title = "Loop", search = function() while true do end end },
@@ -2097,15 +2110,15 @@ test "errors in extensions come back as messages" {
         \\  { name = "badret", title = "Bad Return", run = function() return 42 end },
         \\} }
     );
-    try writeTestFile(dir, "extensions/syntax/init.lua", "return lumen.extension {");
-    try writeTestFile(dir, "extensions/Bad Name/init.lua", "return nil");
-    try writeTestFile(dir, "extensions/keys/init.lua", "lumen.keymap('g', 'x.y')");
-    try writeTestFile(dir, "extensions/sets/init.lua", "lumen.set { widht = 'wide' }");
-    try writeTestFile(dir, "extensions/lay/init.lua", "lumen.layout { panels = 'triple' }");
+    try writeTestFile(folder, "extensions/syntax/init.lua", "return lumen.extension {");
+    try writeTestFile(folder, "extensions/Bad Name/init.lua", "return nil");
+    try writeTestFile(folder, "extensions/keys/init.lua", "lumen.keymap('g', 'x.y')");
+    try writeTestFile(folder, "extensions/sets/init.lua", "lumen.set { widht = 'wide' }");
+    try writeTestFile(folder, "extensions/lay/init.lua", "lumen.layout { panels = 'triple' }");
 
     var probe: Probe = .{};
     defer probe.deinit();
-    const host = try testHost(&probe, dir);
+    const host = try testHost(&probe, folder);
     defer host.shutdown();
     host.reload();
     try probe.wait("registry");
@@ -2136,22 +2149,22 @@ test "errors in extensions come back as messages" {
     try testing.expect(std.mem.find(u8, boom.err.?, "kaboom") != null);
 
     _ = host.list(registry.gen, .from(2), "");
-    const badrow = try probe.take("list");
-    defer badrow.destroy(testing.allocator);
-    try testing.expect(std.mem.find(u8, badrow.err.?, "items[1].title is missing") != null);
+    const bad_row = try probe.take("list");
+    defer bad_row.destroy(testing.allocator);
+    try testing.expect(std.mem.find(u8, bad_row.err.?, "items[1].title is missing") != null);
 
     _ = host.act(registry.gen, .from(3), .command_run);
-    const badret = try probe.take("act");
-    defer badret.destroy(testing.allocator);
-    try testing.expect(std.mem.find(u8, badret.err.?, "must return") != null);
+    const bad_return = try probe.take("act");
+    defer bad_return.destroy(testing.allocator);
+    try testing.expect(std.mem.find(u8, bad_return.err.?, "must return") != null);
 }
 
 test "preferences read Settings' file over their defaults; storage persists" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
-    const dir = try os.tmpDirPath(&tmp, &dbuf);
-    try writeTestFile(dir, "extensions/kv/init.lua",
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const folder = try os.tmpDirPath(&test_dir, &path_buffer);
+    try writeTestFile(folder, "extensions/kv/init.lua",
         \\return lumen.extension {
         \\  preferences = {
         \\    { name = "who", title = "Who", type = "text", default = "nobody" },
@@ -2171,11 +2184,11 @@ test "preferences read Settings' file over their defaults; storage persists" {
         \\}
     );
     // What Settings writes.
-    try writeTestFile(dir, "data/extensions/kv/preferences.json", "{\"loud\": true}");
+    try writeTestFile(folder, "data/extensions/kv/preferences.json", "{\"loud\": true}");
 
     var probe: Probe = .{};
     defer probe.deinit();
-    const host = try testHost(&probe, dir);
+    const host = try testHost(&probe, folder);
     defer host.shutdown();
     host.reload();
     try probe.wait("registry");
@@ -2196,7 +2209,7 @@ test "preferences read Settings' file over their defaults; storage persists" {
     defer before.destroy(testing.allocator);
     const want = [_][]const u8{ "nobody", "true", "s", "nil", "false" };
     try testing.expect(before.err == null);
-    for (want, before.items) |w, it| try testing.expectEqualStrings(w, it.title);
+    for (want, before.items) |wanted, row| try testing.expectEqualStrings(wanted, row.title);
 
     _ = host.act(registry.gen, .from(1), .command_run);
     (try probe.take("act")).destroy(testing.allocator);
@@ -2207,18 +2220,18 @@ test "preferences read Settings' file over their defaults; storage persists" {
     defer registry.destroy(testing.allocator);
     host.reload();
     try probe.wait("registry");
-    const reg2 = probe.registry.?;
-    _ = host.list(reg2.gen, .from(0), "");
+    const registry_reloaded = probe.registry.?;
+    _ = host.list(registry_reloaded.gen, .from(0), "");
     const after = try probe.take("list");
     defer after.destroy(testing.allocator);
     try testing.expectEqualStrings("2", after.items[3].title);
 }
 
 test "storage never writes over what it cannot read, and reads back what it wrote" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
-    const dir = try os.tmpDirPath(&tmp, &dbuf);
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const folder = try os.tmpDirPath(&test_dir, &path_buffer);
     const read_back =
         \\local function file() local f = io.open(lumen.data_dir .. "/storage.json") local t = f:read("a") f:close() return t end
         \\local ok, err = pcall(lumen.storage.set, "k", "v")
@@ -2228,17 +2241,17 @@ test "storage never writes over what it cannot read, and reads back what it wrot
         \\  file(), tostring(lumen.storage.get("k")), tostring(back),
         \\} } } }
     ;
-    try writeTestFile(dir, "extensions/broken/init.lua", read_back);
-    try writeTestFile(dir, "data/extensions/broken/storage.json", "{\"a\": 1, oops");
+    try writeTestFile(folder, "extensions/broken/init.lua", read_back);
+    try writeTestFile(folder, "data/extensions/broken/storage.json", "{\"a\": 1, oops");
     // Bytes that are not UTF-8 are stored as U+FFFD, so the file still reads.
-    try writeTestFile(dir, "extensions/bytes/init.lua", "lumen.storage.set('x', 'a\\xffb')\n" ++ read_back);
+    try writeTestFile(folder, "extensions/bytes/init.lua", "lumen.storage.set('x', 'a\\xffb')\n" ++ read_back);
     // Folders named like init.lua and the style would share their files.
-    try writeTestFile(dir, "extensions/config/init.lua", "return nil");
-    try writeTestFile(dir, "extensions/style/init.lua", "return nil");
+    try writeTestFile(folder, "extensions/config/init.lua", "return nil");
+    try writeTestFile(folder, "extensions/style/init.lua", "return nil");
 
     var probe: Probe = .{};
     defer probe.deinit();
-    const host = try testHost(&probe, dir);
+    const host = try testHost(&probe, folder);
     defer host.shutdown();
     host.reload();
     try probe.wait("registry");
@@ -2253,7 +2266,9 @@ test "storage never writes over what it cannot read, and reads back what it wrot
     defer broken.destroy(testing.allocator);
     try testing.expect(broken.err == null);
     const want = [_][]const u8{ "false", "not overwritten", "{\"a\": 1, oops", "nil" };
-    for (want, broken.items[0..want.len]) |w, it| try testing.expectEqualStrings(w, it.title);
+    for (want, broken.items[0..want.len]) |wanted, row| {
+        try testing.expectEqualStrings(wanted, row.title);
+    }
 
     _ = host.list(registry.gen, .from(1), "");
     const bytes = try probe.take("list");
@@ -2265,11 +2280,11 @@ test "storage never writes over what it cannot read, and reads back what it wrot
 }
 
 test "rows are kept to a size, and lumen.exec's strings outlive its options" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
-    const dir = try os.tmpDirPath(&tmp, &dbuf);
-    try writeTestFile(dir, "extensions/odd/init.lua",
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const folder = try os.tmpDirPath(&test_dir, &path_buffer);
+    try writeTestFile(folder, "extensions/odd/init.lua",
         \\return lumen.extension { commands = {
         \\  { name = "big", title = "Big", items = function()
         \\      local s = string.rep("x", 5 << 20)
@@ -2298,7 +2313,7 @@ test "rows are kept to a size, and lumen.exec's strings outlive its options" {
 
     var probe: Probe = .{};
     defer probe.deinit();
-    const host = try testHost(&probe, dir);
+    const host = try testHost(&probe, folder);
     defer host.shutdown();
     host.reload();
     try probe.wait("registry");

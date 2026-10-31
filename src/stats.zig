@@ -18,7 +18,7 @@ const View = @import("item.zig").View;
 /// were ever added (`total`).
 pub const Ring = struct {
     samples: [samples_max]u64 = undefined,
-    len: usize = 0,
+    samples_count: usize = 0,
     next: usize = 0,
     total: u64 = 0,
 
@@ -28,31 +28,36 @@ pub const Ring = struct {
         assert(ring.next < samples_max);
         ring.samples[ring.next] = sample_ns;
         ring.next = (ring.next + 1) % samples_max;
-        ring.len = @min(ring.len + 1, samples_max);
+        ring.samples_count = @min(ring.samples_count + 1, samples_max);
         ring.total += 1;
-        assert(ring.len <= ring.total);
+        assert(ring.samples_count <= ring.total);
     }
 
-    pub const Summary = struct { n: u64, p50: f64, p95: f64, max: f64 };
+    pub const Summary = struct {
+        samples_total: u64 = 0,
+        latency_ms_p50: f64 = 0,
+        latency_ms_p95: f64 = 0,
+        latency_ms_max: f64 = 0,
+    };
 
     pub fn summary(ring: *const Ring) Summary {
-        if (ring.len == 0) return .{ .n = 0, .p50 = 0, .p95 = 0, .max = 0 };
-        assert(ring.len <= samples_max);
+        if (ring.samples_count == 0) return .{};
+        assert(ring.samples_count <= samples_max);
         var sorted: [samples_max]u64 = undefined;
-        @memcpy(sorted[0..ring.len], ring.samples[0..ring.len]);
-        std.mem.sort(u64, sorted[0..ring.len], {}, std.sort.asc(u64));
-        const last = ring.len - 1;
+        @memcpy(sorted[0..ring.samples_count], ring.samples[0..ring.samples_count]);
+        std.mem.sort(u64, sorted[0..ring.samples_count], {}, std.sort.asc(u64));
+        const last = ring.samples_count - 1;
         return .{
-            .n = ring.total,
-            .p50 = msFromNs(sorted[ring.len / 2]),
-            .p95 = msFromNs(sorted[@min(last, ring.len * 95 / percent)]),
-            .max = msFromNs(sorted[last]),
+            .samples_total = ring.total,
+            .latency_ms_p50 = msFromNs(sorted[ring.samples_count / 2]),
+            .latency_ms_p95 = msFromNs(sorted[@min(last, ring.samples_count * 95 / percent)]),
+            .latency_ms_max = msFromNs(sorted[last]),
         };
     }
 };
 
-fn msFromNs(ns: u64) f64 {
-    return @as(f64, @floatFromInt(ns)) / std.time.ns_per_ms;
+fn msFromNs(duration_ns: u64) f64 {
+    return @as(f64, @floatFromInt(duration_ns)) / std.time.ns_per_ms;
 }
 
 pub const ViewStats = struct { painted: Ring = .{}, search: Ring = .{}, rows: Ring = .{} };
@@ -124,18 +129,18 @@ fn mbFromBytes(bytes: usize) f64 {
 
 /// `VmRSS:  1234 kB` style fields of /proc/self/status, in MB.
 fn procField(status: []const u8, key: []const u8) f64 {
-    const at = std.mem.find(u8, status, key) orelse return 0;
-    var tokens = std.mem.tokenizeAny(u8, status[at + key.len ..], " \t:");
-    const kb = std.fmt.parseInt(u64, tokens.next() orelse "0", 10) catch 0;
-    return @as(f64, @floatFromInt(kb)) / kib_per_mib;
+    const key_start = std.mem.find(u8, status, key) orelse return 0;
+    var tokens = std.mem.tokenizeAny(u8, status[key_start + key.len ..], " \t:");
+    const kibibytes = std.fmt.parseInt(u64, tokens.next() orelse "0", 10) catch 0;
+    return @as(f64, @floatFromInt(kibibytes)) / kib_per_mib;
 }
 
 /// The text of a field of /proc/self/status (`Threads:   24`), or "?".
 fn procText(status: []const u8, comptime key: []const u8) []const u8 {
     const field = key ++ ":";
-    const at = std.mem.find(u8, status, field) orelse return "?";
-    const end = std.mem.findScalarPos(u8, status, at, '\n') orelse status.len;
-    return std.mem.trim(u8, status[at + field.len .. end], " \t");
+    const key_start = std.mem.find(u8, status, field) orelse return "?";
+    const end = std.mem.findScalarPos(u8, status, key_start, '\n') orelse status.len;
+    return std.mem.trim(u8, status[key_start + field.len .. end], " \t");
 }
 
 const ReportError = std.Io.Writer.Error || std.mem.Allocator.Error;
@@ -146,9 +151,9 @@ pub fn report(
     files: ?*index.Service,
     contents: ?*index.ContentService,
 ) ReportError![:0]u8 {
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    errdefer out.deinit();
-    const writer = &out.writer;
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    errdefer output.deinit();
+    const writer = &output.writer;
     const up_s = (now() - started_ns) / std.time.ns_per_s;
     try writer.print("Lumen {s}  pid {d}  up {d}h{d:0>2}m  started in {d:.0} ms\n\n", .{
         version,
@@ -161,7 +166,7 @@ pub fn report(
     if (files) |file_service| try reportFileIndex(writer, file_service);
     if (contents) |content_service| try reportContentIndex(writer, content_service);
     try reportLatency(writer);
-    return out.toOwnedSliceSentinel(0);
+    return output.toOwnedSliceSentinel(0);
 }
 
 /// /proc/self/status is ~1.5 KB; VmRSS and the lines `report` reads come
@@ -169,8 +174,8 @@ pub fn report(
 const proc_status_bytes_max = 4096;
 
 fn reportMemory(writer: *std.Io.Writer) ReportError!void {
-    var status_buf: [proc_status_bytes_max]u8 = undefined;
-    const status = os.readHead("/proc/self/status", &status_buf);
+    var status_buffer: [proc_status_bytes_max]u8 = undefined;
+    const status = os.readHead("/proc/self/status", &status_buffer);
     const malloc_info = mallinfo2();
     try writer.print("Memory\n", .{});
     try writer.print(
@@ -258,22 +263,35 @@ fn reportLatency(writer: *std.Io.Writer) ReportError!void {
     });
     for (view_names, &views) |name, *view_stats| {
         const painted = view_stats.painted.summary();
-        if (painted.n == 0) continue;
+        if (painted.samples_total == 0) continue;
         const search = view_stats.search.summary();
         const rows = view_stats.rows.summary();
         try writer.print(
             "  {s:<10} {d:>6} {d:>8.2} {d:>8.2} {d:>8.2}   {d:>6.2}/{d:<6.2} {d:>6.2}/{d:<6.2}\n",
             .{
-                name,       painted.n,  painted.p50, painted.p95, painted.max,
-                search.p50, search.p95, rows.p50,    rows.p95,
+                name,
+                painted.samples_total,
+                painted.latency_ms_p50,
+                painted.latency_ms_p95,
+                painted.latency_ms_max,
+                search.latency_ms_p50,
+                search.latency_ms_p95,
+                rows.latency_ms_p50,
+                rows.latency_ms_p95,
             },
         );
     }
     const shown = show.summary();
-    if (shown.n > 0) {
+    if (shown.samples_total > 0) {
         try writer.print(
             "  {s:<10} {d:>6} {d:>8.2} {d:>8.2} {d:>8.2}   (window shown -> first frame)\n",
-            .{ "show", shown.n, shown.p50, shown.p95, shown.max },
+            .{
+                "show",
+                shown.samples_total,
+                shown.latency_ms_p50,
+                shown.latency_ms_p95,
+                shown.latency_ms_max,
+            },
         );
     }
 }
@@ -287,9 +305,9 @@ test "procText and procField read /proc/self/status fields" {
 
 test "a ring keeps the last samples and counts them all" {
     var ring: Ring = .{};
-    try std.testing.expectEqual(@as(u64, 0), ring.summary().n);
+    try std.testing.expectEqual(@as(u64, 0), ring.summary().samples_total);
     for (0..Ring.samples_max + 10) |i| ring.add(@intCast(i * std.time.ns_per_ms));
     const summary = ring.summary();
-    try std.testing.expectEqual(@as(u64, Ring.samples_max + 10), summary.n);
-    try std.testing.expectEqual(@as(f64, Ring.samples_max + 9), summary.max);
+    try std.testing.expectEqual(@as(u64, Ring.samples_max + 10), summary.samples_total);
+    try std.testing.expectEqual(@as(f64, Ring.samples_max + 9), summary.latency_ms_max);
 }

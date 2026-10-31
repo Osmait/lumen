@@ -34,14 +34,14 @@ pub const Ctx = struct {
     settings: *const Settings,
 };
 
-/// Runs `op` on `item`. `item.actionsFor` offers each operation only on the
-/// rows item applies to (file operations on files, clipboard ones on
+/// Runs `operation` on `item`. `item.actionsFor` offers each operation only
+/// on the rows it applies to (file operations on files, clipboard ones on
 /// clipboard entries): an operation on another row is a bug, asserted.
-pub fn perform(context: Ctx, item: *const Item, op: item_mod.Op) Outcome {
-    return switch (op) {
+pub fn perform(context: Ctx, item: *const Item, operation: item_mod.Op) Outcome {
+    return switch (operation) {
         .open, .run => primary(context, item),
         .open_with => .{ .choose_app = fileOf(item).path },
-        .always_use => .{ .setting = .{ .setting = settingOf(item), .op = op } },
+        .always_use => .{ .setting = .{ .setting = settingOf(item), .op = operation } },
         .copy_name => hideAfter(copy(item.title)),
         .copy_path => hideAfter(copyPath(item)),
         .show_in_folder => hideAfter(showInFolder(fileOf(item).path)),
@@ -65,11 +65,11 @@ pub fn perform(context: Ctx, item: *const Item, op: item_mod.Op) Outcome {
 /// What Enter does on a row.
 fn primary(context: Ctx, item: *const Item) Outcome {
     return switch (item.action) {
-        .app => |info| hideAfter(launch(info)),
+        .app => |app_info| hideAfter(launch(app_info)),
         .view => |view| .{ .open_view = view },
         .system => |system_action| hideAfter(system(context, system_action)),
         .layout => |layout| hideAfter(hypr.applyLayout(context.gpa, layout)),
-        .window_op => |window_op| hideAfter(windowOp(context, window_op)),
+        .window_op => |window_operation| hideAfter(windowOperation(context, window_operation)),
         .focus_window => hideAfter(focusWindow(context, item)),
         .clip => hideAfter(pasteClip(context, item)),
         .script => |script| hideAfter(runScript(script.path, script.mode, item.title)),
@@ -99,8 +99,8 @@ fn settingOf(item: *const Item) item_mod.Setting {
 /// Copies the path behind a row: an app's desktop file or a file.
 fn copyPath(item: *const Item) void {
     switch (item.action) {
-        .app => |info| {
-            const desktop_app_info: *c.GDesktopAppInfo = @ptrCast(info);
+        .app => |app_info| {
+            const desktop_app_info: *c.GDesktopAppInfo = @ptrCast(app_info);
             const filename = c.g_desktop_app_info_get_filename(desktop_app_info) orelse return;
             copy(std.mem.span(filename));
         },
@@ -255,10 +255,10 @@ pub fn words(
     arena: std.mem.Allocator,
     command: []const u8,
 ) std.mem.Allocator.Error![]const [:0]const u8 {
-    const command_z = try arena.dupeSentinel(u8, command, 0);
+    const command_terminated = try arena.dupeSentinel(u8, command, 0);
     var argv: ?[*]?[*:0]u8 = null;
-    if (c.g_shell_parse_argv(command_z, null, &argv, null) == 0) {
-        return arena.dupe([:0]const u8, &.{command_z});
+    if (c.g_shell_parse_argv(command_terminated, null, &argv, null) == 0) {
+        return arena.dupe([:0]const u8, &.{command_terminated});
     }
     defer c.g_strfreev(argv);
     var list: std.ArrayList([:0]const u8) = .empty;
@@ -418,17 +418,21 @@ fn showInFolder(path: [:0]const u8) void {
     const uri = c.g_filename_to_uri(path, null, null) orelse return;
     defer c.g_free(uri);
     const uris = [_][*:0]const u8{uri};
-    const args = [_]*c.GVariant{ c.g_variant_new_strv(&uris, 1), c.g_variant_new_string("") };
+    const arguments = [_]*c.GVariant{ c.g_variant_new_strv(&uris, 1), c.g_variant_new_string("") };
     // Kept until the bus is there: the call takes it then.
-    const params = c.g_variant_ref_sink(c.g_variant_new_tuple(&args, args.len));
-    c.g_bus_get(c.G_BUS_TYPE_SESSION, null, &onSessionBus, params);
+    const parameters = c.g_variant_ref_sink(c.g_variant_new_tuple(&arguments, arguments.len));
+    c.g_bus_get(c.G_BUS_TYPE_SESSION, null, &showInFolderBusCallback, parameters);
 }
 
-fn onSessionBus(_: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) void {
-    const params: *c.GVariant = @ptrCast(data.?);
-    defer c.g_variant_unref(params);
+fn showInFolderBusCallback(
+    _: ?*c.GObject,
+    result: *c.GAsyncResult,
+    data: ?*anyopaque,
+) callconv(.c) void {
+    const parameters: *c.GVariant = @ptrCast(data.?);
+    defer c.g_variant_unref(parameters);
     var err: ?*c.GError = null;
-    const bus = c.g_bus_get_finish(res, &err) orelse
+    const bus = c.g_bus_get_finish(result, &err) orelse
         return proc.warnError(.actions, err, "show in folder", .{});
     defer c.g_object_unref(bus);
     c.g_dbus_connection_call(
@@ -437,19 +441,23 @@ fn onSessionBus(_: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callcon
         "/org/freedesktop/FileManager1",
         "org.freedesktop.FileManager1",
         "ShowItems",
-        params,
+        parameters,
         null,
         c.G_DBUS_CALL_FLAGS_NONE,
         -1,
         null,
-        &onShown,
+        &showItemsCallback,
         null,
     );
 }
 
-fn onShown(source: ?*c.GObject, res: *c.GAsyncResult, _: ?*anyopaque) callconv(.c) void {
+fn showItemsCallback(
+    source: ?*c.GObject,
+    result: *c.GAsyncResult,
+    _: ?*anyopaque,
+) callconv(.c) void {
     var err: ?*c.GError = null;
-    const reply = c.g_dbus_connection_call_finish(@ptrCast(source.?), res, &err) orelse
+    const reply = c.g_dbus_connection_call_finish(@ptrCast(source.?), result, &err) orelse
         return proc.warnError(.actions, err, "show in folder", .{});
     c.g_variant_unref(reply);
 }
@@ -464,23 +472,19 @@ fn copyFile(context: Ctx, path: [:0]const u8) void {
     proc.pipeTo(&.{ "wl-copy", "--type", "text/uri-list" }, list);
 }
 
-fn launch(info: *c.GAppInfo) void {
+fn launch(app_info: *c.GAppInfo) void {
     const launch_context = proc.launchContext() orelse return;
     defer c.g_object_unref(launch_context);
     var err: ?*c.GError = null;
-    if (c.g_app_info_launch(info, null, launch_context, &err) == 0) proc.warnError(
-        .actions,
-        err,
-        "launch",
-        .{},
-    );
+    const launched = c.g_app_info_launch(app_info, null, launch_context, &err) != 0;
+    if (!launched) proc.warnError(.actions, err, "launch", .{});
 }
 
 fn focusWindow(context: Ctx, item: *const Item) void {
     assert(item.action == .focus_window);
-    var buffer: [64]u8 = undefined;
+    var command_buffer: [64]u8 = undefined;
     const command = std.mem.print(
-        &buffer,
+        &command_buffer,
         "focuswindow address:{s}",
         .{item.action.focus_window},
     ) catch return;
@@ -489,9 +493,11 @@ fn focusWindow(context: Ctx, item: *const Item) void {
 
 fn system(context: Ctx, system_action: item_mod.System) void {
     switch (system_action) {
-        .lock => if (proc.have("hyprlock")) proc.spawn(&.{"hyprlock"}) else proc.spawn(
-            &.{ "loginctl", "lock-session" },
-        ),
+        .lock => if (proc.have("hyprlock")) {
+            proc.spawn(&.{"hyprlock"});
+        } else {
+            proc.spawn(&.{ "loginctl", "lock-session" });
+        },
         .sleep => proc.spawn(&.{ "systemctl", "suspend" }),
         .restart => proc.spawn(&.{ "systemctl", "reboot" }),
         .shutdown => proc.spawn(&.{ "systemctl", "poweroff" }),
@@ -529,8 +535,8 @@ fn system(context: Ctx, system_action: item_mod.System) void {
 
 /// Window commands act on the active window: Lumen's overlay does not take
 /// that role from the client, so it is still the window the user came from.
-fn windowOp(context: Ctx, op: item_mod.WindowOp) void {
-    hypr.dispatch(context.gpa, switch (op) {
+fn windowOperation(context: Ctx, operation: item_mod.WindowOp) void {
+    hypr.dispatch(context.gpa, switch (operation) {
         .toggle_floating => "togglefloating",
         .toggle_fullscreen => "fullscreen 0",
         .toggle_maximize => "fullscreen 1",
@@ -550,14 +556,15 @@ fn runScript(path: [:0]const u8, mode: @import("core").script_meta.Mode, title: 
     // Other modes show the output: last lines as a desktop notification.
     // After `--`, a title or an output line starting with "-" is text, not
     // an option of notify-send's.
-    var buffer: [512:0]u8 = undefined;
-    const title_z = std.mem.printSentinel(&buffer, "{s}", .{title}, 0) catch "Script";
+    var title_buffer: [512:0]u8 = undefined;
+    const title_terminated = std.mem.printSentinel(&title_buffer, "{s}", .{title}, 0) catch
+        "Script";
     proc.spawn(&.{
-        "sh",           "-c",
+        "sh",             "-c",
         \\out=$("$1" 2>&1); notify-send -a Lumen -- "$2" "$(printf '%s' "$out" | tail -n 5)"
         ,
-        "lumen-script", path,
-        title_z,
+        "lumen-script",   path,
+        title_terminated,
     });
 }
 
@@ -591,9 +598,10 @@ fn pasteNow() void {
 /// window decides the chord (terminals paste with Ctrl+Shift+V; Ctrl+V there
 /// is a literal ^V or a terminal's own binding).
 fn sendPaste(_: ?*anyopaque) callconv(.c) c.gboolean {
-    var buffer: [active_window_answer_bytes_max]u8 = undefined;
-    var fixed: std.heap.FixedBufferAllocator = .init(&buffer);
-    const class = if (hypr.activeWindow(fixed.allocator())) |window| window.class else "";
+    var answer_buffer: [active_window_answer_bytes_max]u8 = undefined;
+    var answer_allocator: std.heap.FixedBufferAllocator = .init(&answer_buffer);
+    const window = hypr.activeWindow(answer_allocator.allocator());
+    const class = if (window) |active| active.class else "";
     switch (pasteChord(class)) {
         .ctrl_v => proc.spawn(&.{ "wtype", "-M", "ctrl", "-k", "v", "-m", "ctrl" }),
         .ctrl_shift_v => proc.spawn(&.{
@@ -635,9 +643,9 @@ pub fn pasteChord(class: []const u8) Chord {
         "contour",
         "blackbox",
     };
-    var buffer: [128]u8 = undefined;
-    if (class.len > buffer.len) return .ctrl_v;
-    const lower = std.ascii.lowerString(&buffer, class);
+    var lower_buffer: [128]u8 = undefined;
+    if (class.len > lower_buffer.len) return .ctrl_v;
+    const lower = std.ascii.lowerString(&lower_buffer, class);
     for (terminals) |terminal| if (std.mem.find(u8, lower, terminal) != null) return .ctrl_shift_v;
     return .ctrl_v;
 }

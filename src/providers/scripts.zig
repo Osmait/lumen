@@ -11,7 +11,7 @@ const Item = @import("../item.zig").Item;
 const script_header_bytes_max = 4096;
 
 /// ~/.config/lumen/scripts, in `arena`; null only when out of memory.
-pub fn dir(arena: std.mem.Allocator) ?[:0]const u8 {
+pub fn folderPath(arena: std.mem.Allocator) ?[:0]const u8 {
     const config = std.mem.span(c.g_get_user_config_dir());
     return arena.printSentinel("{s}/lumen/scripts", .{config}, 0) catch null;
 }
@@ -33,7 +33,7 @@ const log = std.log.scoped(.scripts);
 /// The scripts, in `arena`: scanned again only when a file in the folder
 /// was added, removed, renamed or written since the last time.
 pub fn load(arena: std.mem.Allocator) []Item {
-    const path = dir(arena) orelse return &.{};
+    const path = folderPath(arena) orelse return &.{};
     const folder_stamp = stamp(path);
     const cached = if (cache.stamp) |last| std.meta.eql(last, folder_stamp) else false;
     if (!cached) {
@@ -82,8 +82,8 @@ fn stamp(path: [:0]const u8) FolderStamp {
     defer c.g_dir_close(dir_handle);
     var hasher: std.hash.Wyhash = .init(0);
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    while (c.g_dir_read_name(dir_handle)) |name_c| {
-        const name = std.mem.span(name_c);
+    while (c.g_dir_read_name(dir_handle)) |name_terminated| {
+        const name = std.mem.span(name_terminated);
         hasher.update(name);
         const file_path = std.mem.printSentinel(
             &path_buffer,
@@ -106,8 +106,8 @@ fn scan(arena: std.mem.Allocator, path: [:0]const u8) []Item {
     var items: std.ArrayList(Item) = .empty;
     var dropped: usize = 0;
     defer if (dropped > 0) log.warn("{d} scripts left out: out of memory", .{dropped});
-    while (c.g_dir_read_name(dir_handle)) |name_c| {
-        const name = std.mem.span(name_c);
+    while (c.g_dir_read_name(dir_handle)) |name_terminated| {
+        const name = std.mem.span(name_terminated);
         if (name.len == 0 or name[0] == '.') continue;
         const item = (itemOf(arena, path, name) catch {
             dropped += 1;
@@ -130,22 +130,22 @@ fn itemOf(
 ) std.mem.Allocator.Error!?Item {
     const file_path = try arena.printSentinel("{s}/{s}", .{ path, name }, 0);
     // Only the header is read: script metadata lives in its comments.
-    var head_buf: [script_header_bytes_max]u8 = undefined;
-    const head = os.readHead(file_path.ptr, &head_buf);
-    const meta = script_meta.parse(head) orelse return null;
-    const subtitle = if (meta.package_name.len > 0) meta.package_name else "Script Command";
+    var head_buffer: [script_header_bytes_max]u8 = undefined;
+    const head = os.readHead(file_path.ptr, &head_buffer);
+    const metadata = script_meta.parse(head) orelse return null;
+    const subtitle = if (metadata.package_name.len > 0) metadata.package_name else "Script Command";
     return .{
         .key = try arena.print("script:{s}", .{name}),
-        .title = try arena.dupeSentinel(u8, meta.title, 0),
+        .title = try arena.dupeSentinel(u8, metadata.title, 0),
         .subtitle = try arena.dupeSentinel(u8, subtitle, 0),
         .accessory = "Script",
-        .keywords = try arena.dupe(u8, meta.description),
-        .confirm = meta.needs_confirmation,
-        .icon = if (looksLikeEmoji(meta.icon))
-            .{ .emoji = try arena.dupeSentinel(u8, meta.icon, 0) }
+        .keywords = try arena.dupe(u8, metadata.description),
+        .confirm = metadata.needs_confirmation,
+        .icon = if (looksLikeEmoji(metadata.icon))
+            .{ .emoji = try arena.dupeSentinel(u8, metadata.icon, 0) }
         else
             .{ .tile = .{ .name = "utilities-terminal-symbolic", .color = .gray } },
-        .action = .{ .script = .{ .path = file_path, .mode = meta.mode } },
+        .action = .{ .script = .{ .path = file_path, .mode = metadata.mode } },
     };
 }
 

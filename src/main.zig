@@ -42,7 +42,7 @@ const Daemon = struct {
     app: *c.GApplication = undefined,
     /// LUMEN_APP_ID lets end-to-end tests run a second, isolated instance
     /// (GApplication is single-instance per id; the socket is per id too).
-    app_id: [:0]const u8 = ipc.default_app_id,
+    app_id: [:0]const u8 = ipc.app_id_default,
     /// Built in `onStartup`; see `readyUi`.
     ui: Ui = undefined,
     ui_ready: bool = false,
@@ -82,7 +82,7 @@ const ClipboardWatcher = struct {
 /// stack outlives the GTK main loop).
 const Start = struct { gpa: std.mem.Allocator, io: std.Io };
 
-extern fn mallopt(param: c_int, value: c_int) c_int;
+extern fn mallopt(parameter: c_int, value: c_int) c_int;
 const M_MMAP_THRESHOLD: c_int = -3;
 const M_ARENA_MAX: c_int = -8;
 /// Blocks this large or larger come from mmap and go back on free (see
@@ -105,18 +105,21 @@ pub fn main(init: std.process.Init) !void {
     _ = mallopt(M_ARENA_MAX, malloc_arenas_max);
     var argv: std.ArrayList(?[*:0]const u8) = .empty;
     defer argv.deinit(init.gpa);
-    var args_iterator = init.minimal.args.iterate();
-    while (args_iterator.next()) |arg| try argv.append(init.gpa, arg.ptr);
+    var arguments_iterator = init.minimal.args.iterate();
+    while (arguments_iterator.next()) |argument| try argv.append(init.gpa, argument.ptr);
 
-    const args = argv.items[1..];
-    const first_flag: ?cli.Flag = if (args.len > 0) cli.parse(std.mem.span(args[0].?)) else null;
+    const arguments = argv.items[1..];
+    const first_flag: ?cli.Flag = if (arguments.len > 0)
+        cli.parse(std.mem.span(arguments[0].?))
+    else
+        null;
     if (first_flag == .clip_store) return clipStore(init);
     // --help never needs a daemon: print the usage here, before
     // GApplication can start one.
-    for (args) |arg| {
-        if (cli.parse(std.mem.span(arg.?)) == .help) return printToStdout(init.io, cli.usage);
+    for (arguments) |argument| {
+        if (cli.parse(std.mem.span(argument.?)) == .help) return printToStdout(init.io, cli.usage);
     }
-    if (args.len == 1 and first_flag == .version) return printToStdout(init.io, version_line);
+    if (arguments.len == 1 and first_flag == .version) return printToStdout(init.io, version_line);
 
     if (c.g_getenv(ipc.env.app_id)) |app_id| daemon.app_id = std.mem.span(app_id);
     // Commands that only talk to a running daemon must not become one: with
@@ -155,9 +158,12 @@ fn daemonIsRunning() bool {
 }
 
 /// Nobody is told when stdout is closed (`lumen --help | head -0`): there
-/// is no one left to read it.
+/// is no one left to read it. Any other failure (a full disk) is logged.
 fn printToStdout(io: std.Io, text: []const u8) void {
-    std.Io.File.stdout().writeStreamingAll(io, text) catch {};
+    std.Io.File.stdout().writeStreamingAll(io, text) catch |err| switch (err) {
+        error.BrokenPipe => {},
+        else => log.warn("cannot write to stdout: {t}", .{err}),
+    };
 }
 
 /// A test instance takes no keyboard, so nobody can close it by hand: if
@@ -249,25 +255,25 @@ fn commandLineCallback(
     var argc: c_int = 0;
     const argv = c.g_application_command_line_get_arguments(command_line, &argc);
     defer c.g_strfreev(argv);
-    var args: [ipc.args_max][:0]const u8 = undefined;
-    var args_count: usize = 0;
+    var arguments: [ipc.arguments_max][:0]const u8 = undefined;
+    var arguments_count: usize = 0;
     // From 1: without the program's name.
     var argv_index: usize = 1;
-    while (argv_index < argc and args_count < args.len) : (argv_index += 1) {
-        args[args_count] = std.mem.span(argv[argv_index] orelse continue);
-        args_count += 1;
+    while (argv_index < argc and arguments_count < arguments.len) : (argv_index += 1) {
+        arguments[arguments_count] = std.mem.span(argv[argv_index] orelse continue);
+        arguments_count += 1;
     }
-    return run(args[0..args_count], &.{ .command_line = command_line });
+    return run(arguments[0..arguments_count], &.{ .command_line = command_line });
 }
 
 /// Every invocation through the socket.
 fn socketCallback(
-    args: []const [:0]const u8,
+    arguments: []const [:0]const u8,
     payload: []const u8,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) u8 {
-    const status = run(args, &.{ .stdout = stdout, .stderr = stderr, .payload = payload });
+    const status = run(arguments, &.{ .stdout = stdout, .stderr = stderr, .payload = payload });
     return std.math.cast(u8, status) orelse 1;
 }
 
@@ -314,27 +320,27 @@ const Request = union(enum) {
     };
 };
 
-/// `args` (without the program's name) as a Request; null when they are
+/// `arguments` (without the program's name) as a Request; null when they are
 /// not a valid command line. Pure: it neither reads nor changes the UI.
-fn parseRequest(args: []const [:0]const u8) ?Request {
+fn parseRequest(arguments: []const [:0]const u8) ?Request {
     var window: Request.Window = .{};
-    var arg_index: usize = 0;
-    while (arg_index < args.len) : (arg_index += 1) {
-        const flag = cli.parse(args[arg_index]) orelse return null;
+    var argument_index: usize = 0;
+    while (argument_index < arguments.len) : (argument_index += 1) {
+        const flag = cli.parse(arguments[argument_index]) orelse return null;
         const value: [:0]const u8 = switch (cli.specs.get(flag).value) {
             .none => "",
             .required => value: {
-                if (arg_index + 1 == args.len) return null;
-                arg_index += 1;
-                break :value args[arg_index];
+                if (argument_index + 1 == arguments.len) return null;
+                argument_index += 1;
+                break :value arguments[argument_index];
             },
             // An optional value is taken only when the next argument is
             // not itself a flag ("--update --quit" updates every extension).
             .optional => value: {
-                if (arg_index + 1 == args.len) break :value "";
-                if (std.mem.startsWith(u8, args[arg_index + 1], "-")) break :value "";
-                arg_index += 1;
-                break :value args[arg_index];
+                if (argument_index + 1 == arguments.len) break :value "";
+                if (std.mem.startsWith(u8, arguments[argument_index + 1], "-")) break :value "";
+                argument_index += 1;
+                break :value arguments[argument_index];
             },
         };
         switch (flag) {
@@ -381,8 +387,8 @@ fn parseRequest(args: []const [:0]const u8) ?Request {
     return .{ .window = window };
 }
 
-fn run(args: []const [:0]const u8, reply: *const Reply) c_int {
-    const request = parseRequest(args) orelse return usage(reply);
+fn run(arguments: []const [:0]const u8, reply: *const Reply) c_int {
+    const request = parseRequest(arguments) orelse return usage(reply);
     return switch (request) {
         .now => |now| runNow(now, reply),
         .window => |window| runWindow(window, reply),
@@ -459,10 +465,10 @@ fn runWindow(window: Request.Window, reply: *const Reply) c_int {
     }
     if (window.command) |command_id| {
         if (Ui.ext_view.openTarget(ui, command_id, window.query)) return status_ok;
-        var buf: [256]u8 = undefined;
+        var message_buffer: [256]u8 = undefined;
         const id_shown = command_id[0..@min(command_id.len, 200)];
         const message = std.mem.printSentinel(
-            &buf,
+            &message_buffer,
             "lumen: no command \"{s}\"\n",
             .{id_shown},
             0,
@@ -516,14 +522,15 @@ const content_results_max = 50;
 fn startFileIndex(ui: *Ui) void {
     const home = std.mem.span(c.g_get_home_dir());
     const cache_home = std.mem.span(c.g_get_user_cache_dir());
-    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const index_path = std.mem.print(&buf, "{s}/lumen/files.idx", .{cache_home}) catch return;
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const index_format = "{s}/lumen/files.idx";
+    const index_path = std.mem.print(&path_buffer, index_format, .{cache_home}) catch return;
     const file_service = index.Service.start(ui.gpa, ui.io, home, index_path) catch |err| {
         log.warn("file index: {t}", .{err});
         return;
     };
     ui.files = file_service;
-    const cache_dir = std.mem.print(&buf, "{s}/lumen", .{cache_home}) catch return;
+    const cache_dir = std.mem.print(&path_buffer, "{s}/lumen", .{cache_home}) catch return;
     // The content index borrows thread pools the file index keeps for it:
     // sharing the file index's own froze the UI behind content work. It
     // asks the file index (`names`) whether a full listing is needed again.
@@ -554,13 +561,19 @@ fn startFileIndex(ui: *Ui) void {
 }
 
 fn dbPath() ?[*:0]u8 {
-    const dir = c.g_build_filename(c.g_get_user_data_dir(), "lumen", @as(?*const anyopaque, null));
-    defer c.g_free(dir);
-    if (c.g_mkdir_with_parents(dir, 0o700) != 0) return null;
+    const end: ?*const anyopaque = null;
+    const data_dir = c.g_build_filename(c.g_get_user_data_dir(), "lumen", end);
+    defer c.g_free(data_dir);
+    if (c.g_mkdir_with_parents(data_dir, 0o700) != 0) return null;
     // Owner-only even if it already existed (made by hand or by another
-    // tool); one that is not ours stays as it is (EPERM).
-    _ = std.os.linux.chmod(dir, 0o700);
-    return c.g_build_filename(dir, "lumen.db", @as(?*const anyopaque, null));
+    // tool). One that is not ours stays as it is (EPERM): the database
+    // still opens in it, so that is logged and not fatal.
+    const chmod_result = std.os.linux.chmod(data_dir, 0o700);
+    switch (std.os.linux.errno(chmod_result)) {
+        .SUCCESS => {},
+        else => |errno| log.warn("cannot make {s} owner-only: {t}", .{ data_dir, errno }),
+    }
+    return c.g_build_filename(data_dir, "lumen.db", end);
 }
 
 /// `wl-paste --watch lumen --clip-store`: one short-lived process per copy.
@@ -582,7 +595,7 @@ fn startClipboardWatcher() void {
         "--clip-store",
     };
     var err: ?*c.GError = null;
-    if (c.g_spawn_async(
+    const spawned = c.g_spawn_async(
         null,
         @ptrCast(&argv),
         null,
@@ -591,7 +604,8 @@ fn startClipboardWatcher() void {
         null,
         &watcher.pid,
         &err,
-    ) == 0) {
+    ) != 0;
+    if (!spawned) {
         proc.warnError(.main, err, "clipboard watcher", .{});
         return;
     }
@@ -602,9 +616,10 @@ fn startClipboardWatcher() void {
 
 /// Prefer the small `lumen` client beside this binary: wl-paste runs it
 /// once per copy, and lumen-gtk would load GTK each time.
-fn clipboardClientPath(buf: []u8, self_exe: [*:0]const u8) [*:0]const u8 {
+fn clipboardClientPath(path_buffer: []u8, self_exe: [*:0]const u8) [*:0]const u8 {
     const self_dir = std.Io.Dir.path.dirname(std.mem.span(self_exe)) orelse "/";
-    const client = std.mem.printSentinel(buf, "{s}/lumen", .{self_dir}, 0) catch return self_exe;
+    const client = std.mem.printSentinel(path_buffer, "{s}/lumen", .{self_dir}, 0) catch
+        return self_exe;
     if (std.os.linux.access(client.ptr, std.os.linux.X_OK) != 0) return self_exe;
     return client.ptr;
 }
@@ -686,8 +701,8 @@ fn clipStore(init: std.process.Init) !void {
     if (init.environ_map.get(ipc.env.clipboard_state)) |state| {
         if (!ipc.keepsCopy(state)) return;
     }
-    var buf: [stdin_buffer_bytes]u8 = undefined;
-    var stdin = std.Io.File.stdin().reader(init.io, &buf);
+    var stdin_buffer: [stdin_buffer_bytes]u8 = undefined;
+    var stdin = std.Io.File.stdin().reader(init.io, &stdin_buffer);
     // Larger copies are not kept (images, huge selections).
     const content = stdin.interface.allocRemaining(
         init.gpa,
@@ -695,7 +710,7 @@ fn clipStore(init: std.process.Init) !void {
     ) catch |err| switch (err) {
         error.StreamTooLong => return,
         error.ReadFailed => return stdin.err.?,
-        else => |e| return e,
+        else => |read_error| return read_error,
     };
     defer init.gpa.free(content);
     if (!std.unicode.utf8ValidateSlice(content)) return;

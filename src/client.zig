@@ -28,8 +28,11 @@ var answer_buffer: [answer_bytes_max]u8 = undefined;
 pub fn main(init: std.process.Init.Minimal) void {
     const argv = init.args.vector;
     const envp: [*:null]const ?[*:0]const u8 = init.environ.block.slice.ptr;
-    const args = argv[1..];
-    const only_flag: ?cli.Flag = if (args.len == 1) cli.parse(std.mem.span(args[0])) else null;
+    const arguments = argv[1..];
+    const only_flag: ?cli.Flag = if (arguments.len == 1)
+        cli.parse(std.mem.span(arguments[0]))
+    else
+        null;
     // --help is answered here: it needs neither a daemon nor GTK.
     if (only_flag == .help) {
         _ = writeAll(1, cli.usage);
@@ -38,7 +41,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     if (only_flag == .version) printVersion(init.environ);
     const getEnv = std.process.Environ.getPosix;
     if (getEnv(init.environ, ipc.env.runtime_dir)) |runtime_dir| {
-        const app_id = getEnv(init.environ, ipc.env.app_id) orelse ipc.default_app_id;
+        const app_id = getEnv(init.environ, ipc.env.app_id) orelse ipc.app_id_default;
         if (only_flag == .clip_store) {
             // wl-clipboard says when a copy is a password manager's or a clear.
             if (getEnv(init.environ, ipc.env.clipboard_state)) |state| {
@@ -46,8 +49,8 @@ pub fn main(init: std.process.Init.Minimal) void {
             }
             storeCopy(runtime_dir, app_id, argv, envp);
         }
-        if (passable(args)) {
-            if (encodeArgs(args)) |request_head| {
+        if (passable(arguments)) {
+            if (encodeArguments(arguments)) |request_head| {
                 if (ask(runtime_dir, app_id, request_head)) |status| linux.exit_group(status);
             }
         }
@@ -64,14 +67,14 @@ fn storeCopy(
     argv: []const [*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
 ) noreturn {
-    const head = encodeArgs(argv[1..]) orelse runFull(argv, envp);
+    const head = encodeArguments(argv[1..]) orelse runFull(argv, envp);
     const copy_buffer = request[head.len..];
-    const copy_len = unix.readAll(0, copy_buffer, unix.no_deadline) catch linux.exit_group(1);
+    const copy_bytes = unix.readAll(0, copy_buffer, unix.no_deadline) catch linux.exit_group(1);
     // A copy too large to keep is dropped here, as lumen-gtk would.
-    if (copy_len == copy_buffer.len) linux.exit_group(0);
-    const request_len = head.len + copy_len;
-    if (ask(runtime_dir, app_id, request[0..request_len])) |status| linux.exit_group(status);
-    stdinFrom(copy_buffer[0..copy_len]);
+    if (copy_bytes == copy_buffer.len) linux.exit_group(0);
+    const request_bytes = head.len + copy_bytes;
+    if (ask(runtime_dir, app_id, request[0..request_bytes])) |status| linux.exit_group(status);
+    stdinFrom(copy_buffer[0..copy_bytes]);
     runFull(argv, envp);
 }
 
@@ -85,32 +88,33 @@ fn stdinFrom(bytes: []const u8) void {
 }
 
 fn memfdStdin(bytes: []const u8) bool {
-    const rc = linux.memfd_create("lumen-copy", linux.MFD.CLOEXEC);
-    if (failed(rc) != null) return false;
-    const fd: linux.fd_t = @intCast(rc);
+    const memfd_result = linux.memfd_create("lumen-copy", linux.MFD.CLOEXEC);
+    if (failed(memfd_result) != null) return false;
+    const fd: linux.fd_t = @intCast(memfd_result);
     if (!writeAll(fd, bytes)) return false;
     if (failed(linux.lseek(fd, 0, linux.SEEK.SET)) != null) return false;
     return failed(linux.dup2(fd, 0)) == null;
 }
 
-/// The request head for `args`, in `request`; null when they do not fit.
-fn encodeArgs(args: []const [*:0]const u8) ?[]const u8 {
-    var spans: [ipc.args_max][]const u8 = undefined;
-    if (args.len > spans.len) return null;
-    for (args, spans[0..args.len]) |arg, *span| span.* = std.mem.span(arg);
-    return ipc.encode(&request, spans[0..args.len]);
+/// The request head for `arguments`, in `request`; null when they do not
+/// fit.
+fn encodeArguments(arguments: []const [*:0]const u8) ?[]const u8 {
+    var spans: [ipc.arguments_max][]const u8 = undefined;
+    if (arguments.len > spans.len) return null;
+    for (arguments, spans[0..arguments.len]) |argument, *span| span.* = std.mem.span(argument);
+    return ipc.encode(&request, spans[0..arguments.len]);
 }
 
 /// Every flag one the daemon's socket takes, with its value.
-fn passable(args: []const [*:0]const u8) bool {
-    var arg_index: usize = 0;
-    while (arg_index < args.len) : (arg_index += 1) {
-        const flag = cli.parse(std.mem.span(args[arg_index])) orelse return false;
+fn passable(arguments: []const [*:0]const u8) bool {
+    var argument_index: usize = 0;
+    while (argument_index < arguments.len) : (argument_index += 1) {
+        const flag = cli.parse(std.mem.span(arguments[argument_index])) orelse return false;
         const spec = cli.specs.get(flag);
         if (!spec.socket) return false;
         if (spec.value == .required) {
-            if (arg_index + 1 == args.len) return false;
-            arg_index += 1;
+            if (argument_index + 1 == arguments.len) return false;
+            argument_index += 1;
         }
     }
     return true;
@@ -122,8 +126,8 @@ fn printVersion(environ: std.process.Environ) noreturn {
     _ = writeAll(1, "lumen " ++ version ++ "\n");
     const getEnv = std.process.Environ.getPosix;
     const runtime_dir = getEnv(environ, ipc.env.runtime_dir) orelse linux.exit_group(0);
-    const app_id = getEnv(environ, ipc.env.app_id) orelse ipc.default_app_id;
-    const request_head = encodeArgs(&.{"--version"}) orelse linux.exit_group(0);
+    const app_id = getEnv(environ, ipc.env.app_id) orelse ipc.app_id_default;
+    const request_head = encodeArguments(&.{"--version"}) orelse linux.exit_group(0);
     const answer = exchange(runtime_dir, app_id, request_head) orelse linux.exit_group(0);
     const theirs = std.mem.trim(u8, answer.stdout, " \n");
     const restart = "restart it: lumen --quit; lumen --daemon\n";
@@ -154,8 +158,8 @@ fn ask(runtime_dir: []const u8, app_id: []const u8, request_bytes: []const u8) ?
 /// Sends a request (src/ipc.zig) to the daemon and returns its answer, in
 /// `answer_buffer`; null when there is no daemon of ours to ask.
 fn exchange(runtime_dir: []const u8, app_id: []const u8, request_bytes: []const u8) ?ipc.Answer {
-    var path_buf: [256]u8 = undefined;
-    const path = ipc.socketPath(&path_buf, runtime_dir, app_id) orelse return null;
+    var path_buffer: [256]u8 = undefined;
+    const path = ipc.socketPath(&path_buffer, runtime_dir, app_id) orelse return null;
     const fd = unix.connect(path, .{}) orelse return null;
     // Our own daemon only: in a runtime folder others can write to, someone
     // else's socket would get the arguments and the copy.
@@ -169,14 +173,19 @@ fn exchange(runtime_dir: []const u8, app_id: []const u8, request_bytes: []const 
     if (!unix.sendAll(fd, request_bytes)) {
         return failedAnswer("lumen: the daemon closed the connection\n");
     }
-    _ = linux.shutdown(fd, linux.SHUT.WR);
+    // The daemon reads the request until this end; without it, both would
+    // wait for each other forever.
+    if (failed(linux.shutdown(fd, linux.SHUT.WR)) != null) {
+        _ = linux.close(fd);
+        return failedAnswer("lumen: cannot finish the request to the daemon\n");
+    }
     // The daemon answers when it is done, however long that takes.
-    const answer_len = unix.readAll(fd, &answer_buffer, unix.no_deadline) catch 0;
+    const answer_bytes = unix.readAll(fd, &answer_buffer, unix.no_deadline) catch 0;
     _ = linux.close(fd);
-    if (answer_len < ipc.answer_header_bytes) {
+    if (answer_bytes < ipc.answer_header_bytes) {
         return failedAnswer("lumen: no answer from the daemon\n");
     }
-    return ipc.parseAnswer(answer_buffer[0..answer_len]) orelse
+    return ipc.parseAnswer(answer_buffer[0..answer_bytes]) orelse
         failedAnswer("lumen: a truncated answer from the daemon\n");
 }
 
@@ -186,29 +195,33 @@ fn failedAnswer(message: []const u8) ipc.Answer {
 
 /// lumen-gtk beside this file, else on PATH.
 fn runFull(argv: []const [*:0]const u8, envp: [*:null]const ?[*:0]const u8) noreturn {
-    const argv_z: [*:null]const ?[*:0]const u8 = @ptrCast(argv.ptr);
+    const argv_terminated: [*:null]const ?[*:0]const u8 = @ptrCast(argv.ptr);
     var self_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var candidate_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     // An execve that returns failed: the next place is tried.
-    const self_path_len = linux.readlink("/proc/self/exe", &self_path_buffer, self_path_buffer.len);
-    if (failed(self_path_len) == null and self_path_len < self_path_buffer.len) {
-        const self_path = self_path_buffer[0..self_path_len];
+    const self_path_bytes = linux.readlink(
+        "/proc/self/exe",
+        &self_path_buffer,
+        self_path_buffer.len,
+    );
+    if (failed(self_path_bytes) == null and self_path_bytes < self_path_buffer.len) {
+        const self_path = self_path_buffer[0..self_path_bytes];
         const self_dir = std.Io.Dir.path.dirname(self_path) orelse "/";
         const format = "{s}/lumen-gtk";
         if (std.mem.printSentinel(&candidate_buffer, format, .{self_dir}, 0)) |candidate| {
-            _ = linux.execve(candidate.ptr, argv_z, envp);
+            _ = linux.execve(candidate.ptr, argv_terminated, envp);
         } else |_| {}
     }
     var env_index: usize = 0;
-    while (envp[env_index]) |env_entry_z| : (env_index += 1) {
-        const env_entry = std.mem.span(env_entry_z);
+    while (envp[env_index]) |env_entry_terminated| : (env_index += 1) {
+        const env_entry = std.mem.span(env_entry_terminated);
         if (!std.mem.startsWith(u8, env_entry, "PATH=")) continue;
         var path_dirs = std.mem.tokenizeScalar(u8, env_entry["PATH=".len..], ':');
         while (path_dirs.next()) |path_dir| {
             const format = "{s}/lumen-gtk";
             const print = std.mem.printSentinel;
             const candidate = print(&candidate_buffer, format, .{path_dir}, 0) catch continue;
-            _ = linux.execve(candidate.ptr, argv_z, envp);
+            _ = linux.execve(candidate.ptr, argv_terminated, envp);
         }
     }
     _ = writeAll(2, "lumen: cannot find lumen-gtk (it is installed beside lumen)\n");

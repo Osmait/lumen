@@ -54,9 +54,14 @@ pub fn build(b: *std.Build) void {
         .luart = luart,
         .build_options = build_options,
     });
-    const exe = daemonExecutable(b, target, daemon);
+    const executable = daemonExecutable(b, target, daemon);
     const client = clientModule(b, target, optimize, build_options);
-    toolSteps(b, .{ .target = target, .optimize = optimize, .exe = exe, .base = base });
+    toolSteps(b, .{
+        .target = target,
+        .optimize = optimize,
+        .executable = executable,
+        .base = base,
+    });
 
     const test_step = b.step("test", "Run unit tests");
     const tested = [_]*std.Build.Module{ base.core, base.os, base.index, luart, daemon, client };
@@ -114,14 +119,14 @@ fn cLibraries(
     // how each distribution names Lua 5.4 (liblua5.4.so.5.4 on Arch,
     // liblua5.4.so.0 on Debian, gone from Fedora for 5.5). Packagers who
     // want the system's: -Dsystem-libs.
-    const system_libs = b.option(
+    const system_libraries = b.option(
         bool,
         "system-libs",
         "Link the system's SQLite and Lua 5.4 instead of the bundled ones",
     ) orelse false;
     // Lua 5.4's pkg-config name differs between distributions: lua5.4 on
     // Arch and Debian, lua on Fedora.
-    const lua_pkg = b.option(
+    const lua_package = b.option(
         []const u8,
         "lua-pkg",
         "With -Dsystem-libs: pkg-config name of Lua 5.4 (default lua5.4)",
@@ -140,12 +145,12 @@ fn cLibraries(
     lua.defineCMacro("LUA_COMPAT_5_3", null);
     // System libraries are linked to the translation before its module is
     // made, because the module takes them when it is created.
-    if (system_libs) {
+    if (system_libraries) {
         sqlite.linkSystemLibrary("sqlite3", .{});
-        lua.linkSystemLibrary(lua_pkg, .{});
+        lua.linkSystemLibrary(lua_package, .{});
     }
     const libraries: CLibraries = .{ .sqlite = sqlite.createModule(), .lua = lua.createModule() };
-    if (system_libs) return libraries;
+    if (system_libraries) return libraries;
 
     const sqlite_source = b.dependency("sqlite", .{});
     sqlite.addIncludePath(sqlite_source.path(""));
@@ -222,13 +227,17 @@ fn daemonExecutable(
     // LLD links only the libraries used (--as-needed): Zig's own linker
     // also records every one pkg-config lists for GTK (vulkan, harfbuzz,
     // graphene...), which a binary meant for other systems must not ask for.
-    const exe = b.addExecutable(.{ .name = "lumen-gtk", .root_module = daemon, .use_lld = true });
+    const executable = b.addExecutable(.{
+        .name = "lumen-gtk",
+        .root_module = daemon,
+        .use_lld = true,
+    });
     // Built for an older glibc (a release, -Dtarget=x86_64-linux-gnu.2.36),
     // it links against this machine's GTK, built for a newer one; where it
     // runs, the libraries are that system's own.
-    if (!target.query.isNative()) exe.linker_allow_shlib_undefined = true;
-    b.installArtifact(exe);
-    return exe;
+    if (!target.query.isNative()) executable.linker_allow_shlib_undefined = true;
+    b.installArtifact(executable);
+    return executable;
 }
 
 /// `lumen`, what the shortcut runs, installed. Loading GTK costs a process
@@ -267,10 +276,10 @@ fn clientModule(
 fn toolSteps(b: *std.Build, options: struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    exe: *std.Build.Step.Compile,
+    executable: *std.Build.Step.Compile,
     base: BaseModules,
 }) void {
-    const run = b.addRunArtifact(options.exe);
+    const run = b.addRunArtifact(options.executable);
     run.step.dependOn(b.getInstallStep());
     run.addPassthruArgs();
     b.step("run", "Run lumen").dependOn(&run.step);
@@ -328,28 +337,28 @@ fn resolveVersion(b: *std.Build) []const u8 {
     );
     if (version_override) |version| return version;
     const base: []const u8 = @import("build.zig.zon").version;
-    var code: u8 = 0;
+    var exit_code: u8 = 0;
     const root = b.root.toString(b.graph.arena) catch @panic("OOM");
-    const out = b.runAllowFail(&.{
+    const described_output = b.runAllowFail(&.{
         "git",      "-C",     root,
         "describe", "--tags", "--match",
         "v*.*.*",   "--long", "--abbrev=9",
-    }, &code, .ignore) catch return base;
+    }, &exit_code, .ignore) catch return base;
     // For example "v0.1.0-14-ga1b2c3d4e": the tag, the commits since, the hash.
-    const described = std.mem.trim(u8, out, " \r\n");
+    const described = std.mem.trim(u8, described_output, " \r\n");
     var parts = std.mem.splitBackwardsScalar(u8, described, '-');
     const hash = parts.next() orelse return base;
     const commits = parts.next() orelse return base;
     const tag = parts.rest();
     if (hash.len < 2 or hash[0] != 'g' or tag.len < 2) return base;
-    const dev = std.mem.endsWith(u8, base, "-dev");
-    if (std.mem.eql(u8, commits, "0") and !dev) {
+    const is_dev = std.mem.endsWith(u8, base, "-dev");
+    if (std.mem.eql(u8, commits, "0") and !is_dev) {
         if (!std.mem.eql(u8, tag[1..], base)) {
             std.process.fatal("tag {s} does not match build.zig.zon's version {s}", .{ tag, base });
         }
         return base;
     }
-    if (dev) return b.fmt("{s}.{s}+{s}", .{ base, commits, hash[1..] });
+    if (is_dev) return b.fmt("{s}.{s}+{s}", .{ base, commits, hash[1..] });
     return b.fmt("{s}+{s}.{s}", .{ base, commits, hash[1..] });
 }
 

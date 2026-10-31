@@ -23,8 +23,8 @@ pub const style_extension_id = "style";
 
 /// A toggle's value as text, as preferences.json, form values and
 /// `Pref.default` hold it.
-pub fn toggleText(on: bool) [:0]const u8 {
-    return if (on) "true" else "false";
+pub fn toggleText(is_on: bool) [:0]const u8 {
+    return if (is_on) "true" else "false";
 }
 
 /// Whether a toggle's text value is on; anything but `toggleText(true)` is
