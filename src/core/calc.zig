@@ -127,7 +127,7 @@ const Unit = struct {
 };
 
 const units = [_]Unit{
-    // length, base metre
+    // Lengths, in metres.
     .{
         .names = &.{ "mm", "millimeter", "millimeters", "millimetre" },
         .dim = .length,
@@ -148,14 +148,14 @@ const units = [_]Unit{
     .{ .names = &.{ "ft", "foot", "feet" }, .dim = .length, .factor = 0.3048 },
     .{ .names = &.{ "yd", "yard", "yards" }, .dim = .length, .factor = 0.9144 },
     .{ .names = &.{ "mi", "mile", "miles" }, .dim = .length, .factor = 1609.344 },
-    // mass, base kilogram
+    // Masses, in kilograms.
     .{ .names = &.{ "mg", "milligram", "milligrams" }, .dim = .mass, .factor = 1e-6 },
     .{ .names = &.{ "g", "gram", "grams" }, .dim = .mass, .factor = 0.001 },
     .{ .names = &.{ "kg", "kilogram", "kilograms", "kilo", "kilos" }, .dim = .mass, .factor = 1 },
     .{ .names = &.{ "t", "ton", "tons", "tonne", "tonnes" }, .dim = .mass, .factor = 1000 },
     .{ .names = &.{ "oz", "ounce", "ounces" }, .dim = .mass, .factor = 0.028349523125 },
     .{ .names = &.{ "lb", "lbs", "pound", "pounds" }, .dim = .mass, .factor = 0.45359237 },
-    // time, base second
+    // Times, in seconds.
     .{ .names = &.{ "ms", "millisecond", "milliseconds" }, .dim = .time, .factor = 0.001 },
     .{ .names = &.{ "s", "sec", "second", "seconds" }, .dim = .time, .factor = 1 },
     .{ .names = &.{ "min", "minute", "minutes" }, .dim = .time, .factor = 60 },
@@ -163,7 +163,7 @@ const units = [_]Unit{
     .{ .names = &.{ "d", "day", "days" }, .dim = .time, .factor = 86400 },
     .{ .names = &.{ "wk", "week", "weeks" }, .dim = .time, .factor = 604800 },
     .{ .names = &.{ "yr", "year", "years" }, .dim = .time, .factor = 31557600 },
-    // data, base byte (binary multiples, as file managers show them)
+    // Data sizes, in bytes. The multiples are binary, as file managers show them.
     .{ .names = &.{ "b", "byte", "bytes" }, .dim = .data, .factor = 1 },
     .{ .names = &.{ "kb", "kib", "kilobyte", "kilobytes" }, .dim = .data, .factor = 1024 },
     .{ .names = &.{ "mb", "mib", "megabyte", "megabytes" }, .dim = .data, .factor = 1024 * 1024 },
@@ -177,7 +177,7 @@ const units = [_]Unit{
         .dim = .data,
         .factor = 1024 * 1024 * 1024 * 1024,
     },
-    // temperature, base kelvin
+    // Temperatures, in kelvin.
     .{ .names = &.{ "c", "celsius", "°c" }, .dim = .temperature, .factor = 1, .offset = 273.15 },
     .{
         .names = &.{ "f", "fahrenheit", "°f" },
@@ -186,7 +186,7 @@ const units = [_]Unit{
         .offset = 273.15 - 32.0 * 5.0 / 9.0,
     },
     .{ .names = &.{ "k", "kelvin" }, .dim = .temperature, .factor = 1 },
-    // volume, base litre
+    // Volumes, in litres.
     .{
         .names = &.{ "ml", "milliliter", "milliliters", "millilitre" },
         .dim = .volume,
@@ -196,12 +196,12 @@ const units = [_]Unit{
     .{ .names = &.{ "gal", "gallon", "gallons" }, .dim = .volume, .factor = 3.785411784 },
     .{ .names = &.{ "cup", "cups" }, .dim = .volume, .factor = 0.2365882365 },
     .{ .names = &.{ "floz", "fl oz" }, .dim = .volume, .factor = 0.0295735295625 },
-    // speed, base m/s
+    // Speeds, in metres per second.
     .{ .names = &.{ "kmh", "km/h", "kph" }, .dim = .speed, .factor = 1000.0 / 3600.0 },
     .{ .names = &.{"mph"}, .dim = .speed, .factor = 0.44704 },
     .{ .names = &.{ "m/s", "mps" }, .dim = .speed, .factor = 1 },
     .{ .names = &.{ "kn", "knot", "knots" }, .dim = .speed, .factor = 0.514444 },
-    // area, base m²
+    // Areas, in square metres.
     .{ .names = &.{ "m2", "sqm" }, .dim = .area, .factor = 1 },
     .{ .names = &.{ "km2", "sqkm" }, .dim = .area, .factor = 1e6 },
     .{ .names = &.{ "ft2", "sqft" }, .dim = .area, .factor = 0.09290304 },
@@ -218,7 +218,7 @@ fn findUnit(name: []const u8) ?*const Unit {
     return null;
 }
 
-/// "<expr> <unit> to|in|as <unit>"
+/// A conversion, "<expression> <unit> to|in|as <unit>", or null.
 fn splitConversion(text: []const u8) ?Result {
     const separators = [_][]const u8{ " to ", " in ", " as " };
     for (separators) |separator| {
@@ -304,7 +304,7 @@ const Parser = struct {
         return true;
     }
 
-    // expr := term (('+' | '-') term)*
+    /// Parses `expression := term (('+' | '-') term)*`.
     fn parseExpr(parser: *Parser) Error!f64 {
         var value = try parser.parseTerm();
         while (true) {
@@ -324,7 +324,7 @@ const Parser = struct {
         }
     }
 
-    // term := power (('*' | '/' | 'x' | 'mod' | 'of' | implicit) power)*
+    /// Parses `term := power (('*' | '/' | 'mod' | 'of' | implicit) power)*`.
     fn parseTerm(parser: *Parser) Error!f64 {
         var value = try parser.parseUnary();
         while (true) {
@@ -348,7 +348,7 @@ const Parser = struct {
                 parser.saw_operator = true;
                 value *= try parser.parseUnary();
             } else if (parser.startsImplicitProduct(next)) {
-                // Implicit multiplication: 2(3+1), 2pi
+                // A product with no operator written, as in 2(3+1) or 2pi.
                 parser.saw_operator = true;
                 value *= try parser.parseUnary();
             } else {
@@ -386,7 +386,7 @@ const Parser = struct {
         return parser.parsePower();
     }
 
-    // power := postfix ('^' unary)?   (right associative)
+    /// Parses `power := postfix ('^' unary)?`, which is right associative.
     fn parsePower(parser: *Parser) Error!f64 {
         const base = try parser.parsePostfix();
         const operator_len = parser.powerOperatorLen();

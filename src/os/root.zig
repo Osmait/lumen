@@ -279,7 +279,7 @@ pub fn slowMounts(gpa: std.mem.Allocator, under: []const u8) std.mem.Allocator.E
     }
     var lines = std.mem.tokenizeScalar(u8, text.items, '\n');
     while (lines.next()) |line| {
-        // "id parent dev root MOUNT options... - FSTYPE source options"
+        // A line reads "id parent dev root MOUNT options... - FSTYPE source options".
         const dash = std.mem.find(u8, line, " - ") orelse continue;
         var fields = std.mem.tokenizeScalar(u8, line[0..dash], ' ');
         for (0..4) |_| _ = fields.next();

@@ -16,7 +16,7 @@ pub const Badge = struct {
 };
 
 const known = [_]struct { []const u8, Color }{
-    // languages
+    // Programming languages.
     .{ "go", .cyan },       .{ "zig", .orange },   .{ "rs", .brown },     .{ "ts", .blue },
     .{ "tsx", .blue },      .{ "mts", .blue },     .{ "cts", .blue },     .{ "js", .yellow },
     .{ "jsx", .yellow },    .{ "mjs", .yellow },   .{ "cjs", .yellow },   .{ "py", .blue },
@@ -29,18 +29,18 @@ const known = [_]struct { []const u8, Color }{
     .{ "glsl", .green },    .{ "wgsl", .green },   .{ "sh", .green },     .{ "bash", .green },
     .{ "zsh", .green },     .{ "fish", .green },   .{ "ps1", .blue },     .{ "vue", .green },
     .{ "svelte", .orange }, .{ "astro", .orange },
-    // web, styles, markup
+    // Web pages, their styles and other markup.
     .{ "html", .orange },  .{ "htm", .orange },
     .{ "css", .blue },      .{ "scss", .pink },    .{ "sass", .pink },    .{ "less", .blue },
     .{ "xml", .orange },    .{ "svg", .yellow },
-    // data and config
+    // Data and configuration.
       .{ "json", .yellow },  .{ "jsonc", .yellow },
     .{ "yaml", .red },      .{ "yml", .red },      .{ "toml", .gray },    .{ "ini", .gray },
     .{ "conf", .gray },     .{ "cfg", .gray },     .{ "env", .yellow },   .{ "csv", .green },
     .{ "tsv", .green },     .{ "proto", .blue },   .{ "graphql", .pink }, .{ "gql", .pink },
     .{ "lock", .gray },     .{ "zon", .orange },   .{ "nix", .blue },     .{ "tf", .purple },
     .{ "mk", .gray },       .{ "cmake", .green },  .{ "gradle", .cyan },  .{ "dockerfile", .blue },
-    // prose
+    // Prose.
     .{ "md", .gray },       .{ "mdx", .gray },     .{ "txt", .gray },     .{ "rst", .gray },
     .{ "org", .green },     .{ "tex", .green },    .{ "log", .gray },     .{ "diff", .green },
     .{ "patch", .green },
