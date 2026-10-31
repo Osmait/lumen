@@ -70,7 +70,7 @@ cache_path: [:0]u8,
 name_changes: std.atomic.Value(u64) = .init(0),
 /// For `lumen --stats`, read from other threads.
 rescans: std.atomic.Value(u32) = .init(0),
-last_rescan_ns: std.atomic.Value(u64) = .init(0),
+rescan_ns_last: std.atomic.Value(u64) = .init(0),
 /// The service thread's own: when the last rescan ended, and how long the
 /// last one asked for soon after it waited (see `backoff_min_ns`).
 last_rescan_end_ns: ?u64 = null,
@@ -250,7 +250,7 @@ pub const Status = struct {
     rescanning: bool,
     index_bytes: usize = 0,
     rescans: u32 = 0,
-    last_rescan_ns: u64 = 0,
+    rescan_ns_last: u64 = 0,
 };
 
 pub fn status(service: *Service) Status {
@@ -264,7 +264,7 @@ pub fn status(service: *Service) Status {
         .rescanning = service.live.pending_resync,
         .index_bytes = service.live.indexBytes(),
         .rescans = service.rescans.load(.monotonic),
-        .last_rescan_ns = service.last_rescan_ns.load(.monotonic),
+        .rescan_ns_last = service.rescan_ns_last.load(.monotonic),
     };
 }
 
@@ -364,7 +364,7 @@ fn rescan(service: *Service) void {
     defer {
         const end_ns = sys.monotonicNs();
         service.last_rescan_end_ns = end_ns;
-        service.last_rescan_ns.store(end_ns - start_ns, .monotonic);
+        service.rescan_ns_last.store(end_ns - start_ns, .monotonic);
         _ = service.rescans.fetchAdd(1, .monotonic);
         @import("root.zig").trimHeap();
     }

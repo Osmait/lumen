@@ -210,7 +210,7 @@ fn reportFileIndex(writer: *std.Io.Writer, file_service: *index.Service) ReportE
     });
     try writer.print("{d} rescans (last {d:.0} ms)\n", .{
         status.rescans,
-        msFromNs(status.last_rescan_ns),
+        msFromNs(status.rescan_ns_last),
     });
     if (status.unwatched > 0) {
         try writer.print(
