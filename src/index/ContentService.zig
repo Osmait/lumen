@@ -10,8 +10,8 @@
 //! millisecond.
 //!
 //! PDFs and Office documents are indexed through their extracted text,
-//! cached in `text_dir` as `<hash of path>-<mtime>-<size>.txt`: extraction
-//! (a child process per file) happens once per version of a document.
+//! kept in a cache (`TextCache.zig`): extraction (a child process per
+//! file) happens once per version of a document.
 
 const std = @import("std");
 const paths = @import("paths.zig");
@@ -20,6 +20,7 @@ const Io = std.Io;
 const content = @import("content.zig");
 const content_list = @import("content_list.zig");
 const extract = @import("extract.zig");
+const TextCache = @import("TextCache.zig");
 const Pool = @import("Pool.zig");
 const Service = @import("Service.zig");
 const sys = @import("os");
@@ -32,7 +33,7 @@ gpa: std.mem.Allocator,
 io: Io,
 root: []const u8,
 cache_path: [:0]u8,
-text_dir: []u8,
+text_cache: TextCache,
 search_pool: *Pool,
 build_pool: *Pool,
 options: Options,
@@ -142,28 +143,22 @@ pub fn startWith(
     errdefer gpa.free(root_copy);
     const cache_path = try gpa.printSentinel("{s}/content.idx", .{cache_dir}, 0);
     errdefer gpa.free(cache_path);
-    const text_dir = try gpa.print("{s}/text", .{cache_dir});
-    errdefer gpa.free(text_dir);
+    var text_cache: TextCache = try .init(gpa, cache_dir);
+    errdefer text_cache.deinit(gpa);
     service.* = .{
         .gpa = gpa,
         .io = io,
         .root = root_copy,
         .cache_path = cache_path,
-        .text_dir = text_dir,
+        .text_cache = text_cache,
         .search_pool = pools.search,
         .build_pool = pools.build,
         .options = options,
         .worker = .{ .retry_arena = .init(gpa) },
     };
-    // Without it, extracted text is not cached: each document is extracted
-    // again when it is needed.
-    sys.mkdirP(service.text_dir) catch |err| {
-        log.warn("{s}: {t}, extracted text is not cached", .{ service.text_dir, err });
-    };
-    // Older versions made these 0755: the cache holds the text of the
-    // user's documents, so close it before anything else.
+    // Older versions made it 0755: the cache holds the text of the user's
+    // documents, so close it before anything else.
     sys.makePrivate(cache_dir);
-    sys.makePrivate(service.text_dir);
     // Absent or unreadable: built from scratch by the first refresh.
     service.index = content.Index.open(service.cache_path) catch null;
     errdefer if (service.index) |*index| index.deinit(gpa);
@@ -181,7 +176,7 @@ pub fn shutdown(service: *ContentService) void {
     service.worker.retry_arena.deinit();
     service.gpa.free(service.root);
     service.gpa.free(service.cache_path);
-    service.gpa.free(service.text_dir);
+    service.text_cache.deinit(service.gpa);
     service.gpa.destroy(service);
 }
 
@@ -296,7 +291,7 @@ fn pathOf(context: *anyopaque, doc: content.DocIn, path_buffer: []u8) ?[:0]const
     const service: *ContentService = @ptrCast(@alignCast(context));
     switch (doc.source) {
         .plain => return std.mem.printSentinel(path_buffer, "{s}", .{doc.path}, 0) catch null,
-        .extracted => return service.textPath(path_buffer, doc),
+        .extracted => return service.text_cache.path(path_buffer, doc),
     }
 }
 
@@ -318,7 +313,7 @@ pub fn readText(
     var text_path_buffer: paths.Buffer = undefined;
     const text_path: [:0]const u8 = if (source == .extracted) blk: {
         const doc_stat = content_list.stat(doc_path, .document) orelse return null;
-        break :blk service.textPath(&text_path_buffer, .{
+        break :blk service.text_cache.path(&text_path_buffer, .{
             .path = path,
             .mtime = mtime,
             .size = doc_stat.size,
@@ -353,46 +348,17 @@ fn textOf(
     gpa: std.mem.Allocator,
 ) std.mem.Allocator.Error!bool {
     const service: *ContentService = @ptrCast(@alignCast(context));
-    if (doc.source == .plain) return content.readPlain(gpa, doc.path, text);
-    var path_buffer: paths.Buffer = undefined;
-    const text_path = service.textPath(&path_buffer, doc) orelse return false;
-    text.clearRetainingCapacity();
-    const fd = sys.openRegular(text_path) catch return false;
-    defer sys.close(fd);
-    sys.readUpTo(gpa, fd, text, extracted_bytes_max) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        // Part of the text is not the document's text.
-        error.ReadFailed => return false,
+    return switch (doc.source) {
+        .plain => content.readPlain(gpa, doc.path, text),
+        .extracted => service.text_cache.read(gpa, doc, text),
     };
-    return text.items.len > 0;
 }
 
 /// How many bytes the cached text of an extracted document has (0: none
 /// yet), so that building reads no more of them at once than memory allows.
 fn cachedTextBytes(context: *anyopaque, doc: content.DocIn) u64 {
     const service: *ContentService = @ptrCast(@alignCast(context));
-    var path_buffer: paths.Buffer = undefined;
-    const text_path = service.textPath(&path_buffer, doc) orelse return 0;
-    const info = sys.info(text_path) orelse return 0;
-    return info.size;
-}
-
-/// Where a document version's extracted text is cached. Keyed by size as
-/// well as mtime (whole seconds): an edit within the same second reused
-/// the old text, and dropping the old version's text then deleted it.
-fn textPath(service: *ContentService, path_buffer: []u8, doc: content.DocIn) ?[:0]const u8 {
-    var name_buffer: [64]u8 = undefined;
-    const name = textName(&name_buffer, doc);
-    return std.mem.printSentinel(path_buffer, "{s}/{s}", .{ service.text_dir, name }, 0) catch null;
-}
-
-fn textName(name_buffer: *[64]u8, doc: content.DocIn) []const u8 {
-    // 16 + 1 + 20 + 1 + 20 + 4 bytes at most: always fits.
-    return std.mem.print(
-        name_buffer,
-        "{x:0>16}-{d}-{d}.txt",
-        .{ std.hash.Wyhash.hash(0, doc.path), doc.mtime, doc.size },
-    ) catch unreachable;
+    return service.text_cache.size(doc);
 }
 
 /// Extracts what is missing from the text cache, on the background pool
@@ -412,7 +378,7 @@ fn extractMissing(
     var path_buffer: paths.Buffer = undefined;
     for (docs, 0..) |doc, doc_index| {
         if (doc.source != .extracted) continue;
-        const text_path = service.textPath(&path_buffer, doc) orelse continue;
+        const text_path = service.text_cache.path(&path_buffer, doc) orelse continue;
         if (sys.exists(text_path)) continue;
         missing.append(arena, doc_index) catch {
             log.warn("extracting documents: out of memory", .{});
@@ -451,7 +417,7 @@ const ExtractContext = struct {
         const doc = context.docs[context.missing[missing_index]];
         var text_path_buffer: paths.Buffer = undefined;
         var source_path_buffer: paths.Buffer = undefined;
-        const text_path = service.textPath(&text_path_buffer, doc) orelse return;
+        const text_path = service.text_cache.path(&text_path_buffer, doc) orelse return;
         const kind = extract.kindOf(doc.path) orelse return;
         const source_path = std.mem.printSentinel(
             &source_path_buffer,
@@ -717,7 +683,7 @@ fn refresh(service: *ContentService) void {
         break :blk old;
     };
     if (old) |*old_index| {
-        service.dropStaleText(old_index, changed.gone);
+        service.text_cache.dropStale(old_index, changed.gone);
         old_index.deinit(service.gpa);
     }
     if (whole) service.sweepText();
@@ -923,78 +889,13 @@ fn retrySave(service: *ContentService) void {
     service.worker.unsaved = false;
 }
 
-/// Deletes the cached text of document versions that are gone (edited or
-/// deleted): it is keyed by mtime, so each edit otherwise left the old
-/// text in the cache for good.
-fn dropStaleText(service: *ContentService, old: *const content.Index, gone: []const u32) void {
-    var path_buffer: paths.Buffer = undefined;
-    for (gone) |id| {
-        if (old.sources[id] != @backingInt(content.Source.extracted)) continue;
-        const text_path = service.textPath(&path_buffer, old.docIn(id)) orelse continue;
-        // Left behind, it is deleted by the next whole build's sweep.
-        const result = std.os.linux.unlink(text_path);
-        switch (std.os.linux.errno(result)) {
-            .SUCCESS, .NOENT => {},
-            else => |errno| log.warn("deleting {s}: {t}", .{ text_path, errno }),
-        }
-    }
-}
-
-/// Deletes the cached texts no live document of the index refers to: what
-/// `dropStaleText` cannot know of, versions extracted and never indexed
-/// (out of memory, a shutdown or a crash in between), half-written ones.
-/// A text cached under the name used before sizes were part of it
-/// (`<hash>-<mtime>.txt`) is renamed instead, not extracted again. On
-/// start and after a whole build, on the service thread: the one that
-/// writes them.
+/// Sweeps the text cache of what the index in use does not refer to
+/// (`TextCache.sweep`). On start and after a whole build, on the service
+/// thread: the one that writes the cache.
 fn sweepText(service: *ContentService) void {
+    service.assertWorkerThread();
     const index = &(service.index orelse return);
-    var arena_state: std.heap.ArenaAllocator = .init(service.gpa);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    // A name in the cache -> the name it should have.
-    var keep: std.StringHashMapUnmanaged([]const u8) = .empty;
-    for (0..index.docs_count) |doc_index| {
-        const id: u32 = @intCast(doc_index);
-        if (!index.extractedLive(id)) continue;
-        const doc = index.docIn(id);
-        var name_buffer: [64]u8 = undefined;
-        const name = arena.dupe(u8, textName(&name_buffer, doc)) catch return;
-        keep.put(arena, name, name) catch return;
-        const old = arena.print("{x:0>16}-{d}.txt", .{
-            std.hash.Wyhash.hash(0, doc.path),
-            doc.mtime,
-        }) catch return;
-        keep.put(arena, old, name) catch return;
-    }
-    var text_dir_buffer: paths.Buffer = undefined;
-    const text_dir = std.mem.printSentinel(&text_dir_buffer, "{s}", .{service.text_dir}, 0) catch
-        return;
-    const fd = sys.openDir(text_dir) catch return;
-    defer sys.close(fd);
-    var iterator: sys.DirIter = .{ .fd = fd };
-    while (iterator.next() catch return) |entry| {
-        if (entry.kind == std.os.linux.DT.DIR) continue;
-        var name_buffer: [256]u8 = undefined;
-        const name = std.mem.printSentinel(&name_buffer, "{s}", .{entry.name}, 0) catch continue;
-        const name_wanted = keep.get(entry.name) orelse {
-            // Left behind, it is tried again by the next sweep.
-            const result = std.os.linux.unlinkat(fd, name, 0);
-            switch (std.os.linux.errno(result)) {
-                .SUCCESS, .NOENT => {},
-                else => |errno| log.warn("deleting {s}/{s}: {t}", .{ text_dir, name, errno }),
-            }
-            continue;
-        };
-        if (std.mem.eql(u8, name_wanted, entry.name)) continue;
-        var wanted_buffer: [64]u8 = undefined;
-        const target = std.mem.printSentinel(&wanted_buffer, "{s}", .{name_wanted}, 0) catch continue;
-        // Not renamed, the text is extracted again under its new name.
-        const result = std.os.linux.renameat(fd, name, fd, target);
-        if (std.os.linux.errno(result) != .SUCCESS) {
-            log.warn("renaming {s}/{s}: {t}", .{ text_dir, name, std.os.linux.errno(result) });
-        }
-    }
+    service.text_cache.sweep(service.gpa, index);
 }
 
 fn run(service: *ContentService) void {
@@ -1130,7 +1031,8 @@ fn setMtime(path: [:0]const u8, mtime_s: i64) !void {
 /// Files in the text cache whose name starts with `prefix`.
 fn countText(service: *ContentService, prefix: []const u8) !usize {
     var text_dir_buffer: paths.Buffer = undefined;
-    const text_dir = try std.mem.printSentinel(&text_dir_buffer, "{s}", .{service.text_dir}, 0);
+    const directory = service.text_cache.directory;
+    const text_dir = try std.mem.printSentinel(&text_dir_buffer, "{s}", .{directory}, 0);
     const fd = try sys.openDir(text_dir);
     defer sys.close(fd);
     var iterator: sys.DirIter = .{ .fd = fd };
@@ -1489,7 +1391,7 @@ test "content service: a document whose extraction failed in passing is left out
         .io = testing.io,
         .root = tree.absolute,
         .cache_path = undefined,
-        .text_dir = undefined,
+        .text_cache = undefined,
         .search_pool = pool,
         .build_pool = pool,
         .options = .{},
