@@ -379,13 +379,7 @@ const Connection = struct {
             const bytes_sent = os.unix.send(self.fd, self.bytes.items[self.sent..]);
             if (failed(bytes_sent)) |errno| switch (errno) {
                 .INTR => continue,
-                .AGAIN => {
-                    if (self.watch == 0) {
-                        self.watch = c.g_unix_fd_add(self.fd, c.G_IO_OUT, &writableCallback, self);
-                        self.timer = c.g_timeout_add(client_timeout_ms, &timeoutCallback, self);
-                    }
-                    return;
-                },
+                .AGAIN => return self.watchWritable(),
                 // The client has gone (EPIPE, or Ctrl-C): nothing to answer.
                 else => {
                     log.debug("the client left before its answer: {t}", .{errno});
@@ -396,6 +390,15 @@ const Connection = struct {
         }
         assert(self.sent == self.bytes.items.len);
         self.close();
+    }
+
+    /// The client takes no more for now: `flush` again once it can. The
+    /// first time only; the deadline covers the whole answer.
+    fn watchWritable(self: *Connection) void {
+        assert(self.phase == .answer);
+        if (self.watch != 0) return;
+        self.watch = c.g_unix_fd_add(self.fd, c.G_IO_OUT, &writableCallback, self);
+        self.timer = c.g_timeout_add(client_timeout_ms, &timeoutCallback, self);
     }
 };
 
