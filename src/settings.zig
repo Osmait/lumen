@@ -196,7 +196,7 @@ pub const Settings = struct {
     /// known; a known key with a bad value keeps its current value.
     pub fn set(settings: *Settings, key: []const u8, value: []const u8) bool {
         if (std.meta.stringToEnum(Toggle, key)) |toggle| {
-            if (parseBool(value)) |on| settings.setToggle(toggle, on);
+            if (parseBool(value)) |enabled| settings.setToggle(toggle, enabled);
             return true;
         }
         if (std.meta.stringToEnum(Choice, key)) |choice| {
@@ -246,9 +246,9 @@ pub const Settings = struct {
         };
     }
 
-    pub fn setToggle(settings: *Settings, toggle: Toggle, on: bool) void {
+    pub fn setToggle(settings: *Settings, toggle: Toggle, enabled: bool) void {
         switch (toggle) {
-            inline else => |tag| @field(settings, @tagName(tag)) = on,
+            inline else => |tag| @field(settings, @tagName(tag)) = enabled,
         }
     }
 
@@ -288,13 +288,17 @@ pub const Settings = struct {
     }
 
     /// The current value of a choice as its text (what `setChoice` takes).
-    pub fn choiceValue(settings: *const Settings, choice: Choice, buf: []u8) []const u8 {
+    pub fn choiceValue(
+        settings: *const Settings,
+        choice: Choice,
+        number_buffer: []u8,
+    ) []const u8 {
         return switch (choice) {
             inline else => |tag| {
                 const value = @field(settings, @tagName(tag));
                 return switch (@typeInfo(@TypeOf(value))) {
                     .@"enum" => @tagName(value),
-                    .int => std.mem.print(buf, "{d}", .{value}) catch "",
+                    .int => std.mem.print(number_buffer, "{d}", .{value}) catch "",
                     else => value,
                 };
             },
@@ -303,11 +307,11 @@ pub const Settings = struct {
 
     pub const OpenWithError = error{ BadKey, BadApp } || std.mem.Allocator.Error;
 
-    /// `key` is a kind name or ".ext"; an empty `app` removes the entry
-    /// (back to the system default).
     /// An extension key: a dot, then a short token (".log", ".tar.gz").
     const extension_key_bytes_max = 16;
 
+    /// `key` is a kind name or ".ext"; an empty `app` removes the entry
+    /// (back to the system default).
     pub fn setOpenWith(settings: *Settings, key: []const u8, app: []const u8) OpenWithError!void {
         if (!isOpenWithKey(key)) return error.BadKey;
         var lowercase_buffer: [extension_key_bytes_max]u8 = undefined;
@@ -335,9 +339,9 @@ pub const Settings = struct {
 
     /// The app chosen for a file: its extension first, then its kind, then
     /// the kind it falls back to.
-    pub fn appFor(settings: *const Settings, ext_key: []const u8, kind: ?Kind) ?[]const u8 {
-        if (ext_key.len > 0) {
-            if (settings.open_with.get(ext_key)) |app| return app;
+    pub fn appFor(settings: *const Settings, extension_key: []const u8, kind: ?Kind) ?[]const u8 {
+        if (extension_key.len > 0) {
+            if (settings.open_with.get(extension_key)) |app| return app;
         }
         var kind_next = kind orelse return null;
         while (true) {
@@ -376,6 +380,13 @@ pub const Settings = struct {
         kept: []const []const u8,
     ) std.Io.Writer.Error!void {
         const source: Source = .{ .current = settings, .file = file, .kept_keys = kept };
+        try writeKnown(writer, source);
+        try settings.writeUnknown(writer);
+        try settings.writeOpenWith(writer);
+    }
+
+    /// The keys this version knows, with comments that say what each takes.
+    fn writeKnown(writer: *std.Io.Writer, source: Source) std.Io.Writer.Error!void {
         try writer.print(
             \\# Lumen settings. Change them from Lumen (search "Settings") or here:
             \\# Lumen reads this file again when its window opens.
@@ -429,10 +440,18 @@ pub const Settings = struct {
             source.value("terminal"),
             source.value("editor"),
         });
-        if (settings.unknown.items.len > 0) {
-            try writer.writeAll("\n# Not known to this version of Lumen\n");
-            for (settings.unknown.items) |line| try writer.print("{s}\n", .{line});
-        }
+    }
+
+    /// The lines read with keys this version does not know, as they were:
+    /// a newer version's settings survive a save by this one.
+    fn writeUnknown(settings: *const Settings, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (settings.unknown.items.len == 0) return;
+        try writer.writeAll("\n# Not known to this version of Lumen\n");
+        for (settings.unknown.items) |line| try writer.print("{s}\n", .{line});
+    }
+
+    /// The `[open-with]` section: the app chosen for each kind or extension.
+    fn writeOpenWith(settings: *const Settings, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.writeAll("\n" ++ open_with_section ++ "\n" ++
             \\# A file kind (folder pdf image video audio markdown html text office
             \\# archive) or an extension (.log) = the app's desktop file id
@@ -470,10 +489,10 @@ pub const Settings = struct {
         if (std.mem.findScalarLast(u8, path, '/')) |slash| try sys.mkdirP(path[0..slash]);
         var file = if (kept.len > 0) load(gpa, path.ptr) else Settings.init(gpa);
         defer file.deinit();
-        var out: std.Io.Writer.Allocating = .init(gpa);
-        defer out.deinit();
-        try settings.writeKeeping(&out.writer, &file, kept);
-        try sys.writeFileAtomic(path, out.written());
+        var output: std.Io.Writer.Allocating = .init(gpa);
+        defer output.deinit();
+        try settings.writeKeeping(&output.writer, &file, kept);
+        try sys.writeFileAtomic(path, output.written());
     }
 
     pub const Check = enum { ok, unknown_key, bad_value };
@@ -490,8 +509,8 @@ pub const Settings = struct {
             // `token_bytes_max` bytes: the buffer holds its copy.
             var buffer: [1024]u8 = undefined;
             comptime assert(buffer.len > token_bytes_max);
-            var fixed: std.heap.FixedBufferAllocator = .init(&buffer);
-            var probe: Settings = .{ .arena = .init(fixed.allocator()) };
+            var probe_allocator: std.heap.FixedBufferAllocator = .init(&buffer);
+            var probe: Settings = .{ .arena = .init(probe_allocator.allocator()) };
             return if (probe.setChoice(choice, value)) .ok else .bad_value;
         }
         if (std.meta.stringToEnum(Text, key)) |text| {
@@ -504,12 +523,12 @@ pub const Settings = struct {
 pub const Stamp = sys.Stamp;
 
 fn parseBool(text: []const u8) ?bool {
-    const yes = [_][]const u8{ "true", "on", "yes", "1" };
-    const no = [_][]const u8{ "false", "off", "no", "0" };
-    for (yes) |word| {
+    const words_true = [_][]const u8{ "true", "on", "yes", "1" };
+    const words_false = [_][]const u8{ "false", "off", "no", "0" };
+    for (words_true) |word| {
         if (std.ascii.eqlIgnoreCase(text, word)) return true;
     }
-    for (no) |word| {
+    for (words_false) |word| {
         if (std.ascii.eqlIgnoreCase(text, word)) return false;
     }
     return null;
@@ -639,12 +658,12 @@ test "open-with: extension beats kind, Markdown falls back to text" {
 }
 
 test "save is atomic and owner-only; load survives a missing file" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var rel: [4096]u8 = undefined;
-    var buf: [4096]u8 = undefined;
-    const dir = try sys.tmpDirPath(&tmp, &rel);
-    const path = try std.mem.printSentinel(&buf, "{s}/sub/settings.conf", .{dir}, 0);
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var dir_path_buffer: [4096]u8 = undefined;
+    var path_buffer: [4096]u8 = undefined;
+    const dir_path = try sys.tmpDirPath(&test_dir, &dir_path_buffer);
+    const path = try std.mem.printSentinel(&path_buffer, "{s}/sub/settings.conf", .{dir_path}, 0);
 
     var missing = Settings.load(testing.allocator, path);
     defer missing.deinit();
@@ -658,9 +677,11 @@ test "save is atomic and owner-only; load survives a missing file" {
     var back = Settings.load(testing.allocator, path);
     defer back.deinit();
     try testing.expectEqual(TextSize.small, back.text_size);
-    var st: std.os.linux.Statx = undefined;
-    _ = std.os.linux.statx(std.os.linux.AT.FDCWD, path, 0, .{ .MODE = true }, &st);
-    try testing.expectEqual(@as(u32, 0o600), st.mode & 0o777);
+    const linux = std.os.linux;
+    var status: linux.Statx = undefined;
+    const statx_result = linux.statx(linux.AT.FDCWD, path, 0, .{ .MODE = true }, &status);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(statx_result));
+    try testing.expectEqual(@as(u32, 0o600), status.mode & 0o777);
 
     try testing.expect(settings.setChoice(.text_size, "large"));
     try settings.save(testing.allocator, path, &.{});
