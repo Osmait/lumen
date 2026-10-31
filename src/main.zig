@@ -412,7 +412,7 @@ fn runNow(now: Request.Now, reply: *const Reply) c_int {
             return status_ok;
         },
         .text => |text| {
-            c.gtk_editable_set_text(@ptrCast(ui.entry), text.ptr);
+            c.gtk_editable_set_text(@ptrCast(ui.search_bar.entry), text.ptr);
             return status_ok;
         },
         .reload => {

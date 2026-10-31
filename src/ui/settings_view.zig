@@ -83,7 +83,7 @@ fn settingRow(
         switch (source) {
             .theme => .{
                 "theme",
-                themes.displayName(arena, ui.settings.theme, ui.preferDark()),
+                themes.displayName(arena, ui.settings.theme, ui.preferDark(), ui.customThemes()),
                 .{ .go = .themes },
             },
             .default_apps => .{
@@ -496,7 +496,7 @@ pub fn themeCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
     var out: std.ArrayList(Item) = .empty;
     styleCandidates(ui, arena, &out);
     const dark = ui.preferDark();
-    const auto_theme = themes.find(themes.auto_id, dark);
+    const auto_theme = themes.find(themes.auto_id, dark, &.{});
     out.append(arena, .{
         .key = "theme:auto",
         .title = "Automatic",
@@ -519,11 +519,11 @@ pub fn themeCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
         .{styleTitle(arena, ui.settings.style)},
         0,
     ) catch "Style Themes";
-    for (themes.custom) |*theme| {
+    for (ui.customThemes()) |*theme| {
         if (!theme.from_style) continue;
         out.append(arena, themeItem(ui, arena, theme, style_section)) catch break;
     }
-    for (themes.custom) |*theme| {
+    for (ui.customThemes()) |*theme| {
         if (theme.from_style) continue;
         out.append(arena, themeItem(ui, arena, theme, "Your Themes")) catch break;
     }

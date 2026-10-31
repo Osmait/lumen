@@ -3,6 +3,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const c = @import("c");
+const gtk = @import("gtk.zig");
 const item_mod = @import("../item.zig");
 const Ui = @import("Ui.zig");
 
@@ -13,10 +14,10 @@ pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
     const down = keyval == c.GDK_KEY_Down or
         (ctrl and (keyval == c.GDK_KEY_n or keyval == c.GDK_KEY_j));
     const up = keyval == c.GDK_KEY_Up or
-        (ctrl and (keyval == c.GDK_KEY_p or keyval == c.GDK_KEY_k and ui.panel_open));
+        (ctrl and (keyval == c.GDK_KEY_p or keyval == c.GDK_KEY_k and ui.panel.open));
     const enter = keyval == c.GDK_KEY_Return or keyval == c.GDK_KEY_KP_Enter;
 
-    if (ui.panel_open) {
+    if (ui.panel.open) {
         panelKey(ui, keyval, ctrl, down, up, enter);
         return 1;
     }
@@ -58,17 +59,17 @@ pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
 
 /// Keys while the action panel is open: they all go to it.
 fn panelKey(ui: *Ui, keyval: c_uint, ctrl: bool, down: bool, up: bool, enter: bool) void {
-    assert(ui.panel_open);
-    assert(ui.panel_entries.len > 0);
-    assert(ui.panel_selected < ui.panel_entries.len);
+    assert(ui.panel.open);
+    assert(ui.panel.entries.len > 0);
+    assert(ui.panel.selected < ui.panel.entries.len);
     if (keyval == c.GDK_KEY_Escape or (ctrl and keyval == c.GDK_KEY_k and !up)) {
-        ui.closePanel();
+        ui.panel.close();
     } else if (down) {
-        ui.selectPanel(@min(ui.panel_selected + 1, ui.panel_entries.len - 1));
+        ui.panel.select(@min(ui.panel.selected + 1, ui.panel.entries.len - 1));
     } else if (up) {
-        ui.selectPanel(ui.panel_selected -| 1);
+        ui.panel.select(ui.panel.selected -| 1);
     } else if (enter) {
-        ui.performEntry(ui.panel_entries[ui.panel_selected]);
+        ui.performEntry(ui.panel.entries[ui.panel.selected]);
     }
 }
 
@@ -81,7 +82,7 @@ fn escape(ui: *Ui) void {
         // The text is the value being edited: Esc leaves it unsaved.
         ui.goBack();
     } else if (ui.query().len > 0) {
-        c.gtk_editable_set_text(@ptrCast(ui.entry), "");
+        c.gtk_editable_set_text(gtk.editable(ui.search_bar.entry), "");
     } else if (ui.view != .root) ui.goBack() else ui.hide();
 }
 

@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const c = @import("c");
+const gtk = @import("gtk.zig");
 const core = @import("core");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
@@ -10,6 +11,7 @@ const themes = @import("themes.zig");
 const labels = @import("labels.zig");
 const os = @import("os");
 const pictures = @import("pictures.zig");
+const layout_mod = @import("../layout.zig");
 
 /// A small picture of a theme: its background, two lines of text and an
 /// accent dot. Each set of colours is drawn once and cached, init.lua's
@@ -99,17 +101,23 @@ fn fileKey(path: [*:0]const u8, width_px: c_int, height_px: c_int) ?u64 {
     return hash.final();
 }
 
-/// Icon size in result rows, from the Density setting (main thread).
-pub var icon_px: c_int = 32;
-/// Icons replaced by name: ~/.config/lumen/icons/<name>.svg (or .png) is
-/// used wherever the icon <name> would be. Name to path; the UI fills it.
-pub var renamed: std.StringHashMapUnmanaged([:0]const u8) = .empty;
-/// What rows show, from lumen.layout (main thread).
-pub var show: @import("../layout.zig").Show = .{};
-/// Subtitles after titles on the same line (lumen.layout's rows = "inline").
-pub var rows_inline = false;
-/// A row's parts in order (lumen.layout's row).
-pub var row_parts: @import("../layout.zig").Parts(@import("../layout.zig").RowPart) = .{};
+/// How result rows look, from the Density setting and lumen.layout. Ui
+/// keeps one (applyLayout, applyStructure, scanIconDir fill it) and hands
+/// it to the row builders.
+pub const RowLook = struct {
+    /// Icon size, from the Density setting.
+    icon_px: c_int = 32,
+    /// Icons replaced by name: ~/.config/lumen/icons/<name>.svg (or .png)
+    /// is used wherever the icon <name> would be. Name to path, both in
+    /// Ui.icon_arena.
+    renamed: std.StringHashMapUnmanaged([:0]const u8) = .empty,
+    /// What rows show.
+    show: layout_mod.Show = .{},
+    /// Subtitles after titles on the same line (rows = "inline").
+    rows_inline: bool = false,
+    /// A row's parts in order.
+    parts: layout_mod.Parts(layout_mod.RowPart) = .{},
+};
 
 /// An image file as an icon, decoded at twice `size` (sharp on HiDPI) and
 /// kept until the file changes: the same few icons show again and again.
@@ -131,47 +139,47 @@ fn fileTexture(path: [:0]const u8, size: c_int) ?*c.GdkTexture {
 /// the primary action while the row is selected.
 pub const RowParts = struct { hint: ?*c.GtkWidget = null, accessory: ?*c.GtkWidget = null };
 
-pub fn itemRow(item: Item, parts: *RowParts) *c.GtkWidget {
-    const row = c.gtk_list_box_row_new();
+pub fn itemRow(look: *const RowLook, item: Item, parts: *RowParts) *c.GtkWidget {
+    const row = gtk.listBoxRow();
     const box = hbox(12);
     // The parts in lumen.layout's order; those left out are not made.
-    for (row_parts.slice()) |part| switch (part) {
-        .icon => if (show.icons) c.gtk_box_append(@ptrCast(box), iconWidget(item.icon, icon_px)),
+    for (look.parts.slice()) |part| switch (part) {
+        .icon => if (look.show.icons) gtk.append(box, iconWidget(look, item.icon, look.icon_px)),
         .text => {
-            const text = if (rows_inline) hbox(10) else vbox(1);
-            c.gtk_widget_set_valign(text, c.GTK_ALIGN_CENTER);
-            c.gtk_widget_set_hexpand(text, 1);
+            const text = if (look.rows_inline) hbox(10) else vbox(1);
+            gtk.setValign(text, c.GTK_ALIGN_CENTER);
+            gtk.setHexpand(text, true);
             const title = shortLabel(item.title, "title");
-            c.gtk_label_set_ellipsize(@ptrCast(title), c.PANGO_ELLIPSIZE_END);
-            c.gtk_label_set_max_width_chars(@ptrCast(title), 60);
-            c.gtk_box_append(@ptrCast(text), title);
-            if (item.subtitle.len > 0 and show.subtitles) {
+            c.gtk_label_set_ellipsize(title, c.PANGO_ELLIPSIZE_END);
+            c.gtk_label_set_max_width_chars(title, 60);
+            gtk.append(text, title);
+            if (item.subtitle.len > 0 and look.show.subtitles) {
                 const sub = shortLabel(item.subtitle, "subtitle");
-                c.gtk_label_set_ellipsize(@ptrCast(sub), c.PANGO_ELLIPSIZE_END);
-                c.gtk_label_set_max_width_chars(@ptrCast(sub), 60);
-                c.gtk_box_append(@ptrCast(text), sub);
+                c.gtk_label_set_ellipsize(sub, c.PANGO_ELLIPSIZE_END);
+                c.gtk_label_set_max_width_chars(sub, 60);
+                gtk.append(text, sub);
             }
-            c.gtk_box_append(@ptrCast(box), text);
+            gtk.append(box, text);
         },
-        .accessory => if (item.accessory.len > 0 and show.accessories) {
-            parts.accessory = shortLabel(item.accessory, "accessory");
-            c.gtk_box_append(@ptrCast(box), parts.accessory.?);
+        .accessory => if (item.accessory.len > 0 and look.show.accessories) {
+            parts.accessory = gtk.widget(shortLabel(item.accessory, "accessory"));
+            gtk.append(box, parts.accessory.?);
         },
         .hint => {
-            parts.hint = label("", "hint");
-            c.gtk_widget_set_visible(parts.hint.?, 0);
-            c.gtk_box_append(@ptrCast(box), parts.hint.?);
+            parts.hint = gtk.widget(label("", "hint"));
+            gtk.setVisible(parts.hint.?, false);
+            gtk.append(box, parts.hint.?);
         },
     };
-    c.gtk_list_box_row_set_child(@ptrCast(row), box);
-    return row;
+    c.gtk_list_box_row_set_child(row, gtk.widget(box));
+    return gtk.widget(row);
 }
 
 /// A grid cell: a picture (an image file, scaled down as it is decoded) or
 /// a large icon, and the title under it. `w` is the cell's width.
-pub fn gridCell(item: Item, width_px: c_int) *c.GtkWidget {
+pub fn gridCell(look: *const RowLook, item: Item, width_px: c_int) *c.GtkWidget {
     const box = vbox(6);
-    c.gtk_widget_add_css_class(box, "cell");
+    gtk.addClass(box, "cell");
     const pic_h = @divTrunc(width_px * 5, 8);
     const key = if (item.image.len > 0) fileKey(item.image.ptr, width_px, pic_h) else null;
     const cached = if (key) |cache_key| GridPictures.ring.get(cache_key) else null;
@@ -181,31 +189,31 @@ pub fn gridCell(item: Item, width_px: c_int) *c.GtkWidget {
     ) else null) else null;
     const decode = key != null and cached == null;
     const shown = top orelse blk: {
-        const icon = iconWidget(item.icon, @min(@divTrunc(width_px, 2), 56));
-        c.gtk_widget_set_halign(icon, c.GTK_ALIGN_CENTER);
+        const icon = iconWidget(look, item.icon, @min(@divTrunc(width_px, 2), 56));
+        gtk.setHalign(icon, c.GTK_ALIGN_CENTER);
         // As tall as the picture on its way, so the cell keeps its size
         // when it comes.
-        c.gtk_widget_set_size_request(icon, -1, if (decode) pic_h else @min(pic_h, 64));
+        gtk.setSizeRequest(icon, -1, if (decode) pic_h else @min(pic_h, 64));
         break :blk icon;
     };
-    c.gtk_box_append(@ptrCast(box), shown);
+    gtk.append(box, shown);
     const title = shortLabel(item.title, "cell-title");
-    c.gtk_label_set_ellipsize(@ptrCast(title), c.PANGO_ELLIPSIZE_END);
-    c.gtk_label_set_xalign(@ptrCast(title), 0.5);
-    c.gtk_label_set_max_width_chars(@ptrCast(title), 1);
-    c.gtk_widget_set_hexpand(title, 1);
-    c.gtk_box_append(@ptrCast(box), title);
-    c.gtk_widget_set_size_request(box, width_px, -1);
-    if (decode) GridPictures.request(item.image, width_px, pic_h, key.?, box, shown);
-    return box;
+    c.gtk_label_set_ellipsize(title, c.PANGO_ELLIPSIZE_END);
+    c.gtk_label_set_xalign(title, 0.5);
+    c.gtk_label_set_max_width_chars(title, 1);
+    gtk.setHexpand(title, true);
+    gtk.append(box, title);
+    gtk.setSizeRequest(box, width_px, -1);
+    if (decode) GridPictures.request(item.image, width_px, pic_h, key.?, gtk.widget(box), shown);
+    return gtk.widget(box);
 }
 
 fn cellPicture(tex: *c.GdkTexture, height_px: c_int) *c.GtkWidget {
-    const pic = c.gtk_picture_new_for_paintable(tex);
-    c.gtk_picture_set_content_fit(@ptrCast(pic), c.GTK_CONTENT_FIT_COVER);
-    c.gtk_widget_set_size_request(pic, -1, height_px);
-    c.gtk_widget_set_overflow(pic, c.GTK_OVERFLOW_HIDDEN);
-    return pic;
+    const pic = gtk.pictureFromPaintable(tex);
+    c.gtk_picture_set_content_fit(pic, c.GTK_CONTENT_FIT_COVER);
+    gtk.setSizeRequest(pic, -1, height_px);
+    c.gtk_widget_set_overflow(gtk.widget(pic), c.GTK_OVERFLOW_HIDDEN);
+    return gtk.widget(pic);
 }
 
 /// Grid pictures. Every cell decoded its image on the UI thread, uncached,
@@ -265,10 +273,10 @@ pub fn forgetGridPictures() void {
 }
 
 pub fn calcRow(item: Item) *c.GtkWidget {
-    const row = c.gtk_list_box_row_new();
-    c.gtk_widget_add_css_class(row, "calc");
+    const row = gtk.listBoxRow();
+    gtk.addClass(row, "calc");
     const box = hbox(0);
-    c.gtk_box_set_homogeneous(@ptrCast(box), 1);
+    c.gtk_box_set_homogeneous(box, 1);
 
     var buf: [80:0]u8 = undefined;
     const value = std.fmt.parseFloat(f64, item.detail) catch 0;
@@ -277,49 +285,51 @@ pub fn calcRow(item: Item) *c.GtkWidget {
 
     const left_tag: [:0]const u8 = if (item.subtitle.len > 0) item.subtitle else "Expression";
     const right_tag: [:0]const u8 = if (item.accessory.len > 0) item.accessory else "Answer";
-    c.gtk_box_append(@ptrCast(box), calcSide(item.title, left_tag));
+    gtk.append(box, calcSide(item.title, left_tag));
     const arrow = label("→", "calc-arrow");
-    c.gtk_label_set_xalign(@ptrCast(arrow), 0.5);
-    c.gtk_box_append(@ptrCast(box), arrow);
-    c.gtk_box_append(@ptrCast(box), calcSide(buf[0..shown.len :0], right_tag));
-    c.gtk_list_box_row_set_child(@ptrCast(row), box);
-    return row;
+    c.gtk_label_set_xalign(arrow, 0.5);
+    gtk.append(box, arrow);
+    gtk.append(box, calcSide(buf[0..shown.len :0], right_tag));
+    c.gtk_list_box_row_set_child(row, gtk.widget(box));
+    return gtk.widget(row);
 }
 
 pub fn calcSide(value: [:0]const u8, tag: [:0]const u8) *c.GtkWidget {
     const side = vbox(10);
-    c.gtk_widget_set_valign(side, c.GTK_ALIGN_CENTER);
+    gtk.setValign(side, c.GTK_ALIGN_CENTER);
     const value_label = label(value, "calc-value");
-    c.gtk_label_set_xalign(@ptrCast(value_label), 0.5);
-    c.gtk_label_set_ellipsize(@ptrCast(value_label), c.PANGO_ELLIPSIZE_END);
-    c.gtk_box_append(@ptrCast(side), value_label);
+    c.gtk_label_set_xalign(value_label, 0.5);
+    c.gtk_label_set_ellipsize(value_label, c.PANGO_ELLIPSIZE_END);
+    gtk.append(side, value_label);
     const tag_label = label(tag, "calc-label");
-    c.gtk_widget_set_halign(tag_label, c.GTK_ALIGN_CENTER);
-    c.gtk_box_append(@ptrCast(side), tag_label);
-    return side;
+    gtk.setHalign(tag_label, c.GTK_ALIGN_CENTER);
+    gtk.append(side, tag_label);
+    return gtk.widget(side);
 }
 
-pub fn iconWidget(icon: item_mod.Icon, size: c_int) *c.GtkWidget {
+pub fn iconWidget(look: *const RowLook, icon: item_mod.Icon, size: c_int) *c.GtkWidget {
     switch (icon) {
         .logo => |logo| {
-            const texture = logos.texture(logo.name) orelse return iconWidget(.none, size);
-            const img = c.gtk_image_new_from_paintable(texture);
-            c.gtk_image_set_pixel_size(@ptrCast(img), if (logo.on_light) size - 6 else size);
-            c.gtk_widget_add_css_class(img, if (logo.on_light) "logo-plate" else "logo");
-            c.gtk_widget_set_valign(img, c.GTK_ALIGN_CENTER);
-            return img;
+            const texture = logos.texture(logo.name) orelse return iconWidget(look, .none, size);
+            const img = gtk.imageFromPaintable(texture);
+            c.gtk_image_set_pixel_size(img, if (logo.on_light) size - 6 else size);
+            gtk.addClass(img, if (logo.on_light) "logo-plate" else "logo");
+            gtk.setValign(img, c.GTK_ALIGN_CENTER);
+            return gtk.widget(img);
         },
         .gicon => |gicon| {
-            const img = c.gtk_image_new_from_gicon(gicon);
-            c.gtk_image_set_pixel_size(@ptrCast(img), size);
-            c.gtk_widget_add_css_class(img, "app-icon");
-            return img;
+            const img = gtk.imageFromGicon(gicon);
+            c.gtk_image_set_pixel_size(img, size);
+            gtk.addClass(img, "app-icon");
+            return gtk.widget(img);
         },
         .tile => |tile| {
-            if (renamed.get(tile.name)) |path| return iconWidget(.{ .file = path }, size);
-            const img = c.gtk_image_new_from_icon_name(tile.name);
-            c.gtk_image_set_pixel_size(@ptrCast(img), @divTrunc(size, 2) + 2);
-            c.gtk_widget_add_css_class(img, "tile");
+            if (look.renamed.get(tile.name)) |path| {
+                return iconWidget(look, .{ .file = path }, size);
+            }
+            const img = gtk.imageFromIconName(tile.name);
+            c.gtk_image_set_pixel_size(img, @divTrunc(size, 2) + 2);
+            gtk.addClass(img, "tile");
             var cls: [24:0]u8 = undefined;
             const name = std.mem.printSentinel(
                 &cls,
@@ -327,31 +337,32 @@ pub fn iconWidget(icon: item_mod.Icon, size: c_int) *c.GtkWidget {
                 .{tile.color},
                 0,
             ) catch "tile-gray";
-            c.gtk_widget_add_css_class(img, name.ptr);
-            c.gtk_widget_set_valign(img, c.GTK_ALIGN_CENTER);
-            return img;
+            gtk.addClass(img, name.ptr);
+            gtk.setValign(img, c.GTK_ALIGN_CENTER);
+            return gtk.widget(img);
         },
-        .emoji => |emoji| return label(emoji, "emoji"),
+        .emoji => |emoji| return gtk.widget(label(emoji, "emoji")),
         .named => |name| {
-            if (renamed.get(name)) |path| return iconWidget(.{ .file = path }, size);
-            const img = c.gtk_image_new_from_icon_name(name);
-            c.gtk_image_set_pixel_size(@ptrCast(img), size);
-            c.gtk_widget_add_css_class(img, "app-icon");
-            return img;
+            if (look.renamed.get(name)) |path| return iconWidget(look, .{ .file = path }, size);
+            const img = gtk.imageFromIconName(name);
+            c.gtk_image_set_pixel_size(img, size);
+            gtk.addClass(img, "app-icon");
+            return gtk.widget(img);
         },
         .swatch => |sw| {
             const texture = swatchTexture(sw.bg, sw.fg, sw.accent) orelse return iconWidget(
+                look,
                 .none,
                 size,
             );
-            const img = c.gtk_image_new_from_paintable(@ptrCast(texture));
-            c.gtk_image_set_pixel_size(@ptrCast(img), size);
-            c.gtk_widget_set_valign(img, c.GTK_ALIGN_CENTER);
-            return img;
+            const img = gtk.imageFromPaintable(texture);
+            c.gtk_image_set_pixel_size(img, size);
+            gtk.setValign(img, c.GTK_ALIGN_CENTER);
+            return gtk.widget(img);
         },
         .badge => |badge| {
             const badge_label = label(badge.text, "badge");
-            c.gtk_label_set_xalign(@ptrCast(badge_label), 0.5);
+            c.gtk_label_set_xalign(badge_label, 0.5);
             var cls: [24:0]u8 = undefined;
             const name = std.mem.printSentinel(
                 &cls,
@@ -359,24 +370,24 @@ pub fn iconWidget(icon: item_mod.Icon, size: c_int) *c.GtkWidget {
                 .{badge.color},
                 0,
             ) catch "badge-gray";
-            c.gtk_widget_add_css_class(badge_label, name.ptr);
+            gtk.addClass(badge_label, name.ptr);
             // Longer extensions get a smaller font so the tile keeps its size.
-            if (badge.text.len >= 4) c.gtk_widget_add_css_class(badge_label, "badge-long");
-            c.gtk_widget_set_valign(badge_label, c.GTK_ALIGN_CENTER);
-            return badge_label;
+            if (badge.text.len >= 4) gtk.addClass(badge_label, "badge-long");
+            gtk.setValign(badge_label, c.GTK_ALIGN_CENTER);
+            return gtk.widget(badge_label);
         },
         .file => |path| {
-            const tex = fileTexture(path, size) orelse return iconWidget(.none, size);
-            const img = c.gtk_image_new_from_paintable(@ptrCast(tex));
-            c.gtk_image_set_pixel_size(@ptrCast(img), size);
-            c.gtk_widget_add_css_class(img, "file-icon");
-            c.gtk_widget_set_valign(img, c.GTK_ALIGN_CENTER);
-            return img;
+            const tex = fileTexture(path, size) orelse return iconWidget(look, .none, size);
+            const img = gtk.imageFromPaintable(tex);
+            c.gtk_image_set_pixel_size(img, size);
+            gtk.addClass(img, "file-icon");
+            gtk.setValign(img, c.GTK_ALIGN_CENTER);
+            return gtk.widget(img);
         },
         .none => {
-            const img = c.gtk_image_new_from_icon_name("application-x-executable");
-            c.gtk_image_set_pixel_size(@ptrCast(img), size);
-            return img;
+            const img = gtk.imageFromIconName("application-x-executable");
+            c.gtk_image_set_pixel_size(img, size);
+            return gtk.widget(img);
         },
     }
 }
@@ -387,18 +398,14 @@ pub fn connect(instance: anytype, signal: [*:0]const u8, handler: anytype, data:
     _ = c.g_signal_connect_data(@ptrCast(instance), signal, @ptrCast(handler), data, null, 0);
 }
 
-pub fn hbox(spacing: c_int) *c.GtkWidget {
-    return c.gtk_box_new(c.GTK_ORIENTATION_HORIZONTAL, spacing);
-}
+pub const hbox = gtk.hbox;
+pub const vbox = gtk.vbox;
 
-pub fn vbox(spacing: c_int) *c.GtkWidget {
-    return c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, spacing);
-}
-
-pub fn label(text: [*:0]const u8, css: ?[*:0]const u8) *c.GtkWidget {
-    const label_widget = c.gtk_label_new(text);
-    c.gtk_label_set_xalign(@ptrCast(label_widget), 0);
-    if (css) |cls| c.gtk_widget_add_css_class(label_widget, cls);
+/// A label aligned to the start, with the CSS class `css`.
+pub fn label(text: [*:0]const u8, css: ?[*:0]const u8) *c.GtkLabel {
+    const label_widget = gtk.label(text);
+    c.gtk_label_set_xalign(label_widget, 0);
+    if (css) |cls| gtk.addClass(label_widget, cls);
     return label_widget;
 }
 
@@ -409,7 +416,7 @@ pub fn label(text: [*:0]const u8, css: ?[*:0]const u8) *c.GtkWidget {
 pub const row_text_bytes_max = 512;
 
 /// A label for row text, cut to `row_text_bytes_max` bytes on a character boundary.
-fn shortLabel(text: [:0]const u8, css: ?[*:0]const u8) *c.GtkWidget {
+fn shortLabel(text: [:0]const u8, css: ?[*:0]const u8) *c.GtkLabel {
     if (text.len <= row_text_bytes_max) return label(text, css);
     var buf: [row_text_bytes_max + 1]u8 = undefined;
     const length = core.utf8.floorBoundary(text, row_text_bytes_max);

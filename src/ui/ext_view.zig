@@ -4,6 +4,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const c = @import("c");
+const gtk = @import("gtk.zig");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
 const Host = @import("../ext/Host.zig");
@@ -80,21 +81,14 @@ pub fn command(ui: *Ui) ?*const Host.Command {
 fn onRegistry(registry: *Host.Registry, ctx: ?*anyopaque) void {
     const ui: *Ui = @ptrCast(@alignCast(ctx.?));
     const old = ui.ext_registry;
-    const old_result = ui.ext_result;
-    const old_root = ui.ext_root;
     ui.ext_registry = registry;
-    ui.ext_result = null;
-    ui.ext_root = null;
-    ui.ext_pending = false;
-    ui.ext_root_pending = false;
-    // Answers still in flight come from the old files; resetting the
-    // generations drops them when they arrive.
-    ui.ext_gen = 0;
-    ui.ext_root_gen = 0;
+    // Answers still in flight come from the old files: forgetting the
+    // requests drops them when they arrive.
+    const old_result = ui.ext_list.forget();
+    const old_root = ui.ext_root_search.forget();
     // What the views point at by index, found again by id (before anything
     // rebuilds them): the open view may have lost it.
     const lost = if (old) |old_value| remap(ui, old_value, registry) else false;
-    themes.custom = registry.themes;
     ui.layout = registry.layout;
     ui.applyStructure();
     // Rows and theme names point into the old registry: rebuild before
@@ -132,12 +126,10 @@ fn onRegistry(registry: *Host.Registry, ctx: ?*anyopaque) void {
 
 fn onRoot(answer: *Host.RootResult, ctx: ?*anyopaque) void {
     const ui: *Ui = @ptrCast(@alignCast(ctx.?));
-    if (answer.gen != ui.ext_root_gen) {
+    if (!ui.ext_root_search.current(answer)) {
         answer.destroy(ui.gpa);
         return;
     }
-    // Each answer is delivered once: the one shown is never handed back.
-    assert(answer != ui.ext_root);
     const registry = ui.ext_registry orelse {
         answer.destroy(ui.gpa);
         return;
@@ -146,27 +138,28 @@ fn onRoot(answer: *Host.RootResult, ctx: ?*anyopaque) void {
         if (item.icon == .none and
             sec.command < registry.commands.len) item.icon = registry.commands[sec.command].icon;
     };
-    ui.ext_root_pending = false;
-    const old = ui.ext_root;
+    const last = ui.ext_root_search.latest;
     const typed: ?[]const u8 = if (ui.view == .root) std.mem.trim(u8, ui.query(), " ") else null;
-    switch (rootAnswer(
+    const decision = rootAnswer(
         typed,
-        if (old) |old_value| old_value.query else null,
+        if (last) |last_answer| last_answer.query else null,
         answer.query,
         answer.sections.len > 0,
-    )) {
-        .show => {
-            ui.ext_root = answer;
-            ui.keepSelection();
-            ui.refresh();
+    );
+    switch (decision) {
+        .show, .keep => {
+            const replaced = ui.ext_root_search.take(answer);
+            if (decision == .show) {
+                ui.keepSelection();
+                ui.refresh();
+            }
+            if (replaced) |replaced_answer| replaced_answer.destroy(ui.gpa);
         },
-        .keep => ui.ext_root = answer,
         .drop => {
+            ui.ext_root_search.answered();
             answer.destroy(ui.gpa);
-            return;
         },
     }
-    if (old) |old_value| old_value.destroy(ui.gpa);
 }
 
 const RootAnswer = enum {
@@ -205,7 +198,7 @@ pub fn addRootSections(ui: *Ui, query: []const u8) void {
     var any = false;
     for (registry.commands) |cmd| any = any or cmd.root;
     if (!any or query.len < 2) return;
-    if (ui.ext_root) |r| if (std.mem.eql(u8, r.query, query)) {
+    if (ui.ext_root_search.latest) |r| if (std.mem.eql(u8, r.query, query)) {
         for (r.sections) |sec| {
             if (sec.command >= registry.commands.len) continue;
             ui.addSection(registry.commands[sec.command].title);
@@ -213,29 +206,23 @@ pub fn addRootSections(ui: *Ui, query: []const u8) void {
         }
         return;
     };
-    const asked = ui.ext_root_pending and ui.ext_root_asked.eql(query);
-    if (asked) return;
-    ui.ext_root_asked.set(query);
-    ui.ext_root_gen = host.root(registry.gen, query);
-    ui.ext_root_pending = true;
+    if (ui.ext_root_search.asking(query)) return;
+    ui.ext_root_search.sent(host.root(registry.gen, query), query);
 }
 
 fn onList(answer: *Host.ListResult, ctx: ?*anyopaque) void {
     const ui: *Ui = @ptrCast(@alignCast(ctx.?));
-    if (answer.gen != ui.ext_gen) {
+    if (!ui.ext_list.current(answer)) {
         answer.destroy(ui.gpa);
         return;
     }
-    assert(answer != ui.ext_result);
     if (answer.err) |e| log.warn("{s}: {s}", .{ if (command(ui)) |cmd| cmd.id else "?", e });
     // Rows without an icon take their command's. The icon points into the
     // registry, which outlives the result: a reload destroys results first.
     if (command(ui)) |cmd| for (answer.items) |*item| {
         if (item.icon == .none) item.icon = cmd.icon;
     };
-    const old = ui.ext_result;
-    ui.ext_result = answer;
-    ui.ext_pending = false;
+    const old = ui.ext_list.take(answer);
     if (ui.view == .ext) {
         ui.keepSelection();
         ui.rebuild();
@@ -389,7 +376,7 @@ pub fn rootItems(ui: *Ui, arena: std.mem.Allocator) []const Item {
 
 /// The open command's rows before filtering.
 pub fn base(ui: *Ui) []Item {
-    const r = ui.ext_result orelse return &.{};
+    const r = ui.ext_list.latest orelse return &.{};
     return if (r.command == ui.ext_cmd and r.err == null) r.items else &.{};
 }
 
@@ -406,8 +393,8 @@ pub fn enter(ui: *Ui) void {
 pub fn waitingForSearch(ui: *Ui, query: []const u8) bool {
     const cmd = command(ui) orelse return false;
     if (cmd.mode != .search) return false;
-    const r = ui.ext_result orelse return false;
-    if (r != ui.ext_shown) return false;
+    if (!ui.ext_list.showingLatest()) return false;
+    const r = ui.ext_list.latest.?;
     if (r.command == ui.ext_cmd and std.mem.eql(u8, r.query, query)) return false;
     _ = prepare(ui, query);
     return true;
@@ -419,28 +406,25 @@ pub fn waitingForSearch(ui: *Ui, query: []const u8) bool {
 pub fn prepare(ui: *Ui, query: []const u8) bool {
     const cmd = command(ui) orelse return true;
     if (cmd.mode != .search) return true;
-    const answered = if (ui.ext_result) |result|
+    const answered = if (ui.ext_list.latest) |result|
         result.command == ui.ext_cmd and std.mem.eql(u8, result.query, query)
     else
         false;
-    const asked = ui.ext_pending and ui.ext_asked.eql(query);
-    if (!answered and !asked) ask(ui, query);
+    if (!answered and !ui.ext_list.asking(query)) ask(ui, query);
     return false;
 }
 
 fn ask(ui: *Ui, query: []const u8) void {
     const host = ui.ext_host orelse return;
     const registry = ui.ext_registry orelse return;
-    ui.ext_asked.set(query);
-    ui.ext_gen = host.list(registry.gen, ui.ext_cmd, query);
-    ui.ext_pending = true;
+    ui.ext_list.sent(host.list(registry.gen, ui.ext_cmd, query), query);
 }
 
 pub fn emptyText(ui: *Ui, arena: std.mem.Allocator, query: []const u8) [:0]const u8 {
     const cmd = command(ui) orelse return "No Results";
-    if (ui.ext_result) |r| if (r.command == ui.ext_cmd) if (r.err) |e|
+    if (ui.ext_list.latest) |r| if (r.command == ui.ext_cmd) if (r.err) |e|
         return arena.printSentinel("Error: {s}", .{firstLine(arena, e)}, 0) catch "Error";
-    if (ui.ext_pending) return "Loading...";
+    if (ui.ext_list.pending) return "Loading...";
     if (cmd.mode == .search and query.len == 0) return "Type to search";
     return "No Results";
 }
@@ -487,7 +471,7 @@ pub fn perform(ui: *Ui, action_index: u8) void {
     const row = item.action.ext_item;
     if (action_index >= row.actions.len) return;
     if (item.confirm and action_index == 0 and ui.needsConfirm(item)) return;
-    ui.closePanel();
+    ui.panel.close();
     switch (row.actions[action_index]) {
         .lua => {
             const host = ui.ext_host orelse return;
@@ -568,24 +552,24 @@ pub fn openTarget(ui: *Ui, target: []const u8, text: ?[*:0]const u8) bool {
                 return true;
             },
             .form => {
-                if (c.gtk_widget_get_visible(ui.window) == 0) ui.show();
+                if (!gtk.isVisible(ui.window)) ui.show();
                 form_view.open(ui, i);
                 return true;
             },
             .list, .search => {},
         }
         ui.ext_cmd = i;
-        if (c.gtk_widget_get_visible(ui.window) == 0) {
+        if (!gtk.isVisible(ui.window)) {
             ui.showWith(.ext, text);
         } else {
             ui.navigate(.ext);
-            if (text) |t| c.gtk_editable_set_text(@ptrCast(ui.entry), t);
+            if (text) |t| c.gtk_editable_set_text(gtk.editable(ui.search_bar.entry), t);
         }
         return true;
     };
     const view = std.meta.stringToEnum(item_mod.View, target) orelse return false;
     if (view == .ext or view == .choose) return false;
-    if (c.gtk_widget_get_visible(ui.window) == 0) ui.showWith(view, text) else ui.navigate(view);
+    if (!gtk.isVisible(ui.window)) ui.showWith(view, text) else ui.navigate(view);
     return true;
 }
 
