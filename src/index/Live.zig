@@ -248,7 +248,7 @@ pub fn entriesLive(live: *const Live) usize {
 
 /// Bytes the two stores take, mapped or in memory.
 pub fn indexBytes(live: *const Live) usize {
-    return live.base.buf.len + live.delta.store.buf.len;
+    return live.base.bytes.len + live.delta.store.bytes.len;
 }
 
 /// Directories inotify could not watch (the limit was reached).

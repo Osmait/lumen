@@ -53,7 +53,7 @@ pub fn main(init: std.process.Init) !void {
         @as(f64, @floatFromInt(store.len())) / (ms(stats.ns) * 1000),
         @as(
             f64,
-            @floatFromInt(store.buf.len),
+            @floatFromInt(store.bytes.len),
         ) / 1e6,
     });
 
