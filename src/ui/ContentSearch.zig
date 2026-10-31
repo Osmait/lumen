@@ -133,7 +133,8 @@ pub fn submit(content_search: *ContentSearch, query: []const u8, start_ns: u64) 
 fn run(content_search: *ContentSearch) void {
     var seen: u32 = 0;
     while (true) {
-        while (content_search.generation.load(.acquire) == seen and !content_search.stop.load(.acquire)) {
+        while (content_search.generation.load(.acquire) == seen) {
+            if (content_search.stop.load(.acquire)) break;
             content_search.io.futexWaitUncancelable(u32, &content_search.generation.raw, seen);
         }
         if (content_search.stop.load(.acquire)) return;

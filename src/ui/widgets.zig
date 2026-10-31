@@ -23,15 +23,15 @@ pub fn swatchTexture(background: u24, foreground: u24, accent: u24) ?*c.GdkTextu
     };
     const colors = (@as(u72, background) << 48) | (@as(u72, foreground) << 24) | accent;
     if (Cache.ring.get(colors)) |texture| return texture;
-    const size = swatch.size_px;
-    var pixels: [size * size * swatch.bytes_per_pixel]u8 = undefined;
+    const side_px = swatch.size_px;
+    var pixels: [side_px * side_px * swatch.bytes_per_pixel]u8 = undefined;
     const radius = swatch.corner_radius_px;
-    for (0..size) |y| for (0..size) |x| {
+    for (0..side_px) |y| for (0..side_px) |x| {
         const center_x: f32 = @as(f32, @floatFromInt(x)) + 0.5;
         const center_y: f32 = @as(f32, @floatFromInt(y)) + 0.5;
         // Rounded square: distance outside the inner rectangle.
-        const outside_x = @max(@max(radius - center_x, center_x - (size - radius)), 0);
-        const outside_y = @max(@max(radius - center_y, center_y - (size - radius)), 0);
+        const outside_x = @max(@max(radius - center_x, center_x - (side_px - radius)), 0);
+        const outside_y = @max(@max(radius - center_y, center_y - (side_px - radius)), 0);
         const distance = @sqrt(outside_x * outside_x + outside_y * outside_y);
         const coverage = std.math.clamp(radius - distance + 0.5, 0, 1);
         const edge = distance > radius - swatch.outline_px;
@@ -46,7 +46,7 @@ pub fn swatchTexture(background: u24, foreground: u24, accent: u24) ?*c.GdkTextu
         if (dot_x * dot_x + dot_y * dot_y <= swatch.dot_radius_px * swatch.dot_radius_px) {
             color = accent;
         }
-        const offset = (y * size + x) * swatch.bytes_per_pixel;
+        const offset = (y * side_px + x) * swatch.bytes_per_pixel;
         pixels[offset] = @intCast(color >> 16);
         pixels[offset + 1] = @intCast((color >> 8) & 0xff);
         pixels[offset + 2] = @intCast(color & 0xff);
@@ -61,8 +61,9 @@ pub fn swatchTexture(background: u24, foreground: u24, accent: u24) ?*c.GdkTextu
     };
     const bytes = c.g_bytes_new(&pixels, pixels.len);
     defer c.g_bytes_unref(bytes);
-    const stride = size * swatch.bytes_per_pixel;
-    const texture = c.gdk_memory_texture_new(size, size, c.GDK_MEMORY_R8G8B8A8, bytes, stride);
+    const stride = side_px * swatch.bytes_per_pixel;
+    const format = c.GDK_MEMORY_R8G8B8A8;
+    const texture = c.gdk_memory_texture_new(side_px, side_px, format, bytes, stride);
     Cache.ring.put(colors, texture);
     return texture;
 }
@@ -192,16 +193,16 @@ pub const RowLook = struct {
     parts: layout_mod.Parts(layout_mod.RowPart) = .{},
 };
 
-/// An image file as an icon, decoded at twice `size` (sharp on HiDPI) and
+/// An image file as an icon, decoded at twice `size_px` (sharp on HiDPI) and
 /// kept until the file changes: the same few icons show again and again.
 /// Decoded on the UI thread, so within the small `pictures.icon_limits`.
-fn fileTexture(path: [:0]const u8, size: c_int) ?*c.GdkTexture {
+fn fileTexture(path: [:0]const u8, size_px: c_int) ?*c.GdkTexture {
     const Cache = struct {
         var ring: TextureRing(file_icon_cache_entries, u64) = .{};
     };
-    const key = fileKey(path.ptr, size * 2, size * 2) orelse return null;
+    const key = fileKey(path.ptr, size_px * 2, size_px * 2) orelse return null;
     if (Cache.ring.get(key)) |texture| return texture;
-    const decoded = pictures.decodeImage(path.ptr, size * 2, size * 2, pictures.icon_limits);
+    const decoded = pictures.decodeImage(path.ptr, size_px * 2, size_px * 2, pictures.icon_limits);
     defer if (decoded) |pixbuf| c.g_object_unref(pixbuf);
     const texture = if (decoded) |pixbuf| c.gdk_texture_new_for_pixbuf(pixbuf) else null;
     Cache.ring.put(key, texture);
@@ -393,66 +394,68 @@ pub fn calcSide(value: [:0]const u8, tag: [:0]const u8) *c.GtkWidget {
     return gtk.widget(side);
 }
 
-pub fn iconWidget(look: *const RowLook, icon: item_mod.Icon, size: c_int) *c.GtkWidget {
+pub fn iconWidget(look: *const RowLook, icon: item_mod.Icon, size_px: c_int) *c.GtkWidget {
     switch (icon) {
         .logo => |logo| {
-            const texture = logos.texture(logo.name) orelse return iconWidget(look, .none, size);
+            const texture = logos.texture(logo.name) orelse return iconWidget(look, .none, size_px);
             const image = gtk.imageFromPaintable(texture);
-            c.gtk_image_set_pixel_size(image, if (logo.on_light) size - 6 else size);
+            c.gtk_image_set_pixel_size(image, if (logo.on_light) size_px - 6 else size_px);
             gtk.addClass(image, if (logo.on_light) "logo-plate" else "logo");
             gtk.setValign(image, c.GTK_ALIGN_CENTER);
             return gtk.widget(image);
         },
         .gicon => |gicon| {
             const image = gtk.imageFromGicon(gicon);
-            c.gtk_image_set_pixel_size(image, size);
+            c.gtk_image_set_pixel_size(image, size_px);
             gtk.addClass(image, css_class.app_icon);
             return gtk.widget(image);
         },
         .tile => |tile| {
             if (look.renamed.get(tile.name)) |path| {
-                return iconWidget(look, .{ .file = path }, size);
+                return iconWidget(look, .{ .file = path }, size_px);
             }
-            return tileIcon(tile, size);
+            return tileIcon(tile, size_px);
         },
         .emoji => |emoji| return gtk.widget(label(emoji, "emoji")),
         .named => |name| {
-            if (look.renamed.get(name)) |path| return iconWidget(look, .{ .file = path }, size);
+            if (look.renamed.get(name)) |path| return iconWidget(look, .{ .file = path }, size_px);
             const image = gtk.imageFromIconName(name);
-            c.gtk_image_set_pixel_size(image, size);
+            c.gtk_image_set_pixel_size(image, size_px);
             gtk.addClass(image, css_class.app_icon);
             return gtk.widget(image);
         },
         .swatch => |colors| {
             const texture = swatchTexture(colors.bg, colors.fg, colors.accent) orelse {
-                return iconWidget(look, .none, size);
+                return iconWidget(look, .none, size_px);
             };
             const image = gtk.imageFromPaintable(texture);
-            c.gtk_image_set_pixel_size(image, size);
+            c.gtk_image_set_pixel_size(image, size_px);
             gtk.setValign(image, c.GTK_ALIGN_CENTER);
             return gtk.widget(image);
         },
         .badge => |badge| return badgeIcon(badge),
         .file => |path| {
-            const texture = fileTexture(path, size) orelse return iconWidget(look, .none, size);
+            const texture = fileTexture(path, size_px) orelse {
+                return iconWidget(look, .none, size_px);
+            };
             const image = gtk.imageFromPaintable(texture);
-            c.gtk_image_set_pixel_size(image, size);
+            c.gtk_image_set_pixel_size(image, size_px);
             gtk.addClass(image, "file-icon");
             gtk.setValign(image, c.GTK_ALIGN_CENTER);
             return gtk.widget(image);
         },
         .none => {
             const image = gtk.imageFromIconName("application-x-executable");
-            c.gtk_image_set_pixel_size(image, size);
+            c.gtk_image_set_pixel_size(image, size_px);
             return gtk.widget(image);
         },
     }
 }
 
 /// A symbolic icon on a tile of the tile's colour, half the icon's size.
-fn tileIcon(tile: @FieldType(item_mod.Icon, "tile"), size: c_int) *c.GtkWidget {
+fn tileIcon(tile: @FieldType(item_mod.Icon, "tile"), size_px: c_int) *c.GtkWidget {
     const image = gtk.imageFromIconName(tile.name);
-    c.gtk_image_set_pixel_size(image, @divTrunc(size, 2) + 2);
+    c.gtk_image_set_pixel_size(image, @divTrunc(size_px, 2) + 2);
     gtk.addClass(image, "tile");
     var class_bytes: [24:0]u8 = undefined;
     const class = std.mem.printSentinel(
