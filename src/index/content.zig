@@ -23,6 +23,7 @@
 //! lists in segment order.
 
 const std = @import("std");
+const paths = @import("paths.zig");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -685,7 +686,7 @@ pub fn readPlain(
     buf: *std.ArrayList(u8),
 ) std.mem.Allocator.Error!bool {
     buf.clearRetainingCapacity();
-    var path_buffer: [4096]u8 = undefined;
+    var path_buffer: paths.Buffer = undefined;
     const path_z = std.mem.printSentinel(&path_buffer, "{s}", .{path}, 0) catch return false;
     // Not a plain open: the path may have become a FIFO since it was indexed.
     const fd = sys.openRegular(path_z) catch return false;
@@ -1838,9 +1839,9 @@ test "candidates equal a brute-force scan, across segments, after save/open" {
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
+    var dbuf: paths.Buffer = undefined;
     const dir = try sys.tmpDirPath(&tmp, &dbuf);
-    var pbuf: [4096]u8 = undefined;
+    var pbuf: paths.Buffer = undefined;
     const p = try std.mem.printSentinel(&pbuf, "{s}/content.idx", .{dir}, 0);
     try ix.save(p);
     var mapped = try Index.open(p);
@@ -1913,9 +1914,9 @@ test "update: edited and deleted documents leave, new ones join, old ids keep th
 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
+    var dbuf: paths.Buffer = undefined;
     const dir = try sys.tmpDirPath(&tmp, &dbuf);
-    var pbuf: [4096]u8 = undefined;
+    var pbuf: paths.Buffer = undefined;
     const p = try std.mem.printSentinel(&pbuf, "{s}/content.idx", .{dir}, 0);
     try up.save(p);
     var mapped = try Index.open(p);
@@ -1990,9 +1991,9 @@ test "appended updates: same results as rewritten ones, old mappings stay good, 
     defer pool.destroy();
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
+    var dbuf: paths.Buffer = undefined;
     const dir = try sys.tmpDirPath(&tmp, &dbuf);
-    var pbuf: [4096]u8 = undefined;
+    var pbuf: paths.Buffer = undefined;
     const p = try std.mem.printSentinel(&pbuf, "{s}/content.idx", .{dir}, 0);
 
     // Texts by id: 0-2 at first, then one edit or new file per round.
@@ -2217,7 +2218,7 @@ fn worst(matches: []const Match) usize {
 }
 
 fn verifyTask(ctx: *VerifyCtx, task: usize) void {
-    var path_buffer: [4096]u8 = undefined;
+    var path_buffer: paths.Buffer = undefined;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(ctx.gpa);
     const arena = ctx.arenas[task].allocator();
@@ -2289,14 +2290,13 @@ fn rank(doc: DocIn, count: u32, words: []const []const u8, now_s: i64) i32 {
 /// The part of the score known without opening the file.
 fn staticScore(doc: DocIn, words: []const []const u8, now_s: i64) i32 {
     var score: i32 = 0;
-    const slash = std.mem.findScalarLast(u8, doc.path, '/') orelse 0;
-    const name = doc.path[slash + 1 ..];
+    const name = std.Io.Dir.path.basename(doc.path);
     for (words) |word| {
         if (findFold(name, word, 0) != null) score += name_word_score;
     }
     // Saturating: mtimes come from the index file, which may be damaged.
     score += recency.bonus(now_s -| doc.mtime);
-    score -= @intCast(std.mem.count(u8, doc.path, "/") * depth_penalty);
+    score -= @intCast(paths.depth(doc.path) * depth_penalty);
     return score;
 }
 
@@ -2556,7 +2556,7 @@ test "search: the top matches equal reading every document and ranking them all"
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
+    var dbuf: paths.Buffer = undefined;
     const dir = try sys.tmpDirPath(&tmp, &dbuf);
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
@@ -2580,7 +2580,7 @@ test "search: the top matches equal reading every document and ranking them all"
         }
         const sub = if (i % 3 == 0) "/deep/er" else "";
         if (sub.len > 0) {
-            var mb: [4096]u8 = undefined;
+            var mb: paths.Buffer = undefined;
             _ = linux.mkdir(try std.mem.printSentinel(&mb, "{s}/deep", .{dir}, 0), 0o700);
             _ = linux.mkdir(try std.mem.printSentinel(&mb, "{s}/deep/er", .{dir}, 0), 0o700);
         }
@@ -2590,7 +2590,7 @@ test "search: the top matches equal reading every document and ranking them all"
             if (i % 7 == 0) "main" else "doc",
             i,
         });
-        var zb: [4096]u8 = undefined;
+        var zb: paths.Buffer = undefined;
         try sys.writeFile(try std.mem.printSentinel(&zb, "{s}", .{path}, 0), t.items);
         const ages = [_]i64{ 0, 3, 20, 100, 300, 900 };
         d.* = .{ .path = path, .mtime = now - ages[i % ages.len] * 86_400, .size = t.items.len };
@@ -2652,7 +2652,7 @@ test "search: unaccented and capital queries find accented text" {
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
+    var dbuf: paths.Buffer = undefined;
     const dir = try sys.tmpDirPath(&tmp, &dbuf);
     const texts = [_][]const u8{
         "notas\nLa acción empieza aquí.\nfin\n",
@@ -2660,15 +2660,15 @@ test "search: unaccented and capital queries find accented text" {
         "nothing to see\naccidental cion\n",
         "Configuración del sistema\n",
     };
-    var paths: [texts.len][]u8 = undefined;
+    var test_paths: [texts.len][]u8 = undefined;
     var docs: [texts.len]DocIn = undefined;
     for (texts, 0..) |t, i| {
-        paths[i] = try gpa.print("{s}/doc{d}.txt", .{ dir, i });
-        var zb: [4096]u8 = undefined;
-        try sys.writeFile(try std.mem.printSentinel(&zb, "{s}", .{paths[i]}, 0), t);
-        docs[i] = .{ .path = paths[i], .mtime = 0, .size = t.len };
+        test_paths[i] = try gpa.print("{s}/doc{d}.txt", .{ dir, i });
+        var zb: paths.Buffer = undefined;
+        try sys.writeFile(try std.mem.printSentinel(&zb, "{s}", .{test_paths[i]}, 0), t);
+        docs[i] = .{ .path = test_paths[i], .mtime = 0, .size = t.len };
     }
-    defer for (paths) |p| gpa.free(p);
+    defer for (test_paths) |p| gpa.free(p);
     const pool = try Pool.create(gpa, testing.io, 2);
     defer pool.destroy();
     var dummy: u8 = 0;
@@ -2735,10 +2735,10 @@ fn smallIndex(gpa: std.mem.Allocator) !Index {
         "élan",
     };
     var texts: [60][]const u8 = undefined;
-    var paths: [60][]const u8 = undefined;
+    var test_paths: [60][]const u8 = undefined;
     var docs: [60]DocIn = undefined;
     var n_made: usize = 0;
-    defer for (texts[0..n_made], paths[0..n_made]) |t, p| {
+    defer for (texts[0..n_made], test_paths[0..n_made]) |t, p| {
         gpa.free(t);
         gpa.free(p);
     };
@@ -2756,7 +2756,7 @@ fn smallIndex(gpa: std.mem.Allocator) !Index {
             gpa.free(p);
             return e;
         };
-        paths[i] = p;
+        test_paths[i] = p;
         n_made += 1;
         docs[i] = .{
             .path = p,
@@ -3030,9 +3030,9 @@ test "segments that repeat or reorder doc ids (a damaged file): queries, updates
     // results without).
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
+    var dbuf: paths.Buffer = undefined;
     const dir = try sys.tmpDirPath(&tmp, &dbuf);
-    var pbuf: [4096]u8 = undefined;
+    var pbuf: paths.Buffer = undefined;
     const p = try std.mem.printSentinel(&pbuf, "{s}/content.idx", .{dir}, 0);
     try ix.save(p);
     var mapped = try Index.open(p);
@@ -3166,9 +3166,9 @@ test "building high-entropy text: memory stays bounded by rounds and segments" {
     // Written as it grows, like the service does: the index is not held.
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
+    var dbuf: paths.Buffer = undefined;
     const dir = try sys.tmpDirPath(&tmp, &dbuf);
-    var pbuf: [4096]u8 = undefined;
+    var pbuf: paths.Buffer = undefined;
     const p = try std.mem.printSentinel(&pbuf, "{s}/content.idx", .{dir}, 0);
     const reader: TextReader = .{ .read = TestDocs.text, .ctx = &td };
     var ix = try buildFile(gpa, pool, &docs, reader, p, &st);

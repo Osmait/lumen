@@ -4,6 +4,7 @@
 //! ripgrep resolves every .gitignore of a home directory in ~70 ms.
 
 const std = @import("std");
+const paths = @import("paths.zig");
 const linux = std.os.linux;
 const content = @import("content.zig");
 const extract = @import("extract.zig");
@@ -72,10 +73,10 @@ pub fn list(
     const out = try runLister(gpa, io, argv.items, root, options.stop);
     defer gpa.free(out);
 
-    const sep: []const u8 = if (std.mem.endsWith(u8, root, "/")) "" else "/";
+    const sep = paths.separatorAfter(root);
     var docs: std.ArrayList(content.DocIn) = .empty;
     var it = std.mem.tokenizeScalar(u8, out, 0);
-    var path_buffer: [4096]u8 = undefined;
+    var path_buffer: paths.Buffer = undefined;
     while (it.next()) |line| {
         const path_relative = if (std.mem.startsWith(u8, line, "./")) line[2..] else line;
         const path_z = std.mem.printSentinel(
@@ -316,7 +317,7 @@ test "list: what is indexed and what is excluded" {
     try t.mkdir("proj/.git");
     try t.write("proj/.gitignore", "ignored.txt\ngen/\n");
     // Sizes without writing the bytes: sparse files.
-    var buf: [4096]u8 = undefined;
+    var buf: paths.Buffer = undefined;
     for ([_]struct { []const u8, i64 }{ .{ "big.log", content.text_bytes_max + 1 }, .{
         "exactly_max.log",
         content.text_bytes_max,

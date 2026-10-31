@@ -9,6 +9,7 @@
 //! buffer; loading is an `mmap`: no parsing, no copy.
 
 const std = @import("std");
+const paths = @import("paths.zig");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
 const linux = std.os.linux;
@@ -228,7 +229,7 @@ pub const Store = struct {
             const parent = parents_all[entry];
             if (parent == no_parent) break;
             if (parent >= entries_count) return null;
-            if (!std.mem.endsWith(u8, store.name(parent), "/")) path_size += 1;
+            path_size += paths.separatorAfter(store.name(parent)).len;
             if (path_size > out.len) return null;
             entry = parent;
         }
@@ -247,11 +248,10 @@ pub const Store = struct {
                 return out[0..path_size];
             }
             if (parent >= entries_count) return null;
-            if (!std.mem.endsWith(u8, store.name(parent), "/")) {
-                if (end == 0) return null;
-                end -= 1;
-                out[end] = '/';
-            }
+            const separator = paths.separatorAfter(store.name(parent));
+            if (end < separator.len) return null;
+            end -= separator.len;
+            @memcpy(out[end..][0..separator.len], separator);
             entry = parent;
         }
         return null;
@@ -635,9 +635,9 @@ test "save and map give the same index; tombstones stay in memory" {
     defer s.deinit(testing.allocator);
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dir_buf: [4096]u8 = undefined;
+    var dir_buf: paths.Buffer = undefined;
     const dir = try sys.tmpDirPath(&tmp, &dir_buf);
-    var p_buf: [4096]u8 = undefined;
+    var p_buf: paths.Buffer = undefined;
     const p = try std.mem.printSentinel(&p_buf, "{s}/idx", .{dir}, 0);
     try s.save(p);
 
@@ -764,9 +764,9 @@ test "a truncated index file fails to open" {
     defer gpa.free(good);
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dir_buf: [4096]u8 = undefined;
+    var dir_buf: paths.Buffer = undefined;
     const dir = try sys.tmpDirPath(&tmp, &dir_buf);
-    var p_buf: [4096]u8 = undefined;
+    var p_buf: paths.Buffer = undefined;
     const p = try std.mem.printSentinel(&p_buf, "{s}/idx", .{dir}, 0);
     try sys.writeFile(p, good[0 .. good.len - 5]);
     try testing.expectError(error.BadIndex, Store.open(p));
@@ -836,8 +836,8 @@ fn fuzzBuilt(_: void, smith: *testing.Smith) anyerror!void {
     defer s.deinit(gpa);
     // What the builder writes, the validator must accept, unchanged.
     const m = try Store.parse(s.buf, false);
-    var p1: [4096]u8 = undefined;
-    var p2: [4096]u8 = undefined;
+    var p1: paths.Buffer = undefined;
+    var p2: paths.Buffer = undefined;
     for (0..s.len()) |i| try testing.expectEqualStrings(
         s.path(@intCast(i), &p1) orelse "",
         m.path(@intCast(i), &p2) orelse "",

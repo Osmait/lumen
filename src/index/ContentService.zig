@@ -14,6 +14,7 @@
 //! (a child process per file) happens once per version of a document.
 
 const std = @import("std");
+const paths = @import("paths.zig");
 const assert = std.debug.assert;
 const Io = std.Io;
 const content = @import("content.zig");
@@ -307,9 +308,9 @@ pub fn readText(
     extracted: bool,
     lines: u32,
 ) ?[]const u8 {
-    var path_buffer: [4096]u8 = undefined;
+    var path_buffer: paths.Buffer = undefined;
     const doc_path = std.mem.printSentinel(&path_buffer, "{s}", .{path}, 0) catch return null;
-    var text_path_buffer: [4096]u8 = undefined;
+    var text_path_buffer: paths.Buffer = undefined;
     const text_path: [:0]const u8 = if (extracted) blk: {
         const doc_stat = content_list.stat(doc_path, .document) orelse return null;
         break :blk service.textPath(&text_path_buffer, .{
@@ -345,7 +346,7 @@ fn textOf(
 ) std.mem.Allocator.Error!bool {
     const service: *ContentService = @ptrCast(@alignCast(ctx));
     if (doc.source == .plain) return content.readPlain(gpa, doc.path, buf);
-    var path_buffer: [4096]u8 = undefined;
+    var path_buffer: paths.Buffer = undefined;
     const text_path = service.textPath(&path_buffer, doc) orelse return false;
     buf.clearRetainingCapacity();
     const fd = sys.openRegular(text_path) catch return false;
@@ -358,7 +359,7 @@ fn textOf(
 /// that building reads no more of them at once than memory allows.
 fn textLen(ctx: *anyopaque, doc: content.DocIn) u64 {
     const service: *ContentService = @ptrCast(@alignCast(ctx));
-    var path_buffer: [4096]u8 = undefined;
+    var path_buffer: paths.Buffer = undefined;
     const text_path = service.textPath(&path_buffer, doc) orelse return 0;
     const info = sys.info(text_path) orelse return 0;
     return info.size;
@@ -396,7 +397,7 @@ fn extractMissing(
     docs: []content.DocIn,
 ) ?[]content.DocIn {
     var missing: std.ArrayList(usize) = .empty;
-    var path_buffer: [4096]u8 = undefined;
+    var path_buffer: paths.Buffer = undefined;
     for (docs, 0..) |doc, doc_index| {
         if (doc.source != .extracted) continue;
         const text_path = service.textPath(&path_buffer, doc) orelse continue;
@@ -436,8 +437,8 @@ const ExtractContext = struct {
         const service = context.service;
         if (service.stop.load(.acquire)) return;
         const doc = context.docs[context.missing[missing_index]];
-        var text_path_buffer: [4096]u8 = undefined;
-        var source_path_buffer: [4096]u8 = undefined;
+        var text_path_buffer: paths.Buffer = undefined;
+        var source_path_buffer: paths.Buffer = undefined;
         const text_path = service.textPath(&text_path_buffer, doc) orelse return;
         const kind = extract.kindOf(doc.path) orelse return;
         const source_path = std.mem.printSentinel(
@@ -605,7 +606,7 @@ fn indexedChanges(
     const index = &service.index.?;
     var gone: std.ArrayList(u32) = .empty;
     var added: std.ArrayList(content.DocIn) = .empty;
-    var path_buffer: [4096]u8 = undefined;
+    var path_buffer: paths.Buffer = undefined;
     for (0..index.docs_count) |doc_index| {
         const id: u32 = @intCast(doc_index);
         if (index.removed(id)) continue;
@@ -902,7 +903,7 @@ fn retrySave(service: *ContentService) void {
 /// deleted): it is keyed by mtime, so each edit otherwise left the old
 /// text in the cache for good.
 fn dropStaleText(service: *ContentService, old: *const content.Index, gone: []const u32) void {
-    var path_buffer: [4096]u8 = undefined;
+    var path_buffer: paths.Buffer = undefined;
     for (gone) |id| {
         if (old.sources[id] != @backingInt(content.Source.extracted)) continue;
         const text_path = service.textPath(&path_buffer, old.docIn(id)) orelse continue;
@@ -937,7 +938,7 @@ fn sweepText(service: *ContentService) void {
         }) catch return;
         keep.put(arena, old, name) catch return;
     }
-    var dir_buffer: [4096]u8 = undefined;
+    var dir_buffer: paths.Buffer = undefined;
     const dir = std.mem.printSentinel(&dir_buffer, "{s}", .{service.text_dir}, 0) catch return;
     const fd = sys.openDir(dir) catch return;
     defer sys.close(fd);
@@ -1087,7 +1088,7 @@ fn setMtime(path: [:0]const u8, sec: i64) !void {
 
 /// Files in the text cache whose name starts with `prefix`.
 fn countText(service: *ContentService, prefix: []const u8) !usize {
-    var buf: [4096]u8 = undefined;
+    var buf: paths.Buffer = undefined;
     const fd = try sys.openDir(try std.mem.printSentinel(&buf, "{s}", .{service.text_dir}, 0));
     defer sys.close(fd);
     var it: sys.DirIter = .{ .fd = fd };
@@ -1134,7 +1135,7 @@ test "content service: finds, follows edits and deletions, rebuilds only on chan
         try testing.expectEqual(@as(u32, 1), st.builds);
 
         // Edited: new words found, old ones gone.
-        var pbuf: [4096]u8 = undefined;
+        var pbuf: paths.Buffer = undefined;
         const alpha = try f.root.path(&pbuf, "notes/alpha.txt");
         try f.root.write("notes/alpha.txt", "the slow kilimanjaro tortoise\n");
         const edited = sys.nowSeconds() - 100;
@@ -1175,14 +1176,14 @@ test "content service: a cache it cannot write still serves from memory, and sav
     defer f.deinit();
     try f.root.write("a.txt", "an unwritable cache lemur\n");
     // A directory where the index's temporary file goes: writing it fails.
-    var bbuf: [4096]u8 = undefined;
+    var bbuf: paths.Buffer = undefined;
     const blocker = try std.mem.printSentinel(&bbuf, "{s}/content.idx.tmp", .{f.cache.abs}, 0);
     try testing.expect(linux.errno(linux.mkdir(blocker, 0o700)) == .SUCCESS);
     const s = try f.start();
     defer s.shutdown();
     try waitChecks(s, 1);
     try testing.expectEqual(@as(usize, 1), (try f.find(s, "lemur")).len);
-    var ibuf: [4096]u8 = undefined;
+    var ibuf: paths.Buffer = undefined;
     const saved = try std.mem.printSentinel(&ibuf, "{s}/content.idx", .{f.cache.abs}, 0);
     try testing.expect(!sys.exists(saved));
     // Writable again: the next check saves it, though nothing changed.
@@ -1197,7 +1198,7 @@ test "content service: with the name index, checks without name changes only loo
     try f.init();
     defer f.deinit();
     try f.root.write("a.txt", "first apricot\n");
-    var ibuf: [4096]u8 = undefined;
+    var ibuf: paths.Buffer = undefined;
     const idx = try std.mem.printSentinel(&ibuf, "{s}/files.idx", .{f.cache.abs}, 0);
     const names = try Service.start(testing.allocator, testing.io, f.root.abs, idx);
     defer names.shutdown();
@@ -1213,7 +1214,7 @@ test "content service: with the name index, checks without name changes only loo
     try testing.expectEqual(@as(u32, 1), s.status().listings);
 
     // Edited in place (no name change): seen without listing.
-    var pbuf: [4096]u8 = undefined;
+    var pbuf: paths.Buffer = undefined;
     try f.root.write("a.txt", "second banana\n");
     try setMtime(try f.root.path(&pbuf, "a.txt"), sys.nowSeconds() - 100);
     try pokeAndWait(s);
@@ -1249,7 +1250,7 @@ test "content service: rebuilt whole once removed versions pile up" {
     });
     defer s.shutdown();
     try waitChecks(s, 1);
-    var pbuf: [4096]u8 = undefined;
+    var pbuf: paths.Buffer = undefined;
     // One of ten edited: updated.
     try f.root.write("n0.txt", "first edit marmalade\n");
     try setMtime(try f.root.path(&pbuf, "n0.txt"), sys.nowSeconds() - 100);
@@ -1285,7 +1286,7 @@ test "content service: Office documents are extracted once per version" {
     defer stage.deinit();
     try stage.write("[Content_Types].xml", "<?xml version=\"1.0\"?><Types/>");
 
-    var pbuf: [4096]u8 = undefined;
+    var pbuf: paths.Buffer = undefined;
     const report = try f.root.path(&pbuf, "docs/report.docx");
     try f.root.mkdir("docs");
     const zipDoc = struct {
@@ -1388,8 +1389,8 @@ test "content service: Office documents are extracted once per version" {
     try f.cache.write("text/0123456789abcdef-1-2.txt.tmp", "half");
     // And the current version's text under the naming before sizes: renamed
     // on start, not extracted again.
-    var nbuf: [4096]u8 = undefined;
-    var obuf: [4096]u8 = undefined;
+    var nbuf: paths.Buffer = undefined;
+    var obuf: paths.Buffer = undefined;
     const size = sys.info(report).?.size;
     const now_name = try std.mem.printSentinel(&nbuf, "{s}/text/{s}{d}-{d}.txt", .{
         f.cache.abs,
@@ -1429,7 +1430,7 @@ test "content service: a document whose extraction failed in passing is left out
     defer t.deinit();
     try t.write("a.pdf", "not really a pdf");
     try t.write("b.txt", "plain words here");
-    var pbuf: [4096]u8 = undefined;
+    var pbuf: paths.Buffer = undefined;
     const pdf = try t.path(&pbuf, "a.pdf");
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();

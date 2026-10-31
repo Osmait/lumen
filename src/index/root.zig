@@ -14,6 +14,7 @@ pub const content_list = @import("content_list.zig");
 pub const extract = @import("extract.zig");
 pub const format = @import("format.zig");
 pub const recency = @import("recency.zig");
+pub const paths = @import("paths.zig");
 pub const ContentService = @import("ContentService.zig");
 
 extern fn malloc_trim(pad: usize) c_int;

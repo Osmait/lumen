@@ -10,6 +10,7 @@
 //!      locked (microseconds), and the old index is freed after unlocking.
 
 const std = @import("std");
+const paths = @import("paths.zig");
 const Io = std.Io;
 const store_mod = @import("store.zig");
 const Store = store_mod.Store;
@@ -304,7 +305,7 @@ fn concernsContent(service: *Service, change: Watcher.Change) bool {
         else => return true,
     };
     if (name.len > 0 and name[0] == '.') return false;
-    var buf: [4096]u8 = undefined;
+    var buf: paths.Buffer = undefined;
     const dir = service.live.pathOf(parent, &buf) orelse return true;
     const root = service.roots[0];
     const relative = if (std.mem.startsWith(u8, dir, root)) dir[root.len..] else dir;
@@ -467,7 +468,7 @@ fn run(service: *Service) void {
 const testing = std.testing;
 
 fn touch(dir: []const u8, name: []const u8) !void {
-    var buf: [4096]u8 = undefined;
+    var buf: paths.Buffer = undefined;
     const p = try std.mem.printSentinel(&buf, "{s}/{s}", .{ dir, name }, 0);
     try sys.writeFile(p, "x");
 }
@@ -490,11 +491,11 @@ test "live: new, nested and deleted files show up without a rescan" {
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var abs_buf: [4096]u8 = undefined;
+    var abs_buf: paths.Buffer = undefined;
     const abs = try sys.tmpDirAbs(&tmp, &abs_buf);
     try touch(abs, "first_note.md");
 
-    var idx_buf: [4096]u8 = undefined;
+    var idx_buf: paths.Buffer = undefined;
     const idx = try std.mem.print(&idx_buf, "{s}/../lumen-test-{s}.idx", .{ abs, tmp.sub_path });
     const s = try Service.start(gpa, testing.io, abs, idx);
     defer s.shutdown();
@@ -511,20 +512,20 @@ test "live: new, nested and deleted files show up without a rescan" {
     try testing.expect(try waitFor(s, arena, "zebra_quarterly", true));
 
     // A new directory with content inside (scanned whole on creation).
-    var dbuf: [4096]u8 = undefined;
+    var dbuf: paths.Buffer = undefined;
     const sub = try std.mem.printSentinel(&dbuf, "{s}/fresh_dir", .{abs}, 0);
     _ = std.os.linux.mkdir(sub, 0o755);
     try touch(sub, "inner_walrus.txt");
     try testing.expect(try waitFor(s, arena, "inner_walrus", true));
 
     // Deleting the base file and the delta file removes both.
-    var fbuf: [4096]u8 = undefined;
+    var fbuf: paths.Buffer = undefined;
     _ = std.os.linux.unlink(try std.mem.printSentinel(&fbuf, "{s}/first_note.md", .{abs}, 0));
     try testing.expect(try waitFor(s, arena, "first_note", false));
     _ = std.os.linux.unlink(try std.mem.printSentinel(&fbuf, "{s}/inner_walrus.txt", .{sub}, 0));
     try testing.expect(try waitFor(s, arena, "inner_walrus", false));
 
-    var cbuf: [4096]u8 = undefined;
+    var cbuf: paths.Buffer = undefined;
     _ = std.os.linux.unlink(try std.mem.printSentinel(&cbuf, "{s}", .{idx}, 0));
 }
 
@@ -561,7 +562,7 @@ fn waitHas(
 }
 
 fn mkdirAbs(dir: []const u8, name: []const u8) !void {
-    var buf: [4096]u8 = undefined;
+    var buf: paths.Buffer = undefined;
     _ = std.os.linux.mkdir(try std.mem.printSentinel(&buf, "{s}/{s}", .{ dir, name }, 0), 0o755);
 }
 
@@ -577,13 +578,13 @@ test "service: a flooded queue ends in a rescan that finds everything" {
     ) catch 16384;
     if (queued_max > 100_000) return error.SkipZigTest;
 
-    var dbuf: [4096]u8 = undefined;
+    var dbuf: paths.Buffer = undefined;
     const dir = try tmpAbs(&tmp, &dbuf);
     try mkdirAbs(dir, "root");
-    var rbuf: [4096]u8 = undefined;
+    var rbuf: paths.Buffer = undefined;
     const root = try std.mem.print(&rbuf, "{s}/root", .{dir});
     try mkdirAbs(root, "flood");
-    var ibuf: [4096]u8 = undefined;
+    var ibuf: paths.Buffer = undefined;
     const s = try Service.start(gpa, testing.io, root, try std.mem.print(
         &ibuf,
         "{s}/files.idx",
@@ -598,7 +599,7 @@ test "service: a flooded queue ends in a rescan that finds everything" {
 
     // Holding the index stalls the thread before it drains: the queue
     // overflows for real.
-    var fbuf: [4096]u8 = undefined;
+    var fbuf: paths.Buffer = undefined;
     const flood = try std.mem.print(&fbuf, "{s}/flood", .{root});
     const n = queued_max + 1_000;
     s.lock.lockUncancelable(s.io);
@@ -636,24 +637,24 @@ test "service: files created while the first rescan runs are not lost" {
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
+    var dbuf: paths.Buffer = undefined;
     const dir = try tmpAbs(&tmp, &dbuf);
     try mkdirAbs(dir, "root");
-    var rbuf: [4096]u8 = undefined;
+    var rbuf: paths.Buffer = undefined;
     const root = try std.mem.print(&rbuf, "{s}/root", .{dir});
     // Enough to keep the scan busy a few levels deep.
     for (0..40) |i| {
-        var p: [4096]u8 = undefined;
+        var p: paths.Buffer = undefined;
         const sub = try std.mem.print(&p, "{s}/d{d}", .{ root, i });
         sys.mkdirP(sub);
-        var q: [4096]u8 = undefined;
+        var q: paths.Buffer = undefined;
         sys.mkdirP(try std.mem.print(&q, "{s}/deep/deeper", .{sub}));
         for (0..40) |j| {
             var nb: [32]u8 = undefined;
             try touch(sub, try std.mem.print(&nb, "old_{d}.txt", .{j}));
         }
     }
-    var ibuf: [4096]u8 = undefined;
+    var ibuf: paths.Buffer = undefined;
     const s = try Service.start(gpa, testing.io, root, try std.mem.print(
         &ibuf,
         "{s}/files.idx",
@@ -668,7 +669,7 @@ test "service: files created while the first rescan runs are not lost" {
     // directory is read.
     const n = 200;
     for (0..n) |i| {
-        var p: [4096]u8 = undefined;
+        var p: paths.Buffer = undefined;
         var nb: [32]u8 = undefined;
         try touch(
             try std.mem.print(&p, "{s}/d{d}/deep/deeper", .{ root, i % 40 }),
@@ -687,13 +688,13 @@ test "service: shutdown saves what was learned and the next start maps it" {
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
+    var dbuf: paths.Buffer = undefined;
     const dir = try tmpAbs(&tmp, &dbuf);
     try mkdirAbs(dir, "root");
-    var rbuf: [4096]u8 = undefined;
+    var rbuf: paths.Buffer = undefined;
     const root = try std.mem.print(&rbuf, "{s}/root", .{dir});
     try touch(root, "Cargo.toml");
-    var ibuf: [4096]u8 = undefined;
+    var ibuf: paths.Buffer = undefined;
     const idx = try std.mem.printSentinel(&ibuf, "{s}/files.idx", .{dir}, 0);
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
@@ -722,7 +723,7 @@ test "service: shutdown saves what was learned and the next start maps it" {
     var hits: std.ArrayList(engine.Hit) = .empty;
     defer hits.deinit(gpa);
     try e.search(gpa, pool, &saved, "de_la_sesion", .{ .limit = 10, .recency = false }, &hits);
-    var pbuf: [4096]u8 = undefined;
+    var pbuf: paths.Buffer = undefined;
     try testing.expect(hits.items.len > 0 and std.mem.endsWith(
         u8,
         saved.path(hits.items[0].id, &pbuf).?,
@@ -748,15 +749,15 @@ test "service: name changes are counted outside hidden files and folders" {
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
+    var dbuf: paths.Buffer = undefined;
     const dir = try tmpAbs(&tmp, &dbuf);
     try mkdirAbs(dir, "root");
-    var rbuf: [4096]u8 = undefined;
+    var rbuf: paths.Buffer = undefined;
     const root = try std.mem.print(&rbuf, "{s}/root", .{dir});
     try mkdirAbs(root, ".hidden");
-    var hbuf: [4096]u8 = undefined;
+    var hbuf: paths.Buffer = undefined;
     const hidden = try std.mem.print(&hbuf, "{s}/.hidden", .{root});
-    var ibuf: [4096]u8 = undefined;
+    var ibuf: paths.Buffer = undefined;
     const idx = try std.mem.printSentinel(&ibuf, "{s}/files.idx", .{dir}, 0);
 
     const s = try Service.start(gpa, testing.io, root, idx);
@@ -775,12 +776,12 @@ test "service: the delta threshold triggers a compaction" {
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
+    var dbuf: paths.Buffer = undefined;
     const dir = try tmpAbs(&tmp, &dbuf);
     try mkdirAbs(dir, "root");
-    var rbuf: [4096]u8 = undefined;
+    var rbuf: paths.Buffer = undefined;
     const root = try std.mem.print(&rbuf, "{s}/root", .{dir});
-    var ibuf: [4096]u8 = undefined;
+    var ibuf: paths.Buffer = undefined;
     const s = try Service.start(gpa, testing.io, root, try std.mem.print(
         &ibuf,
         "{s}/files.idx",

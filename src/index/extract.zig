@@ -17,6 +17,7 @@
 //!     one on the terminal the daemon was started from, and wait for it.
 
 const std = @import("std");
+const paths = @import("paths.zig");
 const linux = std.os.linux;
 const sys = @import("os");
 
@@ -27,9 +28,13 @@ pub const timeout_ms = 15_000;
 
 /// Kind from the file name's extension (case-insensitive), or null if not supported.
 /// Office's `~$name.docx` owner files (not zips) are not documents.
+/// Office writes `~$name.docx` next to an open document: who has it open,
+/// not a zip.
+const office_owner_prefix = "~$";
+
 pub fn kindOf(path: []const u8) ?Kind {
-    const base = path[if (std.mem.findScalarLast(u8, path, '/')) |s| s + 1 else 0..];
-    if (std.mem.startsWith(u8, base, "~$")) return null;
+    const base = std.Io.Dir.path.basename(path);
+    if (std.mem.startsWith(u8, base, office_owner_prefix)) return null;
     var buf: [4]u8 = undefined;
     const ext = @import("core").file_kind.lowerExt(&buf, base) orelse return null;
     return std.meta.stringToEnum(Kind, ext);

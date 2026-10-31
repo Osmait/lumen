@@ -14,6 +14,7 @@
 //! dropped it for being `unsafe`; in Zig it is the natural API.
 
 const std = @import("std");
+const paths = @import("paths.zig");
 const assert = std.debug.assert;
 const store_mod = @import("store.zig");
 const Store = store_mod.Store;
@@ -121,7 +122,7 @@ fn addLevel(
             }
             stats.dirs += 1;
             if (!level.descend) continue;
-            const sep = if (std.mem.endsWith(u8, parent.path, "/")) "" else "/";
+            const sep = paths.separatorAfter(parent.path);
             const child = try gpa.printSentinel("{s}{s}{s}", .{ parent.path, sep, name }, 0);
             errdefer gpa.free(child);
             try next.append(gpa, .{
@@ -278,7 +279,7 @@ fn readDir(
     while (try it.next()) |e| {
         var kind = e.kind;
         if (kind == sys.Kind.unknown) {
-            var buf: [4096]u8 = undefined;
+            var buf: paths.Buffer = undefined;
             const full = std.mem.printSentinel(
                 &buf,
                 "{s}/{s}",
@@ -304,10 +305,14 @@ fn readDir(
 /// Whether `name` hides itself and what is below it: a dot-name, or one
 /// that says "cache". The scan sets `flag_hidden` by it, and so does `Live`
 /// for what appears after the scan.
+/// A name with this in it, in any case, is hidden: "cache", "Cache",
+/// "ShaderCache", "__pycache__".
+const hidden_word = "cache";
+
 pub fn hiddenByName(name: []const u8) bool {
     assert(name.len > 0);
     if (name[0] == '.') return true;
-    return std.ascii.findIgnoreCase(name, "cache") != null;
+    return std.ascii.findIgnoreCase(name, hidden_word) != null;
 }
 
 /// Whether directory `name` in `parent` is opened, or only indexed: the
@@ -328,7 +333,7 @@ pub fn shouldDescend(parent: []const u8, name: []const u8, cfg: *const Config) b
     for (cfg.cachedir_probe) |probe| {
         if (!std.mem.eql(u8, probe, name)) continue;
         // One stat, only for the handful of suspicious names.
-        var buf: [4096]u8 = undefined;
+        var buf: paths.Buffer = undefined;
         const tag = std.mem.printSentinel(
             &buf,
             "{s}/{s}/CACHEDIR.TAG",
@@ -348,7 +353,7 @@ const ScanTree = struct {
     tmp: testing.TmpDir,
     /// The temp dir's absolute path is `buf[0..len]` (a length, not a
     /// slice: the struct is returned by value).
-    buf: [4096]u8 = undefined,
+    buf: paths.Buffer = undefined,
     len: usize = 0,
 
     fn init() !ScanTree {
@@ -363,7 +368,7 @@ const ScanTree = struct {
     }
 
     fn file(tree: *const ScanTree, rel: []const u8) void {
-        var buf: [4096]u8 = undefined;
+        var buf: paths.Buffer = undefined;
         const p = tree.path(&buf, rel);
         sys.mkdirP(p[0 .. std.mem.findScalarLast(u8, p, '/') orelse 0]);
         sys.writeFile(p, "x") catch unreachable;
@@ -372,7 +377,7 @@ const ScanTree = struct {
     fn scanOf(tree: *const ScanTree, root: []const u8, cfg_in: Config, st: ?*Stats) !Store {
         const pool = try Pool.create(testing.allocator, testing.io, 2);
         defer pool.destroy();
-        var buf: [4096]u8 = undefined;
+        var buf: paths.Buffer = undefined;
         const roots = [_][]const u8{tree.path(&buf, root)};
         var cfg = cfg_in;
         cfg.roots = &roots;
@@ -392,8 +397,8 @@ test "scan: a root may be a link, nothing below one is followed" {
     defer t.tmp.cleanup();
     t.file("real/inside.txt");
     t.file("other/secret.txt");
-    var a: [4096]u8 = undefined;
-    var b: [4096]u8 = undefined;
+    var a: paths.Buffer = undefined;
+    var b: paths.Buffer = undefined;
     _ = std.os.linux.symlink(t.path(&a, "real"), t.path(&b, "home"));
     _ = std.os.linux.symlink(t.path(&a, "other"), t.path(&b, "real/to_other"));
 

@@ -13,6 +13,7 @@
 //! Not thread-safe: its owner (`Live`) is used under the service's lock.
 
 const std = @import("std");
+const paths = @import("paths.zig");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const sys = @import("os");
@@ -259,7 +260,7 @@ test "watcher: events become changes attributed to the watched entry" {
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
+    var dbuf: paths.Buffer = undefined;
     const dir = try tmpAbs(&tmp, &dbuf);
     const w = try create(gpa);
     defer w.destroy(gpa);
@@ -267,8 +268,8 @@ test "watcher: events become changes attributed to the watched entry" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var b1: [4096]u8 = undefined;
-    var b2: [4096]u8 = undefined;
+    var b1: paths.Buffer = undefined;
+    var b2: paths.Buffer = undefined;
     try w.watch(gpa, try std.mem.printSentinel(&b1, "{s}", .{dir}, 0), 7);
     try sys.writeFile(try std.mem.printSentinel(&b1, "{s}/f", .{dir}, 0), "x");
     const d = try std.mem.printSentinel(&b2, "{s}/d", .{dir}, 0);
@@ -318,10 +319,10 @@ test "watcher: links are never followed below a root, and prune drops watches" {
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
+    var dbuf: paths.Buffer = undefined;
     const dir = try tmpAbs(&tmp, &dbuf);
-    var b1: [4096]u8 = undefined;
-    var b2: [4096]u8 = undefined;
+    var b1: paths.Buffer = undefined;
+    var b2: paths.Buffer = undefined;
     const real = try std.mem.printSentinel(&b1, "{s}/real", .{dir}, 0);
     _ = linux.mkdir(real, 0o755);
     const link = try std.mem.printSentinel(&b2, "{s}/link", .{dir}, 0);
@@ -360,11 +361,11 @@ test "watcher: best effort skips what cannot be watched and reports only running
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dir_buffer: [4096]u8 = undefined;
+    var dir_buffer: paths.Buffer = undefined;
     const dir = try tmpAbs(&tmp, &dir_buffer);
-    var dir_z_buffer: [4096]u8 = undefined;
+    var dir_z_buffer: paths.Buffer = undefined;
     const dir_z = try std.mem.printSentinel(&dir_z_buffer, "{s}", .{dir}, 0);
-    var gone_buffer: [4096]u8 = undefined;
+    var gone_buffer: paths.Buffer = undefined;
     const gone = try std.mem.printSentinel(&gone_buffer, "{s}/gone", .{dir}, 0);
     const watcher = try create(gpa);
     defer watcher.destroy(gpa);
@@ -390,7 +391,7 @@ test "watcher: a flooded queue reports the overflow in one drain" {
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
+    var dbuf: paths.Buffer = undefined;
     const dir = try tmpAbs(&tmp, &dbuf);
     var qbuf: [32]u8 = undefined;
     const queued_max = std.fmt.parseInt(
@@ -402,8 +403,8 @@ test "watcher: a flooded queue reports the overflow in one drain" {
 
     const w = try create(gpa);
     defer w.destroy(gpa);
-    var a: [4096]u8 = undefined;
-    var b: [4096]u8 = undefined;
+    var a: paths.Buffer = undefined;
+    var b: paths.Buffer = undefined;
     try w.watch(gpa, try std.mem.printSentinel(&a, "{s}", .{dir}, 0), 0);
     // 48-byte events: 64 KiB is not a whole number of them, so read() never
     // fills the buffer to the byte.

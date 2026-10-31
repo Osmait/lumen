@@ -44,7 +44,7 @@ fn checkMB(name: []const u8, got: f64, limit: f64) void {
 }
 
 fn peakRssMB() f64 {
-    var buf: [4096]u8 = undefined;
+    var buf: index.paths.Buffer = undefined;
     const status = sys.readHead("/proc/self/status", &buf);
     const at = std.mem.find(u8, status, "VmHWM:") orelse return 0;
     var it = std.mem.tokenizeAny(u8, status[at + 6 ..], " \t");
@@ -136,7 +136,7 @@ fn names(gpa: std.mem.Allocator, pool: *index.Pool, dir: []const u8) !void {
         ms(sys.monotonicNs() - t),
     });
 
-    var pbuf: [4096]u8 = undefined;
+    var pbuf: index.paths.Buffer = undefined;
     const path = try std.mem.printSentinel(&pbuf, "{s}/names.idx", .{dir}, 0);
     try s.save(path);
     t = sys.monotonicNs();

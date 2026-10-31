@@ -14,6 +14,7 @@
 //!   + Recency: mtime of the head of the list breaks ties among equals.
 
 const std = @import("std");
+const paths = @import("paths.zig");
 const assert = std.debug.assert;
 const store_mod = @import("store.zig");
 const Store = store_mod.Store;
@@ -588,7 +589,7 @@ const RecencyCtx = struct {
     no_stat: []const []const u8,
 
     fn block(ctx: *RecencyCtx, lo: usize, hi: usize) void {
-        var buf: [4096]u8 = undefined;
+        var buf: paths.Buffer = undefined;
         for (ctx.hits[lo..hi]) |*h| h.score += recencyBonus(ctx, h.id, &buf);
     }
 };
@@ -625,11 +626,12 @@ fn byRecency(
 /// Whether `path` is folder `dir` or below it ("/a/bc" is not below "/a/b").
 pub fn isUnder(path: []const u8, dir: []const u8) bool {
     if (!std.mem.startsWith(u8, path, dir)) return false;
-    return path.len == dir.len or path[dir.len] == '/' or std.mem.endsWith(u8, dir, "/");
+    if (path.len == dir.len) return true;
+    return path[dir.len] == paths.separator or std.mem.endsWith(u8, dir, paths.separator_str);
 }
 
 /// Coarse on purpose: today vs this month vs old.
-fn recencyBonus(ctx: *const RecencyCtx, id: u32, buf: *[4096]u8) i32 {
+fn recencyBonus(ctx: *const RecencyCtx, id: u32, buf: *paths.Buffer) i32 {
     const now = ctx.now;
     const path = ctx.store.path(id, buf[0 .. buf.len - 1]) orelse return 0;
     if (path.len == 0) return 0;
@@ -903,9 +905,9 @@ test "recency: nothing under a slow mount is stat'ed" {
     const gpa = testing.allocator;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    var dbuf: [4096]u8 = undefined;
+    var dbuf: paths.Buffer = undefined;
     const dir = try sys.tmpDirAbs(&tmp, &dbuf);
-    var pbuf: [4096]u8 = undefined;
+    var pbuf: paths.Buffer = undefined;
     try sys.writeFile(try std.mem.printSentinel(&pbuf, "{s}/recent_note.txt", .{dir}, 0), "x");
     var b: store_mod.Builder = .empty;
     const root = try b.push(gpa, dir, store_mod.no_parent, store_mod.flag_dir, 0);
