@@ -73,8 +73,7 @@ pub fn reload(ui: *Ui) void {
 
 pub fn command(ui: *Ui) ?*const Host.Command {
     const registry = ui.ext_registry orelse return null;
-    if (ui.ext_cmd >= registry.commands.len) return null;
-    return &registry.commands[ui.ext_cmd];
+    return registry.command(ui.ext_cmd);
 }
 
 // ------------------------------------------------------------- results
@@ -136,8 +135,8 @@ fn rootCallback(answer: *Host.RootResult, ctx: ?*anyopaque) void {
         return;
     };
     for (answer.sections) |sec| for (sec.items) |*item| {
-        if (item.icon == .none and
-            sec.command < registry.commands.len) item.icon = registry.commands[sec.command].icon;
+        if (item.icon != .none) continue;
+        if (registry.command(sec.command)) |section_command| item.icon = section_command.icon;
     };
     const last = ui.ext_root_search.latest;
     const typed: ?[]const u8 = if (ui.view == .root) std.mem.trim(u8, ui.query(), " ") else null;
@@ -205,8 +204,8 @@ pub fn addRootSections(ui: *Ui, query: []const u8) void {
     if (!any or query.len < root_query_bytes_min) return;
     if (ui.ext_root_search.latest) |answer| if (std.mem.eql(u8, answer.query, query)) {
         for (answer.sections) |sec| {
-            if (sec.command >= registry.commands.len) continue;
-            ui.addSection(registry.commands[sec.command].title);
+            const section_command = registry.command(sec.command) orelse continue;
+            ui.addSection(section_command.title);
             for (sec.items) |item| ui.addItem(item);
         }
         return;
@@ -261,73 +260,78 @@ fn actCallback(answer: *Host.ActResult, ctx: ?*anyopaque) void {
     }
 }
 
-fn find(registry: *const Host.Registry, id: []const u8) ?u16 {
-    for (registry.commands, 0..) |cmd, i| if (std.mem.eql(u8, cmd.id, id)) return @intCast(i);
+fn find(registry: *const Host.Registry, id: []const u8) ?Host.CommandIndex {
+    for (registry.commands, 0..) |cmd, i| if (std.mem.eql(u8, cmd.id, id)) return .from(i);
     return null;
 }
-
-/// An index no registry has: what a view held that a reload took away.
-/// Lookups by it find nothing (the host keeps commands under maxInt(u16)).
-const gone = std.math.maxInt(u16);
 
 /// The open command and form, the preference or field being typed or
 /// chosen: indexes into `old`, moved to `new` by id (Enter would otherwise
 /// save into another extension's preferences, or submit another form).
 /// True when the open view lost what it shows. Call with `new` in place.
 fn remap(ui: *Ui, old: *const Host.Registry, new: *const Host.Registry) bool {
-    ui.ext_cmd = sameCommand(old, new, ui.ext_cmd) orelse gone;
+    ui.ext_cmd = sameCommand(old, new, ui.ext_cmd) orelse .gone;
     const form = sameCommand(old, new, ui.form_cmd);
     // A form whose fields changed starts over: values are kept by position.
-    const same_form = if (form) |i|
-        sameFields(old.commands[ui.form_cmd].fields, new.commands[i].fields)
+    const same_form = if (form) |form_index|
+        sameFields(old.command(ui.form_cmd).?.fields, new.command(form_index).?.fields)
     else
         false;
-    ui.form_cmd = form orelse gone;
+    ui.form_cmd = form orelse .gone;
     if (form != null and !same_form) form_view.reset(ui);
     switch (ui.input) {
-        .pref => |pref_index| ui.input = .{ .pref = samePref(old, new, pref_index) orelse gone },
+        .pref => |pref_index| ui.input = .{ .pref = samePref(old, new, pref_index) orelse .gone },
         .field => if (!same_form) {
-            ui.input = .{ .field = gone };
+            ui.input = .{ .field = .gone };
         },
     }
     switch (ui.choosing) {
-        .pref => |pref_index| ui.choosing = .{ .pref = samePref(old, new, pref_index) orelse gone },
+        .pref => |pref_index| ui.choosing = .{ .pref = samePref(old, new, pref_index) orelse .gone },
         .field => if (!same_form) {
-            ui.choosing = .{ .field = gone };
+            ui.choosing = .{ .field = .gone };
         },
         else => {},
     }
     return switch (ui.view) {
-        .ext => ui.ext_cmd == gone,
-        .form => ui.form_cmd == gone,
+        .ext => ui.ext_cmd == .gone,
+        .form => ui.form_cmd == .gone,
         .input => switch (ui.input) {
-            .pref, .field => |index| index == gone,
+            .pref => |pref_index| pref_index == .gone,
+            .field => |field_index| field_index == .gone,
         },
         .choose => switch (ui.choosing) {
-            .pref, .field => |index| index == gone,
+            .pref => |pref_index| pref_index == .gone,
+            .field => |field_index| field_index == .gone,
             else => false,
         },
         else => false,
     };
 }
 
-/// Command `i` of `old` in `new`, by id.
-fn sameCommand(old: *const Host.Registry, new: *const Host.Registry, i: u16) ?u16 {
-    if (i >= old.commands.len) return null;
-    return find(new, old.commands[i].id);
+/// Command `index` of `old` in `new`, by id.
+fn sameCommand(
+    old: *const Host.Registry,
+    new: *const Host.Registry,
+    index: Host.CommandIndex,
+) ?Host.CommandIndex {
+    const old_command = old.command(index) orelse return null;
+    return find(new, old_command.id);
 }
 
-/// Preference `i` of `old` in `new`: the same extension, name and kind.
-fn samePref(old: *const Host.Registry, new: *const Host.Registry, i: u16) ?u16 {
-    if (i >= old.prefs.len) return null;
-    const preference = old.prefs[i];
+/// Preference `index` of `old` in `new`: the same extension, name and kind.
+fn samePref(
+    old: *const Host.Registry,
+    new: *const Host.Registry,
+    index: Host.PrefIndex,
+) ?Host.PrefIndex {
+    const preference = (old.pref(index) orelse return null).*;
     for (new.prefs, 0..) |query, j| {
         if (std.mem.eql(u8, query.ext, preference.ext) and std.mem.eql(
             u8,
             query.name,
             preference.name,
         ) and
-            query.kind == preference.kind) return @intCast(j);
+            query.kind == preference.kind) return .from(j);
     }
     return null;
 }
@@ -365,7 +369,7 @@ pub fn rootItems(ui: *Ui, arena: std.mem.Allocator) []const Item {
             .accessory = "Command",
             .icon = cmd.icon,
             .keywords = cmd.keywords,
-            .action = .{ .ext_command = .{ .index = @intCast(i), .run = cmd.mode == .run } },
+            .action = .{ .ext_command = .{ .index = .from(i), .run = cmd.mode == .run } },
         }) catch break;
     }
     for (registry.problems) |problem| {
@@ -461,10 +465,10 @@ pub fn placeholder(ui: *Ui, buf: []u8) [*:0]const u8 {
 // -------------------------------------------------------------- actions
 
 /// Enter on a command in the root search: opens its list, or runs it.
-pub fn activate(ui: *Ui, i: u16) void {
+pub fn activate(ui: *Ui, i: Host.CommandIndex) void {
     const registry = ui.ext_registry orelse return;
-    if (i >= registry.commands.len) return;
-    switch (registry.commands[i].mode) {
+    const activated = registry.command(i) orelse return;
+    switch (activated.mode) {
         .run => {
             const host = ui.ext_host orelse return;
             ui.ext_act_gen = host.act(registry.gen, i, .command_run);
@@ -568,7 +572,7 @@ pub fn keymap(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) bool {
 /// `text` typed. False when there is no such thing.
 pub fn openTarget(ui: *Ui, target: []const u8, text: ?[*:0]const u8) bool {
     if (ui.ext_registry) |registry| if (find(registry, target)) |i| {
-        switch (registry.commands[i].mode) {
+        switch (registry.command(i).?.mode) {
             .provider => return false,
             .run => {
                 activate(ui, i);
@@ -683,14 +687,16 @@ test "indexes into the registry follow their ids across a reload" {
         .prefs = &new_prefs,
         .arena = undefined,
     };
-    try testing.expectEqual(@as(?u16, 1), sameCommand(&old, &new, 0));
-    try testing.expectEqual(@as(?u16, 2), sameCommand(&old, &new, 1));
-    try testing.expectEqual(@as(?u16, null), sameCommand(&old, &new, 2));
-    try testing.expectEqual(@as(?u16, null), sameCommand(&old, &new, gone));
+    const Command = Host.CommandIndex;
+    const Pref = Host.PrefIndex;
+    try testing.expectEqual(@as(?Command, .from(1)), sameCommand(&old, &new, .from(0)));
+    try testing.expectEqual(@as(?Command, .from(2)), sameCommand(&old, &new, .from(1)));
+    try testing.expectEqual(@as(?Command, null), sameCommand(&old, &new, .from(2)));
+    try testing.expectEqual(@as(?Command, null), sameCommand(&old, &new, .gone));
     // Not "aaa"'s token, which took its place.
-    try testing.expectEqual(@as(?u16, 1), samePref(&old, &new, 0));
+    try testing.expectEqual(@as(?Pref, .from(1)), samePref(&old, &new, .from(0)));
     // Now a text: typing a password for it would show it.
-    try testing.expectEqual(@as(?u16, null), samePref(&old, &new, 1));
+    try testing.expectEqual(@as(?Pref, null), samePref(&old, &new, .from(1)));
     try testing.expect(sameFields(&name, &name));
     try testing.expect(!sameFields(&name, &renamed));
     try testing.expect(!sameFields(&name, &.{}));

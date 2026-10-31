@@ -17,14 +17,13 @@ const log = std.log.scoped(.ext);
 
 fn command(ui: *Ui) ?*const Host.Command {
     const registry = ui.ext_registry orelse return null;
-    if (ui.form_cmd >= registry.commands.len) return null;
-    const cmd = &registry.commands[ui.form_cmd];
+    const cmd = registry.command(ui.form_cmd) orelse return null;
     return if (cmd.mode == .form) cmd else null;
 }
 
-/// Opens form `i` with its fields at their defaults.
-pub fn open(ui: *Ui, i: u16) void {
-    ui.form_cmd = i;
+/// Opens form `index` with its fields at their defaults.
+pub fn open(ui: *Ui, index: Host.CommandIndex) void {
+    ui.form_cmd = index;
     reset(ui);
     ui.navigate(.form);
 }
@@ -47,15 +46,18 @@ fn clear(ui: *Ui) void {
     ui.form_values.clearRetainingCapacity();
 }
 
-fn value(ui: *Ui, i: usize) [:0]const u8 {
-    return if (i < ui.form_values.items.len) ui.form_values.items[i] else "";
+/// The open form's values, one per field, by position.
+fn value(ui: *Ui, field_index: Host.FieldIndex) [:0]const u8 {
+    const values = ui.form_values.items;
+    return if (field_index.position() < values.len) values[field_index.position()] else "";
 }
 
-pub fn setValue(ui: *Ui, field_index: usize, field_value: []const u8) void {
-    if (field_index >= ui.form_values.items.len) return;
+pub fn setValue(ui: *Ui, field_index: Host.FieldIndex, field_value: []const u8) void {
+    const values = ui.form_values.items;
+    if (field_index.position() >= values.len) return;
     const copy = ui.gpa.dupeSentinel(u8, field_value, 0) catch return;
-    ui.gpa.free(ui.form_values.items[field_index]);
-    ui.form_values.items[field_index] = copy;
+    ui.gpa.free(values[field_index.position()]);
+    values[field_index.position()] = copy;
 }
 
 pub fn title(ui: *Ui) [*:0]const u8 {
@@ -63,9 +65,9 @@ pub fn title(ui: *Ui) [*:0]const u8 {
     return cmd.title.ptr;
 }
 
-pub fn field(ui: *Ui, field_index: usize) ?*const Host.Pref {
+pub fn field(ui: *Ui, field_index: Host.FieldIndex) ?*const Host.Pref {
     const cmd = command(ui) orelse return null;
-    return if (field_index < cmd.fields.len) &cmd.fields[field_index] else null;
+    return cmd.field(field_index);
 }
 
 pub fn candidates(ui: *Ui, arena: std.mem.Allocator) []Item {
@@ -82,9 +84,9 @@ pub fn candidates(ui: *Ui, arena: std.mem.Allocator) []Item {
             .key = arena.print("field:{s}", .{form_field.name}) catch continue,
             .title = field_title,
             .subtitle = form_field.description,
-            .accessory = prefs_view.display(arena, form_field, value(ui, i)),
+            .accessory = prefs_view.display(arena, form_field, value(ui, .from(i))),
             .icon = prefs_view.iconOf(form_field.kind),
-            .action = .{ .setting = .{ .field = @intCast(i) } },
+            .action = .{ .setting = .{ .field = .from(i) } },
         }) catch break;
     }
     // Without its Submit row the form cannot be sent: say so in the log
@@ -99,7 +101,7 @@ pub fn candidates(ui: *Ui, arena: std.mem.Allocator) []Item {
 }
 
 /// Enter on field `field_index`.
-pub fn edit(ui: *Ui, field_index: u16) void {
+pub fn edit(ui: *Ui, field_index: Host.FieldIndex) void {
     const form_field = field(ui, field_index) orelse return;
     prefs_view.editValue(ui, .{ .field = field_index }, form_field, value(ui, field_index));
 }
@@ -109,7 +111,7 @@ pub fn choiceCandidates(
     ui: *Ui,
     arena: std.mem.Allocator,
     out: *std.ArrayList(Item),
-    field_index: u16,
+    field_index: Host.FieldIndex,
 ) void {
     const form_field = field(ui, field_index) orelse return;
     for (form_field.choices) |choice| out.append(
@@ -118,7 +120,7 @@ pub fn choiceCandidates(
     ) catch return;
 }
 
-pub fn pick(ui: *Ui, field_index: u16, field_value: []const u8) void {
+pub fn pick(ui: *Ui, field_index: Host.FieldIndex, field_value: []const u8) void {
     setValue(ui, field_index, field_value);
     ui.goBack();
 }
@@ -135,7 +137,7 @@ pub fn submit(ui: *Ui) void {
     var buf: [form_fields_max]Host.FormValue = undefined;
     assert(cmd.fields.len <= buf.len);
     for (cmd.fields, 0..) |*form_field, i| {
-        const field_value = value(ui, i);
+        const field_value = value(ui, .from(i));
         if (form_field.required and field_value.len == 0) {
             const msg = ui.query_arena.allocator().printSentinel(
                 "Fill in {s} first",

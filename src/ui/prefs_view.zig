@@ -97,7 +97,7 @@ pub fn candidates(ui: *Ui, arena: std.mem.Allocator) []Item {
             .subtitle = preference.description,
             .accessory = display(arena, &preference, current(arena, &preference)),
             .icon = iconOf(preference.kind),
-            .action = .{ .setting = .{ .pref = @intCast(i) } },
+            .action = .{ .setting = .{ .pref = .from(i) } },
         }) catch break;
     }
     manageRows(ui, arena, &out);
@@ -211,10 +211,9 @@ pub fn current(arena: std.mem.Allocator, preference: *const Host.Pref) []const u
 
 /// Enter on a preference: flips a toggle, lists a choice's values, or
 /// opens the input view for text.
-pub fn edit(ui: *Ui, pref_index: u16) void {
+pub fn edit(ui: *Ui, pref_index: Host.PrefIndex) void {
     const registry = ui.ext_registry orelse return;
-    if (pref_index >= registry.prefs.len) return;
-    const preference = &registry.prefs[pref_index];
+    const preference = registry.pref(pref_index) orelse return;
     var arena: std.heap.ArenaAllocator = .init(ui.gpa);
     defer arena.deinit();
     editValue(ui, .{ .pref = pref_index }, preference, current(arena.allocator(), preference));
@@ -258,10 +257,14 @@ pub fn editValue(ui: *Ui, target: Ui.Edited, preference: *const Host.Pref, value
 }
 
 /// The values of a choice preference, for the choose view.
-pub fn choiceCandidates(ui: *Ui, arena: std.mem.Allocator, out: *std.ArrayList(Item), i: u16) void {
+pub fn choiceCandidates(
+    ui: *Ui,
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(Item),
+    pref_index: Host.PrefIndex,
+) void {
     const registry = ui.ext_registry orelse return;
-    if (i >= registry.prefs.len) return;
-    const preference = &registry.prefs[i];
+    const preference = registry.pref(pref_index) orelse return;
     const value = current(arena, preference);
     for (preference.choices) |choice| out.append(
         arena,
@@ -270,10 +273,10 @@ pub fn choiceCandidates(ui: *Ui, arena: std.mem.Allocator, out: *std.ArrayList(I
 }
 
 /// A value picked in the choose view.
-pub fn pick(ui: *Ui, pref_index: u16, value: []const u8) void {
+pub fn pick(ui: *Ui, pref_index: Host.PrefIndex, value: []const u8) void {
     const registry = ui.ext_registry orelse return;
-    if (pref_index >= registry.prefs.len) return;
-    if (!save(ui, &registry.prefs[pref_index], .{ .string = value })) return;
+    const preference = registry.pref(pref_index) orelse return;
+    if (!save(ui, preference, .{ .string = value })) return;
     ui.goBack();
 }
 
@@ -287,7 +290,7 @@ fn inputPref(ui: *Ui) ?*const Host.Pref {
     switch (ui.input) {
         .pref => |pref_index| {
             const registry = ui.ext_registry orelse return null;
-            return if (pref_index < registry.prefs.len) &registry.prefs[pref_index] else null;
+            return registry.pref(pref_index);
         },
         .field => |field_index| return form_view.field(ui, field_index),
     }

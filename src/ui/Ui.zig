@@ -276,7 +276,7 @@ ext_registry: ?*ExtHost.Registry = null,
 /// The files as last loaded (ExtHost.stamp).
 ext_stamp: u64 = 0,
 /// The command the ext view shows (its index in the registry).
-ext_cmd: u16 = 0,
+ext_cmd: ExtHost.CommandIndex = .from(0),
 /// Lists asked of `ext_cmd` and their answers. The visible items point
 /// into the latest one, so it is destroyed only after the rows are built
 /// again.
@@ -289,9 +289,9 @@ ext_act_gen: ExtHost.RequestGeneration = .none,
 prefs_ext: core.FixedStr(extension_id_bytes_max) = .{},
 /// What the input view edits: a preference (index in the registry) or a
 /// field of the open form.
-input: Edited = .{ .pref = 0 },
+input: Edited = .{ .pref = .from(0) },
 /// The open form (index in the registry) and its fields' values (gpa).
-form_cmd: u16 = 0,
+form_cmd: ExtHost.CommandIndex = .from(0),
 form_values: std.ArrayList([:0]u8) = .empty,
 /// How result rows look, for the row builders in widgets.zig.
 row_look: widgets.RowLook = .{},
@@ -441,7 +441,7 @@ const Scroll = struct {
 
 /// A value being edited: an extension's preference or a field of the open
 /// form (indexes in the registry and the form).
-pub const Edited = union(enum) { pref: u16, field: u16 };
+pub const Edited = union(enum) { pref: ExtHost.PrefIndex, field: ExtHost.FieldIndex };
 
 pub const Choosing = union(enum) {
     none,
@@ -450,9 +450,9 @@ pub const Choosing = union(enum) {
     /// Open With for one file; both strings are owned by `gpa`.
     file: struct { path: [:0]u8, mime: [:0]u8 },
     /// A choice preference of an extension (index in the registry).
-    pref: u16,
+    pref: ExtHost.PrefIndex,
     /// A choice field of the open form.
-    field: u16,
+    field: ExtHost.FieldIndex,
 };
 
 /// `hint` shows the primary action while the row is selected, in place of

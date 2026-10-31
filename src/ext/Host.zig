@@ -117,6 +117,9 @@ worker_arena: std.heap.ArenaAllocator,
 pub const Mode = registry_mod.Mode;
 pub const RegistryGeneration = generation_mod.RegistryGeneration;
 pub const RequestGeneration = generation_mod.RequestGeneration;
+pub const CommandIndex = registry_mod.CommandIndex;
+pub const PrefIndex = registry_mod.PrefIndex;
+pub const FieldIndex = registry_mod.FieldIndex;
 pub const config_extension_id = registry_mod.config_extension_id;
 pub const grid_columns_default = registry_mod.grid_columns_default;
 pub const style_extension_id = registry_mod.style_extension_id;
@@ -136,7 +139,7 @@ pub const Registry = registry_mod.Registry;
 /// A command's rows. Owned by the receiver: `destroy`.
 pub const ListResult = struct {
     gen: RequestGeneration,
-    command: u16,
+    command: CommandIndex,
     query: []const u8,
     items: []Item = &.{},
     err: ?[:0]const u8 = null,
@@ -178,7 +181,7 @@ pub const RootResult = struct {
     }
 };
 
-pub const RootSection = struct { command: u16, items: []Item };
+pub const RootSection = struct { command: CommandIndex, items: []Item };
 
 /// Called on the GTK main loop; each takes ownership of its result.
 /// Each request's answer is handed to its callback on the GTK main loop,
@@ -352,7 +355,7 @@ const Pending = struct {
 
 const ListRequest = struct {
     registry_gen: RegistryGeneration,
-    command: u16,
+    command: CommandIndex,
     request_gen: RequestGeneration,
     query: core.FixedStr(query_bytes_max),
 };
@@ -365,7 +368,7 @@ const RootSearchRequest = struct {
 
 const ActRequest = struct {
     registry_gen: RegistryGeneration,
-    command: u16,
+    command: CommandIndex,
     request_gen: RequestGeneration,
     target: Target,
 
@@ -389,7 +392,7 @@ const ActRequest = struct {
 /// A form submitted; owns copies of its values.
 const SubmitRequest = struct {
     registry_gen: RegistryGeneration,
-    command: u16,
+    command: CommandIndex,
     request_gen: RequestGeneration,
     values: []FormValue,
     arena: std.heap.ArenaAllocator,
@@ -478,7 +481,7 @@ pub fn reload(host: *Host) void {
 pub fn list(
     host: *Host,
     registry_gen: RegistryGeneration,
-    command: u16,
+    command: CommandIndex,
     query: []const u8,
 ) RequestGeneration {
     const request_gen = host.requestGenNext();
@@ -503,7 +506,7 @@ pub fn list(
 pub fn submit(
     host: *Host,
     registry_gen: RegistryGeneration,
-    command: u16,
+    command: CommandIndex,
     values: []const FormValue,
 ) RequestGeneration {
     // The window sends one value per field of the form, and a form has at
@@ -539,7 +542,7 @@ pub fn submit(
 fn submitRequestCreate(
     gpa: std.mem.Allocator,
     registry_gen: RegistryGeneration,
-    command: u16,
+    command: CommandIndex,
     request_gen: RequestGeneration,
     values: []const FormValue,
 ) error{OutOfMemory}!*SubmitRequest {
@@ -596,7 +599,7 @@ pub const ActTarget = ActRequest.Target;
 pub fn act(
     host: *Host,
     registry_gen: RegistryGeneration,
-    command: u16,
+    command: CommandIndex,
     target: ActTarget,
 ) RequestGeneration {
     const request_gen = host.requestGenNext();
@@ -1303,12 +1306,16 @@ const reloaded = "Extensions were reloaded";
 /// The command a request names; null when the files were reloaded after
 /// the request was made (its command index is from a registry that is
 /// gone, and may name another command now).
-fn requested(host: *Host, registry_gen: RegistryGeneration, command: u16) ?*WorkerCommand {
+fn requested(
+    host: *Host,
+    registry_gen: RegistryGeneration,
+    command: CommandIndex,
+) ?*WorkerCommand {
     if (registry_gen != host.registry_gen) return null;
     // The registry the UI holds has as many commands as there are worker
     // commands; anything past them is not a command of this registry.
-    if (command >= host.worker_commands.len) return null;
-    const worker_command = &host.worker_commands[command];
+    if (command.position() >= host.worker_commands.len) return null;
+    const worker_command = &host.worker_commands[command.position()];
     assert(worker_command.extension_index < host.extensions.items.len);
     return worker_command;
 }
@@ -1422,7 +1429,7 @@ fn rootSearchExecute(host: *Host, request: *const RootSearchRequest) void {
         if (!worker_command.answers_root_search) continue;
         // A newer query came in: this one is already stale.
         if (host.rootSearchSuperseded()) break;
-        const command: u16 = @intCast(command_index);
+        const command: CommandIndex = .from(command_index);
         const items = host.rootSearchCommand(arena, &rows, worker_command, command, request);
         if (items.len == 0) continue;
         sections.append(arena, .{ .command = command, .items = items }) catch {
@@ -1440,7 +1447,7 @@ fn rootSearchCommand(
     arena: std.mem.Allocator,
     rows: *lua.Capped,
     worker_command: *WorkerCommand,
-    command: u16,
+    command: CommandIndex,
     request: *const RootSearchRequest,
 ) []Item {
     const extension = host.extensionOf(worker_command);
@@ -1472,7 +1479,7 @@ fn rootSearchSuperseded(host: *Host) bool {
 const RootSearchContext = struct {
     extension: *Ext,
     worker_command: *WorkerCommand,
-    command: u16,
+    command: CommandIndex,
     request: *const RootSearchRequest,
     rows_arena: std.mem.Allocator,
     items: []Item = &.{},
@@ -1967,7 +1974,7 @@ test "extensions load, list, search and run actions" {
     try testing.expect(std.mem.find(u8, registry.problems[0].message, "title is missing") != null);
 
     // A list command's rows.
-    const g1 = host.list(registry.gen, 1, "");
+    const g1 = host.list(registry.gen, .from(1), "");
     const fruits = try probe.take("list");
     defer fruits.destroy(testing.allocator);
     try testing.expectEqual(g1, fruits.gen);
@@ -1988,7 +1995,7 @@ test "extensions load, list, search and run actions" {
 
     // Its Lua action runs against that list, and changes state other
     // commands of the extension see.
-    const action_gen = host.act(registry.gen, 1, .{ .row_action = .{
+    const action_gen = host.act(registry.gen, .from(1), .{ .row_action = .{
         .from_root_search = false,
         .list_gen = fruits.gen,
         .row_index = 1,
@@ -2001,7 +2008,7 @@ test "extensions load, list, search and run actions" {
     try testing.expectEqual(Outcome.close, done.outcome);
     // The action took its row's actions away: pressing it again is an
     // error, not a read of whatever `row.actions` is now.
-    _ = host.act(registry.gen, 1, .{ .row_action = .{
+    _ = host.act(registry.gen, .from(1), .{ .row_action = .{
         .from_root_search = false,
         .list_gen = fruits.gen,
         .row_index = 1,
@@ -2010,20 +2017,20 @@ test "extensions load, list, search and run actions" {
     const again = try probe.take("act");
     defer again.destroy(testing.allocator);
     try testing.expect(std.mem.find(u8, again.err.?, "no actions") != null);
-    _ = host.list(registry.gen, 3, "");
+    _ = host.list(registry.gen, .from(3), "");
     const eaten = try probe.take("list");
     defer eaten.destroy(testing.allocator);
     try testing.expectEqualStrings("Banana", eaten.items[0].title);
 
     // A search command gets the query, and lumen.exec runs programs.
-    _ = host.list(registry.gen, 2, "it's \"quoted\"");
+    _ = host.list(registry.gen, .from(2), "it's \"quoted\"");
     const echo = try probe.take("list");
     defer echo.destroy(testing.allocator);
     try testing.expect(echo.err == null);
     try testing.expectEqualStrings("you typed it's \"quoted\"", echo.items[0].title);
 
     // A run command's return value.
-    _ = host.act(registry.gen, 0, .command_run);
+    _ = host.act(registry.gen, .from(0), .command_run);
     const hello = try probe.take("act");
     defer hello.destroy(testing.allocator);
     try testing.expectEqual(Outcome.stay, hello.outcome);
@@ -2034,18 +2041,18 @@ test "extensions load, list, search and run actions" {
     defer r21.destroy(testing.allocator);
     try testing.expectEqual(root_gen, r21.gen);
     try testing.expectEqual(@as(usize, 1), r21.sections.len);
-    try testing.expectEqual(@as(u16, 4), r21.sections[0].command);
+    try testing.expectEqual(CommandIndex.from(4), r21.sections[0].command);
     const doubled = r21.sections[0].items[0];
     try testing.expectEqualStrings("42", doubled.title);
     try testing.expect(doubled.action.ext_item.from_root_search);
-    _ = host.act(registry.gen, 4, .{ .row_action = .{
+    _ = host.act(registry.gen, .from(4), .{ .row_action = .{
         .from_root_search = true,
         .list_gen = doubled.action.ext_item.list_generation,
         .row_index = 0,
         .action_index = 0,
     } });
     (try probe.take("act")).destroy(testing.allocator);
-    _ = host.list(registry.gen, 3, "");
+    _ = host.list(registry.gen, .from(3), "");
     const noted = try probe.take("list");
     defer noted.destroy(testing.allocator);
     try testing.expectEqualStrings("42", noted.items[0].title);
@@ -2055,9 +2062,9 @@ test "extensions load, list, search and run actions" {
     try testing.expectEqual(@as(usize, 0), none.sections.len);
 
     // An action against a list that has been replaced is refused.
-    _ = host.list(registry.gen, 1, "");
+    _ = host.list(registry.gen, .from(1), "");
     (try probe.take("list")).destroy(testing.allocator);
-    _ = host.act(registry.gen, 1, .{ .row_action = .{
+    _ = host.act(registry.gen, .from(1), .{ .row_action = .{
         .from_root_search = false,
         .list_gen = fruits.gen,
         .row_index = 1,
@@ -2070,7 +2077,7 @@ test "extensions load, list, search and run actions" {
     // After a reload, requests against the old registry are refused.
     host.reload();
     try probe.wait("registry");
-    _ = host.list(registry.gen, 1, "");
+    _ = host.list(registry.gen, .from(1), "");
     const old = try probe.take("list");
     defer old.destroy(testing.allocator);
     try testing.expectEqualStrings("Extensions were reloaded", old.err.?);
@@ -2122,17 +2129,17 @@ test "errors in extensions come back as messages" {
         }
     }
 
-    _ = host.list(registry.gen, 0, "");
+    _ = host.list(registry.gen, .from(0), "");
     const boom = try probe.take("list");
     defer boom.destroy(testing.allocator);
     try testing.expect(std.mem.find(u8, boom.err.?, "kaboom") != null);
 
-    _ = host.list(registry.gen, 2, "");
+    _ = host.list(registry.gen, .from(2), "");
     const badrow = try probe.take("list");
     defer badrow.destroy(testing.allocator);
     try testing.expect(std.mem.find(u8, badrow.err.?, "items[1].title is missing") != null);
 
-    _ = host.act(registry.gen, 3, .command_run);
+    _ = host.act(registry.gen, .from(3), .command_run);
     const badret = try probe.take("act");
     defer badret.destroy(testing.allocator);
     try testing.expect(std.mem.find(u8, badret.err.?, "must return") != null);
@@ -2183,16 +2190,16 @@ test "preferences read Settings' file over their defaults; storage persists" {
         "data/extensions/kv/preferences.json",
     ));
 
-    _ = host.list(registry.gen, 0, "");
+    _ = host.list(registry.gen, .from(0), "");
     const before = try probe.take("list");
     defer before.destroy(testing.allocator);
     const want = [_][]const u8{ "nobody", "true", "s", "nil", "false" };
     try testing.expect(before.err == null);
     for (want, before.items) |w, it| try testing.expectEqualStrings(w, it.title);
 
-    _ = host.act(registry.gen, 1, .command_run);
+    _ = host.act(registry.gen, .from(1), .command_run);
     (try probe.take("act")).destroy(testing.allocator);
-    _ = host.act(registry.gen, 1, .command_run);
+    _ = host.act(registry.gen, .from(1), .command_run);
     (try probe.take("act")).destroy(testing.allocator);
     // Storage outlives a reload (a new Lua state reads the file).
     probe.registry = null;
@@ -2200,7 +2207,7 @@ test "preferences read Settings' file over their defaults; storage persists" {
     host.reload();
     try probe.wait("registry");
     const reg2 = probe.registry.?;
-    _ = host.list(reg2.gen, 0, "");
+    _ = host.list(reg2.gen, .from(0), "");
     const after = try probe.take("list");
     defer after.destroy(testing.allocator);
     try testing.expectEqualStrings("2", after.items[3].title);
@@ -2240,14 +2247,14 @@ test "storage never writes over what it cannot read, and reads back what it wrot
         try testing.expect(std.mem.find(u8, registry_problem.message, "are taken") != null);
     }
 
-    _ = host.list(registry.gen, 0, "");
+    _ = host.list(registry.gen, .from(0), "");
     const broken = try probe.take("list");
     defer broken.destroy(testing.allocator);
     try testing.expect(broken.err == null);
     const want = [_][]const u8{ "false", "not overwritten", "{\"a\": 1, oops", "nil" };
     for (want, broken.items[0..want.len]) |w, it| try testing.expectEqualStrings(w, it.title);
 
-    _ = host.list(registry.gen, 1, "");
+    _ = host.list(registry.gen, .from(1), "");
     const bytes = try probe.take("list");
     defer bytes.destroy(testing.allocator);
     try testing.expect(bytes.err == null);
@@ -2297,12 +2304,12 @@ test "rows are kept to a size, and lumen.exec's strings outlive its options" {
     const registry = probe.registry.?;
 
     // One string 1000 rows copy: 5 GB outside the state's memory cap.
-    _ = host.list(registry.gen, 0, "");
+    _ = host.list(registry.gen, .from(0), "");
     const big = try probe.take("list");
     defer big.destroy(testing.allocator);
     try testing.expectEqualStrings(rows_too_big, big.err.?);
 
-    _ = host.list(registry.gen, 1, "");
+    _ = host.list(registry.gen, .from(1), "");
     const long = try probe.take("list");
     defer long.destroy(testing.allocator);
     try testing.expect(long.err == null);
@@ -2312,7 +2319,7 @@ test "rows are kept to a size, and lumen.exec's strings outlive its options" {
     try testing.expectEqual(@as(usize, rows_mod.detail_bytes_max), row.detail.len);
     try testing.expectEqual(@as(usize, rows_mod.line_bytes_max), row.meta[0].value.len);
 
-    _ = host.list(registry.gen, 2, "");
+    _ = host.list(registry.gen, .from(2), "");
     const ran = try probe.take("list");
     defer ran.destroy(testing.allocator);
     try testing.expect(ran.err == null);

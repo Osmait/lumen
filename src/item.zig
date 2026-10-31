@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const assert = std.debug.assert;
+const indexes = @import("ext/indexes.zig");
 const c = @import("c");
 const core = @import("core");
 const settings = @import("settings.zig");
@@ -116,7 +117,7 @@ pub const Action = union(enum) {
     },
     /// An extension command (its index in the extension registry): opens
     /// its list, or runs it when it has no list.
-    ext_command: struct { index: u16, run: bool },
+    ext_command: struct { index: indexes.CommandIndex, run: bool },
     /// A row listed by an extension command.
     ext_item: ExtItem,
     /// An extension that failed to load; `Item.detail` holds the error.
@@ -134,7 +135,7 @@ pub const meta_max = 4;
 pub const ExtItem = struct {
     /// The extension command that listed it (index in the registry), and
     /// whether in its list or in the root search.
-    command: u16,
+    command: indexes.CommandIndex,
     from_root_search: bool = false,
     /// The list result it came from: its Lua actions run against that one.
     list_generation: @import("ext/generation.zig").RequestGeneration,
@@ -178,11 +179,11 @@ pub const Setting = union(enum) {
     /// Opens an extension's preferences (its id).
     ext_prefs: [:0]const u8,
     /// Changes one preference (its index in the extension registry).
-    pref: u16,
+    pref: indexes.PrefIndex,
     /// Saves what was typed in the input view.
     save_input,
     /// Changes a field of the open form (its index in the form).
-    field: u16,
+    field: indexes.FieldIndex,
     /// Submits the open form.
     submit_form,
     /// An extension's folder, git pull, removal (its id).

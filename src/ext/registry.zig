@@ -8,6 +8,10 @@ const item_mod = @import("../item.zig");
 const themes = @import("../ui/themes.zig");
 const layout_mod = @import("../layout.zig");
 const RegistryGeneration = @import("generation.zig").RegistryGeneration;
+const indexes = @import("indexes.zig");
+pub const CommandIndex = indexes.CommandIndex;
+pub const PrefIndex = indexes.PrefIndex;
+pub const FieldIndex = indexes.FieldIndex;
 
 /// Cells to a line in a grid command that does not say.
 pub const grid_columns_default = 5;
@@ -62,6 +66,11 @@ pub const Command = struct {
     /// Rows as a grid of cells (`grid = true`), this many to a line.
     grid: bool = false,
     columns: u8 = grid_columns_default,
+
+    /// Field `index` of the form, or null when it has no such field.
+    pub fn field(command: *const Command, index: FieldIndex) ?*const Pref {
+        return index.in(Pref, command.fields);
+    }
 };
 
 pub const Keymap = struct {
@@ -142,5 +151,15 @@ pub const Registry = struct {
     pub fn destroy(registry: *Registry, gpa: std.mem.Allocator) void {
         registry.arena.deinit();
         gpa.destroy(registry);
+    }
+
+    /// Command `index`, or null when this registry has no such command.
+    pub fn command(registry: *const Registry, index: CommandIndex) ?*const Command {
+        return index.in(Command, registry.commands);
+    }
+
+    /// Preference `index`, or null when this registry has no such one.
+    pub fn pref(registry: *const Registry, index: PrefIndex) ?*const Pref {
+        return index.in(Pref, registry.prefs);
     }
 };

@@ -397,9 +397,7 @@ fn writeChooseTitle(
             try writer.print("Open {s} With", .{std.Io.Dir.path.basename(file.path)});
         },
         .pref => |pref_index| if (ui.ext_registry) |registry| {
-            if (pref_index < registry.prefs.len) {
-                try writer.writeAll(registry.prefs[pref_index].title);
-            }
+            if (registry.pref(pref_index)) |preference| try writer.writeAll(preference.title);
         },
         .field => |field_index| if (form_view.field(ui, field_index)) |form_field| {
             try writer.writeAll(form_field.title);

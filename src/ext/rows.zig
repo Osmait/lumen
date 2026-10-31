@@ -10,6 +10,7 @@ const core = @import("core");
 const api = @import("api.zig");
 const item_mod = @import("../item.zig");
 const RequestGeneration = @import("generation.zig").RequestGeneration;
+const CommandIndex = @import("indexes.zig").CommandIndex;
 const Item = item_mod.Item;
 
 const assert = std.debug.assert;
@@ -43,7 +44,7 @@ comptime {
 pub const RowsOrigin = struct {
     /// The request that listed them (`ExtItem.list_generation`).
     list_gen: RequestGeneration,
-    command: u16,
+    command: CommandIndex,
     from_root_search: bool = false,
     extension_id: []const u8,
 };
