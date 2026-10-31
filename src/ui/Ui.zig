@@ -620,18 +620,17 @@ pub fn build(self: *Ui) void {
     self.buildResults(column);
     self.buildFooter(column);
     self.buildPanel(overlay);
-    const win = self.window;
     const keys = c.gtk_event_controller_key_new();
     c.gtk_event_controller_set_propagation_phase(keys, c.GTK_PHASE_CAPTURE);
     widgets.connect(keys, "key-pressed", &onKey, self);
-    c.gtk_widget_add_controller(gtk.widget(win), keys);
+    c.gtk_widget_add_controller(gtk.widget(self.window), keys);
 
     // A click on the clear part of the surface hides the window, like one on
     // the backdrop. Capture phase: it sees every press, and claims none.
     const click = c.gtk_gesture_click_new();
     c.gtk_event_controller_set_propagation_phase(click, c.GTK_PHASE_CAPTURE);
     widgets.connect(click, "pressed", &backdrop.onWindowPressed, self);
-    c.gtk_widget_add_controller(gtk.widget(win), click);
+    c.gtk_widget_add_controller(gtk.widget(self.window), click);
     self.built = true;
     self.scanIconDir();
     self.applyStructure();
@@ -639,21 +638,20 @@ pub fn build(self: *Ui) void {
 
 /// The layer-shell window and the overlay everything goes in.
 fn buildWindow(self: *Ui) *c.GtkOverlay {
-    const win = gtk.window(self.app);
-    self.window = win;
-    gtk.addClass(win, "lumen");
-    c.gtk_window_set_title(win, "Lumen");
-    c.gtk_window_set_resizable(win, 0);
-    c.gtk_window_set_decorated(win, 0);
+    const window = gtk.window(self.app);
+    self.window = window;
+    gtk.addClass(window, "lumen");
+    c.gtk_window_set_title(window, "Lumen");
+    c.gtk_window_set_resizable(window, 0);
+    c.gtk_window_set_decorated(window, 0);
     // A fixed size: the layer surface would otherwise grow to its content's
     // natural size (a large image preview, a long path).
     c.gtk_window_set_default_size(
-        win,
+        window,
         self.panelWidth() + 2 * style_css.shell_margin_px,
         self.panelHeight() + 2 * style_css.shell_margin_px,
     );
 
-    const window = win;
     c.gtk_layer_init_for_window(window);
     c.gtk_layer_set_layer(window, c.GTK_LAYER_SHELL_LAYER_OVERLAY);
     const keyboard_mode = if (testMode())
@@ -808,15 +806,17 @@ fn scanIconDir(self: *Ui) void {
         self.icon_arena = .init(self.gpa);
     }
     const arena = self.icon_arena.?.allocator();
-    const dir = arena.printSentinel("{s}/icons", .{self.config_dir}, 0) catch return;
-    const icon_dir = c.g_dir_open(dir.ptr, 0, null) orelse return;
-    defer c.g_dir_close(icon_dir);
-    while (c.g_dir_read_name(icon_dir)) |name_c| {
-        const name = std.mem.span(name_c);
+    const icons_path = arena.printSentinel("{s}/icons", .{self.config_dir}, 0) catch return;
+    const icons_folder = c.g_dir_open(icons_path.ptr, 0, null) orelse return;
+    defer c.g_dir_close(icons_folder);
+    while (c.g_dir_read_name(icons_folder)) |name_z| {
+        const name = std.mem.span(name_z);
         const dot = std.mem.findScalarLast(u8, name, '.') orelse continue;
-        const ext = name[dot + 1 ..];
-        if (!(std.ascii.eqlIgnoreCase(ext, "svg") or std.ascii.eqlIgnoreCase(ext, "png"))) continue;
-        const path = arena.printSentinel("{s}/{s}", .{ dir, name }, 0) catch continue;
+        const extension = name[dot + 1 ..];
+        const svg = std.ascii.eqlIgnoreCase(extension, "svg");
+        const png = std.ascii.eqlIgnoreCase(extension, "png");
+        if (!svg and !png) continue;
+        const path = arena.printSentinel("{s}/{s}", .{ icons_path, name }, 0) catch continue;
         self.row_look.renamed.put(
             arena,
             arena.dupe(u8, name[0..dot]) catch continue,
@@ -833,6 +833,7 @@ pub fn keyIcon(self: *const Ui, key: []const u8) ?item_mod.Icon {
     return null;
 }
 
+/// The search bar's widget for `part`.
 fn barWidget(self: *Ui, part: layout_mod.BarPart) *c.GtkWidget {
     return switch (part) {
         .back => self.search_bar.back,
@@ -855,11 +856,11 @@ pub fn applyStructure(self: *Ui) void {
     self.row_look.parts = layout.row;
     // The search bar's parts in order; setView decides which of them show.
     const bar: *c.GtkBox = self.search_bar.box;
-    var prev: ?*c.GtkWidget = null;
+    var previous: ?*c.GtkWidget = null;
     for (layout.searchbar.slice()) |part| {
         const widget = self.barWidget(part);
-        c.gtk_box_reorder_child_after(bar, widget, prev);
-        prev = widget;
+        c.gtk_box_reorder_child_after(bar, widget, previous);
+        previous = widget;
     }
     c.gtk_label_set_text(self.search_bar.prompt, layout.prompt.ptr);
     c.gtk_widget_set_visible(gtk.widget(self.search_bar.prompt), @intFromBool(
@@ -974,8 +975,9 @@ fn applyIconTheme(self: *Ui) void {
     if (self.settings.icon_theme.len == 0) {
         return c.gtk_settings_reset_property(gtk_settings, gtk_icon_theme_property);
     }
-    var buf: [icon_theme_name_bytes_max]u8 = undefined;
-    const name = std.mem.printSentinel(&buf, "{s}", .{self.settings.icon_theme}, 0) catch return;
+    var name_bytes: [icon_theme_name_bytes_max]u8 = undefined;
+    const theme_name = self.settings.icon_theme;
+    const name = std.mem.printSentinel(&name_bytes, "{s}", .{theme_name}, 0) catch return;
     c.g_object_set(gtk_settings, gtk_icon_theme_property, name.ptr, @as(?*anyopaque, null));
 }
 
@@ -1067,49 +1069,55 @@ fn appendStyleCss(self: *Ui, writer: *std.Io.Writer) std.Io.Writer.Error!void {
     self.appearance.style_css_stamp = .none;
     const name = self.settings.style;
     if (name.len == 0) return;
-    var buf: [4096]u8 = undefined;
-    const dir = std.mem.printSentinel(
-        &buf,
+    var folder_bytes: [4096]u8 = undefined;
+    const folder = std.mem.printSentinel(
+        &folder_bytes,
         "{s}/styles/{s}",
         .{ self.config_dir, name },
         0,
     ) catch return;
-    if (os.info(dir) == null) {
+    if (os.info(folder) == null) {
         const style = styles.find(name) orelse return;
         try writer.print("\n/* style {s} */\n", .{name});
         return writer.writeAll(style.css);
     }
-    var pbuf: [4096]u8 = undefined;
-    const path = std.mem.printSentinel(&pbuf, "{s}/style.css", .{dir}, 0) catch return;
+    var path_bytes: [4096]u8 = undefined;
+    const path = std.mem.printSentinel(&path_bytes, "{s}/style.css", .{folder}, 0) catch return;
     self.appearance.style_css_stamp = settings_mod.Stamp.of(path.ptr);
     var contents: ?[*:0]u8 = null;
-    var len: usize = 0;
-    if (c.g_file_get_contents(path.ptr, &contents, &len, null) == 0) return;
+    var length: usize = 0;
+    if (c.g_file_get_contents(path.ptr, &contents, &length, null) == 0) return;
     defer c.g_free(contents);
     try writer.print("\n/* {s} */\n", .{path});
-    try writer.writeAll(contents.?[0..len]);
+    try writer.writeAll(contents.?[0..length]);
     try writer.writeByte('\n');
 }
 
 /// $XDG_CONFIG_HOME/lumen/style.css, after Lumen's rules so it wins. The
 /// classes it can use are listed in EXTENSIONS.md.
 fn appendUserCss(self: *Ui, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-    var buf: [4096]u8 = undefined;
-    const path = std.mem.printSentinel(&buf, "{s}/style.css", .{self.config_dir}, 0) catch return;
+    var path_bytes: [4096]u8 = undefined;
+    const path = std.mem.printSentinel(
+        &path_bytes,
+        "{s}/style.css",
+        .{self.config_dir},
+        0,
+    ) catch return;
     self.appearance.user_css_stamp = settings_mod.Stamp.of(path.ptr);
     var contents: ?[*:0]u8 = null;
-    var len: usize = 0;
-    if (c.g_file_get_contents(path.ptr, &contents, &len, null) == 0) return;
+    var length: usize = 0;
+    if (c.g_file_get_contents(path.ptr, &contents, &length, null) == 0) return;
     defer c.g_free(contents);
     try writer.writeAll("\n/* ~/.config/lumen/style.css */\n");
-    try writer.writeAll(contents.?[0..len]);
+    try writer.writeAll(contents.?[0..length]);
     try writer.writeByte('\n');
 }
 
+/// Whether the user's or the style's style.css changed since it was read.
 fn userCssChanged(self: *Ui) bool {
-    var buf: [4096]u8 = undefined;
+    var path_bytes: [4096]u8 = undefined;
     const path = std.mem.printSentinel(
-        &buf,
+        &path_bytes,
         "{s}/style.css",
         .{self.config_dir},
         0,
@@ -1117,7 +1125,7 @@ fn userCssChanged(self: *Ui) bool {
     if (!settings_mod.Stamp.of(path.ptr).eql(self.appearance.user_css_stamp)) return true;
     if (self.settings.style.len == 0) return false;
     const style = std.mem.printSentinel(
-        &buf,
+        &path_bytes,
         "{s}/styles/{s}/style.css",
         .{ self.config_dir, self.settings.style },
         0,
@@ -1290,9 +1298,10 @@ fn placeOnFocusedMonitor(self: *Ui) void {
     const monitor_count = c.g_list_model_get_n_items(monitors);
     var i: c_uint = 0;
     while (i < monitor_count) : (i += 1) {
-        const obj = c.g_list_model_get_item(monitors, i) orelse continue;
-        defer c.g_object_unref(obj);
-        const monitor: *c.GdkMonitor = @ptrCast(obj);
+        const monitor_object = c.g_list_model_get_item(monitors, i) orelse continue;
+        defer c.g_object_unref(monitor_object);
+        // The display's monitor list holds GdkMonitors only.
+        const monitor: *c.GdkMonitor = @ptrCast(monitor_object);
         const connector = c.gdk_monitor_get_connector(monitor) orelse continue;
         if (!std.mem.eql(u8, std.mem.span(connector), name)) continue;
         c.gtk_layer_set_monitor(self.window, monitor);
@@ -1400,10 +1409,10 @@ pub fn setView(self: *Ui, view: View) void {
     self.base = self.loadBase(self.data_arena.allocator());
 
     self.layoutFor(view);
-    var placeholder_buf: [128]u8 = undefined;
+    var placeholder_bytes: [128]u8 = undefined;
     c.gtk_text_set_placeholder_text(
         self.search_bar.entry,
-        self.placeholderFor(view, &placeholder_buf),
+        self.placeholderFor(view, &placeholder_bytes),
     );
     c.gtk_label_set_text(self.search_bar.scope, self.viewTitle());
     c.gtk_widget_set_visible(gtk.widget(self.search_bar.scope), @intFromBool(
@@ -1426,9 +1435,10 @@ pub fn setView(self: *Ui, view: View) void {
 /// The window's parts for `view`: the detail pane and what it shows, the
 /// grid, the back arrow and the magnifier, the list's size.
 fn layoutFor(self: *Ui, view: View) void {
-    const has_detail = view == .clipboard or view == .files or view == .contents or
-        (view == .ext and if (ext_view.command(self)) |cmd| cmd.detail else false);
-    self.grid_mode = view == .ext and if (ext_view.command(self)) |cmd| cmd.grid else false;
+    const open_command = if (view == .ext) ext_view.command(self) else null;
+    const ext_detail = if (open_command) |shown| shown.detail else false;
+    const has_detail = view == .clipboard or view == .files or view == .contents or ext_detail;
+    self.grid_mode = if (open_command) |shown| shown.grid else false;
     if (self.grid_mode) {
         self.grid_columns = ext_view.command(self).?.columns;
         c.gtk_flow_box_set_min_children_per_line(self.grid, @intCast(self.grid_columns));
@@ -1464,7 +1474,7 @@ fn layoutFor(self: *Ui, view: View) void {
         .contents => .{ "Kind", "Matches", "Modified", "Where" },
         else => .{ "Content type", "Characters", "Words", "Copied" },
     };
-    for (self.detail.meta_keys, keys) |w, k| c.gtk_label_set_text(w, k);
+    for (self.detail.meta_keys, keys) |key_label, key| c.gtk_label_set_text(key_label, key);
     // Code previews do not wrap, they clip long lines like an editor: a
     // wrapping GtkLabel makes GTK lay its text out at several widths per frame
     // (~30 ms measured with `lumen --stats`). Clipboard text is prose: wrap.
@@ -1477,20 +1487,16 @@ fn layoutFor(self: *Ui, view: View) void {
     gtk.setVisible(self.detail.picture, false);
 }
 
-/// The search bar's text while empty, for `view` (`buf` may hold it).
-fn placeholderFor(self: *Ui, view: View, buf: *[128]u8) [*:0]const u8 {
+/// The search bar's text while empty, for `view` (`out` may hold it).
+fn placeholderFor(self: *Ui, view: View, out: *[128]u8) [*:0]const u8 {
     // lumen.layout's placeholder: "Go…" at the root, "<view>…" elsewhere.
-    const custom: ?[*:0]const u8 = if (self.layout.placeholder.len == 0)
-        null
-    else if (view == .root)
-        self.layout.placeholder.ptr
-    else if (std.mem.printSentinel(
-        buf,
-        "{s}…",
-        .{std.mem.span(self.viewTitle())},
-        0,
-    )) |t| t.ptr else |_| "…";
-    return custom orelse switch (view) {
+    if (self.layout.placeholder.len > 0) {
+        if (view == .root) return self.layout.placeholder.ptr;
+        const title = std.mem.span(self.viewTitle());
+        const text = std.mem.printSentinel(out, "{s}…", .{title}, 0) catch return "…";
+        return text.ptr;
+    }
+    return switch (view) {
         .root => "Search for apps and commands...",
         .clipboard => "Type to filter entries...",
         .windows => "Search windows...",
@@ -1500,7 +1506,7 @@ fn placeholderFor(self: *Ui, view: View, buf: *[128]u8) [*:0]const u8 {
         .themes => "Search themes...",
         .default_apps => "Search file kinds...",
         .choose => if (self.choosing == .setting) "Filter values..." else "Search apps...",
-        .ext => ext_view.placeholder(self, buf),
+        .ext => ext_view.placeholder(self, out),
         .dmenu => "Filter...",
         .prefs => "Search preferences...",
         .input => prefs_view.inputTitle(self),
@@ -1822,8 +1828,8 @@ fn fillRoot(self: *Ui, arena: std.mem.Allocator, query_text: []const u8) void {
 
     if (core.calc.evaluate(query_text)) |answer| {
         self.addSection("Calculator");
-        var buf: [64]u8 = undefined;
-        const plain = arena.dupe(u8, core.calc.formatPlain(&buf, answer.value)) catch "";
+        var plain_bytes: [64]u8 = undefined;
+        const plain = arena.dupe(u8, core.calc.formatPlain(&plain_bytes, answer.value)) catch "";
         self.addItem(.{
             .title = arena.dupeSentinel(u8, query_text, 0) catch "",
             .subtitle = arena.dupeSentinel(u8, answer.from_unit, 0) catch "",
@@ -1837,7 +1843,7 @@ fn fillRoot(self: *Ui, arena: std.mem.Allocator, query_text: []const u8) void {
 
     // Scoring and sorting only: rows are timed apart, and fileItems times
     // itself (a deferred timer here counted it twice).
-    const t_search = stats.now();
+    const search_start_ns = stats.now();
     var hits: std.ArrayList(Item) = .empty;
     for (self.base) |item| {
         const fields = [_][]const u8{ item.title, item.keywords, item.subtitle };
@@ -1848,7 +1854,7 @@ fn fillRoot(self: *Ui, arena: std.mem.Allocator, query_text: []const u8) void {
         hits.append(arena, copy) catch break;
     }
     sortByScore(hits.items);
-    self.search_ns += stats.now() - t_search;
+    self.search_ns += stats.now() - search_start_ns;
     // Files from 3 letters on, right after the best few results so they are
     // visible without scrolling; the rest of the results follow.
     const files_wanted = query_text.len >= root_files_query_bytes_min and
@@ -1876,12 +1882,12 @@ fn fillFiltered(
 ) void {
     if (query_text.len == 0) {
         if (grouping == .by_day) {
-            const today = labels.startOfToday();
+            const today_s = labels.startOfToday();
             var last: ?[:0]const u8 = null;
             for (self.base) |item| {
-                const section: [:0]const u8 = if (item.time_s >= today)
+                const section: [:0]const u8 = if (item.time_s >= today_s)
                     "Today"
-                else if (item.time_s >= today - std.time.s_per_day)
+                else if (item.time_s >= today_s - std.time.s_per_day)
                     "Yesterday"
                 else
                     "Earlier";
@@ -1896,7 +1902,7 @@ fn fillFiltered(
         }
         return;
     }
-    const t_search = stats.now();
+    const search_start_ns = stats.now();
     var hits: std.ArrayList(Item) = .empty;
     for (self.base) |item| {
         const detail_scored = item.detail[0..@min(item.detail.len, filtered_detail_bytes_max)];
@@ -1909,7 +1915,7 @@ fn fillFiltered(
         hits.append(arena, copy) catch break;
     }
     sortByScore(hits.items);
-    self.search_ns += stats.now() - t_search;
+    self.search_ns += stats.now() - search_start_ns;
     for (hits.items[0..@min(hits.items.len, filtered_results_max)]) |item| self.addItem(item);
 }
 
@@ -1917,11 +1923,11 @@ fn fillFiltered(
 /// sort's whims (two apps tied for "e2e" swapped between runs).
 fn sortByScore(items: []Item) void {
     std.mem.sort(Item, items, {}, struct {
-        fn gt(_: void, x: Item, y: Item) bool {
+        fn better(_: void, x: Item, y: Item) bool {
             if (x.score != y.score) return x.score > y.score;
             return std.mem.order(u8, x.title, y.title) == .lt;
         }
-    }.gt);
+    }.better);
 }
 
 pub fn addSection(self: *Ui, title: [:0]const u8) void {
@@ -2015,7 +2021,7 @@ fn buildItemRow(self: *Ui, item_index: usize) void {
     // Rows follow the items in order: a row queued for an earlier list
     // would point at the wrong item.
     assert(item_index < self.items.items.len);
-    if (self.lastItemRow()) |prev| assert(prev < item_index);
+    if (self.lastItemRow()) |previous| assert(previous < item_index);
     // The grid has no section rows: a child's index is its item's.
     if (self.grid_mode) assert(self.rows.items.len == item_index);
     const arena = self.query_arena.allocator();
@@ -2092,7 +2098,7 @@ pub fn select(self: *Ui, row_index: ?usize) void {
     if (self.selected) |old| if (old < self.rows.items.len) {
         const row_old = self.rows.items[old];
         if (row_old.hint) |hint| gtk.setVisible(hint, false);
-        if (row_old.accessory) |acc| gtk.setVisible(acc, true);
+        if (row_old.accessory) |accessory| gtk.setVisible(accessory, true);
     };
     self.selected = row_index;
     self.confirm_key = "";
@@ -2239,7 +2245,7 @@ fn viewTitle(self: *Ui) [*:0]const u8 {
         .themes => "Change Theme",
         .default_apps => "Default Apps",
         .choose => &self.choose_title,
-        .ext => if (ext_view.command(self)) |cmd| cmd.title else "Extension",
+        .ext => if (ext_view.command(self)) |shown| shown.title else "Extension",
         .dmenu => dmenu.title(self),
         .prefs => prefs_view.title(self),
         .input => prefs_view.inputTitle(self),
@@ -2278,10 +2284,11 @@ pub fn needsConfirm(self: *Ui, item: *const Item) bool {
     return true;
 }
 
-/// It did not work: say so on the selected row. `msg` must outlive the rows.
-pub fn showFailure(self: *Ui, msg: [:0]const u8) void {
-    self.primary = msg;
-    self.setHint(msg, .warning);
+/// It did not work: say so on the selected row. `message` must outlive the
+/// rows.
+pub fn showFailure(self: *Ui, message: [:0]const u8) void {
+    self.primary = message;
+    self.setHint(message, .warning);
 }
 
 /// A Lua action is running.
@@ -2290,11 +2297,12 @@ pub fn showRunning(self: *Ui) void {
     self.setHint(self.primary, .action);
 }
 
-pub fn perform(self: *Ui, op: item_mod.Op) void {
+/// Runs `operation` on the selected row.
+pub fn perform(self: *Ui, operation: item_mod.Op) void {
     const item = self.selectedItem() orelse return;
-    if (item.confirm and (op == .run or op == .open) and self.needsConfirm(item)) return;
+    const primary = operation == .run or operation == .open;
+    if (item.confirm and primary and self.needsConfirm(item)) return;
     self.panel.close();
-    const primary = op == .run or op == .open;
     // Ranking only, and Db logs its own failures: the action goes ahead
     // whether or not the use was recorded.
     if (primary and item.key.len > 0 and item.action != .setting) {
@@ -2304,7 +2312,7 @@ pub fn perform(self: *Ui, op: item_mod.Op) void {
         return ext_view.activate(self, item.action.ext_command.index);
     }
     if (item.action == .pick) {
-        if (op == .pick_typed) return dmenu.chooseTyped(self);
+        if (operation == .pick_typed) return dmenu.chooseTyped(self);
         return dmenu.choose(self, item.action.pick.index);
     }
 
@@ -2313,7 +2321,7 @@ pub fn perform(self: *Ui, op: item_mod.Op) void {
     var whole = item.*;
     var clip_arena: std.heap.ArenaAllocator = .init(self.gpa);
     defer clip_arena.deinit();
-    const uses_text = switch (op) {
+    const uses_text = switch (operation) {
         .run, .open, .clip_paste, .clip_copy => true,
         else => false,
     };
@@ -2321,7 +2329,7 @@ pub fn perform(self: *Ui, op: item_mod.Op) void {
         const content = self.db.clipContent(clip_arena.allocator(), item.action.clip) catch null;
         whole.detail = content orelse return self.showFailure("Could not read the entry");
     }
-    const outcome = run.perform(self.actionContext(), &whole, op);
+    const outcome = run.perform(self.actionContext(), &whole, operation);
     switch (outcome) {
         .hide => self.hide(),
         .stay => {},
@@ -2331,10 +2339,7 @@ pub fn perform(self: *Ui, op: item_mod.Op) void {
             settings_view.performSetting(self, setting_action.setting, setting_action.op);
         },
         .choose_app => |path| settings_view.chooseAppFor(self, path),
-        .failed => |msg| {
-            self.primary = msg;
-            self.setHint(msg, .warning);
-        },
+        .failed => |message| self.showFailure(message),
     }
 }
 
@@ -2686,8 +2691,9 @@ test "style.css has the sizes Ui computes with" {
     try std.testing.expect(std.mem.startsWith(u8, border, border_width));
 }
 
-inline fn pxText(comptime px: comptime_int) []const u8 {
-    return std.fmt.comptimePrint("{d}px", .{px});
+/// "6px" for 6, as style.css writes it.
+inline fn pxText(comptime size_px: comptime_int) []const u8 {
+    return std.fmt.comptimePrint("{d}px", .{size_px});
 }
 
 /// The value of `property` in the first rule whose selector ends in

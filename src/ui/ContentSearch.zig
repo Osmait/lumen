@@ -26,13 +26,15 @@ pub const query_bytes_max = 1024;
 gpa: std.mem.Allocator,
 io: std.Io,
 service: *index.ContentService,
-limit: usize,
+/// Hits a search returns at most.
+hits_max: usize,
 on_result: Callback,
-ctx: ?*anyopaque,
+/// Handed back to `on_result` with each result.
+context: ?*anyopaque,
 thread: std.Thread = undefined,
 lock: std.Io.Mutex = .init,
 /// Bumped by every `submit`; the worker sleeps on it.
-gen: std.atomic.Value(u32) = .init(0),
+generation: std.atomic.Value(u32) = .init(0),
 /// Set by `submit` (and `shutdown`), cleared by the worker when it takes
 /// the query: the query running is stale.
 newer: std.atomic.Value(bool) = .init(false),
@@ -62,7 +64,7 @@ pub const Result = struct {
 };
 
 /// Called on the GTK main loop; takes ownership of `result`.
-pub const Callback = *const fn (result: *Result, ctx: ?*anyopaque) void;
+pub const Callback = *const fn (result: *Result, context: ?*anyopaque) void;
 
 pub const StartError = std.mem.Allocator.Error || std.Thread.SpawnError;
 
@@ -79,9 +81,9 @@ pub fn start(
     gpa: std.mem.Allocator,
     io: std.Io,
     service: *index.ContentService,
-    limit: usize,
+    hits_max: usize,
     on_result: Callback,
-    ctx: ?*anyopaque,
+    context: ?*anyopaque,
 ) StartError!*ContentSearch {
     const content_search = try gpa.create(ContentSearch);
     errdefer gpa.destroy(content_search);
@@ -89,9 +91,9 @@ pub fn start(
         .gpa = gpa,
         .io = io,
         .service = service,
-        .limit = limit,
+        .hits_max = hits_max,
         .on_result = on_result,
-        .ctx = ctx,
+        .context = context,
     };
     content_search.thread = try std.Thread.spawn(.{}, run, .{content_search});
     // The name only shows in tools like top: a thread without one works.
@@ -100,12 +102,13 @@ pub fn start(
 }
 
 /// Stops and joins the worker. Call once the GTK main loop has stopped:
-/// a result still queued with g_idle_add would otherwise reach a freed `cs`.
+/// a result still queued with g_idle_add would otherwise reach a freed
+/// `content_search`.
 pub fn shutdown(content_search: *ContentSearch) void {
     content_search.stop.store(true, .release);
     content_search.newer.store(true, .release);
-    _ = content_search.gen.fetchAdd(1, .release);
-    content_search.io.futexWake(u32, &content_search.gen.raw, 1);
+    _ = content_search.generation.fetchAdd(1, .release);
+    content_search.io.futexWake(u32, &content_search.generation.raw, 1);
     content_search.thread.join();
     content_search.gpa.destroy(content_search);
 }
@@ -121,24 +124,24 @@ pub fn submit(content_search: *ContentSearch, query: []const u8, start_ns: u64) 
         content_search.query.set(query_clipped);
         content_search.query_start_ns = start_ns;
         content_search.newer.store(true, .release);
-        break :blk content_search.gen.fetchAdd(1, .release) + 1;
+        break :blk content_search.generation.fetchAdd(1, .release) + 1;
     };
-    content_search.io.futexWake(u32, &content_search.gen.raw, 1);
+    content_search.io.futexWake(u32, &content_search.generation.raw, 1);
     return generation;
 }
 
 fn run(content_search: *ContentSearch) void {
     var seen: u32 = 0;
     while (true) {
-        while (content_search.gen.load(.acquire) == seen and !content_search.stop.load(.acquire)) {
-            content_search.io.futexWaitUncancelable(u32, &content_search.gen.raw, seen);
+        while (content_search.generation.load(.acquire) == seen and !content_search.stop.load(.acquire)) {
+            content_search.io.futexWaitUncancelable(u32, &content_search.generation.raw, seen);
         }
         if (content_search.stop.load(.acquire)) return;
 
         const result = content_search.gpa.create(Result) catch {
             // Drop this query rather than spin on it: the next keystroke
             // asks again.
-            seen = content_search.gen.load(.acquire);
+            seen = content_search.generation.load(.acquire);
             log.warn("content search: out of memory", .{});
             continue;
         };
@@ -154,7 +157,7 @@ fn run(content_search: *ContentSearch) void {
         {
             content_search.lock.lockUncancelable(content_search.io);
             defer content_search.lock.unlock(content_search.io);
-            seen = content_search.gen.load(.acquire);
+            seen = content_search.generation.load(.acquire);
             // Unless shutting down, which may have set it just before.
             content_search.newer.store(content_search.stop.load(.acquire), .release);
             result.gen = seen;
@@ -171,7 +174,7 @@ fn run(content_search: *ContentSearch) void {
             content_search.service.searchUntil(
                 arena,
                 result.query,
-                content_search.limit,
+                content_search.hits_max,
                 &content_search.newer,
                 &hits,
             ) catch |err| {
@@ -181,7 +184,7 @@ fn run(content_search: *ContentSearch) void {
         result.search_ns = os.monotonicNs() - now_ns;
         result.hits = hits.items;
         // A newer query arrived meanwhile: this answer is already stale.
-        if (content_search.gen.load(.acquire) != seen) {
+        if (content_search.generation.load(.acquire) != seen) {
             result.destroy(content_search.gpa);
             continue;
         }
@@ -197,6 +200,6 @@ fn run(content_search: *ContentSearch) void {
 fn deliver(data: ?*anyopaque) callconv(.c) c.gboolean {
     const hop: *Hop = @ptrCast(@alignCast(data.?));
     defer hop.content_search.gpa.destroy(hop);
-    hop.content_search.on_result(hop.result, hop.content_search.ctx);
+    hop.content_search.on_result(hop.result, hop.content_search.context);
     return 0;
 }
