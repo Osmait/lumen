@@ -38,7 +38,7 @@ pub fn main(init: std.process.Init.Minimal) void {
     if (only_flag == .version) printVersion(init.environ);
     const getEnv = std.process.Environ.getPosix;
     if (getEnv(init.environ, ipc.env.runtime_dir)) |runtime_dir| {
-        const app_id = getEnv(init.environ, ipc.env.app_id) orelse ipc.default_app_id;
+        const app_id = getEnv(init.environ, ipc.env.app_id) orelse ipc.app_id_default;
         if (only_flag == .clip_store) {
             // wl-clipboard says when a copy is a password manager's or a clear.
             if (getEnv(init.environ, ipc.env.clipboard_state)) |state| {
@@ -122,7 +122,7 @@ fn printVersion(environ: std.process.Environ) noreturn {
     _ = writeAll(1, "lumen " ++ version ++ "\n");
     const getEnv = std.process.Environ.getPosix;
     const runtime_dir = getEnv(environ, ipc.env.runtime_dir) orelse linux.exit_group(0);
-    const app_id = getEnv(environ, ipc.env.app_id) orelse ipc.default_app_id;
+    const app_id = getEnv(environ, ipc.env.app_id) orelse ipc.app_id_default;
     const request_head = encodeArgs(&.{"--version"}) orelse linux.exit_group(0);
     const answer = exchange(runtime_dir, app_id, request_head) orelse linux.exit_group(0);
     const theirs = std.mem.trim(u8, answer.stdout, " \n");

@@ -10,7 +10,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-pub const default_app_id = "dev.osmait.Lumen";
+pub const app_id_default = "dev.osmait.Lumen";
 
 /// Environment variables the client and the daemon both read.
 pub const env = struct {
@@ -168,10 +168,10 @@ test "socket paths" {
     var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings(
         "/run/user/1000/lumen/dev.osmait.Lumen.sock",
-        socketPath(&buf, "/run/user/1000", default_app_id).?,
+        socketPath(&buf, "/run/user/1000", app_id_default).?,
     );
-    try std.testing.expect(socketPath(&buf, "", default_app_id) == null);
+    try std.testing.expect(socketPath(&buf, "", app_id_default) == null);
     var long: [121]u8 = @splat('x');
     long[0] = '/';
-    try std.testing.expect(socketPath(&buf, &long, default_app_id) == null);
+    try std.testing.expect(socketPath(&buf, &long, app_id_default) == null);
 }

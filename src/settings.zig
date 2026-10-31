@@ -13,7 +13,7 @@ const sys = @import("os");
 const Kind = core.file_kind.Kind;
 const assert = std.debug.assert;
 
-pub const default_theme = "lumen-dark";
+pub const theme_default = "lumen-dark";
 
 pub const TextSize = enum { small, default, large };
 pub const Position = enum { upper_third, center };
@@ -106,7 +106,7 @@ pub const editors = [_]Program{
 
 pub const Settings = struct {
     arena: std.heap.ArenaAllocator,
-    theme: []const u8 = default_theme,
+    theme: []const u8 = theme_default,
     text_size: TextSize = .default,
     /// Window background opacity, percent.
     opacity: u8 = opacity_percent_default,
@@ -538,7 +538,7 @@ const testing = std.testing;
 test "defaults, then values from the file" {
     var defaults = Settings.parse(testing.allocator, "");
     defer defaults.deinit();
-    try testing.expectEqualStrings(default_theme, defaults.theme);
+    try testing.expectEqualStrings(theme_default, defaults.theme);
     try testing.expect(defaults.files_in_root and defaults.clipboard);
     try testing.expectEqual(@as(u32, 1000), defaults.clipboard_keep);
 
@@ -592,7 +592,7 @@ test "bad values keep the default, bad lines are ignored" {
     try testing.expectEqual(@as(u32, 1000), settings.clipboard_keep);
     try testing.expect(settings.files_in_root);
     try testing.expectEqualStrings("", settings.terminal);
-    try testing.expectEqualStrings(default_theme, settings.theme);
+    try testing.expectEqualStrings(theme_default, settings.theme);
     try testing.expectEqual(@as(usize, 1), settings.open_with.count());
     try testing.expectEqualStrings("mpv.desktop", settings.appFor("", .video).?);
 }
@@ -648,7 +648,7 @@ test "save is atomic and owner-only; load survives a missing file" {
 
     var missing = Settings.load(testing.allocator, path);
     defer missing.deinit();
-    try testing.expectEqualStrings(default_theme, missing.theme);
+    try testing.expectEqualStrings(theme_default, missing.theme);
 
     var settings = Settings.init(testing.allocator);
     defer settings.deinit();
