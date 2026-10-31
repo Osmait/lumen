@@ -697,18 +697,21 @@ fn pick(ui: *Ui, value: [:0]const u8) void {
     }
 }
 
-/// Opens the file being chosen for with app `id`; with `always`, that app
-/// becomes the default for its kind (or its extension).
-fn openWith(ui: *Ui, id: [:0]const u8, always: bool) void {
+/// Open With once, or Open and Always Use: the app becomes the default
+/// for the file's kind (or its extension).
+const OpenWithChoice = enum { once, as_default };
+
+/// Opens the file being chosen for with app `id`.
+fn openWith(ui: *Ui, id: [:0]const u8, choice: OpenWithChoice) void {
     if (ui.choosing != .file) return;
     const file = ui.choosing.file;
-    if (always) {
+    if (choice == .as_default) {
         const name = std.Io.Dir.path.basename(file.path);
-        var ebuf: [16]u8 = undefined;
+        var extension_buf: [16]u8 = undefined;
         const key: []const u8 = if (core.file_kind.of(file.mime, name, false)) |kind|
             @tagName(kind)
         else
-            core.file_kind.extKey(&ebuf, name);
+            core.file_kind.extKey(&extension_buf, name);
         if (key.len > 0) {
             if (ui.settings.setOpenWith(key, id)) {
                 ui.saveSettings();
@@ -765,7 +768,7 @@ pub fn performSetting(ui: *Ui, setting: item_mod.Setting, op: item_mod.Op) void 
             ui.setReselect("style:{s}", .{id});
             ui.rebuild();
         },
-        .open_with => |id| openWith(ui, id, op == .always_use),
+        .open_with => |id| openWith(ui, id, if (op == .always_use) .as_default else .once),
         .open_file => {
             // Write the defaults first: an empty editor helps nobody.
             if (os.info(ui.settings_path.ptr) == null) ui.saveSettings();

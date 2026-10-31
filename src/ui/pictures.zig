@@ -524,15 +524,18 @@ const Request = struct {
 var waiting: std.ArrayList(*Request) = .empty;
 var decoding = false;
 
+/// Where a request joins the queue: a preview goes ahead of what waits
+/// (it is what is being looked at), grid pictures behind.
+pub const QueuePlace = enum { front, back };
+
 /// Decodes `path` to fit `w`×`h` on a worker thread, within
-/// `picture_limits`, and calls `done`. `first` goes ahead of what waits
-/// (the preview being looked at). Main thread.
+/// `picture_limits`, and calls `done`. Main thread.
 pub fn requestPicture(
     path: []const u8,
     w: c_int,
     h: c_int,
     lane: *Lane,
-    first: bool,
+    place: QueuePlace,
     done: Done,
     ctx: ?*anyopaque,
 ) void {
@@ -551,8 +554,11 @@ pub fn requestPicture(
         .done = done,
         .ctx = ctx,
     };
-    (if (first) waiting.insert(gpa, 0, r) else waiting.append(gpa, r)) catch
-        return finishRequest(r, null, false);
+    const queued = switch (place) {
+        .front => waiting.insert(gpa, 0, r),
+        .back => waiting.append(gpa, r),
+    };
+    queued catch return finishRequest(r, null, false);
     startNext();
 }
 

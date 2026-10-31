@@ -197,9 +197,9 @@ fn fileTexture(path: [:0]const u8, size: c_int) ?*c.GdkTexture {
 
 /// Icon, title over subtitle, accessory, and the hidden hint that shows
 /// the primary action while the row is selected.
-pub const RowParts = struct { hint: ?*c.GtkWidget = null, accessory: ?*c.GtkWidget = null };
+pub const RowParts = struct { hint: ?*c.GtkLabel = null, accessory: ?*c.GtkWidget = null };
 
-pub fn itemRow(look: *const RowLook, item: Item, parts: *RowParts) *c.GtkWidget {
+pub fn itemRow(look: *const RowLook, item: Item, parts: *RowParts) *c.GtkListBoxRow {
     const row = gtk.listBoxRow();
     const box = hbox(12);
     // The parts in lumen.layout's order; those left out are not made.
@@ -226,13 +226,13 @@ pub fn itemRow(look: *const RowLook, item: Item, parts: *RowParts) *c.GtkWidget 
             gtk.append(box, parts.accessory.?);
         },
         .hint => {
-            parts.hint = gtk.widget(label("", "hint"));
+            parts.hint = label("", "hint");
             gtk.setVisible(parts.hint.?, false);
             gtk.append(box, parts.hint.?);
         },
     };
     c.gtk_list_box_row_set_child(row, gtk.widget(box));
-    return gtk.widget(row);
+    return row;
 }
 
 /// A grid cell: a picture (an image file, scaled down as it is decoded) or
@@ -264,7 +264,7 @@ pub fn gridCell(look: *const RowLook, item: Item, width_px: c_int) *c.GtkWidget 
     gtk.setHexpand(title, true);
     gtk.append(box, title);
     gtk.setSizeRequest(box, width_px, -1);
-    if (decode) GridPictures.request(item.image, width_px, pic_h, key.?, gtk.widget(box), shown);
+    if (decode) GridPictures.request(item.image, width_px, pic_h, key.?, box, shown);
     return gtk.widget(box);
 }
 
@@ -286,43 +286,41 @@ const GridPictures = struct {
     var ring: TextureRing(grid_pictures_cached, u64) = .{};
 
     /// A cell waiting for its picture; its widgets are referenced until then.
-    const Wait = struct { key: u64, h: c_int, box: *c.GtkWidget, icon: *c.GtkWidget };
+    const Wait = struct { key: u64, height_px: c_int, box: *c.GtkBox, icon: *c.GtkWidget };
 
     fn request(
         path: []const u8,
-        w: c_int,
-        h: c_int,
+        width_px: c_int,
+        height_px: c_int,
         key: u64,
-        box: *c.GtkWidget,
+        box: *c.GtkBox,
         icon: *c.GtkWidget,
     ) void {
         const wait = std.heap.c_allocator.create(Wait) catch return;
-        wait.* = .{
-            .key = key,
-            .h = h,
-            .box = @ptrCast(c.g_object_ref(box)),
-            .icon = @ptrCast(c.g_object_ref(icon)),
-        };
-        pictures.requestPicture(path, w, h, &pictures.grid_lane, false, &done, wait);
+        _ = c.g_object_ref(box);
+        _ = c.g_object_ref(icon);
+        wait.* = .{ .key = key, .height_px = height_px, .box = box, .icon = icon };
+        const lane = &pictures.grid_lane;
+        pictures.requestPicture(path, width_px, height_px, lane, .back, &done, wait);
     }
 
-    fn done(ctx: ?*anyopaque, pb: ?*c.GdkPixbuf, current: bool) void {
-        const wait: *Wait = @ptrCast(@alignCast(ctx.?));
+    fn done(context: ?*anyopaque, decoded: ?*c.GdkPixbuf, current: bool) void {
+        const wait: *Wait = @ptrCast(@alignCast(context.?));
         defer {
             c.g_object_unref(wait.box);
             c.g_object_unref(wait.icon);
             std.heap.c_allocator.destroy(wait);
         }
         // Dropped for a newer build before it was decoded: nothing learnt.
-        if (pb == null and !current) return;
-        const tex = if (pb) |pixbuf| c.gdk_texture_new_for_pixbuf(pixbuf) else null;
-        ring.put(wait.key, tex);
+        if (decoded == null and !current) return;
+        const texture_or_none = if (decoded) |pixbuf| c.gdk_texture_new_for_pixbuf(pixbuf) else null;
+        ring.put(wait.key, texture_or_none);
         // The cell may be gone (another keystroke): the new build's cell
         // for the same picture finds it in the ring.
-        const texture = tex orelse return;
-        if (c.gtk_widget_get_parent(wait.icon) != wait.box) return;
-        c.gtk_box_remove(@ptrCast(wait.box), wait.icon);
-        c.gtk_box_prepend(@ptrCast(wait.box), cellPicture(texture, wait.h));
+        const texture = texture_or_none orelse return;
+        if (c.gtk_widget_get_parent(wait.icon) != gtk.widget(wait.box)) return;
+        c.gtk_box_remove(wait.box, wait.icon);
+        c.gtk_box_prepend(wait.box, cellPicture(texture, wait.height_px));
     }
 };
 
@@ -332,7 +330,7 @@ pub fn forgetGridPictures() void {
     pictures.grid_lane.forget();
 }
 
-pub fn calcRow(item: Item) *c.GtkWidget {
+pub fn calcRow(item: Item) *c.GtkListBoxRow {
     const row = gtk.listBoxRow();
     gtk.addClass(row, "calc");
     const box = hbox(0);
@@ -351,7 +349,7 @@ pub fn calcRow(item: Item) *c.GtkWidget {
     gtk.append(box, arrow);
     gtk.append(box, calcSide(buf[0..shown.len :0], right_tag));
     c.gtk_list_box_row_set_child(row, gtk.widget(box));
-    return gtk.widget(row);
+    return row;
 }
 
 pub fn calcSide(value: [:0]const u8, tag: [:0]const u8) *c.GtkWidget {

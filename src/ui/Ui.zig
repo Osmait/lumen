@@ -152,12 +152,20 @@ const actions_keys_text = "Ctrl K";
 const enter_key_text = "↵";
 /// The footer's two labels: what Enter does, and "Actions".
 const footer_action_class = "footer-action";
+/// Monitors that get a backdrop; past these, a click on one more monitor
+/// does not close Lumen.
+const backdrops_max = 8;
 /// An extension's id, with room to spare: Host refuses ids over 40 bytes.
 const extension_id_bytes_max = 64;
 /// A message kept for the row after a reload (a failed install's reason).
 const after_reload_message_bytes_max = 160;
 /// The choose view's title ("Open Markdown With", a setting's name).
 const choose_title_bytes_max = 96;
+/// An item's key kept across a rebuild, to select that row again: the row
+/// to reselect, and each view on the navigation stack. A key longer than
+/// this (a deep file path) is cut, and the row is then not found again:
+/// the first row is selected instead.
+const ItemKey = core.FixedStr(80);
 /// Where Center and Upper Third put the pieces: the room above them, in
 /// tenths of the room the monitor leaves above and below.
 const position_center_tenths = 5;
@@ -212,7 +220,7 @@ icons: std.ArrayList(*c.GIcon) = .empty,
 results: *c.GtkBox = undefined,
 /// Clear full-screen layers under the window, one per monitor: a click on
 /// one (anywhere outside Lumen) hides it.
-backdrops: [8]?*c.GtkWidget = @splat(null),
+backdrops: [backdrops_max]?*c.GtkWindow = @splat(null),
 /// What Enter does on the selected row, shown inside it.
 primary: [:0]const u8 = "",
 /// The action panel (Ctrl K).
@@ -298,7 +306,7 @@ choose_title: [choose_title_bytes_max:0]u8 = @splat(0),
 /// Views to go back to (Escape, Backspace, the back arrow).
 navigation: Navigation = .{},
 /// Row to select once the view is built (by its item key).
-reselect: core.FixedStr(80) = .{},
+reselect: ItemKey = .{},
 
 /// The back arrow, magnifier, prompt, scope chip, text field and Ctrl K chip.
 const SearchBar = struct {
@@ -323,7 +331,8 @@ const Footer = struct {
     separator: *c.GtkLabel,
 
     /// What Enter does on the selected row, or a warning waiting for Enter.
-    fn setAction(footer: *const Footer, text: [:0]const u8, warn: bool) void {
+    fn setAction(footer: *const Footer, text: [:0]const u8, tone: HintTone) void {
+        const warn = tone == .warning;
         c.gtk_label_set_text(footer.action, text.ptr);
         gtk.setClass(footer.action, widgets.css_class.warn, warn);
         const any = text.len > 0;
@@ -334,7 +343,7 @@ const Footer = struct {
 };
 
 /// The selected row's preview, picture and "Information" block.
-const DetailPane = struct {
+pub const DetailPane = struct {
     box: *c.GtkBox = undefined,
     text: *c.GtkLabel = undefined,
     picture: *c.GtkPicture = undefined,
@@ -346,7 +355,7 @@ const DetailPane = struct {
     meta_keys: [item_mod.meta_max]*c.GtkLabel = undefined,
     meta_values: [item_mod.meta_max]*c.GtkLabel = undefined,
     /// The image the picture shows or is loading (see detail_pane.showImage).
-    image_path: [4096]u8 = undefined,
+    image_path: [std.Io.Dir.max_path_bytes]u8 = undefined,
     image_path_len: usize = 0,
     image_mtime: i64 = 0,
 };
@@ -444,11 +453,27 @@ pub const Choosing = union(enum) {
 /// `hint` shows the primary action while the row is selected, in place of
 /// `accessory`.
 const Row = struct {
-    widget: *c.GtkWidget,
+    widget: RowWidget,
     item: ?usize,
     section: [:0]const u8 = "",
-    hint: ?*c.GtkWidget = null,
+    hint: ?*c.GtkLabel = null,
     accessory: ?*c.GtkWidget = null,
+};
+
+/// The GObject data an item's list row carries: its index in `rows` plus
+/// one, since a pointer of 0 reads back as no data.
+const row_index_data_key = "lumen-row";
+
+/// A row of the list, or a cell of the grid (`grid_mode`).
+const RowWidget = union(enum) {
+    list_row: *c.GtkListBoxRow,
+    grid_cell: *c.GtkFlowBoxChild,
+
+    fn widget(row_widget: RowWidget) *c.GtkWidget {
+        return switch (row_widget) {
+            inline else => |typed| gtk.widget(typed),
+        };
+    }
 };
 
 /// A row not built yet: an item (its index) or a section title.
@@ -462,7 +487,7 @@ const Navigation = struct {
     count: usize = 0,
 
     const capacity = 8;
-    const Entry = struct { view: View, key: core.FixedStr(80) };
+    const Entry = struct { view: View, key: ItemKey };
 
     fn push(navigation: *Navigation, view: View, selected_key: []const u8) void {
         assert(navigation.count <= capacity);
@@ -1618,8 +1643,8 @@ fn answerPending(self: *Ui, start_ns: u64) bool {
 fn fill(self: *Ui, arena: std.mem.Allocator, query_text: []const u8, start_ns: u64) void {
     switch (self.view) {
         .root => self.fillRoot(arena, query_text),
-        .clipboard => self.fillFiltered(arena, query_text, true),
-        .windows => self.fillFiltered(arena, query_text, false),
+        .clipboard => self.fillFiltered(arena, query_text, .by_day),
+        .windows => self.fillFiltered(arena, query_text, .flat),
         .files => if (query_text.len > 0) {
             self.addSection("Files");
             for (file_results.fileItems(self, arena, query_text, file_results_max)) |item| {
@@ -1829,9 +1854,18 @@ fn fillRoot(self: *Ui, arena: std.mem.Allocator, query_text: []const u8) void {
     }
 }
 
-fn fillFiltered(self: *Ui, arena: std.mem.Allocator, query_text: []const u8, by_day: bool) void {
+/// How a filtered list shows with nothing typed: the clipboard in Today,
+/// Yesterday and Earlier, the windows as they come.
+const Grouping = enum { by_day, flat };
+
+fn fillFiltered(
+    self: *Ui,
+    arena: std.mem.Allocator,
+    query_text: []const u8,
+    grouping: Grouping,
+) void {
     if (query_text.len == 0) {
-        if (by_day) {
+        if (grouping == .by_day) {
             const today = labels.startOfToday();
             var last: ?[:0]const u8 = null;
             for (self.base) |item| {
@@ -1951,7 +1985,7 @@ fn buildSection(self: *Ui, title: [:0]const u8) void {
     c.gtk_list_box_row_set_child(row, gtk.widget(widgets.label(title, "section-title")));
     c.gtk_list_box_append(self.list, gtk.widget(row));
     self.rows.appendAssumeCapacity(.{
-        .widget = gtk.widget(row),
+        .widget = .{ .list_row = row },
         .item = null,
         .section = title,
     });
@@ -1989,7 +2023,7 @@ fn buildItemRow(self: *Ui, item_index: usize) void {
             self.grid,
             @intCast(item_index),
         ) orelse return;
-        self.rows.appendAssumeCapacity(.{ .widget = @ptrCast(child), .item = item_index });
+        self.rows.appendAssumeCapacity(.{ .widget = .{ .grid_cell = child }, .item = item_index });
         return;
     }
     var parts: widgets.RowParts = .{};
@@ -1997,10 +2031,11 @@ fn buildItemRow(self: *Ui, item_index: usize) void {
         widgets.calcRow(item)
     else
         widgets.itemRow(&self.row_look, item, &parts);
-    c.g_object_set_data(row, "lumen-row", @ptrFromInt(self.rows.items.len + 1));
-    c.gtk_list_box_append(self.list, row);
+    const row_tag = self.rows.items.len + 1;
+    c.g_object_set_data(gtk.widget(row), row_index_data_key, @ptrFromInt(row_tag));
+    c.gtk_list_box_append(self.list, gtk.widget(row));
     self.rows.appendAssumeCapacity(.{
-        .widget = row,
+        .widget = .{ .list_row = row },
         .item = item_index,
         .hint = parts.hint,
         .accessory = parts.accessory,
@@ -2051,7 +2086,7 @@ pub fn select(self: *Ui, row_index: ?usize) void {
     self.confirm_key = "";
     self.primary = "";
     const selected_index = row_index orelse {
-        self.setFooterAction("", false);
+        self.setFooterAction("", .action);
         c.gtk_list_box_unselect_all(self.list);
         c.gtk_flow_box_unselect_all(self.grid);
         detail_pane.showDetail(self, null);
@@ -2061,14 +2096,15 @@ pub fn select(self: *Ui, row_index: ?usize) void {
     // Section titles are never selected (nextSelectable skips them).
     assert(row.item != null);
     assert(row.item.? < self.items.items.len);
-    if (self.grid_mode)
-        c.gtk_flow_box_select_child(self.grid, @ptrCast(row.widget))
-    else
-        c.gtk_list_box_select_row(self.list, @ptrCast(row.widget));
-    if (!self.scroll.suppressed) self.scrollTo(row.widget);
+    assert(self.grid_mode == (row.widget == .grid_cell));
+    switch (row.widget) {
+        .grid_cell => |cell| c.gtk_flow_box_select_child(self.grid, cell),
+        .list_row => |list_row| c.gtk_list_box_select_row(self.list, list_row),
+    }
+    if (!self.scroll.suppressed) self.scrollTo(row.widget.widget());
     const item = &self.items.items[row.item.?];
     self.primary = item_mod.actionsFor(item)[0].label;
-    self.setHint(self.primary, false);
+    self.setHint(self.primary, .action);
     detail_pane.showDetail(self, item);
     // Change Theme shows each theme as the selection moves over it, and the
     // theme in use on a style.
@@ -2079,16 +2115,21 @@ pub fn select(self: *Ui, row_index: ?usize) void {
         null);
 }
 
+/// A hint says what Enter does, or warns that Enter is waiting for a
+/// second press (a destructive action) or that something failed.
+const HintTone = enum { action, warning };
+
 /// The footer's "what Enter does" (hidden with nothing selected).
-fn setFooterAction(self: *Ui, text: []const u8, warn: bool) void {
+fn setFooterAction(self: *Ui, text: []const u8, tone: HintTone) void {
     const text_z = self.query_arena.allocator().dupeSentinel(u8, text, 0) catch return;
-    self.footer.setAction(text_z, warn);
+    self.footer.setAction(text_z, tone);
 }
 
 /// The selected row's hint: "Open ↵", or a warning waiting for Enter (and
 /// the footer's, which says the same).
-fn setHint(self: *Ui, text: []const u8, warn: bool) void {
-    self.setFooterAction(text, warn);
+fn setHint(self: *Ui, text: []const u8, tone: HintTone) void {
+    const warn = tone == .warning;
+    self.setFooterAction(text, tone);
     if (!self.layout.show.hints and !warn) return;
     const row_index = self.selected orelse return;
     const row = self.rows.items[row_index];
@@ -2097,12 +2138,12 @@ fn setHint(self: *Ui, text: []const u8, warn: bool) void {
     // Beside the detail pane the list is narrow: the action's name would
     // squeeze the title to a few letters, so only the key shows there.
     const narrow = gtk.isVisible(self.detail.box);
-    const shown = if (warn) text else if (narrow) "↵" else self.query_arena.allocator().print(
-        "{s}  ↵",
+    const shown = if (warn) text else if (narrow) enter_key_text else self.query_arena.allocator().print(
+        "{s}  " ++ enter_key_text,
         .{text},
     ) catch return;
     const text_z = self.query_arena.allocator().dupeSentinel(u8, shown, 0) catch return;
-    c.gtk_label_set_text(@ptrCast(hint), text_z.ptr);
+    c.gtk_label_set_text(hint, text_z.ptr);
     gtk.setClass(hint, widgets.css_class.warn, warn);
     gtk.setVisible(hint, true);
 }
@@ -2155,7 +2196,7 @@ fn onScrollTick(_: ?*c.GtkWidget, _: ?*c.GdkFrameClock, data: ?*anyopaque) callc
         self.scroll.tick = 0;
         return 0;
     }
-    const row = self.rows.items[row_index].widget;
+    const row = self.rows.items[row_index].widget.widget();
     var bounds: c.graphene_rect_t = undefined;
     const placed = c.gtk_widget_compute_bounds(
         row,
@@ -2219,20 +2260,20 @@ pub fn needsConfirm(self: *Ui, item: *const Item) bool {
         .{item.title},
         0,
     ) catch return true;
-    self.setHint(self.primary, true);
+    self.setHint(self.primary, .warning);
     return true;
 }
 
 /// It did not work: say so on the selected row. `msg` must outlive the rows.
 pub fn showFailure(self: *Ui, msg: [:0]const u8) void {
     self.primary = msg;
-    self.setHint(msg, true);
+    self.setHint(msg, .warning);
 }
 
 /// A Lua action is running.
 pub fn showRunning(self: *Ui) void {
     self.primary = "Running...";
-    self.setHint(self.primary, false);
+    self.setHint(self.primary, .action);
 }
 
 pub fn perform(self: *Ui, op: item_mod.Op) void {
@@ -2274,7 +2315,7 @@ pub fn perform(self: *Ui, op: item_mod.Op) void {
         .choose_app => |path| settings_view.chooseAppFor(self, path),
         .failed => |msg| {
             self.primary = msg;
-            self.setHint(msg, true);
+            self.setHint(msg, .warning);
         },
     }
 }
@@ -2288,9 +2329,10 @@ fn onChanged(_: *c.GtkEditable, data: ?*anyopaque) callconv(.c) void {
 
 fn onRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, data: ?*anyopaque) callconv(.c) void {
     const self: *Ui = @ptrCast(@alignCast(data));
-    const tag = @intFromPtr(c.g_object_get_data(row, "lumen-row"));
-    if (tag == 0) return;
-    self.select(tag - 1);
+    const row_tag = @intFromPtr(c.g_object_get_data(row, row_index_data_key));
+    // 0 is no data at all: a row Lumen did not build (the empty text).
+    if (row_tag == 0) return;
+    self.select(row_tag - 1);
     const item = self.selectedItem() orelse return;
     self.performEntry(item_mod.actionsFor(item)[0]);
 }

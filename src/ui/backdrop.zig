@@ -7,15 +7,18 @@ const item_mod = @import("../item.zig");
 const Ui = @import("Ui.zig");
 const widgets = @import("widgets.zig");
 
-pub fn makeBackdrop(ui: *Ui) *c.GtkWidget {
-    const win = c.gtk_window_new();
-    gtk.addClass(win, "lumen-backdrop");
-    c.gtk_window_set_decorated(@ptrCast(win), 0);
-    const window: *c.GtkWindow = @ptrCast(win);
+/// The backdrops' CSS class and their layer-shell namespace (compositor
+/// rules can match it).
+const backdrop_name = "lumen-backdrop";
+
+pub fn makeBackdrop(ui: *Ui) *c.GtkWindow {
+    const window = gtk.plainWindow();
+    gtk.addClass(window, backdrop_name);
+    c.gtk_window_set_decorated(window, 0);
     c.gtk_layer_init_for_window(window);
     c.gtk_layer_set_layer(window, c.GTK_LAYER_SHELL_LAYER_OVERLAY);
     c.gtk_layer_set_keyboard_mode(window, c.GTK_LAYER_SHELL_KEYBOARD_MODE_NONE);
-    c.gtk_layer_set_namespace(window, "lumen-backdrop");
+    c.gtk_layer_set_namespace(window, backdrop_name);
     const edges = [_]c_int{
         c.GTK_LAYER_SHELL_EDGE_LEFT,
         c.GTK_LAYER_SHELL_EDGE_RIGHT,
@@ -27,8 +30,8 @@ pub fn makeBackdrop(ui: *Ui) *c.GtkWidget {
     c.gtk_layer_set_exclusive_zone(window, -1);
     const click = c.gtk_gesture_click_new();
     widgets.connect(click, "pressed", &onBackdropPressed, ui);
-    c.gtk_widget_add_controller(win, click);
-    return win;
+    c.gtk_widget_add_controller(gtk.widget(window), click);
+    return window;
 }
 
 /// One backdrop per monitor, mapped before the window so they stack under it.
@@ -40,12 +43,14 @@ pub fn prewarmBackdrops(ui: *Ui) void {
     const monitor_count = @min(c.g_list_model_get_n_items(monitors), ui.backdrops.len);
     for (ui.backdrops[0..monitor_count], 0..) |*slot, i| {
         if (slot.* != null) continue;
-        const obj = c.g_list_model_get_item(monitors, @intCast(i)) orelse continue;
-        defer c.g_object_unref(obj);
+        const item = c.g_list_model_get_item(monitors, @intCast(i)) orelse continue;
+        defer c.g_object_unref(item);
+        // The display's monitor list holds GdkMonitors only.
+        const monitor: *c.GdkMonitor = @ptrCast(item);
         const backdrop = makeBackdrop(ui);
         slot.* = backdrop;
-        c.gtk_layer_set_monitor(@ptrCast(backdrop), @ptrCast(obj));
-        c.gtk_widget_realize(backdrop);
+        c.gtk_layer_set_monitor(backdrop, monitor);
+        c.gtk_widget_realize(gtk.widget(backdrop));
     }
 }
 
@@ -58,11 +63,13 @@ pub fn showBackdrops(ui: *Ui) void {
             if (slot.*) |backdrop| gtk.setVisible(backdrop, false);
             continue;
         }
-        const obj = c.g_list_model_get_item(monitors, @intCast(i)) orelse continue;
-        defer c.g_object_unref(obj);
+        const item = c.g_list_model_get_item(monitors, @intCast(i)) orelse continue;
+        defer c.g_object_unref(item);
+        // The display's monitor list holds GdkMonitors only.
+        const monitor: *c.GdkMonitor = @ptrCast(item);
         const backdrop = slot.* orelse makeBackdrop(ui);
         slot.* = backdrop;
-        c.gtk_layer_set_monitor(@ptrCast(backdrop), @ptrCast(obj));
+        c.gtk_layer_set_monitor(backdrop, monitor);
         gtk.setVisible(backdrop, true);
     }
 }

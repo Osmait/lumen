@@ -110,10 +110,10 @@ pub fn showContentDetail(ui: *Ui, item: *const Item) void {
 
     const ctype = c.g_content_type_guess(file.path, null, 0, null);
     defer if (ctype) |type_name| c.g_free(type_name);
-    setMeta(ui, .{
+    setMeta(&ui.detail, .{
         labels.kindLabel(arena, file.path, false, ctype),
         item.fact,
-        if (info) |i| labels.formatWhen(arena, i.mtime) else "—",
+        if (info) |file_info| labels.formatWhen(arena, file_info.mtime) else no_value,
         item.where,
     });
 }
@@ -127,12 +127,11 @@ const preview_px = 2048;
 /// each); now on a worker (`pictures.requestPicture`: within
 /// `picture_limits`, one at a time, a request the selection has left
 /// behind dropped before it is decoded), and not again for the same file.
-fn showImage(ui: *Ui, path: [:0]const u8, mtime: i64) void {
-    const detail = &ui.detail;
+fn showImage(detail: *Ui.DetailPane, path: [:0]const u8, mtime: i64) void {
     const shown_path = detail.image_path[0..detail.image_path_len];
     const same_image = detail.image_mtime == mtime and std.mem.eql(u8, shown_path, path);
     if (same_image) return;
-    forgetImage(ui);
+    forgetImage(detail);
     if (path.len > detail.image_path.len) return;
     @memcpy(detail.image_path[0..path.len], path);
     detail.image_path_len = path.len;
@@ -142,27 +141,27 @@ fn showImage(ui: *Ui, path: [:0]const u8, mtime: i64) void {
         preview_px,
         preview_px,
         &pictures.preview_lane,
-        true,
+        .front,
         &onImageLoaded,
-        ui,
+        detail,
     );
 }
 
 /// No image: what is on its way is dropped (before it is decoded, if it
 /// has not started).
-fn forgetImage(ui: *Ui) void {
+fn forgetImage(detail: *Ui.DetailPane) void {
     pictures.preview_lane.forget();
-    ui.detail.image_path_len = 0;
-    c.gtk_picture_set_paintable(gtk.widget(ui.detail.picture), null);
+    detail.image_path_len = 0;
+    c.gtk_picture_set_paintable(gtk.widget(detail.picture), null);
 }
 
-fn onImageLoaded(ctx: ?*anyopaque, pb: ?*c.GdkPixbuf, current: bool) void {
-    const ui: *Ui = @ptrCast(@alignCast(ctx.?));
+fn onImageLoaded(context: ?*anyopaque, decoded: ?*c.GdkPixbuf, current: bool) void {
+    const detail: *Ui.DetailPane = @ptrCast(@alignCast(context.?));
     if (!current) return;
-    const pixbuf = pb orelse return;
-    const tex = c.gdk_texture_new_for_pixbuf(pixbuf);
-    defer c.g_object_unref(tex);
-    c.gtk_picture_set_paintable(gtk.widget(ui.detail.picture), tex);
+    const pixbuf = decoded orelse return;
+    const texture = c.gdk_texture_new_for_pixbuf(pixbuf);
+    defer c.g_object_unref(texture);
+    c.gtk_picture_set_paintable(gtk.widget(detail.picture), texture);
 }
 
 pub fn showFileDetail(ui: *Ui, item: *const Item) void {
@@ -182,16 +181,23 @@ pub fn showFileDetail(ui: *Ui, item: *const Item) void {
     const image = image_type and os.isRegular(file.path);
     const info = os.info(file.path);
     gtk.setVisible(ui.detail.picture, image);
-    if (image) showImage(ui, file.path, if (info) |i| i.mtime else 0) else forgetImage(ui);
+    if (image) {
+        showImage(&ui.detail, file.path, if (info) |file_info| file_info.mtime else 0);
+    } else {
+        forgetImage(&ui.detail);
+    }
 
     // Text preview: the head of anything that is valid UTF-8.
     var text: []const u8 = "";
     if (!image and !file.is_dir) {
-        const head = os.readHead(file.path, arena.alloc(u8, 4096) catch return);
+        const head = os.readHead(file.path, arena.alloc(u8, preview_head_bytes) catch return);
         const valid = core.utf8.validPrefix(head);
-        // Up to 4 bytes may be a character cut at the end of the head; any
-        // more invalid bytes, or a NUL, and it is not text.
-        const text_like = valid.len + 4 >= head.len and std.mem.findScalar(u8, valid, 0) == null;
+        // A character cut at the end of the head leaves bytes that are not
+        // valid alone, at most one sequence's worth; any more invalid bytes,
+        // or a NUL, and it is not text.
+        const utf8_sequence_bytes_max = 4;
+        const text_like = valid.len + utf8_sequence_bytes_max >= head.len and
+            std.mem.findScalar(u8, valid, 0) == null;
         if (text_like) text = labels.firstLines(valid, preview_lines);
     }
     c.gtk_label_set_text(
@@ -199,13 +205,27 @@ pub fn showFileDetail(ui: *Ui, item: *const Item) void {
         (arena.dupeSentinel(u8, text, 0) catch return).ptr,
     );
 
-    setMeta(ui, .{
+    const size_text = if (info) |file_info|
+        (if (file.is_dir) no_value else labels.formatSize(arena, file_info.size))
+    else
+        no_value;
+    setMeta(&ui.detail, .{
         labels.kindLabel(arena, file.path, file.is_dir, content_type),
-        if (info) |inf| (if (file.is_dir) "—" else labels.formatSize(arena, inf.size)) else "—",
-        if (info) |inf| labels.formatWhen(arena, inf.mtime) else "—",
+        size_text,
+        if (info) |file_info| labels.formatWhen(arena, file_info.mtime) else no_value,
         item.subtitle,
     });
 }
+
+/// An Information value that does not apply or could not be read.
+const no_value = "—";
+/// How much of a file the preview reads: enough for `preview_lines`.
+const preview_head_bytes = 4096;
+/// Plain detail text (a clipboard entry, an extension row) is cut to this
+/// much: GTK lays the whole label out at several widths per frame.
+const detail_text_bytes_max = 20_000;
+/// The detail text's class while it shows an extension's markdown.
+const markdown_class = "markdown";
 
 /// Lines of a file preview. The pane shows ~14; GTK wraps and measures all
 /// of the label's text at several widths, and 4 KB (~100 lines) of it cost
@@ -222,14 +242,14 @@ fn showExtDetail(ui: *Ui, item: ?*const Item) void {
     if (markup) {
         // Markup is shown whole: cutting it could leave a tag open.
         c.gtk_label_set_markup(label, (arena.dupeSentinel(u8, item.?.detail, 0) catch return).ptr);
-        gtk.addClass(ui.detail.text, "markdown");
+        gtk.addClass(ui.detail.text, markdown_class);
     } else {
-        const text = if (item) |i| i.detail[0..@min(i.detail.len, 20_000)] else "";
+        const text = if (item) |shown| shown.detail[0..@min(shown.detail.len, detail_text_bytes_max)] else "";
         c.gtk_label_set_text(
             label,
             (arena.dupeSentinel(u8, core.utf8.validPrefix(text), 0) catch return).ptr,
         );
-        c.gtk_widget_remove_css_class(gtk.widget(ui.detail.text), "markdown");
+        gtk.setClass(ui.detail.text, markdown_class, false);
     }
     const meta = if (item) |i| i.meta else &.{};
     gtk.setVisible(ui.detail.meta, meta.len > 0);
@@ -243,8 +263,8 @@ fn showExtDetail(ui: *Ui, item: ?*const Item) void {
 
 /// The four values beside the keys the view set (Kind, Size, Modified,
 /// Where for files; Content type, Characters, Words, Copied for copies).
-fn setMeta(ui: *Ui, values: [4][:0]const u8) void {
-    for (ui.detail.meta_values, values) |value_label, value| {
+fn setMeta(detail: *Ui.DetailPane, values: [item_mod.meta_max][:0]const u8) void {
+    for (detail.meta_values, values) |value_label, value| {
         c.gtk_label_set_text(value_label, value.ptr);
     }
 }
@@ -256,14 +276,14 @@ pub fn showDetail(ui: *Ui, item: ?*const Item) void {
         };
         gtk.setVisible(ui.detail.picture, false);
         c.gtk_label_set_text(ui.detail.text, "");
-        setMeta(ui, @splat(""));
+        setMeta(&ui.detail, @splat(""));
         return;
     }
     if (ui.view == .ext) return showExtDetail(ui, item);
     if (ui.view != .clipboard) return;
     const i = item orelse {
         c.gtk_label_set_text(ui.detail.text, "");
-        setMeta(ui, @splat(""));
+        setMeta(&ui.detail, @splat(""));
         return;
     };
     var arena_instance: std.heap.ArenaAllocator = .init(ui.gpa);
@@ -274,7 +294,7 @@ pub fn showDetail(ui: *Ui, item: ?*const Item) void {
         (ui.db.clipContent(arena, i.action.clip) catch null) orelse i.detail
     else
         i.detail;
-    const text = content[0..@min(content.len, 20_000)];
+    const text = content[0..@min(content.len, detail_text_bytes_max)];
     c.gtk_label_set_text(
         ui.detail.text,
         (arena.dupeSentinel(u8, core.utf8.validPrefix(text), 0) catch return).ptr,
@@ -283,7 +303,7 @@ pub fn showDetail(ui: *Ui, item: ?*const Item) void {
     var words: usize = 0;
     var tok = std.mem.tokenizeAny(u8, content, " \t\r\n");
     while (tok.next()) |_| words += 1;
-    setMeta(ui, .{
+    setMeta(&ui.detail, .{
         "Text",
         arena.printSentinel("{d}", .{chars}, 0) catch "",
         arena.printSentinel("{d}", .{words}, 0) catch "",

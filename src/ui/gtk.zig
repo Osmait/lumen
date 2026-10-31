@@ -159,6 +159,11 @@ pub fn window(application: *c.GtkApplication) *c.GtkWindow {
     return @ptrCast(c.gtk_application_window_new(application));
 }
 
+/// A top-level window that belongs to no application (the backdrops).
+pub fn plainWindow() *c.GtkWindow {
+    return @ptrCast(c.gtk_window_new());
+}
+
 test "gtk: only widget classes upcast to GtkWidget" {
     comptime assert(isWidgetType(c.GtkLabel));
     comptime assert(!isWidgetType(c.GtkCssProvider));
