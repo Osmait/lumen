@@ -68,31 +68,44 @@ const named = [_]struct { []const u8, []const u8, Color }{
 /// documents, archives, no extension at all). Unknown short extensions get a
 /// gray badge: still more telling than a blank page.
 pub fn of(name: []const u8, upper_buf: *[4]u8) ?Badge {
-    for (named) |n| if (std.mem.eql(u8, name, n[0])) return .{ .text = n[1], .color = n[2] };
+    for (named) |entry| {
+        const file_name, const text, const color = entry;
+        if (std.mem.eql(u8, name, file_name)) return .{ .text = text, .color = color };
+    }
     var lower_buf: [16]u8 = undefined;
     const lower = lowerExt(&lower_buf, name) orelse return null;
     const ext = name[name.len - lower.len ..];
-    for (themed) |t| if (std.mem.eql(u8, lower, t)) return null;
-    var color: ?Color = null;
-    for (known) |k| if (std.mem.eql(u8, lower, k[0])) {
-        color = k[1];
-        break;
-    };
-    if (color == null and ext.len > 4) return null;
-    for (ext, 0..) |ch, i| if (!std.ascii.isAlphanumeric(ch) and i < 4) return null;
-    const n = @min(ext.len, upper_buf.len);
-    _ = std.ascii.upperString(upper_buf[0..n], ext[0..n]);
-    return .{ .text = upper_buf[0..n], .color = color orelse .gray };
+    for (themed) |themed_ext| {
+        if (std.mem.eql(u8, lower, themed_ext)) return null;
+    }
+    const color = knownColor(lower);
+    if (color == null and ext.len > upper_buf.len) return null;
+    // Only letters and digits make a badge: "tar.gz~" or "c++" do not.
+    for (ext[0..@min(ext.len, upper_buf.len)]) |char| {
+        if (!std.ascii.isAlphanumeric(char)) return null;
+    }
+    const text_len = @min(ext.len, upper_buf.len);
+    _ = std.ascii.upperString(upper_buf[0..text_len], ext[0..text_len]);
+    return .{ .text = upper_buf[0..text_len], .color = color orelse .gray };
+}
+
+fn knownColor(lower_ext: []const u8) ?Color {
+    for (known) |entry| {
+        const known_ext, const color = entry;
+        if (std.mem.eql(u8, lower_ext, known_ext)) return color;
+    }
+    return null;
 }
 
 /// A language or text format Lumen knows by name, not merely a short
 /// extension (those get a gray badge but may be anything, binaries too).
 pub fn isKnown(name: []const u8) bool {
-    for (named) |n| if (std.mem.eql(u8, name, n[0])) return true;
+    for (named) |entry| {
+        if (std.mem.eql(u8, name, entry[0])) return true;
+    }
     var lower_buf: [16]u8 = undefined;
     const lower = lowerExt(&lower_buf, name) orelse return false;
-    for (known) |k| if (std.mem.eql(u8, lower, k[0])) return true;
-    return false;
+    return knownColor(lower) != null;
 }
 
 test "languages get their colour and short uppercase text" {
@@ -197,10 +210,16 @@ pub const logo_names = [_]struct { []const u8, Logo }{
 
 /// The official logo for a file name, or null (then `of` gives a badge).
 pub fn logoOf(name: []const u8) ?Logo {
-    for (logo_names) |n| if (std.mem.eql(u8, name, n[0])) return n[1];
+    for (logo_names) |entry| {
+        const file_name, const logo = entry;
+        if (std.mem.eql(u8, name, file_name)) return logo;
+    }
     var lower_buf: [16]u8 = undefined;
     const lower = lowerExt(&lower_buf, name) orelse return null;
-    for (logos) |l| if (std.mem.eql(u8, lower, l[0])) return l[1];
+    for (logos) |entry| {
+        const ext, const logo = entry;
+        if (std.mem.eql(u8, lower, ext)) return logo;
+    }
     return null;
 }
 

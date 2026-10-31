@@ -8,6 +8,7 @@
 //! a slow or stuck client costs a buffer, never the window.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const linux = std.os.linux;
 const c = @import("c");
 const ipc = @import("../ipc.zig");
@@ -25,64 +26,110 @@ pub const Handler = *const fn (
     err: *std.Io.Writer,
 ) u8;
 
-var listen_fd: linux.fd_t = -1;
-/// The socket's watch; while accepting is paused, the timer that resumes it
-/// (or 0 until a connection ends).
-var listen_source: c_uint = 0;
-var path_buf: [256]u8 = undefined;
-var path: [:0]const u8 = "";
-var handler: Handler = undefined;
-var gpa: std.mem.Allocator = undefined;
-var conns_open: usize = 0;
+/// The listening socket and its connections. One per daemon, reached from
+/// GLib callbacks; main thread only.
+const Server = struct {
+    listen_fd: linux.fd_t = -1,
+    /// The socket's watch; while accepting is paused, the timer that
+    /// resumes it (or 0 until a connection ends).
+    listen_source: c_uint = 0,
+    path_buffer: [256]u8 = undefined,
+    path: [:0]const u8 = "",
+    handler: Handler = undefined,
+    gpa: std.mem.Allocator = undefined,
+    connections_open: usize = 0,
 
-pub fn start(allocator: std.mem.Allocator, app_id: []const u8, h: Handler) void {
-    const rt = std.mem.span(c.g_getenv("XDG_RUNTIME_DIR") orelse return);
-    listenIn(allocator, rt, app_id, h);
+    fn listening(listener: *const Server) bool {
+        return listener.listen_fd >= 0;
+    }
+};
+
+var server: Server = .{};
+
+pub const ListenError = error{
+    /// $XDG_RUNTIME_DIR is not set.
+    NoRuntimeDir,
+    /// The socket's folder or path does not fit (a sockaddr_un holds 108
+    /// bytes).
+    PathTooLong,
+    /// The socket's folder is a link, someone else's, or open to others.
+    FolderNotPrivate,
+    Socket,
+    Bind,
+    Listen,
+};
+
+/// Listens on $XDG_RUNTIME_DIR/lumen/<app_id>.sock. Without the socket
+/// `lumen` still works, through lumen-gtk, only slower: a failure is
+/// logged here, and the daemon runs on.
+pub fn start(allocator: std.mem.Allocator, app_id: []const u8, handler: Handler) void {
+    const runtime_dir = if (c.g_getenv("XDG_RUNTIME_DIR")) |dir| std.mem.span(dir) else "";
+    listenIn(allocator, runtime_dir, app_id, handler) catch |err| {
+        log.warn("no socket ({t}): `lumen` goes through lumen-gtk, slower", .{err});
+    };
 }
 
-fn listenIn(allocator: std.mem.Allocator, rt: []const u8, app_id: []const u8, h: Handler) void {
+fn listenIn(
+    allocator: std.mem.Allocator,
+    runtime_dir: []const u8,
+    app_id: []const u8,
+    handler: Handler,
+) ListenError!void {
+    assert(!server.listening());
+    if (runtime_dir.len == 0) return error.NoRuntimeDir;
     var dir_buf: [256]u8 = undefined;
-    const dir = ipc.dir(&dir_buf, rt) orelse return;
+    const dir = ipc.dir(&dir_buf, runtime_dir) orelse return error.PathTooLong;
     os.mkdirP(dir);
     if (!isPrivateDir(dir)) {
-        log.warn("{s} is not a folder of ours alone: no socket", .{dir});
-        return;
+        log.warn("{s} is not a folder of ours alone", .{dir});
+        return error.FolderNotPrivate;
     }
-    path = ipc.socketPath(&path_buf, rt, app_id) orelse return;
+    const socket_path = ipc.socketPath(&server.path_buffer, runtime_dir, app_id) orelse {
+        return error.PathTooLong;
+    };
     const rc = linux.socket(
         linux.AF.UNIX,
         linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
         0,
     );
-    if (linux.errno(rc) != .SUCCESS) return;
+    if (failed(rc)) |errno| {
+        log.warn("socket: {t}", .{errno});
+        return error.Socket;
+    }
     const fd: linux.fd_t = @intCast(rc);
+    errdefer _ = linux.close(fd);
     // A socket left by a daemon that crashed; only the primary instance
     // gets here, so it is not a live one.
-    _ = linux.unlink(path.ptr);
+    _ = linux.unlink(socket_path.ptr);
     var addr: linux.sockaddr.un = .{ .path = @splat(0) };
-    @memcpy(addr.path[0..path.len], path);
-    if (linux.errno(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.un))) != .SUCCESS or
-        linux.errno(linux.listen(fd, 16)) != .SUCCESS)
-    {
-        log.warn("cannot listen on {s}", .{path});
-        _ = linux.close(fd);
-        path = "";
-        return;
+    @memcpy(addr.path[0..socket_path.len], socket_path);
+    if (failed(linux.bind(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.un)))) |errno| {
+        log.warn("bind {s}: {t}", .{ socket_path, errno });
+        return error.Bind;
     }
-    _ = linux.chmod(path.ptr, 0o600);
-    listen_fd = fd;
-    handler = h;
-    gpa = allocator;
+    if (failed(linux.listen(fd, connections_max))) |errno| {
+        log.warn("listen {s}: {t}", .{ socket_path, errno });
+        return error.Listen;
+    }
+    // The folder is owner-only already: a chmod that fails leaves the
+    // socket no more open than that.
+    _ = linux.chmod(socket_path.ptr, 0o600);
+    server.path = socket_path;
+    server.listen_fd = fd;
+    server.handler = handler;
+    server.gpa = allocator;
     watchSocket();
 }
 
+/// Closes the socket and removes its file; the connections still open end
+/// on their own. Safe to call when not listening.
 pub fn stop() void {
-    if (listen_fd < 0) return;
-    if (listen_source != 0) _ = c.g_source_remove(listen_source);
-    listen_source = 0;
-    _ = linux.close(listen_fd);
-    listen_fd = -1;
-    _ = linux.unlink(path.ptr);
+    if (!server.listening()) return;
+    if (server.listen_source != 0) _ = c.g_source_remove(server.listen_source);
+    server.listen_source = 0;
+    _ = linux.close(server.listen_fd);
+    server.listen_fd = -1;
+    _ = linux.unlink(server.path.ptr);
 }
 
 /// Whether `dir` is a real folder (not a link to one), ours, and owner-only;
@@ -114,26 +161,29 @@ fn isPrivateDir(dir: [:0]const u8) bool {
 /// next, so a flood of them cannot hold the window.
 const accepts_max = 16;
 /// Connections open at once; past it the socket is left alone until one
-/// ends (each may hold a request up to ipc.max_request_bytes).
-const conns_max = 16;
+/// ends (each may hold a request up to ipc.max_request_bytes). Also the
+/// listen backlog.
+const connections_max = 16;
 /// How long a client has to send its request, and again to take the answer.
-const client_ms = 10_000;
+const client_timeout_ms = 10_000;
 /// Out of descriptors: how long to wait before accepting again.
 const backoff_ms = 500;
 
 fn watchSocket() void {
-    listen_source = c.g_unix_fd_add(listen_fd, c.G_IO_IN, &onReady, null);
+    assert(server.listening());
+    assert(server.listen_source == 0);
+    server.listen_source = c.g_unix_fd_add(server.listen_fd, c.G_IO_IN, &acceptCallback, null);
 }
 
-fn onReady(fd: c_int, _: c_uint, _: ?*anyopaque) callconv(.c) c.gboolean {
+fn acceptCallback(fd: c_int, _: c_uint, _: ?*anyopaque) callconv(.c) c.gboolean {
     for (0..accepts_max) |_| {
-        if (conns_open == conns_max) return pause(0);
+        if (server.connections_open == connections_max) return pause(0);
         const rc = linux.accept4(fd, null, null, linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK);
-        if (failed(rc)) |e| switch (e) {
+        if (failed(rc)) |errno| switch (errno) {
             // The connection stays queued and the socket readable: watching
             // it now would wake the main loop again at once, forever.
             .MFILE, .NFILE, .NOBUFS, .NOMEM => {
-                log.warn("cannot accept a connection: {t}", .{e});
+                log.warn("cannot accept a connection: {t}", .{errno});
                 return pause(backoff_ms);
             },
             else => break,
@@ -146,11 +196,13 @@ fn onReady(fd: c_int, _: c_uint, _: ?*anyopaque) callconv(.c) c.gboolean {
 /// Stops watching the socket: for `ms`, or until a connection ends (0).
 /// Returns what removes the socket's current watch.
 fn pause(ms: c_uint) c.gboolean {
-    listen_source = if (ms == 0) 0 else c.g_timeout_add(ms, &onResume, null);
+    server.listen_source = if (ms == 0) 0 else c.g_timeout_add(ms, &pauseCallback, null);
     return 0;
 }
 
-fn onResume(_: ?*anyopaque) callconv(.c) c.gboolean {
+fn pauseCallback(_: ?*anyopaque) callconv(.c) c.gboolean {
+    // The source ends with this call: watchSocket must see it gone.
+    server.listen_source = 0;
     watchSocket();
     return 0;
 }
@@ -168,17 +220,20 @@ const Conn = struct {
     fn open(fd: linux.fd_t) void {
         // Only our own user (the folder is owner-only already).
         if (os.unix.peerUid(fd) != linux.getuid()) {
+            log.warn("refused a connection from another user", .{});
             _ = linux.close(fd);
             return;
         }
-        const self = gpa.create(Conn) catch {
+        const self = server.gpa.create(Conn) catch {
+            log.warn("out of memory: a connection refused", .{});
             _ = linux.close(fd);
             return;
         };
         self.* = .{ .fd = fd };
-        conns_open += 1;
-        self.watch = c.g_unix_fd_add(fd, c.G_IO_IN, &onReadable, self);
-        self.timer = c.g_timeout_add(client_ms, &onTimeout, self);
+        server.connections_open += 1;
+        assert(server.connections_open <= connections_max);
+        self.watch = c.g_unix_fd_add(fd, c.G_IO_IN, &readableCallback, self);
+        self.timer = c.g_timeout_add(client_timeout_ms, &timeoutCallback, self);
     }
 
     /// Ends the connection, from anywhere, its own callbacks included (a
@@ -187,14 +242,15 @@ const Conn = struct {
         if (self.watch != 0) _ = c.g_source_remove(self.watch);
         if (self.timer != 0) _ = c.g_source_remove(self.timer);
         _ = linux.close(self.fd);
-        self.buf.deinit(gpa);
-        gpa.destroy(self);
-        conns_open -= 1;
-        // Paused at conns_max: there is room again.
-        if (listen_fd >= 0 and listen_source == 0) watchSocket();
+        self.buf.deinit(server.gpa);
+        server.gpa.destroy(self);
+        assert(server.connections_open > 0);
+        server.connections_open -= 1;
+        // Paused at connections_max: there is room again.
+        if (server.listening() and server.listen_source == 0) watchSocket();
     }
 
-    fn onReadable(_: c_int, _: c_uint, data: ?*anyopaque) callconv(.c) c.gboolean {
+    fn readableCallback(_: c_int, _: c_uint, data: ?*anyopaque) callconv(.c) c.gboolean {
         const self: *Conn = @ptrCast(@alignCast(data));
         switch (self.read()) {
             .more => return 1,
@@ -204,13 +260,13 @@ const Conn = struct {
         return 0;
     }
 
-    fn onWritable(_: c_int, _: c_uint, data: ?*anyopaque) callconv(.c) c.gboolean {
+    fn writableCallback(_: c_int, _: c_uint, data: ?*anyopaque) callconv(.c) c.gboolean {
         const self: *Conn = @ptrCast(@alignCast(data));
         self.flush();
         return 1;
     }
 
-    fn onTimeout(data: ?*anyopaque) callconv(.c) c.gboolean {
+    fn timeoutCallback(data: ?*anyopaque) callconv(.c) c.gboolean {
         const self: *Conn = @ptrCast(@alignCast(data));
         log.warn("dropped a client too slow to {s}", .{switch (self.phase) {
             .request => "send its request",
@@ -224,20 +280,20 @@ const Conn = struct {
     /// or when the buffer is full (the client sends no more than that).
     fn read(self: *Conn) enum { more, done, failed } {
         while (self.buf.items.len < ipc.max_request_bytes) {
-            self.buf.ensureUnusedCapacity(gpa, 64 * 1024) catch return .failed;
+            self.buf.ensureUnusedCapacity(server.gpa, 64 * 1024) catch return .failed;
             const spare = self.buf.unusedCapacitySlice();
             const room = @min(spare.len, ipc.max_request_bytes - self.buf.items.len);
-            const n = linux.read(self.fd, spare.ptr, room);
-            if (failed(n)) |e| switch (e) {
+            const bytes_read = linux.read(self.fd, spare.ptr, room);
+            if (failed(bytes_read)) |errno| switch (errno) {
                 .AGAIN => return .more,
                 .INTR => continue,
                 else => {
-                    log.warn("dropped a request: {t}", .{e});
+                    log.warn("dropped a request: {t}", .{errno});
                     return .failed;
                 },
             };
-            if (n == 0) return .done;
-            self.buf.items.len += n;
+            if (bytes_read == 0) return .done;
+            self.buf.items.len += bytes_read;
         }
         return .done;
     }
@@ -249,26 +305,32 @@ const Conn = struct {
         self.watch = 0;
         self.timer = 0;
         self.phase = .answer;
-        const req = ipc.parse(self.buf.items) orelse return self.close();
+        const request = ipc.parse(self.buf.items) orelse {
+            log.warn("dropped a malformed request", .{});
+            return self.close();
+        };
 
-        var arena: std.heap.ArenaAllocator = .init(gpa);
-        defer arena.deinit();
-        const a = arena.allocator();
-        const args = a.alloc([:0]const u8, req.argc) catch return self.close();
-        for (req.args[0..req.argc], args) |src, *dst|
-            dst.* = a.dupeSentinel(u8, src, 0) catch return self.close();
-        var out: std.Io.Writer.Allocating = .init(a);
-        var err: std.Io.Writer.Allocating = .init(a);
-        const status = handler(args, req.payload, &out.writer, &err.writer);
+        var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const args = arena.alloc([:0]const u8, request.argc) catch return self.close();
+        for (request.args[0..request.argc], args) |arg, *arg_z| {
+            arg_z.* = arena.dupeSentinel(u8, arg, 0) catch return self.close();
+        }
+        var stdout: std.Io.Writer.Allocating = .init(arena);
+        var stderr: std.Io.Writer.Allocating = .init(arena);
+        const status = server.handler(args, request.payload, &stdout.writer, &stderr.writer);
 
         // The request is done with: the buffer takes the answer.
         self.buf.clearRetainingCapacity();
-        var head: [5]u8 = undefined;
-        head[0] = status;
-        std.mem.writeInt(u32, head[1..5], @intCast(out.written().len), .little);
-        self.buf.appendSlice(gpa, &head) catch return self.close();
-        self.buf.appendSlice(gpa, out.written()) catch return self.close();
-        self.buf.appendSlice(gpa, err.written()) catch return self.close();
+        const stdout_len = std.math.cast(u32, stdout.written().len) orelse {
+            log.warn("an answer over 4 GiB, dropped", .{});
+            return self.close();
+        };
+        const header = ipc.encodeAnswerHeader(status, stdout_len);
+        self.buf.appendSlice(server.gpa, &header) catch return self.close();
+        self.buf.appendSlice(server.gpa, stdout.written()) catch return self.close();
+        self.buf.appendSlice(server.gpa, stderr.written()) catch return self.close();
         self.flush();
     }
 
@@ -276,21 +338,25 @@ const Conn = struct {
     /// closes once all is sent.
     fn flush(self: *Conn) void {
         while (self.sent < self.buf.items.len) {
-            const n = os.unix.send(self.fd, self.buf.items[self.sent..]);
-            if (failed(n)) |e| switch (e) {
+            const rc = os.unix.send(self.fd, self.buf.items[self.sent..]);
+            if (failed(rc)) |errno| switch (errno) {
                 .INTR => continue,
                 .AGAIN => {
                     if (self.watch == 0) {
-                        self.watch = c.g_unix_fd_add(self.fd, c.G_IO_OUT, &onWritable, self);
-                        self.timer = c.g_timeout_add(client_ms, &onTimeout, self);
+                        self.watch = c.g_unix_fd_add(self.fd, c.G_IO_OUT, &writableCallback, self);
+                        self.timer = c.g_timeout_add(client_timeout_ms, &timeoutCallback, self);
                     }
                     return;
                 },
-                // The client has gone (EPIPE): nothing to answer.
-                else => return self.close(),
+                // The client has gone (EPIPE, or Ctrl-C): nothing to answer.
+                else => {
+                    log.debug("the client left before its answer: {t}", .{errno});
+                    return self.close();
+                },
             };
-            self.sent += n;
+            self.sent += rc;
         }
+        assert(self.sent == self.buf.items.len);
         self.close();
     }
 };
@@ -381,7 +447,7 @@ const Done = struct {
         return flag.load(.acquire);
     }
     fn closed() bool {
-        return conns_open == 0;
+        return server.connections_open == 0;
     }
 };
 
@@ -404,9 +470,36 @@ fn testListen(tmp: *std.testing.TmpDir, buf: []u8) ![:0]const u8 {
     var rt_buf: [256]u8 = undefined;
     // Relative: a socket's path must fit in 108 bytes.
     const rt = try os.tmpDirPath(tmp, &rt_buf);
-    listenIn(testing.allocator, rt, "t", &testHandler);
-    try testing.expect(listen_fd >= 0);
+    try listenIn(testing.allocator, rt, "t", &testHandler);
+    try testing.expect(server.listen_fd >= 0);
     return ipc.socketPath(buf, rt, "t").?;
+}
+
+test "each reason not to listen is an error of its own" {
+    try testing.expectError(error.NoRuntimeDir, listenIn(testing.allocator, "", "t", &testHandler));
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var runtime_buffer: [256]u8 = undefined;
+    const runtime_dir = try os.tmpDirPath(&tmp, &runtime_buffer);
+    const app_id_too_long: [120]u8 = @splat('x');
+    try testing.expectError(
+        error.PathTooLong,
+        listenIn(testing.allocator, runtime_dir, &app_id_too_long, &testHandler),
+    );
+
+    // The folder is a link: refused, whatever it points at.
+    var link_buffer: [512]u8 = undefined;
+    const link_runtime = try std.mem.printSentinel(&link_buffer, "{s}/link", .{runtime_dir}, 0);
+    var folder_buffer: [512]u8 = undefined;
+    const link_folder = try std.mem.printSentinel(&folder_buffer, "{s}/lumen", .{link_runtime}, 0);
+    try testing.expect(failed(linux.mkdir(link_runtime, 0o700)) == null);
+    try testing.expect(failed(linux.symlink("/tmp", link_folder)) == null);
+    try testing.expectError(
+        error.FolderNotPrivate,
+        listenIn(testing.allocator, link_runtime, "t", &testHandler),
+    );
+    try testing.expect(!server.listening());
 }
 
 test "a client that sends nothing holds neither the main loop nor the others" {
@@ -425,15 +518,15 @@ test "a client that sends nothing holds neither the main loop nor the others" {
     thread.join();
     // Served at once: a server waiting on the silent one would not be.
     try testing.expect(os.monotonicNs() - t0 < 300 * std.time.ns_per_ms);
-    try testing.expectEqual(@as(usize, 5 + 8), client.len);
-    try testing.expectEqual(@as(u8, 7), got[0]);
-    try testing.expectEqualStrings("--x copy", got[5..client.len]);
-    try testing.expectEqual(@as(usize, 1), conns_open);
+    const answer = ipc.parseAnswer(got[0..client.len]).?;
+    try testing.expectEqual(@as(u8, 7), answer.status);
+    try testing.expectEqualStrings("--x copy", answer.stdout);
+    try testing.expectEqual(@as(usize, 1), server.connections_open);
 
     // It hangs up without a request: dropped, nothing left behind.
     _ = linux.close(stalled);
     _ = iterateUntil(&Done.closed);
-    try testing.expectEqual(@as(usize, 0), conns_open);
+    try testing.expectEqual(@as(usize, 0), server.connections_open);
 }
 
 test "a large answer goes out as the client takes it, the main loop turning" {
@@ -449,9 +542,9 @@ test "a large answer goes out as the client takes it, the main loop turning" {
     const thread = try client.start();
     const longest_ns = iterateUntil(&Done.answered);
     thread.join();
-    try testing.expectEqual(@as(usize, 5 + (1 << 20)), client.len);
+    try testing.expectEqual(@as(usize, ipc.answer_header_bytes + (1 << 20)), client.len);
     // Not one turn spent waiting for the client to read.
     try testing.expect(longest_ns < 100 * std.time.ns_per_ms);
     _ = iterateUntil(&Done.closed);
-    try testing.expectEqual(@as(usize, 0), conns_open);
+    try testing.expectEqual(@as(usize, 0), server.connections_open);
 }

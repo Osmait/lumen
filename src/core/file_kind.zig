@@ -17,8 +17,8 @@ pub const Kind = enum {
     office,
     archive,
 
-    pub fn title(k: Kind) [:0]const u8 {
-        return switch (k) {
+    pub fn title(kind: Kind) [:0]const u8 {
+        return switch (kind) {
             .folder => "Folders",
             .pdf => "PDF Documents",
             .image => "Images",
@@ -33,8 +33,8 @@ pub const Kind = enum {
     }
 
     /// A MIME type every app for this kind handles, to ask GIO for them.
-    pub fn sampleMime(k: Kind) [:0]const u8 {
-        return switch (k) {
+    pub fn sampleMime(kind: Kind) [:0]const u8 {
+        return switch (kind) {
             .folder => "inode/directory",
             .pdf => "application/pdf",
             .image => "image/png",
@@ -48,8 +48,8 @@ pub const Kind = enum {
         };
     }
 
-    pub fn icon(k: Kind) [:0]const u8 {
-        return switch (k) {
+    pub fn icon(kind: Kind) [:0]const u8 {
+        return switch (kind) {
             .folder => "folder-symbolic",
             .pdf => "x-office-document-symbolic",
             .image => "image-x-generic-symbolic",
@@ -65,24 +65,19 @@ pub const Kind = enum {
 
     /// Where to look when this kind has no app of its own: Markdown is
     /// text too.
-    pub fn fallback(k: Kind) ?Kind {
-        return if (k == .markdown) .text else null;
+    pub fn fallback(kind: Kind) ?Kind {
+        return if (kind == .markdown) .text else null;
     }
 };
 
 /// The kind of a file, or null when it is none of the groups (then the
 /// system default opens it).
 pub fn of(mime: []const u8, name: []const u8, is_dir: bool) ?Kind {
-    if (is_dir or std.mem.eql(u8, mime, "inode/directory")) return .folder;
-    if (std.mem.eql(u8, mime, "text/markdown") or hasExt(
-        name,
-        &.{ ".md", ".markdown" },
-    )) return .markdown;
-    if (std.mem.eql(u8, mime, "text/html") or std.mem.eql(
-        u8,
-        mime,
-        "application/xhtml+xml",
-    )) return .html;
+    if (is_dir) return .folder;
+    if (std.mem.eql(u8, mime, "inode/directory")) return .folder;
+    if (std.mem.eql(u8, mime, "text/markdown")) return .markdown;
+    if (hasExt(name, &.{ ".md", ".markdown" })) return .markdown;
+    if (isAny(mime, &.{ "text/html", "application/xhtml+xml" })) return .html;
     if (std.mem.eql(u8, mime, "application/pdf")) return .pdf;
     if (std.mem.startsWith(u8, mime, "image/")) return .image;
     if (std.mem.startsWith(u8, mime, "audio/")) return .audio;
@@ -90,18 +85,7 @@ pub fn of(mime: []const u8, name: []const u8, is_dir: bool) ?Kind {
     // .mts): a code badge wins over that guess.
     const code = file_badge.isKnown(name);
     if (std.mem.startsWith(u8, mime, "video/")) return if (code) .text else .video;
-    if (std.mem.startsWith(u8, mime, "application/vnd.oasis.opendocument.") or
-        std.mem.startsWith(u8, mime, "application/vnd.openxmlformats-officedocument.") or
-        std.mem.eql(u8, mime, "application/msword") or std.mem.eql(
-        u8,
-        mime,
-        "application/vnd.ms-excel",
-    ) or
-        std.mem.eql(
-            u8,
-            mime,
-            "application/vnd.ms-powerpoint",
-        ) or std.mem.eql(u8, mime, "application/rtf")) return .office;
+    if (isOffice(mime)) return .office;
     const archives = [_][]const u8{
         "application/zip",
         "application/x-tar",
@@ -117,8 +101,9 @@ pub fn of(mime: []const u8, name: []const u8, is_dir: bool) ?Kind {
         "application/x-bzip2",
         "application/x-bzip2-compressed-tar",
     };
-    for (archives) |a| if (std.mem.eql(u8, mime, a)) return .archive;
-    if (std.mem.startsWith(u8, mime, "text/") or code) return .text;
+    if (isAny(mime, &archives)) return .archive;
+    if (std.mem.startsWith(u8, mime, "text/")) return .text;
+    if (code) return .text;
     const texty = [_][]const u8{
         "application/json",
         "application/xml",
@@ -130,8 +115,31 @@ pub fn of(mime: []const u8, name: []const u8, is_dir: bool) ?Kind {
         "application/sql",
         "application/x-desktop",
     };
-    for (texty) |t| if (std.mem.eql(u8, mime, t)) return .text;
+    if (isAny(mime, &texty)) return .text;
     return null;
+}
+
+fn isOffice(mime: []const u8) bool {
+    const families = [_][]const u8{
+        "application/vnd.oasis.opendocument.",
+        "application/vnd.openxmlformats-officedocument.",
+    };
+    for (families) |family| {
+        if (std.mem.startsWith(u8, mime, family)) return true;
+    }
+    return isAny(mime, &.{
+        "application/msword",
+        "application/vnd.ms-excel",
+        "application/vnd.ms-powerpoint",
+        "application/rtf",
+    });
+}
+
+fn isAny(mime: []const u8, mimes: []const []const u8) bool {
+    for (mimes) |candidate| {
+        if (std.mem.eql(u8, mime, candidate)) return true;
+    }
+    return false;
 }
 
 /// "log" for "server.LOG", in `buf`: null when the name has none (no dot,
@@ -152,8 +160,13 @@ pub fn extKey(buf: []u8, name: []const u8) []const u8 {
     return buf[0 .. 1 + ext.len];
 }
 
-fn hasExt(name: []const u8, exts: []const []const u8) bool {
-    for (exts) |e| if (name.len > e.len and std.ascii.endsWithIgnoreCase(name, e)) return true;
+fn hasExt(name: []const u8, extensions: []const []const u8) bool {
+    for (extensions) |extension| {
+        // The name must be more than the extension: ".md" alone is not one.
+        if (name.len > extension.len and std.ascii.endsWithIgnoreCase(name, extension)) {
+            return true;
+        }
+    }
     return false;
 }
 

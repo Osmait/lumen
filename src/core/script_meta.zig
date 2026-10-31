@@ -25,66 +25,63 @@ pub const Meta = struct {
     needs_confirmation: bool = false,
 };
 
+/// Only the header is metadata: lines past this many are not read.
+const header_lines_max = 40;
+
+/// The keys Lumen reads, spelled as in the header. Others
+/// (`schemaVersion`, `argument1`...) are ignored.
+const Key = enum { title, mode, icon, packageName, description, needsConfirmation };
+
 /// Parses the header of `source`. Slices point into `source`. Returns null if
 /// there is no title (not a script command).
 pub fn parse(source: []const u8) ?Meta {
     var meta: Meta = .{};
     var lines = std.mem.splitScalar(u8, source, '\n');
-    var n: usize = 0;
-    while (lines.next()) |raw| : (n += 1) {
-        if (n > 40) break;
-        const line = std.mem.trim(u8, raw, " \t\r");
-        const body = stripComment(line) orelse continue;
-        const key_start = if (std.mem.startsWith(u8, body, "@raycast."))
-            "@raycast.".len
-        else if (std.mem.startsWith(u8, body, "@lumen."))
-            "@lumen.".len
-        else
-            continue;
-        const rest = body[key_start..];
-        const sp = std.mem.findAny(u8, rest, " \t") orelse continue;
-        const key = rest[0..sp];
-        const value = std.mem.trim(u8, rest[sp..], " \t");
-
-        if (std.mem.eql(
-            u8,
-            key,
-            "title",
-        )) meta.title = value else if (std.mem.eql(u8, key, "mode")) {
-            meta.mode = if (std.mem.eql(u8, value, "silent")) .silent else if (std.mem.eql(
-                u8,
-                value,
-                "compact",
-            )) .compact else if (std.mem.eql(
-                u8,
-                value,
-                "fullOutput",
-            )) .full_output else if (std.mem.eql(u8, value, "inline")) .@"inline" else .unknown;
-        } else if (std.mem.eql(u8, key, "icon")) meta.icon = value else if (std.mem.eql(
-            u8,
-            key,
-            "packageName",
-        )) meta.package_name = value else if (std.mem.eql(
-            u8,
-            key,
-            "description",
-        )) meta.description = value else if (std.mem.eql(
-            u8,
-            key,
-            "needsConfirmation",
-        )) meta.needs_confirmation = std.mem.eql(u8, value, "true");
+    var line_index: usize = 0;
+    while (lines.next()) |line_raw| : (line_index += 1) {
+        if (line_index > header_lines_max) break;
+        const line = std.mem.trim(u8, line_raw, " \t\r");
+        const comment = stripComment(line) orelse continue;
+        const entry = stripPrefix(comment) orelse continue;
+        const key_end = std.mem.findAny(u8, entry, " \t") orelse continue;
+        const key = std.meta.stringToEnum(Key, entry[0..key_end]) orelse continue;
+        const value = std.mem.trim(u8, entry[key_end..], " \t");
+        switch (key) {
+            .title => meta.title = value,
+            .mode => meta.mode = parseMode(value),
+            .icon => meta.icon = value,
+            .packageName => meta.package_name = value,
+            .description => meta.description = value,
+            .needsConfirmation => meta.needs_confirmation = std.mem.eql(u8, value, "true"),
+        }
     }
     if (meta.title.len == 0) return null;
     return meta;
 }
 
-/// The text after a `#`, `//` or `--` comment marker.
+/// The entry after `@lumen.` or `@raycast.`, or null on any other comment.
+fn stripPrefix(comment: []const u8) ?[]const u8 {
+    for ([_][]const u8{ "@lumen.", "@raycast." }) |prefix| {
+        if (std.mem.startsWith(u8, comment, prefix)) return comment[prefix.len..];
+    }
+    return null;
+}
+
+fn parseMode(value: []const u8) Mode {
+    if (std.mem.eql(u8, value, "silent")) return .silent;
+    if (std.mem.eql(u8, value, "compact")) return .compact;
+    if (std.mem.eql(u8, value, "fullOutput")) return .full_output;
+    if (std.mem.eql(u8, value, "inline")) return .@"inline";
+    return .unknown;
+}
+
+/// The text after a `#`, `//` or `--` comment marker; null for the shebang
+/// and for lines that are not comments.
 fn stripComment(line: []const u8) ?[]const u8 {
-    const markers = [_][]const u8{ "#", "//", "--" };
-    for (markers) |m| {
-        if (std.mem.startsWith(u8, line, m)) {
-            if (std.mem.startsWith(u8, line, "#!")) return null;
-            return std.mem.trim(u8, line[m.len..], " \t");
+    if (std.mem.startsWith(u8, line, "#!")) return null;
+    for ([_][]const u8{ "#", "//", "--" }) |marker| {
+        if (std.mem.startsWith(u8, line, marker)) {
+            return std.mem.trim(u8, line[marker.len..], " \t");
         }
     }
     return null;
@@ -125,4 +122,26 @@ test "@raycast keys and other comment styles" {
 
 test "no title, no command" {
     try std.testing.expect(parse("#!/bin/sh\necho hi\n") == null);
+}
+
+test "every mode, and modes and keys that are not known" {
+    const cases = [_]struct { text: []const u8, mode: Mode }{
+        .{ .text = "silent", .mode = .silent },
+        .{ .text = "compact", .mode = .compact },
+        .{ .text = "fullOutput", .mode = .full_output },
+        .{ .text = "inline", .mode = .@"inline" },
+        .{ .text = "full_output", .mode = .unknown },
+        .{ .text = "loud", .mode = .unknown },
+    };
+    for (cases) |case| try std.testing.expectEqual(case.mode, parseMode(case.text));
+
+    const source =
+        \\# @lumen.title T
+        \\# @lumen.schemaVersion 1
+        \\-- @lumen.description What it does
+        \\# @other.icon x
+    ;
+    const meta = parse(source).?;
+    try std.testing.expectEqualStrings("What it does", meta.description);
+    try std.testing.expectEqualStrings("", meta.icon);
 }

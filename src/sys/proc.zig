@@ -8,20 +8,20 @@ const os = @import("os");
 const log = std.log.scoped(.proc);
 
 /// Longest argv the spawn functions take (the program included).
-pub const max_args = 32;
+pub const argv_max = 32;
 
 /// Fire and forget. Logs and gives up on failure, or when `argv` has more
-/// than `max_args` entries.
+/// than `argv_max` entries.
 pub fn spawn(argv: []const [:0]const u8) void {
-    var buf: Argv = undefined;
-    const ptr = buf.of(argv) orelse return;
+    var argv_buffer: Argv = undefined;
+    const argv_z = argv_buffer.of(argv) orelse return;
     var err: ?*c.GError = null;
     // Reaped here rather than by an intermediate child: GLib otherwise forks
     // the daemon twice (a ~200 MB process) for every command it starts.
     var pid: c.GPid = 0;
     const ok = c.g_spawn_async(
         null,
-        ptr,
+        argv_z,
         null,
         c.G_SPAWN_SEARCH_PATH | c.G_SPAWN_DO_NOT_REAP_CHILD,
         null,
@@ -30,10 +30,11 @@ pub fn spawn(argv: []const [:0]const u8) void {
         &err,
     );
     if (ok == 0) return logError("spawn", argv[0], err);
-    _ = c.g_child_watch_add(pid, &reap, null);
+    _ = c.g_child_watch_add(pid, &reapCallback, null);
 }
 
-fn reap(pid: c.GPid, _: c_int, _: ?*anyopaque) callconv(.c) void {
+/// Reaps a child spawned without GLib's intermediate one, when it exits.
+fn reapCallback(pid: c.GPid, _: c_int, _: ?*anyopaque) callconv(.c) void {
     c.g_spawn_close_pid(pid);
 }
 
@@ -43,7 +44,7 @@ pub fn shell(cmd: [:0]const u8) void {
 }
 
 /// How long `output` waits for a program's output: it runs on the main loop.
-const output_ms = 2000;
+const output_timeout_ms = 2000;
 
 /// What `output` allocates with.
 const alloc = std.heap.c_allocator;
@@ -52,18 +53,18 @@ const alloc = std.heap.c_allocator;
 /// was still writing after `output_ms` (then it is killed). Caller owns the
 /// result and frees it with `free`.
 pub fn output(argv: []const [:0]const u8) ?[:0]u8 {
-    return outputWithin(argv, output_ms);
+    return outputWithin(argv, output_timeout_ms);
 }
 
-fn outputWithin(argv: []const [:0]const u8, limit_ms: u64) ?[:0]u8 {
-    var buf: Argv = undefined;
-    const ptr = buf.of(argv) orelse return null;
+fn outputWithin(argv: []const [:0]const u8, timeout_ms: u64) ?[:0]u8 {
+    var argv_buffer: Argv = undefined;
+    const argv_z = argv_buffer.of(argv) orelse return null;
     var pid: c.GPid = 0;
     var out_fd: c_int = -1;
     var err: ?*c.GError = null;
     if (c.g_spawn_async_with_pipes(
         null,
-        ptr,
+        argv_z,
         null,
         c.G_SPAWN_SEARCH_PATH | c.G_SPAWN_STDERR_TO_DEV_NULL | c.G_SPAWN_DO_NOT_REAP_CHILD,
         null,
@@ -79,28 +80,31 @@ fn outputWithin(argv: []const [:0]const u8, limit_ms: u64) ?[:0]u8 {
     }
     // Reaped whenever it exits: until then its pid is not reused, so the
     // kill below cannot hit another process.
-    _ = c.g_child_watch_add(pid, &reap, null);
+    _ = c.g_child_watch_add(pid, &reapCallback, null);
     defer _ = linux.close(out_fd);
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(alloc);
-    const deadline_ns = os.monotonicNs() + limit_ms * std.time.ns_per_ms;
+    const deadline_ns = os.monotonicNs() + timeout_ms * std.time.ns_per_ms;
     while (true) {
         var chunk: [16 * 1024]u8 = undefined;
-        const n = os.unix.readSome(out_fd, &chunk, deadline_ns) catch |e| {
-            if (e == error.Timeout) {
-                log.warn("{s}: no answer in {d} ms, stopped", .{ argv[0], limit_ms });
-                _ = linux.kill(pid, .KILL);
+        const chunk_len = os.unix.readSome(out_fd, &chunk, deadline_ns) catch |read_err| {
+            switch (read_err) {
+                error.Timeout => {
+                    log.warn("{s}: no answer in {d} ms, stopped", .{ argv[0], timeout_ms });
+                    _ = linux.kill(pid, .KILL);
+                },
+                error.Syscall => log.warn("{s}: reading its output failed", .{argv[0]}),
             }
             return null;
         };
-        if (n == 0) break;
-        out.appendSlice(alloc, chunk[0..n]) catch return null;
+        if (chunk_len == 0) break;
+        out.appendSlice(alloc, chunk[0..chunk_len]) catch return null;
     }
     return out.toOwnedSliceSentinel(alloc, 0) catch null;
 }
 
-pub fn free(s: [:0]u8) void {
-    alloc.free(s);
+pub fn free(text: [:0]u8) void {
+    alloc.free(text);
 }
 
 /// Runs `argv` with `input` on its stdin, without waiting for it to exit
@@ -108,48 +112,50 @@ pub fn free(s: [:0]u8) void {
 /// written from the main loop as the program reads it, so one that does not
 /// read cannot hold the window.
 pub fn pipeTo(argv: []const [:0]const u8, input: []const u8) void {
-    var buf: Argv = undefined;
-    const ptr = buf.of(argv) orelse return;
+    var argv_buffer: Argv = undefined;
+    const argv_z = argv_buffer.of(argv) orelse return;
     var err: ?*c.GError = null;
-    const sp = c.g_subprocess_newv(ptr, c.G_SUBPROCESS_FLAGS_STDIN_PIPE, &err) orelse {
+    const flags = c.G_SUBPROCESS_FLAGS_STDIN_PIPE;
+    const subprocess = c.g_subprocess_newv(argv_z, flags, &err) orelse {
         logError("pipe", argv[0], err);
         return;
     };
     // A copy: `input` is the caller's only until this returns.
     const bytes = c.g_bytes_new(input.ptr, input.len);
     defer c.g_bytes_unref(bytes);
-    // `sp` is released once the program has its input and has exited.
-    c.g_subprocess_communicate_async(sp, bytes, null, &onPiped, null);
+    // `subprocess` is released once the program has its input and exited.
+    c.g_subprocess_communicate_async(subprocess, bytes, null, &pipeToCallback, null);
 }
 
-fn onPiped(source: ?*c.GObject, res: *c.GAsyncResult, _: ?*anyopaque) callconv(.c) void {
-    const sp: *c.GSubprocess = @ptrCast(source.?);
-    defer c.g_object_unref(sp);
+fn pipeToCallback(source: ?*c.GObject, result: *c.GAsyncResult, _: ?*anyopaque) callconv(.c) void {
+    const subprocess: *c.GSubprocess = @ptrCast(source.?);
+    defer c.g_object_unref(subprocess);
     var err: ?*c.GError = null;
-    if (c.g_subprocess_communicate_finish(sp, res, null, null, &err) == 0)
+    if (c.g_subprocess_communicate_finish(subprocess, result, null, null, &err) == 0) {
         warnError(.proc, err, "write to a program", .{});
+    }
 }
 
 /// Whether `name` is on PATH.
 pub fn have(name: [:0]const u8) bool {
-    const p = c.g_find_program_in_path(name.ptr) orelse return false;
-    c.g_free(p);
+    const program_path = c.g_find_program_in_path(name.ptr) orelse return false;
+    c.g_free(program_path);
     return true;
 }
 
 /// A NULL-terminated argv for GLib, on the caller's stack.
 const Argv = struct {
-    ptrs: [max_args:null]?[*:0]const u8,
+    ptrs: [argv_max:null]?[*:0]const u8,
 
-    fn of(buf: *Argv, argv: []const [:0]const u8) ?[*:null]const ?[*:0]const u8 {
+    fn of(buffer: *Argv, argv: []const [:0]const u8) ?[*:null]const ?[*:0]const u8 {
         if (argv.len == 0) return null;
-        if (argv.len > max_args) {
-            log.warn("{s}: {d} arguments, more than {d}", .{ argv[0], argv.len, max_args });
+        if (argv.len > argv_max) {
+            log.warn("{s}: {d} arguments, more than {d}", .{ argv[0], argv.len, argv_max });
             return null;
         }
-        for (argv, 0..) |a, i| buf.ptrs[i] = a.ptr;
-        buf.ptrs[argv.len] = null;
-        return &buf.ptrs;
+        for (argv, buffer.ptrs[0..argv.len]) |arg, *ptr| ptr.* = arg.ptr;
+        buffer.ptrs[argv.len] = null;
+        return &buffer.ptrs;
     }
 };
 
@@ -165,9 +171,9 @@ pub fn warnError(
     comptime what: []const u8,
     args: anytype,
 ) void {
-    const e = err orelse return;
-    defer c.g_error_free(e);
-    std.log.scoped(scope).warn(what ++ ": {s}", args ++ .{e.message});
+    const gerror = err orelse return;
+    defer c.g_error_free(gerror);
+    std.log.scoped(scope).warn(what ++ ": {s}", args ++ .{gerror.message});
 }
 
 /// The display's context for launching apps (startup notification, the
@@ -178,12 +184,12 @@ pub fn launchContext() ?*c.GAppLaunchContext {
 }
 
 test "argv longer than the buffer is refused, not overflowed" {
-    var long: [max_args + 1][:0]const u8 = @splat("x");
-    var buf: Argv = undefined;
-    try std.testing.expect(buf.of(&long) == null);
-    const ok = buf.of(long[0..max_args]) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(ok[max_args] == null);
-    try std.testing.expect(buf.of(&.{}) == null);
+    var long: [argv_max + 1][:0]const u8 = @splat("x");
+    var argv_buffer: Argv = undefined;
+    try std.testing.expect(argv_buffer.of(&long) == null);
+    const argv_z = argv_buffer.of(long[0..argv_max]) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(argv_z[argv_max] == null);
+    try std.testing.expect(argv_buffer.of(&.{}) == null);
 }
 
 test "output: what a program prints, or nothing once it takes too long" {
@@ -191,7 +197,8 @@ test "output: what a program prints, or nothing once it takes too long" {
     defer free(out);
     try std.testing.expectEqualStrings("hi\n", out);
 
-    const t0 = os.monotonicNs();
-    try std.testing.expect(outputWithin(&.{ "sh", "-c", "echo partial; exec sleep 30" }, 100) == null);
-    try std.testing.expect(os.monotonicNs() - t0 < std.time.ns_per_s);
+    const start_ns = os.monotonicNs();
+    const argv = &.{ "sh", "-c", "echo partial; exec sleep 30" };
+    try std.testing.expect(outputWithin(argv, 100) == null);
+    try std.testing.expect(os.monotonicNs() - start_ns < std.time.ns_per_s);
 }

@@ -5,6 +5,7 @@
 //! compositor.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const linux = std.os.linux;
 const c = @import("c");
 const os = @import("os");
@@ -75,19 +76,21 @@ fn request(arena: std.mem.Allocator, what: []const u8) ?[]const u8 {
 /// Connects to one of Hyprland's sockets (".socket.sock" for requests,
 /// ".socket2.sock" for events); null without Hyprland.
 fn connect(which: []const u8, opts: os.unix.ConnectOptions) ?linux.fd_t {
-    const sig = std.mem.span(c.g_getenv("HYPRLAND_INSTANCE_SIGNATURE") orelse return null);
-    const rt = std.mem.span(c.g_getenv("XDG_RUNTIME_DIR") orelse return null);
-    var path_buf: [108]u8 = undefined;
+    const signature_z = c.g_getenv("HYPRLAND_INSTANCE_SIGNATURE") orelse return null;
+    const runtime_dir_z = c.g_getenv("XDG_RUNTIME_DIR") orelse return null;
+    const instance_signature = std.mem.span(signature_z);
+    const runtime_dir = std.mem.span(runtime_dir_z);
+    var path_buf: [@sizeOf(@FieldType(linux.sockaddr.un, "path"))]u8 = undefined;
     const path = std.mem.print(
         &path_buf,
         "{s}/hypr/{s}/{s}",
-        .{ rt, sig, which },
+        .{ runtime_dir, instance_signature, which },
     ) catch return null;
     return os.unix.connect(path, opts);
 }
 
 /// A compositor that does not answer must not freeze the window.
-const answer_ns = std.time.ns_per_s;
+const answer_timeout_ns = std.time.ns_per_s;
 /// Nor one that never stops: `j/clients` with 200 windows is ~300 KB.
 const answer_bytes_max = 16 << 20;
 
@@ -98,14 +101,17 @@ const answer_bytes_max = 16 << 20;
 fn dispatchOver(msg: []const u8) bool {
     const fd = connect(".socket.sock", .{}) orelse return false;
     defer _ = linux.close(fd);
-    const n = linux.write(fd, msg.ptr, msg.len);
-    if (os.unix.failed(n) != null or n == 0) return false;
+    const written = linux.write(fd, msg.ptr, msg.len);
+    if (os.unix.failed(written) != null) return false;
+    if (written == 0) return false;
     // Partly sent: the rest goes too, never again from the start.
-    if (n < msg.len) _ = os.unix.writeAll(fd, msg[n..]);
-    const deadline_ns = os.monotonicNs() + answer_ns;
+    if (written < msg.len and !os.unix.writeAll(fd, msg[written..])) {
+        log.warn("dispatch partly sent: {d} of {d} bytes", .{ written, msg.len });
+    }
+    const deadline_ns = os.monotonicNs() + answer_timeout_ns;
     var answer: [256]u8 = undefined;
-    while (os.unix.readSome(fd, &answer, deadline_ns)) |got| {
-        if (got == 0) break;
+    while (os.unix.readSome(fd, &answer, deadline_ns)) |answer_len| {
+        if (answer_len == 0) break;
     } else |_| {}
     return true;
 }
@@ -115,28 +121,29 @@ fn talk(arena: std.mem.Allocator, msg: []const u8) ?[]const u8 {
     const fd = connect(".socket.sock", .{}) orelse return null;
     defer _ = linux.close(fd);
     if (!os.unix.writeAll(fd, msg)) return null;
-    const deadline_ns = os.monotonicNs() + answer_ns;
-    var out: std.ArrayList(u8) = .empty;
+    const deadline_ns = os.monotonicNs() + answer_timeout_ns;
+    var answer: std.ArrayList(u8) = .empty;
     while (true) {
-        if (out.items.len >= answer_bytes_max) {
+        if (answer.items.len >= answer_bytes_max) {
             log.warn("{s}: answer over {d} bytes, dropped", .{ msg, answer_bytes_max });
             return null;
         }
-        out.ensureUnusedCapacity(arena, 16 * 1024) catch return null;
-        const n = os.unix.readSome(fd, out.unusedCapacitySlice(), deadline_ns) catch return null;
-        if (n == 0) break;
-        out.items.len += n;
+        answer.ensureUnusedCapacity(arena, 16 * 1024) catch return null;
+        const spare = answer.unusedCapacitySlice();
+        const chunk_len = os.unix.readSome(fd, spare, deadline_ns) catch return null;
+        if (chunk_len == 0) break;
+        answer.items.len += chunk_len;
     }
-    return if (out.items.len > 0) out.items else null;
+    return if (answer.items.len > 0) answer.items else null;
 }
 
 /// Most recently focused first.
 pub fn sortByFocus(all: []Client) void {
     std.mem.sort(Client, all, {}, struct {
-        fn lt(_: void, a: Client, b: Client) bool {
-            return a.focusHistoryID < b.focusHistoryID;
+        fn lessThan(_: void, left: Client, right: Client) bool {
+            return left.focusHistoryID < right.focusHistoryID;
         }
-    }.lt);
+    }.lessThan);
 }
 
 /// Windows ordered by last focus, most recent first; they live in `arena`.
@@ -147,9 +154,10 @@ pub fn clients(arena: std.mem.Allocator) []Client {
 }
 
 pub fn activeWindow(arena: std.mem.Allocator) ?Client {
-    const w = query(arena, Client, "activewindow") orelse return null;
-    if (w.address.len == 0) return null;
-    return w;
+    const window = query(arena, Client, "activewindow") orelse return null;
+    // No window focused: Hyprland answers with an empty one.
+    if (window.address.len == 0) return null;
+    return window;
 }
 
 pub fn monitor(arena: std.mem.Allocator, id: i64) ?geometry.Monitor {
@@ -157,28 +165,27 @@ pub fn monitor(arena: std.mem.Allocator, id: i64) ?geometry.Monitor {
 }
 
 pub fn findMonitor(all: []const MonitorJson, id: i64) ?geometry.Monitor {
-    for (all) |m| {
+    for (all) |monitor_json| {
+        if (monitor_json.id != id) continue;
+        const found = monitorFromJson(monitor_json);
         // The geometry runs without overflow checks (core is ReleaseFast):
         // a broken reply stops here, never reaching its arithmetic.
-        if (m.id == id and !geometry.Monitor.plausible(
-            m.x,
-            m.y,
-            m.width,
-            m.height,
-            m.scale,
-            m.reserved,
-        )) return null;
-        if (m.id == id) return .{
-            .x = m.x,
-            .y = m.y,
-            .width = m.width,
-            .height = m.height,
-            .scale = m.scale,
-            .transform = m.transform,
-            .reserved = m.reserved,
-        };
+        if (!found.plausible()) return null;
+        return found;
     }
     return null;
+}
+
+fn monitorFromJson(monitor_json: MonitorJson) geometry.Monitor {
+    return .{
+        .x = monitor_json.x,
+        .y = monitor_json.y,
+        .width = monitor_json.width,
+        .height = monitor_json.height,
+        .scale = monitor_json.scale,
+        .transform = monitor_json.transform,
+        .reserved = monitor_json.reserved,
+    };
 }
 
 /// Connector name of the focused monitor ("DP-1").
@@ -187,7 +194,9 @@ pub fn focusedMonitorName(arena: std.mem.Allocator) ?[]const u8 {
 }
 
 pub fn focusedName(all: []const MonitorJson) ?[]const u8 {
-    for (all) |m| if (m.focused) return m.name;
+    for (all) |monitor_json| {
+        if (monitor_json.focused) return monitor_json.name;
+    }
     return null;
 }
 
@@ -197,146 +206,203 @@ pub fn batchString(
     gpa: std.mem.Allocator,
     commands: []const []const u8,
 ) std.mem.Allocator.Error![:0]u8 {
-    var cmd: std.ArrayList(u8) = .empty;
-    errdefer cmd.deinit(gpa);
+    var joined: std.ArrayList(u8) = .empty;
+    errdefer joined.deinit(gpa);
     for (commands, 0..) |command, i| {
-        if (i > 0) try cmd.appendSlice(gpa, " ; ");
-        try cmd.appendSlice(gpa, "dispatch ");
-        try cmd.appendSlice(gpa, command);
+        if (i > 0) try joined.appendSlice(gpa, " ; ");
+        try joined.appendSlice(gpa, "dispatch ");
+        try joined.appendSlice(gpa, command);
     }
-    return cmd.toOwnedSliceSentinel(gpa, 0);
+    return joined.toOwnedSliceSentinel(gpa, 0);
 }
+
+/// What `hyprctl --batch` sends ahead of "dispatch a;dispatch b".
+const batch_prefix = "[[BATCH]]";
 
 /// Dispatches waiting for the window to hide: sent before Hyprland gave the
 /// focus back from Lumen's layer, a `focuswindow` is undone by that (seen:
 /// the focus stayed put). Sent once the focus is back (`sendAfterHide`).
-/// Starting hyprctl for them took ~4 ms; the socket, ~0.05.
-var queued_buf: [8192]u8 = undefined;
-var queued_len: usize = 0;
-var queued_idle: c_uint = 0;
+/// Starting hyprctl for them took ~4 ms; the socket, ~0.05. Main thread
+/// only, like the GLib sources it uses.
+const DispatchQueue = struct {
+    /// "[[BATCH]]dispatch a;dispatch b", as `hyprctl --batch` would send.
+    buffer: [8192]u8 = undefined,
+    len: usize = 0,
+    /// The idle source that sends the queue if the window does not hide.
+    idle_source: c_uint = 0,
+
+    /// Appends `commands`; false when they do not fit, and then nothing of
+    /// them was queued.
+    fn append(queue: *DispatchQueue, commands: []const []const u8) bool {
+        var writer: std.Io.Writer = .fixed(queue.buffer[queue.len..]);
+        for (commands) |command| {
+            const empty = queue.len + writer.end == 0;
+            const separator = if (empty) batch_prefix ++ "dispatch " else ";dispatch ";
+            writer.writeAll(separator) catch return false;
+            writer.writeAll(command) catch return false;
+        }
+        queue.len += writer.end;
+        assert(std.mem.startsWith(u8, queue.buffer[0..queue.len], batch_prefix));
+        return true;
+    }
+
+    fn cancelIdle(queue: *DispatchQueue) void {
+        if (queue.idle_source != 0) _ = c.g_source_remove(queue.idle_source);
+        queue.idle_source = 0;
+    }
+};
+
+var dispatch_queue: DispatchQueue = .{};
 
 pub fn batch(gpa: std.mem.Allocator, commands: []const []const u8) void {
-    var w: std.Io.Writer = .fixed(queued_buf[queued_len..]);
-    const ok = blk: {
-        for (commands) |command| {
-            w.writeAll(
-                if (queued_len + w.end == 0) "[[BATCH]]dispatch " else ";dispatch ",
-            ) catch break :blk false;
-            w.writeAll(command) catch break :blk false;
-        }
-        break :blk true;
-    };
-    if (!ok) {
-        // Too long to queue: the old way.
-        const z = batchString(gpa, commands) catch return;
-        defer gpa.free(z);
-        proc.spawn(&.{ "hyprctl", "--batch", z });
+    if (!dispatch_queue.append(commands)) {
+        // Too long to queue: run hyprctl now (slower, but never dropped).
+        const batch_z = batchString(gpa, commands) catch return;
+        defer gpa.free(batch_z);
+        proc.spawn(&.{ "hyprctl", "--batch", batch_z });
         return;
     }
-    queued_len += w.end;
-    // Not every action hides the window.
-    if (queued_idle == 0) queued_idle = c.g_idle_add(&sendQueuedIdle, null);
+    // Send on the next idle, in case the action does not hide the window;
+    // sendAfterHide replaces this when it does.
+    if (dispatch_queue.idle_source == 0) {
+        dispatch_queue.idle_source = c.g_idle_add(&batchIdleCallback, null);
+    }
 }
 
-fn sendQueuedIdle(_: ?*anyopaque) callconv(.c) c.gboolean {
-    queued_idle = 0;
+fn batchIdleCallback(_: ?*anyopaque) callconv(.c) c.gboolean {
+    dispatch_queue.idle_source = 0;
     sendQueued();
     return 0;
 }
 
+/// After this long without a focus event, queued dispatches go anyway.
+const focus_fallback_ms = 60;
+
 /// Before the window hides: queued dispatches go once Hyprland has given
-/// the focus back (or after 60 ms). Listening starts now, so the event that
-/// the hide causes is not missed.
+/// the focus back (or after `focus_fallback_ms`). Listening starts now, so
+/// the event that the hide causes is not missed.
 pub fn sendAfterHide() void {
-    if (queued_len == 0) return;
-    if (queued_idle != 0) _ = c.g_source_remove(queued_idle);
-    queued_idle = 0;
-    afterFocusChange(&sendQueued, 60);
+    if (dispatch_queue.len == 0) return;
+    dispatch_queue.cancelIdle();
+    afterFocusChange(&sendQueued, focus_fallback_ms);
 }
 
 /// Sends what `batch` queued; hyprctl if the socket cannot be reached.
 pub fn sendQueued() void {
-    if (queued_len == 0) return;
-    const msg = queued_buf[0..queued_len];
-    queued_len = 0;
+    if (dispatch_queue.len == 0) return;
+    const msg = dispatch_queue.buffer[0..dispatch_queue.len];
+    dispatch_queue.len = 0;
     if (dispatchOver(msg)) return;
-    // "[[BATCH]]dispatch a;dispatch b" is what `hyprctl --batch` sends.
-    var zbuf: [8192]u8 = undefined;
-    const z = std.mem.printSentinel(&zbuf, "{s}", .{msg["[[BATCH]]".len..]}, 0) catch return;
-    proc.spawn(&.{ "hyprctl", "--batch", z });
+    assert(std.mem.startsWith(u8, msg, batch_prefix));
+    var batch_buffer: [8192]u8 = undefined;
+    const commands = msg[batch_prefix.len..];
+    const batch_z = std.mem.printSentinel(&batch_buffer, "{s}", .{commands}, 0) catch return;
+    proc.spawn(&.{ "hyprctl", "--batch", batch_z });
 }
 
-/// Calls `cb` once Hyprland gives a window the focus (`activewindow` on its
-/// event socket), else after `fallback_ms`: a paste right after Lumen hides
-/// waited a fixed 120 ms, and the focus is back in ~2.
-pub fn afterFocusChange(cb: *const fn () void, fallback_ms: c_uint) void {
-    for (focus_cbs[0..n_focus_cbs]) |x| if (x == cb) return;
-    if (n_focus_cbs == focus_cbs.len) return cb();
-    focus_cbs[n_focus_cbs] = cb;
-    n_focus_cbs += 1;
-    if (events_timer != 0) return; // already waiting: one event serves all
-    events_len = 0;
-    if (connect(".socket2.sock", .{ .nonblock = true })) |fd| {
-        events_fd = fd;
-        events_watch = c.g_unix_fd_add(fd, c.G_IO_IN, &onEvents, null);
+/// Waits for Hyprland to give a window the focus (`activewindow` on its
+/// event socket), then calls back whoever asked. Main thread only.
+const FocusWaiter = struct {
+    callbacks: [4]*const fn () void = undefined,
+    callbacks_count: usize = 0,
+    events_fd: linux.fd_t = -1,
+    /// The event socket's watch and the fallback timer; 0 when not set.
+    watch_source: c_uint = 0,
+    timer_source: c_uint = 0,
+    /// Events read so far; a line may arrive in pieces.
+    events_buffer: [4096]u8 = undefined,
+    events_len: usize = 0,
+
+    fn waiting(waiter: *const FocusWaiter) bool {
+        return waiter.timer_source != 0;
     }
-    events_timer = c.g_timeout_add(fallback_ms, &onFallback, null);
+
+    fn stop(waiter: *FocusWaiter) void {
+        if (waiter.watch_source != 0) _ = c.g_source_remove(waiter.watch_source);
+        if (waiter.timer_source != 0) _ = c.g_source_remove(waiter.timer_source);
+        if (waiter.events_fd >= 0) _ = linux.close(waiter.events_fd);
+        waiter.watch_source = 0;
+        waiter.timer_source = 0;
+        waiter.events_fd = -1;
+    }
+
+    /// Stops waiting and calls everyone who asked, once each.
+    fn fire(waiter: *FocusWaiter) void {
+        waiter.stop();
+        assert(!waiter.waiting());
+        // A callback may ask again: it gets a fresh list.
+        const callbacks = waiter.callbacks;
+        const callbacks_count = waiter.callbacks_count;
+        waiter.callbacks_count = 0;
+        for (callbacks[0..callbacks_count]) |callback| callback();
+    }
+};
+
+var focus_waiter: FocusWaiter = .{};
+
+/// Calls `callback` once Hyprland gives a window the focus, else after
+/// `fallback_ms`: a paste right after Lumen hides waited a fixed 120 ms,
+/// and the focus is back in ~2.
+pub fn afterFocusChange(callback: *const fn () void, fallback_ms: c_uint) void {
+    const waiter = &focus_waiter;
+    for (waiter.callbacks[0..waiter.callbacks_count]) |waiting_callback| {
+        if (waiting_callback == callback) return;
+    }
+    if (waiter.callbacks_count == waiter.callbacks.len) {
+        log.debug("{d} callbacks already wait for the focus: called now", .{
+            waiter.callbacks_count,
+        });
+        return callback();
+    }
+    waiter.callbacks[waiter.callbacks_count] = callback;
+    waiter.callbacks_count += 1;
+    // Already waiting: one event serves all.
+    if (waiter.waiting()) return;
+    waiter.events_len = 0;
+    if (connect(".socket2.sock", .{ .nonblock = true })) |fd| {
+        waiter.events_fd = fd;
+        waiter.watch_source = c.g_unix_fd_add(fd, c.G_IO_IN, &afterFocusChangeEventsCallback, null);
+    }
+    waiter.timer_source = c.g_timeout_add(fallback_ms, &afterFocusChangeTimeoutCallback, null);
 }
 
-var focus_cbs: [4]*const fn () void = undefined;
-var n_focus_cbs: usize = 0;
-var events_fd: linux.fd_t = -1;
-var events_watch: c_uint = 0;
-var events_timer: c_uint = 0;
-var events_buf: [4096]u8 = undefined;
-var events_len: usize = 0;
-
-fn stopWaiting() void {
-    if (events_watch != 0) _ = c.g_source_remove(events_watch);
-    if (events_timer != 0) _ = c.g_source_remove(events_timer);
-    if (events_fd >= 0) _ = linux.close(events_fd);
-    events_watch = 0;
-    events_timer = 0;
-    events_fd = -1;
-}
-
-fn fire() void {
-    stopWaiting();
-    const cbs = focus_cbs;
-    const n = n_focus_cbs;
-    n_focus_cbs = 0;
-    for (cbs[0..n]) |cb| cb();
-}
-
-fn onFallback(_: ?*anyopaque) callconv(.c) c.gboolean {
-    events_timer = 0;
-    fire();
+fn afterFocusChangeTimeoutCallback(_: ?*anyopaque) callconv(.c) c.gboolean {
+    // The source ends with this call: fire must not remove it again.
+    focus_waiter.timer_source = 0;
+    focus_waiter.fire();
     return 0;
 }
 
-fn onEvents(fd: c_int, _: c_uint, _: ?*anyopaque) callconv(.c) c.gboolean {
-    // A burst is read over several turns of the main loop, never holding it.
+/// Reads at most this many times per turn of the main loop: a burst of
+/// events is read over several turns, never holding the window.
+const events_reads_max = 64;
+
+fn afterFocusChangeEventsCallback(fd: c_int, _: c_uint, _: ?*anyopaque) callconv(.c) c.gboolean {
+    const waiter = &focus_waiter;
     for (0..events_reads_max) |_| {
-        if (events_len == events_buf.len) events_len = 0;
-        const n = linux.read(fd, events_buf[events_len..].ptr, events_buf.len - events_len);
-        if (linux.errno(n) != .SUCCESS or n == 0) break;
-        events_len += n;
+        // Full without a focus event: what came so far is of no use.
+        if (waiter.events_len == waiter.events_buffer.len) waiter.events_len = 0;
+        const spare = waiter.events_buffer[waiter.events_len..];
+        const bytes_read = linux.read(fd, spare.ptr, spare.len);
+        if (linux.errno(bytes_read) != .SUCCESS) break;
+        if (bytes_read == 0) break;
+        waiter.events_len += bytes_read;
     }
-    if (focusEvent(events_buf[0..events_len])) {
-        // fire() removes this source: say so instead of removing it twice.
-        events_watch = 0;
-        fire();
+    if (focusEvent(waiter.events_buffer[0..waiter.events_len])) {
+        // The source ends with this call: fire must not remove it again.
+        waiter.watch_source = 0;
+        waiter.fire();
         return 0;
     }
     return 1;
 }
 
-const events_reads_max = 64;
-
 /// Whether Hyprland's event text holds a focus change.
 fn focusEvent(text: []const u8) bool {
     var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line| if (std.mem.startsWith(u8, line, "activewindow>>")) return true;
+    while (lines.next()) |line| {
+        if (std.mem.startsWith(u8, line, "activewindow>>")) return true;
+    }
     return false;
 }
 
@@ -355,37 +421,43 @@ pub fn applyLayout(gpa: std.mem.Allocator, layout: geometry.Layout) void {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const win = activeWindow(arena) orelse return;
-    const mon = monitor(arena, win.monitor) orelse return;
-    batch(gpa, layoutCommands(arena, win, mon, layout) catch return);
+    const window = activeWindow(arena) orelse return;
+    const window_monitor = monitor(arena, window.monitor) orelse return;
+    const commands = layoutCommands(arena, window, window_monitor, layout) catch return;
+    batch(gpa, commands);
 }
 
-/// The dispatches that put `win` where `layout` says on `mon`. Pixel moves
-/// need a floating window (and fullscreen windows ignore them), hence the
-/// first two. `fullscreen` only acts on the active window, which `win` is.
-/// The commands live in `arena`.
+/// Pixels kept between a placed window and the edges, and between halves.
+const layout_gap_px = 8;
+
+/// The dispatches that put `window` where `layout` says on `monitor_area`.
+/// Pixel moves need a floating window (and fullscreen windows ignore them),
+/// hence the first two. `fullscreen` only acts on the active window, which
+/// `window` is. The commands live in `arena`.
 pub fn layoutCommands(
     arena: std.mem.Allocator,
-    win: Client,
-    mon: geometry.Monitor,
+    window: Client,
+    monitor_area: geometry.Monitor,
     layout: geometry.Layout,
 ) std.mem.Allocator.Error![]const []const u8 {
-    const r = geometry.place(layout, mon.usable(), win.size[0], win.size[1], 8);
-    var cmds: std.ArrayList([]const u8) = .empty;
-    if (win.fullscreen != 0) try cmds.append(arena, "fullscreen 0");
-    if (!win.floating) try cmds.append(arena, try arena.print(
-        "setfloating address:{s}",
-        .{win.address},
-    ));
-    try cmds.append(arena, try arena.print(
+    // activeWindow returns no window without an address.
+    assert(window.address.len > 0);
+    const current_size: geometry.Size = .{ .w = window.size[0], .h = window.size[1] };
+    const rect = geometry.place(layout, monitor_area.usable(), current_size, layout_gap_px);
+    var commands: std.ArrayList([]const u8) = .empty;
+    if (window.fullscreen != 0) try commands.append(arena, "fullscreen 0");
+    if (!window.floating) {
+        try commands.append(arena, try arena.print("setfloating address:{s}", .{window.address}));
+    }
+    try commands.append(arena, try arena.print(
         "resizewindowpixel exact {d} {d},address:{s}",
-        .{ r.w, r.h, win.address },
+        .{ rect.w, rect.h, window.address },
     ));
-    try cmds.append(arena, try arena.print(
+    try commands.append(arena, try arena.print(
         "movewindowpixel exact {d} {d},address:{s}",
-        .{ r.x, r.y, win.address },
+        .{ rect.x, rect.y, window.address },
     ));
-    return cmds.items;
+    return commands.items;
 }
 
 // ---------------------------------------------------------------- tests
@@ -407,9 +479,8 @@ test "clients: recorded output, extra fields ignored, ordered by focus" {
 test "monitors: rotation and scale give the usable area" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const mons = parse([]MonitorJson, arena.allocator(), @embedFile(
-        "testdata/hypr_monitors.json",
-    )).?;
+    const monitors_json = @embedFile("testdata/hypr_monitors.json");
+    const mons = parse([]MonitorJson, arena.allocator(), monitors_json).?;
     try testing.expectEqualStrings("DP-1", focusedName(mons).?);
     // HDMI-A-1: 1600x900 rotated 270° -> 900x1600 logical, bar on top.
     const hdmi = findMonitor(mons, 0).?.usable();
@@ -421,8 +492,8 @@ test "monitors: rotation and scale give the usable area" {
 
     // Replies no monitor gives are refused, not computed with.
     var bad = mons[1];
-    for ([_]f64{ 0, -1, 1e-300, std.math.nan(f64), std.math.inf(f64) }) |s| {
-        bad.scale = s;
+    for ([_]f64{ 0, -1, 1e-300, std.math.nan(f64), std.math.inf(f64) }) |scale| {
+        bad.scale = scale;
         try testing.expect(findMonitor(&.{bad}, bad.id) == null);
     }
     bad = mons[1];
@@ -436,11 +507,12 @@ test "monitors: rotation and scale give the usable area" {
 test "layout commands: tiled window floats first, fullscreen leaves first" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
-    const mons = parse([]MonitorJson, a, @embedFile("testdata/hypr_monitors.json")).?;
-    const all = parse([]Client, a, @embedFile("testdata/hypr_clients.json")).?;
+    const allocator = arena.allocator();
+    const mons = parse([]MonitorJson, allocator, @embedFile("testdata/hypr_monitors.json")).?;
+    const all = parse([]Client, allocator, @embedFile("testdata/hypr_clients.json")).?;
     const discord = all[0]; // tiled, on DP-1
-    const cmds = try layoutCommands(a, discord, findMonitor(mons, discord.monitor).?, .left_half);
+    const discord_monitor = findMonitor(mons, discord.monitor).?;
+    const cmds = try layoutCommands(allocator, discord, discord_monitor, .left_half);
     try testing.expectEqual(@as(usize, 3), cmds.len);
     try testing.expectEqualStrings("setfloating address:0x5600000000a0", cmds[0]);
     try testing.expectEqualStrings(
@@ -452,9 +524,9 @@ test "layout commands: tiled window floats first, fullscreen leaves first" {
     var full = all[1];
     full.fullscreen = 1;
     full.floating = true;
-    const fc = try layoutCommands(a, full, findMonitor(mons, 0).?, .maximize);
-    try testing.expectEqualStrings("fullscreen 0", fc[0]);
-    try testing.expectEqual(@as(usize, 3), fc.len);
+    const full_cmds = try layoutCommands(allocator, full, findMonitor(mons, 0).?, .maximize);
+    try testing.expectEqualStrings("fullscreen 0", full_cmds[0]);
+    try testing.expectEqual(@as(usize, 3), full_cmds.len);
 
     const joined = try batchString(testing.allocator, cmds[0..2]);
     defer testing.allocator.free(joined);

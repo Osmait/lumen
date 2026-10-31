@@ -27,16 +27,16 @@ pub fn init(gpa: std.mem.Allocator) Apps {
 pub fn deinit(self: *Apps) void {
     self.dropStale();
     self.stale.deinit(self.gpa);
-    if (self.list) |l| c.g_list_free_full(l, &c.g_object_unref);
+    if (self.list) |list| c.g_list_free_full(list, &c.g_object_unref);
     self.arena.deinit();
     self.* = undefined;
 }
 
 /// Frees the lists `reload` replaced; call once nothing points into them.
 pub fn dropStale(self: *Apps) void {
-    for (self.stale.items) |*g| {
-        if (g.list) |l| c.g_list_free_full(l, &c.g_object_unref);
-        g.arena.deinit();
+    for (self.stale.items) |*generation| {
+        if (generation.list) |list| c.g_list_free_full(list, &c.g_object_unref);
+        generation.arena.deinit();
     }
     self.stale.clearRetainingCapacity();
 }
@@ -49,44 +49,51 @@ pub fn reload(self: *Apps) void {
             self.arena = .init(self.gpa);
         } else |_| {
             // No room to keep them: free now, as before (rare and racy).
-            if (self.list) |l| c.g_list_free_full(l, &c.g_object_unref);
+            if (self.list) |list| c.g_list_free_full(list, &c.g_object_unref);
             _ = self.arena.reset(.retain_capacity);
         }
     }
     self.list = c.g_app_info_get_all();
-    const a = self.arena.allocator();
+    const arena = self.arena.allocator();
 
     var items: std.ArrayList(Item) = .empty;
     var dropped: usize = 0;
     defer if (dropped > 0) log.warn("{d} apps left out: out of memory", .{dropped});
     var node = self.list;
-    while (node) |n| : (node = n.next) {
-        const info: *c.GAppInfo = @ptrCast(@alignCast(n.data));
+    while (node) |list_node| : (node = list_node.next) {
+        const info: *c.GAppInfo = @ptrCast(@alignCast(list_node.data));
         if (c.g_app_info_should_show(info) == 0) continue;
-        const id = std.mem.span(c.g_app_info_get_id(info) orelse continue);
-        const name = std.mem.span(c.g_app_info_get_display_name(info) orelse continue);
-        const dai: *c.GDesktopAppInfo = @ptrCast(info);
-
-        var generic: [:0]const u8 = "";
-        if (c.g_desktop_app_info_get_generic_name(dai)) |g| generic = std.mem.span(g);
-
-        items.append(a, .{
-            .key = a.print("app:{s}", .{id}) catch {
-                dropped += 1;
-                continue;
-            },
-            .title = name,
-            .subtitle = generic,
-            .accessory = "Application",
-            .icon = if (c.g_app_info_get_icon(info)) |icon| .{ .gicon = icon } else .none,
-            .keywords = keywords(a, dai, info),
-            .action = .{ .app = info },
-        }) catch {
+        const item = (itemOf(arena, info) catch {
+            dropped += 1;
+            continue;
+        }) orelse continue;
+        items.append(arena, item) catch {
             dropped += 1;
             continue;
         };
     }
-    self.items = items.toOwnedSlice(a) catch items.items;
+    self.items = items.toOwnedSlice(arena) catch items.items;
+}
+
+/// The row for `info`, its strings in `arena`; null for an app without an
+/// id or a name.
+fn itemOf(arena: std.mem.Allocator, info: *c.GAppInfo) std.mem.Allocator.Error!?Item {
+    const id = std.mem.span(c.g_app_info_get_id(info) orelse return null);
+    const name = std.mem.span(c.g_app_info_get_display_name(info) orelse return null);
+    const desktop_info: *c.GDesktopAppInfo = @ptrCast(info);
+    var generic_name: [:0]const u8 = "";
+    if (c.g_desktop_app_info_get_generic_name(desktop_info)) |generic_name_z| {
+        generic_name = std.mem.span(generic_name_z);
+    }
+    return .{
+        .key = try arena.print("app:{s}", .{id}),
+        .title = name,
+        .subtitle = generic_name,
+        .accessory = "Application",
+        .icon = if (c.g_app_info_get_icon(info)) |icon| .{ .gicon = icon } else .none,
+        .keywords = try keywords(arena, desktop_info, info),
+        .action = .{ .app = info },
+    };
 }
 
 /// Icon of the app that owns windows of `class` (Hyprland's class is the
@@ -95,12 +102,13 @@ pub fn iconForClass(self: *const Apps, class: []const u8) ?*c.GIcon {
     if (class.len == 0) return null;
     for (self.items) |item| {
         const info = item.action.app;
-        const dai: *c.GDesktopAppInfo = @ptrCast(info);
-        if (c.g_desktop_app_info_get_startup_wm_class(dai)) |wm| {
-            if (std.ascii.eqlIgnoreCase(std.mem.span(wm), class)) return iconOf(item);
+        const desktop_info: *c.GDesktopAppInfo = @ptrCast(info);
+        if (c.g_desktop_app_info_get_startup_wm_class(desktop_info)) |wm_class| {
+            if (std.ascii.eqlIgnoreCase(std.mem.span(wm_class), class)) return iconOf(item);
         }
         const id = std.mem.span(c.g_app_info_get_id(info) orelse continue);
-        const stem = if (std.mem.endsWith(u8, id, ".desktop")) id[0 .. id.len - 8] else id;
+        const suffix = ".desktop";
+        const stem = if (std.mem.endsWith(u8, id, suffix)) id[0 .. id.len - suffix.len] else id;
         if (std.ascii.eqlIgnoreCase(stem, class)) return iconOf(item);
         // Reverse-DNS ids: org.mozilla.firefox vs class "firefox".
         if (std.mem.findScalarLast(u8, stem, '.')) |dot| {
@@ -112,25 +120,30 @@ pub fn iconForClass(self: *const Apps, class: []const u8) ?*c.GIcon {
 
 fn iconOf(item: Item) ?*c.GIcon {
     return switch (item.icon) {
-        .gicon => |g| g,
+        .gicon => |gicon| gicon,
         else => null,
     };
 }
 
-/// Keywords, executable name and categories, space separated.
-fn keywords(a: std.mem.Allocator, dai: *c.GDesktopAppInfo, info: *c.GAppInfo) []const u8 {
+/// Keywords and the executable's name, space separated, in `arena`.
+fn keywords(
+    arena: std.mem.Allocator,
+    desktop_info: *c.GDesktopAppInfo,
+    info: *c.GAppInfo,
+) std.mem.Allocator.Error![]const u8 {
     var out: std.ArrayList(u8) = .empty;
-    if (c.g_desktop_app_info_get_keywords(dai)) |kw| {
-        var i: usize = 0;
-        while (kw[i]) |k| : (i += 1) {
-            out.appendSlice(a, std.mem.span(k)) catch break;
-            out.append(a, ' ') catch break;
+    if (c.g_desktop_app_info_get_keywords(desktop_info)) |keywords_z| {
+        var keyword_index: usize = 0;
+        while (keywords_z[keyword_index]) |keyword| : (keyword_index += 1) {
+            try out.appendSlice(arena, std.mem.span(keyword));
+            try out.append(arena, ' ');
         }
     }
-    if (c.g_app_info_get_executable(info)) |exe| {
-        const e = std.mem.span(exe);
-        const base = if (std.mem.findScalarLast(u8, e, '/')) |s| e[s + 1 ..] else e;
-        out.appendSlice(a, base) catch {};
+    if (c.g_app_info_get_executable(info)) |executable_z| {
+        const executable = std.mem.span(executable_z);
+        const slash = std.mem.findScalarLast(u8, executable, '/');
+        const base = if (slash) |at| executable[at + 1 ..] else executable;
+        try out.appendSlice(arena, base);
     }
     return out.items;
 }
