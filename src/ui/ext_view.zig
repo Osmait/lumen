@@ -280,13 +280,17 @@ fn remap(ui: *Ui, old: *const Host.Registry, new: *const Host.Registry) bool {
     ui.form_cmd = form orelse .gone;
     if (form != null and !same_form) form_view.reset(ui);
     switch (ui.input) {
-        .pref => |pref_index| ui.input = .{ .pref = samePref(old, new, pref_index) orelse .gone },
+        .pref => |pref_index| {
+            ui.input = .{ .pref = samePref(old, new, pref_index) orelse .gone };
+        },
         .field => if (!same_form) {
             ui.input = .{ .field = .gone };
         },
     }
     switch (ui.choosing) {
-        .pref => |pref_index| ui.choosing = .{ .pref = samePref(old, new, pref_index) orelse .gone },
+        .pref => |pref_index| {
+            ui.choosing = .{ .pref = samePref(old, new, pref_index) orelse .gone };
+        },
         .field => if (!same_form) {
             ui.choosing = .{ .field = .gone };
         },
@@ -325,13 +329,10 @@ fn samePref(
     index: Host.PrefIndex,
 ) ?Host.PrefIndex {
     const preference = (old.pref(index) orelse return null).*;
-    for (new.prefs, 0..) |query, j| {
-        if (std.mem.eql(u8, query.ext, preference.ext) and std.mem.eql(
-            u8,
-            query.name,
-            preference.name,
-        ) and
-            query.kind == preference.kind) return .from(j);
+    for (new.prefs, 0..) |candidate, j| {
+        const same_extension = std.mem.eql(u8, candidate.ext, preference.ext);
+        const same_name = std.mem.eql(u8, candidate.name, preference.name);
+        if (same_extension and same_name and candidate.kind == preference.kind) return .from(j);
     }
     return null;
 }
@@ -527,8 +528,9 @@ fn open(ui: *Ui, target: [:0]const u8) void {
         const lctx = proc.launchContext() orelse return;
         defer c.g_object_unref(lctx);
         var err: ?*c.GError = null;
-        if (c.g_app_info_launch_default_for_uri(target.ptr, lctx, &err) == 0)
+        if (c.g_app_info_launch_default_for_uri(target.ptr, lctx, &err) == 0) {
             proc.warnError(.ext, err, "open {s}", .{target});
+        }
         return;
     }
     var buf: [4096]u8 = undefined;

@@ -249,7 +249,7 @@ pub fn itemRow(look: *const RowLook, item: Item, parts: *RowParts) *c.GtkListBox
 }
 
 /// A grid cell: a picture (an image file, scaled down as it is decoded) or
-/// a large icon, and the title under it. `w` is the cell's width.
+/// a large icon, and the title under it. `width_px` is the cell's width.
 pub fn gridCell(look: *const RowLook, item: Item, width_px: c_int) *c.GtkWidget {
     // Ui keeps a cell at least a pixel wide, however narrow the layout.
     assert(width_px > 0);
@@ -264,10 +264,9 @@ pub fn gridCell(look: *const RowLook, item: Item, width_px: c_int) *c.GtkWidget 
     else
         null;
     const cached = if (key) |cache_key| GridPictures.ring.get(cache_key) else null;
-    const top = if (cached) |cached_texture| (if (cached_texture) |tex| cellPicture(
-        tex,
-        picture_height_px,
-    ) else null) else null;
+    // Cached as null: the picture did not decode, and the icon shows instead.
+    const cached_texture = cached orelse null;
+    const top = if (cached_texture) |texture| cellPicture(texture, picture_height_px) else null;
     const decode = key != null and cached == null;
     const shown = top orelse blk: {
         const icon = iconWidget(look, item.icon, @min(@divTrunc(width_px, 2), grid_icon_px_max));

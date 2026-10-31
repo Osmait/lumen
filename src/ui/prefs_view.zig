@@ -117,14 +117,16 @@ fn manageRows(ui: *Ui, arena: std.mem.Allocator, out: *std.ArrayList(Item)) void
         .icon = .{ .tile = .{ .name = "folder-open-symbolic", .color = .blue } },
         .action = .{ .setting = .{ .ext_open = dir } },
     }) catch return;
-    if (os.info(git) != null) out.append(arena, .{
-        .key = "manage:update",
-        .section = "Manage",
-        .title = "Update",
-        .subtitle = "git pull",
-        .icon = .{ .tile = .{ .name = "view-refresh-symbolic", .color = .green } },
-        .action = .{ .setting = .{ .ext_update = id } },
-    }) catch return;
+    if (os.info(git) != null) {
+        out.append(arena, .{
+            .key = "manage:update",
+            .section = "Manage",
+            .title = "Update",
+            .subtitle = "git pull",
+            .icon = .{ .tile = .{ .name = "view-refresh-symbolic", .color = .green } },
+            .action = .{ .setting = .{ .ext_update = id } },
+        }) catch return;
+    }
     out.append(arena, .{
         .key = "manage:uninstall",
         .section = "Manage",

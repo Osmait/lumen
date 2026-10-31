@@ -195,10 +195,12 @@ fn headerSize(data: []const u8) ?Size {
 
 fn bmpSize(data: []const u8) ?Size {
     const info_size = int(u32, data, bmp.info_size_offset, .little) orelse return null;
-    if (info_size == bmp.os2_info_size) return .{
-        .width_px = int(u16, data, bmp.os2_width_offset, .little) orelse return null,
-        .height_px = int(u16, data, bmp.os2_height_offset, .little) orelse return null,
-    };
+    if (info_size == bmp.os2_info_size) {
+        return .{
+            .width_px = int(u16, data, bmp.os2_width_offset, .little) orelse return null,
+            .height_px = int(u16, data, bmp.os2_height_offset, .little) orelse return null,
+        };
+    }
     return .{
         .width_px = @abs(int(i32, data, bmp.width_offset, .little) orelse return null),
         .height_px = @abs(int(i32, data, bmp.height_offset, .little) orelse return null),
@@ -475,13 +477,13 @@ fn heifSizes(data: []const u8, from: usize, end: usize, depth: u8, size: *Size) 
         const next = at + @as(usize, @intCast(box_bytes));
         const container = std.mem.eql(u8, kind, iso_box.item_properties) or
             std.mem.eql(u8, kind, iso_box.property_container);
+        const spatial_extent = std.mem.eql(u8, kind, iso_box.spatial_extent) and
+            next >= body + iso_box.ispe_bytes;
         if (std.mem.eql(u8, kind, iso_box.meta)) {
             heifSizes(data, body + iso_box.full_box_bytes, next, depth + 1, size);
         } else if (container) {
             heifSizes(data, body, next, depth + 1, size);
-        } else if (std.mem.eql(u8, kind, iso_box.spatial_extent) and
-            next >= body + iso_box.ispe_bytes)
-        {
+        } else if (spatial_extent) {
             const width = int(u32, data, body + iso_box.ispe_width_offset, .big).?;
             const height = int(u32, data, body + iso_box.ispe_height_offset, .big).?;
             size.width_px = @max(size.width_px, width);

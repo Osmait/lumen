@@ -131,11 +131,9 @@ fn onRead(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
     if (err) |err_some| c.g_error_free(err_some);
     if (session.finished) return session.destroy();
 
-    var len: usize = 0;
-    const chunk: []const u8 = if (bytes) |bytes_some| if (c.g_bytes_get_data(
-        bytes_some,
-        &len,
-    )) |data_ptr| data_ptr[0..len] else "" else "";
+    var length: usize = 0;
+    const received_data = if (bytes) |received| c.g_bytes_get_data(received, &length) else null;
+    const chunk: []const u8 = if (received_data) |chunk_start| chunk_start[0..length] else "";
     if (chunk.len == 0) {
         // End of input (or an error): the last line may lack its newline.
         if (session.partial.items.len > 0) addLine(session, session.partial.items);
@@ -219,9 +217,8 @@ fn addLine(session: *Session, raw: []const u8) void {
                 .icon => {
                     const name = arena.dupeSentinel(u8, value, 0) catch continue;
                     // A first byte past ASCII starts a character, not an icon name.
-                    line.icon = if (value.len > 0 and value[0] >= 0x80) .{
-                        .emoji = name,
-                    } else .byName(name);
+                    const is_character = value.len > 0 and value[0] >= 0x80;
+                    line.icon = if (is_character) .{ .emoji = name } else .byName(name);
                 },
                 .meta => line.meta = arena.dupe(u8, value) catch "",
                 .nonselectable => line.selectable = !std.mem.eql(u8, value, rofi_true),

@@ -179,12 +179,13 @@ pub fn displayName(
     prefer_dark: bool,
     custom: []const Theme,
 ) [:0]const u8 {
-    if (std.mem.eql(u8, id, auto_id))
+    if (std.mem.eql(u8, id, auto_id)) {
         return arena.printSentinel(
             "Automatic ({s})",
             .{find(id, prefer_dark, custom).name},
             0,
         ) catch "Automatic";
+    }
     return find(id, prefer_dark, custom).name;
 }
 

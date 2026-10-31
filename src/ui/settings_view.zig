@@ -459,11 +459,10 @@ pub fn appOptions(
     if (!open_now) {
         const def = c.g_app_info_get_default_for_type(mime, 0);
         defer if (def) |default_app| c.g_object_unref(default_app);
-        const name: [:0]const u8 = if (def) |default_app| (arena.dupeSentinel(
-            u8,
-            std.mem.span(c.g_app_info_get_display_name(default_app) orelse ""),
-            0,
-        ) catch "") else "none set";
+        const name: [:0]const u8 = if (def) |default_app| blk: {
+            const display_name = c.g_app_info_get_display_name(default_app) orelse "";
+            break :blk arena.dupeSentinel(u8, std.mem.span(display_name), 0) catch "";
+        } else "none set";
         out.append(arena, .{
             .key = "pick:",
             .title = "System Default",
@@ -636,10 +635,9 @@ fn titleOf(arena: std.mem.Allocator, name: []const u8) [:0]const u8 {
     const out = arena.allocSentinel(u8, name.len, 0) catch return "";
     var start = true;
     for (name, 0..) |choice, i| {
-        out[i] = if (choice == '-' or choice == '_') ' ' else if (start) std.ascii.toUpper(
-            choice,
-        ) else choice;
-        start = choice == '-' or choice == '_';
+        const separator = choice == '-' or choice == '_';
+        out[i] = if (separator) ' ' else if (start) std.ascii.toUpper(choice) else choice;
+        start = separator;
     }
     return out;
 }

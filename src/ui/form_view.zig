@@ -75,11 +75,10 @@ pub fn candidates(ui: *Ui, arena: std.mem.Allocator) []Item {
     var out: std.ArrayList(Item) = .empty;
     for (cmd.fields, 0..) |*form_field, i| {
         // A required field is marked with a star after its title.
-        const field_title = if (form_field.required) arena.printSentinel(
-            "{s} *",
-            .{form_field.title},
-            0,
-        ) catch form_field.title else form_field.title;
+        const field_title = if (form_field.required)
+            arena.printSentinel("{s} *", .{form_field.title}, 0) catch form_field.title
+        else
+            form_field.title;
         out.append(arena, .{
             .key = arena.print("field:{s}", .{form_field.name}) catch continue,
             .title = field_title,

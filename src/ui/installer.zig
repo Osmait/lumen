@@ -266,12 +266,10 @@ fn start(
 /// What the job printed, as UTF-8 (U+FFFD for what is not, NUL included):
 /// it goes to the caller over D-Bus and onto a row. Free with g_free.
 fn outputText(bytes: ?*c.GBytes) [:0]u8 {
-    var len: usize = 0;
-    const data: [*]const u8 = if (bytes) |data_bytes| c.g_bytes_get_data(
-        data_bytes,
-        &len,
-    ) orelse "" else "";
-    return std.mem.span(c.g_utf8_make_valid(data, @intCast(len)));
+    var length: usize = 0;
+    const received = if (bytes) |output| c.g_bytes_get_data(output, &length) else null;
+    const data: [*]const u8 = received orelse "";
+    return std.mem.span(c.g_utf8_make_valid(data, @intCast(length)));
 }
 
 /// What git says last on a failure, in bytes: the message has to fit 1 KB.
@@ -309,11 +307,10 @@ fn onDone(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
         // A failed clone can leave half a folder behind, and the next
         // install would find it there.
         if (job.kind == .install) removeTree(job.dirZ());
-        const why = if (err) |gerror| std.mem.span(gerror.message) else std.mem.trim(
-            u8,
-            output,
-            " \n",
-        );
+        const why = if (err) |gerror|
+            std.mem.span(gerror.message)
+        else
+            std.mem.trim(u8, output, " \n");
         const end = tail(why, failure_output_bytes_max);
         return fail(ui, cmdline, "{s} failed:\n{s}{s}", .{ @tagName(job.kind), end[0], end[1] });
     }
@@ -382,7 +379,7 @@ fn print(
 fn removeTree(dir: [:0]const u8) void {
     var argv = [_:null]?[*:0]const u8{ "rm", "-rf", "--", dir.ptr };
     var err: ?*c.GError = null;
-    if (c.g_spawn_sync(
+    const spawned = c.g_spawn_sync(
         null,
         @ptrCast(&argv),
         null,
@@ -393,9 +390,8 @@ fn removeTree(dir: [:0]const u8) void {
         null,
         null,
         &err,
-    ) == 0) {
-        proc.warnError(.install, err, "rm {s}", .{dir});
-    }
+    );
+    if (spawned == 0) proc.warnError(.install, err, "rm {s}", .{dir});
 }
 
 test "long output keeps its end, and messages stay valid UTF-8" {

@@ -656,13 +656,11 @@ fn buildWindow(self: *Ui) *c.GtkOverlay {
     const window = win;
     c.gtk_layer_init_for_window(window);
     c.gtk_layer_set_layer(window, c.GTK_LAYER_SHELL_LAYER_OVERLAY);
-    c.gtk_layer_set_keyboard_mode(
-        window,
-        if (testMode())
-            c.GTK_LAYER_SHELL_KEYBOARD_MODE_NONE
-        else
-            c.GTK_LAYER_SHELL_KEYBOARD_MODE_EXCLUSIVE,
-    );
+    const keyboard_mode = if (testMode())
+        c.GTK_LAYER_SHELL_KEYBOARD_MODE_NONE
+    else
+        c.GTK_LAYER_SHELL_KEYBOARD_MODE_EXCLUSIVE;
+    c.gtk_layer_set_keyboard_mode(window, keyboard_mode);
     c.gtk_layer_set_namespace(window, "lumen");
     c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_TOP, 1);
 
@@ -877,10 +875,10 @@ pub fn applyStructure(self: *Ui) void {
     gtk.setClass(self.column, "with-footer", layout.footer);
     // spacer, then search and results in the chosen order, footer last.
     c.gtk_box_reorder_child_after(column_box, gtk.widget(self.spacer), null);
-    const first, const second = if (layout.search == .bottom) .{
-        self.results,
-        self.search_bar.box,
-    } else .{ self.search_bar.box, self.results };
+    const first, const second = if (layout.search == .bottom)
+        .{ self.results, self.search_bar.box }
+    else
+        .{ self.search_bar.box, self.results };
     c.gtk_box_reorder_child_after(column_box, gtk.widget(first), gtk.widget(self.spacer));
     c.gtk_box_reorder_child_after(column_box, gtk.widget(second), gtk.widget(first));
     c.gtk_box_reorder_child_after(column_box, gtk.widget(self.footer.box), gtk.widget(second));
@@ -1221,10 +1219,9 @@ pub fn showWith(self: *Ui, view: View, text: ?[*:0]const u8) void {
     self.navigation.clear();
     // The choose view needs a setting to choose for, and the ext view a
     // command to show; without one, their parent view opens instead.
-    self.setView(
-        if (view == .choose and self.choosing == .none) .settings else if (view == .ext and
-            ext_view.command(self) == null) .root else view,
-    );
+    const choose_has_nothing = view == .choose and self.choosing == .none;
+    const ext_has_nothing = view == .ext and ext_view.command(self) == null;
+    self.setView(if (choose_has_nothing) .settings else if (ext_has_nothing) .root else view);
     if (text) |initial| c.gtk_editable_set_text(gtk.editable(self.search_bar.entry), initial);
     if (was_hidden) backdrop.showBackdrops(self);
     gtk.setVisible(self.window, true);
@@ -1855,12 +1852,10 @@ fn fillRoot(self: *Ui, arena: std.mem.Allocator, query_text: []const u8) void {
     // visible without scrolling; the rest of the results follow.
     const files_wanted = query_text.len >= root_files_query_bytes_min and
         self.settings.files_in_root;
-    const files = if (files_wanted) file_results.fileItems(
-        self,
-        arena,
-        query_text,
-        root_files_max,
-    ) else &.{};
+    const files = if (files_wanted)
+        file_results.fileItems(self, arena, query_text, root_files_max)
+    else
+        &.{};
     const shown = @min(hits.items.len, root_results_max);
     const head = if (files.len > 0) @min(shown, root_results_before_files_max) else shown;
     for (hits.items[0..head]) |item| self.addItem(item);
@@ -1938,8 +1933,8 @@ pub fn addSection(self: *Ui, title: [:0]const u8) void {
 /// Queues the row and returns true when `eager_rows` rows are built already.
 /// Returns false when the caller must build it now.
 fn deferRow(self: *Ui, pending_row: Pending) bool {
-    if (self.grid_mode or
-        (self.rows.items.len < eager_rows and self.pending.items.len == 0)) return false;
+    const eager = self.rows.items.len < eager_rows and self.pending.items.len == 0;
+    if (self.grid_mode or eager) return false;
     self.pending.append(self.query_arena.allocator(), pending_row) catch return false;
     if (self.pending_idle == 0) {
         self.pending_idle = c.g_idle_add_full(c.G_PRIORITY_LOW, &onPendingRows, self, null);
@@ -2124,11 +2119,14 @@ pub fn select(self: *Ui, row_index: ?usize) void {
     detail_pane.showDetail(self, item);
     // Change Theme shows each theme as the selection moves over it, and the
     // theme in use on a style.
-    if (self.view == .themes) self.applyAppearance(if (item.action == .setting and
-        item.action.setting == .theme)
-        themes.find(item.action.setting.theme, self.preferDark(), self.customThemes())
-    else
-        null);
+    if (self.view == .themes) {
+        const is_theme = item.action == .setting and item.action.setting == .theme;
+        const preview: ?*const themes.Theme = if (is_theme)
+            themes.find(item.action.setting.theme, self.preferDark(), self.customThemes())
+        else
+            null;
+        self.applyAppearance(preview);
+    }
 }
 
 /// The footer's "what Enter does" (hidden with nothing selected).
@@ -2314,9 +2312,11 @@ pub fn perform(self: *Ui, op: item_mod.Op) void {
     var whole = item.*;
     var clip_arena: std.heap.ArenaAllocator = .init(self.gpa);
     defer clip_arena.deinit();
-    if (item.action == .clip and (op == .run or op == .open or op == .clip_paste or
-        op == .clip_copy))
-    {
+    const uses_text = switch (op) {
+        .run, .open, .clip_paste, .clip_copy => true,
+        else => false,
+    };
+    if (item.action == .clip and uses_text) {
         const content = self.db.clipContent(clip_arena.allocator(), item.action.clip) catch null;
         whole.detail = content orelse return self.showFailure("Could not read the entry");
     }
@@ -2520,10 +2520,12 @@ fn dumpWindow(self: *Ui, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.print("{s}{t}", .{ if (i > 0) "," else "", part });
     }
     try writer.print(" prompt={s} placeholder={s}\n", .{ layout.prompt, layout.placeholder });
-    if (layout.footer) try writer.print("footer: {s} | {s}\n", .{
-        c.gtk_label_get_text(self.footer.title),
-        c.gtk_label_get_text(self.footer.action),
-    });
+    if (layout.footer) {
+        try writer.print("footer: {s} | {s}\n", .{
+            c.gtk_label_get_text(self.footer.title),
+            c.gtk_label_get_text(self.footer.action),
+        });
+    }
 }
 
 /// One line per row: the selection mark, the texts, the icon and the key.
@@ -2594,14 +2596,18 @@ fn emptyText(self: *Ui, arena: std.mem.Allocator) [:0]const u8 {
         return file_results.contentsHint(self, arena, query_text.len);
     }
     if (self.view == .contents and self.content_query.pending) return "Searching...";
-    if (self.view == .contents) if (self.content_query.latest) |result| if (result.err) |err|
+    const content_error = if (self.content_query.latest) |result| result.err else null;
+    if (self.view == .contents and content_error != null) {
         return arena.printSentinel(
             "Content search failed ({t})",
-            .{err},
+            .{content_error.?},
             0,
         ) catch "Content search failed";
-    if (self.view == .clipboard and query_text.len == 0 and
-        !self.settings.clipboard) return "Clipboard history is off: turn it on in Settings";
+    }
+    const clipboard_off = self.view == .clipboard and !self.settings.clipboard;
+    if (clipboard_off and query_text.len == 0) {
+        return "Clipboard history is off: turn it on in Settings";
+    }
     if (self.view == .ext) return ext_view.emptyText(self, arena, query_text);
     if (self.view == .dmenu) return dmenu.emptyText(self);
     return "No Results";
