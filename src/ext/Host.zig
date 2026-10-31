@@ -488,6 +488,10 @@ pub fn list(host: *Host, registry_gen: u32, command: u16, query: []const u8) u32
 /// Calls form `command`'s submit with `values` (copied). Its answer comes
 /// like an action's.
 pub fn submit(host: *Host, registry_gen: u32, command: u16, values: []const FormValue) u32 {
+    // The window sends one value per field of the form, and a form has at
+    // most `form_fields_max`.
+    assert(values.len >= 1);
+    assert(values.len <= form_fields_max);
     const request_gen = host.requestGenNext();
     const request = submitRequestCreate(
         host.gpa,
@@ -1284,6 +1288,12 @@ fn requested(host: *Host, registry_gen: u32, command: u16) ?*WorkerCommand {
     return worker_command;
 }
 
+/// The extension that defined `worker_command`.
+fn extensionOf(host: *const Host, worker_command: *const WorkerCommand) *Ext {
+    assert(worker_command.extension_index < host.extensions.items.len);
+    return host.extensions.items[worker_command.extension_index];
+}
+
 fn listExecute(host: *Host, request: *const ListRequest) void {
     const result = host.answerCreate(ListResult, "list", .{
         .gen = request.request_gen,
@@ -1303,7 +1313,7 @@ fn listExecute(host: *Host, request: *const ListRequest) void {
         result.err = reloaded;
         return;
     };
-    const extension = host.extensions.items[worker_command.extension_index];
+    const extension = host.extensionOf(worker_command);
     var rows: lua.Capped = .{ .child = arena, .bytes_max = rows_bytes_max };
     var context: ListContext = .{
         .extension = extension,
@@ -1408,7 +1418,7 @@ fn rootSearchCommand(
     command: u16,
     request: *const RootSearchRequest,
 ) []Item {
-    const extension = host.extensions.items[worker_command.extension_index];
+    const extension = host.extensionOf(worker_command);
     var context: RootSearchContext = .{
         .extension = extension,
         .worker_command = worker_command,
@@ -1477,7 +1487,7 @@ fn submitExecute(host: *Host, request: *SubmitRequest) void {
         return;
     };
     assert(request.values.len <= form_fields_max);
-    const extension = host.extensions.items[worker_command.extension_index];
+    const extension = host.extensionOf(worker_command);
     var context: SubmitContext = .{
         .worker_command = worker_command,
         .request = request,
@@ -1548,7 +1558,7 @@ fn actExecute(host: *Host, request: ActRequest) void {
         result.err = reloaded;
         return;
     };
-    const extension = host.extensions.items[worker_command.extension_index];
+    const extension = host.extensionOf(worker_command);
     var context: ActContext = .{
         .worker_command = worker_command,
         .request = request,
@@ -2065,26 +2075,19 @@ test "errors in extensions come back as messages" {
     try testing.expectEqual(@as(usize, 4), registry.commands.len);
     try testing.expectEqual(@as(usize, 5), registry.problems.len);
     try testing.expect(!registry.has_layout);
-    for (registry.problems) |p| {
-        const want: []const u8 = if (std.mem.eql(
-            u8,
-            p.ext,
-            "Bad Name",
-        )) "folder names" else if (std.mem.eql(
-            u8,
-            p.ext,
-            "keys",
-        )) "needs ctrl" else if (std.mem.eql(
-            u8,
-            p.ext,
-            "sets",
-        )) "no setting named \"widht\"" else if (std.mem.eql(
-            u8,
-            p.ext,
-            "lay",
-        )) "bad value for panels" else "unexpected symbol near <eof>";
-        if (std.mem.find(u8, p.message, want) == null) {
-            std.debug.print("{s}: {s}\n", .{ p.ext, p.message });
+    // What each broken extension's report says; the one not listed is the
+    // file with a syntax error.
+    const messages_expected = std.StaticStringMap([]const u8).initComptime(.{
+        .{ "Bad Name", "folder names" },
+        .{ "keys", "needs ctrl" },
+        .{ "sets", "no setting named \"widht\"" },
+        .{ "lay", "bad value for panels" },
+    });
+    for (registry.problems) |problem_reported| {
+        const message_expected = messages_expected.get(problem_reported.ext) orelse
+            "unexpected symbol near <eof>";
+        if (std.mem.find(u8, problem_reported.message, message_expected) == null) {
+            std.debug.print("{s}: {s}\n", .{ problem_reported.ext, problem_reported.message });
             return error.TestUnexpectedResult;
         }
     }

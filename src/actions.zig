@@ -273,8 +273,13 @@ fn resolveEditor(settings: *const Settings) []const u8 {
 /// What "Automatic" means for the editor: $VISUAL, $EDITOR, else nvim.
 pub fn autoEditor() [:0]const u8 {
     const editor_env = c.g_getenv("VISUAL") orelse c.g_getenv("EDITOR");
-    return if (editor_env) |editor_command| std.mem.span(editor_command) else "nvim";
+    return if (editor_env) |editor_command| std.mem.span(editor_command) else editor_fallback;
 }
+
+/// What runs when no terminal or editor is set, none of the known ones is
+/// installed and the environment names none.
+const terminal_fallback = "xterm";
+const editor_fallback = "nvim";
 
 fn resolveTerminal(settings: *const Settings) [:0]const u8 {
     for (settings_mod.terminals) |terminal| {
@@ -292,7 +297,7 @@ pub fn autoTerminal() [:0]const u8 {
         const command, _ = terminal;
         if (proc.have(command)) return command;
     }
-    return "xterm";
+    return terminal_fallback;
 }
 
 pub const EditorCommand = struct { argv: []const [:0]const u8, in_terminal: bool };

@@ -653,7 +653,7 @@ fn testState(budget: *Budget) !*State {
 }
 
 /// Runs `code` and returns its error message (null when it succeeded).
-fn runCode(L: *State, a: std.mem.Allocator, code: [:0]const u8) ?[:0]const u8 {
+fn runCode(L: *State, arena: std.mem.Allocator, code: [:0]const u8) ?[:0]const u8 {
     const Ctx = struct {
         code: [:0]const u8,
         fn run(Ls: *State, ctx: *@This()) void {
@@ -662,7 +662,7 @@ fn runCode(L: *State, a: std.mem.Allocator, code: [:0]const u8) ?[:0]const u8 {
         }
     };
     var ctx: Ctx = .{ .code = code };
-    return protect(L, a, Ctx, &ctx, Ctx.run);
+    return protect(L, arena, Ctx, &ctx, Ctx.run);
 }
 
 test "errors come back as messages, and the sandbox holds" {
