@@ -174,7 +174,9 @@ pub fn install(
         return fail(ui, caller, "URL too long", .{});
     };
     // "--": a URL starting with "-" is not an option.
-    var argv = [_:null]?[*:0]const u8{ "git", "clone", "--depth", "1", "--", url_z.ptr, folder.ptr };
+    var argv = [_:null]?[*:0]const u8{
+        "git", "clone", "--depth", "1", "--", url_z.ptr, folder.ptr,
+    };
     start(ui, caller, .install, name, folder, &argv);
 }
 
@@ -243,7 +245,7 @@ fn start(
         c.G_SUBPROCESS_FLAGS_STDOUT_PIPE | c.G_SUBPROCESS_FLAGS_STDERR_MERGE,
         &err,
     ) orelse {
-        const reason: []const u8 = if (err) |gerror| std.mem.span(gerror.message) else "cannot start";
+        const reason = if (err) |gerror| std.mem.span(gerror.message) else "cannot start";
         fail(ui, caller, "{s}: {s}", .{ std.mem.span(argv[0].?), reason });
         if (err) |gerror| c.g_error_free(gerror);
         return;
@@ -432,5 +434,8 @@ test "extension names come from the repository" {
         "https://codeberg.org/x/todo-lumen/",
     ));
     try std.testing.expectEqualStrings("my-tool", nameFromUrl(&name_bytes, "/home/me/src/My.Tool"));
-    try std.testing.expectEqualStrings("lumen", nameFromUrl(&name_bytes, "https://github.com/x/lumen"));
+    try std.testing.expectEqualStrings("lumen", nameFromUrl(
+        &name_bytes,
+        "https://github.com/x/lumen",
+    ));
 }

@@ -67,10 +67,11 @@ fn decodeSize(data: []const u8, width_px: c_int, height_px: c_int, limits: Limit
 
 /// How far into a file `isSvg` looks for the `<svg` tag: past an XML
 /// declaration, a doctype and comments, which come first.
-const svg_sniff_bytes = 4096;
+const svg_sniff_bytes_max = 4096;
 
+/// Whether `data` starts like an SVG document.
 fn isSvg(data: []const u8) bool {
-    const head = data[0..@min(data.len, svg_sniff_bytes)];
+    const head = data[0..@min(data.len, svg_sniff_bytes_max)];
     const text = std.mem.trimStart(u8, head, " \t\r\n\xef\xbb\xbf");
     return std.mem.startsWith(u8, text, "<") and std.mem.find(u8, head, "<svg") != null;
 }
@@ -430,11 +431,11 @@ const tiff = struct {
 fn tiffSize(data: []const u8, endian: std.builtin.Endian) ?Size {
     var size: Size = .{ .width_px = 0, .height_px = 0 };
     var directory: usize = int(u32, data, tiff.first_directory_offset, endian) orelse return null;
-    var directories_count: usize = 0;
-    while (directory != 0 and directories_count < tiff.directories_max) : (directories_count += 1) {
-        const entries_count = int(u16, data, directory, endian) orelse break;
+    var directory_count: usize = 0;
+    while (directory != 0 and directory_count < tiff.directories_max) : (directory_count += 1) {
+        const entry_count = int(u16, data, directory, endian) orelse break;
         const entries_at = directory + tiff.entry_count_bytes;
-        for (0..entries_count) |entry_index| {
+        for (0..entry_count) |entry_index| {
             const entry = entries_at + entry_index * tiff.entry_bytes;
             const tag = int(u16, data, entry, endian) orelse break;
             if (tag != tiff.tag_image_width and tag != tiff.tag_image_length) continue;
@@ -451,7 +452,7 @@ fn tiffSize(data: []const u8, endian: std.builtin.Endian) ?Size {
                 size.height_px = @max(size.height_px, value);
             }
         }
-        const next_at = entries_at + @as(usize, entries_count) * tiff.entry_bytes;
+        const next_at = entries_at + @as(usize, entry_count) * tiff.entry_bytes;
         directory = int(u32, data, next_at, endian) orelse break;
     }
     return size;
@@ -497,14 +498,15 @@ fn heifSizes(data: []const u8, from: usize, end: usize, depth: u8, size: *Size) 
 /// for it before that are not decoded yet: the selection moved, the grid
 /// was built again. Read by the decoding thread.
 pub const Lane = struct {
-    gen: std.atomic.Value(u32) = .init(0),
+    generation: std.atomic.Value(u32) = .init(0),
 
+    /// Requests made so far are no longer wanted.
     pub fn forget(lane: *Lane) void {
-        _ = lane.gen.fetchAdd(1, .release);
+        _ = lane.generation.fetchAdd(1, .release);
     }
 
     fn current(lane: *const Lane) u32 {
-        return lane.gen.load(.acquire);
+        return lane.generation.load(.acquire);
     }
 };
 
@@ -520,16 +522,16 @@ pub var grid_lane: Lane = .{};
 /// Called on the main thread once per request with the picture (borrowed:
 /// take a reference to keep it) or null. `current`: its lane has not moved
 /// on since it was asked; when it has, a null may only mean it was dropped.
-pub const Done = *const fn (ctx: ?*anyopaque, pixbuf: ?*c.GdkPixbuf, current: bool) void;
+pub const Done = *const fn (context: ?*anyopaque, pixbuf: ?*c.GdkPixbuf, current: bool) void;
 
 const Request = struct {
     path: [:0]u8,
     width_px: c_int,
     height_px: c_int,
     lane: *Lane,
-    gen: u32,
+    generation: u32,
     done: Done,
-    ctx: ?*anyopaque,
+    context: ?*anyopaque,
 };
 
 /// Requests not started yet, and whether one is decoding (main thread).
@@ -552,25 +554,25 @@ pub fn requestPicture(
     lane: *Lane,
     place: QueuePlace,
     done: Done,
-    ctx: ?*anyopaque,
+    context: ?*anyopaque,
 ) void {
     // A size of 0 would make the decoder scale to nothing.
     assert(width_px > 0);
     assert(height_px > 0);
     const gpa = std.heap.c_allocator;
     // Out of memory: as good as dropped (nothing is learnt about the file).
-    const request = gpa.create(Request) catch return done(ctx, null, false);
+    const request = gpa.create(Request) catch return done(context, null, false);
     request.* = .{
         .path = gpa.dupeSentinel(u8, path, 0) catch {
             gpa.destroy(request);
-            return done(ctx, null, false);
+            return done(context, null, false);
         },
         .width_px = width_px,
         .height_px = height_px,
         .lane = lane,
-        .gen = lane.current(),
+        .generation = lane.current(),
         .done = done,
-        .ctx = ctx,
+        .context = context,
     };
     const queued = switch (place) {
         .front => waiting.insert(gpa, 0, request),
@@ -583,7 +585,7 @@ pub fn requestPicture(
 fn startNext() void {
     while (!decoding and waiting.items.len > 0) {
         const request = waiting.orderedRemove(0);
-        if (request.gen != request.lane.current()) {
+        if (request.generation != request.lane.current()) {
             finishRequest(request, null, false);
             continue;
         }
@@ -603,7 +605,9 @@ fn decodeRequest(
 ) callconv(.c) void {
     const request: *Request = @ptrCast(@alignCast(data.?));
     // Its lane moved on while it waited for a thread.
-    if (request.gen != request.lane.current()) return c.g_task_return_pointer(task, null, null);
+    if (request.generation != request.lane.current()) {
+        return c.g_task_return_pointer(task, null, null);
+    }
     const pixbuf = decodeImage(
         request.path.ptr,
         request.width_px,
@@ -622,7 +626,7 @@ fn onDecoded(_: ?*c.GObject, result: *c.GAsyncResult, data: ?*anyopaque) callcon
     decoding = false;
     const pixbuf: ?*c.GdkPixbuf = @ptrCast(c.g_task_propagate_pointer(@ptrCast(result), null));
     defer unrefObject(pixbuf);
-    finishRequest(request, pixbuf, request.gen == request.lane.current());
+    finishRequest(request, pixbuf, request.generation == request.lane.current());
     startNext();
 }
 
@@ -632,7 +636,7 @@ fn finishRequest(request: *Request, pixbuf: ?*c.GdkPixbuf, current: bool) void {
         gpa.free(request.path);
         gpa.destroy(request);
     }
-    request.done(request.ctx, pixbuf, current);
+    request.done(request.context, pixbuf, current);
 }
 
 test "image sizes are read from headers" {
@@ -678,34 +682,36 @@ test "image sizes are read from headers" {
 }
 
 test "a picture over the limits is never decoded" {
-    const t = std.testing;
+    const testing = std.testing;
     const limits: Limits = .{ .bytes = 1 << 20, .pixels = 4096 * 4096 };
     const bomb = "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x4e\x20\x00\x00\x4e\x20\x08\x02";
-    try t.expect(decodeSize(bomb, 512, 512, limits) == null);
+    try testing.expect(decodeSize(bomb, 512, 512, limits) == null);
     // Within the limits: never decoded larger than it is.
     const small = "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x10\x00\x00\x00\x20\x08\x02";
-    try t.expectEqual([2]c_int{ 16, 32 }, decodeSize(small, 512, 512, limits).?);
-    try t.expectEqual([2]c_int{ 16, 20 }, decodeSize(small, 512, 20, limits).?);
+    try testing.expectEqual([2]c_int{ 16, 32 }, decodeSize(small, 512, 512, limits).?);
+    try testing.expectEqual([2]c_int{ 16, 20 }, decodeSize(small, 512, 20, limits).?);
     // SVG is drawn at the size asked for; an unknown format is not decoded.
     const svg = "\xef\xbb\xbf<?xml version=\"1.0\"?>\n<svg width=\"30000\" height=\"30000\"/>";
-    try t.expectEqual([2]c_int{ 64, 64 }, decodeSize(svg, 64, 64, limits).?);
-    try t.expect(decodeSize("P6 30000 30000 255 ", 64, 64, limits) == null);
+    try testing.expectEqual([2]c_int{ 64, 64 }, decodeSize(svg, 64, 64, limits).?);
+    try testing.expect(decodeSize("P6 30000 30000 255 ", 64, 64, limits) == null);
 
-    var dir: os.TestDir = try .init();
-    defer dir.deinit();
-    var buf: [4096]u8 = undefined;
+    var test_dir: os.TestDir = try .init();
+    defer test_dir.deinit();
+    var path_bytes: [4096]u8 = undefined;
     // Refused from its header: gdk-pixbuf is never called.
-    try dir.write("bomb.png", bomb);
-    try t.expect(decodeImage(try dir.path(&buf, "bomb.png"), 64, 64, limits) == null);
+    try test_dir.write("bomb.png", bomb);
+    const bomb_path = try test_dir.path(&path_bytes, "bomb.png");
+    try testing.expect(decodeImage(bomb_path, 64, 64, limits) == null);
     // Larger than `bytes`.
-    const big = try t.allocator.alloc(u8, limits.bytes + 1);
-    defer t.allocator.free(big);
+    const big = try testing.allocator.alloc(u8, limits.bytes + 1);
+    defer testing.allocator.free(big);
     @memset(big, 0);
     @memcpy(big[0..small.len], small);
-    try dir.write("big.png", big);
-    try t.expect(decodeImage(try dir.path(&buf, "big.png"), 64, 64, limits) == null);
+    try test_dir.write("big.png", big);
+    const big_path = try test_dir.path(&path_bytes, "big.png");
+    try testing.expect(decodeImage(big_path, 64, 64, limits) == null);
     // A FIFO named like a picture: refused at once, not waited on.
-    const fifo = try dir.path(&buf, "fifo.png");
-    try t.expect(std.os.linux.mknod(fifo, std.os.linux.S.IFIFO | 0o600, 0) == 0);
-    try t.expect(decodeImage(fifo, 64, 64, limits) == null);
+    const fifo = try test_dir.path(&path_bytes, "fifo.png");
+    try testing.expect(std.os.linux.mknod(fifo, std.os.linux.S.IFIFO | 0o600, 0) == 0);
+    try testing.expect(decodeImage(fifo, 64, 64, limits) == null);
 }

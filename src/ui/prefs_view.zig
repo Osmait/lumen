@@ -111,7 +111,8 @@ pub fn candidates(ui: *Ui, arena: std.mem.Allocator) []Item {
 /// The extension's folder, git pull when it is a checkout, removal.
 fn manageRows(ui: *Ui, arena: std.mem.Allocator, out: *std.ArrayList(Item)) void {
     const id = arena.dupeSentinel(u8, extensionId(ui), 0) catch return;
-    const folder = arena.printSentinel("{s}/extensions/{s}", .{ ui.config_dir, id }, 0) catch return;
+    const folder_template = "{s}/extensions/{s}";
+    const folder = arena.printSentinel(folder_template, .{ ui.config_dir, id }, 0) catch return;
     const git = arena.printSentinel("{s}/.git", .{folder}, 0) catch return;
     out.append(arena, .{
         .key = "manage:open",
