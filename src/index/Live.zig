@@ -1393,10 +1393,20 @@ test "live: one path in base and delta comes out once" {
     const r = try t.live.deltaRoot(t.root, 0);
     _ = try t.live.delta_builder.push(testing.allocator, "dup.txt", r, store_mod.flag_hidden, 1);
     try t.live.rebuildDelta();
-    const hits = try t.searchOpts("dup", .{ .limit = 50, .recency = false });
-    try testing.expectEqual(2, hits.len);
-    try testing.expect(std.mem.endsWith(u8, hits[0].path, "/dup.txt"));
-    try testing.expect(std.mem.endsWith(u8, hits[1].path, "/dupe.txt"));
+    // The root entry is left out. Its name is its whole path, and the temp
+    // folder's random name can hold "d", "u" and "p" in order, which made
+    // the fuzzy query find it in about one run in fifteen.
+    var paths: [4][]const u8 = undefined;
+    var paths_count: usize = 0;
+    for (try t.searchOpts("dup", .{ .limit = 50, .recency = false })) |hit| {
+        if (std.mem.eql(u8, hit.path, t.root)) continue;
+        try testing.expect(paths_count < paths.len);
+        paths[paths_count] = hit.path;
+        paths_count += 1;
+    }
+    try testing.expectEqual(2, paths_count);
+    try testing.expect(std.mem.endsWith(u8, paths[0], "/dup.txt"));
+    try testing.expect(std.mem.endsWith(u8, paths[1], "/dupe.txt"));
 }
 
 test "live: new entries under a dot-dir rank like scanned ones" {
