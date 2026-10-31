@@ -43,27 +43,27 @@ const Daemon = struct {
     /// LUMEN_APP_ID lets end-to-end tests run a second, isolated instance
     /// (GApplication is single-instance per id; the socket is per id too).
     app_id: [:0]const u8 = ipc.app_id_default,
-    /// Built in `onStartup`; see `readyUi`.
-    ui: Ui = undefined,
-    ui_ready: bool = false,
+    /// The window, built in `startupCallback`; see `readyUi`.
+    ui: ?Ui = null,
     shutting_down: bool = false,
     clipboard_watcher: ClipboardWatcher = .{},
 };
 
 var daemon: Daemon = .{};
 
-/// The window, or null when it was never built: before `onStartup`, or
-/// when the database could not be opened. Commands that need it fail then.
+/// The window, or null when it was never built: before `startupCallback`,
+/// or when the database could not be opened. Commands that need it fail
+/// then.
 fn readyUi() ?*Ui {
-    return if (daemon.ui_ready) &daemon.ui else null;
+    return if (daemon.ui) |*ui| ui else null;
 }
 
 /// `wl-paste --watch lumen --clip-store`, restarted with a backoff when it
 /// dies on its own (wl-paste losing the compositor, a crash): without a
 /// restart the history silently stopped growing.
 const ClipboardWatcher = struct {
-    /// 0 when no watcher runs.
-    pid: c.GPid = 0,
+    /// Null when no watcher runs.
+    pid: ?c.GPid = null,
     started_ns: u64 = 0,
     backoff_ms: c_uint = backoff_ms_min,
 
@@ -74,7 +74,7 @@ const ClipboardWatcher = struct {
     const healthy_after_ns = 60 * std.time.ns_per_s;
 
     fn running(watcher: *const ClipboardWatcher) bool {
-        return watcher.pid != 0;
+        return watcher.pid != null;
     }
 };
 
@@ -173,7 +173,7 @@ const test_instance_lifetime_s = 300;
 /// Runs once, in the primary instance.
 fn startupCallback(gtk_app: *c.GtkApplication, data: ?*anyopaque) callconv(.c) void {
     const start: *const Start = @ptrCast(@alignCast(data.?));
-    assert(!daemon.ui_ready);
+    assert(daemon.ui == null);
     const path = dbPath() orelse {
         log.err("cannot create the data directory", .{});
         return;
@@ -187,11 +187,11 @@ fn startupCallback(gtk_app: *c.GtkApplication, data: ?*anyopaque) callconv(.c) v
         // Only the table grows until the next start; Db logged SQLite's word.
         log.warn("frecency prune: {t}", .{err});
     };
+    // Built in place: the window's callbacks keep pointers to it.
     daemon.ui = Ui.init(start.gpa, start.io, gtk_app, db);
-    const ui = &daemon.ui;
+    const ui = &daemon.ui.?;
     ui.build();
     ui.on_settings_changed = &settingsChangedCallback;
-    daemon.ui_ready = true;
     Ui.ext_view.start(ui);
     c.g_application_hold(daemon.app);
     if (c.g_getenv(ipc.env.test_mode) == null) {
@@ -495,8 +495,7 @@ fn usage(reply: *const Reply) c_int {
 fn shutdownCallback(_: *c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
     daemon.shutting_down = true;
     ipc_server.stop();
-    const watcher = &daemon.clipboard_watcher;
-    if (watcher.running()) _ = c.kill(watcher.pid, c.SIGTERM);
+    if (daemon.clipboard_watcher.pid) |pid| _ = c.kill(pid, c.SIGTERM);
     const ui = readyUi() orelse return;
     Ui.ext_view.shutdown(ui);
     // Saves what the index learned this session, so it is there tomorrow.
@@ -594,6 +593,7 @@ fn startClipboardWatcher() void {
         clipboardClientPath(&client_buffer, self_exe),
         "--clip-store",
     };
+    var pid: c.GPid = undefined;
     var err: ?*c.GError = null;
     const spawned = c.g_spawn_async(
         null,
@@ -602,16 +602,16 @@ fn startClipboardWatcher() void {
         c.G_SPAWN_SEARCH_PATH | c.G_SPAWN_DO_NOT_REAP_CHILD,
         &dieWithParent,
         null,
-        &watcher.pid,
+        &pid,
         &err,
     ) != 0;
     if (!spawned) {
         proc.warnError(.main, err, "clipboard watcher", .{});
         return;
     }
-    assert(watcher.running());
+    watcher.pid = pid;
     watcher.started_ns = stats.now();
-    _ = c.g_child_watch_add(watcher.pid, &clipboardWatcherExitCallback, null);
+    _ = c.g_child_watch_add(pid, &clipboardWatcherExitCallback, null);
 }
 
 /// Prefer the small `lumen` client beside this binary: wl-paste runs it
@@ -627,7 +627,7 @@ fn clipboardClientPath(path_buffer: []u8, self_exe: [*:0]const u8) [*:0]const u8
 fn clipboardWatcherExitCallback(pid: c.GPid, status: c_int, _: ?*anyopaque) callconv(.c) void {
     c.g_spawn_close_pid(pid);
     const watcher = &daemon.clipboard_watcher;
-    if (pid == watcher.pid) watcher.pid = 0;
+    if (watcher.pid == pid) watcher.pid = null;
     // Stopped on purpose: shutting down, or history turned off.
     if (daemon.shutting_down) return;
     const ui = readyUi() orelse return;
@@ -665,7 +665,7 @@ fn settingsChangedCallback() void {
             startClipboardWatcher();
         }
     } else {
-        if (watcher.running()) _ = c.kill(watcher.pid, c.SIGTERM);
+        if (watcher.pid) |pid| _ = c.kill(pid, c.SIGTERM);
     }
 }
 
