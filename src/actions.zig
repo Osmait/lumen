@@ -21,14 +21,14 @@ pub const Outcome = union(enum) {
     refresh_view,
     open_view: item_mod.View,
     /// The UI owns the settings: it applies these.
-    setting: struct { setting: item_mod.Setting, op: item_mod.Op },
+    setting: struct { setting: item_mod.Setting, operation: item_mod.Operation },
     /// Show the apps that can open this file.
     choose_app: [:0]const u8,
     /// It did not work: the UI says so on the row and stays.
     failed: [:0]const u8,
 };
 
-pub const Ctx = struct {
+pub const Context = struct {
     gpa: std.mem.Allocator,
     db: *Db,
     settings: *const Settings,
@@ -37,11 +37,11 @@ pub const Ctx = struct {
 /// Runs `operation` on `item`. `item.actionsFor` offers each operation only
 /// on the rows it applies to (file operations on files, clipboard ones on
 /// clipboard entries): an operation on another row is a bug, asserted.
-pub fn perform(context: Ctx, item: *const Item, operation: item_mod.Op) Outcome {
+pub fn perform(context: Context, item: *const Item, operation: item_mod.Operation) Outcome {
     return switch (operation) {
         .open, .run => primary(context, item),
         .open_with => .{ .choose_app = fileOf(item).path },
-        .always_use => .{ .setting = .{ .setting = settingOf(item), .op = operation } },
+        .always_use => .{ .setting = .{ .setting = settingOf(item), .operation = operation } },
         .copy_name => hideAfter(copy(item.title)),
         .copy_path => hideAfter(copyPath(item)),
         .show_in_folder => hideAfter(showInFolder(fileOf(item).path)),
@@ -63,19 +63,19 @@ pub fn perform(context: Ctx, item: *const Item, operation: item_mod.Op) Outcome 
 }
 
 /// What Enter does on a row.
-fn primary(context: Ctx, item: *const Item) Outcome {
+fn primary(context: Context, item: *const Item) Outcome {
     return switch (item.action) {
         .app => |app_info| hideAfter(launch(app_info)),
         .view => |view| .{ .open_view = view },
         .system => |system_action| hideAfter(system(context, system_action)),
         .layout => |layout| hideAfter(hypr.applyLayout(context.gpa, layout)),
-        .window_op => |window_operation| hideAfter(windowOperation(context, window_operation)),
+        .window_operation => |operation| hideAfter(windowOperation(context, operation)),
         .focus_window => hideAfter(focusWindow(context, item)),
         .clip => hideAfter(pasteClip(context, item)),
         .script => |script| hideAfter(runScript(script.path, script.mode, item.title)),
         .calc => hideAfter(copy(item.detail)),
         .file => |file| hideAfter(openFile(context, file.path, file.entry())),
-        .setting => |setting| .{ .setting = .{ .setting = setting, .op = .run } },
+        .setting => |setting| .{ .setting = .{ .setting = setting, .operation = .run } },
         // The UI runs extension commands (ext_view.zig).
         .ext_command, .ext_item, .pick => .stay,
         .ext_problem => hideAfter(copy(item.detail)),
@@ -110,12 +110,12 @@ fn copyPath(item: *const Item) void {
     }
 }
 
-fn resetRanking(context: Ctx, item: *const Item) Outcome {
+fn resetRanking(context: Context, item: *const Item) Outcome {
     context.db.forget(item.key) catch return .{ .failed = "Could not reset the ranking" };
     return .stay;
 }
 
-fn closeWindow(context: Ctx, item: *const Item) Outcome {
+fn closeWindow(context: Context, item: *const Item) Outcome {
     assert(item.action == .focus_window);
     const address = item.action.focus_window;
     var command_buffer: [64]u8 = undefined;
@@ -125,17 +125,17 @@ fn closeWindow(context: Ctx, item: *const Item) Outcome {
     return .refresh_view;
 }
 
-fn pasteClip(context: Ctx, item: *const Item) void {
+fn pasteClip(context: Context, item: *const Item) void {
     touchClip(context, item);
     pasteText(item.detail);
 }
 
-fn copyClip(context: Ctx, item: *const Item) void {
+fn copyClip(context: Context, item: *const Item) void {
     touchClip(context, item);
     copy(item.detail);
 }
 
-fn deleteClip(context: Ctx, item: *const Item) Outcome {
+fn deleteClip(context: Context, item: *const Item) Outcome {
     assert(item.action == .clip);
     context.db.deleteClip(item.action.clip) catch {
         return .{ .failed = "Could not delete the entry" };
@@ -143,7 +143,7 @@ fn deleteClip(context: Ctx, item: *const Item) Outcome {
     return .refresh_view;
 }
 
-fn clearClips(context: Ctx) Outcome {
+fn clearClips(context: Context) Outcome {
     context.db.clearClips() catch return .{ .failed = "Could not clear the history" };
     return .refresh_view;
 }
@@ -156,7 +156,7 @@ fn fileOf(item: *const Item) @FieldType(item_mod.Action, "file") {
 
 /// Marks a clipboard entry as just used. Recency only: the paste or copy
 /// goes ahead even if this fails, and Db logs the failure.
-fn touchClip(context: Ctx, item: *const Item) void {
+fn touchClip(context: Context, item: *const Item) void {
     assert(item.action == .clip);
     context.db.touchClip(item.action.clip, now()) catch {};
 }
@@ -175,7 +175,7 @@ fn trash(path: [:0]const u8) Outcome {
 /// Opens with the app chosen in Settings > Default Apps for the file's
 /// extension or kind, else the system default for its type (directories in
 /// the file manager).
-pub fn openFile(context: Ctx, path: [:0]const u8, entry: core.file_kind.Entry) void {
+pub fn openFile(context: Context, path: [:0]const u8, entry: core.file_kind.Entry) void {
     const name = baseName(path);
     const mime = if (entry == .folder) null else c.g_content_type_guess(path, null, 0, null);
     defer if (mime) |mime_type| c.g_free(mime_type);
@@ -225,7 +225,7 @@ pub fn openWith(path: [:0]const u8, app_id: [:0]const u8) bool {
 /// The editor from Settings (else $VISUAL/$EDITOR, else nvim) at `line`:
 /// GUI editors directly, terminal ones inside the terminal from Settings
 /// (else $TERMINAL, else the first one installed).
-fn openAtLine(context: Ctx, path: [:0]const u8, line: u32) void {
+fn openAtLine(context: Context, path: [:0]const u8, line: u32) void {
     var arena_state: std.heap.ArenaAllocator = .init(context.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -464,7 +464,7 @@ fn showItemsCallback(
 
 /// Puts the file itself on the clipboard (paste it in a file manager or a
 /// chat), as a text/uri-list.
-fn copyFile(context: Ctx, path: [:0]const u8) void {
+fn copyFile(context: Context, path: [:0]const u8) void {
     const uri = c.g_filename_to_uri(path, null, null) orelse return;
     defer c.g_free(uri);
     const list = context.gpa.print("{s}\r\n", .{uri}) catch return;
@@ -480,7 +480,7 @@ fn launch(app_info: *c.GAppInfo) void {
     if (!launched) proc.warnError(.actions, err, "launch", .{});
 }
 
-fn focusWindow(context: Ctx, item: *const Item) void {
+fn focusWindow(context: Context, item: *const Item) void {
     assert(item.action == .focus_window);
     var command_buffer: [64]u8 = undefined;
     const command = std.mem.print(
@@ -491,7 +491,7 @@ fn focusWindow(context: Ctx, item: *const Item) void {
     hypr.dispatch(context.gpa, command);
 }
 
-fn system(context: Ctx, system_action: item_mod.System) void {
+fn system(context: Context, system_action: item_mod.System) void {
     switch (system_action) {
         .lock => if (proc.have("hyprlock")) {
             proc.spawn(&.{"hyprlock"});
@@ -535,7 +535,7 @@ fn system(context: Ctx, system_action: item_mod.System) void {
 
 /// Window commands act on the active window: Lumen's overlay does not take
 /// that role from the client, so it is still the window the user came from.
-fn windowOperation(context: Ctx, operation: item_mod.WindowOp) void {
+fn windowOperation(context: Context, operation: item_mod.WindowOperation) void {
     hypr.dispatch(context.gpa, switch (operation) {
         .toggle_floating => "togglefloating",
         .toggle_fullscreen => "fullscreen 0",

@@ -118,7 +118,7 @@ pub const Mode = registry_mod.Mode;
 pub const RegistryGeneration = generation_mod.RegistryGeneration;
 pub const RequestGeneration = generation_mod.RequestGeneration;
 pub const CommandIndex = registry_mod.CommandIndex;
-pub const PrefIndex = registry_mod.PrefIndex;
+pub const PreferenceIndex = registry_mod.PreferenceIndex;
 pub const FieldIndex = registry_mod.FieldIndex;
 pub const config_extension_id = registry_mod.config_extension_id;
 pub const grid_columns_default = registry_mod.grid_columns_default;
@@ -127,12 +127,12 @@ pub const toggleText = registry_mod.toggleText;
 pub const toggleIsOn = registry_mod.toggleIsOn;
 pub const Command = registry_mod.Command;
 pub const Keymap = registry_mod.Keymap;
-pub const PrefKind = registry_mod.PrefKind;
-pub const Pref = registry_mod.Pref;
-pub const PrefChoice = registry_mod.PrefChoice;
+pub const PreferenceKind = registry_mod.PreferenceKind;
+pub const Preference = registry_mod.Preference;
+pub const PreferenceChoice = registry_mod.PreferenceChoice;
 pub const IconOverride = registry_mod.IconOverride;
 pub const SettingOverride = registry_mod.SettingOverride;
-pub const ExtInfo = registry_mod.ExtInfo;
+pub const ExtensionInfo = registry_mod.ExtensionInfo;
 pub const Problem = registry_mod.Problem;
 pub const Registry = registry_mod.Registry;
 
@@ -142,7 +142,7 @@ pub const ListResult = struct {
     command: CommandIndex,
     query: []const u8,
     items: []Item = &.{},
-    err: ?[:0]const u8 = null,
+    error_message: ?[:0]const u8 = null,
     arena: std.heap.ArenaAllocator,
 
     pub fn destroy(result: *ListResult, gpa: std.mem.Allocator) void {
@@ -158,7 +158,7 @@ pub const Outcome = enum { close, stay, refresh };
 pub const ActResult = struct {
     generation: RequestGeneration,
     outcome: Outcome = .close,
-    err: ?[:0]const u8 = null,
+    error_message: ?[:0]const u8 = null,
     arena: std.heap.ArenaAllocator,
 
     pub fn destroy(result: *ActResult, gpa: std.mem.Allocator) void {
@@ -259,9 +259,9 @@ pub const Load = struct {
     themes: std.ArrayList(themes.Theme) = .empty,
     keymaps: std.ArrayList(Keymap) = .empty,
     settings: std.ArrayList(SettingOverride) = .empty,
-    prefs: std.ArrayList(Pref) = .empty,
+    preferences: std.ArrayList(Preference) = .empty,
     icons: std.ArrayList(IconOverride) = .empty,
-    extensions: std.ArrayList(ExtInfo) = .empty,
+    extensions: std.ArrayList(ExtensionInfo) = .empty,
     style_settings: std.ArrayList(SettingOverride) = .empty,
     layout: layout_mod.Layout = .{},
     has_layout: bool = false,
@@ -275,7 +275,7 @@ pub const Load = struct {
         "themes",
         "keymaps",
         "settings",
-        "prefs",
+        "preferences",
         "icons",
         "style_settings",
     };
@@ -693,7 +693,7 @@ fn reloadExecute(host: *Host) void {
     host.loadAll(&load);
     host.registryFill(registry, &load);
     for (registry.problems) |file_problem| {
-        log.warn("{s}: {s}", .{ file_problem.ext, file_problem.message });
+        log.warn("{s}: {s}", .{ file_problem.extension, file_problem.message });
     }
     host.deliver(.{ .registry = registry });
 }
@@ -766,7 +766,7 @@ fn registryFill(host: *Host, registry: *Registry, load: *Load) void {
     registry.themes = load.themes.items;
     registry.keymaps = load.keymaps.items;
     registry.settings = load.settings.items;
-    registry.prefs = load.prefs.items;
+    registry.preferences = load.preferences.items;
     registry.icons = load.icons.items;
     registry.extensions = load.extensions.items;
     registry.style_settings = load.style_settings.items;
@@ -823,7 +823,10 @@ fn problemAppend(
 ) error{OutOfMemory}!void {
     const extension_id_copy = try load.arena.dupeSentinel(u8, extension_id, 0);
     const message_copy = try load.arena.dupeSentinel(u8, message, 0);
-    try load.problems.append(load.arena, .{ .ext = extension_id_copy, .message = message_copy });
+    try load.problems.append(load.arena, .{
+        .extension = extension_id_copy,
+        .message = message_copy,
+    });
 }
 
 /// Lists an extension that loaded in Settings > Extensions. Out of memory,
@@ -1007,13 +1010,13 @@ fn parsePreferences(
         if (preferenceDeclared(context.load, context.extension.id, preference.name)) {
             lua.raise(L, "two preferences named \"{s}\"", .{preference.name});
         }
-        context.load.prefs.append(context.load.arena, preference) catch lua.oom(L);
+        context.load.preferences.append(context.load.arena, preference) catch lua.oom(L);
     }
 }
 
 fn preferenceDeclared(load: *const Load, extension_id: []const u8, name: []const u8) bool {
-    for (load.prefs.items) |preference| {
-        if (!std.mem.eql(u8, preference.ext, extension_id)) continue;
+    for (load.preferences.items) |preference| {
+        if (!std.mem.eql(u8, preference.extension, extension_id)) continue;
         if (std.mem.eql(u8, preference.name, name)) return true;
     }
     return false;
@@ -1066,14 +1069,14 @@ fn prefChoices(
     arena: std.mem.Allocator,
     field_table: c_int,
     where: []const u8,
-) []const PrefChoice {
+) []const PreferenceChoice {
     const mark: lua.StackMark = .init(L);
     defer mark.restore(L);
     const choice_list = lua.fieldList(L, field_table, "choices", where) orelse
         lua.raise(L, "{s}.choices: a list expected for a choice", .{where});
     const choices_count = lua.c.lua_rawlen(L, choice_list);
     if (choices_count == 0) lua.raise(L, "{s}.choices is empty", .{where});
-    const choices = arena.alloc(PrefChoice, choices_count) catch lua.oom(L);
+    const choices = arena.alloc(PreferenceChoice, choices_count) catch lua.oom(L);
     for (choices, 1..) |*choice, choice_number| {
         const choice_mark: lua.StackMark = .init(L);
         defer choice_mark.restore(L);
@@ -1100,20 +1103,20 @@ fn parseField(
     field_table: c_int,
     where: []const u8,
     extension_title: [:0]const u8,
-) Pref {
+) Preference {
     const arena = context.load.arena;
     const name = fieldName(L, arena, field_table, where);
     const kind_name = lua.fieldString(L, arena, field_table, "type", where) orelse "text";
-    const kind = std.meta.stringToEnum(PrefKind, kind_name) orelse lua.raise(
+    const kind = std.meta.stringToEnum(PreferenceKind, kind_name) orelse lua.raise(
         L,
         "{s}.type: toggle, choice, text or password (got \"{s}\")",
         .{ where, kind_name },
     );
     const file = arena.printSentinel("{s}/preferences.json", .{context.extension.data}, 0) catch
         lua.oom(L);
-    var preference: Pref = .{
-        .ext = context.extension.id,
-        .ext_title = extension_title,
+    var preference: Preference = .{
+        .extension = context.extension.id,
+        .extension_title = extension_title,
         .file = file,
         .name = name,
         .title = lua.fieldString(L, arena, field_table, "title", where) orelse name,
@@ -1184,7 +1187,7 @@ fn formFields(
     is_form: bool,
     where: []const u8,
     extension_title: [:0]const u8,
-) []const Pref {
+) []const Preference {
     const mark: lua.StackMark = .init(L);
     defer mark.restore(L);
     const field_list_type = lua.getField(L, command_table, "fields");
@@ -1202,7 +1205,7 @@ fn formFields(
     if (fields_count == 0 or fields_count > form_fields_max) {
         lua.raise(L, "{s}.fields: 1 to {d} fields", .{ where, form_fields_max });
     }
-    const fields = context.load.arena.alloc(Pref, fields_count) catch lua.oom(L);
+    const fields = context.load.arena.alloc(Preference, fields_count) catch lua.oom(L);
     for (fields, 1..) |*field, field_number| {
         const field_mark: lua.StackMark = .init(L);
         defer field_mark.restore(L);
@@ -1349,11 +1352,11 @@ fn listExecute(host: *Host, request: *const ListRequest) void {
     const query = request.query.slice();
     result.query = arena.dupe(u8, query) catch {
         // An answer for "" would pass for the answer to an empty query.
-        result.err = "out of memory";
+        result.error_message = "out of memory";
         return;
     };
     const worker_command = host.requested(request.registry_generation, request.command) orelse {
-        result.err = reloaded;
+        result.error_message = reloaded;
         return;
     };
     const extension = host.extensionOf(worker_command);
@@ -1365,8 +1368,14 @@ fn listExecute(host: *Host, request: *const ListRequest) void {
         .result = result,
         .rows_arena = rows.allocator(),
     };
-    result.err = extension.run(arena, list_budget_ns, ListContext, &context, ListContext.run);
-    if (result.err != null and rows.refused) result.err = rows_too_big;
+    result.error_message = extension.run(
+        arena,
+        list_budget_ns,
+        ListContext,
+        &context,
+        ListContext.run,
+    );
+    if (result.error_message != null and rows.refused) result.error_message = rows_too_big;
 }
 
 const ListContext = struct {
@@ -1527,7 +1536,7 @@ fn submitExecute(host: *Host, request: *SubmitRequest) void {
     }) orelse return;
     defer host.deliver(.{ .act = result });
     const worker_command = host.requested(request.registry_generation, request.command) orelse {
-        result.err = reloaded;
+        result.error_message = reloaded;
         return;
     };
     assert(request.values.len <= form_fields_max);
@@ -1538,7 +1547,13 @@ fn submitExecute(host: *Host, request: *SubmitRequest) void {
         .result = result,
     };
     const arena = result.arena.allocator();
-    result.err = extension.run(arena, act_budget_ns, SubmitContext, &context, SubmitContext.run);
+    result.error_message = extension.run(
+        arena,
+        act_budget_ns,
+        SubmitContext,
+        &context,
+        SubmitContext.run,
+    );
 }
 
 const SubmitContext = struct {
@@ -1599,7 +1614,7 @@ fn actExecute(host: *Host, request: ActRequest) void {
     }) orelse return;
     defer host.deliver(.{ .act = result });
     const worker_command = host.requested(request.registry_generation, request.command) orelse {
-        result.err = reloaded;
+        result.error_message = reloaded;
         return;
     };
     const extension = host.extensionOf(worker_command);
@@ -1609,7 +1624,13 @@ fn actExecute(host: *Host, request: ActRequest) void {
         .result = result,
     };
     const arena = result.arena.allocator();
-    result.err = extension.run(arena, act_budget_ns, ActContext, &context, ActContext.run);
+    result.error_message = extension.run(
+        arena,
+        act_budget_ns,
+        ActContext,
+        &context,
+        ActContext.run,
+    );
 }
 
 const ActContext = struct {
@@ -1984,7 +2005,7 @@ test "extensions load, list, search and run actions" {
     }
     // The broken one is reported, the others load.
     try testing.expectEqual(@as(usize, 1), registry.problems.len);
-    try testing.expectEqualStrings("broken", registry.problems[0].ext);
+    try testing.expectEqualStrings("broken", registry.problems[0].extension);
     try testing.expect(std.mem.find(u8, registry.problems[0].message, "title is missing") != null);
 
     // A list command's rows.
@@ -1992,7 +2013,7 @@ test "extensions load, list, search and run actions" {
     const fruits = try probe.take("list");
     defer fruits.destroy(testing.allocator);
     try testing.expectEqual(fruits_generation, fruits.generation);
-    try testing.expect(fruits.err == null);
+    try testing.expect(fruits.error_message == null);
     try testing.expectEqual(@as(usize, 2), fruits.items.len);
     try testing.expectEqualStrings("Apple", fruits.items[0].title);
     try testing.expectEqualStrings(
@@ -2018,7 +2039,7 @@ test "extensions load, list, search and run actions" {
     const done = try probe.take("act");
     defer done.destroy(testing.allocator);
     try testing.expectEqual(action_generation, done.generation);
-    try testing.expect(done.err == null);
+    try testing.expect(done.error_message == null);
     try testing.expectEqual(Outcome.close, done.outcome);
     // The action took its row's actions away: pressing it again is an
     // error, not a read of whatever `row.actions` is now.
@@ -2030,7 +2051,7 @@ test "extensions load, list, search and run actions" {
     } });
     const again = try probe.take("act");
     defer again.destroy(testing.allocator);
-    try testing.expect(std.mem.find(u8, again.err.?, "no actions") != null);
+    try testing.expect(std.mem.find(u8, again.error_message.?, "no actions") != null);
     _ = host.list(registry.generation, .from(3), "");
     const eaten = try probe.take("list");
     defer eaten.destroy(testing.allocator);
@@ -2040,7 +2061,7 @@ test "extensions load, list, search and run actions" {
     _ = host.list(registry.generation, .from(2), "it's \"quoted\"");
     const echo = try probe.take("list");
     defer echo.destroy(testing.allocator);
-    try testing.expect(echo.err == null);
+    try testing.expect(echo.error_message == null);
     try testing.expectEqualStrings("you typed it's \"quoted\"", echo.items[0].title);
 
     // A run command's return value.
@@ -2086,7 +2107,7 @@ test "extensions load, list, search and run actions" {
     } });
     const stale = try probe.take("act");
     defer stale.destroy(testing.allocator);
-    try testing.expect(std.mem.find(u8, stale.err.?, "changed") != null);
+    try testing.expect(std.mem.find(u8, stale.error_message.?, "changed") != null);
 
     // After a reload, requests against the old registry are refused.
     host.reload();
@@ -2094,7 +2115,7 @@ test "extensions load, list, search and run actions" {
     _ = host.list(registry.generation, .from(1), "");
     const old = try probe.take("list");
     defer old.destroy(testing.allocator);
-    try testing.expectEqualStrings("Extensions were reloaded", old.err.?);
+    try testing.expectEqualStrings("Extensions were reloaded", old.error_message.?);
 }
 
 test "errors in extensions come back as messages" {
@@ -2135,10 +2156,11 @@ test "errors in extensions come back as messages" {
         .{ "lay", "bad value for panels" },
     });
     for (registry.problems) |problem_reported| {
-        const message_expected = messages_expected.get(problem_reported.ext) orelse
+        const message_expected = messages_expected.get(problem_reported.extension) orelse
             "unexpected symbol near <eof>";
         if (std.mem.find(u8, problem_reported.message, message_expected) == null) {
-            std.debug.print("{s}: {s}\n", .{ problem_reported.ext, problem_reported.message });
+            const extension_id = problem_reported.extension;
+            std.debug.print("{s}: {s}\n", .{ extension_id, problem_reported.message });
             return error.TestUnexpectedResult;
         }
     }
@@ -2146,17 +2168,18 @@ test "errors in extensions come back as messages" {
     _ = host.list(registry.generation, .from(0), "");
     const boom = try probe.take("list");
     defer boom.destroy(testing.allocator);
-    try testing.expect(std.mem.find(u8, boom.err.?, "kaboom") != null);
+    try testing.expect(std.mem.find(u8, boom.error_message.?, "kaboom") != null);
 
     _ = host.list(registry.generation, .from(2), "");
     const bad_row = try probe.take("list");
     defer bad_row.destroy(testing.allocator);
-    try testing.expect(std.mem.find(u8, bad_row.err.?, "items[1].title is missing") != null);
+    const bad_row_message = bad_row.error_message.?;
+    try testing.expect(std.mem.find(u8, bad_row_message, "items[1].title is missing") != null);
 
     _ = host.act(registry.generation, .from(3), .command_run);
     const bad_return = try probe.take("act");
     defer bad_return.destroy(testing.allocator);
-    try testing.expect(std.mem.find(u8, bad_return.err.?, "must return") != null);
+    try testing.expect(std.mem.find(u8, bad_return.error_message.?, "must return") != null);
 }
 
 test "preferences read Settings' file over their defaults; storage persists" {
@@ -2193,14 +2216,14 @@ test "preferences read Settings' file over their defaults; storage persists" {
     host.reload();
     try probe.wait("registry");
     const registry = probe.registry.?;
-    try testing.expectEqual(@as(usize, 3), registry.prefs.len);
-    try testing.expectEqual(PrefKind.toggle, registry.prefs[1].kind);
-    try testing.expectEqualStrings("false", registry.prefs[1].default);
-    try testing.expectEqualStrings("s", registry.prefs[2].default);
-    try testing.expectEqualStrings("Medium", registry.prefs[2].choices[1].label);
+    try testing.expectEqual(@as(usize, 3), registry.preferences.len);
+    try testing.expectEqual(PreferenceKind.toggle, registry.preferences[1].kind);
+    try testing.expectEqualStrings("false", registry.preferences[1].default);
+    try testing.expectEqualStrings("s", registry.preferences[2].default);
+    try testing.expectEqualStrings("Medium", registry.preferences[2].choices[1].label);
     try testing.expect(std.mem.endsWith(
         u8,
-        registry.prefs[0].file,
+        registry.preferences[0].file,
         "data/extensions/kv/preferences.json",
     ));
 
@@ -2208,7 +2231,7 @@ test "preferences read Settings' file over their defaults; storage persists" {
     const before = try probe.take("list");
     defer before.destroy(testing.allocator);
     const want = [_][]const u8{ "nobody", "true", "s", "nil", "false" };
-    try testing.expect(before.err == null);
+    try testing.expect(before.error_message == null);
     for (want, before.items) |wanted, row| try testing.expectEqualStrings(wanted, row.title);
 
     _ = host.act(registry.generation, .from(1), .command_run);
@@ -2264,7 +2287,7 @@ test "storage never writes over what it cannot read, and reads back what it wrot
     _ = host.list(registry.generation, .from(0), "");
     const broken = try probe.take("list");
     defer broken.destroy(testing.allocator);
-    try testing.expect(broken.err == null);
+    try testing.expect(broken.error_message == null);
     const want = [_][]const u8{ "false", "not overwritten", "{\"a\": 1, oops", "nil" };
     for (want, broken.items[0..want.len]) |wanted, row| {
         try testing.expectEqualStrings(wanted, row.title);
@@ -2273,7 +2296,7 @@ test "storage never writes over what it cannot read, and reads back what it wrot
     _ = host.list(registry.generation, .from(1), "");
     const bytes = try probe.take("list");
     defer bytes.destroy(testing.allocator);
-    try testing.expect(bytes.err == null);
+    try testing.expect(bytes.error_message == null);
     try testing.expectEqualStrings("true", bytes.items[0].title);
     try testing.expectEqualStrings("v", bytes.items[4].title);
     try testing.expect(std.mem.find(u8, bytes.items[2].title, "\"a\u{FFFD}b\"") != null);
@@ -2323,12 +2346,12 @@ test "rows are kept to a size, and lumen.exec's strings outlive its options" {
     _ = host.list(registry.generation, .from(0), "");
     const big = try probe.take("list");
     defer big.destroy(testing.allocator);
-    try testing.expectEqualStrings(rows_too_big, big.err.?);
+    try testing.expectEqualStrings(rows_too_big, big.error_message.?);
 
     _ = host.list(registry.generation, .from(1), "");
     const long = try probe.take("list");
     defer long.destroy(testing.allocator);
-    try testing.expect(long.err == null);
+    try testing.expect(long.error_message == null);
     const row = long.items[0];
     // Cut between characters: 512 "é" of two bytes each.
     try testing.expectEqual(@as(usize, rows_mod.line_bytes_max), row.title.len);
@@ -2338,6 +2361,6 @@ test "rows are kept to a size, and lumen.exec's strings outlive its options" {
     _ = host.list(registry.generation, .from(2), "");
     const ran = try probe.take("list");
     defer ran.destroy(testing.allocator);
-    try testing.expect(ran.err == null);
+    try testing.expect(ran.error_message == null);
     try testing.expectEqualStrings("true", ran.items[0].title);
 }

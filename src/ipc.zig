@@ -59,13 +59,13 @@ pub fn socketPath(
 }
 
 /// The folder the sockets live in, in `path_buffer`.
-pub fn dir(path_buffer: []u8, runtime_dir: []const u8) ?[:0]const u8 {
+pub fn folderPath(path_buffer: []u8, runtime_dir: []const u8) ?[:0]const u8 {
     return std.mem.printSentinel(path_buffer, "{s}/lumen", .{runtime_dir}, 0) catch null;
 }
 
 pub const Request = struct {
-    args: [arguments_max][]const u8 = undefined,
-    argc: usize = 0,
+    arguments: [arguments_max][]const u8 = undefined,
+    arguments_count: usize = 0,
     payload: []const u8 = "",
 };
 
@@ -81,11 +81,11 @@ pub fn parse(bytes: []const u8) ?Request {
         const argument_bytes = std.mem.readInt(u32, bytes[offset..][0..4], .little);
         offset += 4;
         if (bytes.len - offset < argument_bytes) return null;
-        request.args[argument_index] = bytes[offset .. offset + argument_bytes];
+        request.arguments[argument_index] = bytes[offset .. offset + argument_bytes];
         offset += argument_bytes;
     }
     assert(offset <= bytes.len);
-    request.argc = arguments_count;
+    request.arguments_count = arguments_count;
     request.payload = bytes[offset..];
     return request;
 }
@@ -106,9 +106,9 @@ pub fn encode(head_buffer: []u8, arguments: []const []const u8) ?[]const u8 {
     // What is written is what the daemon will read.
     if (std.debug.runtime_safety) {
         const decoded = parse(head_buffer[0..offset]).?;
-        assert(decoded.argc == arguments.len);
+        assert(decoded.arguments_count == arguments.len);
         assert(decoded.payload.len == 0);
-        for (decoded.args[0..decoded.argc], arguments) |got, want| {
+        for (decoded.arguments[0..decoded.arguments_count], arguments) |got, want| {
             assert(std.mem.eql(u8, got, want));
         }
     }
@@ -159,9 +159,9 @@ test "requests round-trip, empty arguments included" {
     @memcpy(full[0..head.len], head);
     @memcpy(full[head.len..][0..5], "hello");
     const request = parse(full[0 .. head.len + 5]).?;
-    try std.testing.expectEqual(@as(usize, 4), request.argc);
-    try std.testing.expectEqualStrings("--query", request.args[2]);
-    try std.testing.expectEqualStrings("", request.args[3]);
+    try std.testing.expectEqual(@as(usize, 4), request.arguments_count);
+    try std.testing.expectEqualStrings("--query", request.arguments[2]);
+    try std.testing.expectEqualStrings("", request.arguments[3]);
     try std.testing.expectEqualStrings("hello", request.payload);
 }
 

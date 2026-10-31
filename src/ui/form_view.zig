@@ -66,7 +66,7 @@ pub fn title(ui: *Ui) [*:0]const u8 {
     return form.title.ptr;
 }
 
-pub fn field(ui: *Ui, field_index: Host.FieldIndex) ?*const Host.Pref {
+pub fn field(ui: *Ui, field_index: Host.FieldIndex) ?*const Host.Preference {
     const form = command(ui) orelse return null;
     return form.field(field_index);
 }

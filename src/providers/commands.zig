@@ -298,7 +298,7 @@ const windows = [_]Item{
         .accessory = "Command",
         .keywords = "tile tiling",
         .icon = .{ .tile = .{ .name = "window-new-symbolic", .color = .green } },
-        .action = .{ .window_op = .toggle_floating },
+        .action = .{ .window_operation = .toggle_floating },
     },
     .{
         .key = "win:full",
@@ -306,7 +306,7 @@ const windows = [_]Item{
         .subtitle = "Window Management",
         .accessory = "Command",
         .icon = .{ .tile = .{ .name = "view-fullscreen-symbolic", .color = .green } },
-        .action = .{ .window_op = .toggle_fullscreen },
+        .action = .{ .window_operation = .toggle_fullscreen },
     },
     .{
         .key = "win:pin",
@@ -315,7 +315,7 @@ const windows = [_]Item{
         .accessory = "Command",
         .keywords = "sticky all workspaces",
         .icon = .{ .tile = .{ .name = "view-restore-symbolic", .color = .green } },
-        .action = .{ .window_op = .pin },
+        .action = .{ .window_operation = .pin },
     },
     .{
         .key = "win:close",
@@ -324,7 +324,7 @@ const windows = [_]Item{
         .accessory = "Command",
         .keywords = "kill quit",
         .icon = .{ .tile = .{ .name = "window-close-symbolic", .color = .green } },
-        .action = .{ .window_op = .close },
+        .action = .{ .window_operation = .close },
     },
     .{
         .key = "win:nextws",
@@ -333,7 +333,7 @@ const windows = [_]Item{
         .accessory = "Command",
         .keywords = "desktop",
         .icon = .{ .tile = .{ .name = "go-next-symbolic", .color = .green } },
-        .action = .{ .window_op = .next_workspace },
+        .action = .{ .window_operation = .next_workspace },
     },
     .{
         .key = "win:prevws",
@@ -342,7 +342,7 @@ const windows = [_]Item{
         .accessory = "Command",
         .keywords = "desktop",
         .icon = .{ .tile = .{ .name = "go-previous-symbolic", .color = .green } },
-        .action = .{ .window_op = .prev_workspace },
+        .action = .{ .window_operation = .prev_workspace },
     },
     .{
         .key = "win:nextmon",
@@ -351,6 +351,6 @@ const windows = [_]Item{
         .accessory = "Command",
         .keywords = "monitor screen",
         .icon = .{ .tile = .{ .name = "object-flip-horizontal-symbolic", .color = .green } },
-        .action = .{ .window_op = .move_next_monitor },
+        .action = .{ .window_operation = .move_next_monitor },
     },
 };

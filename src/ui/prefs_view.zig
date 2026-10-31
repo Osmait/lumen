@@ -23,8 +23,8 @@ pub fn extensionRows(ui: *Ui, arena: std.mem.Allocator, out: *std.ArrayList(Item
     const registry = ui.ext_registry orelse return;
     for (registry.extensions) |extension| {
         var preference_count: usize = 0;
-        for (registry.prefs) |preference| {
-            preference_count += @intFromBool(std.mem.eql(u8, preference.ext, extension.id));
+        for (registry.preferences) |preference| {
+            preference_count += @intFromBool(std.mem.eql(u8, preference.extension, extension.id));
         }
         out.append(arena, .{
             .key = arena.print("set:ext:{s}", .{extension.id}) catch continue,
@@ -41,15 +41,15 @@ pub fn extensionRows(ui: *Ui, arena: std.mem.Allocator, out: *std.ArrayList(Item
         }) catch return;
     }
     for (registry.problems) |problem| {
-        if (std.mem.eql(u8, problem.ext, Host.config_extension_id)) continue;
+        if (std.mem.eql(u8, problem.extension, Host.config_extension_id)) continue;
         out.append(arena, .{
-            .key = arena.print("set:ext:{s}", .{problem.ext}) catch continue,
+            .key = arena.print("set:ext:{s}", .{problem.extension}) catch continue,
             .section = "Extensions",
-            .title = problem.ext,
+            .title = problem.extension,
             .subtitle = "Failed to load",
             .icon = .{ .tile = .{ .name = "dialog-warning-symbolic", .color = .red } },
             .keywords = "extension error update uninstall",
-            .action = .{ .setting = .{ .ext_prefs = problem.ext } },
+            .action = .{ .setting = .{ .ext_prefs = problem.extension } },
         }) catch return;
     }
 }
@@ -83,7 +83,7 @@ pub fn title(ui: *Ui) [*:0]const u8 {
         if (std.mem.eql(u8, extension.id, extensionId(ui))) return extension.title.ptr;
     }
     for (registry.problems) |problem| {
-        if (std.mem.eql(u8, problem.ext, extensionId(ui))) return problem.ext.ptr;
+        if (std.mem.eql(u8, problem.extension, extensionId(ui))) return problem.extension.ptr;
     }
     return "Extension";
 }
@@ -92,8 +92,8 @@ pub fn title(ui: *Ui) [*:0]const u8 {
 pub fn candidates(ui: *Ui, arena: std.mem.Allocator) []Item {
     const registry = ui.ext_registry orelse return &.{};
     var out: std.ArrayList(Item) = .empty;
-    for (registry.prefs, 0..) |preference, i| {
-        if (!std.mem.eql(u8, preference.ext, extensionId(ui))) continue;
+    for (registry.preferences, 0..) |preference, i| {
+        if (!std.mem.eql(u8, preference.extension, extensionId(ui))) continue;
         out.append(arena, .{
             .key = arena.print("pref:{s}", .{preference.name}) catch continue,
             .section = "Preferences",
@@ -147,7 +147,7 @@ fn manageRows(ui: *Ui, arena: std.mem.Allocator, out: *std.ArrayList(Item)) void
 }
 
 /// The tile a preference or field of `kind` shows.
-pub fn iconOf(kind: Host.PrefKind) item_mod.Icon {
+pub fn iconOf(kind: Host.PreferenceKind) item_mod.Icon {
     return switch (kind) {
         .toggle => .{ .tile = .{ .name = "emblem-ok-symbolic", .color = .green } },
         .choice => .{ .tile = .{ .name = "view-list-symbolic", .color = .blue } },
@@ -162,7 +162,7 @@ const text_value_bytes_max = 40;
 /// How a value shows on the right of its row.
 pub fn display(
     arena: std.mem.Allocator,
-    preference: *const Host.Pref,
+    preference: *const Host.Preference,
     value: []const u8,
 ) [:0]const u8 {
     return switch (preference.kind) {
@@ -207,7 +207,7 @@ fn readStored(arena: std.mem.Allocator, file: [:0]const u8) Stored {
 }
 
 /// The saved value as text ("true"/"false" for toggles), else the default.
-pub fn current(arena: std.mem.Allocator, preference: *const Host.Pref) []const u8 {
+pub fn current(arena: std.mem.Allocator, preference: *const Host.Preference) []const u8 {
     const stored = switch (readStored(arena, preference.file)) {
         .values => |values| values,
         .absent, .unreadable => return preference.default,
@@ -222,9 +222,9 @@ pub fn current(arena: std.mem.Allocator, preference: *const Host.Pref) []const u
 
 /// Enter on a preference: flips a toggle, lists a choice's values, or
 /// opens the input view for text.
-pub fn edit(ui: *Ui, pref_index: Host.PrefIndex) void {
+pub fn edit(ui: *Ui, pref_index: Host.PreferenceIndex) void {
     const registry = ui.ext_registry orelse return;
-    const preference = registry.pref(pref_index) orelse return;
+    const preference = registry.preference(pref_index) orelse return;
     var arena: std.heap.ArenaAllocator = .init(ui.gpa);
     defer arena.deinit();
     editValue(ui, .{ .pref = pref_index }, preference, current(arena.allocator(), preference));
@@ -232,7 +232,12 @@ pub fn edit(ui: *Ui, pref_index: Host.PrefIndex) void {
 
 /// Enter on a preference or a form field whose value is `value`: flips a
 /// toggle, lists a choice's values, or opens the input view for text.
-pub fn editValue(ui: *Ui, target: Ui.Edited, preference: *const Host.Pref, value: []const u8) void {
+pub fn editValue(
+    ui: *Ui,
+    target: Ui.Edited,
+    preference: *const Host.Preference,
+    value: []const u8,
+) void {
     switch (preference.kind) {
         .toggle => {
             const enabled = !Host.toggleIsOn(value);
@@ -272,10 +277,10 @@ pub fn choiceCandidates(
     ui: *Ui,
     arena: std.mem.Allocator,
     out: *std.ArrayList(Item),
-    pref_index: Host.PrefIndex,
+    pref_index: Host.PreferenceIndex,
 ) void {
     const registry = ui.ext_registry orelse return;
-    const preference = registry.pref(pref_index) orelse return;
+    const preference = registry.preference(pref_index) orelse return;
     const value = current(arena, preference);
     for (preference.choices) |choice| out.append(
         arena,
@@ -284,9 +289,9 @@ pub fn choiceCandidates(
 }
 
 /// A value picked in the choose view.
-pub fn pick(ui: *Ui, pref_index: Host.PrefIndex, value: []const u8) void {
+pub fn pick(ui: *Ui, pref_index: Host.PreferenceIndex, value: []const u8) void {
     const registry = ui.ext_registry orelse return;
-    const preference = registry.pref(pref_index) orelse return;
+    const preference = registry.preference(pref_index) orelse return;
     if (!save(ui, preference, .{ .string = value })) return;
     ui.goBack();
 }
@@ -297,11 +302,11 @@ pub fn inputTitle(ui: *Ui) [*:0]const u8 {
 }
 
 /// What the input view edits: a preference, or a field of the open form.
-fn inputPref(ui: *Ui) ?*const Host.Pref {
+fn inputPref(ui: *Ui) ?*const Host.Preference {
     switch (ui.input) {
         .pref => |pref_index| {
             const registry = ui.ext_registry orelse return null;
-            return registry.pref(pref_index);
+            return registry.preference(pref_index);
         },
         .field => |field_index| return form_view.field(ui, field_index),
     }
@@ -344,7 +349,7 @@ pub fn saveInput(ui: *Ui) void {
 /// Writes one value into the extension's preferences.json (atomically,
 /// owner-only), then reloads the extensions so Lua sees it. False when it
 /// was not saved; the selected row says why.
-fn save(ui: *Ui, preference: *const Host.Pref, value: std.json.Value) bool {
+fn save(ui: *Ui, preference: *const Host.Preference, value: std.json.Value) bool {
     var arena_instance: std.heap.ArenaAllocator = .init(ui.gpa);
     defer arena_instance.deinit();
     const arena = arena_instance.allocator();

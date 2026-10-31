@@ -328,9 +328,9 @@ pub const DetailPane = struct {
     meta: *c.GtkBox = undefined,
     /// One line per label and value pair; extensions show as many as they
     /// give.
-    meta_lines: [item_mod.meta_max]*c.GtkBox = undefined,
-    meta_keys: [item_mod.meta_max]*c.GtkLabel = undefined,
-    meta_values: [item_mod.meta_max]*c.GtkLabel = undefined,
+    meta_lines: [item_mod.metadata_max]*c.GtkBox = undefined,
+    meta_keys: [item_mod.metadata_max]*c.GtkLabel = undefined,
+    meta_values: [item_mod.metadata_max]*c.GtkLabel = undefined,
     /// The image the picture shows or is loading (see detail_pane.showImage).
     image_path: [std.Io.Dir.max_path_bytes]u8 = undefined,
     image_path_length: usize = 0,
@@ -413,7 +413,7 @@ const Scroll = struct {
 
 /// A value being edited: an extension's preference or a field of the open
 /// form (indexes in the registry and the form).
-pub const Edited = union(enum) { pref: ExtHost.PrefIndex, field: ExtHost.FieldIndex };
+pub const Edited = union(enum) { pref: ExtHost.PreferenceIndex, field: ExtHost.FieldIndex };
 
 pub const Choosing = union(enum) {
     none,
@@ -422,7 +422,7 @@ pub const Choosing = union(enum) {
     /// Open With for one file; both strings are owned by `gpa`.
     file: struct { path: [:0]u8, mime: [:0]u8 },
     /// A choice preference of an extension (index in the registry).
-    pref: ExtHost.PrefIndex,
+    pref: ExtHost.PreferenceIndex,
     /// A choice field of the open form.
     field: ExtHost.FieldIndex,
 };
@@ -1193,7 +1193,7 @@ pub fn setReselect(self: *Ui, comptime fmt: []const u8, args: anytype) void {
     self.reselect.print(fmt, args);
 }
 
-pub fn actionContext(self: *Ui) run.Ctx {
+pub fn actionContext(self: *Ui) run.Context {
     return .{ .gpa = self.gpa, .db = &self.db, .settings = &self.settings };
 }
 
@@ -2265,8 +2265,8 @@ pub fn openPanel(self: *Ui) void {
 /// Runs one of the selected row's actions (a row of the action panel, or
 /// what Enter and Ctrl+Enter do).
 pub fn performEntry(self: *Ui, entry: item_mod.Entry) void {
-    if (entry.op == .ext) return ext_view.perform(self, entry.index);
-    self.perform(entry.op);
+    if (entry.operation == .ext) return ext_view.perform(self, entry.index);
+    self.perform(entry.operation);
 }
 
 /// Destructive commands need a second Enter: true while waiting for it
@@ -2297,7 +2297,7 @@ pub fn showRunning(self: *Ui) void {
 }
 
 /// Runs `operation` on the selected row.
-pub fn perform(self: *Ui, operation: item_mod.Op) void {
+pub fn perform(self: *Ui, operation: item_mod.Operation) void {
     const item = self.selectedItem() orelse return;
     const primary = operation == .run or operation == .open;
     if (item.confirm and primary and self.needsConfirm(item)) return;
@@ -2335,7 +2335,7 @@ pub fn perform(self: *Ui, operation: item_mod.Op) void {
         .refresh_view => self.setView(self.view),
         .open_view => |view| self.navigate(view),
         .setting => |setting_action| {
-            settings_view.performSetting(self, setting_action.setting, setting_action.op);
+            settings_view.performSetting(self, setting_action.setting, setting_action.operation);
         },
         .choose_app => |path| settings_view.chooseAppFor(self, path),
         .failed => |message| self.showFailure(message),
@@ -2463,7 +2463,7 @@ pub fn injectKey(self: *Ui, name: []const u8) bool {
     };
     // Anything else written like a keymap ("ctrl+g").
     const parsed = ext_view.parseKey(name) orelse return false;
-    _ = keyboard.handleKey(self, parsed.keyval, parsed.mods);
+    _ = keyboard.handleKey(self, parsed.keyval, parsed.modifiers);
     return true;
 }
 

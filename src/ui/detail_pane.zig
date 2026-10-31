@@ -59,7 +59,7 @@ pub fn buildDetail(ui: *Ui) void {
     gtk.addClass(meta, "meta");
     gtk.append(meta, widgets.label("Information", "meta-header"));
     const keys = [_][:0]const u8{ "Content type", "Characters", "Words", "Copied" };
-    comptime std.debug.assert(keys.len == item_mod.meta_max);
+    comptime std.debug.assert(keys.len == item_mod.metadata_max);
     for (keys, 0..) |key, i| {
         const line = widgets.hbox(12);
         ui.detail.meta_lines[i] = line;
@@ -271,7 +271,7 @@ fn showExtDetail(ui: *Ui, item: ?*const Item) void {
 
 /// The four values beside the keys the view set (Kind, Size, Modified,
 /// Where for files; Content type, Characters, Words, Copied for copies).
-fn setMeta(detail: *Ui.DetailPane, values: [item_mod.meta_max][:0]const u8) void {
+fn setMeta(detail: *Ui.DetailPane, values: [item_mod.metadata_max][:0]const u8) void {
     for (detail.meta_values, values) |value_label, value| {
         c.gtk_label_set_text(value_label, value.ptr);
     }

@@ -453,7 +453,7 @@ fn keymap(L: *lua.State) lua.Error!c_int {
         .{keys},
     );
     const modifiers_required = gtk.GDK_CONTROL_MASK | gtk.GDK_ALT_MASK | gtk.GDK_SUPER_MASK;
-    if (parsed.mods & modifiers_required == 0) {
+    if (parsed.modifiers & modifiers_required == 0) {
         return lua.fail(
             L,
             "lumen.keymap: \"{s}\" needs ctrl, alt or super (plain keys type into the search)",
@@ -463,15 +463,15 @@ fn keymap(L: *lua.State) lua.Error!c_int {
     const arena = load.arena;
     load.keymaps.append(arena, .{
         .keyval = parsed.keyval,
-        .mods = parsed.mods,
+        .modifiers = parsed.modifiers,
         .keys = arena.dupeSentinel(u8, keys, 0) catch return lua.failOom(L),
         .target = arena.dupeSentinel(u8, target, 0) catch return lua.failOom(L),
-        .ext = arena.dupeSentinel(u8, extension.id, 0) catch return lua.failOom(L),
+        .extension = arena.dupeSentinel(u8, extension.id, 0) catch return lua.failOom(L),
     }) catch return lua.failOom(L);
     return 0;
 }
 
-pub const Keys = struct { keyval: c_uint, mods: gtk.GdkModifierType };
+pub const Keys = struct { keyval: c_uint, modifiers: gtk.GdkModifierType };
 
 const Modifier = struct { name: []const u8, mask: gtk.GdkModifierType };
 
@@ -502,7 +502,7 @@ pub fn parseKeys(text: []const u8) ?Keys {
     if (key_name.len == 1) name_terminated[0] = std.ascii.toLower(key_name[0]);
     const keyval = gtk.gdk_keyval_from_name(&name_terminated);
     if (keyval == 0 or keyval == gtk.GDK_KEY_VoidSymbol) return null;
-    return .{ .keyval = gtk.gdk_keyval_to_lower(keyval), .mods = modifiers_mask };
+    return .{ .keyval = gtk.gdk_keyval_to_lower(keyval), .modifiers = modifiers_mask };
 }
 
 fn modifierMask(name: []const u8) ?gtk.GdkModifierType {
@@ -790,12 +790,12 @@ fn jsonEncode(L: *lua.State) lua.Error!c_int {
 
 test "keys parse like ctrl+g" {
     const ctrl_g = parseKeys("ctrl+g").?;
-    try std.testing.expectEqual(gtk.GDK_CONTROL_MASK, ctrl_g.mods);
+    try std.testing.expectEqual(gtk.GDK_CONTROL_MASK, ctrl_g.modifiers);
     try std.testing.expectEqual(@as(c_uint, 'g'), ctrl_g.keyval);
     try std.testing.expectEqual(parseKeys("Ctrl+Shift+G").?.keyval, ctrl_g.keyval);
     try std.testing.expectEqual(
         gtk.GDK_CONTROL_MASK | gtk.GDK_SHIFT_MASK,
-        parseKeys("ctrl+shift+g").?.mods,
+        parseKeys("ctrl+shift+g").?.modifiers,
     );
     try std.testing.expectEqual(gtk.GDK_KEY_Return, parseKeys("alt+Return").?.keyval);
     try std.testing.expect(parseKeys("hyper+g") == null);

@@ -81,7 +81,7 @@ fn listenIn(
     assert(!server.listening());
     if (runtime_dir.len == 0) return error.NoRuntimeDir;
     var dir_buffer: [256]u8 = undefined;
-    const dir = ipc.dir(&dir_buffer, runtime_dir) orelse return error.PathTooLong;
+    const dir = ipc.folderPath(&dir_buffer, runtime_dir) orelse return error.PathTooLong;
     // A folder that could not be made fails the check below.
     os.mkdirP(dir) catch |err| log.warn("{s}: {t}", .{ dir, err });
     if (!isPrivateDir(dir)) {
@@ -331,13 +331,14 @@ const Connection = struct {
         var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        const args = arena.alloc([:0]const u8, request.argc) catch return self.close();
-        for (request.args[0..request.argc], args) |arg, *arg_z| {
-            arg_z.* = arena.dupeSentinel(u8, arg, 0) catch return self.close();
+        const arguments_count = request.arguments_count;
+        const arguments = arena.alloc([:0]const u8, arguments_count) catch return self.close();
+        for (request.arguments[0..arguments_count], arguments) |argument, *argument_z| {
+            argument_z.* = arena.dupeSentinel(u8, argument, 0) catch return self.close();
         }
         var stdout: std.Io.Writer.Allocating = .init(arena);
         var stderr: std.Io.Writer.Allocating = .init(arena);
-        const status = server.handler(args, request.payload, &stdout.writer, &stderr.writer);
+        const status = server.handler(arguments, request.payload, &stdout.writer, &stderr.writer);
 
         // The request is done with: the buffer takes the answer.
         self.bytes.clearRetainingCapacity();

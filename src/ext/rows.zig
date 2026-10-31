@@ -27,7 +27,7 @@ const path_bytes_max = 4096;
 /// A row's `detail` or `markdown`.
 pub const detail_bytes_max = 128 << 10;
 /// Label and value pairs of a row's `metadata`.
-const meta_max = item_mod.meta_max;
+const metadata_max = item_mod.metadata_max;
 /// A short text that starts with a byte past ASCII is an emoji icon; any
 /// other text names an icon.
 const emoji_bytes_max = 32;
@@ -170,7 +170,7 @@ fn rowActions(
         entry.* = .{
             .label = parsed.label,
             .keys = keysFor(action_index),
-            .op = .ext,
+            .operation = .ext,
             .index = @intCast(action_index),
         };
     }
@@ -188,7 +188,7 @@ fn defaultActions(
     const entries = arena.dupe(item_mod.Entry, &.{.{
         .label = "Copy to Clipboard",
         .keys = "↵",
-        .op = .ext,
+        .operation = .ext,
     }}) catch lua.oom(L);
     return extItem(source, actions, entries);
 }
@@ -212,18 +212,18 @@ fn extItem(
 }
 
 /// `metadata = { { "Label", "value" }, { label = "Size", value = 42 } }`:
-/// up to `meta_max` pairs for the detail pane.
+/// up to `metadata_max` pairs for the detail pane.
 fn metadata(
     L: *lua.State,
     arena: std.mem.Allocator,
     row: c_int,
     where: []const u8,
-) []const item_mod.Meta {
+) []const item_mod.Metadata {
     const mark: lua.StackMark = .init(L);
     defer mark.restore(L);
     const pairs = lua.fieldList(L, row, "metadata", where) orelse return &.{};
-    const pairs_count = @min(lua.c.lua_rawlen(L, pairs), meta_max);
-    const metas = arena.alloc(item_mod.Meta, pairs_count) catch lua.oom(L);
+    const pairs_count = @min(lua.c.lua_rawlen(L, pairs), metadata_max);
+    const metas = arena.alloc(item_mod.Metadata, pairs_count) catch lua.oom(L);
     for (metas, 1..) |*meta, pair_number| {
         const pair_mark: lua.StackMark = .init(L);
         defer pair_mark.restore(L);
@@ -241,7 +241,7 @@ fn metadata(
                 pairPart(L, arena, pair, 2, pair_where),
         };
     }
-    assert(metas.len <= meta_max);
+    assert(metas.len <= metadata_max);
     return metas;
 }
 

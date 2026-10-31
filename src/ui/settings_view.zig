@@ -159,7 +159,7 @@ fn settingName(setting: item_mod.Setting) ?[]const u8 {
     };
 }
 
-const Option = Host.PrefChoice;
+const Option = Host.PreferenceChoice;
 
 /// A row of the choose view: `option`, checked when it is the `current`
 /// value.
@@ -405,7 +405,7 @@ fn writeChooseTitle(
             try writer.print("Open {s} With", .{std.Io.Dir.path.basename(file.path)});
         },
         .pref => |pref_index| if (ui.ext_registry) |registry| {
-            if (registry.pref(pref_index)) |preference| try writer.writeAll(preference.title);
+            if (registry.preference(pref_index)) |preference| try writer.writeAll(preference.title);
         },
         .field => |field_index| if (form_view.field(ui, field_index)) |form_field| {
             try writer.writeAll(form_field.title);
@@ -778,7 +778,7 @@ fn lockKey(setting: item_mod.Setting) ?[]const u8 {
 }
 
 /// Applies what a settings row does.
-pub fn performSetting(ui: *Ui, setting: item_mod.Setting, operation: item_mod.Op) void {
+pub fn performSetting(ui: *Ui, setting: item_mod.Setting, operation: item_mod.Operation) void {
     if (lockKey(setting)) |key| if (ui.overridden(key)) return ui.showFailure("Set in init.lua");
     switch (setting) {
         .toggle => |toggle| {

@@ -77,7 +77,7 @@ pub const System = enum {
     empty_trash,
 };
 
-pub const WindowOp = enum {
+pub const WindowOperation = enum {
     toggle_floating,
     toggle_fullscreen,
     toggle_maximize,
@@ -93,7 +93,7 @@ pub const Action = union(enum) {
     view: View,
     system: System,
     layout: core.geometry.Layout,
-    window_op: WindowOp,
+    window_operation: WindowOperation,
     /// Hyprland window address.
     focus_window: [:0]const u8,
     /// Row id in the clipboard table; the text is in `Item.detail`.
@@ -126,11 +126,11 @@ pub const Action = union(enum) {
     pick: struct { index: u32, selectable: bool },
 };
 
-pub const Meta = struct { label: [:0]const u8, value: [:0]const u8 };
+pub const Metadata = struct { label: [:0]const u8, value: [:0]const u8 };
 
 /// Label and value pairs a row shows in the detail pane. The pane has one
 /// line of widgets for each.
-pub const meta_max = 4;
+pub const metadata_max = 4;
 
 pub const ExtItem = struct {
     /// The extension command that listed it (index in the registry), and
@@ -179,7 +179,7 @@ pub const Setting = union(enum) {
     /// Opens an extension's preferences (its id).
     ext_prefs: [:0]const u8,
     /// Changes one preference (its index in the extension registry).
-    pref: indexes.PrefIndex,
+    pref: indexes.PreferenceIndex,
     /// Saves what was typed in the input view.
     save_input,
     /// Changes a field of the open form (its index in the form).
@@ -209,7 +209,7 @@ pub const Item = struct {
     /// `detail` is Pango markup (an extension's markdown).
     markup: bool = false,
     /// Label and value pairs for the detail pane's Information block.
-    meta: []const Meta = &.{},
+    meta: []const Metadata = &.{},
     /// A picture for a grid cell (an image file's path).
     image: [:0]const u8 = "",
     /// Shown only in the detail pane: the folder, and a short fact (e.g.
@@ -225,7 +225,7 @@ pub const Item = struct {
     time_s: i64 = 0,
 };
 
-pub const Op = enum {
+pub const Operation = enum {
     open,
     run,
     copy_name,
@@ -256,8 +256,8 @@ pub const Entry = struct {
     label: [:0]const u8,
     /// Shown as key caps, e.g. "↵", "Ctrl ↵", "Ctrl X".
     keys: [:0]const u8,
-    op: Op,
-    /// For `Op.ext`: which of the row's actions.
+    operation: Operation,
+    /// For `Operation.ext`: which of the row's actions.
     index: u8 = 0,
 };
 
@@ -266,63 +266,63 @@ pub const Entry = struct {
 pub fn actionsFor(item: *const Item) []const Entry {
     const entries: []const Entry = switch (item.action) {
         .app => &.{
-            .{ .label = "Open Application", .keys = "↵", .op = .open },
-            .{ .label = "Copy Name", .keys = "Ctrl ↵", .op = .copy_name },
-            .{ .label = "Copy Desktop File Path", .keys = "Ctrl Shift C", .op = .copy_path },
-            .{ .label = "Reset Ranking", .keys = "", .op = .reset_ranking },
+            .{ .label = "Open Application", .keys = "↵", .operation = .open },
+            .{ .label = "Copy Name", .keys = "Ctrl ↵", .operation = .copy_name },
+            .{ .label = "Copy Desktop File Path", .keys = "Ctrl Shift C", .operation = .copy_path },
+            .{ .label = "Reset Ranking", .keys = "", .operation = .reset_ranking },
         },
         .view => &.{
-            .{ .label = "Open Command", .keys = "↵", .op = .open },
-            .{ .label = "Reset Ranking", .keys = "", .op = .reset_ranking },
+            .{ .label = "Open Command", .keys = "↵", .operation = .open },
+            .{ .label = "Reset Ranking", .keys = "", .operation = .reset_ranking },
         },
-        .system, .layout, .window_op, .script => &.{
-            .{ .label = "Run Command", .keys = "↵", .op = .run },
-            .{ .label = "Reset Ranking", .keys = "", .op = .reset_ranking },
+        .system, .layout, .window_operation, .script => &.{
+            .{ .label = "Run Command", .keys = "↵", .operation = .run },
+            .{ .label = "Reset Ranking", .keys = "", .operation = .reset_ranking },
         },
         .focus_window => &.{
-            .{ .label = "Switch to Window", .keys = "↵", .op = .focus },
-            .{ .label = "Close Window", .keys = "Ctrl ↵", .op = .close_window },
+            .{ .label = "Switch to Window", .keys = "↵", .operation = .focus },
+            .{ .label = "Close Window", .keys = "Ctrl ↵", .operation = .close_window },
         },
         .clip => &.{
-            .{ .label = "Paste to Active App", .keys = "↵", .op = .clip_paste },
-            .{ .label = "Copy to Clipboard", .keys = "Ctrl ↵", .op = .clip_copy },
-            .{ .label = "Delete Entry", .keys = "Ctrl X", .op = .clip_delete },
-            .{ .label = "Delete All Entries", .keys = "Ctrl Shift X", .op = .clip_clear },
+            .{ .label = "Paste to Active App", .keys = "↵", .operation = .clip_paste },
+            .{ .label = "Copy to Clipboard", .keys = "Ctrl ↵", .operation = .clip_copy },
+            .{ .label = "Delete Entry", .keys = "Ctrl X", .operation = .clip_delete },
+            .{ .label = "Delete All Entries", .keys = "Ctrl Shift X", .operation = .clip_clear },
         },
         .file => |file| if (file.line > 0 and !file.extracted) &.{
-            .{ .label = "Open at Line", .keys = "↵", .op = .open_at_line },
-            .{ .label = "Open", .keys = "Ctrl ↵", .op = .open },
-            .{ .label = "Open With...", .keys = "Ctrl O", .op = .open_with },
-            .{ .label = "Show in Folder", .keys = "", .op = .show_in_folder },
-            .{ .label = "Copy Path", .keys = "Ctrl Shift C", .op = .copy_path },
-            .{ .label = "Copy File", .keys = "Ctrl Shift F", .op = .copy_file },
+            .{ .label = "Open at Line", .keys = "↵", .operation = .open_at_line },
+            .{ .label = "Open", .keys = "Ctrl ↵", .operation = .open },
+            .{ .label = "Open With...", .keys = "Ctrl O", .operation = .open_with },
+            .{ .label = "Show in Folder", .keys = "", .operation = .show_in_folder },
+            .{ .label = "Copy Path", .keys = "Ctrl Shift C", .operation = .copy_path },
+            .{ .label = "Copy File", .keys = "Ctrl Shift F", .operation = .copy_file },
         } else &.{
-            .{ .label = "Open", .keys = "↵", .op = .open },
-            .{ .label = "Show in Folder", .keys = "Ctrl ↵", .op = .show_in_folder },
-            .{ .label = "Open With...", .keys = "Ctrl O", .op = .open_with },
-            .{ .label = "Copy Path", .keys = "Ctrl Shift C", .op = .copy_path },
-            .{ .label = "Copy File", .keys = "Ctrl Shift F", .op = .copy_file },
-            .{ .label = "Move to Trash", .keys = "Ctrl X", .op = .trash },
+            .{ .label = "Open", .keys = "↵", .operation = .open },
+            .{ .label = "Show in Folder", .keys = "Ctrl ↵", .operation = .show_in_folder },
+            .{ .label = "Open With...", .keys = "Ctrl O", .operation = .open_with },
+            .{ .label = "Copy Path", .keys = "Ctrl Shift C", .operation = .copy_path },
+            .{ .label = "Copy File", .keys = "Ctrl Shift F", .operation = .copy_file },
+            .{ .label = "Move to Trash", .keys = "Ctrl X", .operation = .trash },
         },
         .setting => |setting| settingActions(setting),
         .calc => &.{
-            .{ .label = "Copy Answer", .keys = "↵", .op = .calc_copy },
-            .{ .label = "Paste Answer", .keys = "Ctrl ↵", .op = .calc_paste },
+            .{ .label = "Copy Answer", .keys = "↵", .operation = .calc_copy },
+            .{ .label = "Paste Answer", .keys = "Ctrl ↵", .operation = .calc_paste },
         },
         .ext_command => |command| if (command.run) &.{
-            .{ .label = "Run Command", .keys = "↵", .op = .run },
-            .{ .label = "Reset Ranking", .keys = "", .op = .reset_ranking },
+            .{ .label = "Run Command", .keys = "↵", .operation = .run },
+            .{ .label = "Reset Ranking", .keys = "", .operation = .reset_ranking },
         } else &.{
-            .{ .label = "Open Command", .keys = "↵", .op = .open },
-            .{ .label = "Reset Ranking", .keys = "", .op = .reset_ranking },
+            .{ .label = "Open Command", .keys = "↵", .operation = .open },
+            .{ .label = "Reset Ranking", .keys = "", .operation = .reset_ranking },
         },
         .ext_item => |ext_item| ext_item.entries,
-        .ext_problem => &.{.{ .label = "Copy Error", .keys = "↵", .op = .copy_detail }},
+        .ext_problem => &.{.{ .label = "Copy Error", .keys = "↵", .operation = .copy_detail }},
         .pick => |pick| if (pick.selectable) &.{
-            .{ .label = "Select", .keys = "↵", .op = .run },
-            .{ .label = "Use Typed Text", .keys = "Ctrl ↵", .op = .pick_typed },
+            .{ .label = "Select", .keys = "↵", .operation = .run },
+            .{ .label = "Use Typed Text", .keys = "Ctrl ↵", .operation = .pick_typed },
         } else &.{
-            .{ .label = "Use Typed Text", .keys = "Ctrl ↵", .op = .pick_typed },
+            .{ .label = "Use Typed Text", .keys = "Ctrl ↵", .operation = .pick_typed },
         },
     };
     // The action panel and Enter run `entries[0]`. An extension's row has
@@ -335,22 +335,22 @@ pub fn actionsFor(item: *const Item) []const Entry {
 /// can also remember the app.
 fn settingActions(setting: Setting) []const Entry {
     return switch (setting) {
-        .toggle => &.{.{ .label = "Toggle", .keys = "↵", .op = .run }},
-        .choose, .kind, .go => &.{.{ .label = "Change", .keys = "↵", .op = .run }},
-        .pick => &.{.{ .label = "Select", .keys = "↵", .op = .run }},
-        .theme => &.{.{ .label = "Use Theme", .keys = "↵", .op = .run }},
-        .style => &.{.{ .label = "Use Style", .keys = "↵", .op = .run }},
+        .toggle => &.{.{ .label = "Toggle", .keys = "↵", .operation = .run }},
+        .choose, .kind, .go => &.{.{ .label = "Change", .keys = "↵", .operation = .run }},
+        .pick => &.{.{ .label = "Select", .keys = "↵", .operation = .run }},
+        .theme => &.{.{ .label = "Use Theme", .keys = "↵", .operation = .run }},
+        .style => &.{.{ .label = "Use Style", .keys = "↵", .operation = .run }},
         .open_with => &.{
-            .{ .label = "Open", .keys = "↵", .op = .run },
-            .{ .label = "Open and Always Use", .keys = "Ctrl ↵", .op = .always_use },
+            .{ .label = "Open", .keys = "↵", .operation = .run },
+            .{ .label = "Open and Always Use", .keys = "Ctrl ↵", .operation = .always_use },
         },
-        .open_file => &.{.{ .label = "Open Settings File", .keys = "↵", .op = .run }},
-        .reset => &.{.{ .label = "Reset All Settings", .keys = "↵", .op = .run }},
-        .ext_prefs, .pref, .field => &.{.{ .label = "Change", .keys = "↵", .op = .run }},
-        .submit_form => &.{.{ .label = "Submit", .keys = "↵", .op = .run }},
-        .ext_open => &.{.{ .label = "Open Folder", .keys = "↵", .op = .run }},
-        .ext_update => &.{.{ .label = "Update", .keys = "↵", .op = .run }},
-        .ext_uninstall => &.{.{ .label = "Uninstall", .keys = "↵", .op = .run }},
-        .save_input => &.{.{ .label = "Save", .keys = "↵", .op = .run }},
+        .open_file => &.{.{ .label = "Open Settings File", .keys = "↵", .operation = .run }},
+        .reset => &.{.{ .label = "Reset All Settings", .keys = "↵", .operation = .run }},
+        .ext_prefs, .pref, .field => &.{.{ .label = "Change", .keys = "↵", .operation = .run }},
+        .submit_form => &.{.{ .label = "Submit", .keys = "↵", .operation = .run }},
+        .ext_open => &.{.{ .label = "Open Folder", .keys = "↵", .operation = .run }},
+        .ext_update => &.{.{ .label = "Update", .keys = "↵", .operation = .run }},
+        .ext_uninstall => &.{.{ .label = "Uninstall", .keys = "↵", .operation = .run }},
+        .save_input => &.{.{ .label = "Save", .keys = "↵", .operation = .run }},
     };
 }

@@ -218,7 +218,7 @@ fn listCallback(answer: *Host.ListResult, context: ?*anyopaque) void {
         return;
     }
     const open_command = command(ui);
-    if (answer.err) |message| {
+    if (answer.error_message) |message| {
         log.warn("{s}: {s}", .{ if (open_command) |listed| listed.id else "?", message });
     }
     // Rows without an icon take their command's. The icon points into the
@@ -239,7 +239,7 @@ fn actCallback(answer: *Host.ActResult, context: ?*anyopaque) void {
     defer answer.destroy(ui.gpa);
     if (answer.generation != ui.ext_act_generation) return;
     ui.ext_act_generation = .none;
-    if (answer.err) |message| {
+    if (answer.error_message) |message| {
         log.warn("action: {s}", .{message});
         ui.showFailure(firstLine(ui.query_arena.allocator(), message));
         return;
@@ -327,11 +327,11 @@ fn sameCommand(
 fn samePref(
     old: *const Host.Registry,
     new: *const Host.Registry,
-    index: Host.PrefIndex,
-) ?Host.PrefIndex {
-    const preference = (old.pref(index) orelse return null).*;
-    for (new.prefs, 0..) |candidate, j| {
-        const same_extension = std.mem.eql(u8, candidate.ext, preference.ext);
+    index: Host.PreferenceIndex,
+) ?Host.PreferenceIndex {
+    const preference = (old.preference(index) orelse return null).*;
+    for (new.preferences, 0..) |candidate, j| {
+        const same_extension = std.mem.eql(u8, candidate.extension, preference.extension);
         const same_name = std.mem.eql(u8, candidate.name, preference.name);
         if (same_extension and same_name and candidate.kind == preference.kind) return .from(j);
     }
@@ -339,7 +339,7 @@ fn samePref(
 }
 
 /// Whether a form's fields are the same names and kinds, in the same order.
-fn sameFields(fields_old: []const Host.Pref, fields_new: []const Host.Pref) bool {
+fn sameFields(fields_old: []const Host.Preference, fields_new: []const Host.Preference) bool {
     if (fields_old.len != fields_new.len) return false;
     for (fields_old, fields_new) |field_old, field_new| {
         if (!std.mem.eql(u8, field_old.name, field_new.name)) return false;
@@ -382,7 +382,7 @@ pub fn rootItems(ui: *Ui, arena: std.mem.Allocator) []const Item {
         out.append(arena, .{
             .title = arena.printSentinel(
                 "Extension \"{s}\" failed to load",
-                .{problem.ext},
+                .{problem.extension},
                 0,
             ) catch continue,
             .subtitle = firstLine(arena, problem.message),
@@ -398,7 +398,8 @@ pub fn rootItems(ui: *Ui, arena: std.mem.Allocator) []const Item {
 /// The open command's rows before filtering.
 pub fn base(ui: *Ui) []Item {
     const answer = ui.ext_list.latest orelse return &.{};
-    return if (answer.command == ui.ext_command and answer.err == null) answer.items else &.{};
+    const answer_listed = answer.command == ui.ext_command and answer.error_message == null;
+    return if (answer_listed) answer.items else &.{};
 }
 
 /// Before the ext view shows: list commands are asked once here.
@@ -446,7 +447,7 @@ fn ask(ui: *Ui, query: []const u8) void {
 pub fn emptyText(ui: *Ui, arena: std.mem.Allocator, query: []const u8) [:0]const u8 {
     const open_command = command(ui) orelse return "No Results";
     if (ui.ext_list.latest) |answer| {
-        if (answer.command == ui.ext_command) if (answer.err) |message| {
+        if (answer.command == ui.ext_command) if (answer.error_message) |message| {
             return arena.printSentinel("Error: {s}", .{firstLine(arena, message)}, 0) catch "Error";
         };
     }
@@ -567,11 +568,11 @@ pub fn keymap(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) bool {
     const mask = c.GDK_CONTROL_MASK | c.GDK_ALT_MASK | c.GDK_SHIFT_MASK | c.GDK_SUPER_MASK;
     const key = c.gdk_keyval_to_lower(keyval);
     for (registry.keymaps) |binding| {
-        if (binding.keyval != key or binding.mods != state & mask) continue;
+        if (binding.keyval != key or binding.modifiers != state & mask) continue;
         if (!openTarget(ui, binding.target, null)) {
             log.warn(
                 "keymap {s} ({s}): no command or view \"{s}\"",
-                .{ binding.keys, binding.ext, binding.target },
+                .{ binding.keys, binding.extension, binding.target },
             );
         }
         return true;
@@ -635,7 +636,7 @@ test "an answer whose rows may be on screen outlives them" {
     try testing.expectEqual(RootAnswer.keep, rootAnswer(null, "ab", "abc", true));
 }
 
-fn testCommand(id: [:0]const u8, fields: []const Host.Pref) Host.Command {
+fn testCommand(id: [:0]const u8, fields: []const Host.Preference) Host.Command {
     return .{
         .id = id,
         .title = id,
@@ -650,10 +651,10 @@ fn testCommand(id: [:0]const u8, fields: []const Host.Pref) Host.Command {
     };
 }
 
-fn testPref(ext: [:0]const u8, name: [:0]const u8, kind: Host.PrefKind) Host.Pref {
+fn testPref(ext: [:0]const u8, name: [:0]const u8, kind: Host.PreferenceKind) Host.Preference {
     return .{
-        .ext = ext,
-        .ext_title = ext,
+        .extension = ext,
+        .extension_title = ext,
         .file = "",
         .name = name,
         .title = name,
@@ -664,8 +665,8 @@ fn testPref(ext: [:0]const u8, name: [:0]const u8, kind: Host.PrefKind) Host.Pre
 }
 
 test "indexes into the registry follow their ids across a reload" {
-    const name = [_]Host.Pref{testPref("notes", "name", .text)};
-    const renamed = [_]Host.Pref{testPref("notes", "title", .text)};
+    const name = [_]Host.Preference{testPref("notes", "name", .text)};
+    const renamed = [_]Host.Preference{testPref("notes", "title", .text)};
     const old_commands = [_]Host.Command{
         testCommand("a.list", &.{}),
         testCommand("notes.new", &name),
@@ -677,11 +678,11 @@ test "indexes into the registry follow their ids across a reload" {
         testCommand("a.list", &.{}),
         testCommand("notes.new", &renamed),
     };
-    const old_prefs = [_]Host.Pref{
+    const old_prefs = [_]Host.Preference{
         testPref("a", "token", .password),
         testPref("b", "key", .password),
     };
-    const new_prefs = [_]Host.Pref{
+    const new_prefs = [_]Host.Preference{
         testPref("aaa", "token", .password),
         testPref("a", "token", .password),
         testPref("b", "key", .text),
@@ -689,25 +690,25 @@ test "indexes into the registry follow their ids across a reload" {
     const old: Host.Registry = .{
         .generation = @fromBackingInt(@as(u32, 1)),
         .commands = &old_commands,
-        .prefs = &old_prefs,
+        .preferences = &old_prefs,
         .arena = undefined,
     };
     const new: Host.Registry = .{
         .generation = @fromBackingInt(@as(u32, 2)),
         .commands = &new_commands,
-        .prefs = &new_prefs,
+        .preferences = &new_prefs,
         .arena = undefined,
     };
     const Command = Host.CommandIndex;
-    const Pref = Host.PrefIndex;
+    const Preference = Host.PreferenceIndex;
     try testing.expectEqual(@as(?Command, .from(1)), sameCommand(&old, &new, .from(0)));
     try testing.expectEqual(@as(?Command, .from(2)), sameCommand(&old, &new, .from(1)));
     try testing.expectEqual(@as(?Command, null), sameCommand(&old, &new, .from(2)));
     try testing.expectEqual(@as(?Command, null), sameCommand(&old, &new, .gone));
     // Not "aaa"'s token, which took its place.
-    try testing.expectEqual(@as(?Pref, .from(1)), samePref(&old, &new, .from(0)));
+    try testing.expectEqual(@as(?Preference, .from(1)), samePref(&old, &new, .from(0)));
     // Now a text: typing a password for it would show it.
-    try testing.expectEqual(@as(?Pref, null), samePref(&old, &new, .from(1)));
+    try testing.expectEqual(@as(?Preference, null), samePref(&old, &new, .from(1)));
     try testing.expect(sameFields(&name, &name));
     try testing.expect(!sameFields(&name, &renamed));
     try testing.expect(!sameFields(&name, &.{}));

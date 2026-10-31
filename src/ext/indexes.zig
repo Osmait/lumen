@@ -6,13 +6,13 @@ const std = @import("std");
 const assert = std.debug.assert;
 
 pub const CommandIndex = Index(.command);
-pub const PrefIndex = Index(.pref);
+pub const PreferenceIndex = Index(.preference);
 pub const FieldIndex = Index(.field);
 
 /// A distinct u16 position type per `list`. The type keeps `list` as a
 /// declaration: without it, the three would be one and the same type (Zig
 /// interns a type that does not depend on its parameter).
-fn Index(comptime list: enum { command, pref, field }) type {
+fn Index(comptime list: enum { command, preference, field }) type {
     return enum(u16) {
         pub const list_name = list;
         /// A position no registry has: what a view held that a reload took
@@ -42,8 +42,8 @@ fn Index(comptime list: enum { command, pref, field }) type {
 }
 
 test "indexes of different lists are different types" {
-    try std.testing.expect(CommandIndex != PrefIndex);
-    try std.testing.expect(PrefIndex != FieldIndex);
+    try std.testing.expect(CommandIndex != PreferenceIndex);
+    try std.testing.expect(PreferenceIndex != FieldIndex);
     const items = [_]u8{ 7, 8 };
     try std.testing.expectEqual(@as(u8, 8), CommandIndex.from(1).in(u8, &items).?.*);
     try std.testing.expectEqual(null, CommandIndex.from(2).in(u8, &items));
