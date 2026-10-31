@@ -28,6 +28,24 @@ const log = std.log.scoped(.content);
 
 const ContentService = @This();
 
+gpa: std.mem.Allocator,
+io: Io,
+root: []const u8,
+cache_path: [:0]u8,
+text_dir: []u8,
+search_pool: *Pool,
+build_pool: *Pool,
+options: Options,
+lock: Io.RwLock = .init,
+index: ?content.Index = null,
+stop: std.atomic.Value(bool) = .init(false),
+wake: std.atomic.Value(u32) = .init(0),
+thread: ?std.Thread = null,
+/// Written by the service thread, read by any thread (`status`).
+counters: Counters = .{},
+/// The service thread's own state, read and written without the lock.
+worker: Worker,
+
 pub const Options = struct {
     refresh_interval_ns: u64 = 5 * 60 * std.time.ns_per_s,
     /// Opening the window asks for a refresh, at most this often.
@@ -39,33 +57,16 @@ pub const Options = struct {
     /// The name index over the same root: while it saw no name change that
     /// could matter, a check only looks at the files already indexed
     /// (edits in place) instead of listing them all with ripgrep (~0.45 s
-    /// of CPU for 49 k). Null: always list.
+    /// of CPU for 49 k). When it is null, every check lists.
     names: ?*Service = null,
     /// Listed at least this often anyway (a .gitignore edited in place
     /// changes what is listed without a name change).
     list_interval_ns: u64 = 30 * 60 * std.time.ns_per_s,
 };
+
 const extracted_bytes_max = content.extracted_bytes_max;
 /// `readText` reads a file this much at a time, counting lines as it goes.
 const text_read_bytes = 16 * 1024;
-
-gpa: std.mem.Allocator,
-io: Io,
-root: []const u8,
-cache_path: [:0]u8,
-text_dir: []u8,
-search_pool: *Pool,
-build_pool: *Pool,
-opts: Options,
-lock: Io.RwLock = .init,
-index: ?content.Index = null,
-stop: std.atomic.Value(bool) = .init(false),
-wake: std.atomic.Value(u32) = .init(0),
-thread: ?std.Thread = null,
-/// Written by the service thread, read by any thread (`status`).
-counters: Counters = .{},
-/// The service thread's own state, read and written without the lock.
-worker: Worker,
 
 /// What the service thread counts and times, for `lumen --stats` and for
 /// tests (`checks` counts finished checks). Only the service thread writes
@@ -97,7 +98,7 @@ const Worker = struct {
     /// The service thread, set by `run` before its first check.
     thread_id: ?std.Thread.Id = null,
     /// `names.nameChanges()` when files were last listed.
-    listed_names: ?u64 = null,
+    listed_name_changes: ?u64 = null,
     listed_at_ns: u64 = 0,
     /// The index in use could not be saved: retried on the next check even
     /// if nothing changed.
@@ -133,7 +134,7 @@ pub fn startWith(
     root: []const u8,
     cache_dir: []const u8,
     pools: Pools,
-    opts: Options,
+    options: Options,
 ) StartError!*ContentService {
     const service = try gpa.create(ContentService);
     errdefer gpa.destroy(service);
@@ -151,7 +152,7 @@ pub fn startWith(
         .text_dir = text_dir,
         .search_pool = pools.search,
         .build_pool = pools.build,
-        .opts = opts,
+        .options = options,
         .worker = .{ .retry_arena = .init(gpa) },
     };
     // Without it, extracted text is not cached: each document is extracted
@@ -291,11 +292,11 @@ pub fn searchUntil(
 }
 
 /// The file holding a document's text, for verification (see PathFn).
-fn pathOf(ctx: *anyopaque, doc: content.DocIn, buf: []u8) ?[:0]const u8 {
-    const service: *ContentService = @ptrCast(@alignCast(ctx));
+fn pathOf(context: *anyopaque, doc: content.DocIn, path_buffer: []u8) ?[:0]const u8 {
+    const service: *ContentService = @ptrCast(@alignCast(context));
     switch (doc.source) {
-        .plain => return std.mem.printSentinel(buf, "{s}", .{doc.path}, 0) catch null,
-        .extracted => return service.textPath(buf, doc),
+        .plain => return std.mem.printSentinel(path_buffer, "{s}", .{doc.path}, 0) catch null,
+        .extracted => return service.textPath(path_buffer, doc),
     }
 }
 
@@ -346,30 +347,30 @@ pub fn readText(
 
 /// Text of a document: the file itself, or its cached extraction.
 fn textOf(
-    ctx: *anyopaque,
+    context: *anyopaque,
     doc: content.DocIn,
-    buf: *std.ArrayList(u8),
+    text: *std.ArrayList(u8),
     gpa: std.mem.Allocator,
 ) std.mem.Allocator.Error!bool {
-    const service: *ContentService = @ptrCast(@alignCast(ctx));
-    if (doc.source == .plain) return content.readPlain(gpa, doc.path, buf);
+    const service: *ContentService = @ptrCast(@alignCast(context));
+    if (doc.source == .plain) return content.readPlain(gpa, doc.path, text);
     var path_buffer: paths.Buffer = undefined;
     const text_path = service.textPath(&path_buffer, doc) orelse return false;
-    buf.clearRetainingCapacity();
+    text.clearRetainingCapacity();
     const fd = sys.openRegular(text_path) catch return false;
     defer sys.close(fd);
-    sys.readUpTo(gpa, fd, buf, extracted_bytes_max) catch |err| switch (err) {
+    sys.readUpTo(gpa, fd, text, extracted_bytes_max) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         // Part of the text is not the document's text.
         error.ReadFailed => return false,
     };
-    return buf.items.len > 0;
+    return text.items.len > 0;
 }
 
-/// How long the cached text of an extracted document is (0: none yet), so
-/// that building reads no more of them at once than memory allows.
-fn textLen(ctx: *anyopaque, doc: content.DocIn) u64 {
-    const service: *ContentService = @ptrCast(@alignCast(ctx));
+/// How many bytes the cached text of an extracted document has (0: none
+/// yet), so that building reads no more of them at once than memory allows.
+fn cachedTextBytes(context: *anyopaque, doc: content.DocIn) u64 {
+    const service: *ContentService = @ptrCast(@alignCast(context));
     var path_buffer: paths.Buffer = undefined;
     const text_path = service.textPath(&path_buffer, doc) orelse return 0;
     const info = sys.info(text_path) orelse return 0;
@@ -379,16 +380,16 @@ fn textLen(ctx: *anyopaque, doc: content.DocIn) u64 {
 /// Where a document version's extracted text is cached. Keyed by size as
 /// well as mtime (whole seconds): an edit within the same second reused
 /// the old text, and dropping the old version's text then deleted it.
-fn textPath(service: *ContentService, buf: []u8, doc: content.DocIn) ?[:0]const u8 {
+fn textPath(service: *ContentService, path_buffer: []u8, doc: content.DocIn) ?[:0]const u8 {
     var name_buffer: [64]u8 = undefined;
     const name = textName(&name_buffer, doc);
-    return std.mem.printSentinel(buf, "{s}/{s}", .{ service.text_dir, name }, 0) catch null;
+    return std.mem.printSentinel(path_buffer, "{s}/{s}", .{ service.text_dir, name }, 0) catch null;
 }
 
-fn textName(buf: *[64]u8, doc: content.DocIn) []const u8 {
+fn textName(name_buffer: *[64]u8, doc: content.DocIn) []const u8 {
     // 16 + 1 + 20 + 1 + 20 + 4 bytes at most: always fits.
     return std.mem.print(
-        buf,
+        name_buffer,
         "{x:0>16}-{d}-{d}.txt",
         .{ std.hash.Wyhash.hash(0, doc.path), doc.mtime, doc.size },
     ) catch unreachable;
@@ -586,9 +587,14 @@ fn unchanged(index: *const content.Index, id: u32, doc: content.DocIn) bool {
     return index.sources[id] == @backingInt(doc.source);
 }
 
-/// Every file to index, listed by ripgrep; `names` is what the name index
-/// said before listing, so a change during the listing lists again next time.
-fn listAll(service: *ContentService, arena: std.mem.Allocator, names: ?u64) ?[]content.DocIn {
+/// Every file to index, listed by ripgrep; `name_changes` is what the name
+/// index said before listing, so a change during the listing lists again
+/// next time.
+fn listAll(
+    service: *ContentService,
+    arena: std.mem.Allocator,
+    name_changes: ?u64,
+) ?[]content.DocIn {
     service.assertWorkerThread();
     const start_ns = sys.monotonicNs();
     const docs = content_list.list(arena, service.gpa, service.io, service.root, .{
@@ -600,7 +606,7 @@ fn listAll(service: *ContentService, arena: std.mem.Allocator, names: ?u64) ?[]c
     };
     service.counters.last_list_ns.store(sys.monotonicNs() - start_ns, .monotonic);
     _ = service.counters.listings.fetchAdd(1, .release);
-    service.worker.listed_names = names;
+    service.worker.listed_name_changes = name_changes;
     service.worker.listed_at_ns = start_ns;
     return docs;
 }
@@ -668,9 +674,9 @@ fn refresh(service: *ContentService) void {
     var arena_state: std.heap.ArenaAllocator = .init(service.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const names = if (service.opts.names) |names| names.nameChanges() else null;
+    const name_changes = if (service.options.names) |names| names.nameChanges() else null;
     var docs: ?[]content.DocIn = null;
-    var changed = service.changes(arena, names, &docs) orelse return;
+    var changed = service.changes(arena, name_changes, &docs) orelse return;
     if (service.stop.load(.acquire)) return;
     if (service.index != null and changed.gone.len == 0 and changed.added.len == 0) {
         if (service.worker.unsaved) service.retrySave();
@@ -683,7 +689,7 @@ fn refresh(service: *ContentService) void {
     const whole = service.wantsWhole(changed);
     // A whole build indexes every file: they must be listed.
     if (whole and docs == null) {
-        docs = service.listAll(arena, names) orelse return;
+        docs = service.listAll(arena, name_changes) orelse return;
         changed = service.diff(arena, docs.?) catch return;
     }
     var start_ns = sys.monotonicNs();
@@ -723,12 +729,12 @@ fn refresh(service: *ContentService) void {
 fn changes(
     service: *ContentService,
     arena: std.mem.Allocator,
-    names: ?u64,
+    name_changes: ?u64,
     docs: *?[]content.DocIn,
 ) ?Diff {
     const start_ns = sys.monotonicNs();
-    if (service.listingReason(names, start_ns) != null) {
-        docs.* = service.listAll(arena, names) orelse return null;
+    if (service.listingReason(name_changes, start_ns) != null) {
+        docs.* = service.listAll(arena, name_changes) orelse return null;
         return service.diff(arena, docs.*.?) catch null;
     }
     const changed = service.indexedChanges(arena) catch return null;
@@ -740,14 +746,18 @@ fn changes(
 /// looked at.
 const ListingReason = enum { no_index, names_unknown, names_changed, listing_stale };
 
-fn listingReason(service: *const ContentService, names: ?u64, now_ns: u64) ?ListingReason {
+fn listingReason(
+    service: *const ContentService,
+    name_changes: ?u64,
+    now_ns: u64,
+) ?ListingReason {
     service.assertWorkerThread();
     if (service.index == null) return .no_index;
-    const names_now = names orelse return .names_unknown;
-    const names_listed = service.worker.listed_names orelse return .names_unknown;
-    if (names_now != names_listed) return .names_changed;
+    const name_changes_now = name_changes orelse return .names_unknown;
+    const name_changes_listed = service.worker.listed_name_changes orelse return .names_unknown;
+    if (name_changes_now != name_changes_listed) return .names_changed;
     const listing_age_ns = now_ns - service.worker.listed_at_ns;
-    if (listing_age_ns >= service.opts.list_interval_ns) return .listing_stale;
+    if (listing_age_ns >= service.options.list_interval_ns) return .listing_stale;
     return null;
 }
 
@@ -761,8 +771,8 @@ fn wantsWhole(service: *const ContentService, changed: Diff) bool {
     const index = &(service.index orelse return true);
     const removed_count = index.docs_removed_count + changed.gone.len;
     const docs_count = index.docs_count + changed.added.len;
-    if (removed_count * 100 > docs_count * service.opts.removed_percent_max) return true;
-    if (index.segments_count >= service.opts.segments_max) return true;
+    if (removed_count * 100 > docs_count * service.options.removed_percent_max) return true;
+    if (index.segments_count >= service.options.segments_max) return true;
     return index.buf.len * 100 > index.bytes_live * (100 + garbage_percent_max);
 }
 
@@ -806,7 +816,7 @@ fn buildNext(service: *ContentService, input: BuildInput) ?content.Index {
     const reader: content.TextReader = .{
         .read = textOf,
         .ctx = service,
-        .extracted_len = textLen,
+        .extracted_bytes = cachedTextBytes,
     };
     if (std.mem.findScalarLast(u8, service.cache_path, '/')) |slash| {
         // The save below fails and says so; the index is served from memory.
@@ -921,7 +931,12 @@ fn dropStaleText(service: *ContentService, old: *const content.Index, gone: []co
     for (gone) |id| {
         if (old.sources[id] != @backingInt(content.Source.extracted)) continue;
         const text_path = service.textPath(&path_buffer, old.docIn(id)) orelse continue;
-        _ = std.os.linux.unlink(text_path);
+        // Left behind, it is deleted by the next whole build's sweep.
+        const result = std.os.linux.unlink(text_path);
+        switch (std.os.linux.errno(result)) {
+            .SUCCESS, .NOENT => {},
+            else => |errno| log.warn("deleting {s}: {t}", .{ text_path, errno }),
+        }
     }
 }
 
@@ -952,9 +967,10 @@ fn sweepText(service: *ContentService) void {
         }) catch return;
         keep.put(arena, old, name) catch return;
     }
-    var dir_buffer: paths.Buffer = undefined;
-    const dir = std.mem.printSentinel(&dir_buffer, "{s}", .{service.text_dir}, 0) catch return;
-    const fd = sys.openDir(dir) catch return;
+    var text_dir_buffer: paths.Buffer = undefined;
+    const text_dir = std.mem.printSentinel(&text_dir_buffer, "{s}", .{service.text_dir}, 0) catch
+        return;
+    const fd = sys.openDir(text_dir) catch return;
     defer sys.close(fd);
     var iterator: sys.DirIter = .{ .fd = fd };
     while (iterator.next() catch return) |entry| {
@@ -962,13 +978,22 @@ fn sweepText(service: *ContentService) void {
         var name_buffer: [256]u8 = undefined;
         const name = std.mem.printSentinel(&name_buffer, "{s}", .{entry.name}, 0) catch continue;
         const name_wanted = keep.get(entry.name) orelse {
-            _ = std.os.linux.unlinkat(fd, name, 0);
+            // Left behind, it is tried again by the next sweep.
+            const result = std.os.linux.unlinkat(fd, name, 0);
+            switch (std.os.linux.errno(result)) {
+                .SUCCESS, .NOENT => {},
+                else => |errno| log.warn("deleting {s}/{s}: {t}", .{ text_dir, name, errno }),
+            }
             continue;
         };
         if (std.mem.eql(u8, name_wanted, entry.name)) continue;
         var wanted_buffer: [64]u8 = undefined;
         const target = std.mem.printSentinel(&wanted_buffer, "{s}", .{name_wanted}, 0) catch continue;
-        _ = std.os.linux.renameat(fd, name, fd, target);
+        // Not renamed, the text is extracted again under its new name.
+        const result = std.os.linux.renameat(fd, name, fd, target);
+        if (std.os.linux.errno(result) != .SUCCESS) {
+            log.warn("renaming {s}/{s}: {t}", .{ text_dir, name, std.os.linux.errno(result) });
+        }
     }
 }
 
@@ -989,7 +1014,7 @@ fn run(service: *ContentService) void {
         // for any reason is harmless, since the loop looks at `stop` and
         // the clock either way.
         const since_check_ns = sys.monotonicNs() - service.counters.last_check_ns.load(.acquire);
-        const due_ns = service.opts.refresh_interval_ns -| since_check_ns;
+        const due_ns = service.options.refresh_interval_ns -| since_check_ns;
         service.io.futexWaitTimeout(u32, &service.wake.raw, seen, .{ .duration = .{
             .raw = .fromNanoseconds(@max(due_ns, std.time.ns_per_s)),
             .clock = .awake,
@@ -999,9 +1024,9 @@ fn run(service: *ContentService) void {
         const wake_now = service.wake.load(.acquire);
         const poked = wake_now != seen;
         seen = wake_now;
-        if (since_ns >= service.opts.refresh_interval_ns) {
+        if (since_ns >= service.options.refresh_interval_ns) {
             service.refresh();
-        } else if (poked and since_ns >= service.opts.poke_interval_ns_min) {
+        } else if (poked and since_ns >= service.options.poke_interval_ns_min) {
             service.refresh();
         }
     }
@@ -1014,11 +1039,11 @@ const linux = std.os.linux;
 const TestTree = sys.TestDir;
 
 fn haveTool(name: []const u8) bool {
-    const r = std.process.run(testing.allocator, testing.io, .{
+    const result = std.process.run(testing.allocator, testing.io, .{
         .argv = &.{ name, "--version" },
     }) catch return false;
-    testing.allocator.free(r.stdout);
-    testing.allocator.free(r.stderr);
+    testing.allocator.free(result.stdout);
+    testing.allocator.free(result.stderr);
     return true;
 }
 
@@ -1062,14 +1087,14 @@ const Fixture = struct {
         });
     }
 
-    fn startWith(fixture: *Fixture, opts: Options) !*ContentService {
+    fn startWith(fixture: *Fixture, options: Options) !*ContentService {
         return ContentService.startWith(
             testing.allocator,
             testing.io,
             fixture.root.abs,
             fixture.cache.abs,
             .{ .search = fixture.search_pool, .build = fixture.build_pool },
-            opts,
+            options,
         );
     }
 
@@ -1079,9 +1104,9 @@ const Fixture = struct {
     }
 };
 
-fn waitChecks(service: *ContentService, n: u32) !void {
+fn waitChecks(service: *ContentService, checks: u32) !void {
     for (0..2000) |_| {
-        if (service.status().checks >= n) return;
+        if (service.status().checks >= checks) return;
         sys.sleepUs(5_000);
     }
     return error.Timeout;
@@ -1089,54 +1114,57 @@ fn waitChecks(service: *ContentService, n: u32) !void {
 
 /// What the window does on open, then waits for that check to finish.
 fn pokeAndWait(service: *ContentService) !void {
-    const n = service.status().checks;
+    const checks_before = service.status().checks;
     service.poke();
-    try waitChecks(service, n + 1);
+    try waitChecks(service, checks_before + 1);
 }
 
 /// Moves a file's mtime away from "now": the index compares whole seconds.
-fn setMtime(path: [:0]const u8, sec: i64) !void {
-    const ts = [2]linux.timespec{ .{ .sec = sec, .nsec = 0 }, .{ .sec = sec, .nsec = 0 } };
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(
-        linux.utimensat(linux.AT.FDCWD, path, &ts, 0),
-    ));
+fn setMtime(path: [:0]const u8, mtime_s: i64) !void {
+    const time: linux.timespec = .{ .sec = mtime_s, .nsec = 0 };
+    const times = [2]linux.timespec{ time, time };
+    const result = linux.utimensat(linux.AT.FDCWD, path, &times, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(result));
 }
 
 /// Files in the text cache whose name starts with `prefix`.
 fn countText(service: *ContentService, prefix: []const u8) !usize {
-    var buf: paths.Buffer = undefined;
-    const fd = try sys.openDir(try std.mem.printSentinel(&buf, "{s}", .{service.text_dir}, 0));
+    var text_dir_buffer: paths.Buffer = undefined;
+    const text_dir = try std.mem.printSentinel(&text_dir_buffer, "{s}", .{service.text_dir}, 0);
+    const fd = try sys.openDir(text_dir);
     defer sys.close(fd);
-    var it: sys.DirIter = .{ .fd = fd };
-    var n: usize = 0;
-    while (try it.next()) |e| n += @intFromBool(std.mem.startsWith(u8, e.name, prefix));
-    return n;
+    var iterator: sys.DirIter = .{ .fd = fd };
+    var count: usize = 0;
+    while (try iterator.next()) |entry| {
+        count += @intFromBool(std.mem.startsWith(u8, entry.name, prefix));
+    }
+    return count;
 }
 
 test "content service: finds, follows edits and deletions, rebuilds only on change, reuses the saved index" {
-    var f: Fixture = undefined;
-    try f.init();
-    defer f.deinit();
-    try f.root.write("notes/alpha.txt", "the quick zanzibar fox\n");
-    try f.root.write("other.md", "unrelated words here\n");
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.root.write("notes/alpha.txt", "the quick zanzibar fox\n");
+    try fixture.root.write("other.md", "unrelated words here\n");
 
     {
-        const s = try f.start();
-        defer s.shutdown();
-        try waitChecks(s, 1);
-        var st = s.status();
-        try testing.expect(st.ready);
-        try testing.expect(!st.building);
-        try testing.expectEqual(@as(usize, 2), st.docs);
-        try testing.expectEqual(@as(u32, 1), st.builds);
+        const service = try fixture.start();
+        defer service.shutdown();
+        try waitChecks(service, 1);
+        var status_now = service.status();
+        try testing.expect(status_now.ready);
+        try testing.expect(!status_now.building);
+        try testing.expectEqual(@as(usize, 2), status_now.docs);
+        try testing.expectEqual(@as(u32, 1), status_now.builds);
 
-        var hits = try f.find(s, "zanzibar");
+        var hits = try fixture.find(service, "zanzibar");
         try testing.expectEqual(@as(usize, 1), hits.len);
         try testing.expect(std.mem.endsWith(u8, hits[0].path, "/notes/alpha.txt"));
         try testing.expect(!hits[0].extracted);
         try testing.expectEqual(@as(u32, 1), hits[0].line);
-        const text = s.readText(
-            f.arena_state.allocator(),
+        const text = service.readText(
+            fixture.arena_state.allocator(),
             hits[0].path,
             hits[0].mtime,
             .plain,
@@ -1145,208 +1173,210 @@ test "content service: finds, follows edits and deletions, rebuilds only on chan
         try testing.expectEqualStrings("the quick zanzibar fox\n", text);
 
         // Nothing changed: listed again, not rebuilt.
-        try pokeAndWait(s);
-        st = s.status();
-        try testing.expectEqual(@as(u32, 2), st.checks);
-        try testing.expectEqual(@as(u32, 1), st.builds);
+        try pokeAndWait(service);
+        status_now = service.status();
+        try testing.expectEqual(@as(u32, 2), status_now.checks);
+        try testing.expectEqual(@as(u32, 1), status_now.builds);
 
         // Edited: new words found, old ones gone.
-        var pbuf: paths.Buffer = undefined;
-        const alpha = try f.root.path(&pbuf, "notes/alpha.txt");
-        try f.root.write("notes/alpha.txt", "the slow kilimanjaro tortoise\n");
+        var path_buffer: paths.Buffer = undefined;
+        const alpha = try fixture.root.path(&path_buffer, "notes/alpha.txt");
+        try fixture.root.write("notes/alpha.txt", "the slow kilimanjaro tortoise\n");
         const edited = sys.nowSeconds() - 100;
         try setMtime(alpha, edited);
-        try pokeAndWait(s);
-        try testing.expectEqual(@as(u32, 2), s.status().builds);
-        try testing.expectEqual(@as(u32, 1), s.status().updates);
-        hits = try f.find(s, "kilimanjaro");
+        try pokeAndWait(service);
+        try testing.expectEqual(@as(u32, 2), service.status().builds);
+        try testing.expectEqual(@as(u32, 1), service.status().updates);
+        hits = try fixture.find(service, "kilimanjaro");
         try testing.expectEqual(@as(usize, 1), hits.len);
         try testing.expectEqual(edited, hits[0].mtime);
-        try testing.expectEqual(@as(usize, 0), (try f.find(s, "zanzibar")).len);
+        try testing.expectEqual(@as(usize, 0), (try fixture.find(service, "zanzibar")).len);
 
         // Deleted: out of the index.
-        _ = linux.unlink(alpha);
-        try pokeAndWait(s);
-        st = s.status();
-        try testing.expectEqual(@as(u32, 3), st.builds);
-        try testing.expectEqual(@as(u32, 2), st.updates);
-        try testing.expectEqual(@as(usize, 1), st.docs);
-        try testing.expectEqual(@as(usize, 0), (try f.find(s, "kilimanjaro")).len);
-        try testing.expectEqual(@as(usize, 1), (try f.find(s, "unrelated")).len);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.unlink(alpha)));
+        try pokeAndWait(service);
+        status_now = service.status();
+        try testing.expectEqual(@as(u32, 3), status_now.builds);
+        try testing.expectEqual(@as(u32, 2), status_now.updates);
+        try testing.expectEqual(@as(usize, 1), status_now.docs);
+        try testing.expectEqual(@as(usize, 0), (try fixture.find(service, "kilimanjaro")).len);
+        try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "unrelated")).len);
     }
 
     // Restarted on the same cache: the saved index serves at once, and the
     // start-up check finds nothing to rebuild.
-    const s = try f.start();
-    defer s.shutdown();
-    try testing.expect(s.status().ready);
-    try testing.expectEqual(@as(usize, 1), s.status().docs);
-    try testing.expectEqual(@as(usize, 1), (try f.find(s, "unrelated")).len);
-    try waitChecks(s, 1);
-    try testing.expectEqual(@as(u32, 0), s.status().builds);
+    const service = try fixture.start();
+    defer service.shutdown();
+    try testing.expect(service.status().ready);
+    try testing.expectEqual(@as(usize, 1), service.status().docs);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "unrelated")).len);
+    try waitChecks(service, 1);
+    try testing.expectEqual(@as(u32, 0), service.status().builds);
 }
 
 test "content service: a cache it cannot write still serves from memory, and saves later" {
-    var f: Fixture = undefined;
-    try f.init();
-    defer f.deinit();
-    try f.root.write("a.txt", "an unwritable cache lemur\n");
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.root.write("a.txt", "an unwritable cache lemur\n");
     // A directory where the index's temporary file goes: writing it fails.
-    var bbuf: paths.Buffer = undefined;
-    const blocker = try std.mem.printSentinel(&bbuf, "{s}/content.idx.tmp", .{f.cache.abs}, 0);
+    var blocker_buffer: paths.Buffer = undefined;
+    const blocker = try fixture.cache.path(&blocker_buffer, "content.idx.tmp");
     try testing.expect(linux.errno(linux.mkdir(blocker, 0o700)) == .SUCCESS);
-    const s = try f.start();
-    defer s.shutdown();
-    try waitChecks(s, 1);
-    try testing.expectEqual(@as(usize, 1), (try f.find(s, "lemur")).len);
-    var ibuf: paths.Buffer = undefined;
-    const saved = try std.mem.printSentinel(&ibuf, "{s}/content.idx", .{f.cache.abs}, 0);
+    const service = try fixture.start();
+    defer service.shutdown();
+    try waitChecks(service, 1);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "lemur")).len);
+    var saved_buffer: paths.Buffer = undefined;
+    const saved = try fixture.cache.path(&saved_buffer, "content.idx");
     try testing.expect(!sys.exists(saved));
     // Writable again: the next check saves it, though nothing changed.
-    _ = linux.rmdir(blocker);
-    try pokeAndWait(s);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.rmdir(blocker)));
+    try pokeAndWait(service);
     try testing.expect(sys.exists(saved));
-    try testing.expectEqual(@as(u32, 1), s.status().builds);
+    try testing.expectEqual(@as(u32, 1), service.status().builds);
 }
 
 test "content service: with the name index, checks without name changes only look at indexed files" {
-    var f: Fixture = undefined;
-    try f.init();
-    defer f.deinit();
-    try f.root.write("a.txt", "first apricot\n");
-    var ibuf: paths.Buffer = undefined;
-    const idx = try std.mem.printSentinel(&ibuf, "{s}/files.idx", .{f.cache.abs}, 0);
-    const names = try Service.start(testing.allocator, testing.io, f.root.abs, idx);
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.root.write("a.txt", "first apricot\n");
+    var names_path_buffer: paths.Buffer = undefined;
+    const names_path = try fixture.cache.path(&names_path_buffer, "files.idx");
+    const names = try Service.start(testing.allocator, testing.io, fixture.root.abs, names_path);
     defer names.shutdown();
     _ = try Service.waitNames(names, null);
-    const s = try f.startWith(.{
+    const service = try fixture.startWith(.{
         .refresh_interval_ns = std.math.maxInt(u64),
         .poke_interval_ns_min = 0,
         .removed_percent_max = 100,
         .names = names,
     });
-    defer s.shutdown();
-    try waitChecks(s, 1);
-    try testing.expectEqual(@as(u32, 1), s.status().listings);
+    defer service.shutdown();
+    try waitChecks(service, 1);
+    try testing.expectEqual(@as(u32, 1), service.status().listings);
 
     // Edited in place (no name change): seen without listing.
-    var pbuf: paths.Buffer = undefined;
-    try f.root.write("a.txt", "second banana\n");
-    try setMtime(try f.root.path(&pbuf, "a.txt"), sys.nowSeconds() - 100);
-    try pokeAndWait(s);
-    var st = s.status();
-    try testing.expectEqual(@as(u32, 1), st.listings);
-    try testing.expectEqual(@as(u32, 1), st.updates);
-    try testing.expectEqual(@as(usize, 1), (try f.find(s, "banana")).len);
-    try testing.expectEqual(@as(usize, 0), (try f.find(s, "apricot")).len);
+    var path_buffer: paths.Buffer = undefined;
+    try fixture.root.write("a.txt", "second banana\n");
+    try setMtime(try fixture.root.path(&path_buffer, "a.txt"), sys.nowSeconds() - 100);
+    try pokeAndWait(service);
+    var status_now = service.status();
+    try testing.expectEqual(@as(u32, 1), status_now.listings);
+    try testing.expectEqual(@as(u32, 1), status_now.updates);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "banana")).len);
+    try testing.expectEqual(@as(usize, 0), (try fixture.find(service, "apricot")).len);
 
     // A new file is a name change: the next check lists.
     const before = names.nameChanges().?;
-    try f.root.write("b.txt", "third cherry\n");
+    try fixture.root.write("b.txt", "third cherry\n");
     _ = try Service.waitNames(names, before);
-    try pokeAndWait(s);
-    st = s.status();
-    try testing.expectEqual(@as(u32, 2), st.listings);
-    try testing.expectEqual(@as(usize, 2), st.docs);
-    try testing.expectEqual(@as(usize, 1), (try f.find(s, "cherry")).len);
+    try pokeAndWait(service);
+    status_now = service.status();
+    try testing.expectEqual(@as(u32, 2), status_now.listings);
+    try testing.expectEqual(@as(usize, 2), status_now.docs);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "cherry")).len);
 }
 
 test "content service: rebuilt whole once removed versions pile up" {
-    var f: Fixture = undefined;
-    try f.init();
-    defer f.deinit();
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
     for (0..10) |i| {
-        var nbuf: [32]u8 = undefined;
-        try f.root.write(try std.mem.print(&nbuf, "n{d}.txt", .{i}), "plain words\n");
+        var name_buffer: [32]u8 = undefined;
+        try fixture.root.write(try std.mem.print(&name_buffer, "n{d}.txt", .{i}), "plain words\n");
     }
-    const s = try f.startWith(.{
+    const service = try fixture.startWith(.{
         .refresh_interval_ns = std.math.maxInt(u64),
         .poke_interval_ns_min = 0,
         .removed_percent_max = 20,
     });
-    defer s.shutdown();
-    try waitChecks(s, 1);
-    var pbuf: paths.Buffer = undefined;
+    defer service.shutdown();
+    try waitChecks(service, 1);
+    var path_buffer: paths.Buffer = undefined;
     // One of ten edited: updated.
-    try f.root.write("n0.txt", "first edit marmalade\n");
-    try setMtime(try f.root.path(&pbuf, "n0.txt"), sys.nowSeconds() - 100);
-    try pokeAndWait(s);
-    try testing.expectEqual(@as(u32, 1), s.status().updates);
+    try fixture.root.write("n0.txt", "first edit marmalade\n");
+    try setMtime(try fixture.root.path(&path_buffer, "n0.txt"), sys.nowSeconds() - 100);
+    try pokeAndWait(service);
+    try testing.expectEqual(@as(u32, 1), service.status().updates);
     // Three more: 4 removed of 14 is past 20 %, so rebuilt whole.
     for (1..4) |i| {
-        var nbuf: [32]u8 = undefined;
-        const name = try std.mem.print(&nbuf, "n{d}.txt", .{i});
-        try f.root.write(name, "later edit quokka\n");
-        try setMtime(try f.root.path(&pbuf, name), sys.nowSeconds() - 50);
+        var name_buffer: [32]u8 = undefined;
+        const name = try std.mem.print(&name_buffer, "n{d}.txt", .{i});
+        try fixture.root.write(name, "later edit quokka\n");
+        try setMtime(try fixture.root.path(&path_buffer, name), sys.nowSeconds() - 50);
     }
-    try pokeAndWait(s);
-    const st = s.status();
-    try testing.expectEqual(@as(u32, 3), st.builds);
-    try testing.expectEqual(@as(u32, 1), st.updates);
-    try testing.expectEqual(@as(usize, 10), st.docs);
-    try testing.expectEqual(@as(usize, 3), (try f.find(s, "quokka")).len);
-    try testing.expectEqual(@as(usize, 1), (try f.find(s, "marmalade")).len);
+    try pokeAndWait(service);
+    const status_now = service.status();
+    try testing.expectEqual(@as(u32, 3), status_now.builds);
+    try testing.expectEqual(@as(u32, 1), status_now.updates);
+    try testing.expectEqual(@as(usize, 10), status_now.docs);
+    try testing.expectEqual(@as(usize, 3), (try fixture.find(service, "quokka")).len);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "marmalade")).len);
     // Whole again: nothing removed is left.
-    s.lock.lockSharedUncancelable(s.io);
-    defer s.lock.unlockShared(s.io);
-    try testing.expectEqual(@as(usize, 0), s.index.?.docs_removed_count);
+    service.lock.lockSharedUncancelable(service.io);
+    defer service.lock.unlockShared(service.io);
+    try testing.expectEqual(@as(usize, 0), service.index.?.docs_removed_count);
 }
 
 test "content service: Office documents are extracted once per version" {
-    var f: Fixture = undefined;
-    try f.init();
-    defer f.deinit();
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
     if (!haveTool("zip") or !haveTool("unzip")) return error.SkipZigTest;
     // Staged outside the root, so document.xml is not indexed as plain text.
     var stage = try TestTree.init();
     defer stage.deinit();
     try stage.write("[Content_Types].xml", "<?xml version=\"1.0\"?><Types/>");
 
-    var pbuf: paths.Buffer = undefined;
-    const report = try f.root.path(&pbuf, "docs/report.docx");
-    try f.root.mkdir("docs");
+    var path_buffer: paths.Buffer = undefined;
+    const report = try fixture.root.path(&path_buffer, "docs/report.docx");
+    try fixture.root.mkdir("docs");
     const zipDoc = struct {
         fn run(tree: *TestTree, out: [:0]const u8, word: []const u8) !void {
-            var xbuf: [512]u8 = undefined;
-            try tree.write("word/document.xml", try std.mem.print(&xbuf,
+            var xml_buffer: [512]u8 = undefined;
+            try tree.write("word/document.xml", try std.mem.print(&xml_buffer,
                 \\<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Minutes about the {s} project</w:t></w:r></w:p></w:body></w:document>
             , .{word}));
-            _ = linux.unlink(out); // zip would add to an old one
-            const r = try std.process.run(testing.allocator, testing.io, .{
+            // Zip would add to an old one.
+            const unlinked = linux.errno(linux.unlink(out));
+            try testing.expect(unlinked == .SUCCESS or unlinked == .NOENT);
+            const result = try std.process.run(testing.allocator, testing.io, .{
                 .argv = &.{ "zip", "-q", "-X", "-r", out, "." },
                 .cwd = .{ .path = tree.abs },
             });
-            testing.allocator.free(r.stdout);
-            testing.allocator.free(r.stderr);
-            try testing.expect(r.term == .exited and r.term.exited == 0);
+            testing.allocator.free(result.stdout);
+            testing.allocator.free(result.stderr);
+            try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
         }
     }.run;
     try zipDoc(&stage, report, "wombat");
     try setMtime(report, sys.nowSeconds() - 200);
     // Not a zip: extraction fails, leaving an empty text so it is not retried.
-    try f.root.write("docs/broken.docx", "garbage, not a zip");
+    try fixture.root.write("docs/broken.docx", "garbage, not a zip");
 
-    var hash_buf: [32]u8 = undefined;
-    const prefix = try std.mem.print(&hash_buf, "{x:0>16}-", .{std.hash.Wyhash.hash(0, report)});
-    const v2 = sys.nowSeconds() - 100;
+    var prefix_buffer: [32]u8 = undefined;
+    const prefix = try std.mem.print(&prefix_buffer, "{x:0>16}-", .{std.hash.Wyhash.hash(0, report)});
+    const mtime_second = sys.nowSeconds() - 100;
 
     {
-        const s = try f.start();
-        defer s.shutdown();
-        try waitChecks(s, 1);
-        var st = s.status();
-        try testing.expectEqual(@as(usize, 2), st.docs);
-        try testing.expectEqual(@as(usize, 2), st.extracted);
-        try testing.expectEqual(@as(u32, 2), st.extractions);
-        try testing.expectEqual(@as(usize, 2), try countText(s, ""));
-        try testing.expectEqual(@as(usize, 1), try countText(s, prefix));
+        const service = try fixture.start();
+        defer service.shutdown();
+        try waitChecks(service, 1);
+        var status_now = service.status();
+        try testing.expectEqual(@as(usize, 2), status_now.docs);
+        try testing.expectEqual(@as(usize, 2), status_now.extracted);
+        try testing.expectEqual(@as(u32, 2), status_now.extractions);
+        try testing.expectEqual(@as(usize, 2), try countText(service, ""));
+        try testing.expectEqual(@as(usize, 1), try countText(service, prefix));
 
-        var hits = try f.find(s, "wombat");
+        var hits = try fixture.find(service, "wombat");
         try testing.expectEqual(@as(usize, 1), hits.len);
         try testing.expectEqualStrings(report, hits[0].path);
         try testing.expect(hits[0].extracted);
-        const text = s.readText(
-            f.arena_state.allocator(),
+        const text = service.readText(
+            fixture.arena_state.allocator(),
             hits[0].path,
             hits[0].mtime,
             .extracted,
@@ -1354,35 +1384,34 @@ test "content service: Office documents are extracted once per version" {
         ).?;
         try testing.expectEqualStrings("Minutes about the wombat project", text);
         // Asked as plain text, the zip is not the text.
-        if (s.readText(
-            f.arena_state.allocator(),
+        const raw = service.readText(
+            fixture.arena_state.allocator(),
             hits[0].path,
             hits[0].mtime,
             .plain,
             std.math.maxInt(u32),
-        )) |raw| {
-            try testing.expect(std.mem.find(u8, raw, "wombat") == null);
-        }
+        );
+        if (raw) |zip| try testing.expect(std.mem.find(u8, zip, "wombat") == null);
 
         // Unchanged: neither extracted nor rebuilt again (the broken one too).
-        try pokeAndWait(s);
-        st = s.status();
-        try testing.expectEqual(@as(u32, 2), st.extractions);
-        try testing.expectEqual(@as(u32, 1), st.builds);
+        try pokeAndWait(service);
+        status_now = service.status();
+        try testing.expectEqual(@as(u32, 2), status_now.extractions);
+        try testing.expectEqual(@as(u32, 1), status_now.builds);
 
         // A new version: extracted once more, the old version's text dropped.
         try zipDoc(&stage, report, "platypus");
-        try setMtime(report, v2);
-        try pokeAndWait(s);
-        st = s.status();
-        try testing.expectEqual(@as(u32, 3), st.extractions);
-        try testing.expectEqual(@as(u32, 2), st.builds);
-        try testing.expectEqual(@as(usize, 1), try countText(s, prefix));
-        var nbuf: [64]u8 = undefined;
-        const name = try std.mem.print(&nbuf, "{s}{d}-", .{ prefix, v2 });
-        try testing.expectEqual(@as(usize, 1), try countText(s, name));
-        try testing.expectEqual(@as(usize, 0), (try f.find(s, "wombat")).len);
-        hits = try f.find(s, "platypus");
+        try setMtime(report, mtime_second);
+        try pokeAndWait(service);
+        status_now = service.status();
+        try testing.expectEqual(@as(u32, 3), status_now.extractions);
+        try testing.expectEqual(@as(u32, 2), status_now.builds);
+        try testing.expectEqual(@as(usize, 1), try countText(service, prefix));
+        var name_buffer: [64]u8 = undefined;
+        const name = try std.mem.print(&name_buffer, "{s}{d}-", .{ prefix, mtime_second });
+        try testing.expectEqual(@as(usize, 1), try countText(service, name));
+        try testing.expectEqual(@as(usize, 0), (try fixture.find(service, "wombat")).len);
+        hits = try fixture.find(service, "platypus");
         try testing.expectEqual(@as(usize, 1), hits.len);
         try testing.expect(hits[0].extracted);
 
@@ -1390,113 +1419,113 @@ test "content service: Office documents are extracted once per version" {
         // size): the old text was reused, then the current one deleted as
         // the old version's.
         try zipDoc(&stage, report, "echidna, and a much longer sentence");
-        try setMtime(report, v2);
-        try pokeAndWait(s);
-        try testing.expectEqual(@as(u32, 4), s.status().extractions);
-        try testing.expectEqual(@as(usize, 0), (try f.find(s, "platypus")).len);
-        try testing.expectEqual(@as(usize, 1), (try f.find(s, "echidna")).len);
-        try testing.expectEqual(@as(usize, 1), try countText(s, prefix));
+        try setMtime(report, mtime_second);
+        try pokeAndWait(service);
+        try testing.expectEqual(@as(u32, 4), service.status().extractions);
+        try testing.expectEqual(@as(usize, 0), (try fixture.find(service, "platypus")).len);
+        try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "echidna")).len);
+        try testing.expectEqual(@as(usize, 1), try countText(service, prefix));
     }
 
     // Texts no document refers to: a version never indexed (a crash in
     // between), the old naming, a write cut short. Swept on start.
-    try f.cache.write("text/0123456789abcdef-1700000000-99.txt", "stale");
-    try f.cache.write("text/0123456789abcdef-1700000000.txt", "old name");
-    try f.cache.write("text/0123456789abcdef-1-2.txt.tmp", "half");
+    try fixture.cache.write("text/0123456789abcdef-1700000000-99.txt", "stale");
+    try fixture.cache.write("text/0123456789abcdef-1700000000.txt", "old name");
+    try fixture.cache.write("text/0123456789abcdef-1-2.txt.tmp", "half");
     // And the current version's text under the naming before sizes: renamed
     // on start, not extracted again.
-    var nbuf: paths.Buffer = undefined;
-    var obuf: paths.Buffer = undefined;
+    var now_name_buffer: paths.Buffer = undefined;
+    var old_name_buffer: paths.Buffer = undefined;
     const size = sys.info(report).?.size;
-    const now_name = try std.mem.printSentinel(&nbuf, "{s}/text/{s}{d}-{d}.txt", .{
-        f.cache.abs,
+    const now_name = try std.mem.printSentinel(&now_name_buffer, "{s}/text/{s}{d}-{d}.txt", .{
+        fixture.cache.abs,
         prefix,
-        v2,
+        mtime_second,
         size,
     }, 0);
-    const old_name = try std.mem.printSentinel(&obuf, "{s}/text/{s}{d}.txt", .{
-        f.cache.abs,
+    const old_name = try std.mem.printSentinel(&old_name_buffer, "{s}/text/{s}{d}.txt", .{
+        fixture.cache.abs,
         prefix,
-        v2,
+        mtime_second,
     }, 0);
     try sys.rename(now_name, old_name);
 
     // Restarted: the extracted text is reused, nothing is extracted again.
     // (Its text is found once renamed: the start's sweep, then the check.)
-    const s = try f.start();
-    defer s.shutdown();
-    try waitChecks(s, 1);
-    try testing.expectEqual(@as(u32, 0), s.status().extractions);
-    try testing.expectEqual(@as(u32, 0), s.status().builds);
-    try testing.expectEqual(@as(usize, 0), try countText(s, "0123456789abcdef-"));
+    const service = try fixture.start();
+    defer service.shutdown();
+    try waitChecks(service, 1);
+    try testing.expectEqual(@as(u32, 0), service.status().extractions);
+    try testing.expectEqual(@as(u32, 0), service.status().builds);
+    try testing.expectEqual(@as(usize, 0), try countText(service, "0123456789abcdef-"));
     // Both documents' texts stay (the broken one's is empty).
-    try testing.expectEqual(@as(usize, 2), try countText(s, ""));
+    try testing.expectEqual(@as(usize, 2), try countText(service, ""));
     try testing.expect(sys.exists(now_name));
-    try testing.expectEqual(@as(usize, 1), (try f.find(s, "echidna")).len);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "echidna")).len);
 
     // Deleted: its text goes with it.
-    _ = linux.unlink(report);
-    try pokeAndWait(s);
-    try testing.expectEqual(@as(usize, 0), try countText(s, prefix));
-    try testing.expectEqual(@as(usize, 1), s.status().docs);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.unlink(report)));
+    try pokeAndWait(service);
+    try testing.expectEqual(@as(usize, 0), try countText(service, prefix));
+    try testing.expectEqual(@as(usize, 1), service.status().docs);
 }
 
 test "content service: a document whose extraction failed in passing is left out, and retried" {
-    var t = try TestTree.init();
-    defer t.deinit();
-    try t.write("a.pdf", "not really a pdf");
-    try t.write("b.txt", "plain words here");
-    var pbuf: paths.Buffer = undefined;
-    const pdf = try t.path(&pbuf, "a.pdf");
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    try tree.write("a.pdf", "not really a pdf");
+    try tree.write("b.txt", "plain words here");
+    var path_buffer: paths.Buffer = undefined;
+    const pdf = try tree.path(&path_buffer, "a.pdf");
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const pool = try Pool.create(testing.allocator, testing.io, 0);
     defer pool.destroy();
     // Only what retrying touches: no thread, no cache.
-    var s: ContentService = .{
+    var service: ContentService = .{
         .gpa = testing.allocator,
         .io = testing.io,
-        .root = t.abs,
+        .root = tree.abs,
         .cache_path = undefined,
         .text_dir = undefined,
         .search_pool = pool,
         .build_pool = pool,
-        .opts = .{},
+        .options = .{},
         .worker = .{
             .thread_id = std.Thread.getCurrentId(),
             .retry_arena = .init(testing.allocator),
         },
     };
-    defer s.worker.retry_arena.deinit();
-    const docs = content_list.list(arena, testing.allocator, testing.io, t.abs, .{
+    defer service.worker.retry_arena.deinit();
+    const docs = content_list.list(arena, testing.allocator, testing.io, tree.abs, .{
         .documents = true,
-    }) catch |err|
-        return switch (err) {
-            error.FileNotFound => error.SkipZigTest, // no ripgrep
-            else => err,
-        };
+    }) catch |err| switch (err) {
+        // Without ripgrep.
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
     try testing.expectEqual(@as(usize, 2), docs.len);
     try testing.expectEqualStrings(pdf, docs[0].path);
 
     // Timed out: left out (indexed, it stayed textless until it changed).
-    const kept = s.leaveOut(arena, docs, &.{0}, &[_]?anyerror{error.Timeout}).?;
+    const kept = service.leaveOut(arena, docs, &.{0}, &[_]?anyerror{error.Timeout}).?;
     try testing.expectEqual(@as(usize, 1), kept.len);
     try testing.expect(std.mem.endsWith(u8, kept[0].path, "/b.txt"));
-    try testing.expectEqual(@as(usize, 1), s.worker.retry.len);
-    try testing.expectEqualStrings(pdf, s.worker.retry[0].path);
-    const reader: content.TextReader = .{ .read = textOf, .ctx = &s };
-    s.index = try content.build(testing.allocator, pool, kept, reader, null);
-    defer s.index.?.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), service.worker.retry.len);
+    try testing.expectEqualStrings(pdf, service.worker.retry[0].path);
+    const reader: content.TextReader = .{ .read = textOf, .ctx = &service };
+    service.index = try content.build(testing.allocator, pool, kept, reader, null);
+    defer service.index.?.deinit(testing.allocator);
 
     // The next check, though it lists nothing, tries it again.
-    const d = try s.indexedChanges(arena);
-    try testing.expectEqual(@as(usize, 0), d.gone.len);
-    try testing.expectEqual(@as(usize, 1), d.added.len);
-    try testing.expectEqualStrings(pdf, d.added[0].path);
-    try testing.expectEqual(content.Source.extracted, d.added[0].source);
+    const changes_found = try service.indexedChanges(arena);
+    try testing.expectEqual(@as(usize, 0), changes_found.gone.len);
+    try testing.expectEqual(@as(usize, 1), changes_found.added.len);
+    try testing.expectEqualStrings(pdf, changes_found.added[0].path);
+    try testing.expectEqual(content.Source.extracted, changes_found.added[0].source);
     // Extracted this time: indexed, nothing left to retry.
-    const all = s.leaveOut(arena, d.added, &.{0}, &[_]?anyerror{null}).?;
+    const all = service.leaveOut(arena, changes_found.added, &.{0}, &[_]?anyerror{null}).?;
     try testing.expectEqual(@as(usize, 1), all.len);
-    try testing.expectEqual(@as(usize, 0), s.worker.retry.len);
+    try testing.expectEqual(@as(usize, 0), service.worker.retry.len);
 }
