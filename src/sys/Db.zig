@@ -256,8 +256,25 @@ pub fn addClip(db: *Db, content: []const u8, now: i64, keep: u32) Error!void {
     , .{@max(keep, 1)});
 }
 
+/// A clipboard entry's rowid, so it cannot be passed where a time (the
+/// other i64 these functions take) is meant. SQLite's rowids start at 1.
+pub const ClipId = enum(i64) {
+    _,
+
+    fn of(row: i64) ClipId {
+        assert(row > 0);
+        return @fromBackingInt(row);
+    }
+
+    fn rowid(id: ClipId) i64 {
+        const value = @backingInt(id);
+        assert(value > 0);
+        return value;
+    }
+};
+
 pub const Clip = struct {
-    id: i64,
+    id: ClipId,
     /// The first `head_chars` characters; `clipContent` has all of it.
     head: []const u8,
     created_at: i64,
@@ -287,7 +304,7 @@ pub fn recentClips(
         // SQLite's LIMIT holds: never more rows than asked for.
         assert(list.items.len < limit);
         try list.append(arena, .{
-            .id = c.sqlite3_column_int64(stmt, 0),
+            .id = .of(c.sqlite3_column_int64(stmt, 0)),
             .head = try arena.dupe(u8, columnText(stmt, 1)),
             .created_at = c.sqlite3_column_int64(stmt, 2),
             .last_copied = c.sqlite3_column_int64(stmt, 3),
@@ -300,24 +317,24 @@ pub fn recentClips(
 pub fn clipContent(
     db: *Db,
     arena: std.mem.Allocator,
-    id: i64,
+    id: ClipId,
 ) (Error || std.mem.Allocator.Error)!?[]const u8 {
     const stmt = try db.prepare("SELECT content FROM clipboard WHERE id = ?1");
     defer _ = c.sqlite3_finalize(stmt);
-    try db.bind(stmt, .{id});
+    try db.bind(stmt, .{id.rowid()});
     if (!try db.nextRow(stmt)) return null;
     return try arena.dupe(u8, columnText(stmt, 0));
 }
 
-pub fn touchClip(db: *Db, id: i64, now: i64) Error!void {
-    // Ids come from `recentClips`: SQLite's rowids, which start at 1.
-    assert(id > 0);
-    try db.execArgs("UPDATE clipboard SET last_copied = ?2 WHERE id = ?1", .{ id, now });
+pub fn touchClip(db: *Db, id: ClipId, now_s: i64) Error!void {
+    try db.execArgs(
+        "UPDATE clipboard SET last_copied = ?2 WHERE id = ?1",
+        .{ id.rowid(), now_s },
+    );
 }
 
-pub fn deleteClip(db: *Db, id: i64) Error!void {
-    assert(id > 0);
-    try db.execArgs("DELETE FROM clipboard WHERE id = ?1", .{id});
+pub fn deleteClip(db: *Db, id: ClipId) Error!void {
+    try db.execArgs("DELETE FROM clipboard WHERE id = ?1", .{id.rowid()});
 }
 
 pub fn clearClips(db: *Db) Error!void {
@@ -455,6 +472,6 @@ test "a failed write is an error, not silence" {
         "CREATE TRIGGER no_delete BEFORE DELETE ON clipboard BEGIN SELECT RAISE(ABORT, 'locked'); END;",
     );
     try db.addClip("secret", 1, Db.clip_entries_max);
-    try std.testing.expectError(error.DbStep, db.deleteClip(1));
+    try std.testing.expectError(error.DbStep, db.deleteClip(.of(1)));
     try std.testing.expectError(error.DbExec, db.clearClips());
 }

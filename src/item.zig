@@ -97,7 +97,7 @@ pub const Action = union(enum) {
     /// Hyprland window address.
     focus_window: [:0]const u8,
     /// Row id in the clipboard table; the text is in `Item.detail`.
-    clip: i64,
+    clip: @import("sys/Db.zig").ClipId,
     script: struct { path: [:0]const u8, mode: core.script_meta.Mode },
     /// Calculator result; `Item.detail` holds the plain value to copy.
     calc,
