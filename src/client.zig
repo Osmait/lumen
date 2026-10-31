@@ -173,7 +173,12 @@ fn exchange(runtime_dir: []const u8, app_id: []const u8, request_bytes: []const 
     if (!unix.sendAll(fd, request_bytes)) {
         return failedAnswer("lumen: the daemon closed the connection\n");
     }
-    _ = linux.shutdown(fd, linux.SHUT.WR);
+    // The daemon reads the request until this end; without it, both would
+    // wait for each other forever.
+    if (failed(linux.shutdown(fd, linux.SHUT.WR)) != null) {
+        _ = linux.close(fd);
+        return failedAnswer("lumen: cannot finish the request to the daemon\n");
+    }
     // The daemon answers when it is done, however long that takes.
     const answer_bytes = unix.readAll(fd, &answer_buffer, unix.no_deadline) catch 0;
     _ = linux.close(fd);
