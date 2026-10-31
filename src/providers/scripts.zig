@@ -17,12 +17,16 @@ pub fn dir(arena: std.mem.Allocator) ?[:0]const u8 {
 }
 
 /// The last scan's scripts, and what the folder looked like then: the root
-/// view is built on every show, and each scan read every script. Main
-/// thread only.
-var cache_arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
-var cache_items: []Item = &.{};
-/// Null until the first scan.
-var cache_stamp: ?FolderStamp = null;
+/// view is built on every show, and each scan read every script.
+const Cache = struct {
+    arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator),
+    items: []Item = &.{},
+    /// Null until the first scan.
+    stamp: ?FolderStamp = null,
+};
+
+/// The process's one cache. Main thread only, like `load`.
+var cache: Cache = .{};
 
 const log = std.log.scoped(.scripts);
 
@@ -31,14 +35,14 @@ const log = std.log.scoped(.scripts);
 pub fn load(arena: std.mem.Allocator) []Item {
     const path = dir(arena) orelse return &.{};
     const folder_stamp = stamp(path);
-    const cached = if (cache_stamp) |last| std.meta.eql(last, folder_stamp) else false;
+    const cached = if (cache.stamp) |last| std.meta.eql(last, folder_stamp) else false;
     if (!cached) {
-        _ = cache_arena.reset(.retain_capacity);
-        cache_items = scan(cache_arena.allocator(), path);
-        cache_stamp = folder_stamp;
+        _ = cache.arena.reset(.retain_capacity);
+        cache.items = scan(cache.arena.allocator(), path);
+        cache.stamp = folder_stamp;
     }
-    const items = arena.alloc(Item, cache_items.len) catch return &.{};
-    for (cache_items, items, 0..) |cached_item, *item, copied| {
+    const items = arena.alloc(Item, cache.items.len) catch return &.{};
+    for (cache.items, items, 0..) |cached_item, *item, copied| {
         item.* = copy(arena, cached_item) catch {
             log.warn("out of memory: {d} of {d} scripts listed", .{ copied, items.len });
             return items[0..copied];

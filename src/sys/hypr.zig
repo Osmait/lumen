@@ -290,6 +290,7 @@ const DispatchQueue = struct {
     }
 };
 
+/// One queue for the one window that hides. Main thread only.
 var dispatch_queue: DispatchQueue = .{};
 
 pub fn batch(gpa: std.mem.Allocator, commands: []const []const u8) void {
@@ -377,6 +378,8 @@ const FocusWaiter = struct {
     }
 };
 
+/// One wait for the focus at a time, which every callback asked for in the
+/// meantime shares. Main thread only.
 var focus_waiter: FocusWaiter = .{};
 
 /// Calls `callback` once Hyprland gives a window the focus, else after

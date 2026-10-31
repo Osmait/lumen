@@ -44,6 +44,8 @@ const Server = struct {
     }
 };
 
+/// The daemon listens on one socket, so there is one server. GLib's watch
+/// callbacks reach it here; main thread only.
 var server: Server = .{};
 
 pub const ListenError = error{
