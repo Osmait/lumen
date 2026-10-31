@@ -23,9 +23,22 @@ const log = std.log.scoped(.content_search);
 /// `clip(query)`, not the query typed.
 pub const query_bytes_max = 1024;
 
-pub fn clip(query: []const u8) []const u8 {
-    return query[0..core.utf8.floorBoundary(query, query_bytes_max)];
-}
+gpa: std.mem.Allocator,
+io: std.Io,
+service: *index.ContentService,
+limit: usize,
+on_result: Callback,
+ctx: ?*anyopaque,
+thread: std.Thread = undefined,
+lock: std.Io.Mutex = .init,
+/// Bumped by every `submit`; the worker sleeps on it.
+gen: std.atomic.Value(u32) = .init(0),
+/// Set by `submit` (and `shutdown`), cleared by the worker when it takes
+/// the query: the query running is stale.
+newer: std.atomic.Value(bool) = .init(false),
+stop: std.atomic.Value(bool) = .init(false),
+query: core.FixedStr(query_bytes_max) = .{},
+query_start_ns: u64 = 0,
 
 /// Owned by the receiver of `Callback`, which frees it with `destroy`.
 pub const Result = struct {
@@ -51,24 +64,15 @@ pub const Result = struct {
 /// Called on the GTK main loop; takes ownership of `result`.
 pub const Callback = *const fn (result: *Result, ctx: ?*anyopaque) void;
 
-gpa: std.mem.Allocator,
-io: std.Io,
-service: *index.ContentService,
-limit: usize,
-on_result: Callback,
-ctx: ?*anyopaque,
-thread: std.Thread = undefined,
-lock: std.Io.Mutex = .init,
-/// Bumped by every `submit`; the worker sleeps on it.
-gen: std.atomic.Value(u32) = .init(0),
-/// Set by `submit` (and `shutdown`), cleared by the worker when it takes
-/// the query: the query running is stale.
-newer: std.atomic.Value(bool) = .init(false),
-stop: std.atomic.Value(bool) = .init(false),
-query: core.FixedStr(query_bytes_max) = .{},
-query_start_ns: u64 = 0,
-
 pub const StartError = std.mem.Allocator.Error || std.Thread.SpawnError;
+
+const Hop = struct { content_search: *ContentSearch, result: *Result };
+
+/// The part of `query` a search runs: whole UTF-8 characters, at most
+/// `query_bytes_max` bytes.
+pub fn clip(query: []const u8) []const u8 {
+    return query[0..core.utf8.floorBoundary(query, query_bytes_max)];
+}
 
 /// Starts the worker. `service` must outlive it.
 pub fn start(
@@ -189,8 +193,6 @@ fn run(content_search: *ContentSearch) void {
         _ = c.g_idle_add(&deliver, hop);
     }
 }
-
-const Hop = struct { content_search: *ContentSearch, result: *Result };
 
 fn deliver(data: ?*anyopaque) callconv(.c) c.gboolean {
     const hop: *Hop = @ptrCast(@alignCast(data.?));

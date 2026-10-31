@@ -53,36 +53,6 @@ pub const onContentResult = file_results.onContentResult;
 
 const log = std.log.scoped(.ui);
 
-/// The pieces' width in px: lumen.layout's, else the Width setting's.
-fn panelW(self: *const Ui) c_int {
-    if (self.layout.width) |width_px| return width_px;
-    return switch (self.settings.width) {
-        .narrow => 620,
-        .default => 750,
-        .wide => 920,
-    };
-}
-
-/// The pieces' height in px: lumen.layout's, else the Height setting's.
-fn panelH(self: *const Ui) c_int {
-    if (self.layout.height) |height_px| return height_px;
-    return switch (self.settings.height) {
-        .short => 380,
-        .default => 474,
-        .tall => 640,
-    };
-}
-
-/// The list's height limit: what is left beside the search bar, the
-/// results' padding and border, the footer and the gaps between pieces
-/// (none in a single panel).
-fn listMaxH(self: *const Ui) c_int {
-    const gap_px: c_int = if (self.layout.panels == .split) pieces_gap_px else 0;
-    const footer_px: c_int = if (self.layout.footer) footer_height_px + gap_px else 0;
-    const results_frame_px = 2 * (style_css.results_padding_px + style_css.results_border_px);
-    return self.panelH() - style_css.search_height_px - results_frame_px - gap_px - footer_px;
-}
-
 /// Sizes style.css sets that the window's arithmetic depends on. The test
 /// "style.css has the sizes Ui computes with" reads the stylesheet and
 /// fails when one side changes without the other.
@@ -523,6 +493,51 @@ const Navigation = struct {
     }
 };
 
+/// The settings lumen.layout can fix with its own pixels and place.
+const LayoutSetting = enum { width, height, position };
+
+/// The values `color_scheme_key` takes. "default" is the desktop's own
+/// default, which is light.
+const ColorScheme = enum { default, @"prefer-dark", @"prefer-light" };
+
+/// How a filtered list shows with nothing typed: the clipboard in Today,
+/// Yesterday and Earlier, the windows as they come.
+const Grouping = enum { by_day, flat };
+
+/// A hint says what Enter does, or warns that Enter is waiting for a
+/// second press (a destructive action) or that something failed.
+const HintTone = enum { action, warning };
+
+/// The pieces' width in px: lumen.layout's, else the Width setting's.
+fn panelWidth(self: *const Ui) c_int {
+    if (self.layout.width) |width_px| return width_px;
+    return switch (self.settings.width) {
+        .narrow => 620,
+        .default => 750,
+        .wide => 920,
+    };
+}
+
+/// The pieces' height in px: lumen.layout's, else the Height setting's.
+fn panelHeight(self: *const Ui) c_int {
+    if (self.layout.height) |height_px| return height_px;
+    return switch (self.settings.height) {
+        .short => 380,
+        .default => 474,
+        .tall => 640,
+    };
+}
+
+/// The list's height limit: what is left beside the search bar, the
+/// results' padding and border, the footer and the gaps between pieces
+/// (none in a single panel).
+fn listHeightMax(self: *const Ui) c_int {
+    const gap_px: c_int = if (self.layout.panels == .split) pieces_gap_px else 0;
+    const footer_px: c_int = if (self.layout.footer) footer_height_px + gap_px else 0;
+    const results_frame_px = 2 * (style_css.results_padding_px + style_css.results_border_px);
+    return self.panelHeight() - style_css.search_height_px - results_frame_px - gap_px - footer_px;
+}
+
 /// Rows built in the keystroke's frame: the ~8 the list shows and a few to
 /// scroll into. Building all 61 file rows (~430 widgets) per key cost ~14 of
 /// the view's 23 ms, because GTK laid out every one.
@@ -598,7 +613,7 @@ pub fn build(self: *Ui) void {
     const column = widgets.vbox(10);
     self.column = column;
     gtk.addClass(column, "shell");
-    gtk.setSizeRequest(column, self.panelW(), self.panelH());
+    gtk.setSizeRequest(column, self.panelWidth(), self.panelHeight());
     c.gtk_overlay_set_child(overlay, gtk.widget(column));
 
     self.buildSearchBar(column);
@@ -634,8 +649,8 @@ fn buildWindow(self: *Ui) *c.GtkOverlay {
     // natural size (a large image preview, a long path).
     c.gtk_window_set_default_size(
         win,
-        self.panelW() + 2 * style_css.shell_margin_px,
-        self.panelH() + 2 * style_css.shell_margin_px,
+        self.panelWidth() + 2 * style_css.shell_margin_px,
+        self.panelHeight() + 2 * style_css.shell_margin_px,
     );
 
     const window = win;
@@ -714,7 +729,7 @@ fn buildResults(self: *Ui, column: *c.GtkBox) void {
     );
     // As tall as the rows, up to the space left under the search bar.
     c.gtk_scrolled_window_set_propagate_natural_height(self.scroller, 1);
-    c.gtk_scrolled_window_set_max_content_height(self.scroller, self.listMaxH());
+    c.gtk_scrolled_window_set_max_content_height(self.scroller, self.listHeightMax());
     gtk.setHexpand(self.scroller, true);
     self.list = gtk.listBox();
     gtk.addClass(self.list, "results");
@@ -904,9 +919,9 @@ pub fn applyStructure(self: *Ui) void {
 fn applyLayout(self: *Ui) void {
     self.row_look.icon_px = themes.densitySizes(self.settings.density).icon_px;
     if (!self.built) return;
-    const width_px = self.panelW();
-    const height_px = self.panelH();
-    c.gtk_scrolled_window_set_max_content_height(self.scroller, self.listMaxH());
+    const width_px = self.panelWidth();
+    const height_px = self.panelHeight();
+    c.gtk_scrolled_window_set_max_content_height(self.scroller, self.listHeightMax());
     var width_current_px: c_int = 0;
     var height_current_px: c_int = 0;
     c.gtk_widget_get_size_request(gtk.widget(self.column), &width_current_px, &height_current_px);
@@ -1006,9 +1021,6 @@ pub fn applyOverrides(self: *Ui) void {
     const registry = self.ext_registry orelse return;
     for (registry.settings) |override| _ = self.settings.set(override.key, override.value);
 }
-
-/// The settings lumen.layout can fix with its own pixels and place.
-const LayoutSetting = enum { width, height, position };
 
 /// Set by init.lua: Settings shows it but cannot change it.
 pub fn overridden(self: *const Ui, key: []const u8) bool {
@@ -1124,9 +1136,6 @@ pub fn customThemes(self: *const Ui) []const themes.Theme {
 /// Where the desktop keeps its light or dark preference.
 const interface_schema = "org.gnome.desktop.interface";
 const color_scheme_key = "color-scheme";
-/// The values `color_scheme_key` takes. "default" is the desktop's own
-/// default, which is light.
-const ColorScheme = enum { default, @"prefer-dark", @"prefer-light" };
 
 /// The desktop's light/dark preference (dark when it cannot be read, or
 /// says something new).
@@ -1303,7 +1312,7 @@ fn placeOnFocusedMonitor(self: *Ui) void {
         const at_bottom = position == .bottom;
         c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_TOP, @intFromBool(!at_bottom));
         c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_BOTTOM, @intFromBool(at_bottom));
-        const room_px = geometry.height - self.panelH();
+        const room_px = geometry.height - self.panelHeight();
         const room_above_tenths: c_int = switch (position) {
             .center => position_center_tenths,
             .upper_third => position_upper_third_tenths,
@@ -1443,13 +1452,13 @@ fn layoutFor(self: *Ui, view: View) void {
     const detail_below = self.layout.detail == .bottom;
     c.gtk_widget_set_size_request(
         gtk.widget(self.scroller),
-        if (has_detail and !detail_below) @divTrunc(self.panelW() * 2, 5) else -1,
+        if (has_detail and !detail_below) @divTrunc(self.panelWidth() * 2, 5) else -1,
         -1,
     );
     gtk.setHexpand(self.scroller, !has_detail or detail_below);
     c.gtk_scrolled_window_set_max_content_height(
         self.scroller,
-        if (has_detail and detail_below) @divTrunc(self.listMaxH(), 2) else self.listMaxH(),
+        if (has_detail and detail_below) @divTrunc(self.listHeightMax(), 2) else self.listHeightMax(),
     );
     const keys: [4][:0]const u8 = switch (view) {
         .files => .{ "Kind", "Size", "Modified", "Where" },
@@ -1862,10 +1871,6 @@ fn fillRoot(self: *Ui, arena: std.mem.Allocator, query_text: []const u8) void {
     }
 }
 
-/// How a filtered list shows with nothing typed: the clipboard in Today,
-/// Yesterday and Earlier, the windows as they come.
-const Grouping = enum { by_day, flat };
-
 fn fillFiltered(
     self: *Ui,
     arena: std.mem.Allocator,
@@ -2023,7 +2028,7 @@ fn buildItemRow(self: *Ui, item_index: usize) void {
     self.rows.ensureUnusedCapacity(arena, 1) catch return;
     if (self.grid_mode) {
         const gaps_px = grid_spacing_px * (self.grid_columns - 1) + grid_frame_px;
-        const cell_px = @divTrunc(self.panelW() - gaps_px, self.grid_columns);
+        const cell_px = @divTrunc(self.panelWidth() - gaps_px, self.grid_columns);
         // At least a pixel: lumen.layout's width and a command's columns can leave
         // no room, and a cell of no width would ask for pictures of no size.
         const cell_width_px = @max(cell_px - 2 * style_css.grid_cell_padding_px, 1);
@@ -2124,10 +2129,6 @@ pub fn select(self: *Ui, row_index: ?usize) void {
     else
         null);
 }
-
-/// A hint says what Enter does, or warns that Enter is waiting for a
-/// second press (a destructive action) or that something failed.
-const HintTone = enum { action, warning };
 
 /// The footer's "what Enter does" (hidden with nothing selected).
 fn setFooterAction(self: *Ui, text: []const u8, tone: HintTone) void {
@@ -2485,8 +2486,8 @@ pub fn dump(
         .{if (self.settings.style.len > 0) self.settings.style else "-"},
     );
     try writer.print("layout: {d}x{d} panels={t} search={t} detail={t} rows={t} footer={}", .{
-        self.panelW(),
-        self.panelH(),
+        self.panelWidth(),
+        self.panelHeight(),
         lay.panels,
         lay.search,
         lay.detail,
