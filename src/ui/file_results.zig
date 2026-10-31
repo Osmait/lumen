@@ -151,7 +151,8 @@ pub fn fileIcon(ui: *Ui, path: [:0]const u8, is_directory: bool) item_mod.Icon {
             var key_bytes: [file_key_prefix.len + extension_bytes_max]u8 = undefined;
             const extension = name[dot.? + 1 ..];
             const key = std.mem.print(&key_bytes, file_key_prefix ++ "{s}", .{extension}) catch "";
-            if (config.keyIcon(ui, std.ascii.lowerString(key_bytes[0..key.len], key))) |icon| return icon;
+            const key_lower = std.ascii.lowerString(key_bytes[0..key.len], key);
+            if (config.keyIcon(ui, key_lower)) |icon| return icon;
         }
         if (core.file_badge.logoOf(name)) |logo| return .{ .logo = logo };
         var badge_text: [4]u8 = undefined;

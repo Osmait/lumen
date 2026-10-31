@@ -455,7 +455,11 @@ fn onScrollTick(_: ?*c.GtkWidget, _: ?*c.GdkFrameClock, data: ?*anyopaque) callc
     return 0;
 }
 
-pub fn onRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, data: ?*anyopaque) callconv(.c) void {
+pub fn onRowActivated(
+    _: *c.GtkListBox,
+    row: *c.GtkListBoxRow,
+    data: ?*anyopaque,
+) callconv(.c) void {
     const ui: *Ui = @ptrCast(@alignCast(data));
     const row_tag = @intFromPtr(c.g_object_get_data(row, row_index_data_key));
     // 0 is no data at all: a row Lumen did not build (the empty text).

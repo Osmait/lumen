@@ -81,11 +81,12 @@ fn settingRow(
     row: RowSpec,
 ) Item {
     const title, const icon, const source, const keywords = row;
+    const custom_themes = config.customThemes(ui);
     const name: []const u8, const value: [:0]const u8, const action: item_mod.Setting =
         switch (source) {
             .theme => .{
                 "theme",
-                themes.displayName(arena, ui.settings.theme, config.preferDark(ui), config.customThemes(ui)),
+                themes.displayName(arena, ui.settings.theme, config.preferDark(ui), custom_themes),
                 .{ .go = .themes },
             },
             .default_apps => .{
@@ -780,7 +781,9 @@ fn lockKey(setting: item_mod.Setting) ?[]const u8 {
 
 /// Applies what a settings row does.
 pub fn performSetting(ui: *Ui, setting: item_mod.Setting, operation: item_mod.Operation) void {
-    if (lockKey(setting)) |key| if (config.overridden(ui, key)) return ui.showFailure("Set in init.lua");
+    if (lockKey(setting)) |key| {
+        if (config.overridden(ui, key)) return ui.showFailure("Set in init.lua");
+    }
     switch (setting) {
         .toggle => |toggle| {
             ui.settings.setToggle(toggle, !ui.settings.get(toggle));

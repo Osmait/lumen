@@ -275,7 +275,8 @@ fn fillSuggestions(ui: *Ui, arena: std.mem.Allocator) void {
     sortByScore(used.items);
     if (used.items.len > 0 and ui.settings.suggestions) {
         row_list.addSection(ui, "Suggestions");
-        for (used.items[0..@min(used.items.len, suggestions_max)]) |item| row_list.addItem(ui, item);
+        const suggested = used.items[0..@min(used.items.len, suggestions_max)];
+        for (suggested) |item| row_list.addItem(ui, item);
     }
     row_list.addSection(ui, "Commands");
     for (ui.base) |item| {
@@ -379,7 +380,8 @@ fn fillFiltered(
     }
     sortByScore(hits.items);
     ui.search_ns += stats.now() - search_start_ns;
-    for (hits.items[0..@min(hits.items.len, filtered_results_max)]) |item| row_list.addItem(ui, item);
+    const shown = hits.items[0..@min(hits.items.len, filtered_results_max)];
+    for (shown) |item| row_list.addItem(ui, item);
 }
 
 /// Best first; equal scores by title, so the order never depends on the
