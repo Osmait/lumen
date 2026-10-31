@@ -29,10 +29,13 @@ const linux = std.os.linux;
 const Pool = @import("Pool.zig");
 const sys = @import("os");
 const format = @import("format.zig");
-const align8 = format.align8;
+const alignUp = format.alignUp;
+const Bytes = format.Bytes;
+const BytesConst = format.BytesConst;
 const corpusEntry = format.corpusEntry;
 const fold = @import("core").fold;
 const utf8 = @import("core").utf8;
+const recency = @import("recency.zig");
 
 /// 02: trigrams of folded text (accents and case, `core.fold`).
 /// 03: a flags column (documents removed by an incremental update).
@@ -86,16 +89,22 @@ const Trigrams = struct {
     fn next(trigrams: *Trigrams) ?u32 {
         while (trigrams.position < trigrams.text.len) {
             const folded = fold.step(trigrams.text, &trigrams.position);
-            trigrams.window = (trigrams.window << 8 | folded) & trigram_mask;
-            if (trigrams.seen == 2) return trigrams.window;
+            trigrams.window = (trigrams.window << @bitSizeOf(u8) | folded) & trigram_mask;
+            if (trigrams.seen == trigram_chars - 1) return trigrams.window;
             trigrams.seen += 1;
         }
         return null;
     }
 };
 
-/// Three folded characters of one byte each.
-const trigram_mask: u32 = 0xff_ffff;
+/// A trigram is this many folded characters of one byte each: queries
+/// shorter than that cannot be narrowed by the index.
+pub const trigram_chars = 3;
+const trigram_bits = trigram_chars * @bitSizeOf(u8);
+const trigram_mask: u32 = (1 << trigram_bits) - 1;
+/// Every possible trigram: the most distinct (trigram, doc) pairs a single
+/// document can give.
+const trigrams_count = trigram_mask + 1;
 
 /// The first bytes of the file. The doc table's columns and the segments'
 /// arrays are read in place, in the host's byte order, and so is this: the
@@ -178,11 +187,11 @@ const DocColumns = struct {
     docs_removed_count: usize,
 
     fn parse(
-        buf: []align(8) u8,
+        buf: Bytes,
         docs_offset: usize,
         docs_count: usize,
     ) error{BadIndex}!DocColumns {
-        assert(docs_offset % 8 == 0);
+        assert(docs_offset % format.alignment_bytes == 0);
         assert(docs_offset + docs_count * doc_size <= buf.len);
         var cursor = docs_offset;
         var columns: DocColumns = undefined;
@@ -218,7 +227,7 @@ const DocColumns = struct {
 };
 
 pub const Index = struct {
-    buf: []align(8) u8,
+    buf: Bytes,
     mapped: bool,
     docs_count: usize,
     segments_count: usize,
@@ -297,7 +306,7 @@ pub const Index = struct {
     /// would mean decoding every list on open. Whatever reads lists across
     /// segments copes with ids that repeat or go back instead (`candidates`,
     /// `closeSegment`).
-    pub fn parse(whole: []align(8) u8, mapped: bool) error{BadIndex}!Index {
+    pub fn parse(whole: Bytes, mapped: bool) error{BadIndex}!Index {
         if (whole.len < header_size) return error.BadIndex;
         const header = Header.decode(whole[0..header_size]);
         if (!std.mem.eql(u8, &header.magic, magic)) return error.BadIndex;
@@ -307,7 +316,13 @@ pub const Index = struct {
         // Doc ids are u32 in posting lists and results.
         if (header.docs_count > std.math.maxInt(u32)) return error.BadIndex;
         const docs_count: usize = @intCast(header.docs_count);
-        const docs_offset = try region(buf.len, header.docs_offset, docs_count, doc_size, 8);
+        const docs_offset = try region(
+            buf.len,
+            header.docs_offset,
+            docs_count,
+            doc_size,
+            format.alignment_bytes,
+        );
         if (docs_offset < header_size) return error.BadIndex;
         const paths_offset = docs_offset + docs_count * doc_size;
         if (header.paths_size > buf.len - paths_offset) return error.BadIndex;
@@ -316,7 +331,7 @@ pub const Index = struct {
             header.directory_offset,
             header.segments_count,
             @sizeOf(SegmentEntry),
-            8,
+            format.alignment_bytes,
         );
         const segments_count: usize = @intCast(header.segments_count);
 
@@ -471,7 +486,7 @@ fn region(
     return @intCast(offset);
 }
 
-fn checkSegment(buf: []align(8) const u8, segment: SegmentEntry) error{BadIndex}!void {
+fn checkSegment(buf: BytesConst, segment: SegmentEntry) error{BadIndex}!void {
     const keys_offset = try region(buf.len, segment.keys_offset, segment.keys_count, 4, 4);
     const keys_count: usize = @intCast(segment.keys_count); // Fits: bounded by buf.len.
     const offsets_count = std.math.add(u64, segment.keys_count, 1) catch return error.BadIndex;
@@ -490,7 +505,7 @@ fn checkSegment(buf: []align(8) const u8, segment: SegmentEntry) error{BadIndex}
     if (offsets[keys_count] > segment.postings_size) return error.BadIndex;
 }
 
-fn sliceAt(comptime T: type, buf: []align(8) u8, offset: usize, count: usize) []T {
+fn sliceAt(comptime T: type, buf: Bytes, offset: usize, count: usize) []T {
     assert(offset % @alignOf(T) == 0);
     assert(offset + count * @sizeOf(T) <= buf.len);
     const items: [*]T = @ptrCast(@alignCast(buf.ptr + offset));
@@ -517,6 +532,15 @@ fn strictlyAscending(comptime T: type, items: []const T) bool {
     return true;
 }
 
+/// Varints are unsigned LEB128: seven bits of the number per byte, low bits
+/// first, the high bit set on every byte but the last.
+const varint_payload_bits = 7;
+const varint_payload_mask: u8 = (1 << varint_payload_bits) - 1;
+const varint_continues: u8 = 1 << varint_payload_bits;
+/// A u32 takes five bytes at most; the fifth carries the top four bits.
+const varint_last_shift = 4 * varint_payload_bits;
+const varint_last_payload_max: u8 = (1 << (@bitSizeOf(u32) - varint_last_shift)) - 1;
+
 /// Next varint of `bytes` from `position`, or null at the end of the list or
 /// on a malformed one: cut off by the end of the list (continuation bit on
 /// the last byte) or longer than a u32 needs. Never reads past `bytes`.
@@ -526,14 +550,13 @@ fn readVarint(bytes: []const u8, position: *usize) ?u32 {
     var i = position.*;
     while (i < bytes.len) : (i += 1) {
         const byte = bytes[i];
-        // The 5th byte holds the top 4 bits and ends the number.
-        if (shift == 28 and byte > 0x0f) return null;
-        value |= @as(u32, byte & 0x7f) << shift;
-        if (byte & 0x80 == 0) {
+        if (shift == varint_last_shift and byte > varint_last_payload_max) return null;
+        value |= @as(u32, byte & varint_payload_mask) << shift;
+        if (byte & varint_continues == 0) {
             position.* = i + 1;
             return value;
         }
-        shift += 7;
+        shift += varint_payload_bits;
     }
     return null;
 }
@@ -571,9 +594,9 @@ const ListReader = struct {
 
 fn writeVarint(gpa: std.mem.Allocator, out: *std.ArrayList(u8), value: u32) !void {
     var rest = value;
-    while (rest >= 0x80) {
-        try out.append(gpa, @intCast(rest & 0x7f | 0x80));
-        rest >>= 7;
+    while (rest >= varint_continues) {
+        try out.append(gpa, @as(u8, @intCast(rest & varint_payload_mask)) | varint_continues);
+        rest >>= varint_payload_bits;
     }
     try out.append(gpa, @intCast(rest));
 }
@@ -650,7 +673,7 @@ pub const TextReader = struct {
             else
                 extracted_bytes_max,
         };
-        return @intCast(@min(text_size, 1 << 24));
+        return @intCast(@min(text_size, trigrams_count));
     }
 };
 
@@ -701,9 +724,10 @@ fn extractTask(ctx: *ExtractCtx, task: usize) void {
 
 fn extractTaskOrFail(ctx: *ExtractCtx, task: usize) std.mem.Allocator.Error!void {
     const gpa = ctx.gpa;
-    // One bit per possible trigram: dedup in O(n) without sorting.
-    var seen: []u64 = &.{};
-    defer gpa.free(seen);
+    // One bit per possible trigram: dedup in O(n) without sorting. Made on
+    // the first document with text, then reused and cleared key by key.
+    var seen: std.DynamicBitSetUnmanaged = .{};
+    defer seen.deinit(gpa);
     var keys: std.ArrayList(u32) = .empty;
     defer keys.deinit(gpa);
     var text: std.ArrayList(u8) = .empty;
@@ -719,22 +743,17 @@ fn extractTaskOrFail(ctx: *ExtractCtx, task: usize) std.mem.Allocator.Error!void
             .len = out.items.len - start,
         };
         if (!try ctx.text.read(ctx.text.ctx, ctx.docs[doc], &text, gpa)) continue;
-        if (seen.len == 0) {
-            seen = try gpa.alloc(u64, @divExact(trigram_mask + 1, 64));
-            @memset(seen, 0);
-        }
+        if (seen.bit_length == 0) seen = try .initEmpty(gpa, trigrams_count);
         keys.clearRetainingCapacity();
         var trigrams: Trigrams = .{ .text = text.items };
         while (trigrams.next()) |key| {
-            const word = key >> 6;
-            const bit = @as(u64, 1) << @intCast(key & 63);
-            if (seen[word] & bit != 0) continue;
-            seen[word] |= bit;
+            if (seen.isSet(key)) continue;
+            seen.set(key);
             try keys.append(gpa, key);
         }
-        for (keys.items) |key| seen[key >> 6] &= ~(@as(u64, 1) << @intCast(key & 63));
+        for (keys.items) |key| seen.unset(key);
         try out.ensureUnusedCapacity(gpa, keys.items.len);
-        for (keys.items) |key| out.appendAssumeCapacity(@as(u64, key) << 32 | doc);
+        for (keys.items) |key| out.appendAssumeCapacity(pairOf(key, @intCast(doc)));
     }
 }
 
@@ -975,7 +994,7 @@ fn segmentPairs(
         };
         while (reader.next()) |doc| {
             if (flags[doc] & flag_removed != 0) continue;
-            try out.append(gpa, @as(u64, key) << 32 | doc);
+            try out.append(gpa, pairOf(key, doc));
         }
     }
 }
@@ -1021,8 +1040,10 @@ const Sink = struct {
         try sink.buf.appendNTimes(sink.gpa, 0, n);
     }
 
-    fn pad8(sink: *Sink) FileError!void {
-        while (sink.pos() % 8 != 0) try sink.buf.append(sink.gpa, 0);
+    /// Zeros up to the next multiple of `format.alignment_bytes`.
+    fn padToAlignment(sink: *Sink) FileError!void {
+        try sink.zeros(alignUp(sink.pos()) - sink.pos());
+        assert(sink.pos() % format.alignment_bytes == 0);
     }
 
     /// Writes what is buffered (file mode only).
@@ -1136,7 +1157,7 @@ fn writeDocs(
         .reserve => try sink.zeros(header_size),
         .none => assert(sink.pos() >= header_size),
     }
-    try sink.pad8();
+    try sink.padToAlignment();
     var paths_size: usize = 0;
     for (docs[reused.len..]) |doc| paths_size += doc.path.len;
     // The path size column is u16; `DocIn.path` promises that it fits.
@@ -1149,7 +1170,7 @@ fn writeDocs(
 
     // Built in the buffer: nothing is written before the doc table is done.
     const table_start = sink.buf.items.len;
-    try sink.zeros(align8(docs.len * doc_size + paths_size));
+    try sink.zeros(alignUp(docs.len * doc_size + paths_size));
     const table = sink.buf.items;
     var cursor = table_start;
     for (docs) |doc| {
@@ -1291,15 +1312,15 @@ fn closePairs(
 fn copySegment(
     sink: *Sink,
     dir: *std.ArrayList(SegmentEntry),
-    from: []align(8) const u8,
+    from: BytesConst,
     segment: SegmentEntry,
 ) FileError!void {
     const keys_count: usize = @intCast(segment.keys_count);
     const postings_size: usize = @intCast(segment.postings_size);
-    try sink.pad8();
+    try sink.padToAlignment();
     const keys_offset = sink.pos();
     try sink.append(from[@intCast(segment.keys_offset)..][0 .. keys_count * @sizeOf(u32)]);
-    try sink.pad8();
+    try sink.padToAlignment();
     const offsets_offset = sink.pos();
     const offsets_size = (keys_count + 1) * @sizeOf(u32);
     try sink.append(from[@intCast(segment.offsets_offset)..][0..offsets_size]);
@@ -1327,7 +1348,7 @@ fn finish(
     build_stats: *BuildStats,
     stats: ?*BuildStats,
 ) FileError!Header {
-    try sink.pad8();
+    try sink.padToAlignment();
     const directory_offset = sink.pos();
     try sink.append(std.mem.sliceAsBytes(dir));
     const size_total = sink.pos();
@@ -1336,12 +1357,12 @@ fn finish(
 
     assert(docs_count <= std.math.maxInt(u32));
     assert(table.offset >= header_size);
-    assert(table.offset % 8 == 0);
+    assert(table.offset % format.alignment_bytes == 0);
     assert(table.offset + docs_count * doc_size + table.paths_size <= directory_offset);
-    assert(directory_offset % 8 == 0);
+    assert(directory_offset % format.alignment_bytes == 0);
     for (dir) |segment| {
-        assert(segment.keys_offset % 4 == 0);
-        assert(segment.offsets_offset % 4 == 0);
+        assert(segment.keys_offset % @alignOf(u32) == 0);
+        assert(segment.offsets_offset % @alignOf(u32) == 0);
         assert(segment.postings_offset + segment.postings_size <= directory_offset);
     }
     return .{
@@ -1385,10 +1406,10 @@ fn closeSegment(
         assert(encoded);
     }
 
-    try sink.pad8();
+    try sink.padToAlignment();
     const keys_offset = sink.pos();
     try sink.append(std.mem.sliceAsBytes(lists.keys.items));
-    try sink.pad8();
+    try sink.padToAlignment();
     const offsets_offset = sink.pos();
     try sink.append(std.mem.sliceAsBytes(lists.offsets.items));
     const postings_offset = sink.pos();
@@ -1431,7 +1452,7 @@ const Lists = struct {
     ) std.mem.Allocator.Error!bool {
         var i: usize = 0;
         while (i < pairs.len) {
-            const key: u32 = @intCast(pairs[i] >> 32);
+            const key = pairKey(pairs[i]);
             if (lists.keys.getLastOrNull()) |key_previous| {
                 if (key_previous >= key) return false;
             }
@@ -1439,8 +1460,8 @@ const Lists = struct {
             try lists.offsets.append(gpa, @intCast(lists.postings.items.len));
             var doc_previous: u32 = 0;
             var first = true;
-            while (i < pairs.len and pairs[i] >> 32 == key) : (i += 1) {
-                const doc: u32 = @truncate(pairs[i]);
+            while (i < pairs.len and pairKey(pairs[i]) == key) : (i += 1) {
+                const doc = pairDoc(pairs[i]);
                 if (!first and doc <= doc_previous) return false;
                 first = false;
                 try writeVarint(gpa, &lists.postings, doc - doc_previous);
@@ -1453,22 +1474,39 @@ const Lists = struct {
     }
 };
 
-/// The radix sort takes the 24 bits of a trigram in two passes.
+/// A (trigram, doc) pair packed in a u64, the trigram in the high half:
+/// sorting the numbers sorts by trigram, then by doc.
+const pair_key_shift = @bitSizeOf(u32);
+
+inline fn pairOf(key: u32, doc: u32) u64 {
+    assert(key <= trigram_mask);
+    return @as(u64, key) << pair_key_shift | doc;
+}
+
+inline fn pairKey(pair: u64) u32 {
+    return @intCast(pair >> pair_key_shift);
+}
+
+inline fn pairDoc(pair: u64) u32 {
+    return @truncate(pair);
+}
+
+/// The radix sort takes the bits of a trigram in two passes.
 const radix_bits = 12;
 const radix_buckets = 1 << radix_bits;
 
 comptime {
-    assert(2 * radix_bits == 24);
+    assert(2 * radix_bits == trigram_bits);
     assert(radix_buckets - 1 == trigram_mask >> radix_bits);
 }
 
-/// LSD radix sort on bits 32..55 (the trigram), two stable passes of
+/// LSD radix sort on the trigram half of each pair, two stable passes of
 /// `radix_bits` bits. `scratch` is as long as `pairs` and left garbled.
 fn radixByKey(pairs: []u64, scratch: []u64) void {
     assert(scratch.len == pairs.len);
     var source = pairs;
     var target = scratch;
-    inline for (.{ 32, 32 + radix_bits }) |shift| {
+    inline for (.{ pair_key_shift, pair_key_shift + radix_bits }) |shift| {
         var count: [radix_buckets + 1]usize = @splat(0);
         for (source) |pair| {
             const bucket: usize = @intCast((pair >> shift) & (radix_buckets - 1));
@@ -1537,6 +1575,23 @@ const NeedleKind = enum {
     raw,
 };
 
+/// Bytes of `hay` compared at once by `findFoldImpl`'s vector loop.
+const vector_bytes = 32;
+/// Set in a lower-case ASCII letter, clear in its capital.
+const ascii_case_bit = 0x20;
+/// The UTF-8 lead bytes of the accented letters `core.fold` folds (Latin-1
+/// Supplement and Latin Extended-A). They mirror its own `lead_first` and
+/// `lead_last`.
+const folded_lead_first = 0xC3;
+const folded_lead_last = 0xC5;
+
+comptime {
+    assert('a' | ascii_case_bit == 'a');
+    assert('A' | ascii_case_bit == 'a');
+    // One mask bit per byte of the vector.
+    assert(vector_bytes == @bitSizeOf(u32));
+}
+
 fn findFoldImpl(
     comptime kind: NeedleKind,
     hay: []const u8,
@@ -1551,17 +1606,20 @@ fn findFoldImpl(
     const first = fold.step(needle, &j);
     const letter = first >= 'a' and first <= 'z';
     const last_start = hay.len - needle_folded_count;
-    const V = @Vector(32, u8);
+    const V = @Vector(vector_bytes, u8);
     var i = from;
-    while (i + 32 <= last_start + 1) : (i += 32) {
-        const v: V = hay[i..][0..32].*;
+    while (i + vector_bytes <= last_start + 1) : (i += vector_bytes) {
+        const v: V = hay[i..][0..vector_bytes].*;
         var mask: u32 = undefined;
         if (letter) {
-            // For a letter, `v | 0x20 == first` holds exactly for its two
-            // cases (cheaper than folding A-Z first); plus every lead byte
-            // of an accented letter (0xC3-0xC5, one unsigned compare).
-            const cases: u32 = @bitCast(v | @as(V, @splat(0x20)) == @as(V, @splat(first)));
-            const lead: u32 = @bitCast(v -% @as(V, @splat(0xC3)) <= @as(V, @splat(2)));
+            // For a letter, `v | ascii_case_bit == first` holds exactly for
+            // its two cases (cheaper than folding A-Z first); plus every lead
+            // byte of an accented letter (one unsigned compare).
+            const lower: V = v | @as(V, @splat(ascii_case_bit));
+            const cases: u32 = @bitCast(lower == @as(V, @splat(first)));
+            const lead_offset = v -% @as(V, @splat(folded_lead_first));
+            const lead_span: V = @splat(folded_lead_last - folded_lead_first);
+            const lead: u32 = @bitCast(lead_offset <= lead_span);
             mask = cases | lead;
         } else {
             // Nothing else folds: the byte itself.
@@ -1576,7 +1634,7 @@ fn findFoldImpl(
     while (i <= last_start) : (i += 1) {
         const byte = hay[i];
         const candidate = std.ascii.toLower(byte) == first or
-            (letter and byte >= 0xC3 and byte <= 0xC5);
+            (letter and byte >= folded_lead_first and byte <= folded_lead_last);
         if (!candidate) continue;
         if (matchAt(kind, hay, i, needle, from)) |end| return .{ .start = i, .end = end };
     }
@@ -1600,7 +1658,7 @@ inline fn matchAt(
         switch (kind) {
             .ascii => {
                 const h = hay[k];
-                if (h < 0x80) {
+                if (std.ascii.isAscii(h)) {
                     if (std.ascii.toLower(h) != needle[j]) return null;
                     k += 1;
                 } else if (fold.step(hay, &k) != needle[j]) return null;
@@ -2182,7 +2240,7 @@ fn verifyTask(ctx: *VerifyCtx, task: usize) void {
         // than map + unmap, whose TLB shootdown hits every core of a
         // 24-thread process. Extracted texts run to megabytes and usually
         // match early, so those are mapped and only touched where scanned.
-        var mapped: ?[]align(8) u8 = null;
+        var mapped: ?Bytes = null;
         defer if (mapped) |bytes| sys.unmap(bytes);
         const text: []const u8 = switch (doc.source) {
             .plain => blk: {
@@ -2237,16 +2295,7 @@ fn staticScore(doc: DocIn, words: []const []const u8, now_s: i64) i32 {
         if (findFold(name, word, 0) != null) score += name_word_score;
     }
     // Saturating: mtimes come from the index file, which may be damaged.
-    // Whole days: one edited in the future counts as today.
-    const age_days = @divFloor(now_s -| doc.mtime, std.time.s_per_day);
-    score += switch (age_days) {
-        std.math.minInt(i64)...0 => 300,
-        1...6 => 220,
-        7...29 => 140,
-        30...179 => 60,
-        180...364 => 20,
-        else => 0,
-    };
+    score += recency.bonus(now_s -| doc.mtime);
     score -= @intCast(std.mem.count(u8, doc.path, "/") * depth_penalty);
     return score;
 }
@@ -2323,7 +2372,7 @@ pub fn search(
     var longest: usize = 0;
     for (words) |word| longest = @max(longest, word.len);
     // Nothing a trigram can narrow.
-    if (longest < 3) return;
+    if (longest < trigram_chars) return;
     var docs: std.ArrayList(u32) = .empty;
     defer docs.deinit(gpa);
     try index.candidates(gpa, words, &docs);
@@ -3156,7 +3205,7 @@ test "random byte flips in a content index never crash, nor updating it" {
 }
 
 fn fuzzParseBytes(_: void, smith: *testing.Smith) anyerror!void {
-    var buf: [16384]u8 align(8) = undefined;
+    var buf: [16384]u8 align(format.alignment_bytes) = undefined;
     const b = buf[0..smith.slice(&buf)];
     // Often make the header plausible, so the fuzzer reaches the checks
     // behind it.
@@ -3167,7 +3216,7 @@ fn fuzzParseBytes(_: void, smith: *testing.Smith) anyerror!void {
         const paths_size = smith.valueRangeAtMost(u32, 0, @intCast(
             b.len - header_size - n * doc_size,
         ));
-        const directory_offset = align8(header_size + n * doc_size + paths_size);
+        const directory_offset = alignUp(header_size + n * doc_size + paths_size);
         std.mem.writeInt(u64, b[8..16], n, .little);
         std.mem.writeInt(u64, b[16..24], smith.valueRangeAtMost(u8, 0, 4), .little);
         std.mem.writeInt(u64, b[24..32], paths_size, .little);

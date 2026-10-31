@@ -83,16 +83,14 @@ pub fn extractText(
     @memcpy(argv[head.len..][0..members.len], members);
 
     // Markup outweighs text several times over; the cap only guards memory.
-    const xml_cap = @max(bytes_max, @min(bytes_max *| 8, 256 << 20));
-    // unzip: 11 = some member not found (optional ones, or an xlsx without
-    // strings); a corrupt archive is 9, a password-protected one 82.
+    const xml_cap = @max(bytes_max, @min(bytes_max *| xml_per_text_max, xml_bytes_max));
     const xml = try runTool(
         gpa,
         io,
         argv[0 .. head.len + members.len],
         fd,
         xml_cap,
-        &.{ 0, 11 },
+        &.{ unzip_exit.ok, unzip_exit.member_missing },
         timeout_ms,
         cancel,
     );
@@ -106,6 +104,23 @@ pub const Error = sys.Error || error{ ToolMissing, ToolFailed, Timeout };
 /// stdout. Reaching the cap kills the tool and keeps what was read; the
 /// timeout kills it and fails (what it printed may be any part of the
 /// text); otherwise its exit code must be in `ok_codes`.
+/// How many bytes of markup an Office document may have per byte of text
+/// wanted, and the most markup read whatever the text: markup outweighs
+/// text several times over, and these caps only guard memory.
+const xml_per_text_max = 8;
+/// The usual markup bytes per text byte, for the first allocation.
+const xml_per_text_guess = 4;
+const xml_bytes_max = 256 << 20;
+
+/// unzip's exit codes that still give text. A corrupt archive is 9 and a
+/// password-protected one 82: those fail.
+const unzip_exit = struct {
+    const ok = 0;
+    /// Some member was not found: an optional one, or an xlsx without
+    /// shared strings.
+    const member_missing = 11;
+};
+
 fn runTool(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -178,7 +193,8 @@ fn skipped(local: []const u8) bool {
 fn xmlToText(gpa: std.mem.Allocator, xml: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
-    try out.ensureTotalCapacity(gpa, xml.len / 4 + 16);
+    // A guess that saves most regrowth: text is a fraction of its markup.
+    try out.ensureTotalCapacity(gpa, xml.len / xml_per_text_guess + 16);
     var w: TextOut = .{ .out = &out, .gpa = gpa };
     var skip: Skip = .{};
     var i: usize = 0;

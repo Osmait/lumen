@@ -23,6 +23,15 @@ pub const ListError = std.process.RunError || std.mem.Allocator.Error;
 /// A hung network or FUSE mount under the root must not hang the content
 /// service forever: ripgrep gets this long, then the current index stays.
 const list_timeout_ns = 60 * std.time.ns_per_s;
+/// How often a running listing looks at `stop` and the deadline.
+const list_poll_ms = 100;
+/// The most bytes read per look at ripgrep's output.
+const list_read_bytes_min = 64;
+/// The most a listing may print: paths of a few million files.
+const list_output_bytes_max = 256 << 20;
+/// Documents above this (PDF, Office) are not extracted: a book-sized PDF
+/// gives far more text than `content.extracted_bytes_max` keeps.
+const document_bytes_max = 64 << 20;
 
 pub const ListOptions = struct {
     /// Also documents whose text is extracted (PDF, Office), not only
@@ -121,17 +130,17 @@ fn runLister(
     defer reader.deinit();
     const deadline = sys.monotonicNs() + list_timeout_ns;
     const slice: std.Io.Timeout = .{
-        .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake },
+        .duration = .{ .raw = .fromMilliseconds(list_poll_ms), .clock = .awake },
     };
     while (true) {
-        reader.fill(64, slice) catch |err| switch (err) {
+        reader.fill(list_read_bytes_min, slice) catch |err| switch (err) {
             error.EndOfStream => break,
             error.Timeout => {},
             else => |e| return e,
         };
         if (stop) |s| if (s.load(.acquire)) return error.Canceled;
         if (sys.monotonicNs() >= deadline) return error.Timeout;
-        if (reader.reader(0).buffered().len > 256 << 20) return error.StreamTooLong;
+        if (reader.reader(0).buffered().len > list_output_bytes_max) return error.StreamTooLong;
     }
     try reader.checkAnyError();
     _ = try child.wait(io);
@@ -157,8 +166,12 @@ pub fn stat(path: [*:0]const u8, kind: Kind) ?Stat {
     );
     if (linux.errno(rc) != .SUCCESS or stx.mode & linux.S.IFMT != linux.S.IFREG) return null;
     switch (kind) {
-        .text => if (stx.size > content.text_bytes_max or stx.size < 3) return null,
-        .document => if (stx.size > 64 << 20) return null,
+        // Shorter than a trigram: no query can find anything in it.
+        .text => {
+            if (stx.size > content.text_bytes_max) return null;
+            if (stx.size < content.trigram_chars) return null;
+        },
+        .document => if (stx.size > document_bytes_max) return null,
     }
     return .{ .mtime = stx.mtime.sec, .size = stx.size };
 }

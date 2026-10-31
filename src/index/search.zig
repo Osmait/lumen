@@ -21,6 +21,7 @@ const Pool = @import("Pool.zig");
 const fine = @import("fine.zig");
 const sys = @import("os");
 const fold = @import("core").fold;
+const recency = @import("recency.zig");
 
 /// Candidates one pool task scores.
 const chunk_entries = 8192;
@@ -40,7 +41,7 @@ const recency_mul = 16;
 /// Candidate sets larger than this are not cached for refinement.
 const cache_max = 100_000;
 /// Ceiling of the recency bonus; bounds how many results need a `stat`.
-pub const recency_max = 300;
+pub const recency_max = recency.bonus_max;
 /// Longest query, in bytes once spaces are dropped: the longest file name.
 pub const query_bytes_max = 255;
 
@@ -439,6 +440,56 @@ noinline fn cheapFolded(name: []const u8, q: []const u8) ?i32 {
 /// on its first `folded_bytes_max` characters (Linux names stop at 255 bytes).
 const folded_bytes_max = 1024;
 
+/// What each property of a match is worth to the cheap scorer. Together
+/// they order the names the fine scorer then looks at.
+const cheap_weight = struct {
+    /// A matched character right after the previous match.
+    const consecutive = 30;
+    /// A match on the name's first character.
+    const name_start = 45;
+    /// A match right after a separator (`isWordSeparator`).
+    const word_start = 28;
+    /// A match on a camelCase boundary.
+    const camel_start = 22;
+    /// Taken per byte before the first match, up to `before_first_bytes_max`.
+    const before_first_per_byte = 2;
+    const before_first_bytes_max = 64;
+    /// One point taken per this many bytes of name: shorter names first.
+    const name_bytes_per_point = 4;
+    /// The name is the query, with or without its extension: people type
+    /// "readme" for README.md as much as for README.
+    const whole_name = 120;
+};
+
+/// Whether a match right after `byte` starts a word. A switch, not a
+/// search in a string: it runs once per matched byte of every candidate.
+inline fn isWordSeparator(byte: u8) bool {
+    return switch (byte) {
+        '_', '-', '.', ' ', '/' => true,
+        else => false,
+    };
+}
+
+/// What the entry's metadata adds to its cheap score (`adjust`).
+const metadata_weight = struct {
+    const directory = 15;
+    /// Taken from a hidden entry on top of the whole recency bonus, so that
+    /// a cache touched every day still ranks below a plain file.
+    const hidden_beyond_recency = 60;
+    /// Taken per level of depth: twelve levels down is rarely what you
+    /// were after.
+    const per_depth = 3;
+};
+
+/// The fine score counts this many times the cheap one in the final score.
+const fine_weight = 4;
+
+comptime {
+    // A hidden entry with the full recency bonus still loses to the same
+    // name unhidden and not recent.
+    assert(metadata_weight.hidden_beyond_recency > 0);
+}
+
 const CheapMode = enum {
     /// `name` is the original, known to be ASCII (its mask says so):
     /// lowercased on the fly.
@@ -472,19 +523,19 @@ fn cheapCore(
         const h = if (ascii) std.ascii.toLower(raw) else raw;
         if (h != q[qi]) continue;
         if (first_hit == std.math.maxInt(usize)) first_hit = i;
-        if (prev_hit +% 1 == i) s += 30;
+        if (prev_hit +% 1 == i) s += cheap_weight.consecutive;
         if (i == 0) {
-            s += 45;
+            s += cheap_weight.name_start;
         } else {
             const prev = name[i - 1];
             const camel_boundary = if (ascii)
                 std.ascii.isLower(prev) and std.ascii.isUpper(raw)
             else
                 std.ascii.isLower(prev) and !upper[i - 1] and upper[i];
-            if (prev == '_' or prev == '-' or prev == '.' or prev == ' ' or prev == '/') {
-                s += 28;
+            if (isWordSeparator(prev)) {
+                s += cheap_weight.word_start;
             } else if (camel_boundary) {
-                s += 22;
+                s += cheap_weight.camel_start;
             }
         }
         prev_hit = i;
@@ -494,12 +545,11 @@ fn cheapCore(
     // The lengths below are folded lengths: an unseen tail must be ASCII
     // too for the original's to be the same.
     if (mode == .ascii and !fold.isAscii(name[seen..])) return error.NonAscii;
-    s -= @as(i32, @intCast(@min(first_hit, 64))) * 2;
-    s -= @as(i32, @intCast(name.len / 4));
-    // The name IS the query, with or without its extension: people type
-    // "readme" for README.md as much as for README.
+    const before_first: i32 = @intCast(@min(first_hit, cheap_weight.before_first_bytes_max));
+    s -= before_first * cheap_weight.before_first_per_byte;
+    s -= @as(i32, @intCast(name.len / cheap_weight.name_bytes_per_point));
     const stem_len = std.mem.findScalarLast(u8, name, '.') orelse name.len;
-    if (name.len == q.len or (stem_len > 0 and stem_len == q.len)) s += 120;
+    if (name.len == q.len or (stem_len > 0 and stem_len == q.len)) s += cheap_weight.whole_name;
     return s;
 }
 
@@ -508,11 +558,9 @@ fn cheapCore(
 fn adjust(store: *const Store, id: u32, cheap: i32) i32 {
     const fl = store.flags()[id];
     var s = cheap;
-    if (fl & store_mod.flag_dir != 0) s += 15;
-    // Must outweigh the recency bonus: an active cache is touched every day.
-    if (fl & store_mod.flag_hidden != 0) s -= recency_max + 60;
-    // Twelve levels down is rarely what you were after.
-    return s - @as(i32, store.depths()[id]) * 3;
+    if (fl & store_mod.flag_dir != 0) s += metadata_weight.directory;
+    if (fl & store_mod.flag_hidden != 0) s -= recency_max + metadata_weight.hidden_beyond_recency;
+    return s - @as(i32, store.depths()[id]) * metadata_weight.per_depth;
 }
 
 /// Finalists per pool task for the fine scorer and the recency stats.
@@ -528,7 +576,7 @@ const FineCtx = struct {
     fn block(ctx: *FineCtx, lo: usize, hi: usize) void {
         for (ctx.in[lo..hi], ctx.out[lo..hi]) |f, *h| {
             const fs = fine.score(ctx.store.name(f.id), ctx.q) orelse 0;
-            h.* = .{ .score = fs * 4 + f.score, .id = f.id };
+            h.* = .{ .score = fs * fine_weight + f.score, .id = f.id };
         }
     }
 };
@@ -588,16 +636,8 @@ fn recencyBonus(ctx: *const RecencyCtx, id: u32, buf: *[4096]u8) i32 {
     for (ctx.no_stat) |dir| if (isUnder(path, dir)) return 0;
     buf[path.len] = 0;
     const mtime = sys.mtime(buf[0..path.len :0]) orelse return 0;
-    if (mtime > now) return recency_max;
     // Saturating: an mtime is whatever the file system says.
-    return switch (@divTrunc(now -| mtime, std.time.s_per_day)) {
-        0 => 300,
-        1...6 => 220,
-        7...29 => 140,
-        30...179 => 60,
-        180...364 => 20,
-        else => 0,
-    };
+    return recency.bonus(now -| mtime);
 }
 
 /// Reference: scores every entry with the fine scorer, no cascade, no cuts.
@@ -623,7 +663,8 @@ pub fn searchExhaustive(
         const id: u32 = @intCast(i);
         const cheap = cheapScoreMasked(store.name(id), query_folded, m) orelse continue;
         const fs = fine.score(store.name(id), query_folded) orelse 0;
-        try all.append(gpa, .{ .score = fs * 4 + adjust(store, id, cheap), .id = id });
+        const score = fs * fine_weight + adjust(store, id, cheap);
+        try all.append(gpa, .{ .score = score, .id = id });
     }
     std.mem.sort(Pair, all.items, {}, lessThan);
     for (all.items[0..@min(limit, all.items.len)]) |h| try out.append(gpa, .{

@@ -211,8 +211,9 @@ const Pools = struct {
 pub fn shutdown(service: *Service) void {
     service.stop.store(true, .release);
     if (service.wake_fd != no_fd) {
+        // An eventfd takes exactly one u64, the amount to add.
         const one: u64 = 1;
-        _ = std.os.linux.write(service.wake_fd, std.mem.asBytes(&one), 8);
+        _ = std.os.linux.write(service.wake_fd, std.mem.asBytes(&one), @sizeOf(u64));
     }
     if (service.thread) |thread| thread.join();
     if (service.live.dirty or service.live.pending_resync) service.saveOnShutdown();

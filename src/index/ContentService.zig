@@ -45,6 +45,8 @@ pub const Options = struct {
     list_interval_ns: u64 = 30 * 60 * std.time.ns_per_s,
 };
 const extracted_bytes_max = content.extracted_bytes_max;
+/// `readText` reads a file this much at a time, counting lines as it goes.
+const text_read_bytes = 16 * 1024;
 
 gpa: std.mem.Allocator,
 io: Io,
@@ -323,7 +325,7 @@ pub fn readText(
     var text: std.ArrayList(u8) = .empty;
     var lines_seen: u32 = 0;
     while (text.items.len < text_bytes_max and lines_seen < lines) {
-        text.ensureUnusedCapacity(arena, 16 * 1024) catch return null;
+        text.ensureUnusedCapacity(arena, text_read_bytes) catch return null;
         const spare = text.unusedCapacitySlice();
         const bytes_wanted = @min(spare.len, text_bytes_max - text.items.len);
         const bytes_read = std.os.linux.read(fd, spare.ptr, bytes_wanted);
