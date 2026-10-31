@@ -24,6 +24,7 @@ const rows_mod = @import("rows.zig");
 const registry_mod = @import("registry.zig");
 const generation_mod = @import("generation.zig");
 const stamp_mod = @import("stamp.zig");
+pub const Extension = @import("Extension.zig");
 const os = @import("os");
 const core = @import("core");
 const item_mod = @import("../item.zig");
@@ -37,16 +38,11 @@ const Host = @This();
 const log = std.log.scoped(.ext);
 const assert = std.debug.assert;
 
-/// Limits for each extension's Lua state: the memory it may hold, and how
-/// long a load, a list or an action may run before the instruction hook
-/// stops it.
-const memory_bytes_max = 64 << 20;
+/// How long a load, a list or an action may run before the instruction
+/// hook stops it.
 const load_budget_ns = 5 * std.time.ns_per_s;
 const list_budget_ns = 10 * std.time.ns_per_s;
 const act_budget_ns = 30 * std.time.ns_per_s;
-/// For anything Lua still runs as a state closes (lumen.exec waits no
-/// longer than this).
-const close_budget_ns = 1 * std.time.ns_per_s;
 
 /// The most rows one list answer takes, and actions one row takes.
 pub const items_max = rows_mod.items_max;
@@ -202,53 +198,6 @@ pub const Callbacks = struct {
 pub const FormValue = struct { name: []const u8, value: []const u8, toggle: bool };
 
 // ------------------------------------------------- the worker's own types
-
-/// One loaded file and its Lua state. Worker thread only.
-pub const Extension = struct {
-    budget: lua.Budget = .{ .bytes_max = memory_bytes_max },
-    L: *lua.State = undefined,
-    host: *Host,
-    id: [:0]const u8,
-    folder: [:0]const u8,
-    /// Its storage and preferences: $XDG_DATA_HOME/lumen/extensions/<id>.
-    data: [:0]const u8,
-    /// Set only while this extension's file runs: `lumen.theme`,
-    /// `lumen.keymap`, `lumen.set`, `lumen.layout` and `lumen.icons` add
-    /// to it. Null at any other time, which those functions report as an
-    /// error.
-    load: ?*Load = null,
-
-    pub fn gpa(extension: *Extension) std.mem.Allocator {
-        return extension.host.gpa;
-    }
-
-    pub fn io(extension: *Extension) std.Io {
-        return extension.host.io;
-    }
-
-    /// Runs `handler` in this state, protected, with `budget_ns` to finish
-    /// (the instruction hook stops it past that). Its error, or null.
-    fn run(
-        extension: *Extension,
-        arena: std.mem.Allocator,
-        budget_ns: u64,
-        comptime Context: type,
-        context: *Context,
-        comptime handler: fn (*lua.State, *Context) void,
-    ) ?[:0]const u8 {
-        extension.budget.deadline_ns = os.monotonicNs() + budget_ns;
-        defer extension.budget.deadline_ns = std.math.maxInt(u64);
-        return lua.protect(extension.L, arena, Context, context, handler);
-    }
-
-    /// Closes its state. Closing runs the finalizers left, with the
-    /// instruction hook off (Lua turns hooks off in `__gc`); extensions
-    /// cannot set any (lua.openLibs), and lumen.exec gets a deadline anyway.
-    fn close(extension: *Extension) void {
-        extension.budget.deadline_ns = os.monotonicNs() + close_budget_ns;
-        lua.c.lua_close(extension.L);
-    }
-};
 
 const c_noref = lua.c.LUA_NOREF;
 
@@ -674,10 +623,7 @@ fn pendingTake(host: *Host) Pending {
 // --------------------------------------------------------------- reload
 
 fn closeAll(host: *Host) void {
-    for (host.extensions.items) |extension| {
-        extension.close();
-        host.gpa.destroy(extension);
-    }
+    for (host.extensions.items) |extension| extension.destroy();
     host.extensions.clearRetainingCapacity();
     host.gpa.free(host.worker_commands);
     host.worker_commands = &.{};
@@ -881,7 +827,7 @@ fn loadSource(
     path: [:0]const u8,
     source: ?[:0]const u8,
 ) void {
-    const extension = host.extensionCreate(id, folder) orelse {
+    const extension = Extension.create(host, id, folder) orelse {
         problem(load, id, "out of memory");
         return;
     };
@@ -915,28 +861,7 @@ fn loadSource(
     }
     load.rollback(before);
     problem(load, id, failure orelse "out of memory");
-    extension.close();
-    host.gpa.destroy(extension);
-}
-
-/// A new state for the file of extension `id` in `folder`; null when out of
-/// memory.
-fn extensionCreate(host: *Host, id: []const u8, folder: []const u8) ?*Extension {
-    const worker_arena = host.worker_arena.allocator();
-    // Never an empty data folder: its storage would go to "/storage.json".
-    const data = worker_arena.printSentinel("{s}/extensions/{s}", .{ host.data_dir, id }, 0) catch
-        return null;
-    const id_copy = worker_arena.dupeSentinel(u8, id, 0) catch return null;
-    const folder_copy = worker_arena.dupeSentinel(u8, folder, 0) catch return null;
-    const extension = host.gpa.create(Extension) catch return null;
-    extension.* = .{ .host = host, .id = id_copy, .folder = folder_copy, .data = data };
-    // Without it, the extension runs; lumen.storage fails and says so.
-    os.mkdirP(extension.data) catch |err| log.warn("{s}: {t}", .{ extension.data, err });
-    extension.L = lua.newState(&extension.budget) orelse {
-        host.gpa.destroy(extension);
-        return null;
-    };
-    return extension;
+    extension.destroy();
 }
 
 const LoadContext = struct {
