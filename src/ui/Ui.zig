@@ -98,6 +98,8 @@ const file_results_max = 60;
 const content_results_max = 50;
 /// Clipboard and window searches: the lists are short already.
 const filtered_results_max = 200;
+/// Clipboard entries the clipboard view loads, newest first.
+const clipboard_rows_max = 500;
 /// Files in the root search, after this many of the best other results.
 const root_files_max = 5;
 const root_results_before_files_max = 6;
@@ -1269,10 +1271,10 @@ pub fn prewarm(self: *Ui) void {
     c.gtk_widget_realize(gtk.widget(self.window));
     backdrop.prewarmBackdrops(self);
     self.setView(.root);
-    var size: c_int = 0;
+    var size_px: c_int = 0;
     const window = gtk.widget(self.window);
-    c.gtk_widget_measure(window, c.GTK_ORIENTATION_HORIZONTAL, -1, &size, null, null, null);
-    c.gtk_widget_measure(window, c.GTK_ORIENTATION_VERTICAL, -1, &size, null, null, null);
+    c.gtk_widget_measure(window, c.GTK_ORIENTATION_HORIZONTAL, -1, &size_px, null, null, null);
+    c.gtk_widget_measure(window, c.GTK_ORIENTATION_VERTICAL, -1, &size_px, null, null, null);
 }
 
 pub fn hide(self: *Ui) void {
@@ -1327,14 +1329,14 @@ fn placeOnFocusedMonitor(self: *Ui) void {
             .top, .bottom => 0,
         };
         const room_above_px = @divTrunc(room_px * room_above_tenths, 10);
-        const margin: c_int = switch (position) {
+        const margin_px: c_int = switch (position) {
             .top, .bottom => offset_px - style_css.shell_margin_px,
             .upper_third, .center => @max(room_above_px - style_css.shell_margin_px, 0) + offset_px,
         };
         c.gtk_layer_set_margin(
             window,
             if (at_bottom) c.GTK_LAYER_SHELL_EDGE_BOTTOM else c.GTK_LAYER_SHELL_EDGE_TOP,
-            margin,
+            margin_px,
         );
         return;
     }
@@ -1522,9 +1524,9 @@ fn rootCandidates(self: *Ui, arena: std.mem.Allocator) []Item {
         scripts.load(arena),
         ext_view.rootItems(self, arena),
     };
-    var count: usize = 0;
-    for (sources) |source| count += source.len;
-    const all = arena.alloc(Item, count) catch {
+    var item_count: usize = 0;
+    for (sources) |source| item_count += source.len;
+    const all = arena.alloc(Item, item_count) catch {
         log.warn("out of memory: the root search lists no apps or commands", .{});
         return &.{};
     };
@@ -1538,7 +1540,7 @@ fn rootCandidates(self: *Ui, arena: std.mem.Allocator) []Item {
 }
 
 fn clipCandidates(self: *Ui, arena: std.mem.Allocator) []Item {
-    const clips = self.db.recentClips(arena, 500) catch return &.{};
+    const clips = self.db.recentClips(arena, clipboard_rows_max) catch return &.{};
     var out: std.ArrayList(Item) = .empty;
     for (clips) |clip| {
         out.append(arena, .{
@@ -1609,12 +1611,12 @@ pub fn refresh(self: *Ui) void {
     if (self.answerPending(start_ns)) return;
     self.search_ns = 0;
     defer {
-        const total = stats.now() - start_ns;
+        const total_ns = stats.now() - start_ns;
         stats.pending = .{
             .start_ns = start_ns,
             .view = self.view,
             .search_ns = self.search_ns,
-            .rows_ns = total -| self.search_ns,
+            .rows_ns = total_ns -| self.search_ns,
             .is_show = false,
         };
     }
@@ -1755,12 +1757,12 @@ fn selectAfterRefresh(self: *Ui) void {
         // The row to select back may be any of them.
         self.ensureRows();
         // A copy: clearing writes into the buffer `slice` points at.
-        const pending = self.reselect;
+        const reselect = self.reselect;
         self.reselect.clear();
-        const want = pending.slice();
+        const wanted_key = reselect.slice();
         for (self.rows.items, 0..) |row, i| {
             const item_index = row.item orelse continue;
-            if (std.mem.eql(u8, self.items.items[item_index].key, want)) {
+            if (std.mem.eql(u8, self.items.items[item_index].key, wanted_key)) {
                 first = i;
                 break;
             }
@@ -1967,10 +1969,11 @@ pub fn ensureRows(self: *Ui) void {
     self.buildPending(self.pending.items.len);
 }
 
-fn buildPending(self: *Ui, count: usize) void {
-    const built_count = @min(count, self.pending.items.len);
+/// Builds up to `row_count_max` of the queued rows, oldest first.
+fn buildPending(self: *Ui, row_count_max: usize) void {
+    const built_count = @min(row_count_max, self.pending.items.len);
     for (self.pending.items[0..built_count]) |pending_row| switch (pending_row) {
-        .item => |i| self.buildItemRow(i),
+        .item => |item_index| self.buildItemRow(item_index),
         .section => |title| self.buildSection(title),
     };
     // What is left moves to the front.
@@ -2096,8 +2099,8 @@ pub fn select(self: *Ui, row_index: ?usize) void {
     assert(self.built);
     if (row_index) |row_given| assert(row_given < self.rows.items.len);
     defer assert(self.selected == row_index);
-    if (self.selected) |old| if (old < self.rows.items.len) {
-        const row_old = self.rows.items[old];
+    if (self.selected) |previous| if (previous < self.rows.items.len) {
+        const row_old = self.rows.items[previous];
         if (row_old.hint) |hint| gtk.setVisible(hint, false);
         if (row_old.accessory) |accessory| gtk.setVisible(accessory, true);
     };
@@ -2174,11 +2177,8 @@ fn scrollTo(self: *Ui, row: *c.GtkWidget) void {
     // A row just added has no place yet: it is scrolled to on a later frame,
     // once the list's layout is done.
     const container = if (self.grid_mode) gtk.widget(self.grid) else gtk.widget(self.list);
-    const placed = c.gtk_widget_compute_bounds(
-        row,
-        container,
-        &bounds,
-    ) != 0 and bounds.size.height != 0;
+    const has_bounds = c.gtk_widget_compute_bounds(row, container, &bounds) != 0;
+    const placed = has_bounds and bounds.size.height != 0;
     if (!placed) {
         if (self.scroll.tick == 0) {
             self.scroll.tries = 0;
@@ -2192,17 +2192,17 @@ fn scrollTo(self: *Ui, row: *c.GtkWidget) void {
         return;
     }
     const adjustment = c.gtk_scrolled_window_get_vadjustment(self.scroller);
-    const value = c.gtk_adjustment_get_value(adjustment);
-    const page = c.gtk_adjustment_get_page_size(adjustment);
+    const shown_top = c.gtk_adjustment_get_value(adjustment);
+    const shown_height = c.gtk_adjustment_get_page_size(adjustment);
     const top: f64 = bounds.origin.y;
     const bottom: f64 = top + bounds.size.height;
     // Keep a section header above the first item visible, and the selection
     // clear of the fade at the bottom edge (style.css, undershoot).
     const fade_px = style_css.results_fade_px;
-    if (top < value + scroll_top_slack_px) {
+    if (top < shown_top + scroll_top_slack_px) {
         c.gtk_adjustment_set_value(adjustment, @max(top - scroll_section_title_px, 0));
-    } else if (bottom > value + page - fade_px) {
-        c.gtk_adjustment_set_value(adjustment, bottom - page + fade_px);
+    } else if (bottom > shown_top + shown_height - fade_px) {
+        c.gtk_adjustment_set_value(adjustment, bottom - shown_height + fade_px);
     }
 }
 
@@ -2219,11 +2219,9 @@ fn onScrollTick(_: ?*c.GtkWidget, _: ?*c.GdkFrameClock, data: ?*anyopaque) callc
     }
     const row = self.rows.items[row_index].widget.widget();
     var bounds: c.graphene_rect_t = undefined;
-    const placed = c.gtk_widget_compute_bounds(
-        row,
-        if (self.grid_mode) gtk.widget(self.grid) else gtk.widget(self.list),
-        &bounds,
-    ) != 0 and bounds.size.height > 0;
+    const container = if (self.grid_mode) gtk.widget(self.grid) else gtk.widget(self.list);
+    const has_bounds = c.gtk_widget_compute_bounds(row, container, &bounds) != 0;
+    const placed = has_bounds and bounds.size.height > 0;
     if (!placed and self.scroll.tries < scroll_frames_max) return 1;
     self.scroll.tick = 0;
     if (placed) self.scrollTo(row);
@@ -2367,9 +2365,9 @@ fn onGridActivated(
     data: ?*anyopaque,
 ) callconv(.c) void {
     const self: *Ui = @ptrCast(@alignCast(data));
-    const i = c.gtk_flow_box_child_get_index(child);
-    if (i < 0 or i >= self.rows.items.len) return;
-    self.select(@intCast(i));
+    const cell_index = c.gtk_flow_box_child_get_index(child);
+    if (cell_index < 0 or cell_index >= self.rows.items.len) return;
+    self.select(@intCast(cell_index));
     const item = self.selectedItem() orelse return;
     self.performEntry(item_mod.actionsFor(item)[0]);
 }
@@ -2380,8 +2378,8 @@ fn onPanelRowActivated(
     data: ?*anyopaque,
 ) callconv(.c) void {
     const self: *Ui = @ptrCast(@alignCast(data));
-    const i: usize = @intCast(c.gtk_list_box_row_get_index(row));
-    if (i < self.panel.entries.len) self.performEntry(self.panel.entries[i]);
+    const entry_index: usize = @intCast(c.gtk_list_box_row_get_index(row));
+    if (entry_index < self.panel.entries.len) self.performEntry(self.panel.entries[entry_index]);
 }
 
 fn onBackClicked(
@@ -2438,7 +2436,7 @@ fn onKey(
 
 /// `lumen --key NAME`: the same handling as a real key press, for tests.
 /// Names: down, up, enter, ctrl+enter, ctrl+k, escape, backspace, pagedown,
-/// pageup, ctrl+x.
+/// pageup, ctrl+x, ctrl+o, left, right, and any keymap ("ctrl+g").
 pub fn injectKey(self: *Ui, name: []const u8) bool {
     const keys = [_]struct { []const u8, c_uint, c.GdkModifierType }{
         .{ "down", c.GDK_KEY_Down, 0 },                 .{ "up", c.GDK_KEY_Up, 0 },
@@ -2459,8 +2457,8 @@ pub fn injectKey(self: *Ui, name: []const u8) bool {
         .{ "ctrl+o", c.GDK_KEY_o, c.GDK_CONTROL_MASK }, .{ "left", c.GDK_KEY_Left, 0 },
         .{ "right", c.GDK_KEY_Right, 0 },
     };
-    for (keys) |key_name| if (std.mem.eql(u8, key_name[0], name)) {
-        _ = keyboard.handleKey(self, key_name[1], key_name[2]);
+    for (keys) |key| if (std.mem.eql(u8, key[0], name)) {
+        _ = keyboard.handleKey(self, key[1], key[2]);
         return true;
     };
     // Anything else written like a keymap ("ctrl+g").
