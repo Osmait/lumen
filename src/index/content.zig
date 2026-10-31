@@ -32,6 +32,7 @@
 //!                        candidates
 //!   content_search.zig   a query: candidates ranked, verified in parallel
 //!   content_find.zig     the folded (SIMD) substring search verifying runs
+//!   content_testing.zig  fixtures the tests of these files share
 //!
 //! `ContentService.zig` keeps an index current in the background and serves
 //! queries from it.
