@@ -14,6 +14,7 @@
 //!   + Recency: mtime of the head of the list breaks ties among equals.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const store_mod = @import("store.zig");
 const Store = store_mod.Store;
 const Pool = @import("Pool.zig");
@@ -41,7 +42,13 @@ const cache_max = 100_000;
 /// Ceiling of the recency bonus; bounds how many results need a `stat`.
 pub const recency_max = 300;
 /// Longest query, in bytes once spaces are dropped: the longest file name.
-pub const max_query = 255;
+pub const query_bytes_max = 255;
+
+comptime {
+    // Two limits, not one: the fine scorer's is the smaller, and a query
+    // between the two is still searched, ranked by its cheap score alone.
+    assert(fine.query_letters_max <= query_bytes_max);
+}
 
 pub const Hit = struct { id: u32, score: i32 };
 
@@ -78,21 +85,32 @@ pub const Engine = struct {
     last_candidates: std.ArrayList(u32) = .empty,
     cache_valid: bool = false,
 
-    pub fn deinit(e: *Engine, gpa: std.mem.Allocator) void {
-        e.last_query.deinit(gpa);
-        e.last_candidates.deinit(gpa);
-        e.* = undefined;
+    pub fn deinit(engine: *Engine, gpa: std.mem.Allocator) void {
+        engine.last_query.deinit(gpa);
+        engine.last_candidates.deinit(gpa);
+        engine.* = undefined;
     }
 
-    pub fn reset(e: *Engine) void {
-        e.last_query.clearRetainingCapacity();
-        e.last_candidates.clearRetainingCapacity();
-        e.cache_valid = false;
+    pub fn reset(engine: *Engine) void {
+        engine.last_query.clearRetainingCapacity();
+        engine.last_candidates.clearRetainingCapacity();
+        engine.cache_valid = false;
+    }
+
+    /// Whether `query_folded` only narrows the last query, so that its
+    /// candidates are a subset of the cached ones: "espa" -> "españ"
+    /// ("espan" extends "espa"), and "Carg" -> "cargo".
+    fn refines(engine: *const Engine, query_folded: []const u8) bool {
+        if (!engine.cache_valid) return false;
+        const last = engine.last_query.items;
+        if (last.len == 0) return false;
+        if (query_folded.len <= last.len) return false;
+        return std.mem.startsWith(u8, query_folded, last);
     }
 
     /// Top `limit` hits for `query`, appended to `out` (cleared first).
     pub fn search(
-        e: *Engine,
+        engine: *Engine,
         gpa: std.mem.Allocator,
         pool: *Pool,
         store: *const Store,
@@ -102,26 +120,33 @@ pub const Engine = struct {
     ) std.mem.Allocator.Error!void {
         const limit = opts.limit;
         out.clearRetainingCapacity();
-        var packed_buf: [max_query]u8 = undefined;
+        var packed_buf: [query_bytes_max]u8 = undefined;
         const query = packQuery(query_in, &packed_buf);
         if (query.len == 0 or limit == 0 or store.len() == 0) {
-            e.reset();
+            engine.reset();
             return;
         }
         // Everything below compares folded bytes: "Español" -> "espanol".
-        var qbuf: [max_query]u8 = undefined;
-        const ql = fold.foldInto(&qbuf, query);
-        const qmask = store_mod.charMask(ql);
+        var query_folded_buffer: [query_bytes_max]u8 = undefined;
+        const query_folded = fold.foldInto(&query_folded_buffer, query);
+        const query_mask = store_mod.charMask(query_folded);
         // With 1-2 letters almost everything matches: caching half a million
         // ids would not speed anything up.
-        const cacheable = ql.len > 2;
+        const cacheable = query_folded.len > 2;
 
-        // On folded queries: "espa" -> "españ" refines ("espan" extends
-        // "espa"), and so does "Carg" -> "cargo".
-        const refine = e.cache_valid and e.last_query.items.len > 0 and
-            ql.len > e.last_query.items.len and std.mem.startsWith(u8, ql, e.last_query.items);
+        // On folded queries (see `refines`).
+        const refine = engine.refines(query_folded);
 
-        var sifted = try e.sift(gpa, pool, store, ql, qmask, limit, refine, cacheable);
+        var sifted = try engine.sift(
+            gpa,
+            pool,
+            store,
+            query_folded,
+            query_mask,
+            limit,
+            refine,
+            cacheable,
+        );
         defer sifted.deinit(gpa);
         const finalists = &sifted.finalists;
 
@@ -131,8 +156,13 @@ pub const Engine = struct {
         var hits: std.ArrayList(Pair) = .empty;
         defer hits.deinit(gpa);
         try hits.resize(gpa, finalists.items.len);
-        var fctx: FineCtx = .{ .store = store, .q = ql, .in = finalists.items, .out = hits.items };
-        pool.runBlocks(finalists.items.len, fine_block, &fctx, FineCtx.block);
+        var fine_context: FineCtx = .{
+            .store = store,
+            .q = query_folded,
+            .in = finalists.items,
+            .out = hits.items,
+        };
+        pool.runBlocks(finalists.items.len, fine_block, &fine_context, FineCtx.block);
         std.mem.sort(Pair, hits.items, {}, lessThan);
 
         if (opts.recency) byRecency(pool, store, hits.items, limit, opts.no_stat);
@@ -142,12 +172,12 @@ pub const Engine = struct {
         for (hits.items[0..take]) |h| out.appendAssumeCapacity(.{ .id = h.id, .score = h.score });
 
         if (cacheable and !sifted.overflow and sifted.cands.items.len <= cache_max) {
-            e.last_query.clearRetainingCapacity();
-            try e.last_query.appendSlice(gpa, ql);
-            e.last_candidates.clearRetainingCapacity();
-            try e.last_candidates.appendSlice(gpa, sifted.cands.items);
-            e.cache_valid = true;
-        } else e.cache_valid = false;
+            engine.last_query.clearRetainingCapacity();
+            try engine.last_query.appendSlice(gpa, query_folded);
+            engine.last_candidates.clearRetainingCapacity();
+            try engine.last_candidates.appendSlice(gpa, sifted.cands.items);
+            engine.cache_valid = true;
+        } else engine.cache_valid = false;
     }
 
     const Sifted = struct {
@@ -158,27 +188,27 @@ pub const Engine = struct {
         /// Some chunk ran out of memory: `cands` is incomplete.
         overflow: bool = false,
 
-        fn deinit(f: *Sifted, gpa: std.mem.Allocator) void {
-            f.finalists.deinit(gpa);
-            f.cands.deinit(gpa);
+        fn deinit(sifted: *Sifted, gpa: std.mem.Allocator) void {
+            sifted.finalists.deinit(gpa);
+            sifted.cands.deinit(gpa);
         }
     };
 
     /// Layers 2 and 3 over the index (or the last query's candidates when
     /// refining), chunk by chunk on the pool, then the chunks' tops merged.
     fn sift(
-        e: *const Engine,
+        engine: *const Engine,
         gpa: std.mem.Allocator,
         pool: *Pool,
         store: *const Store,
-        ql: []const u8,
-        qmask: u64,
+        query_folded: []const u8,
+        query_mask: u64,
         limit: usize,
         refine: bool,
         cacheable: bool,
     ) std.mem.Allocator.Error!Sifted {
         const keep = limit * finalist_mul;
-        const source_len: usize = if (refine) e.last_candidates.items.len else store.len();
+        const source_len: usize = if (refine) engine.last_candidates.items.len else store.len();
         // Fewer chunks when refining: split the finalist budget among them,
         // or the incremental case runs short of finalists (recall fell to
         // 52% with a fixed K in the Rust version).
@@ -196,10 +226,10 @@ pub const Engine = struct {
         var ctx: SiftCtx = .{
             .gpa = gpa,
             .store = store,
-            .ids = if (refine) e.last_candidates.items else null,
+            .ids = if (refine) engine.last_candidates.items else null,
             .source_len = source_len,
-            .qmask = qmask,
-            .q = ql,
+            .query_mask = query_mask,
+            .q = query_folded,
             .per_chunk = per_chunk,
             .cache_cap = if (cacheable) cache_max else 0,
             .partials = partials,
@@ -226,8 +256,8 @@ pub const Engine = struct {
 /// Spaces separate words but are not part of what is matched: "cargo toml"
 /// becomes "cargotoml", a subsequence of "Cargo.toml" (the Rust version
 /// matched the space literally, so multi-word queries found nothing).
-/// Longer than `max_query`: nothing (no name can match it).
-fn packQuery(q: []const u8, buf: *[max_query]u8) []const u8 {
+/// Longer than `query_bytes_max`: nothing (no name can match it).
+fn packQuery(q: []const u8, buf: *[query_bytes_max]u8) []const u8 {
     var n: usize = 0;
     for (q) |ch| {
         if (ch == ' ' or ch == '\t') continue;
@@ -247,9 +277,9 @@ const Partial = struct {
     cands: std.ArrayList(u32) = .empty,
     overflow: bool = false,
 
-    fn deinit(p: *Partial, gpa: std.mem.Allocator) void {
-        p.top.deinit(gpa);
-        p.cands.deinit(gpa);
+    fn deinit(partial: *Partial, gpa: std.mem.Allocator) void {
+        partial.top.deinit(gpa);
+        partial.cands.deinit(gpa);
     }
 };
 
@@ -259,7 +289,7 @@ const SiftCtx = struct {
     /// Candidate ids when refining; null = every entry.
     ids: ?[]const u32,
     source_len: usize,
-    qmask: u64,
+    query_mask: u64,
     q: []const u8,
     per_chunk: usize,
     cache_cap: usize,
@@ -292,7 +322,7 @@ fn sift(ctx: *SiftCtx, ci: usize, lo: usize, hi: usize) !void {
     var idx = lo;
     while (idx < hi) : (idx += 1) {
         const id: u32 = if (ctx.ids) |ids| ids[idx] else @intCast(idx);
-        if (masks[id] & ctx.qmask != ctx.qmask) continue;
+        if (masks[id] & ctx.query_mask != ctx.query_mask) continue;
         const cheap = cheapScoreMasked(ctx.store.name(id), ctx.q, masks[id]) orelse continue;
         const s = adjust(ctx.store, id, cheap);
         // `>=`: on equal scores the id breaks the tie, so an equal can still
@@ -306,10 +336,11 @@ fn sift(ctx: *SiftCtx, ci: usize, lo: usize, hi: usize) !void {
             }
         }
         if (ctx.cache_cap > 0) {
-            if (p.cands.items.len < ctx.cache_cap) try p.cands.append(
-                ctx.gpa,
-                id,
-            ) else p.overflow = true;
+            if (p.cands.items.len < ctx.cache_cap) {
+                try p.cands.append(ctx.gpa, id);
+            } else {
+                p.overflow = true;
+            }
         }
     }
     if (p.top.items.len > k) {
@@ -388,8 +419,8 @@ pub fn cheapScoreMasked(name: []const u8, q: []const u8, mask: u64) ?i32 {
 
 // Out of line: its 2 KB of buffers stay off the hot loop's stack frame.
 noinline fn cheapFolded(name: []const u8, q: []const u8) ?i32 {
-    var buf: [max_folded]u8 = undefined;
-    var upper: [max_folded]bool = undefined;
+    var buf: [folded_bytes_max]u8 = undefined;
+    var upper: [folded_bytes_max]bool = undefined;
     const n = fold.foldCase(&buf, &upper, name);
     return cheapCore(
         .folded,
@@ -400,8 +431,8 @@ noinline fn cheapFolded(name: []const u8, q: []const u8) ?i32 {
 }
 
 /// Longest name folded for `cheapScore`; a longer non-ASCII name is scored
-/// on its first `max_folded` characters (Linux names stop at 255 bytes).
-const max_folded = 1024;
+/// on its first `folded_bytes_max` characters (Linux names stop at 255 bytes).
+const folded_bytes_max = 1024;
 
 const CheapMode = enum {
     /// `name` is the original, known to be ASCII (its mask says so):
@@ -441,12 +472,15 @@ fn cheapCore(
             s += 45;
         } else {
             const prev = name[i - 1];
-            if (prev == '_' or prev == '-' or prev == '.' or prev == ' ' or prev == '/') {
-                s += 28;
-            } else if (if (ascii)
+            const camel_boundary = if (ascii)
                 std.ascii.isLower(prev) and std.ascii.isUpper(raw)
             else
-                std.ascii.isLower(prev) and !upper[i - 1] and upper[i]) s += 22;
+                std.ascii.isLower(prev) and !upper[i - 1] and upper[i];
+            if (prev == '_' or prev == '-' or prev == '.' or prev == ' ' or prev == '/') {
+                s += 28;
+            } else if (camel_boundary) {
+                s += 22;
+            }
         }
         prev_hit = i;
         qi += 1;
@@ -525,13 +559,13 @@ fn byRecency(
     while (n < hits.len and hits[n].score >= floor) n += 1;
     n = @min(n, limit * recency_mul);
     // Up to 960 path rebuilds and stats for the UI's 60: on the pool.
-    var rctx: RecencyCtx = .{
+    var recency_context: RecencyCtx = .{
         .store = store,
         .hits = hits[0..n],
         .now = sys.nowSeconds(),
         .no_stat = no_stat,
     };
-    pool.runBlocks(n, recency_block, &rctx, RecencyCtx.block);
+    pool.runBlocks(n, recency_block, &recency_context, RecencyCtx.block);
     std.mem.sort(Pair, hits[0..n], {}, lessThan);
 }
 
@@ -571,19 +605,19 @@ pub fn searchExhaustive(
     out: *std.ArrayList(Hit),
 ) std.mem.Allocator.Error!void {
     out.clearRetainingCapacity();
-    var packed_buf: [max_query]u8 = undefined;
+    var packed_buf: [query_bytes_max]u8 = undefined;
     const query = packQuery(query_in, &packed_buf);
     if (query.len == 0) return;
-    var qbuf: [max_query]u8 = undefined;
-    const ql = fold.foldInto(&qbuf, query);
-    const qmask = store_mod.charMask(ql);
+    var query_folded_buffer: [query_bytes_max]u8 = undefined;
+    const query_folded = fold.foldInto(&query_folded_buffer, query);
+    const query_mask = store_mod.charMask(query_folded);
     var all: std.ArrayList(Pair) = .empty;
     defer all.deinit(gpa);
     for (store.masks(), 0..) |m, i| {
-        if (m & qmask != qmask) continue;
+        if (m & query_mask != query_mask) continue;
         const id: u32 = @intCast(i);
-        const cheap = cheapScoreMasked(store.name(id), ql, m) orelse continue;
-        const fs = fine.score(store.name(id), ql) orelse 0;
+        const cheap = cheapScoreMasked(store.name(id), query_folded, m) orelse continue;
+        const fs = fine.score(store.name(id), query_folded) orelse 0;
         try all.append(gpa, .{ .score = fs * 4 + adjust(store, id, cheap), .id = id });
     }
     std.mem.sort(Pair, all.items, {}, lessThan);

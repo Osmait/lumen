@@ -14,6 +14,7 @@
 //! dropped it for being `unsafe`; in Zig it is the natural API.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const store_mod = @import("store.zig");
 const Store = store_mod.Store;
 const Builder = store_mod.Builder;
@@ -73,10 +74,10 @@ const Batch = struct {
     flags: std.ArrayList(u8) = .empty,
     errors: u64 = 0,
 
-    fn deinit(b: *Batch, gpa: std.mem.Allocator) void {
-        b.names.deinit(gpa);
-        b.ends.deinit(gpa);
-        b.flags.deinit(gpa);
+    fn deinit(batch: *Batch, gpa: std.mem.Allocator) void {
+        batch.names.deinit(gpa);
+        batch.ends.deinit(gpa);
+        batch.flags.deinit(gpa);
     }
 };
 
@@ -89,10 +90,6 @@ const LevelCtx = struct {
     follow: bool,
 };
 
-/// Scans `cfg.roots`. With a watcher, each directory is watched *before* it
-/// is read: a change is then either in the read or arrives as an event,
-/// never lost in between (scanning first and arming later leaves a blind
-/// window as long as the arming).
 /// Adds what one level's folders hold to the index, and the folders among
 /// it to `next` (when the walk goes `deeper`).
 fn addLevel(
@@ -133,6 +130,10 @@ fn addLevel(
     }
 }
 
+/// Scans `cfg.roots`. With a watcher, each directory is watched *before* it
+/// is read: a change is then either in the read or arrives as an event,
+/// never lost in between (scanning first and arming later leaves a blind
+/// window as long as the arming).
 pub fn scan(
     gpa: std.mem.Allocator,
     pool: *Pool,
@@ -164,9 +165,12 @@ pub fn scan(
     var depth: u16 = 1;
     while (frontier.items.len > 0 and depth <= cfg.max_depth) : (depth +|= 1) {
         const follow = depth == 1 and cfg.follow_roots;
-        if (watcher) |w| for (frontier.items) |f| {
-            (if (follow) w.watchRoot(gpa, f.path, f.id) else w.watch(gpa, f.path, f.id)) catch {};
-        };
+        if (watcher) |w| {
+            const placement: Watcher.Placement = if (follow) .root else .below_root;
+            for (frontier.items) |folder| {
+                try w.watchBestEffort(gpa, folder.path, folder.id, placement);
+            }
+        }
 
         const batches = try gpa.alloc(Batch, frontier.items.len);
         defer {
@@ -279,32 +283,43 @@ fn readDir(
             ) catch continue;
             kind = sys.kindOf(full);
         }
-        var fl: u8 = 0;
+        var flags: u8 = 0;
         // Dot-dirs and caches are noise: searchable, ranked low, and the
         // flag is inherited by everything below ("~/orca/skein-zig-pkg-cache"
         // READMEs outranked the user's own).
-        if (e.name[0] == '.' or std.ascii.findIgnoreCase(
-            e.name,
-            "cache",
-        ) != null) fl |= store_mod.flag_hidden;
-        if (kind == sys.Kind.symlink) fl |= store_mod.flag_symlink;
+        if (hiddenByName(e.name)) flags |= store_mod.flag_hidden;
+        if (kind == sys.Kind.symlink) flags |= store_mod.flag_symlink;
         // A skipped directory is still indexed (searchable), just not opened.
-        if (kind == sys.Kind.dir and shouldDescend(path, e.name, cfg)) fl |= store_mod.flag_dir;
+        if (kind == sys.Kind.dir and shouldDescend(path, e.name, cfg)) flags |= store_mod.flag_dir;
         try batch.names.appendSlice(gpa, e.name);
         try batch.ends.append(gpa, @intCast(batch.names.items.len));
-        try batch.flags.append(gpa, fl);
+        try batch.flags.append(gpa, flags);
     }
 }
 
-fn shouldDescend(parent: []const u8, name: []const u8, cfg: *const Config) bool {
+/// Whether `name` hides itself and what is below it: a dot-name, or one
+/// that says "cache". The scan sets `flag_hidden` by it, and so does `Live`
+/// for what appears after the scan.
+pub fn hiddenByName(name: []const u8) bool {
+    assert(name.len > 0);
+    if (name[0] == '.') return true;
+    return std.ascii.findIgnoreCase(name, "cache") != null;
+}
+
+/// Whether directory `name` in `parent` is opened, or only indexed: the
+/// `skip` rules, and caches marked by a CACHEDIR.TAG. The scan decides by
+/// it, and so does `Live` for a directory created after the scan.
+pub fn shouldDescend(parent: []const u8, name: []const u8, cfg: *const Config) bool {
     for (cfg.skip) |rule| {
         if (std.mem.findScalarLast(u8, rule, '/')) |slash| {
-            if (std.mem.eql(
-                u8,
-                rule[slash + 1 ..],
-                name,
-            ) and std.mem.endsWith(u8, parent, rule[0..slash])) return false;
-        } else if (std.mem.eql(u8, rule, name)) return false;
+            // "a/b": a directory `b` inside one whose path ends in `a`.
+            const rule_name = rule[slash + 1 ..];
+            const rule_parent = rule[0..slash];
+            if (!std.mem.eql(u8, rule_name, name)) continue;
+            if (std.mem.endsWith(u8, parent, rule_parent)) return false;
+        } else {
+            if (std.mem.eql(u8, rule, name)) return false;
+        }
     }
     for (cfg.cachedir_probe) |probe| {
         if (!std.mem.eql(u8, probe, name)) continue;
@@ -338,32 +353,32 @@ const ScanTree = struct {
         return t;
     }
 
-    fn path(t: *const ScanTree, buf: []u8, rel: []const u8) [:0]const u8 {
-        const dir = t.buf[0..t.len];
+    fn path(tree: *const ScanTree, buf: []u8, rel: []const u8) [:0]const u8 {
+        const dir = tree.buf[0..tree.len];
         return std.mem.printSentinel(buf, "{s}/{s}", .{ dir, rel }, 0) catch unreachable;
     }
 
-    fn file(t: *const ScanTree, rel: []const u8) void {
+    fn file(tree: *const ScanTree, rel: []const u8) void {
         var buf: [4096]u8 = undefined;
-        const p = t.path(&buf, rel);
+        const p = tree.path(&buf, rel);
         sys.mkdirP(p[0 .. std.mem.findScalarLast(u8, p, '/') orelse 0]);
         sys.writeFile(p, "x") catch unreachable;
     }
 
-    fn scanOf(t: *const ScanTree, root: []const u8, cfg_in: Config, st: ?*Stats) !Store {
+    fn scanOf(tree: *const ScanTree, root: []const u8, cfg_in: Config, st: ?*Stats) !Store {
         const pool = try Pool.create(testing.allocator, testing.io, 2);
         defer pool.destroy();
         var buf: [4096]u8 = undefined;
-        const roots = [_][]const u8{t.path(&buf, root)};
+        const roots = [_][]const u8{tree.path(&buf, root)};
         var cfg = cfg_in;
         cfg.roots = &roots;
         return scan(testing.allocator, pool, &cfg, null, st);
     }
 
     /// Entries named `name` anywhere in `s`.
-    fn named(s: *const Store, name: []const u8) usize {
+    fn named(store: *const Store, name: []const u8) usize {
         var n: usize = 0;
-        for (0..s.len()) |i| n += @intFromBool(std.mem.eql(u8, s.name(@intCast(i)), name));
+        for (0..store.len()) |i| n += @intFromBool(std.mem.eql(u8, store.name(@intCast(i)), name));
         return n;
     }
 };

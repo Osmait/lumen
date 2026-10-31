@@ -1,6 +1,6 @@
 //! What the content index covers: text under $HOME that `rg --files` lists
 //! (it honours .gitignore, skips hidden files) and that is at most
-//! `content.max_text` bytes, plus PDFs and Office documents (text extracted).
+//! `content.text_bytes_max` bytes, plus PDFs and Office documents (text extracted).
 //! ripgrep resolves every .gitignore of a home directory in ~70 ms.
 
 const std = @import("std");
@@ -148,7 +148,7 @@ pub fn stat(path: [*:0]const u8, doc_kind: bool) ?Stat {
         &stx,
     );
     if (linux.errno(rc) != .SUCCESS or stx.mode & linux.S.IFMT != linux.S.IFREG) return null;
-    if (!doc_kind and (stx.size > content.max_text or stx.size < 3)) return null;
+    if (!doc_kind and (stx.size > content.text_bytes_max or stx.size < 3)) return null;
     if (doc_kind and stx.size > 64 << 20) return null;
     return .{ .mtime = stx.mtime.sec, .size = stx.size };
 }
@@ -247,7 +247,7 @@ test "list: what is indexed and what is excluded" {
         "about-cache.txt", // "cache" in a file name, not a dir: kept
         "proj/kept.txt",
         "three.txt", // written with exactly 3 bytes below
-        "exactly_max.log", // exactly content.max_text bytes below
+        "exactly_max.log", // exactly content.text_bytes_max bytes below
     };
     for (keep) |k| try t.write(k, text);
     try t.write("three.txt", "abc");
@@ -283,7 +283,7 @@ test "list: what is indexed and what is excluded" {
         "two.txt", // 2 bytes
         "empty.txt",
         "img/photo.png",
-        "big.log", // > max_text
+        "big.log", // > text_bytes_max
     };
     for (drop) |d| try t.write(d, text);
     try t.write("two.txt", "ab");
@@ -294,9 +294,9 @@ test "list: what is indexed and what is excluded" {
     try t.write("proj/.gitignore", "ignored.txt\ngen/\n");
     // Sizes without writing the bytes: sparse files.
     var buf: [4096]u8 = undefined;
-    for ([_]struct { []const u8, i64 }{ .{ "big.log", content.max_text + 1 }, .{
+    for ([_]struct { []const u8, i64 }{ .{ "big.log", content.text_bytes_max + 1 }, .{
         "exactly_max.log",
-        content.max_text,
+        content.text_bytes_max,
     } }) |e| {
         const rc = linux.open(try t.path(&buf, e[0]), .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
         try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
@@ -330,7 +330,7 @@ test "list: what is indexed and what is excluded" {
     }
     for (got) |d| {
         if (std.mem.endsWith(u8, d.path, "/exactly_max.log")) try testing.expectEqual(
-            @as(u64, content.max_text),
+            @as(u64, content.text_bytes_max),
             d.size,
         );
     }

@@ -209,50 +209,53 @@ const TextOut = struct {
     gpa: std.mem.Allocator,
     gap: Gap = .none,
 
-    fn sep(w: *TextOut, g: Gap) void {
-        if (@backingInt(g) > @backingInt(w.gap)) w.gap = g;
+    /// A gap at least as wide as `gap` before the next text.
+    fn sep(text_out: *TextOut, gap: Gap) void {
+        if (@backingInt(gap) > @backingInt(text_out.gap)) text_out.gap = gap;
     }
 
-    fn text(w: *TextOut, s: []const u8) !void {
-        if (w.gap != .none and w.out.items.len > 0)
-            try w.out.append(w.gpa, if (w.gap == .newline) '\n' else ' ');
-        w.gap = .none;
-        try w.out.appendSlice(w.gpa, s);
+    fn text(text_out: *TextOut, bytes: []const u8) !void {
+        if (text_out.gap != .none and text_out.out.items.len > 0) {
+            const separator: u8 = if (text_out.gap == .newline) '\n' else ' ';
+            try text_out.out.append(text_out.gpa, separator);
+        }
+        text_out.gap = .none;
+        try text_out.out.appendSlice(text_out.gpa, bytes);
     }
 
     /// Character data, entities not decoded (CDATA) or already decoded.
-    fn raw(w: *TextOut, s: []const u8) !void {
+    fn raw(text_out: *TextOut, s: []const u8) !void {
         var i: usize = 0;
         while (i < s.len) {
             if (isSpace(s[i])) {
-                w.sep(.space);
+                text_out.sep(.space);
                 i += 1;
                 continue;
             }
             const start = i;
             while (i < s.len and !isSpace(s[i])) i += 1;
-            try w.text(s[start..i]);
+            try text_out.text(s[start..i]);
         }
     }
 
     /// Text from `i` up to the next tag, its entities decoded; where it
     /// ends. Dropped inside a skipped element.
-    fn charData(w: *TextOut, xml: []const u8, i: usize, skipping: bool) !usize {
+    fn charData(text_out: *TextOut, xml: []const u8, i: usize, skipping: bool) !usize {
         const rest = xml[i..];
         const end = i + (std.mem.findAny(u8, rest, "<&") orelse rest.len);
-        if (!skipping) try w.raw(xml[i..end]);
+        if (!skipping) try text_out.raw(xml[i..end]);
         if (end == xml.len or xml[end] != '&') return end;
         const r = decodeEntity(xml[end..]);
         if (!skipping) {
             if (r.len == 0) {
-                try w.text("&");
+                try text_out.text("&");
             } else if (r.cp) |cp| switch (cp) {
-                '\n' => w.sep(.newline),
-                ' ', '\t', '\r' => w.sep(.space),
+                '\n' => text_out.sep(.newline),
+                ' ', '\t', '\r' => text_out.sep(.space),
                 else => {
                     var buf: [4]u8 = undefined;
                     // decodeEntity returns only encodable code points.
-                    try w.text(buf[0 .. std.unicode.utf8Encode(cp, &buf) catch unreachable]);
+                    try text_out.text(buf[0 .. std.unicode.utf8Encode(cp, &buf) catch unreachable]);
                 },
             };
         }
@@ -261,22 +264,28 @@ const TextOut = struct {
 
     /// A comment, CDATA section, declaration or doctype at `i`: where it
     /// ends. Null for a tag.
-    fn markup(w: *TextOut, xml: []const u8, i: usize, skipping: bool) !?usize {
+    fn markup(text_out: *TextOut, xml: []const u8, i: usize, skipping: bool) !?usize {
         const rest = xml[i..];
-        if (std.mem.startsWith(u8, rest, "<!--"))
-            return if (std.mem.findPos(u8, xml, i + 4, "-->")) |e| e + 3 else xml.len;
+        if (std.mem.startsWith(u8, rest, "<!--")) {
+            const end = std.mem.findPos(u8, xml, i + "<!--".len, "-->") orelse return xml.len;
+            return end + "-->".len;
+        }
         if (std.mem.startsWith(u8, rest, "<![CDATA[")) {
-            const e = std.mem.findPos(u8, xml, i + 9, "]]>") orelse xml.len;
-            if (!skipping) try w.raw(xml[i + 9 .. e]);
-            return @min(e + 3, xml.len);
+            const start = i + "<![CDATA[".len;
+            const end = std.mem.findPos(u8, xml, start, "]]>") orelse xml.len;
+            if (!skipping) try text_out.raw(xml[start..end]);
+            return @min(end + "]]>".len, xml.len);
         }
         if (std.mem.startsWith(u8, rest, "<?")) {
             // A declaration starts each concatenated member (pptx slides).
-            w.sep(.newline);
-            return if (std.mem.findPos(u8, xml, i + 2, "?>")) |e| e + 2 else xml.len;
+            text_out.sep(.newline);
+            const end = std.mem.findPos(u8, xml, i + "<?".len, "?>") orelse return xml.len;
+            return end + "?>".len;
         }
-        if (std.mem.startsWith(u8, rest, "<!"))
-            return if (std.mem.findScalarPos(u8, xml, i + 2, '>')) |e| e + 1 else xml.len;
+        if (std.mem.startsWith(u8, rest, "<!")) {
+            const end = std.mem.findScalarPos(u8, xml, i + "<!".len, '>') orelse return xml.len;
+            return end + ">".len;
+        }
         return null;
     }
 };
@@ -326,13 +335,13 @@ const Skip = struct {
     depth: usize = 0,
 
     /// True while inside it (this tag included), counting nesting.
-    fn swallow(s: *Skip, tag: Tag) bool {
-        const name = s.name orelse return false;
+    fn swallow(skip: *Skip, tag: Tag) bool {
+        const name = skip.name orelse return false;
         if (std.mem.eql(u8, tag.name, name)) {
             if (tag.closing) {
-                s.depth -= 1;
-                if (s.depth == 0) s.* = .{};
-            } else if (!tag.self_closing) s.depth += 1;
+                skip.depth -= 1;
+                if (skip.depth == 0) skip.* = .{};
+            } else if (!tag.self_closing) skip.depth += 1;
         }
         return true;
     }
@@ -502,21 +511,21 @@ const TestDir = struct {
     t: sys.TestDir,
     abs: []const u8,
 
-    fn init(td: *TestDir) !void {
-        td.t = try .init();
-        td.abs = td.t.abs;
+    fn init(test_dir: *TestDir) !void {
+        test_dir.t = try .init();
+        test_dir.abs = test_dir.t.abs;
     }
-    fn deinit(td: *TestDir) void {
-        td.t.deinit();
+    fn deinit(test_dir: *TestDir) void {
+        test_dir.t.deinit();
     }
-    fn write(td: *TestDir, name: []const u8, data: []const u8) !void {
-        try td.t.write(name, data);
+    fn write(test_dir: *TestDir, name: []const u8, data: []const u8) !void {
+        try test_dir.t.write(name, data);
     }
-    fn absZ(td: *TestDir, name: []const u8) ![:0]u8 {
-        return testing.allocator.printSentinel("{s}/{s}", .{ td.abs, name }, 0);
+    fn absZ(test_dir: *TestDir, name: []const u8) ![:0]u8 {
+        return testing.allocator.printSentinel("{s}/{s}", .{ test_dir.abs, name }, 0);
     }
-    fn extract(td: *TestDir, name: []const u8, max: usize) ![]u8 {
-        const p = try td.absZ(name);
+    fn extract(test_dir: *TestDir, name: []const u8, max: usize) ![]u8 {
+        const p = try test_dir.absZ(name);
         defer testing.allocator.free(p);
         return extractText(
             testing.allocator,
@@ -532,8 +541,8 @@ const TestDir = struct {
     }
 };
 
-fn expectExtract(td: *TestDir, name: []const u8, want: []const u8) !void {
-    const got = try td.extract(name, 1 << 20);
+fn expectExtract(test_dir: *TestDir, name: []const u8, want: []const u8) !void {
+    const got = try test_dir.extract(name, 1 << 20);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings(want, got);
 }
@@ -596,14 +605,14 @@ test "extract docx, xlsx, pptx (OOXML)" {
 /// names) in name order. `unzip -p` prints members in
 /// archive order, and `zip -r` would follow readdir's order, which differs
 /// between file systems (Office writes the body first; sorted names do too).
-fn zipInto(td: *TestDir, dir: []const u8, name: []const u8) !void {
-    return zipWith(td, dir, name, "");
+fn zipInto(test_dir: *TestDir, dir: []const u8, name: []const u8) !void {
+    return zipWith(test_dir, dir, name, "");
 }
 
 /// `zipInto` with more options for zip.
-fn zipWith(td: *TestDir, dir: []const u8, name: []const u8, options: []const u8) !void {
+fn zipWith(test_dir: *TestDir, dir: []const u8, name: []const u8, options: []const u8) !void {
     var buf: [256]u8 = undefined;
-    const rel = try std.mem.print(&buf, "{s}/{s}", .{ td.abs, dir });
+    const rel = try std.mem.print(&buf, "{s}/{s}", .{ test_dir.abs, dir });
     var cmd_buf: [256]u8 = undefined;
     const cmd = try std.mem.print(
         &cmd_buf,
