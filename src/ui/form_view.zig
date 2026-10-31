@@ -124,8 +124,8 @@ pub fn pick(ui: *Ui, field_index: u16, field_value: []const u8) void {
 }
 
 /// Fields a form has at most. Host refuses a command with more when it
-/// loads the files (its `form_fields_max`), so `submit` never runs out.
-const form_fields_max = 20;
+/// loads the files, so `submit` never runs out.
+const form_fields_max = Host.form_fields_max;
 
 /// The Submit row: required fields first, then the extension's submit.
 pub fn submit(ui: *Ui) void {

@@ -40,6 +40,7 @@ pub const installer = @import("installer.zig");
 const prefs_view = @import("prefs_view.zig");
 const form_view = @import("form_view.zig");
 const ExtHost = @import("../ext/Host.zig");
+const ipc = @import("../ipc.zig");
 const layout_mod = @import("../layout.zig");
 const Inflight = @import("inflight.zig").Inflight;
 const Kind = core.file_kind.Kind;
@@ -155,8 +156,12 @@ const footer_action_class = "footer-action";
 /// Monitors that get a backdrop; past these, a click on one more monitor
 /// does not close Lumen.
 const backdrops_max = 8;
-/// An extension's id, with room to spare: Host refuses ids over 40 bytes.
+/// An extension's id, with room to spare over the longest one Host accepts.
 const extension_id_bytes_max = 64;
+
+comptime {
+    assert(extension_id_bytes_max >= ExtHost.id_bytes_max);
+}
 /// A message kept for the row after a reload (a failed install's reason).
 const after_reload_message_bytes_max = 160;
 /// The choose view's title ("Open Markdown With", a setting's name).
@@ -198,7 +203,7 @@ list: *c.GtkListBox = undefined,
 /// Extension commands with `grid = true` show their rows here instead.
 grid: *c.GtkFlowBox = undefined,
 grid_mode: bool = false,
-grid_columns: c_int = 5,
+grid_columns: c_int = ExtHost.grid_columns_default,
 scroller: *c.GtkScrolledWindow = undefined,
 detail: DetailPane = .{},
 /// File index, started by main once the window exists.
@@ -547,7 +552,7 @@ const arena_keep: std.heap.ArenaAllocator.ResetMode = .{ .retain_with_limit = 4 
 /// End-to-end tests run a second, isolated Lumen (LUMEN_TEST=1): it must not
 /// take the keyboard from the session, nor ask Hyprland where to go.
 pub fn testMode() bool {
-    return c.g_getenv("LUMEN_TEST") != null;
+    return c.g_getenv(ipc.env.test_mode) != null;
 }
 
 /// Takes `db`. Call `build` before anything else: the widgets are made

@@ -215,17 +215,17 @@ pub fn choiceOptions(
             .default = "Default",
             .comfortable = "Comfortable",
         }),
-        .opacity => numberOptions(&.{
-            .{ .value = 100, .label = "100% (Opaque)" },
-            .{ .value = 97, .label = "97%" },
-            .{ .value = 90, .label = "90%" },
-            .{ .value = 80, .label = "80%" },
+        .opacity => numberOptions(&settings_mod.opacity_choices, &.{
+            "100% (Opaque)",
+            "97%",
+            "90%",
+            "80%",
         }),
-        .clipboard_keep => numberOptions(&.{
-            .{ .value = 100, .label = "100 entries" },
-            .{ .value = 500, .label = "500 entries" },
-            .{ .value = 1000, .label = "1,000 entries" },
-            .{ .value = 5000, .label = "5,000 entries" },
+        .clipboard_keep => numberOptions(&settings_mod.keep_choices, &.{
+            "100 entries",
+            "500 entries",
+            "1,000 entries",
+            "5,000 entries",
         }),
         .icon_theme => iconThemes(arena),
         .terminal, .editor => blk: {
@@ -273,18 +273,17 @@ fn enumOptions(
     return &options;
 }
 
-const NumberOption = struct { value: u32, label: [:0]const u8 };
-
-/// The options of a numeric setting, its values written as Settings reads
-/// them back.
-fn numberOptions(comptime numbers: []const NumberOption) []const Option {
+/// The options of a number setting: the values Settings offers, written
+/// as Settings reads them back, with a label for each in the same order.
+fn numberOptions(
+    comptime values: anytype,
+    comptime value_labels: []const [:0]const u8,
+) []const Option {
     const options = comptime blk: {
-        var built: [numbers.len]Option = undefined;
-        for (numbers, &built) |number, *option| {
-            option.* = .{
-                .value = std.fmt.comptimePrint("{d}", .{number.value}),
-                .label = number.label,
-            };
+        std.debug.assert(values.len == value_labels.len);
+        var built: [value_labels.len]Option = undefined;
+        for (values, value_labels, &built) |value, label, *option| {
+            option.* = .{ .value = std.fmt.comptimePrint("{d}", .{value}), .label = label };
         }
         break :blk built;
     };
@@ -753,8 +752,8 @@ fn openWith(ui: *Ui, id: [:0]const u8, choice: OpenWithChoice) void {
 
 pub fn performSetting(ui: *Ui, setting: item_mod.Setting, op: item_mod.Op) void {
     const locked: ?[]const u8 = switch (setting) {
-        .theme => "theme",
-        .style => "style",
+        .theme => @tagName(settings_mod.Text.theme),
+        .style => @tagName(settings_mod.Text.style),
         else => settingName(setting),
     };
     if (locked) |key| if (ui.overridden(key)) return ui.showFailure("Set in init.lua");
@@ -782,13 +781,13 @@ pub fn performSetting(ui: *Ui, setting: item_mod.Setting, op: item_mod.Op) void 
             ui.navigate(target);
         },
         .theme => |id| {
-            _ = ui.settings.set("theme", id);
+            _ = ui.settings.setTextValue(.theme, id);
             ui.saveSettings();
             ui.goBack();
         },
         .style => |id| {
             // Its CSS now, its Lua (layout, themes, lumen.set) on the reload.
-            _ = ui.settings.set("style", id);
+            _ = ui.settings.setTextValue(.style, id);
             ui.saveSettings();
             ui.style_defaults_pending = true;
             ext_view.syncStyle(ui);

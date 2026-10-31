@@ -49,7 +49,7 @@ pub fn extensionRows(ui: *Ui, arena: std.mem.Allocator, out: *std.ArrayList(Item
         }) catch return;
     }
     for (registry.problems) |problem| {
-        if (std.mem.eql(u8, problem.ext, "config")) continue;
+        if (std.mem.eql(u8, problem.ext, Host.config_extension_id)) continue;
         out.append(arena, .{
             .key = arena.print("set:ext:{s}", .{problem.ext}) catch continue,
             .section = "Extensions",
@@ -145,15 +145,6 @@ pub fn iconOf(kind: Host.PrefKind) item_mod.Icon {
     };
 }
 
-/// A toggle's value as preferences and form fields keep it: the JSON
-/// spelling, which is also what a toggle's `default` is written as.
-const toggle_on = "true";
-const toggle_off = "false";
-
-fn toggleIsOn(value: []const u8) bool {
-    return std.mem.eql(u8, value, toggle_on);
-}
-
 /// A text preference shows this much of its value on its row.
 const text_value_bytes_shown = 40;
 
@@ -164,7 +155,7 @@ pub fn display(
     value: []const u8,
 ) [:0]const u8 {
     return switch (preference.kind) {
-        .toggle => if (toggleIsOn(value)) "On" else "Off",
+        .toggle => if (Host.toggleIsOn(value)) "On" else "Off",
         .choice => for (preference.choices) |choice| {
             if (std.mem.eql(u8, choice.value, value)) break choice.label;
         } else arena.dupeSentinel(u8, value, 0) catch "",
@@ -212,7 +203,7 @@ pub fn current(arena: std.mem.Allocator, preference: *const Host.Pref) []const u
     };
     const stored_value = stored.get(preference.name) orelse return preference.default;
     return switch (stored_value) {
-        .bool => |flag| if (flag) "true" else "false",
+        .bool => |flag| Host.toggleText(flag),
         .string => |text| text,
         else => preference.default,
     };
@@ -234,12 +225,12 @@ pub fn edit(ui: *Ui, pref_index: u16) void {
 pub fn editValue(ui: *Ui, target: Ui.Edited, preference: *const Host.Pref, value: []const u8) void {
     switch (preference.kind) {
         .toggle => {
-            const on = !toggleIsOn(value);
+            const on = !Host.toggleIsOn(value);
             switch (target) {
                 // The value was not saved; the row's hint already says why.
                 .pref => if (!save(ui, preference, .{ .bool = on })) return,
                 .field => |field_index| {
-                    form_view.setValue(ui, field_index, if (on) toggle_on else toggle_off);
+                    form_view.setValue(ui, field_index, Host.toggleText(on));
                 },
             }
             // Row keys are "pref:<name>" and "field:<name>".

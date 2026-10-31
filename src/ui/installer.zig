@@ -20,8 +20,12 @@ const proc = @import("../sys/proc.zig");
 const Kind = enum { install, update, uninstall };
 
 /// The name an extension is installed under (its folder), with room to
-/// spare: Host refuses ids over 40 bytes.
+/// spare over the longest id Host accepts.
 const extension_name_bytes_max = 64;
+
+comptime {
+    std.debug.assert(extension_name_bytes_max >= Host.id_bytes_max);
+}
 
 const Job = struct {
     ui: *Ui,

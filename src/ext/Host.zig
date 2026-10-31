@@ -65,9 +65,9 @@ const rows_too_big = std.fmt.comptimePrint(
     .{rows_bytes_max >> 20},
 );
 /// Fields of one form.
-const form_fields_max = 20;
+pub const form_fields_max = 20;
 /// An extension's folder name, a command's or a field's name.
-const id_bytes_max = 40;
+pub const id_bytes_max = 40;
 /// A grid command's cells to a line.
 const grid_columns_min = 2;
 const grid_columns_max = 10;
@@ -115,6 +115,7 @@ worker_arena: std.heap.ArenaAllocator,
 /// because the window names them through Host.
 pub const Mode = registry_mod.Mode;
 pub const config_extension_id = registry_mod.config_extension_id;
+pub const grid_columns_default = registry_mod.grid_columns_default;
 pub const style_extension_id = registry_mod.style_extension_id;
 pub const toggleText = registry_mod.toggleText;
 pub const toggleIsOn = registry_mod.toggleIsOn;

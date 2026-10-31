@@ -197,12 +197,20 @@ pub const Settings = struct {
             return true;
         }
         if (std.meta.stringToEnum(Text, key)) |text| {
-            if (textValid(text, value)) switch (text) {
-                inline else => |tag| settings.setText(&@field(settings, @tagName(tag)), value),
-            };
+            _ = settings.setTextValue(text, value);
             return true;
         }
         return false;
+    }
+
+    /// Sets a text setting (theme, style) to a copy of `value`. False, with
+    /// the current value kept, when `value` is not one it may hold.
+    pub fn setTextValue(settings: *Settings, text: Text, value: []const u8) bool {
+        if (!textValid(text, value)) return false;
+        switch (text) {
+            inline else => |tag| settings.setText(&@field(settings, @tagName(tag)), value),
+        }
+        return true;
     }
 
     /// Whether `value` may be written as `text`: a token. An empty style is
