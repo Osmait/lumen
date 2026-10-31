@@ -58,38 +58,54 @@ lock: Io.RwLock = .init,
 index: ?content.Index = null,
 stop: std.atomic.Value(bool) = .init(false),
 wake: std.atomic.Value(u32) = .init(0),
-last_check_ns: std.atomic.Value(u64) = .init(0),
 thread: ?std.Thread = null,
-building: std.atomic.Value(bool) = .init(false),
-/// For `lumen --stats` (and tests: `checks` counts finished checks). Read
-/// from other threads.
-builds: std.atomic.Value(u32) = .init(0),
-/// Of those, the ones that only added what changed.
-updates: std.atomic.Value(u32) = .init(0),
-/// Checks that listed every file (the others only looked at indexed ones).
-listings: std.atomic.Value(u32) = .init(0),
-/// `names.nameChanges()` when files were last listed. Service thread only.
-listed_names: ?u64 = null,
-listed_at_ns: u64 = 0,
-checks: std.atomic.Value(u32) = .init(0),
-extractions: std.atomic.Value(u32) = .init(0),
-last_list_ns: std.atomic.Value(u64) = .init(0),
-/// The last check that looked at indexed files only.
-last_stat_ns: std.atomic.Value(u64) = .init(0),
-last_build_ns: std.atomic.Value(u64) = .init(0),
-last_extract_ns: std.atomic.Value(u64) = .init(0),
-/// The index in use could not be saved: retried on the next check even if
-/// nothing changed. Service thread only.
-unsaved: bool = false,
-/// Documents whose extraction failed in passing (a timeout, a missing tool,
-/// memory): kept out of the index, which would remember them as textless
-/// for as long as they do not change, and tried again by the next check.
-/// In `retry_arena`. Service thread only.
-retry: []const content.DocIn = &.{},
-retry_arena: std.heap.ArenaAllocator,
-/// The service thread, set by `run` before its first check. What the
-/// comments call "service thread only" asserts it (`assertWorkerThread`).
-worker_thread_id: ?std.Thread.Id = null,
+/// Written by the service thread, read by any thread (`status`).
+counters: Counters = .{},
+/// The service thread's own state, read and written without the lock.
+worker: Worker,
+
+/// What the service thread counts and times, for `lumen --stats` and for
+/// tests (`checks` counts finished checks). Only the service thread writes
+/// them; any thread reads them through `status`, so they are atomics.
+pub const Counters = struct {
+    building: std.atomic.Value(bool) = .init(false),
+    builds: std.atomic.Value(u32) = .init(0),
+    /// Of the builds, the ones that only added what changed.
+    updates: std.atomic.Value(u32) = .init(0),
+    /// Checks that listed every file (the others only looked at indexed
+    /// ones).
+    listings: std.atomic.Value(u32) = .init(0),
+    checks: std.atomic.Value(u32) = .init(0),
+    /// Documents whose text was extracted (a child process each).
+    extractions: std.atomic.Value(u32) = .init(0),
+    /// When the last check started, for the rate limit of `poke`.
+    last_check_ns: std.atomic.Value(u64) = .init(0),
+    last_list_ns: std.atomic.Value(u64) = .init(0),
+    /// The last check that looked at indexed files only.
+    last_stat_ns: std.atomic.Value(u64) = .init(0),
+    last_build_ns: std.atomic.Value(u64) = .init(0),
+    last_extract_ns: std.atomic.Value(u64) = .init(0),
+};
+
+/// State only the service thread reads or writes, so it needs no lock and no
+/// atomics. Every function that touches it asserts the thread
+/// (`assertWorkerThread`).
+const Worker = struct {
+    /// The service thread, set by `run` before its first check.
+    thread_id: ?std.Thread.Id = null,
+    /// `names.nameChanges()` when files were last listed.
+    listed_names: ?u64 = null,
+    listed_at_ns: u64 = 0,
+    /// The index in use could not be saved: retried on the next check even
+    /// if nothing changed.
+    unsaved: bool = false,
+    /// Documents whose extraction failed in passing (a timeout, a missing
+    /// tool, memory): kept out of the index, which would remember them as
+    /// textless for as long as they do not change, and tried again by the
+    /// next check. In `retry_arena`.
+    retry: []const content.DocIn = &.{},
+    retry_arena: std.heap.ArenaAllocator,
+};
 
 /// The thread pools it borrows: they must outlive the service.
 pub const Pools = struct { search: *Pool, build: *Pool };
@@ -133,7 +149,7 @@ pub fn startWith(
         .search_pool = pools.search,
         .build_pool = pools.build,
         .opts = opts,
-        .retry_arena = .init(gpa),
+        .worker = .{ .retry_arena = .init(gpa) },
     };
     sys.mkdirP(service.text_dir);
     // Older versions made these 0755: the cache holds the text of the
@@ -154,7 +170,7 @@ pub fn shutdown(service: *ContentService) void {
     service.poke();
     if (service.thread) |t| t.join();
     if (service.index) |*ix| ix.deinit(service.gpa);
-    service.retry_arena.deinit();
+    service.worker.retry_arena.deinit();
     service.gpa.free(service.root);
     service.gpa.free(service.cache_path);
     service.gpa.free(service.text_dir);
@@ -197,20 +213,20 @@ pub fn status(service: *ContentService) Status {
     }
     return .{
         .docs = if (service.index) |ix| ix.live() else 0,
-        .building = service.building.load(.acquire),
+        .building = service.counters.building.load(.acquire),
         .ready = service.index != null,
         .extracted = extracted,
         .segments = if (service.index) |ix| ix.segments_count else 0,
         .index_bytes = if (service.index) |ix| ix.buf.len else 0,
-        .builds = service.builds.load(.acquire),
-        .updates = service.updates.load(.acquire),
-        .listings = service.listings.load(.acquire),
-        .checks = service.checks.load(.acquire),
-        .extractions = service.extractions.load(.acquire),
-        .last_list_ns = service.last_list_ns.load(.monotonic),
-        .last_stat_ns = service.last_stat_ns.load(.monotonic),
-        .last_build_ns = service.last_build_ns.load(.monotonic),
-        .last_extract_ns = service.last_extract_ns.load(.monotonic),
+        .builds = service.counters.builds.load(.acquire),
+        .updates = service.counters.updates.load(.acquire),
+        .listings = service.counters.listings.load(.acquire),
+        .checks = service.counters.checks.load(.acquire),
+        .extractions = service.counters.extractions.load(.acquire),
+        .last_list_ns = service.counters.last_list_ns.load(.monotonic),
+        .last_stat_ns = service.counters.last_stat_ns.load(.monotonic),
+        .last_build_ns = service.counters.last_build_ns.load(.monotonic),
+        .last_extract_ns = service.counters.last_extract_ns.load(.monotonic),
     };
 }
 
@@ -452,7 +468,7 @@ const ExtractContext = struct {
         sys.writeFileAtomic(text_path, text) catch |err| {
             log.warn("caching text of {s}: {t}", .{ doc.path, err });
         };
-        _ = service.extractions.fetchAdd(1, .release);
+        _ = service.counters.extractions.fetchAdd(1, .release);
     }
 };
 
@@ -466,6 +482,7 @@ fn leaveOut(
     missing: []const usize,
     failed: []const ?anyerror,
 ) ?[]content.DocIn {
+    service.assertWorkerThread();
     assert(missing.len == failed.len);
     var failed_count: usize = 0;
     var failed_first: ?usize = null;
@@ -474,9 +491,9 @@ fn leaveOut(
         failed_count += 1;
         if (failed_first == null) failed_first = missing_index;
     }
-    const retry_count_before = service.retry.len;
-    _ = service.retry_arena.reset(.retain_capacity);
-    service.retry = &.{};
+    const retry_count_before = service.worker.retry.len;
+    _ = service.worker.retry_arena.reset(.retain_capacity);
+    service.worker.retry = &.{};
     if (failed_count == 0) return docs;
 
     const first = failed_first.?;
@@ -486,7 +503,7 @@ fn leaveOut(
             .{ failed_count, docs[missing[first]].path, failed[first].? },
         );
     }
-    const retry_arena = service.retry_arena.allocator();
+    const retry_arena = service.worker.retry_arena.allocator();
     const retry = retry_arena.alloc(content.DocIn, failed_count) catch return null;
     const dropped = arena.alloc(bool, docs.len) catch return null;
     @memset(dropped, false);
@@ -499,7 +516,7 @@ fn leaveOut(
         retry_index += 1;
     }
     assert(retry_index == failed_count);
-    service.retry = retry;
+    service.worker.retry = retry;
 
     var kept_count: usize = 0;
     for (docs, dropped) |doc, doc_dropped| {
@@ -575,10 +592,10 @@ fn listAll(service: *ContentService, arena: std.mem.Allocator, names: ?u64) ?[]c
         if (err != error.Canceled) log.warn("listing files: {t}", .{err});
         return null;
     };
-    service.last_list_ns.store(sys.monotonicNs() - start_ns, .monotonic);
-    _ = service.listings.fetchAdd(1, .release);
-    service.listed_names = names;
-    service.listed_at_ns = start_ns;
+    service.counters.last_list_ns.store(sys.monotonicNs() - start_ns, .monotonic);
+    _ = service.counters.listings.fetchAdd(1, .release);
+    service.worker.listed_names = names;
+    service.worker.listed_at_ns = start_ns;
     return docs;
 }
 
@@ -590,6 +607,7 @@ fn indexedChanges(
     service: *ContentService,
     arena: std.mem.Allocator,
 ) std.mem.Allocator.Error!Diff {
+    service.assertWorkerThread();
     const index = &service.index.?;
     var gone: std.ArrayList(u32) = .empty;
     var added: std.ArrayList(content.DocIn) = .empty;
@@ -614,7 +632,7 @@ fn indexedChanges(
         });
     }
     // Not in the index (`extractMissing` left them out): as they are now.
-    for (service.retry) |doc| {
+    for (service.worker.retry) |doc| {
         const path = std.mem.printSentinel(&path_buffer, "{s}", .{doc.path}, 0) catch continue;
         const stat = content_list.stat(path, true) orelse continue;
         try added.append(arena, .{
@@ -628,17 +646,16 @@ fn indexedChanges(
 }
 
 /// The service thread is the only one that replaces the index and the only
-/// one that reads `listed_names`, `unsaved` and `retry`: what it does
-/// without the lock relies on that.
+/// one that touches `worker`: what it does without the lock relies on that.
 fn assertWorkerThread(service: *const ContentService) void {
-    assert(service.worker_thread_id.? == std.Thread.getCurrentId());
+    assert(service.worker.thread_id.? == std.Thread.getCurrentId());
 }
 
 fn refresh(service: *ContentService) void {
     service.assertWorkerThread();
-    service.last_check_ns.store(sys.monotonicNs(), .release);
+    service.counters.last_check_ns.store(sys.monotonicNs(), .release);
     // Counted when done, so `checks` going up means its result is visible.
-    defer _ = service.checks.fetchAdd(1, .release);
+    defer _ = service.counters.checks.fetchAdd(1, .release);
     var arena_state: std.heap.ArenaAllocator = .init(service.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -647,12 +664,12 @@ fn refresh(service: *ContentService) void {
     var changed = service.changes(arena, names, &docs) orelse return;
     if (service.stop.load(.acquire)) return;
     if (service.index != null and changed.gone.len == 0 and changed.added.len == 0) {
-        if (service.unsaved) service.retrySave();
+        if (service.worker.unsaved) service.retrySave();
         return;
     }
 
-    service.building.store(true, .release);
-    defer service.building.store(false, .release);
+    service.counters.building.store(true, .release);
+    defer service.counters.building.store(false, .release);
     defer @import("root.zig").trimHeap();
     const whole = service.wantsWhole(changed);
     // A whole build indexes every file: they must be listed.
@@ -666,15 +683,15 @@ fn refresh(service: *ContentService) void {
     } else {
         changed.added = service.extractMissing(arena, changed.added) orelse return;
     }
-    service.last_extract_ns.store(sys.monotonicNs() - start_ns, .monotonic);
+    service.counters.last_extract_ns.store(sys.monotonicNs() - start_ns, .monotonic);
     if (service.stop.load(.acquire)) return;
     // Only documents to retry, which failed again.
     if (!whole and changed.gone.len == 0 and changed.added.len == 0) return;
     start_ns = sys.monotonicNs();
     const fresh = service.buildNext(if (whole) docs.? else null, changed) orelse return;
-    service.last_build_ns.store(sys.monotonicNs() - start_ns, .monotonic);
-    _ = service.builds.fetchAdd(1, .release);
-    if (!whole) _ = service.updates.fetchAdd(1, .release);
+    service.counters.last_build_ns.store(sys.monotonicNs() - start_ns, .monotonic);
+    _ = service.counters.builds.fetchAdd(1, .release);
+    if (!whole) _ = service.counters.updates.fetchAdd(1, .release);
 
     var old = blk: {
         service.lock.lockUncancelable(service.io);
@@ -705,7 +722,7 @@ fn changes(
         return service.diff(arena, docs.*.?) catch null;
     }
     const changed = service.indexedChanges(arena) catch return null;
-    service.last_stat_ns.store(sys.monotonicNs() - start_ns, .monotonic);
+    service.counters.last_stat_ns.store(sys.monotonicNs() - start_ns, .monotonic);
     return changed;
 }
 
@@ -714,11 +731,12 @@ fn changes(
 const ListingReason = enum { no_index, names_unknown, names_changed, listing_stale };
 
 fn listingReason(service: *const ContentService, names: ?u64, now_ns: u64) ?ListingReason {
+    service.assertWorkerThread();
     if (service.index == null) return .no_index;
     const names_now = names orelse return .names_unknown;
-    const names_listed = service.listed_names orelse return .names_unknown;
+    const names_listed = service.worker.listed_names orelse return .names_unknown;
     if (names_now != names_listed) return .names_changed;
-    if (now_ns - service.listed_at_ns >= service.opts.list_interval_ns) return .listing_stale;
+    if (now_ns - service.worker.listed_at_ns >= service.opts.list_interval_ns) return .listing_stale;
     return null;
 }
 
@@ -749,10 +767,11 @@ const BuildStrategy = enum {
 };
 
 fn buildStrategy(service: *const ContentService, docs_all: ?[]const content.DocIn) BuildStrategy {
+    service.assertWorkerThread();
     if (docs_all != null) return .build_whole;
     const index = &service.index.?;
     if (!index.mapped) return .rewrite_file;
-    if (service.unsaved) return .rewrite_file;
+    if (service.worker.unsaved) return .rewrite_file;
     return .append_to_mapped_file;
 }
 
@@ -777,7 +796,7 @@ fn buildNext(
     }
     const strategy = service.buildStrategy(docs_all);
     if (service.buildNextToFile(strategy, docs_all, changed, reader)) |fresh| {
-        if (fresh.mapped) service.unsaved = false;
+        if (fresh.mapped) service.worker.unsaved = false;
         return fresh;
     } else |err| switch (err) {
         error.OutOfMemory => {
@@ -793,7 +812,7 @@ fn buildNext(
         // served from there; saving is retried on the next check.
         else => {
             log.warn("writing the content index: {t}", .{err});
-            service.unsaved = true;
+            service.worker.unsaved = true;
         },
     }
     const fresh = if (docs_all) |docs|
@@ -865,7 +884,7 @@ fn retrySave(service: *ContentService) void {
         log.warn("saving the content index: {t}", .{err});
         return;
     };
-    service.unsaved = false;
+    service.worker.unsaved = false;
 }
 
 /// Deletes the cached text of document versions that are gone (edited or
@@ -928,7 +947,7 @@ fn sweepText(service: *ContentService) void {
 }
 
 fn run(service: *ContentService) void {
-    service.worker_thread_id = std.Thread.getCurrentId();
+    service.worker.thread_id = std.Thread.getCurrentId();
     // A saved index is a photo: always check it on start.
     // `seen` is read before refreshing: a poke that lands during a refresh
     // still counts afterwards (it may come after the listing).
@@ -941,14 +960,14 @@ fn run(service: *ContentService) void {
         // Sleep until the next periodic check; `poke` and `shutdown` wake
         // the thread sooner. The wait cannot be canceled: this thread is
         // joined, never canceled.
-        const since_check_ns = sys.monotonicNs() - service.last_check_ns.load(.acquire);
+        const since_check_ns = sys.monotonicNs() - service.counters.last_check_ns.load(.acquire);
         const due_ns = service.opts.refresh_interval_ns -| since_check_ns;
         service.io.futexWaitTimeout(u32, &service.wake.raw, seen, .{ .duration = .{
             .raw = .fromNanoseconds(@max(due_ns, std.time.ns_per_s)),
             .clock = .awake,
         } }) catch {};
         if (service.stop.load(.acquire)) return;
-        const since_ns = sys.monotonicNs() - service.last_check_ns.load(.acquire);
+        const since_ns = sys.monotonicNs() - service.counters.last_check_ns.load(.acquire);
         const wake_now = service.wake.load(.acquire);
         const poked = wake_now != seen;
         seen = wake_now;
@@ -1416,9 +1435,12 @@ test "content service: a document whose extraction failed in passing is left out
         .search_pool = pool,
         .build_pool = pool,
         .opts = .{},
-        .retry_arena = .init(testing.allocator),
+        .worker = .{
+            .thread_id = std.Thread.getCurrentId(),
+            .retry_arena = .init(testing.allocator),
+        },
     };
-    defer s.retry_arena.deinit();
+    defer s.worker.retry_arena.deinit();
     const docs = content_list.list(arena, testing.allocator, testing.io, t.abs, true) catch |err|
         return switch (err) {
             error.FileNotFound => error.SkipZigTest, // no ripgrep
@@ -1431,8 +1453,8 @@ test "content service: a document whose extraction failed in passing is left out
     const kept = s.leaveOut(arena, docs, &.{0}, &[_]?anyerror{error.Timeout}).?;
     try testing.expectEqual(@as(usize, 1), kept.len);
     try testing.expect(std.mem.endsWith(u8, kept[0].path, "/b.txt"));
-    try testing.expectEqual(@as(usize, 1), s.retry.len);
-    try testing.expectEqualStrings(pdf, s.retry[0].path);
+    try testing.expectEqual(@as(usize, 1), s.worker.retry.len);
+    try testing.expectEqualStrings(pdf, s.worker.retry[0].path);
     const reader: content.TextReader = .{ .read = textOf, .ctx = &s };
     s.index = try content.build(testing.allocator, pool, kept, reader, null);
     defer s.index.?.deinit(testing.allocator);
@@ -1446,5 +1468,5 @@ test "content service: a document whose extraction failed in passing is left out
     // Extracted this time: indexed, nothing left to retry.
     const all = s.leaveOut(arena, d.added, &.{0}, &[_]?anyerror{null}).?;
     try testing.expectEqual(@as(usize, 1), all.len);
-    try testing.expectEqual(@as(usize, 0), s.retry.len);
+    try testing.expectEqual(@as(usize, 0), s.worker.retry.len);
 }
