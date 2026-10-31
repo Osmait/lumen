@@ -13,6 +13,8 @@ const Ui = @import("Ui.zig");
 const prefs_view = @import("prefs_view.zig");
 const settings_view = @import("settings_view.zig");
 
+const log = std.log.scoped(.ext);
+
 fn command(ui: *Ui) ?*const Host.Command {
     const registry = ui.ext_registry orelse return null;
     if (ui.form_cmd >= registry.commands.len) return null;
@@ -49,11 +51,11 @@ fn value(ui: *Ui, i: usize) [:0]const u8 {
     return if (i < ui.form_values.items.len) ui.form_values.items[i] else "";
 }
 
-pub fn setValue(ui: *Ui, i: usize, field_value: []const u8) void {
-    if (i >= ui.form_values.items.len) return;
+pub fn setValue(ui: *Ui, field_index: usize, field_value: []const u8) void {
+    if (field_index >= ui.form_values.items.len) return;
     const copy = ui.gpa.dupeSentinel(u8, field_value, 0) catch return;
-    ui.gpa.free(ui.form_values.items[i]);
-    ui.form_values.items[i] = copy;
+    ui.gpa.free(ui.form_values.items[field_index]);
+    ui.form_values.items[field_index] = copy;
 }
 
 pub fn title(ui: *Ui) [*:0]const u8 {
@@ -61,9 +63,9 @@ pub fn title(ui: *Ui) [*:0]const u8 {
     return cmd.title.ptr;
 }
 
-pub fn field(ui: *Ui, i: usize) ?*const Host.Pref {
+pub fn field(ui: *Ui, field_index: usize) ?*const Host.Pref {
     const cmd = command(ui) orelse return null;
-    return if (i < cmd.fields.len) &cmd.fields[i] else null;
+    return if (field_index < cmd.fields.len) &cmd.fields[field_index] else null;
 }
 
 pub fn candidates(ui: *Ui, arena: std.mem.Allocator) []Item {
@@ -85,32 +87,39 @@ pub fn candidates(ui: *Ui, arena: std.mem.Allocator) []Item {
             .action = .{ .setting = .{ .field = @intCast(i) } },
         }) catch break;
     }
+    // Without its Submit row the form cannot be sent: say so in the log
+    // (the next keystroke builds the rows again).
     out.append(arena, .{
         .key = "form:submit",
         .title = cmd.submit_title,
         .icon = .{ .tile = .{ .name = "document-send-symbolic", .color = .blue } },
         .action = .{ .setting = .submit_form },
-    }) catch {};
+    }) catch log.warn("out of memory: the form has no Submit row", .{});
     return out.items;
 }
 
-/// Enter on field `i`.
-pub fn edit(ui: *Ui, i: u16) void {
-    const form_field = field(ui, i) orelse return;
-    prefs_view.editValue(ui, .{ .field = i }, form_field, value(ui, i));
+/// Enter on field `field_index`.
+pub fn edit(ui: *Ui, field_index: u16) void {
+    const form_field = field(ui, field_index) orelse return;
+    prefs_view.editValue(ui, .{ .field = field_index }, form_field, value(ui, field_index));
 }
 
-/// The values of choice field `i`, for the choose view.
-pub fn choiceCandidates(ui: *Ui, arena: std.mem.Allocator, out: *std.ArrayList(Item), i: u16) void {
-    const form_field = field(ui, i) orelse return;
+/// The values of choice field `field_index`, for the choose view.
+pub fn choiceCandidates(
+    ui: *Ui,
+    arena: std.mem.Allocator,
+    out: *std.ArrayList(Item),
+    field_index: u16,
+) void {
+    const form_field = field(ui, field_index) orelse return;
     for (form_field.choices) |choice| out.append(
         arena,
-        settings_view.pickRow(arena, choice, value(ui, i)) catch return,
+        settings_view.pickRow(arena, choice, value(ui, field_index)) catch return,
     ) catch return;
 }
 
-pub fn pick(ui: *Ui, i: u16, field_value: []const u8) void {
-    setValue(ui, i, field_value);
+pub fn pick(ui: *Ui, field_index: u16, field_value: []const u8) void {
+    setValue(ui, field_index, field_value);
     ui.goBack();
 }
 

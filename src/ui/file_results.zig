@@ -82,13 +82,20 @@ pub fn itemsFromHits(
     return out.items;
 }
 
+/// What the content search asks for while the query is too short to look
+/// up, from the same minimum the search uses.
+const type_more_hint = std.fmt.comptimePrint(
+    "Type at least {d} characters",
+    .{Ui.content_query_bytes_min},
+);
+
 pub fn contentsHint(ui: *Ui, arena: std.mem.Allocator, typed: usize) [:0]const u8 {
     const service = ui.contents orelse return "Content index unavailable";
-    const st = service.status();
-    if (!st.ready) return "Indexing the text of your files...";
-    if (typed > 0) return "Type at least 3 characters";
+    const status = service.status();
+    if (!status.ready) return "Indexing the text of your files...";
+    if (typed > 0) return type_more_hint;
     var buf: [32]u8 = undefined;
-    const count_text = core.calc.formatDisplay(&buf, @floatFromInt(st.docs));
+    const count_text = core.calc.formatDisplay(&buf, @floatFromInt(status.docs));
     return arena.printSentinel("Search inside {s} files", .{count_text}, 0) catch "";
 }
 
@@ -179,9 +186,9 @@ fn typeIcon(ctype: [*:0]const u8) ?*c.GIcon {
 
 pub fn filesHint(ui: *Ui, arena: std.mem.Allocator) [:0]const u8 {
     const service = ui.files orelse return "File index unavailable";
-    const st = service.status();
-    if (st.entries == 0) return "Indexing your files...";
+    const status = service.status();
+    if (status.entries == 0) return "Indexing your files...";
     var buf: [32]u8 = undefined;
-    const count_text = core.calc.formatDisplay(&buf, @floatFromInt(st.entries));
+    const count_text = core.calc.formatDisplay(&buf, @floatFromInt(status.entries));
     return arena.printSentinel("Type to search {s} files", .{count_text}, 0) catch "";
 }

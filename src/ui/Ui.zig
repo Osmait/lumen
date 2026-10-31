@@ -137,7 +137,7 @@ const suggestions_max = 6;
 const root_files_query_bytes_min = 3;
 /// A content query needs a whole trigram: the content index looks up
 /// three-character pieces.
-const content_query_bytes_min = 3;
+pub const content_query_bytes_min = 3;
 /// How much of a clipboard entry's text the filter scores. Each keystroke
 /// scores every entry on the main thread.
 const filtered_detail_bytes_max = 2000;
@@ -1211,7 +1211,7 @@ pub fn showWith(self: *Ui, view: View, text: ?[*:0]const u8) void {
         if (view == .choose and self.choosing == .none) .settings else if (view == .ext and
             ext_view.command(self) == null) .root else view,
     );
-    if (text) |t| c.gtk_editable_set_text(gtk.editable(self.search_bar.entry), t);
+    if (text) |initial| c.gtk_editable_set_text(gtk.editable(self.search_bar.entry), initial);
     if (was_hidden) backdrop.showBackdrops(self);
     gtk.setVisible(self.window, true);
     c.gtk_window_present(self.window);
@@ -1536,18 +1536,21 @@ fn clipCandidates(self: *Ui, arena: std.mem.Allocator) []Item {
 
 fn windowCandidates(self: *Ui, arena: std.mem.Allocator) []Item {
     var out: std.ArrayList(Item) = .empty;
-    for (hypr.clients(arena)) |cl| {
-        if (!cl.mapped or cl.address.len == 0) continue;
-        const icon: item_mod.Icon = if (self.apps.iconForClass(cl.class)) |g|
-            .{ .gicon = g }
+    for (hypr.clients(arena)) |client| {
+        if (!client.mapped or client.address.len == 0) continue;
+        const icon: item_mod.Icon = if (self.apps.iconForClass(client.class)) |gicon|
+            .{ .gicon = gicon }
         else
             .{ .tile = .{ .name = "focus-windows-symbolic", .color = .blue } };
         out.append(arena, .{
-            .title = labels.displayText(arena, if (cl.title.len > 0) cl.title else cl.class),
-            .subtitle = labels.displayText(arena, cl.class),
-            .accessory = arena.printSentinel("Workspace {s}", .{cl.workspace.name}, 0) catch "",
+            .title = labels.displayText(
+                arena,
+                if (client.title.len > 0) client.title else client.class,
+            ),
+            .subtitle = labels.displayText(arena, client.class),
+            .accessory = arena.printSentinel("Workspace {s}", .{client.workspace.name}, 0) catch "",
             .icon = icon,
-            .action = .{ .focus_window = arena.dupeSentinel(u8, cl.address, 0) catch continue },
+            .action = .{ .focus_window = arena.dupeSentinel(u8, client.address, 0) catch continue },
         }) catch break;
     }
     return out.items;
@@ -2016,7 +2019,9 @@ fn buildItemRow(self: *Ui, item_index: usize) void {
     if (self.grid_mode) {
         const gaps_px = grid_spacing_px * (self.grid_columns - 1) + grid_frame_px;
         const cell_px = @divTrunc(self.panelW() - gaps_px, self.grid_columns);
-        const cell_width_px = cell_px - 2 * style_css.grid_cell_padding_px;
+        // At least a pixel: lumen.layout's width and a command's columns can leave
+        // no room, and a cell of no width would ask for pictures of no size.
+        const cell_width_px = @max(cell_px - 2 * style_css.grid_cell_padding_px, 1);
         const cell = widgets.gridCell(&self.row_look, item, cell_width_px);
         c.gtk_flow_box_append(self.grid, cell);
         const child = c.gtk_flow_box_get_child_at_index(
@@ -2134,15 +2139,18 @@ fn setHint(self: *Ui, text: []const u8, tone: HintTone) void {
     const row_index = self.selected orelse return;
     const row = self.rows.items[row_index];
     const hint = row.hint orelse return;
-    if (row.accessory) |acc| gtk.setVisible(acc, false);
+    if (row.accessory) |accessory| gtk.setVisible(accessory, false);
     // Beside the detail pane the list is narrow: the action's name would
     // squeeze the title to a few letters, so only the key shows there.
     const narrow = gtk.isVisible(self.detail.box);
-    const shown = if (warn) text else if (narrow) enter_key_text else self.query_arena.allocator().print(
-        "{s}  " ++ enter_key_text,
-        .{text},
-    ) catch return;
-    const text_z = self.query_arena.allocator().dupeSentinel(u8, shown, 0) catch return;
+    const arena = self.query_arena.allocator();
+    const shown = if (warn)
+        text
+    else if (narrow)
+        enter_key_text
+    else
+        arena.print("{s}  " ++ enter_key_text, .{text}) catch return;
+    const text_z = arena.dupeSentinel(u8, shown, 0) catch return;
     c.gtk_label_set_text(hint, text_z.ptr);
     gtk.setClass(hint, widgets.css_class.warn, warn);
     gtk.setVisible(hint, true);
@@ -2310,8 +2318,10 @@ pub fn perform(self: *Ui, op: item_mod.Op) void {
         .hide => self.hide(),
         .stay => {},
         .refresh_view => self.setView(self.view),
-        .open_view => |v| self.navigate(v),
-        .setting => |sa| settings_view.performSetting(self, sa.setting, sa.op),
+        .open_view => |view| self.navigate(view),
+        .setting => |setting_action| {
+            settings_view.performSetting(self, setting_action.setting, setting_action.op);
+        },
         .choose_app => |path| settings_view.chooseAppFor(self, path),
         .failed => |msg| {
             self.primary = msg;

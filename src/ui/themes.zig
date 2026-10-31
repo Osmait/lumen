@@ -261,8 +261,8 @@ pub fn densitySizes(density: Density) DensitySizes {
     };
 }
 
-fn rgba(w: *std.Io.Writer, name: []const u8, color: u24, alpha: f32) !void {
-    try w.print("  --{s}: rgba({d}, {d}, {d}, {d:.2});\n", .{
+fn rgba(writer: *std.Io.Writer, name: []const u8, color: u24, alpha: f32) !void {
+    try writer.print("  --{s}: rgba({d}, {d}, {d}, {d:.2});\n", .{
         name,
         color >> 16,
         (color >> 8) & 0xff,
@@ -273,9 +273,11 @@ fn rgba(w: *std.Io.Writer, name: []const u8, color: u24, alpha: f32) !void {
 
 /// Text on an accent fill (the selected row): near-black or white,
 /// whichever reads better.
-pub fn onAccent(t: *const Theme) u24 {
-    const dark: u24 = 0x10131a;
-    return if (contrast(t.accent, dark) >= contrast(t.accent, 0xffffff)) dark else 0xffffff;
+pub fn onAccent(theme: *const Theme) u24 {
+    const near_black: u24 = 0x10131a;
+    const white: u24 = 0xffffff;
+    const black_contrast = contrast(theme.accent, near_black);
+    return if (black_contrast >= contrast(theme.accent, white)) near_black else white;
 }
 
 /// "#rrggbb" for Pango markup.
@@ -296,16 +298,24 @@ pub fn contrast(x: u24, y: u24) f64 {
 /// luminances so black on black is a ratio of 1, not a division by zero.
 const wcag_flare = 0.05;
 
+/// WCAG 2's relative luminance: each sRGB channel made linear, then
+/// weighted (red, green, blue) by how bright the eye sees it.
 fn luminance(color: u24) f64 {
-    var sum: f64 = 0;
     const weights = [_]f64{ 0.2126, 0.7152, 0.0722 };
-    for (weights, 0..) |wt, i| {
-        const shift: u5 = @intCast(16 - 8 * i);
-        const v = @as(f64, @floatFromInt((color >> shift) & 0xff)) / 255;
-        const lin = if (v <= 0.03928) v / 12.92 else std.math.pow(f64, (v + 0.055) / 1.055, 2.4);
-        sum += wt * lin;
+    var sum: f64 = 0;
+    for (weights, 0..) |weight, channel_index| {
+        const shift: u5 = @intCast(16 - 8 * channel_index);
+        const channel = @as(f64, @floatFromInt((color >> shift) & 0xff)) / 255;
+        sum += weight * srgbToLinear(channel);
     }
     return sum;
+}
+
+/// The sRGB transfer function undone, with WCAG 2's constants.
+fn srgbToLinear(channel: f64) f64 {
+    const linear_segment_end = 0.03928;
+    if (channel <= linear_segment_end) return channel / 12.92;
+    return std.math.pow(f64, (channel + 0.055) / 1.055, 2.4);
 }
 
 test "every theme is readable" {

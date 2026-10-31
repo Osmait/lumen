@@ -75,7 +75,7 @@ pub const Session = struct {
 
     fn destroy(session: *Session) void {
         if (session.rebuild_timer != 0) _ = c.g_source_remove(session.rebuild_timer);
-        if (session.stream) |st| c.g_object_unref(st);
+        if (session.stream) |stream| c.g_object_unref(stream);
         c.g_object_unref(session.cancel);
         session.partial.deinit(session.gpa);
         session.arena.deinit();

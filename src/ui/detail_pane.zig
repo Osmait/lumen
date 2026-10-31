@@ -93,7 +93,7 @@ pub fn showContentDetail(ui: *Ui, item: *const Item) void {
     const text = service.readText(
         arena,
         file.path,
-        if (info) |i| i.mtime else 0,
+        if (info) |file_info| file_info.mtime else 0,
         file.extracted,
         file.line + labels.context_after,
     ) orelse item.detail;
@@ -238,20 +238,21 @@ fn showExtDetail(ui: *Ui, item: ?*const Item) void {
     defer arena_instance.deinit();
     const arena = arena_instance.allocator();
     const label: *c.GtkLabel = ui.detail.text;
-    const markup = if (item) |i| i.markup else false;
+    const markup = if (item) |shown| shown.markup else false;
     if (markup) {
         // Markup is shown whole: cutting it could leave a tag open.
         c.gtk_label_set_markup(label, (arena.dupeSentinel(u8, item.?.detail, 0) catch return).ptr);
         gtk.addClass(ui.detail.text, markdown_class);
     } else {
-        const text = if (item) |shown| shown.detail[0..@min(shown.detail.len, detail_text_bytes_max)] else "";
+        const detail = if (item) |shown| shown.detail else "";
+        const text = detail[0..@min(detail.len, detail_text_bytes_max)];
         c.gtk_label_set_text(
             label,
             (arena.dupeSentinel(u8, core.utf8.validPrefix(text), 0) catch return).ptr,
         );
         gtk.setClass(ui.detail.text, markdown_class, false);
     }
-    const meta = if (item) |i| i.meta else &.{};
+    const meta = if (item) |shown| shown.meta else &.{};
     gtk.setVisible(ui.detail.meta, meta.len > 0);
     for (ui.detail.meta_lines, ui.detail.meta_keys, ui.detail.meta_values, 0..) |line, k, v, i| {
         gtk.setVisible(line, i < meta.len);

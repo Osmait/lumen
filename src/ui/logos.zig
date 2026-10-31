@@ -74,13 +74,13 @@ var cache: [svgs.len]?*c.GdkTexture = @splat(null);
 
 /// The logo as a texture, made on first use and kept for the process.
 pub fn texture(name: []const u8) ?*c.GdkTexture {
-    const i = find(name) orelse return null;
-    if (cache[i]) |t| return t;
+    const logo_index = find(name) orelse return null;
+    if (cache[logo_index]) |cached| return cached;
     const data = svg(name) orelse return null;
     const bytes = c.g_bytes_new_static(data.ptr, data.len);
     defer c.g_bytes_unref(bytes);
-    cache[i] = c.gdk_texture_new_from_bytes(bytes, null) orelse return null;
-    return cache[i];
+    cache[logo_index] = c.gdk_texture_new_from_bytes(bytes, null) orelse return null;
+    return cache[logo_index];
 }
 
 test "every logo the mapping names is embedded" {

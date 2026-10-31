@@ -220,13 +220,13 @@ pub fn current(arena: std.mem.Allocator, preference: *const Host.Pref) []const u
 
 /// Enter on a preference: flips a toggle, lists a choice's values, or
 /// opens the input view for text.
-pub fn edit(ui: *Ui, i: u16) void {
+pub fn edit(ui: *Ui, pref_index: u16) void {
     const registry = ui.ext_registry orelse return;
-    if (i >= registry.prefs.len) return;
-    const preference = &registry.prefs[i];
+    if (pref_index >= registry.prefs.len) return;
+    const preference = &registry.prefs[pref_index];
     var arena: std.heap.ArenaAllocator = .init(ui.gpa);
     defer arena.deinit();
-    editValue(ui, .{ .pref = i }, preference, current(arena.allocator(), preference));
+    editValue(ui, .{ .pref = pref_index }, preference, current(arena.allocator(), preference));
 }
 
 /// Enter on a preference or a form field whose value is `value`: flips a
@@ -238,7 +238,9 @@ pub fn editValue(ui: *Ui, target: Ui.Edited, preference: *const Host.Pref, value
             switch (target) {
                 // The value was not saved; the row's hint already says why.
                 .pref => if (!save(ui, preference, .{ .bool = on })) return,
-                .field => |i| form_view.setValue(ui, i, if (on) toggle_on else toggle_off),
+                .field => |field_index| {
+                    form_view.setValue(ui, field_index, if (on) toggle_on else toggle_off);
+                },
             }
             // Row keys are "pref:<name>" and "field:<name>".
             ui.setReselect("{t}:{s}", .{ target, preference.name });
@@ -246,8 +248,8 @@ pub fn editValue(ui: *Ui, target: Ui.Edited, preference: *const Host.Pref, value
         },
         .choice => {
             settings_view.setChoosing(ui, switch (target) {
-                .pref => |i| .{ .pref = i },
-                .field => |i| .{ .field = i },
+                .pref => |pref_index| .{ .pref = pref_index },
+                .field => |field_index| .{ .field = field_index },
             });
             ui.setReselect("pick:{s}", .{value});
             ui.navigate(.choose);
@@ -277,10 +279,10 @@ pub fn choiceCandidates(ui: *Ui, arena: std.mem.Allocator, out: *std.ArrayList(I
 }
 
 /// A value picked in the choose view.
-pub fn pick(ui: *Ui, i: u16, value: []const u8) void {
+pub fn pick(ui: *Ui, pref_index: u16, value: []const u8) void {
     const registry = ui.ext_registry orelse return;
-    if (i >= registry.prefs.len) return;
-    if (!save(ui, &registry.prefs[i], .{ .string = value })) return;
+    if (pref_index >= registry.prefs.len) return;
+    if (!save(ui, &registry.prefs[pref_index], .{ .string = value })) return;
     ui.goBack();
 }
 
@@ -292,11 +294,11 @@ pub fn inputTitle(ui: *Ui) [*:0]const u8 {
 /// What the input view edits: a preference, or a field of the open form.
 fn inputPref(ui: *Ui) ?*const Host.Pref {
     switch (ui.input) {
-        .pref => |i| {
+        .pref => |pref_index| {
             const registry = ui.ext_registry orelse return null;
-            return if (i < registry.prefs.len) &registry.prefs[i] else null;
+            return if (pref_index < registry.prefs.len) &registry.prefs[pref_index] else null;
         },
-        .field => |i| return form_view.field(ui, i),
+        .field => |field_index| return form_view.field(ui, field_index),
     }
 }
 
@@ -329,7 +331,7 @@ pub fn saveInput(ui: *Ui) void {
     const preference = inputPref(ui) orelse return;
     switch (ui.input) {
         .pref => if (!save(ui, preference, .{ .string = ui.query() })) return,
-        .field => |i| form_view.setValue(ui, i, ui.query()),
+        .field => |field_index| form_view.setValue(ui, field_index, ui.query()),
     }
     ui.goBack();
 }

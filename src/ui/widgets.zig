@@ -1,6 +1,7 @@
 //! The GTK pieces rows are made of: boxes, labels, icons, result rows.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const c = @import("c");
 const gtk = @import("gtk.zig");
 const core = @import("core");
@@ -120,43 +121,55 @@ const grid_icon_height_px_max = 64;
 /// Textures by key, the oldest replaced once full (widgets showing one keep
 /// their own reference). A key can map to null: known not to load. Main
 /// thread.
-fn TextureRing(comptime n: usize, comptime Key: type) type {
+fn TextureRing(comptime capacity: usize, comptime Key: type) type {
     return struct {
-        keys: [n]Key = undefined,
-        textures: [n]?*c.GdkTexture = @splat(null),
+        keys: [capacity]Key = undefined,
+        textures: [capacity]?*c.GdkTexture = @splat(null),
         len: usize = 0,
         /// Next slot to reuse once full.
         next: usize = 0,
 
+        const Ring = @This();
+
         /// Null: not in the ring; null inside: known not to load.
-        fn get(r: *const @This(), key: Key) ??*c.GdkTexture {
-            for (r.keys[0..r.len], r.textures[0..r.len]) |k, t| if (k == key) return t;
+        fn get(ring: *const Ring, key: Key) ??*c.GdkTexture {
+            for (ring.keys[0..ring.len], ring.textures[0..ring.len]) |slot_key, texture| {
+                if (slot_key == key) return texture;
+            }
             return null;
         }
 
-        /// Takes `tex`'s reference.
-        fn put(r: *@This(), key: Key, tex: ?*c.GdkTexture) void {
-            const slot = if (r.len < n) r.len else r.next;
-            if (r.len < n) {
-                r.len += 1;
-            } else r.next = (r.next + 1) % n;
-            if (r.textures[slot]) |old| c.g_object_unref(old);
-            r.keys[slot] = key;
-            r.textures[slot] = tex;
+        /// Takes `texture`'s reference.
+        fn put(ring: *Ring, key: Key, texture: ?*c.GdkTexture) void {
+            assert(ring.len <= capacity);
+            const slot = if (ring.len < capacity) ring.len else ring.next;
+            if (ring.len < capacity) {
+                ring.len += 1;
+            } else {
+                ring.next = (ring.next + 1) % capacity;
+            }
+            if (ring.textures[slot]) |old| c.g_object_unref(old);
+            ring.keys[slot] = key;
+            ring.textures[slot] = texture;
         }
     };
 }
 
-/// A key for what `path` holds now, decoded at `w`×`h`: an edited file gets
+/// A key for what `path` holds now, decoded at that size: an edited file gets
 /// a new one (mtime to the nanosecond, size, inode). Null when it is gone.
 fn fileKey(path: [*:0]const u8, width_px: c_int, height_px: c_int) ?u64 {
-    const st = os.Stamp.of(path);
-    if (st.eql(.none)) return null;
+    const stamp = os.Stamp.of(path);
+    if (stamp.eql(.none)) return null;
     var hash: std.hash.Wyhash = .init(0);
     hash.update(std.mem.span(path));
-    const parts = [_]i64{ st.sec, st.nsec, @bitCast(st.size), @bitCast(
-        st.ino,
-    ), width_px, height_px };
+    const parts = [_]i64{
+        stamp.sec,
+        stamp.nsec,
+        @bitCast(stamp.size),
+        @bitCast(stamp.ino),
+        width_px,
+        height_px,
+    };
     hash.update(std.mem.asBytes(&parts));
     return hash.final();
 }
@@ -188,11 +201,11 @@ fn fileTexture(path: [:0]const u8, size: c_int) ?*c.GdkTexture {
     };
     const key = fileKey(path.ptr, size * 2, size * 2) orelse return null;
     if (Cache.ring.get(key)) |texture| return texture;
-    const pb = pictures.decodeImage(path.ptr, size * 2, size * 2, pictures.icon_limits);
-    defer if (pb) |pixbuf| c.g_object_unref(pixbuf);
-    const tex = if (pb) |pixbuf| c.gdk_texture_new_for_pixbuf(pixbuf) else null;
-    Cache.ring.put(key, tex);
-    return tex;
+    const decoded = pictures.decodeImage(path.ptr, size * 2, size * 2, pictures.icon_limits);
+    defer if (decoded) |pixbuf| c.g_object_unref(pixbuf);
+    const texture = if (decoded) |pixbuf| c.gdk_texture_new_for_pixbuf(pixbuf) else null;
+    Cache.ring.put(key, texture);
+    return texture;
 }
 
 /// Icon, title over subtitle, accessory, and the hidden hint that shows
@@ -238,14 +251,22 @@ pub fn itemRow(look: *const RowLook, item: Item, parts: *RowParts) *c.GtkListBox
 /// A grid cell: a picture (an image file, scaled down as it is decoded) or
 /// a large icon, and the title under it. `w` is the cell's width.
 pub fn gridCell(look: *const RowLook, item: Item, width_px: c_int) *c.GtkWidget {
+    // Ui keeps a cell at least a pixel wide, however narrow the layout.
+    assert(width_px > 0);
     const box = vbox(6);
     gtk.addClass(box, "cell");
-    const pic_h = @divTrunc(width_px * grid_picture_height_parts, grid_picture_width_parts);
-    const key = if (item.image.len > 0) fileKey(item.image.ptr, width_px, pic_h) else null;
+    const picture_height_px = @max(
+        @divTrunc(width_px * grid_picture_height_parts, grid_picture_width_parts),
+        1,
+    );
+    const key = if (item.image.len > 0)
+        fileKey(item.image.ptr, width_px, picture_height_px)
+    else
+        null;
     const cached = if (key) |cache_key| GridPictures.ring.get(cache_key) else null;
     const top = if (cached) |cached_texture| (if (cached_texture) |tex| cellPicture(
         tex,
-        pic_h,
+        picture_height_px,
     ) else null) else null;
     const decode = key != null and cached == null;
     const shown = top orelse blk: {
@@ -253,7 +274,11 @@ pub fn gridCell(look: *const RowLook, item: Item, width_px: c_int) *c.GtkWidget 
         gtk.setHalign(icon, c.GTK_ALIGN_CENTER);
         // As tall as the picture on its way, so the cell keeps its size
         // when it comes.
-        gtk.setSizeRequest(icon, -1, if (decode) pic_h else @min(pic_h, grid_icon_height_px_max));
+        const icon_height_px = if (decode)
+            picture_height_px
+        else
+            @min(picture_height_px, grid_icon_height_px_max);
+        gtk.setSizeRequest(icon, -1, icon_height_px);
         break :blk icon;
     };
     gtk.append(box, shown);
@@ -264,7 +289,7 @@ pub fn gridCell(look: *const RowLook, item: Item, width_px: c_int) *c.GtkWidget 
     gtk.setHexpand(title, true);
     gtk.append(box, title);
     gtk.setSizeRequest(box, width_px, -1);
-    if (decode) GridPictures.request(item.image, width_px, pic_h, key.?, box, shown);
+    if (decode) GridPictures.request(item.image, width_px, picture_height_px, key.?, box, shown);
     return gtk.widget(box);
 }
 
@@ -313,7 +338,10 @@ const GridPictures = struct {
         }
         // Dropped for a newer build before it was decoded: nothing learnt.
         if (decoded == null and !current) return;
-        const texture_or_none = if (decoded) |pixbuf| c.gdk_texture_new_for_pixbuf(pixbuf) else null;
+        const texture_or_none = if (decoded) |pixbuf|
+            c.gdk_texture_new_for_pixbuf(pixbuf)
+        else
+            null;
         ring.put(wait.key, texture_or_none);
         // The cell may be gone (another keystroke): the new build's cell
         // for the same picture finds it in the ring.
@@ -407,12 +435,10 @@ pub fn iconWidget(look: *const RowLook, icon: item_mod.Icon, size: c_int) *c.Gtk
             gtk.addClass(img, css_class.app_icon);
             return gtk.widget(img);
         },
-        .swatch => |sw| {
-            const texture = swatchTexture(sw.bg, sw.fg, sw.accent) orelse return iconWidget(
-                look,
-                .none,
-                size,
-            );
+        .swatch => |colors| {
+            const texture = swatchTexture(colors.bg, colors.fg, colors.accent) orelse {
+                return iconWidget(look, .none, size);
+            };
             const img = gtk.imageFromPaintable(texture);
             c.gtk_image_set_pixel_size(img, size);
             gtk.setValign(img, c.GTK_ALIGN_CENTER);

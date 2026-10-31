@@ -96,10 +96,10 @@ fn settingRow(
                 arena,
                 choice,
             ), .{ .choose = choice } },
-            .toggle => |t| .{
-                @tagName(t),
-                if (ui.settings.get(t)) "On" else "Off",
-                .{ .toggle = t },
+            .toggle => |toggle| .{
+                @tagName(toggle),
+                if (ui.settings.get(toggle)) "On" else "Off",
+                .{ .toggle = toggle },
             },
         };
     return .{
@@ -119,7 +119,7 @@ pub fn settingsCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
         out.append(arena, settingRow(ui, arena, sec[0], sec[1], row)) catch break;
     };
     prefs_view.extensionRows(ui, arena, &out);
-    out.append(arena, .{
+    appendRow(Item, arena, &out, .{
         .key = settingKey(arena, "open_file"),
         .section = "Lumen",
         .title = "Open Settings File",
@@ -127,8 +127,8 @@ pub fn settingsCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
         .icon = .{ .tile = .{ .name = "document-edit-symbolic", .color = .gray } },
         .action = .{ .setting = .open_file },
         .keywords = "config edit text",
-    }) catch {};
-    out.append(arena, .{
+    });
+    appendRow(Item, arena, &out, .{
         .key = settingKey(arena, "reset"),
         .section = "Lumen",
         .title = "Reset All Settings",
@@ -136,7 +136,7 @@ pub fn settingsCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
         .action = .{ .setting = .reset },
         .keywords = "defaults restore",
         .confirm = true,
-    }) catch {};
+    });
     // What init.lua fixes cannot be changed here.
     for (out.items) |*item| {
         const key = settingName(item.action.setting) orelse continue;
@@ -148,7 +148,7 @@ pub fn settingsCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
 /// The settings.conf key a Settings row changes, if any.
 fn settingName(s: item_mod.Setting) ?[]const u8 {
     return switch (s) {
-        .toggle => |t| @tagName(t),
+        .toggle => |toggle| @tagName(toggle),
         .choose => |choice| @tagName(choice),
         else => null,
     };
@@ -169,6 +169,18 @@ pub fn pickRow(
         .icon = .{ .tile = .{ .name = "object-select-symbolic", .color = .gray } },
         .action = .{ .setting = .{ .pick = option.value } },
     };
+}
+
+/// Appends one row (or option, or folder) to a list being built for a view.
+/// Out of memory, the list shows without it: it is built again on the next
+/// keystroke, and the log says what happened.
+fn appendRow(
+    comptime Row: type,
+    arena: std.mem.Allocator,
+    list: *std.ArrayList(Row),
+    row: Row,
+) void {
+    list.append(arena, row) catch log.warn("out of memory: a row is left out", .{});
 }
 
 /// The values a choice can take, in the order they are listed.
@@ -229,14 +241,15 @@ pub fn choiceOptions(
             for (list) |program| if (std.mem.eql(u8, program[0], auto_base)) {
                 auto_name = program[1];
             };
-            out.append(arena, .{
+            appendRow(Option, arena, &out, .{
                 .value = "",
                 .label = arena.printSentinel("Automatic ({s})", .{auto_name}, 0) catch "Automatic",
-            }) catch {};
-            for (list) |program| if (proc.have(program[0])) out.append(arena, .{
-                .value = program[0],
-                .label = program[1],
-            }) catch {};
+            });
+            for (list) |program| {
+                if (proc.have(program[0])) {
+                    appendRow(Option, arena, &out, .{ .value = program[0], .label = program[1] });
+                }
+            }
             break :blk out.items;
         },
     };
@@ -304,12 +317,12 @@ fn iconThemes(arena: std.mem.Allocator) []const Option {
     var roots: std.ArrayList([]const u8) = .empty;
     const home = std.mem.span(c.g_get_home_dir());
     const user_data_dir = std.mem.span(c.g_get_user_data_dir());
-    roots.append(arena, arena.print("{s}/.icons", .{home}) catch "") catch {};
-    roots.append(arena, arena.print("{s}/icons", .{user_data_dir}) catch "") catch {};
+    appendRow([]const u8, arena, &roots, arena.print("{s}/.icons", .{home}) catch "");
+    appendRow([]const u8, arena, &roots, arena.print("{s}/icons", .{user_data_dir}) catch "");
     var system_data_dirs = c.g_get_system_data_dirs();
     while (system_data_dirs[0]) |data_dir| : (system_data_dirs += 1) {
         const root = arena.print("{s}/icons", .{std.mem.span(data_dir)}) catch "";
-        roots.append(arena, root) catch {};
+        appendRow([]const u8, arena, &roots, root);
     }
     for (roots.items) |root| {
         const root_z = arena.dupeSentinel(u8, root, 0) catch continue;
@@ -369,28 +382,40 @@ pub fn chooseTitle(choice: settings_mod.Choice) []const u8 {
     };
 }
 
+fn writeChooseTitle(
+    ui: *Ui,
+    writer: *std.Io.Writer,
+    choosing: Ui.Choosing,
+) std.Io.Writer.Error!void {
+    switch (choosing) {
+        .none => {},
+        .setting => |choice| try writer.writeAll(chooseTitle(choice)),
+        .kind => |kind| try writer.print("Open {s} With", .{kind.title()}),
+        .file => |file| {
+            try writer.print("Open {s} With", .{std.Io.Dir.path.basename(file.path)});
+        },
+        .pref => |pref_index| if (ui.ext_registry) |registry| {
+            if (pref_index < registry.prefs.len) {
+                try writer.writeAll(registry.prefs[pref_index].title);
+            }
+        },
+        .field => |field_index| if (form_view.field(ui, field_index)) |form_field| {
+            try writer.writeAll(form_field.title);
+        },
+    }
+}
+
 pub fn setChoosing(ui: *Ui, next: Ui.Choosing) void {
     if (ui.choosing == .file) {
         ui.gpa.free(ui.choosing.file.path);
         ui.gpa.free(ui.choosing.file.mime);
     }
     ui.choosing = next;
-    // A title longer than the buffer is cut on a character boundary rather
-    // than dropped, because an empty title tells the user nothing.
     var writer: std.Io.Writer = .fixed(ui.choose_title[0 .. ui.choose_title.len - 1]);
-    switch (next) {
-        .none => {},
-        .setting => |choice| writer.writeAll(chooseTitle(choice)) catch {},
-        .kind => |kind| writer.print("Open {s} With", .{kind.title()}) catch {},
-        .file => |file| writer.print(
-            "Open {s} With",
-            .{std.Io.Dir.path.basename(file.path)},
-        ) catch {},
-        .pref => |i| if (ui.ext_registry) |registry| {
-            if (i < registry.prefs.len) writer.writeAll(registry.prefs[i].title) catch {};
-        },
-        .field => |i| if (form_view.field(ui, i)) |file| writer.writeAll(file.title) catch {},
-    }
+    // A title longer than the buffer is cut on a character boundary rather
+    // than dropped, because an empty title tells the user nothing: the
+    // writer is full, and what it holds is kept.
+    writeChooseTitle(ui, &writer, next) catch {};
     const title_len = core.utf8.validPrefix(writer.buffered()).len;
     ui.choose_title[title_len] = 0;
 }
@@ -407,17 +432,17 @@ pub fn chooseCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
                 pickRow(arena, option, current) catch break,
             ) catch break;
         },
-        .kind => |k| appOptions(
+        .kind => |kind| appOptions(
             ui,
             arena,
             &out,
-            k.sampleMime(),
-            ui.settings.open_with.get(@tagName(k)),
+            kind.sampleMime(),
+            ui.settings.open_with.get(@tagName(kind)),
             false,
         ),
-        .file => |f| appOptions(ui, arena, &out, f.mime, null, true),
-        .pref => |i| prefs_view.choiceCandidates(ui, arena, &out, i),
-        .field => |i| form_view.choiceCandidates(ui, arena, &out, i),
+        .file => |file| appOptions(ui, arena, &out, file.mime, null, true),
+        .pref => |pref_index| prefs_view.choiceCandidates(ui, arena, &out, pref_index),
+        .field => |field_index| form_view.choiceCandidates(ui, arena, &out, field_index),
     }
     return out.items;
 }
@@ -459,7 +484,9 @@ pub fn appOptions(
             const id = arena.dupe(u8, std.mem.span(
                 c.g_app_info_get_id(info) orelse continue,
             )) catch continue;
-            declared.put(arena, id, {}) catch {};
+            declared.put(arena, id, {}) catch {
+                log.warn("out of memory: an app may list under Other Apps", .{});
+            };
         }
     }
     for ([_]bool{ true, false }) |want_declared| {
@@ -545,14 +572,14 @@ pub fn themeCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
     styleCandidates(ui, arena, &out);
     const dark = ui.preferDark();
     const auto_theme = themes.find(themes.auto_id, dark, &.{});
-    out.append(arena, .{
+    appendRow(Item, arena, &out, .{
         .key = "theme:auto",
         .title = "Automatic",
         .subtitle = "Lumen Dark or Light, following the system",
         .accessory = if (std.mem.eql(u8, ui.settings.theme, themes.auto_id)) "✓" else "",
         .icon = swatchOf(auto_theme),
         .action = .{ .setting = .{ .theme = themes.auto_id } },
-    }) catch {};
+    });
     for ([_]bool{ true, false }) |want_dark| {
         for (&themes.all) |*theme| {
             if (theme.dark != want_dark) continue;
@@ -691,8 +718,8 @@ fn pick(ui: *Ui, value: [:0]const u8) void {
             }
             ui.goBack();
         },
-        .pref => |i| prefs_view.pick(ui, i, value),
-        .field => |i| form_view.pick(ui, i, value),
+        .pref => |pref_index| prefs_view.pick(ui, pref_index, value),
+        .field => |field_index| form_view.pick(ui, field_index, value),
         .none, .file => {},
     }
 }
@@ -749,10 +776,10 @@ pub fn performSetting(ui: *Ui, setting: item_mod.Setting, op: item_mod.Op) void 
             ui.setReselect("pick:{s}", .{ui.settings.open_with.get(@tagName(kind)) orelse ""});
             ui.navigate(.choose);
         },
-        .pick => |v| pick(ui, v),
-        .go => |v| {
+        .pick => |value| pick(ui, value),
+        .go => |target| {
             ui.reselect.clear();
-            ui.navigate(v);
+            ui.navigate(target);
         },
         .theme => |id| {
             _ = ui.settings.set("theme", id);
@@ -776,9 +803,9 @@ pub fn performSetting(ui: *Ui, setting: item_mod.Setting, op: item_mod.Op) void 
             ui.hide();
         },
         .ext_prefs => |id| prefs_view.open(ui, id),
-        .pref => |i| prefs_view.edit(ui, i),
+        .pref => |pref_index| prefs_view.edit(ui, pref_index),
         .save_input => prefs_view.saveInput(ui),
-        .field => |i| form_view.edit(ui, i),
+        .field => |field_index| form_view.edit(ui, field_index),
         .submit_form => form_view.submit(ui),
         .ext_open => |dir| {
             run.openFile(ui.actionCtx(), dir, true);

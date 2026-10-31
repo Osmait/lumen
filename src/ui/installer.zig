@@ -6,6 +6,7 @@
 //! selected row. The extensions reload after every change.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const c = @import("c");
 const Host = @import("../ext/Host.zig");
 const os = @import("os");
@@ -26,7 +27,7 @@ const Job = struct {
     ui: *Ui,
     /// Null when started from Settings.
     cmdline: ?*c.GApplicationCommandLine,
-    sp: *c.GSubprocess,
+    subprocess: *c.GSubprocess,
     kind: Kind,
     name: core.FixedStr(extension_name_bytes_max) = .{},
     /// What removeTree deletes on failure: whole, never cut (see `start`).
@@ -81,6 +82,7 @@ pub fn nameFromUrl(buf: []u8, url: []const u8) []const u8 {
 /// over D-Bus, whose strings must be.
 fn format(buf: []u8, comptime fmt: []const u8, args: anytype) [:0]const u8 {
     var writer: std.Io.Writer = .fixed(buf[0 .. buf.len - 1]);
+    // Full: what fits is kept, which is the cut this function promises.
     writer.print(fmt, args) catch {};
     const valid_len = core.utf8.validPrefix(writer.buffered()).len;
     buf[valid_len] = 0;
@@ -90,11 +92,13 @@ fn format(buf: []u8, comptime fmt: []const u8, args: anytype) [:0]const u8 {
 /// The end of `s` in at most `max` bytes, from a character on, after "..."
 /// when cut: the last lines git prints say why it failed. Formats as two
 /// strings: `"{s}{s}"`.
-fn tail(text: []const u8, max: usize) struct { []const u8, []const u8 } {
-    if (text.len <= max) return .{ "", text };
-    var i = text.len - max;
-    while (i < text.len and text[i] & 0xC0 == 0x80) i += 1;
-    return .{ "...", text[i..] };
+fn tail(text: []const u8, bytes_max: usize) struct { []const u8, []const u8 } {
+    assert(bytes_max > 0);
+    if (text.len <= bytes_max) return .{ "", text };
+    var tail_start = text.len - bytes_max;
+    // Past UTF-8 continuation bytes (10xxxxxx), to a character's start.
+    while (tail_start < text.len and text[tail_start] & 0xC0 == 0x80) tail_start += 1;
+    return .{ "...", text[tail_start..] };
 }
 
 /// A failure: to the caller's stderr (exit 1), or on the selected row.
@@ -104,11 +108,11 @@ fn fail(
     comptime fmt: []const u8,
     args: anytype,
 ) void {
-    var buf: [1024]u8 = undefined;
+    var buf: [failure_bytes_max]u8 = undefined;
     const msg = format(&buf, fmt, args);
-    const cl = cmdline orelse return note(ui, msg);
-    c.g_application_command_line_printerr(cl, "lumen: %s\n", msg.ptr);
-    c.g_application_command_line_set_exit_status(cl, 1);
+    const command_line = cmdline orelse return note(ui, msg);
+    c.g_application_command_line_printerr(command_line, "lumen: %s\n", msg.ptr);
+    c.g_application_command_line_set_exit_status(command_line, 1);
 }
 
 /// The first line of `msg` on the selected row (Settings has no caller),
@@ -223,7 +227,7 @@ fn start(
     argv: [*:null]?[*:0]const u8,
 ) void {
     var err: ?*c.GError = null;
-    const sp = c.g_subprocess_newv(
+    const subprocess = c.g_subprocess_newv(
         argv,
         c.G_SUBPROCESS_FLAGS_STDOUT_PIPE | c.G_SUBPROCESS_FLAGS_STDERR_MERGE,
         &err,
@@ -234,13 +238,13 @@ fn start(
         return;
     };
     const job = ui.gpa.create(Job) catch {
-        c.g_object_unref(sp);
+        c.g_object_unref(subprocess);
         return fail(ui, cmdline, "out of memory", .{});
     };
     job.* = .{
         .ui = ui,
-        .cmdline = if (cmdline) |cl| @ptrCast(c.g_object_ref(cl)) else null,
-        .sp = sp,
+        .cmdline = if (cmdline) |command_line| @ptrCast(c.g_object_ref(command_line)) else null,
+        .subprocess = subprocess,
         .kind = kind,
     };
     job.name.set(name);
@@ -249,7 +253,7 @@ fn start(
     job.dir.set(dir);
     // As bytes: git prints file names and messages in any encoding, and the
     // UTF-8 variant fails on the first byte that is not.
-    c.g_subprocess_communicate_async(sp, null, null, &onDone, job);
+    c.g_subprocess_communicate_async(subprocess, null, null, &onDone, job);
 }
 
 /// What the job printed, as UTF-8 (U+FFFD for what is not, NUL included):
@@ -271,14 +275,21 @@ fn onDone(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
     const ui = job.ui;
     const cmdline = job.cmdline;
     defer {
-        c.g_object_unref(job.sp);
+        c.g_object_unref(job.subprocess);
         // The caller's `lumen --install` returns once this is released.
-        if (cmdline) |cl| c.g_object_unref(cl);
+        if (cmdline) |command_line| c.g_object_unref(command_line);
         ui.gpa.destroy(job);
     }
     var out: ?*c.GBytes = null;
     var err: ?*c.GError = null;
-    const ran = c.g_subprocess_communicate_finish(job.sp, async_result, &out, null, &err) != 0;
+    const finished = c.g_subprocess_communicate_finish(
+        job.subprocess,
+        async_result,
+        &out,
+        null,
+        &err,
+    );
+    const ran = finished != 0;
     defer if (err) |gerror| c.g_error_free(gerror);
     defer if (out) |output_bytes| c.g_bytes_unref(output_bytes);
     const output = outputText(out);
@@ -286,8 +297,8 @@ fn onDone(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
     // Failed or not, the files may have changed (half a pull, a clone
     // removed again): the extensions load again, after the message.
     defer ext_view.reload(ui);
-    const ok = ran and err == null and c.g_subprocess_get_successful(job.sp) != 0;
-    if (!ok) {
+    const succeeded = ran and err == null and c.g_subprocess_get_successful(job.subprocess) != 0;
+    if (!succeeded) {
         // A failed clone can leave half a folder behind, and the next
         // install would find it there.
         if (job.kind == .install) removeTree(job.dirZ());
@@ -329,12 +340,15 @@ fn onDone(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
         },
         .uninstall => print(ui, cmdline, "Removed {s}\n", .{job.nameSlice()}),
     }
-    if (cmdline) |cl| c.g_application_command_line_set_exit_status(cl, 0);
+    if (cmdline) |command_line| c.g_application_command_line_set_exit_status(command_line, 0);
     // From Settings: the removed extension's page has nothing left to show.
     if (cmdline == null and job.kind == .uninstall and ui.view == .prefs) ui.goBack();
 }
 
+/// What an install, update or removal prints: the success line and git's
+/// output, or the failure and its reason.
 const print_bytes_max = 8192;
+const failure_bytes_max = 1024;
 
 /// Success: to the caller's stdout, or on the selected row.
 fn print(
@@ -345,8 +359,8 @@ fn print(
 ) void {
     var buf: [print_bytes_max]u8 = undefined;
     const msg = format(&buf, fmt, args);
-    const cl = cmdline orelse return note(ui, msg);
-    c.g_application_command_line_print(cl, "%s", msg.ptr);
+    const command_line = cmdline orelse return note(ui, msg);
+    c.g_application_command_line_print(command_line, "%s", msg.ptr);
 }
 
 /// rm -rf, waited for (a fresh clone: small and local).
