@@ -1001,31 +1001,57 @@ const PeakAllocator = struct {
         peak.peak = @max(peak.peak, peak.held);
     }
 
-    fn alloc(context: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+    fn alloc(
+        context: *anyopaque,
+        length: usize,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) ?[*]u8 {
         const peak_allocator: *PeakAllocator = @ptrCast(@alignCast(context));
-        const memory = peak_allocator.child.rawAlloc(len, a, ra) orelse return null;
-        peak_allocator.count(len, 0);
+        const child = peak_allocator.child;
+        const memory = child.rawAlloc(length, alignment, return_address) orelse return null;
+        peak_allocator.count(length, 0);
         return memory;
     }
 
-    fn resize(context: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+    fn resize(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        length_new: usize,
+        return_address: usize,
+    ) bool {
         const peak_allocator: *PeakAllocator = @ptrCast(@alignCast(context));
-        if (!peak_allocator.child.rawResize(m, a, n, ra)) return false;
-        peak_allocator.count(n, m.len);
+        const child = peak_allocator.child;
+        if (!child.rawResize(memory, alignment, length_new, return_address)) return false;
+        peak_allocator.count(length_new, memory.len);
         return true;
     }
 
-    fn remap(context: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+    fn remap(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        length_new: usize,
+        return_address: usize,
+    ) ?[*]u8 {
         const peak_allocator: *PeakAllocator = @ptrCast(@alignCast(context));
-        const memory = peak_allocator.child.rawRemap(m, a, n, ra) orelse return null;
-        peak_allocator.count(n, m.len);
-        return memory;
+        const child = peak_allocator.child;
+        const remapped = child.rawRemap(memory, alignment, length_new, return_address) orelse
+            return null;
+        peak_allocator.count(length_new, memory.len);
+        return remapped;
     }
 
-    fn free(context: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+    fn free(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) void {
         const peak_allocator: *PeakAllocator = @ptrCast(@alignCast(context));
-        peak_allocator.child.rawFree(m, a, ra);
-        peak_allocator.count(0, m.len);
+        peak_allocator.child.rawFree(memory, alignment, return_address);
+        peak_allocator.count(0, memory.len);
     }
 };
 

@@ -1,6 +1,6 @@
 //! The extracted text of PDFs and Office documents, cached on disk so that
 //! extraction (a child process per file, `extract.zig`) happens once per
-//! version of a document: `<dir>/<hash of path>-<mtime>-<size>.txt`. An
+//! version of a document: `<directory>/<hash of path>-<mtime>-<size>.txt`. An
 //! empty file stands for a document that cannot be extracted, so it is not
 //! tried again until it changes.
 //!
@@ -21,7 +21,7 @@ const log = std.log.scoped(.content);
 const TextCache = @This();
 
 /// The folder the texts are in, owned.
-dir: []u8,
+directory: []u8,
 
 /// Room for a name: the path's hash in 16 hex digits, an mtime and a size
 /// (20 digits each at most), two dashes and `.txt`.
@@ -35,17 +35,17 @@ comptime {
 /// (it holds the text of the user's documents). If it cannot be created,
 /// nothing is cached: each document is extracted again when it is needed.
 pub fn init(gpa: std.mem.Allocator, cache_dir: []const u8) std.mem.Allocator.Error!TextCache {
-    const dir = try gpa.print("{s}/text", .{cache_dir});
-    sys.mkdirP(dir) catch |err| {
-        log.warn("{s}: {t}, extracted text is not cached", .{ dir, err });
+    const directory = try gpa.print("{s}/text", .{cache_dir});
+    sys.mkdirP(directory) catch |err| {
+        log.warn("{s}: {t}, extracted text is not cached", .{ directory, err });
     };
     // Older versions made it 0755.
-    sys.makePrivate(dir);
-    return .{ .dir = dir };
+    sys.makePrivate(directory);
+    return .{ .directory = directory };
 }
 
 pub fn deinit(cache: *TextCache, gpa: std.mem.Allocator) void {
-    gpa.free(cache.dir);
+    gpa.free(cache.directory);
     cache.* = undefined;
 }
 
@@ -55,7 +55,7 @@ pub fn deinit(cache: *TextCache, gpa: std.mem.Allocator) void {
 pub fn path(cache: TextCache, path_buffer: []u8, doc: DocIn) ?[:0]const u8 {
     var name_buffer: [name_bytes_max]u8 = undefined;
     const name = nameOf(&name_buffer, doc);
-    return std.mem.printSentinel(path_buffer, "{s}/{s}", .{ cache.dir, name }, 0) catch null;
+    return std.mem.printSentinel(path_buffer, "{s}/{s}", .{ cache.directory, name }, 0) catch null;
 }
 
 fn nameOf(name_buffer: *[name_bytes_max]u8, doc: DocIn) []const u8 {
@@ -122,9 +122,10 @@ pub fn sweep(cache: TextCache, gpa: std.mem.Allocator, index: *const Index) void
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const keep = namesKept(arena_state.allocator(), index) catch return;
-    var dir_buffer: paths.Buffer = undefined;
-    const dir = std.mem.printSentinel(&dir_buffer, "{s}", .{cache.dir}, 0) catch return;
-    const fd = sys.openDir(dir) catch return;
+    var directory_buffer: paths.Buffer = undefined;
+    const directory = std.mem.printSentinel(&directory_buffer, "{s}", .{cache.directory}, 0) catch
+        return;
+    const fd = sys.openDir(directory) catch return;
     defer sys.close(fd);
     var iterator: sys.DirIter = .{ .fd = fd };
     while (iterator.next() catch return) |entry| {
@@ -136,7 +137,7 @@ pub fn sweep(cache: TextCache, gpa: std.mem.Allocator, index: *const Index) void
             const result = linux.unlinkat(fd, name, 0);
             switch (linux.errno(result)) {
                 .SUCCESS, .NOENT => {},
-                else => |errno| log.warn("deleting {s}/{s}: {t}", .{ dir, name, errno }),
+                else => |errno| log.warn("deleting {s}/{s}: {t}", .{ directory, name, errno }),
             }
             continue;
         };
@@ -146,7 +147,7 @@ pub fn sweep(cache: TextCache, gpa: std.mem.Allocator, index: *const Index) void
         // Not renamed, the text is extracted again under its new name.
         const result = linux.renameat(fd, name, fd, target);
         if (linux.errno(result) != .SUCCESS) {
-            log.warn("renaming {s}/{s}: {t}", .{ dir, name, linux.errno(result) });
+            log.warn("renaming {s}/{s}: {t}", .{ directory, name, linux.errno(result) });
         }
     }
 }

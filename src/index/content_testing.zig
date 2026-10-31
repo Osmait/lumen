@@ -69,7 +69,8 @@ pub fn smallIndex(gpa: std.mem.Allocator) !Index {
     const pool = try Pool.create(gpa, testing.io, 1);
     defer pool.destroy();
     var test_docs: TestDocs = .{ .texts = &texts };
-    return content.build(gpa, pool, &docs, .{ .read = TestDocs.readText, .context = &test_docs }, null);
+    const reader: content.TextReader = .{ .read = TestDocs.readText, .context = &test_docs };
+    return content.build(gpa, pool, &docs, reader, null);
 }
 
 /// Touches everything a reader of an index may touch: must never crash on

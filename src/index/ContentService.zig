@@ -1031,7 +1031,8 @@ fn setMtime(path: [:0]const u8, mtime_s: i64) !void {
 /// Files in the text cache whose name starts with `prefix`.
 fn countText(service: *ContentService, prefix: []const u8) !usize {
     var text_dir_buffer: paths.Buffer = undefined;
-    const text_dir = try std.mem.printSentinel(&text_dir_buffer, "{s}", .{service.text_cache.dir}, 0);
+    const directory = service.text_cache.directory;
+    const text_dir = try std.mem.printSentinel(&text_dir_buffer, "{s}", .{directory}, 0);
     const fd = try sys.openDir(text_dir);
     defer sys.close(fd);
     var iterator: sys.DirIter = .{ .fd = fd };
