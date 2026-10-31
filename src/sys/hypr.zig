@@ -1,5 +1,19 @@
-//! Hyprland through its request socket (read; `hyprctl -j` if it cannot be
-//! reached) and `hyprctl dispatch` (act).
+//! Hyprland, for the window switcher, window layouts and pasting into the
+//! window that had the focus.
+//!
+//! - Queries (`clients`, `activeWindow`, `monitor`) ask Hyprland's request
+//!   socket for JSON, or run `hyprctl -j` when it cannot be reached.
+//! - Dispatches (`batch`, `dispatch`) are queued, not sent: one that goes
+//!   while Lumen's layer still has the focus is undone when it hides. The
+//!   queue is sent once Hyprland gives the focus back (`sendAfterHide`,
+//!   which waits for `activewindow` on the event socket), or on the next
+//!   idle if the window does not hide.
+//! - `afterFocusChange` is that wait, for anyone else too (a paste).
+//! - Layouts turn a `geometry.Layout` into dispatches for the active window.
+//!
+//! The queue and the wait are one each, driven by GLib sources: main
+//! thread only.
+//!
 //! Parsing and command building are pure functions over the JSON text, so
 //! they are tested against recorded output (testdata/) instead of a live
 //! compositor.
@@ -14,6 +28,8 @@ const ipc = @import("../ipc.zig");
 const geometry = @import("core").geometry;
 
 const log = std.log.scoped(.hypr);
+
+// ---------------------------------------------------------------- queries
 
 pub const Client = struct {
     address: []const u8,
@@ -74,98 +90,11 @@ fn request(arena: std.mem.Allocator, what: []const u8) ?[]const u8 {
     return talk(arena, message);
 }
 
-/// Hyprland's two sockets: one for requests (dispatches, queries), one it
-/// writes its events to.
-const Socket = enum {
-    requests,
-    events,
-
-    fn fileName(socket: Socket) []const u8 {
-        return switch (socket) {
-            .requests => ".socket.sock",
-            .events => ".socket2.sock",
-        };
-    }
-};
-
-/// Connects to one of Hyprland's sockets; null without Hyprland.
-fn connect(socket: Socket, options: os.unix.ConnectOptions) ?linux.fd_t {
-    const signature_z = c.g_getenv("HYPRLAND_INSTANCE_SIGNATURE") orelse return null;
-    const runtime_dir_z = c.g_getenv(ipc.env.runtime_dir) orelse return null;
-    const instance_signature = std.mem.span(signature_z);
-    const runtime_dir = std.mem.span(runtime_dir_z);
-    var path_buffer: [@sizeOf(@FieldType(linux.sockaddr.un, "path"))]u8 = undefined;
-    const path = std.mem.print(
-        &path_buffer,
-        "{s}/hypr/{s}/{s}",
-        .{ runtime_dir, instance_signature, socket.fileName() },
-    ) catch return null;
-    return os.unix.connect(path, options);
-}
-
-/// A compositor that does not answer must not freeze the window.
-const answer_timeout_ns = std.time.ns_per_s;
-/// Nor one that never stops: `j/clients` with 200 windows is ~300 KB.
-const answer_bytes_max = 16 << 20;
-/// How much more room the answer gets each time it fills up.
-const answer_chunk_bytes = 16 << 10;
-/// Room for the event lines read and not yet ended by a newline. An event
-/// is one short line ("activewindow>>class,title").
-const events_buffer_bytes = 4096;
-/// The answer to dispatches is only read to its end, never kept: "ok" per
-/// dispatch.
-const ok_answer_bytes_max = 256;
-/// Dispatches queued for the window to hide (`DispatchQueue`). A layout is
-/// four short commands; a batch that does not fit runs through hyprctl.
-const dispatch_queue_bytes_max = 8192;
-
-comptime {
-    assert(answer_chunk_bytes < answer_bytes_max);
-    // `sendQueued` copies the queue without its prefix and adds a zero.
-    assert(batch_prefix.len >= 1);
-}
-
-/// Sends dispatches and waits until Hyprland has run them. False only when
-/// nothing was sent (no socket), so hyprctl may try instead: once sent, a
-/// dispatch must never go twice (a toggle would undo itself). What Hyprland
-/// answers ("ok" per dispatch) does not matter.
-fn dispatchOver(message: []const u8) bool {
-    const fd = connect(.requests, .{}) orelse return false;
-    defer _ = linux.close(fd);
-    const written = linux.write(fd, message.ptr, message.len);
-    if (os.unix.failed(written) != null) return false;
-    if (written == 0) return false;
-    // Partly sent: the rest goes too, never again from the start.
-    if (written < message.len and !os.unix.writeAll(fd, message[written..])) {
-        log.warn("dispatch partly sent: {d} of {d} bytes", .{ written, message.len });
-    }
-    const deadline_ns = os.monotonicNs() + answer_timeout_ns;
-    var answer: [ok_answer_bytes_max]u8 = undefined;
-    while (os.unix.readSome(fd, &answer, deadline_ns)) |answer_len| {
-        if (answer_len == 0) break;
-    } else |_| {}
-    return true;
-}
-
-/// Sends `message` to the request socket and reads the whole answer.
-fn talk(arena: std.mem.Allocator, message: []const u8) ?[]const u8 {
-    const fd = connect(.requests, .{}) orelse return null;
-    defer _ = linux.close(fd);
-    if (!os.unix.writeAll(fd, message)) return null;
-    const deadline_ns = os.monotonicNs() + answer_timeout_ns;
-    var answer: std.ArrayList(u8) = .empty;
-    while (true) {
-        if (answer.items.len >= answer_bytes_max) {
-            log.warn("{s}: answer over {d} bytes, dropped", .{ message, answer_bytes_max });
-            return null;
-        }
-        answer.ensureUnusedCapacity(arena, answer_chunk_bytes) catch return null;
-        const spare = answer.unusedCapacitySlice();
-        const chunk_len = os.unix.readSome(fd, spare, deadline_ns) catch return null;
-        if (chunk_len == 0) break;
-        answer.items.len += chunk_len;
-    }
-    return if (answer.items.len > 0) answer.items else null;
+/// Windows ordered by last focus, most recent first; they live in `arena`.
+pub fn clients(arena: std.mem.Allocator) []Client {
+    const all = query(arena, []Client, "clients") orelse return &.{};
+    sortByFocus(all);
+    return all;
 }
 
 /// Most recently focused first.
@@ -175,13 +104,6 @@ pub fn sortByFocus(all: []Client) void {
             return left.focusHistoryID < right.focusHistoryID;
         }
     }.lessThan);
-}
-
-/// Windows ordered by last focus, most recent first; they live in `arena`.
-pub fn clients(arena: std.mem.Allocator) []Client {
-    const all = query(arena, []Client, "clients") orelse return &.{};
-    sortByFocus(all);
-    return all;
 }
 
 pub fn activeWindow(arena: std.mem.Allocator) ?Client {
@@ -231,21 +153,128 @@ pub fn focusedName(all: []const MonitorJson) ?[]const u8 {
     return null;
 }
 
-/// The argument of `hyprctl --batch`: "dispatch a ; dispatch b". Caller owns
-/// it.
-pub fn batchString(
-    gpa: std.mem.Allocator,
-    commands: []const []const u8,
-) std.mem.Allocator.Error![:0]u8 {
-    var joined: std.ArrayList(u8) = .empty;
-    errdefer joined.deinit(gpa);
-    for (commands, 0..) |command, i| {
-        if (i > 0) try joined.appendSlice(gpa, " " ++ batch_separator ++ " ");
-        try joined.appendSlice(gpa, dispatch_keyword);
-        try joined.appendSlice(gpa, command);
+// ---------------------------------------------------------------- sockets
+
+/// Hyprland's two sockets: one for requests (dispatches, queries), one it
+/// writes its events to.
+const Socket = enum {
+    requests,
+    events,
+
+    fn fileName(socket: Socket) []const u8 {
+        return switch (socket) {
+            .requests => ".socket.sock",
+            .events => ".socket2.sock",
+        };
     }
-    return joined.toOwnedSliceSentinel(gpa, 0);
+};
+
+/// Connects to one of Hyprland's sockets; null without Hyprland.
+fn connect(socket: Socket, options: os.unix.ConnectOptions) ?linux.fd_t {
+    const signature_z = c.g_getenv("HYPRLAND_INSTANCE_SIGNATURE") orelse return null;
+    const runtime_dir_z = c.g_getenv(ipc.env.runtime_dir) orelse return null;
+    const instance_signature = std.mem.span(signature_z);
+    const runtime_dir = std.mem.span(runtime_dir_z);
+    var path_buffer: [@sizeOf(@FieldType(linux.sockaddr.un, "path"))]u8 = undefined;
+    const path = std.mem.print(
+        &path_buffer,
+        "{s}/hypr/{s}/{s}",
+        .{ runtime_dir, instance_signature, socket.fileName() },
+    ) catch return null;
+    return os.unix.connect(path, options);
 }
+
+/// A compositor that does not answer must not freeze the window.
+const answer_timeout_ns = std.time.ns_per_s;
+/// Nor one that never stops: `j/clients` with 200 windows is ~300 KB.
+const answer_bytes_max = 16 << 20;
+/// How much more room the answer gets each time it fills up.
+const answer_chunk_bytes = 16 << 10;
+/// The answer to dispatches is only read to its end, never kept: "ok" per
+/// dispatch.
+const ok_answer_bytes_max = 256;
+
+comptime {
+    assert(answer_chunk_bytes < answer_bytes_max);
+}
+
+/// Sends `message` to the request socket and reads the whole answer.
+fn talk(arena: std.mem.Allocator, message: []const u8) ?[]const u8 {
+    const fd = connect(.requests, .{}) orelse return null;
+    defer _ = linux.close(fd);
+    if (!os.unix.writeAll(fd, message)) return null;
+    const deadline_ns = os.monotonicNs() + answer_timeout_ns;
+    var answer: std.ArrayList(u8) = .empty;
+    while (true) {
+        if (answer.items.len >= answer_bytes_max) {
+            log.warn("{s}: answer over {d} bytes, dropped", .{ message, answer_bytes_max });
+            return null;
+        }
+        answer.ensureUnusedCapacity(arena, answer_chunk_bytes) catch return null;
+        const spare = answer.unusedCapacitySlice();
+        const chunk_len = os.unix.readSome(fd, spare, deadline_ns) catch return null;
+        if (chunk_len == 0) break;
+        answer.items.len += chunk_len;
+    }
+    return if (answer.items.len > 0) answer.items else null;
+}
+
+/// Sends dispatches and waits until Hyprland has run them. False only when
+/// nothing was sent (no socket), so hyprctl may try instead: once sent, a
+/// dispatch must never go twice (a toggle would undo itself). What Hyprland
+/// answers ("ok" per dispatch) does not matter.
+fn dispatchOver(message: []const u8) bool {
+    const fd = connect(.requests, .{}) orelse return false;
+    defer _ = linux.close(fd);
+    const written = linux.write(fd, message.ptr, message.len);
+    if (os.unix.failed(written) != null) return false;
+    if (written == 0) return false;
+    // Partly sent: the rest goes too, never again from the start.
+    if (written < message.len and !os.unix.writeAll(fd, message[written..])) {
+        log.warn("dispatch partly sent: {d} of {d} bytes", .{ written, message.len });
+    }
+    const deadline_ns = os.monotonicNs() + answer_timeout_ns;
+    var answer: [ok_answer_bytes_max]u8 = undefined;
+    while (os.unix.readSome(fd, &answer, deadline_ns)) |answer_len| {
+        if (answer_len == 0) break;
+    } else |_| {}
+    return true;
+}
+
+// ---------------------------------------------------------------- dispatches
+
+/// `batch` of one command.
+pub fn dispatch(gpa: std.mem.Allocator, command: []const u8) void {
+    batch(gpa, &.{command});
+}
+
+/// Queues `commands` ("focuswindow address:0x..."): they go on the next
+/// idle, or once the window has hidden and the focus is back
+/// (`sendAfterHide`).
+pub fn batch(gpa: std.mem.Allocator, commands: []const []const u8) void {
+    if (!dispatch_queue.append(commands)) {
+        // Too long to queue: run hyprctl now (slower, but never dropped).
+        const batch_z = batchString(gpa, commands) catch return;
+        defer gpa.free(batch_z);
+        proc.spawn(&.{ "hyprctl", "--batch", batch_z });
+        return;
+    }
+    // Send on the next idle, in case the action does not hide the window;
+    // sendAfterHide replaces this when it does.
+    if (dispatch_queue.idle_source == 0) {
+        dispatch_queue.idle_source = c.g_idle_add(&batchIdleCallback, null);
+    }
+}
+
+fn batchIdleCallback(_: ?*anyopaque) callconv(.c) c.gboolean {
+    dispatch_queue.idle_source = 0;
+    sendQueued();
+    return 0;
+}
+
+/// Dispatches queued for the window to hide (`DispatchQueue`). A layout is
+/// four short commands; a batch that does not fit runs through hyprctl.
+const dispatch_queue_bytes_max = 8192;
 
 /// What `hyprctl --batch` sends ahead of "dispatch a;dispatch b".
 const batch_prefix = "[[BATCH]]";
@@ -253,6 +282,11 @@ const batch_prefix = "[[BATCH]]";
 const batch_separator = ";";
 /// Ahead of each dispatcher and its arguments ("dispatch exit").
 const dispatch_keyword = "dispatch ";
+
+comptime {
+    // `sendQueued` copies the queue without its prefix and adds a zero.
+    assert(batch_prefix.len >= 1);
+}
 
 /// Dispatches waiting for the window to hide: sent before Hyprland gave the
 /// focus back from Lumen's layer, a `focuswindow` is undone by that (seen:
@@ -293,27 +327,6 @@ const DispatchQueue = struct {
 /// One queue for the one window that hides. Main thread only.
 var dispatch_queue: DispatchQueue = .{};
 
-pub fn batch(gpa: std.mem.Allocator, commands: []const []const u8) void {
-    if (!dispatch_queue.append(commands)) {
-        // Too long to queue: run hyprctl now (slower, but never dropped).
-        const batch_z = batchString(gpa, commands) catch return;
-        defer gpa.free(batch_z);
-        proc.spawn(&.{ "hyprctl", "--batch", batch_z });
-        return;
-    }
-    // Send on the next idle, in case the action does not hide the window;
-    // sendAfterHide replaces this when it does.
-    if (dispatch_queue.idle_source == 0) {
-        dispatch_queue.idle_source = c.g_idle_add(&batchIdleCallback, null);
-    }
-}
-
-fn batchIdleCallback(_: ?*anyopaque) callconv(.c) c.gboolean {
-    dispatch_queue.idle_source = 0;
-    sendQueued();
-    return 0;
-}
-
 /// After this long without a focus event, queued dispatches go anyway.
 const focus_fallback_ms = 60;
 
@@ -339,6 +352,28 @@ pub fn sendQueued() void {
     const batch_z = std.mem.printSentinel(&batch_buffer, "{s}", .{commands}, 0) catch return;
     proc.spawn(&.{ "hyprctl", "--batch", batch_z });
 }
+
+/// The argument of `hyprctl --batch`: "dispatch a ; dispatch b". Caller owns
+/// it.
+pub fn batchString(
+    gpa: std.mem.Allocator,
+    commands: []const []const u8,
+) std.mem.Allocator.Error![:0]u8 {
+    var joined: std.ArrayList(u8) = .empty;
+    errdefer joined.deinit(gpa);
+    for (commands, 0..) |command, i| {
+        if (i > 0) try joined.appendSlice(gpa, " " ++ batch_separator ++ " ");
+        try joined.appendSlice(gpa, dispatch_keyword);
+        try joined.appendSlice(gpa, command);
+    }
+    return joined.toOwnedSliceSentinel(gpa, 0);
+}
+
+// ---------------------------------------------------------------- focus
+
+/// Room for the event lines read and not yet ended by a newline. An event
+/// is one short line ("activewindow>>class,title").
+const events_buffer_bytes = 4096;
 
 /// Waits for Hyprland to give a window the focus (`activewindow` on its
 /// event socket), then calls back whoever asked. Main thread only.
@@ -454,9 +489,7 @@ test "a focus change among Hyprland's events" {
     try std.testing.expect(!focusEvent("openlayer>>lumen\n"));
 }
 
-pub fn dispatch(gpa: std.mem.Allocator, command: []const u8) void {
-    batch(gpa, &.{command});
-}
+// ---------------------------------------------------------------- layouts
 
 /// Moves and resizes the active window for `layout`, floating it first.
 pub fn applyLayout(gpa: std.mem.Allocator, layout: geometry.Layout) void {
