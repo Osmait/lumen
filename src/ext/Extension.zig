@@ -11,7 +11,7 @@ const std = @import("std");
 const lua = @import("luart").lua;
 const os = @import("os");
 const Host = @import("Host.zig");
-const Load = Host.Load;
+const Load = @import("Load.zig");
 
 const Extension = @This();
 

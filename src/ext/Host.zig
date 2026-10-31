@@ -26,6 +26,7 @@ const generation_mod = @import("generation.zig");
 const stamp_mod = @import("stamp.zig");
 const requests = @import("requests.zig");
 pub const Extension = @import("Extension.zig");
+pub const Load = @import("Load.zig");
 const os = @import("os");
 const core = @import("core");
 const item_mod = @import("../item.zig");
@@ -183,76 +184,6 @@ pub const Callbacks = struct {
 
 /// A form's values, as the UI hands them over.
 pub const FormValue = struct { name: []const u8, value: []const u8, toggle: bool };
-
-// ------------------------------------------------- the worker's own types
-
-/// What a reload collects; lives in the new registry's arena.
-pub const Load = struct {
-    arena: std.mem.Allocator,
-    commands: std.ArrayList(Command) = .empty,
-    /// Parallel to `commands`: where the worker finds each one.
-    worker_commands: std.ArrayList(requests.WorkerCommand) = .empty,
-    themes: std.ArrayList(themes.Theme) = .empty,
-    keymaps: std.ArrayList(Keymap) = .empty,
-    settings: std.ArrayList(SettingOverride) = .empty,
-    preferences: std.ArrayList(Preference) = .empty,
-    icons: std.ArrayList(IconOverride) = .empty,
-    extensions: std.ArrayList(ExtensionInfo) = .empty,
-    style_settings: std.ArrayList(SettingOverride) = .empty,
-    layout: layout_mod.Layout = .{},
-    has_layout: bool = false,
-    problems: std.ArrayList(Problem) = .empty,
-
-    /// What a file adds, dropped again if it fails half-way (its problem
-    /// and its extension entry are added after it ran).
-    const undone = .{
-        "commands",
-        "worker_commands",
-        "themes",
-        "keymaps",
-        "settings",
-        "preferences",
-        "icons",
-        "style_settings",
-    };
-
-    /// How far each list of `undone` had grown before a file ran.
-    const Mark = struct {
-        lengths: [undone.len]usize,
-        layout: layout_mod.Layout,
-        has_layout: bool,
-    };
-
-    fn mark(load: *const Load) Mark {
-        var saved: Mark = .{
-            .lengths = undefined,
-            .layout = load.layout,
-            .has_layout = load.has_layout,
-        };
-        inline for (undone, 0..) |field, index| {
-            saved.lengths[index] = @field(load, field).items.len;
-        }
-        return saved;
-    }
-
-    /// Drops what was added since `saved`. Lists only grow while a file
-    /// runs, so none can be shorter than it was.
-    fn rollback(load: *Load, saved: Mark) void {
-        inline for (undone, 0..) |field, index| {
-            assert(saved.lengths[index] <= @field(load, field).items.len);
-            @field(load, field).shrinkRetainingCapacity(saved.lengths[index]);
-        }
-        load.layout = saved.layout;
-        load.has_layout = saved.has_layout;
-        assert(load.commands.items.len == load.worker_commands.items.len);
-    }
-
-    /// The commands added since `saved`.
-    fn commandsSince(load: *const Load, saved: Mark) usize {
-        comptime assert(std.mem.eql(u8, undone[0], "commands"));
-        return load.commands.items.len - saved.lengths[0];
-    }
-};
 
 // ------------------------------------------------------- the main thread
 
@@ -522,7 +453,7 @@ fn loadAll(host: *Host, load: *Load) void {
         host.lock.lockUncancelable(host.io);
         defer host.lock.unlock(host.io);
         break :blk worker_arena.dupe(u8, host.style.slice()) catch {
-            problem(load, style_extension_id, "out of memory");
+            load.problem(style_extension_id, "out of memory");
             break :blk "";
         };
     };
@@ -533,7 +464,7 @@ fn loadAll(host: *Host, load: *Load) void {
             host.loadSource(load, config_extension_id, host.config_dir, path, null);
         }
     } else |_| {
-        problem(load, config_extension_id, "out of memory");
+        load.problem(config_extension_id, "out of memory");
     }
 
     for (host.extensionDirs(worker_arena)) |id| host.loadExtension(load, id);
@@ -543,26 +474,26 @@ fn loadAll(host: *Host, load: *Load) void {
 fn loadExtension(host: *Host, load: *Load, id: [:0]const u8) void {
     const worker_arena = host.worker_arena.allocator();
     if (!validId(id)) {
-        problem(load, id, "extension folder names may use only a-z, 0-9, - and _");
+        load.problem(id, "extension folder names may use only a-z, 0-9, - and _");
         return;
     }
     if (reservedId(id)) {
         const message =
             "\"config\" and \"style\" are taken (init.lua and the style); rename the folder";
-        problem(load, id, message);
+        load.problem(id, message);
         return;
     }
     const folder_format = "{s}/extensions/{s}";
     const folder = worker_arena.printSentinel(folder_format, .{ host.config_dir, id }, 0) catch {
-        problem(load, id, "out of memory");
+        load.problem(id, "out of memory");
         return;
     };
     const path = worker_arena.printSentinel("{s}/init.lua", .{folder}, 0) catch {
-        problem(load, id, "out of memory");
+        load.problem(id, "out of memory");
         return;
     };
     if (os.info(path) == null) {
-        problem(load, id, "no init.lua in the extension's folder");
+        load.problem(id, "no init.lua in the extension's folder");
         return;
     }
     host.loadSource(load, id, folder, path, null);
@@ -624,50 +555,6 @@ pub fn reservedId(id: []const u8) bool {
     return std.mem.eql(u8, id, config_extension_id) or std.mem.eql(u8, id, style_extension_id);
 }
 
-/// Reports what went wrong with a file in Settings > Extensions. Out of
-/// memory, the report goes to the log instead, so it is never lost.
-fn problem(load: *Load, extension_id: []const u8, message: []const u8) void {
-    problemAppend(load, extension_id, message) catch {
-        log.warn("{s}: {s} (not shown in Settings: out of memory)", .{ extension_id, message });
-    };
-}
-
-fn problemAppend(
-    load: *Load,
-    extension_id: []const u8,
-    message: []const u8,
-) error{OutOfMemory}!void {
-    const extension_id_copy = try load.arena.dupeSentinel(u8, extension_id, 0);
-    const message_copy = try load.arena.dupeSentinel(u8, message, 0);
-    try load.problems.append(load.arena, .{
-        .extension = extension_id_copy,
-        .message = message_copy,
-    });
-}
-
-/// Lists an extension that loaded in Settings > Extensions. Out of memory,
-/// it is reported as a problem instead: an entry with an empty id would
-/// reach the views that act on an extension by its id.
-fn extensionLoaded(load: *Load, id: []const u8, title: [:0]const u8, commands_count: usize) void {
-    extensionLoadedAppend(load, id, title, commands_count) catch {
-        problem(load, id, "loaded, but out of memory to list it");
-    };
-}
-
-fn extensionLoadedAppend(
-    load: *Load,
-    id: []const u8,
-    title: [:0]const u8,
-    commands_count: usize,
-) error{OutOfMemory}!void {
-    const id_copy = try load.arena.dupeSentinel(u8, id, 0);
-    try load.extensions.append(load.arena, .{
-        .id = id_copy,
-        .title = if (title.len > 0) title else id_copy,
-        .commands = @intCast(commands_count),
-    });
-}
-
 /// A style: <config>/styles/<name>/init.lua, else the built-in one. Its
 /// file runs as the extension "style".
 fn loadStyle(host: *Host, load: *Load, name: []const u8) void {
@@ -682,7 +569,7 @@ fn loadStyle(host: *Host, load: *Load, name: []const u8) void {
     } else if (styles.find(name)) |built_in| {
         host.loadSource(load, style_extension_id, host.config_dir, "=style", built_in.lua);
     } else {
-        problem(load, style_extension_id, "no such style");
+        load.problem(style_extension_id, "no such style");
     }
 }
 
@@ -696,7 +583,7 @@ fn loadSource(
     source: ?[:0]const u8,
 ) void {
     const extension = Extension.create(host, id, folder) orelse {
-        problem(load, id, "out of memory");
+        load.problem(id, "out of memory");
         return;
     };
     const before = load.mark();
@@ -720,7 +607,7 @@ fn loadSource(
         if (host.extensions.append(host.gpa, extension)) {
             // init.lua and the style are not extensions to list.
             if (!reservedId(id)) {
-                extensionLoaded(load, id, context.title, load.commandsSince(before));
+                load.extensionLoaded(id, context.title, load.commandsSince(before));
             }
             return;
         } else |_| {
@@ -728,7 +615,7 @@ fn loadSource(
         }
     }
     load.rollback(before);
-    problem(load, id, failure orelse "out of memory");
+    load.problem(id, failure orelse "out of memory");
     extension.destroy();
 }
 
