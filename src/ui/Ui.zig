@@ -1365,6 +1365,14 @@ pub fn refresh(self: *Ui) void {
             .is_show = false,
         };
     }
+    // The panel lists the actions of a row that is about to go. Keys go to
+    // the panel while it is open, so only an answer arriving (a list, the
+    // root search, content, an extension reload, an app reload) gets here
+    // with it open; an extension row's actions live in that answer's
+    // predecessor, which is freed once the rows are rebuilt, and Enter
+    // would have run them on whatever row is selected then.
+    if (self.panel_open) self.closePanel();
+    assert(!self.panel_open);
     self.resetRows();
     self.confirm_key = "";
     c.gtk_flow_box_remove_all(self.grid);
@@ -2010,6 +2018,8 @@ pub fn openPanel(self: *Ui) void {
 
 pub fn closePanel(self: *Ui) void {
     self.panel_open = false;
+    // The entries may point into an answer that is freed next.
+    self.panel_entries = &.{};
     gtk.setVisible(self.panel, false);
 }
 

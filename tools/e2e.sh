@@ -433,6 +433,14 @@ L --command fixture.fruits; sleep 0.3
 L --key ctrl+k
 expect "action panel lists the item's actions" 'Record Mango \[Ctrl ↵\]'
 L --key escape
+# A reload in the root view rebuilds the rows under the open panel, whose
+# entries belong to a row that is gone.
+query root "fixture fruits"
+L --key ctrl+k
+expect "action panel open in the root search" '^panel:'
+L --reload; sleep 0.5
+expect_not "rows rebuilt by a reload close the action panel" '^panel:'
+L --command fixture.fruits; sleep 0.3
 L --key ctrl+enter
 if wait_for '^visible: false' 3 && [[ "$(cat "$T/ext-ran" 2>/dev/null)" == Mango ]]; then ok "Lua action ran and closed the window"; else ko "Lua action ran and closed the window" "$(L --dump; cat "$T/ext-ran" 2>&1)"; fi
 L --command fixture.echo --query "hi there"
