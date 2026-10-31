@@ -58,7 +58,7 @@ pub const Session = struct {
     caller: *c.GApplicationCommandLine,
     stream: ?*c.GInputStream,
     cancellable: *c.GCancellable,
-    /// Lines and their text.
+    /// Holds the lines and their text.
     arena: std.heap.ArenaAllocator,
     lines: std.ArrayList(Line) = .empty,
     /// The end of the input not yet ended by a newline.
@@ -328,7 +328,7 @@ test "a long line is matched by its head and printed whole" {
     const score = core.fuzzy.scoreFields("needle", &.{matched(&long)});
     try std.testing.expect(score == core.fuzzy.no_match);
     try std.testing.expectEqualStrings("short", matched("short"));
-    // Never half a character.
+    // A cut never splits a character.
     var accents: [match_bytes_max + 1]u8 = undefined;
     accents[0] = 'x';
     for (0..match_bytes_max / 2) |i| @memcpy(accents[1 + 2 * i ..][0..2], "é");

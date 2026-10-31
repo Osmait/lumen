@@ -46,7 +46,7 @@ pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
         ui.goBack();
         return 1;
     }
-    // Keymaps from init.lua and extensions.
+    // Then the keymaps from init.lua and extensions.
     if (Ui.ext_view.keymap(ui, keyval, state)) return 1;
     return 0;
 }

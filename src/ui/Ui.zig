@@ -874,7 +874,8 @@ pub fn applyStructure(self: *Ui) void {
     gtk.setClass(self.column, "single", layout.panels == .single);
     gtk.setClass(self.column, "search-bottom", layout.search == .bottom);
     gtk.setClass(self.column, "with-footer", layout.footer);
-    // spacer, then search and results in the chosen order, footer last.
+    // The spacer first, then the search bar and the results in the chosen
+    // order, the footer last.
     c.gtk_box_reorder_child_after(column_box, gtk.widget(self.spacer), null);
     const first, const second = if (layout.search == .bottom)
         .{ self.results, self.search_bar.box }
@@ -1377,7 +1378,7 @@ fn loadBase(self: *Ui, arena: std.mem.Allocator) []Item {
         .default_apps => settings_view.defaultAppsCandidates(self, arena),
         .choose => settings_view.chooseCandidates(self, arena),
         .ext => ext_view.base(self),
-        // Filtered straight from the session's lines.
+        // The rows are filtered straight from the session's lines.
         .dmenu => &.{},
         .prefs => prefs_view.candidates(self, arena),
         .input => prefs_view.inputCandidates(self, arena),
@@ -1648,9 +1649,9 @@ pub fn refresh(self: *Ui) void {
 /// per keystroke. True when that is the case and the query was sent.
 fn answerPending(self: *Ui, start_ns: u64) bool {
     const query_text = std.mem.trim(u8, self.query(), " ");
-    // An extension's search command.
+    // An extension's search command keeps its rows until it answers.
     if (self.view == .ext and ext_view.waitingForSearch(self, query_text)) return true;
-    // Contents: the rows on screen are the last result's.
+    // In the contents view, the rows on screen are the last result's.
     if (self.view != .contents) return false;
     const content_search = self.content_search orelse return false;
     if (query_text.len < content_query_bytes_min) return false;
@@ -1661,7 +1662,7 @@ fn answerPending(self: *Ui, start_ns: u64) bool {
     return true;
 }
 
-/// The current view's rows for `q`.
+/// Builds the current view's rows for `query_text`.
 fn fill(self: *Ui, arena: std.mem.Allocator, query_text: []const u8, start_ns: u64) void {
     switch (self.view) {
         .root => self.fillRoot(arena, query_text),

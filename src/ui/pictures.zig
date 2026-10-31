@@ -702,7 +702,7 @@ test "a picture over the limits is never decoded" {
     try test_dir.write("bomb.png", bomb);
     const bomb_path = try test_dir.path(&path_bytes, "bomb.png");
     try testing.expect(decodeImage(bomb_path, 64, 64, limits) == null);
-    // Larger than `bytes`.
+    // A file larger than `bytes` is not decoded either.
     const big = try testing.allocator.alloc(u8, limits.bytes + 1);
     defer testing.allocator.free(big);
     @memset(big, 0);

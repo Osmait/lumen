@@ -28,7 +28,7 @@ pub fn buildDetail(ui: *Ui) void {
     gtk.addClass(ui.detail.box, "detail");
     gtk.setHexpand(ui.detail.box, true);
 
-    // Image previews (files view).
+    // The picture shows image previews (files view).
     ui.detail.picture = gtk.picture();
     c.gtk_picture_set_content_fit(ui.detail.picture, c.GTK_CONTENT_FIT_SCALE_DOWN);
     gtk.setVexpand(ui.detail.picture, true);

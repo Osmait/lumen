@@ -29,7 +29,7 @@ comptime {
 
 const Job = struct {
     ui: *Ui,
-    /// Null when started from Settings.
+    /// The caller's command line; null when started from Settings.
     caller: ?*c.GApplicationCommandLine,
     subprocess: *c.GSubprocess,
     kind: Kind,
@@ -357,7 +357,7 @@ fn reportSuccess(job: *Job, output: [:0]const u8) void {
             const end = tail(if (output.len > 0) output else "Up to date\n", print_bytes_max - 8);
             print(ui, caller, "{s}{s}", .{ end[0], end[1] });
         } else {
-            // git's own lines are too long for a row: a summary.
+            // git's own lines are too long for a row: a summary shows instead.
             const none = output.len == 0 or std.mem.find(u8, output, "Already up to date") != null;
             note(ui, if (none) "Already up to date" else "Updated");
         },
@@ -386,7 +386,8 @@ fn print(
     c.g_application_command_line_print(command_line, "%s", message.ptr);
 }
 
-/// rm -rf, waited for (a fresh clone: small and local).
+/// Removes `folder` like rm -rf and waits for it: a fresh clone is small
+/// and local.
 fn removeTree(folder: [:0]const u8) void {
     var argv = [_:null]?[*:0]const u8{ "rm", "-rf", "--", folder.ptr };
     var err: ?*c.GError = null;
