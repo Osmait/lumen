@@ -457,7 +457,7 @@ fn run(service: *Service) void {
         const fd = service.live.watcher.fd;
         service.lock.unlockShared(service.io);
         // A negative descriptor is one `poll` ignores.
-        if (!sys.waitEvents(fd, service.wake_fd orelse -1)) continue;
+        if (!sys.waitEvents(fd, service.wake_fd)) continue;
 
         _ = arena_state.reset(.retain_capacity);
         if (service.applyEvents(arena_state.allocator())) service.rescan();
