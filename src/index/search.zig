@@ -532,7 +532,7 @@ fn cheapCore(
             seen = i;
             break;
         }
-        if (mode == .ascii and raw >= 0x80) return error.NonAscii;
+        if (mode == .ascii and !std.ascii.isAscii(raw)) return error.NonAscii;
         const h = if (ascii) std.ascii.toLower(raw) else raw;
         if (h != q[qi]) continue;
         if (first_hit == std.math.maxInt(usize)) first_hit = i;
