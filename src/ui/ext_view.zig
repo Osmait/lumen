@@ -89,7 +89,6 @@ fn onRegistry(registry: *Host.Registry, ctx: ?*anyopaque) void {
     // What the views point at by index, found again by id (before anything
     // rebuilds them): the open view may have lost it.
     const lost = if (old) |old_value| remap(ui, old_value, registry) else false;
-    themes.custom = registry.themes;
     ui.layout = registry.layout;
     ui.applyStructure();
     // Rows and theme names point into the old registry: rebuild before

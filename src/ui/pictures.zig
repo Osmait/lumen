@@ -281,8 +281,13 @@ pub const Lane = struct {
     }
 };
 
+// The decoder is one per process, like the GTask pool it runs on: its two
+// lanes and its queue below are module state, used from the main thread
+// only (the workers hand back through it).
+
 /// The detail pane's image preview.
 pub var preview_lane: Lane = .{};
+/// The grid's cell pictures.
 pub var grid_lane: Lane = .{};
 
 /// Called on the main thread once per request with the picture (borrowed:

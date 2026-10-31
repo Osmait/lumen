@@ -162,13 +162,10 @@ pub const all = [_]Theme{
     },
 };
 
-/// Themes from init.lua (`lumen.theme`); set by the UI when the files
-/// load. Main thread only.
-pub var custom: []const Theme = &.{};
-
-/// The theme with `id`; unknown ids (a typo in the file, a theme removed)
-/// get the default. `auto` resolves with `prefer_dark`.
-pub fn find(id: []const u8, prefer_dark: bool) *const Theme {
+/// The theme with `id`, among the built-in ones and `custom` (init.lua's
+/// and the style's `lumen.theme`); unknown ids (a typo in the file, a
+/// theme removed) get the default. `auto` resolves with `prefer_dark`.
+pub fn find(id: []const u8, prefer_dark: bool, custom: []const Theme) *const Theme {
     if (std.mem.eql(u8, id, auto_id)) return if (prefer_dark) &all[0] else &all[1];
     for (&all) |*t| if (std.mem.eql(u8, t.id, id)) return t;
     for (custom) |*t| if (std.mem.eql(u8, t.id, id)) return t;
@@ -176,14 +173,19 @@ pub fn find(id: []const u8, prefer_dark: bool) *const Theme {
 }
 
 /// The name shown for a theme setting value ("Auto (Lumen Dark)").
-pub fn displayName(arena: std.mem.Allocator, id: []const u8, prefer_dark: bool) [:0]const u8 {
+pub fn displayName(
+    arena: std.mem.Allocator,
+    id: []const u8,
+    prefer_dark: bool,
+    custom: []const Theme,
+) [:0]const u8 {
     if (std.mem.eql(u8, id, auto_id))
         return arena.printSentinel(
             "Automatic ({s})",
-            .{find(id, prefer_dark).name},
+            .{find(id, prefer_dark, custom).name},
             0,
         ) catch "Automatic";
-    return find(id, prefer_dark).name;
+    return find(id, prefer_dark, custom).name;
 }
 
 /// The variables block `style.css` is painted with.
@@ -295,10 +297,10 @@ test "ids are unique and lookups fall back" {
     for (all, 0..) |x, i| for (all[i + 1 ..]) |y| try std.testing.expect(
         !std.mem.eql(u8, x.id, y.id),
     );
-    try std.testing.expectEqualStrings("nord", find("nord", true).id);
-    try std.testing.expectEqualStrings("lumen-dark", find("no-such-theme", false).id);
-    try std.testing.expectEqualStrings("lumen-dark", find(auto_id, true).id);
-    try std.testing.expectEqualStrings("lumen-light", find(auto_id, false).id);
+    try std.testing.expectEqualStrings("nord", find("nord", true, &.{}).id);
+    try std.testing.expectEqualStrings("lumen-dark", find("no-such-theme", false, &.{}).id);
+    try std.testing.expectEqualStrings("lumen-dark", find(auto_id, true, &.{}).id);
+    try std.testing.expectEqualStrings("lumen-light", find(auto_id, false, &.{}).id);
 }
 
 test "style.css only uses variables the themes define" {
@@ -335,7 +337,7 @@ test "text size and opacity reach the CSS" {
     s.opacity = 80;
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
-    try css(&out.writer, find("nord", true), &s);
+    try css(&out.writer, find("nord", true, &.{}), &s);
     try std.testing.expect(
         std.mem.find(u8, out.written(), "--bg: rgba(46, 52, 64, 0.80);") != null,
     );

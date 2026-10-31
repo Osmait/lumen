@@ -109,27 +109,25 @@ pub fn showContentDetail(ui: *Ui, item: *const Item) void {
     });
 }
 
-/// The image the preview shows or is loading. Decoding happened on the UI
-/// thread for every keystroke that kept an image as the top hit (a 24 MP
-/// photo: ~100 ms each); now on a worker (`pictures.requestPicture`: within
-/// `picture_limits`, one at a time, a request the selection has left
-/// behind dropped before it is decoded), and not again for the same file.
-var image_path: [4096]u8 = undefined;
-var image_len: usize = 0;
-var image_mtime: i64 = 0;
-
 /// The preview's size: sharp on a HiDPI screen, and a 24 MP photo kept as
 /// 16 MB instead of 96.
 const preview_px = 2048;
 
+/// Shows the image at `path`. Decoding happened on the UI thread for every
+/// keystroke that kept an image as the top hit (a 24 MP photo: ~100 ms
+/// each); now on a worker (`pictures.requestPicture`: within
+/// `picture_limits`, one at a time, a request the selection has left
+/// behind dropped before it is decoded), and not again for the same file.
 fn showImage(ui: *Ui, path: [:0]const u8, mtime: i64) void {
-    const same_image = image_mtime == mtime and std.mem.eql(u8, image_path[0..image_len], path);
+    const detail = &ui.detail;
+    const shown_path = detail.image_path[0..detail.image_path_len];
+    const same_image = detail.image_mtime == mtime and std.mem.eql(u8, shown_path, path);
     if (same_image) return;
     forgetImage(ui);
-    if (path.len > image_path.len) return;
-    @memcpy(image_path[0..path.len], path);
-    image_len = path.len;
-    image_mtime = mtime;
+    if (path.len > detail.image_path.len) return;
+    @memcpy(detail.image_path[0..path.len], path);
+    detail.image_path_len = path.len;
+    detail.image_mtime = mtime;
     pictures.requestPicture(
         path,
         preview_px,
@@ -145,7 +143,7 @@ fn showImage(ui: *Ui, path: [:0]const u8, mtime: i64) void {
 /// has not started).
 fn forgetImage(ui: *Ui) void {
     pictures.preview_lane.forget();
-    image_len = 0;
+    ui.detail.image_path_len = 0;
     c.gtk_picture_set_paintable(gtk.widget(ui.detail.picture), null);
 }
 

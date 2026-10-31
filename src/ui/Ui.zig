@@ -121,7 +121,7 @@ grid: *c.GtkFlowBox = undefined,
 grid_mode: bool = false,
 grid_columns: c_int = 5,
 scroller: *c.GtkScrolledWindow = undefined,
-detail: DetailPane = undefined,
+detail: DetailPane = .{},
 /// File index, started by main once the window exists.
 files: ?*index.Service = null,
 /// Content (full-text) index, started by main after `files`.
@@ -209,7 +209,9 @@ input: Edited = .{ .pref = 0 },
 /// The open form (index in the registry) and its fields' values (gpa).
 form_cmd: u16 = 0,
 form_values: std.ArrayList([:0]u8) = .empty,
-/// ~/.config/lumen/icons as last read (widgets.renamed points into it).
+/// How result rows look, for the row builders in widgets.zig.
+row_look: widgets.RowLook = .{},
+/// ~/.config/lumen/icons as last read (row_look.renamed points into it).
 icon_arena: ?std.heap.ArenaAllocator = null,
 /// A message to show on the selected row after the next extension reload.
 /// The reload rebuilds every row, so a message set before it would be lost.
@@ -262,16 +264,20 @@ const Footer = struct {
 
 /// The selected row's preview, picture and "Information" block.
 const DetailPane = struct {
-    box: *c.GtkBox,
-    text: *c.GtkLabel,
-    picture: *c.GtkPicture,
+    box: *c.GtkBox = undefined,
+    text: *c.GtkLabel = undefined,
+    picture: *c.GtkPicture = undefined,
     /// The "Information" block under the preview (hidden for extensions).
-    meta: *c.GtkBox,
+    meta: *c.GtkBox = undefined,
     /// One line per label and value pair; extensions show as many as they
     /// give.
-    meta_lines: [item_mod.meta_max]*c.GtkBox,
-    meta_keys: [item_mod.meta_max]*c.GtkLabel,
-    meta_values: [item_mod.meta_max]*c.GtkLabel,
+    meta_lines: [item_mod.meta_max]*c.GtkBox = undefined,
+    meta_keys: [item_mod.meta_max]*c.GtkLabel = undefined,
+    meta_values: [item_mod.meta_max]*c.GtkLabel = undefined,
+    /// The image the picture shows or is loading (see detail_pane.showImage).
+    image_path: [4096]u8 = undefined,
+    image_path_len: usize = 0,
+    image_mtime: i64 = 0,
 };
 
 /// The selected row's actions, floating over the results (Ctrl K).
@@ -672,9 +678,9 @@ fn buildPanel(self: *Ui, overlay: *c.GtkOverlay) void {
 }
 
 /// ~/.config/lumen/icons/<name>.svg|png replaces the icon <name> everywhere
-/// (widgets.renamed). Read when the window opens: a handful of files.
+/// (row_look.renamed). Read when the window opens: a handful of files.
 fn scanIconDir(self: *Ui) void {
-    widgets.renamed = .empty;
+    self.row_look.renamed = .empty;
     if (self.icon_arena) |*icon_arena| {
         _ = icon_arena.reset(.retain_capacity);
     } else {
@@ -690,7 +696,7 @@ fn scanIconDir(self: *Ui) void {
         const ext = name[dot + 1 ..];
         if (!(std.ascii.eqlIgnoreCase(ext, "svg") or std.ascii.eqlIgnoreCase(ext, "png"))) continue;
         const path = arena.printSentinel("{s}/{s}", .{ dir, name }, 0) catch continue;
-        widgets.renamed.put(
+        self.row_look.renamed.put(
             arena,
             arena.dupe(u8, name[0..dot]) catch continue,
             path,
@@ -723,9 +729,9 @@ fn barWidget(self: *Ui, part: layout_mod.BarPart) *c.GtkWidget {
 pub fn applyStructure(self: *Ui) void {
     assert(self.built);
     const layout = self.layout;
-    widgets.show = layout.show;
-    widgets.rows_inline = layout.rows == .inline_;
-    widgets.row_parts = layout.row;
+    self.row_look.show = layout.show;
+    self.row_look.rows_inline = layout.rows == .inline_;
+    self.row_look.parts = layout.row;
     // The search bar's parts in order; setView decides which of them show.
     const bar: *c.GtkBox = self.search_bar.box;
     var prev: ?*c.GtkWidget = null;
@@ -788,7 +794,7 @@ pub fn applyStructure(self: *Ui) void {
 /// Width, height and density from the settings. A layer surface takes its
 /// size when it is mapped: a change while it shows maps it again.
 fn applyLayout(self: *Ui) void {
-    widgets.icon_px = switch (self.settings.density) {
+    self.row_look.icon_px = switch (self.settings.density) {
         .compact => 26,
         .default => 32,
         .comfortable => 38,
@@ -897,7 +903,7 @@ pub fn overridden(self: *const Ui, key: []const u8) bool {
 }
 
 fn currentTheme(self: *Ui) *const themes.Theme {
-    return themes.find(self.settings.theme, self.preferDark());
+    return themes.find(self.settings.theme, self.preferDark(), self.customThemes());
 }
 
 /// Theme variables + style.css + the user's style.css, reloaded only when
@@ -986,6 +992,12 @@ fn userCssChanged(self: *Ui) bool {
 }
 
 /// The desktop's light/dark preference (dark when it cannot be read).
+/// init.lua's and the style's themes (`lumen.theme`), from the registry.
+pub fn customThemes(self: *const Ui) []const themes.Theme {
+    const registry = self.ext_registry orelse return &.{};
+    return registry.themes;
+}
+
 pub fn preferDark(self: *Ui) bool {
     const interface_settings = self.appearance.interface_settings orelse return true;
     const color_scheme = c.g_settings_get_string(interface_settings, "color-scheme");
@@ -1865,7 +1877,8 @@ fn buildItemRow(self: *Ui, item_index: usize) void {
     self.rows.ensureUnusedCapacity(arena, 1) catch return;
     if (self.grid_mode) {
         const gap = 6 * (self.grid_columns - 1) + 24;
-        const cell = widgets.gridCell(item, @divTrunc(self.panelW() - gap, self.grid_columns) - 12);
+        const cell_width_px = @divTrunc(self.panelW() - gap, self.grid_columns) - 12;
+        const cell = widgets.gridCell(&self.row_look, item, cell_width_px);
         c.gtk_flow_box_append(self.grid, cell);
         const child = c.gtk_flow_box_get_child_at_index(
             self.grid,
@@ -1875,7 +1888,10 @@ fn buildItemRow(self: *Ui, item_index: usize) void {
         return;
     }
     var parts: widgets.RowParts = .{};
-    const row = if (item.action == .calc) widgets.calcRow(item) else widgets.itemRow(item, &parts);
+    const row = if (item.action == .calc)
+        widgets.calcRow(item)
+    else
+        widgets.itemRow(&self.row_look, item, &parts);
     c.g_object_set_data(row, "lumen-row", @ptrFromInt(self.rows.items.len + 1));
     c.gtk_list_box_append(self.list, row);
     self.rows.appendAssumeCapacity(.{
@@ -1953,7 +1969,7 @@ pub fn select(self: *Ui, row_index: ?usize) void {
     // theme in use on a style.
     if (self.view == .themes) self.applyAppearance(if (item.action == .setting and
         item.action.setting == .theme)
-        themes.find(item.action.setting.theme, self.preferDark())
+        themes.find(item.action.setting.theme, self.preferDark(), self.customThemes())
     else
         null);
 }

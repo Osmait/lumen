@@ -11,6 +11,7 @@ const themes = @import("themes.zig");
 const labels = @import("labels.zig");
 const os = @import("os");
 const pictures = @import("pictures.zig");
+const layout_mod = @import("../layout.zig");
 
 /// A small picture of a theme: its background, two lines of text and an
 /// accent dot. Each set of colours is drawn once and cached, init.lua's
@@ -100,17 +101,23 @@ fn fileKey(path: [*:0]const u8, width_px: c_int, height_px: c_int) ?u64 {
     return hash.final();
 }
 
-/// Icon size in result rows, from the Density setting (main thread).
-pub var icon_px: c_int = 32;
-/// Icons replaced by name: ~/.config/lumen/icons/<name>.svg (or .png) is
-/// used wherever the icon <name> would be. Name to path; the UI fills it.
-pub var renamed: std.StringHashMapUnmanaged([:0]const u8) = .empty;
-/// What rows show, from lumen.layout (main thread).
-pub var show: @import("../layout.zig").Show = .{};
-/// Subtitles after titles on the same line (lumen.layout's rows = "inline").
-pub var rows_inline = false;
-/// A row's parts in order (lumen.layout's row).
-pub var row_parts: @import("../layout.zig").Parts(@import("../layout.zig").RowPart) = .{};
+/// How result rows look, from the Density setting and lumen.layout. Ui
+/// keeps one (applyLayout, applyStructure, scanIconDir fill it) and hands
+/// it to the row builders.
+pub const RowLook = struct {
+    /// Icon size, from the Density setting.
+    icon_px: c_int = 32,
+    /// Icons replaced by name: ~/.config/lumen/icons/<name>.svg (or .png)
+    /// is used wherever the icon <name> would be. Name to path, both in
+    /// Ui.icon_arena.
+    renamed: std.StringHashMapUnmanaged([:0]const u8) = .empty,
+    /// What rows show.
+    show: layout_mod.Show = .{},
+    /// Subtitles after titles on the same line (rows = "inline").
+    rows_inline: bool = false,
+    /// A row's parts in order.
+    parts: layout_mod.Parts(layout_mod.RowPart) = .{},
+};
 
 /// An image file as an icon, decoded at twice `size` (sharp on HiDPI) and
 /// kept until the file changes: the same few icons show again and again.
@@ -132,21 +139,21 @@ fn fileTexture(path: [:0]const u8, size: c_int) ?*c.GdkTexture {
 /// the primary action while the row is selected.
 pub const RowParts = struct { hint: ?*c.GtkWidget = null, accessory: ?*c.GtkWidget = null };
 
-pub fn itemRow(item: Item, parts: *RowParts) *c.GtkWidget {
+pub fn itemRow(look: *const RowLook, item: Item, parts: *RowParts) *c.GtkWidget {
     const row = gtk.listBoxRow();
     const box = hbox(12);
     // The parts in lumen.layout's order; those left out are not made.
-    for (row_parts.slice()) |part| switch (part) {
-        .icon => if (show.icons) gtk.append(box, iconWidget(item.icon, icon_px)),
+    for (look.parts.slice()) |part| switch (part) {
+        .icon => if (look.show.icons) gtk.append(box, iconWidget(look, item.icon, look.icon_px)),
         .text => {
-            const text = if (rows_inline) hbox(10) else vbox(1);
+            const text = if (look.rows_inline) hbox(10) else vbox(1);
             gtk.setValign(text, c.GTK_ALIGN_CENTER);
             gtk.setHexpand(text, true);
             const title = shortLabel(item.title, "title");
             c.gtk_label_set_ellipsize(title, c.PANGO_ELLIPSIZE_END);
             c.gtk_label_set_max_width_chars(title, 60);
             gtk.append(text, title);
-            if (item.subtitle.len > 0 and show.subtitles) {
+            if (item.subtitle.len > 0 and look.show.subtitles) {
                 const sub = shortLabel(item.subtitle, "subtitle");
                 c.gtk_label_set_ellipsize(sub, c.PANGO_ELLIPSIZE_END);
                 c.gtk_label_set_max_width_chars(sub, 60);
@@ -154,7 +161,7 @@ pub fn itemRow(item: Item, parts: *RowParts) *c.GtkWidget {
             }
             gtk.append(box, text);
         },
-        .accessory => if (item.accessory.len > 0 and show.accessories) {
+        .accessory => if (item.accessory.len > 0 and look.show.accessories) {
             parts.accessory = gtk.widget(shortLabel(item.accessory, "accessory"));
             gtk.append(box, parts.accessory.?);
         },
@@ -170,7 +177,7 @@ pub fn itemRow(item: Item, parts: *RowParts) *c.GtkWidget {
 
 /// A grid cell: a picture (an image file, scaled down as it is decoded) or
 /// a large icon, and the title under it. `w` is the cell's width.
-pub fn gridCell(item: Item, width_px: c_int) *c.GtkWidget {
+pub fn gridCell(look: *const RowLook, item: Item, width_px: c_int) *c.GtkWidget {
     const box = vbox(6);
     gtk.addClass(box, "cell");
     const pic_h = @divTrunc(width_px * 5, 8);
@@ -182,7 +189,7 @@ pub fn gridCell(item: Item, width_px: c_int) *c.GtkWidget {
     ) else null) else null;
     const decode = key != null and cached == null;
     const shown = top orelse blk: {
-        const icon = iconWidget(item.icon, @min(@divTrunc(width_px, 2), 56));
+        const icon = iconWidget(look, item.icon, @min(@divTrunc(width_px, 2), 56));
         gtk.setHalign(icon, c.GTK_ALIGN_CENTER);
         // As tall as the picture on its way, so the cell keeps its size
         // when it comes.
@@ -300,10 +307,10 @@ pub fn calcSide(value: [:0]const u8, tag: [:0]const u8) *c.GtkWidget {
     return gtk.widget(side);
 }
 
-pub fn iconWidget(icon: item_mod.Icon, size: c_int) *c.GtkWidget {
+pub fn iconWidget(look: *const RowLook, icon: item_mod.Icon, size: c_int) *c.GtkWidget {
     switch (icon) {
         .logo => |logo| {
-            const texture = logos.texture(logo.name) orelse return iconWidget(.none, size);
+            const texture = logos.texture(logo.name) orelse return iconWidget(look, .none, size);
             const img = gtk.imageFromPaintable(texture);
             c.gtk_image_set_pixel_size(img, if (logo.on_light) size - 6 else size);
             gtk.addClass(img, if (logo.on_light) "logo-plate" else "logo");
@@ -317,7 +324,9 @@ pub fn iconWidget(icon: item_mod.Icon, size: c_int) *c.GtkWidget {
             return gtk.widget(img);
         },
         .tile => |tile| {
-            if (renamed.get(tile.name)) |path| return iconWidget(.{ .file = path }, size);
+            if (look.renamed.get(tile.name)) |path| {
+                return iconWidget(look, .{ .file = path }, size);
+            }
             const img = gtk.imageFromIconName(tile.name);
             c.gtk_image_set_pixel_size(img, @divTrunc(size, 2) + 2);
             gtk.addClass(img, "tile");
@@ -334,7 +343,7 @@ pub fn iconWidget(icon: item_mod.Icon, size: c_int) *c.GtkWidget {
         },
         .emoji => |emoji| return gtk.widget(label(emoji, "emoji")),
         .named => |name| {
-            if (renamed.get(name)) |path| return iconWidget(.{ .file = path }, size);
+            if (look.renamed.get(name)) |path| return iconWidget(look, .{ .file = path }, size);
             const img = gtk.imageFromIconName(name);
             c.gtk_image_set_pixel_size(img, size);
             gtk.addClass(img, "app-icon");
@@ -342,6 +351,7 @@ pub fn iconWidget(icon: item_mod.Icon, size: c_int) *c.GtkWidget {
         },
         .swatch => |sw| {
             const texture = swatchTexture(sw.bg, sw.fg, sw.accent) orelse return iconWidget(
+                look,
                 .none,
                 size,
             );
@@ -367,7 +377,7 @@ pub fn iconWidget(icon: item_mod.Icon, size: c_int) *c.GtkWidget {
             return gtk.widget(badge_label);
         },
         .file => |path| {
-            const tex = fileTexture(path, size) orelse return iconWidget(.none, size);
+            const tex = fileTexture(path, size) orelse return iconWidget(look, .none, size);
             const img = gtk.imageFromPaintable(tex);
             c.gtk_image_set_pixel_size(img, size);
             gtk.addClass(img, "file-icon");
