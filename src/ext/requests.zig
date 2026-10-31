@@ -53,8 +53,6 @@ pub const rows_too_big = std.fmt.comptimePrint(
     .{rows_bytes_max >> 20},
 );
 
-const c_noref = lua.c.LUA_NOREF;
-
 /// Where the worker finds a command: its state and its spec table, and the
 /// lists its rows came from (their actions run there).
 pub const WorkerCommand = struct {
@@ -64,19 +62,20 @@ pub const WorkerCommand = struct {
     spec_reference: c_int,
     mode: Mode,
     answers_root_search: bool,
-    /// The list its last `items` or `search` returned.
-    list_kept: Kept = .{},
-    /// The list its last `root` returned.
-    root_search_kept: Kept = .{},
+    /// The list its last `items` or `search` returned; null before one.
+    list_kept: ?Kept = null,
+    /// The list its last `root` returned; null before one.
+    root_search_kept: ?Kept = null,
 };
 
 /// A Lua list kept alive in the registry so that its rows' actions can run
 /// later. An action for a row of another list is refused: the row it
 /// names may be gone, or another row now.
 pub const Kept = struct {
-    reference: c_int = c_noref,
+    /// The list (registry reference).
+    reference: c_int,
     /// The request that produced it.
-    list_generation: RequestGeneration = .none,
+    list_generation: RequestGeneration,
 };
 
 /// Requests the worker has not taken yet. A newer request of a kind
@@ -276,14 +275,14 @@ const ListContext = struct {
 };
 
 /// Keeps the list at `rows` for its rows' actions, until the next one.
-fn keep(L: *lua.State, kept: *Kept, rows: c_int, list_generation: RequestGeneration) void {
-    if (kept.reference != c_noref) {
-        lua.unref(L, kept.reference);
-        kept.reference = c_noref;
+fn keep(L: *lua.State, kept: *?Kept, rows: c_int, list_generation: RequestGeneration) void {
+    if (kept.*) |old| {
+        lua.unref(L, old.reference);
+        // `ref` below may raise: no reference to a freed slot is left.
+        kept.* = null;
     }
     lua.c.lua_pushvalue(L, rows);
-    kept.reference = lua.ref(L);
-    kept.list_generation = list_generation;
+    kept.* = .{ .reference = lua.ref(L), .list_generation = list_generation };
 }
 
 pub fn rootSearchExecute(host: *Host, request: *const RootSearchRequest) void {
@@ -520,13 +519,13 @@ fn pushRowAction(
     worker_command: *const WorkerCommand,
     row_action: ActRequest.RowAction,
 ) void {
-    const kept = if (row_action.from_root_search)
-        &worker_command.root_search_kept
+    const kept_or_null = if (row_action.from_root_search)
+        worker_command.root_search_kept
     else
-        &worker_command.list_kept;
-    if (kept.reference == c_noref or kept.list_generation != row_action.list_generation) {
-        lua.raise(L, "the list changed meanwhile; try again", .{});
-    }
+        worker_command.list_kept;
+    const list_changed = "the list changed meanwhile; try again";
+    const kept = kept_or_null orelse lua.raise(L, list_changed, .{});
+    if (kept.list_generation != row_action.list_generation) lua.raise(L, list_changed, .{});
     _ = lua.pushRef(L, kept.reference);
     const rows = lua.absIndex(L, -1);
     if (lua.c.lua_rawgeti(L, rows, @intCast(row_action.row_index + 1)) != lua.c.LUA_TTABLE) {
