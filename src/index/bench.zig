@@ -45,12 +45,12 @@ pub fn main(init: std.process.Init) !void {
     defer store.deinit(gpa);
     std.debug.print("scan      {d:>8.1} ms  {d} entries ({d} dirs, {d} errors)  {d:.1} M/s  {d:.1} MB\n", .{
         ms(
-            stats.ns,
+            stats.elapsed_ns,
         ),
         store.len(),
         stats.dirs,
         stats.errors,
-        @as(f64, @floatFromInt(store.len())) / (ms(stats.ns) * 1000),
+        @as(f64, @floatFromInt(store.len())) / (ms(stats.elapsed_ns) * 1000),
         @as(
             f64,
             @floatFromInt(store.bytes.len),
