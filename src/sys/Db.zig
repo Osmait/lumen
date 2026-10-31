@@ -163,6 +163,8 @@ fn stepFailed(db: *Db, rc: c_int) Error {
 // ---------------------------------------------------------------- frecency
 
 pub fn recordUse(db: *Db, key: []const u8, now: i64) Error!void {
+    // An item without a key has no ranking; Ui.perform skips those.
+    assert(key.len > 0);
     try db.execArgs(
         \\INSERT INTO frecency (key, count, last_used) VALUES (?1, 1, ?2)
         \\ON CONFLICT(key) DO UPDATE SET count = count + 1, last_used = ?2
@@ -282,6 +284,8 @@ pub fn recentClips(
     defer _ = c.sqlite3_finalize(stmt);
     try db.bind(stmt, .{ limit, head_chars });
     while (try db.nextRow(stmt)) {
+        // SQLite's LIMIT holds: never more rows than asked for.
+        assert(list.items.len < limit);
         try list.append(arena, .{
             .id = c.sqlite3_column_int64(stmt, 0),
             .head = try arena.dupe(u8, columnText(stmt, 1)),
@@ -306,10 +310,13 @@ pub fn clipContent(
 }
 
 pub fn touchClip(db: *Db, id: i64, now: i64) Error!void {
+    // Ids come from `recentClips`: SQLite's rowids, which start at 1.
+    assert(id > 0);
     try db.execArgs("UPDATE clipboard SET last_copied = ?2 WHERE id = ?1", .{ id, now });
 }
 
 pub fn deleteClip(db: *Db, id: i64) Error!void {
+    assert(id > 0);
     try db.execArgs("DELETE FROM clipboard WHERE id = ?1", .{id});
 }
 
