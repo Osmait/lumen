@@ -110,8 +110,10 @@ spacer: *c.GtkBox = undefined,
 /// The bar under the results (lumen.layout's footer).
 footer: Footer = undefined,
 search_bar: SearchBar = undefined,
-/// True once `build` has made the widgets. Settings read before that are
-/// applied to the widgets when they exist.
+/// True once `build` has made the widgets; until then every widget field is
+/// undefined. `build` reads the settings before it makes them, so
+/// `applyLayout` waits for this, and the functions that touch the widgets
+/// assert it.
 built: bool = false,
 list: *c.GtkListBox = undefined,
 /// Extension commands with `grid = true` show their rows here instead.
@@ -719,6 +721,7 @@ fn barWidget(self: *Ui, part: layout_mod.BarPart) *c.GtkWidget {
 /// detail pane's side, what rows show; then the size. The caller rebuilds
 /// the rows.
 pub fn applyStructure(self: *Ui) void {
+    assert(self.built);
     const layout = self.layout;
     widgets.show = layout.show;
     widgets.rows_inline = layout.rows == .inline_;
@@ -1042,6 +1045,7 @@ pub fn show(self: *Ui) void {
 
 /// Shows `view`, optionally with `text` already typed in the search bar.
 pub fn showWith(self: *Ui, view: View, text: ?[*:0]const u8) void {
+    assert(self.built);
     const show_start_ns = stats.now();
     const was_hidden = !gtk.isVisible(self.window);
     _ = self.frec_arena.reset(.retain_capacity);
@@ -1110,6 +1114,7 @@ pub fn prewarm(self: *Ui) void {
 }
 
 pub fn hide(self: *Ui) void {
+    assert(self.built);
     // Window actions wait for Hyprland to give the focus back.
     hypr.sendAfterHide();
     dmenu.finish(self, null);
@@ -1220,6 +1225,7 @@ fn loadBase(self: *Ui, arena: std.mem.Allocator) []Item {
 }
 
 pub fn setView(self: *Ui, view: View) void {
+    assert(self.built);
     const leaving_themes = self.view == .themes and view != .themes;
     // Leaving the dmenu view answers the waiting `lumen --dmenu` with
     // nothing.
@@ -1435,6 +1441,7 @@ fn resetRows(self: *Ui) void {
 }
 
 pub fn refresh(self: *Ui) void {
+    assert(self.built);
     const start_ns = stats.now();
     if (self.answerPending(start_ns)) return;
     self.search_ns = 0;
@@ -1911,6 +1918,7 @@ pub fn nextSelectable(self: *Ui, from: ?usize, direction: i32) ?usize {
 }
 
 pub fn select(self: *Ui, row_index: ?usize) void {
+    assert(self.built);
     if (row_index) |row_given| assert(row_given < self.rows.items.len);
     defer assert(self.selected == row_index);
     if (self.selected) |old| if (old < self.rows.items.len) {
@@ -2068,6 +2076,7 @@ fn viewTitle(self: *Ui) [*:0]const u8 {
 // --------------------------------------------------------- action panel
 
 pub fn openPanel(self: *Ui) void {
+    assert(self.built);
     const item = self.selectedItem() orelse return;
     self.panel.show(item_mod.actionsFor(item));
 }
@@ -2281,6 +2290,7 @@ pub fn dump(
     self: *Ui,
     gpa: std.mem.Allocator,
 ) (std.Io.Writer.Error || std.mem.Allocator.Error)![:0]u8 {
+    assert(self.built);
     var scratch_state: std.heap.ArenaAllocator = .init(gpa);
     defer scratch_state.deinit();
     const arena = scratch_state.allocator();
