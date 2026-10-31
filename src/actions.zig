@@ -74,7 +74,7 @@ fn primary(context: Ctx, item: *const Item) Outcome {
         .clip => hideAfter(pasteClip(context, item)),
         .script => |script| hideAfter(runScript(script.path, script.mode, item.title)),
         .calc => hideAfter(copy(item.detail)),
-        .file => |file| hideAfter(openFile(context, file.path, file.is_dir)),
+        .file => |file| hideAfter(openFile(context, file.path, file.entry())),
         .setting => |setting| .{ .setting = .{ .setting = setting, .op = .run } },
         // The UI runs extension commands (ext_view.zig).
         .ext_command, .ext_item, .pick => .stay,
@@ -175,14 +175,17 @@ fn trash(path: [:0]const u8) Outcome {
 /// Opens with the app chosen in Settings > Default Apps for the file's
 /// extension or kind, else the system default for its type (directories in
 /// the file manager).
-pub fn openFile(context: Ctx, path: [:0]const u8, is_dir: bool) void {
+pub fn openFile(context: Ctx, path: [:0]const u8, entry: core.file_kind.Entry) void {
     const name = baseName(path);
-    const mime = if (is_dir) null else c.g_content_type_guess(path, null, 0, null);
+    const mime = if (entry == .folder) null else c.g_content_type_guess(path, null, 0, null);
     defer if (mime) |mime_type| c.g_free(mime_type);
     const mime_text = if (mime) |mime_type| std.mem.span(mime_type) else "";
-    const kind = core.file_kind.of(mime_text, name, is_dir);
+    const kind = core.file_kind.of(mime_text, name, entry);
     var extension_buffer: [16]u8 = undefined;
-    const extension_key = if (is_dir) "" else core.file_kind.extKey(&extension_buffer, name);
+    const extension_key = switch (entry) {
+        .folder => "",
+        .file => core.file_kind.extKey(&extension_buffer, name),
+    };
     if (context.settings.appFor(extension_key, kind)) |app| {
         var app_id_buffer: [256]u8 = undefined;
         const id = std.mem.printSentinel(&app_id_buffer, "{s}", .{app}, 0) catch "";

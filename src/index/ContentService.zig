@@ -305,13 +305,13 @@ pub fn readText(
     arena: std.mem.Allocator,
     path: []const u8,
     mtime: i64,
-    extracted: bool,
+    source: content.Source,
     lines: u32,
 ) ?[]const u8 {
     var path_buffer: paths.Buffer = undefined;
     const doc_path = std.mem.printSentinel(&path_buffer, "{s}", .{path}, 0) catch return null;
     var text_path_buffer: paths.Buffer = undefined;
-    const text_path: [:0]const u8 = if (extracted) blk: {
+    const text_path: [:0]const u8 = if (source == .extracted) blk: {
         const doc_stat = content_list.stat(doc_path, .document) orelse return null;
         break :blk service.textPath(&text_path_buffer, .{
             .path = path,
@@ -322,7 +322,10 @@ pub fn readText(
     } else doc_path;
     const fd = sys.openRegular(text_path) catch return null;
     defer sys.close(fd);
-    const text_bytes_max: usize = if (extracted) extracted_bytes_max else content.text_bytes_max;
+    const text_bytes_max: usize = switch (source) {
+        .plain => content.text_bytes_max,
+        .extracted => extracted_bytes_max,
+    };
     var text: std.ArrayList(u8) = .empty;
     var lines_seen: u32 = 0;
     while (text.items.len < text_bytes_max and lines_seen < lines) {
@@ -1125,7 +1128,7 @@ test "content service: finds, follows edits and deletions, rebuilds only on chan
             f.arena_state.allocator(),
             hits[0].path,
             hits[0].mtime,
-            false,
+            .plain,
             std.math.maxInt(u32),
         ).?;
         try testing.expectEqualStrings("the quick zanzibar fox\n", text);
@@ -1335,7 +1338,7 @@ test "content service: Office documents are extracted once per version" {
             f.arena_state.allocator(),
             hits[0].path,
             hits[0].mtime,
-            true,
+            .extracted,
             std.math.maxInt(u32),
         ).?;
         try testing.expectEqualStrings("Minutes about the wombat project", text);
@@ -1344,7 +1347,7 @@ test "content service: Office documents are extracted once per version" {
             f.arena_state.allocator(),
             hits[0].path,
             hits[0].mtime,
-            false,
+            .plain,
             std.math.maxInt(u32),
         )) |raw| {
             try testing.expect(std.mem.find(u8, raw, "wombat") == null);

@@ -737,7 +737,7 @@ fn openWith(ui: *Ui, id: [:0]const u8, choice: OpenWithChoice) void {
     if (choice == .as_default) {
         const name = std.Io.Dir.path.basename(file.path);
         var extension_buf: [16]u8 = undefined;
-        const key: []const u8 = if (core.file_kind.of(file.mime, name, false)) |kind|
+        const key: []const u8 = if (core.file_kind.of(file.mime, name, .file)) |kind|
             @tagName(kind)
         else
             core.file_kind.extKey(&extension_buf, name);
@@ -801,7 +801,7 @@ pub fn performSetting(ui: *Ui, setting: item_mod.Setting, op: item_mod.Op) void 
         .open_file => {
             // Write the defaults first: an empty editor helps nobody.
             if (os.info(ui.settings_path.ptr) == null) ui.saveSettings();
-            run.openFile(ui.actionCtx(), ui.settings_path, false);
+            run.openFile(ui.actionCtx(), ui.settings_path, .file);
             ui.hide();
         },
         .ext_prefs => |id| prefs_view.open(ui, id),
@@ -810,7 +810,7 @@ pub fn performSetting(ui: *Ui, setting: item_mod.Setting, op: item_mod.Op) void 
         .field => |field_index| form_view.edit(ui, field_index),
         .submit_form => form_view.submit(ui),
         .ext_open => |dir| {
-            run.openFile(ui.actionCtx(), dir, true);
+            run.openFile(ui.actionCtx(), dir, .folder);
             ui.hide();
         },
         .ext_update => |id| {

@@ -72,8 +72,11 @@ pub const Kind = enum {
 
 /// The kind of a file, or null when it is none of the groups (then the
 /// system default opens it).
-pub fn of(mime: []const u8, name: []const u8, is_dir: bool) ?Kind {
-    if (is_dir) return .folder;
+/// What a path names, when the caller already knows it is a folder.
+pub const Entry = enum { file, folder };
+
+pub fn of(mime: []const u8, name: []const u8, entry: Entry) ?Kind {
+    if (entry == .folder) return .folder;
     if (std.mem.eql(u8, mime, "inode/directory")) return .folder;
     if (std.mem.eql(u8, mime, "text/markdown")) return .markdown;
     if (hasExt(name, &.{ ".md", ".markdown" })) return .markdown;
@@ -172,28 +175,28 @@ fn hasExt(name: []const u8, extensions: []const []const u8) bool {
 
 test "kinds from MIME type and name" {
     const t = std.testing;
-    try t.expectEqual(Kind.folder, of("", "Projects", true));
-    try t.expectEqual(Kind.pdf, of("application/pdf", "a.pdf", false));
-    try t.expectEqual(Kind.image, of("image/jpeg", "a.jpg", false));
-    try t.expectEqual(Kind.video, of("video/mp4", "a.mp4", false));
-    try t.expectEqual(Kind.audio, of("audio/flac", "a.flac", false));
-    try t.expectEqual(Kind.markdown, of("text/markdown", "README.md", false));
-    try t.expectEqual(Kind.markdown, of("application/octet-stream", "notes.MD", false));
-    try t.expectEqual(Kind.html, of("text/html", "index.html", false));
-    try t.expectEqual(Kind.text, of("text/plain", "a.txt", false));
-    try t.expectEqual(Kind.text, of("text/rust", "lib.rs", false));
-    try t.expectEqual(Kind.text, of("application/json", "a.json", false));
+    try t.expectEqual(Kind.folder, of("", "Projects", .folder));
+    try t.expectEqual(Kind.pdf, of("application/pdf", "a.pdf", .file));
+    try t.expectEqual(Kind.image, of("image/jpeg", "a.jpg", .file));
+    try t.expectEqual(Kind.video, of("video/mp4", "a.mp4", .file));
+    try t.expectEqual(Kind.audio, of("audio/flac", "a.flac", .file));
+    try t.expectEqual(Kind.markdown, of("text/markdown", "README.md", .file));
+    try t.expectEqual(Kind.markdown, of("application/octet-stream", "notes.MD", .file));
+    try t.expectEqual(Kind.html, of("text/html", "index.html", .file));
+    try t.expectEqual(Kind.text, of("text/plain", "a.txt", .file));
+    try t.expectEqual(Kind.text, of("text/rust", "lib.rs", .file));
+    try t.expectEqual(Kind.text, of("application/json", "a.json", .file));
     try t.expectEqual(Kind.office, of(
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "a.docx",
-        false,
+        .file,
     ));
-    try t.expectEqual(Kind.archive, of("application/zip", "a.zip", false));
+    try t.expectEqual(Kind.archive, of("application/zip", "a.zip", .file));
     // GLib's guesses for code it does not know.
-    try t.expectEqual(Kind.text, of("application/octet-stream", "main.zig", false));
-    try t.expectEqual(Kind.text, of("video/mp2t", "app.ts", false));
-    try t.expectEqual(@as(?Kind, null), of("application/x-executable", "a.out", false));
-    try t.expectEqual(@as(?Kind, null), of("application/octet-stream", "firmware.bin", false));
+    try t.expectEqual(Kind.text, of("application/octet-stream", "main.zig", .file));
+    try t.expectEqual(Kind.text, of("video/mp2t", "app.ts", .file));
+    try t.expectEqual(@as(?Kind, null), of("application/x-executable", "a.out", .file));
+    try t.expectEqual(@as(?Kind, null), of("application/octet-stream", "firmware.bin", .file));
     try t.expectEqual(Kind.text, Kind.markdown.fallback().?);
 }
 

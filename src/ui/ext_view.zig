@@ -541,7 +541,7 @@ fn open(ui: *Ui, target: [:0]const u8) void {
         log.warn("open {s}: no such file", .{path});
         return;
     };
-    run.openFile(ui.actionCtx(), path, info.is_dir);
+    run.openFile(ui.actionCtx(), path, if (info.is_dir) .folder else .file);
 }
 
 // --------------------------------------------------------------- keymaps

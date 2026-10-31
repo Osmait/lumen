@@ -109,6 +109,10 @@ pub const Action = union(enum) {
         line: u32 = 0,
         /// The match is in text extracted from a PDF/Office document.
         extracted: bool = false,
+
+        pub fn entry(file: @This()) core.file_kind.Entry {
+            return if (file.is_dir) .folder else .file;
+        }
     },
     /// An extension command (its index in the extension registry): opens
     /// its list, or runs it when it has no list.

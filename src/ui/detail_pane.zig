@@ -94,7 +94,7 @@ pub fn showContentDetail(ui: *Ui, item: *const Item) void {
         arena,
         file.path,
         if (info) |file_info| file_info.mtime else 0,
-        file.extracted,
+        if (file.extracted) .extracted else .plain,
         file.line + labels.context_after,
     ) orelse item.detail;
     const words = index.content.splitWords(arena, ui.query()) catch return;
