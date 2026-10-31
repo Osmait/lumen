@@ -7,6 +7,7 @@
 const std = @import("std");
 const lua = @import("luart").lua;
 const Host = @import("Host.zig");
+const rows = @import("rows.zig");
 const json = @import("luart").json;
 const proc = @import("../sys/proc.zig");
 const themes = @import("../ui/themes.zig");
@@ -698,7 +699,7 @@ fn icons(L: *lua.State) lua.Error!c_int {
                 .{key},
             );
         }
-        const icon = Host.parseIcon(L, arena, -1, "lumen.icons") orelse
+        const icon = rows.parseIcon(L, arena, -1, "lumen.icons") orelse
             return lua.fail(L, "lumen.icons: no icon for {s}", .{key});
         const full_key = iconKey(arena, key) catch return lua.failOom(L);
         load.icons.append(arena, .{ .key = full_key, .icon = icon }) catch
