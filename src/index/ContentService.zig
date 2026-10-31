@@ -683,7 +683,8 @@ fn refresh(service: *ContentService) void {
     // Only documents to retry, which failed again.
     if (!whole and changed.gone.len == 0 and changed.added.len == 0) return;
     start_ns = sys.monotonicNs();
-    const fresh = service.buildNext(if (whole) docs.? else null, changed) orelse return;
+    const input: BuildInput = if (whole) .{ .whole = docs.? } else .{ .update = changed };
+    const fresh = service.buildNext(input) orelse return;
     service.counters.last_build_ns.store(sys.monotonicNs() - start_ns, .monotonic);
     _ = service.counters.builds.fetchAdd(1, .release);
     if (!whole) _ = service.counters.updates.fetchAdd(1, .release);
@@ -750,6 +751,15 @@ fn wantsWhole(service: *const ContentService, changed: Diff) bool {
     return index.buf.len * 100 > index.bytes_live * (100 + garbage_percent_max);
 }
 
+/// What the next index is made from.
+const BuildInput = union(enum) {
+    /// Every document, indexed from scratch.
+    whole: []const content.DocIn,
+    /// The index in use, with the documents of `Diff.gone` taken out and
+    /// those of `Diff.added` put in.
+    update: Diff,
+};
+
 /// How `buildNext` gets the next index to the cache file.
 const BuildStrategy = enum {
     /// Every document, into a new file.
@@ -761,26 +771,23 @@ const BuildStrategy = enum {
     rewrite_file,
 };
 
-fn buildStrategy(service: *const ContentService, docs_all: ?[]const content.DocIn) BuildStrategy {
+fn buildStrategy(service: *const ContentService, input: BuildInput) BuildStrategy {
     service.assertWorkerThread();
-    if (docs_all != null) return .build_whole;
+    if (input == .whole) return .build_whole;
     const index = &service.index.?;
     if (!index.mapped) return .rewrite_file;
     if (service.worker.unsaved) return .rewrite_file;
     return .append_to_mapped_file;
 }
 
-/// The next index: `docs_all` built whole, or the current one updated with
-/// `changed`. Written to the cache file as it grows and served mapped
-/// (clean page cache, never the whole index in heap); an update is
-/// appended to the file the index is mapped from, or the file rewritten if
-/// it is not that one any more. Null (logged) when it cannot be built.
-fn buildNext(
-    service: *ContentService,
-    docs_all: ?[]const content.DocIn,
-    changed: Diff,
-) ?content.Index {
+/// The next index, from `input`. Written to the cache file as it grows and
+/// served mapped (clean page cache, never the whole index in heap); an
+/// update is appended to the file the index is mapped from, or the file
+/// rewritten if it is not that one any more. When the file cannot be
+/// written, built in memory instead. Null (logged) when it cannot be built.
+fn buildNext(service: *ContentService, input: BuildInput) ?content.Index {
     service.assertWorkerThread();
+    if (input == .update) assert(service.index != null);
     const reader: content.TextReader = .{
         .read = textOf,
         .ctx = service,
@@ -789,8 +796,8 @@ fn buildNext(
     if (std.mem.findScalarLast(u8, service.cache_path, '/')) |slash| {
         sys.mkdirP(service.cache_path[0..slash]);
     }
-    const strategy = service.buildStrategy(docs_all);
-    if (service.buildNextToFile(strategy, docs_all, changed, reader)) |fresh| {
+    const strategy = service.buildStrategy(input);
+    if (service.buildNextToFile(strategy, input, reader)) |fresh| {
         if (fresh.mapped) service.worker.unsaved = false;
         return fresh;
     } else |err| switch (err) {
@@ -810,19 +817,7 @@ fn buildNext(
             service.worker.unsaved = true;
         },
     }
-    const fresh = if (docs_all) |docs|
-        content.build(service.gpa, service.build_pool, docs, reader, null)
-    else
-        content.update(
-            service.gpa,
-            service.build_pool,
-            &service.index.?,
-            changed.gone,
-            changed.added,
-            reader,
-            null,
-        );
-    return fresh catch |err| {
+    return service.buildNextInMemory(input, reader) catch |err| {
         log.warn("building the content index: {t}", .{err});
         return null;
     };
@@ -831,17 +826,23 @@ fn buildNext(
 fn buildNextToFile(
     service: *ContentService,
     strategy: BuildStrategy,
-    docs_all: ?[]const content.DocIn,
-    changed: Diff,
+    input: BuildInput,
     reader: content.TextReader,
 ) content.FileError!content.Index {
     const gpa = service.gpa;
     const pool = service.build_pool;
     const path = service.cache_path;
+    const changed = switch (input) {
+        .whole => |docs| {
+            assert(strategy == .build_whole);
+            return content.buildFile(gpa, pool, docs, reader, path, null);
+        },
+        .update => |changed| changed,
+    };
+    const index = &service.index.?;
     switch (strategy) {
-        .build_whole => return content.buildFile(gpa, pool, docs_all.?, reader, path, null),
+        .build_whole => unreachable,
         .append_to_mapped_file => {
-            const index = &service.index.?;
             const appended = try content.appendFile(
                 gpa,
                 pool,
@@ -858,16 +859,28 @@ fn buildNextToFile(
         },
         .rewrite_file => {},
     }
-    return content.updateFile(
-        gpa,
-        pool,
-        &service.index.?,
-        changed.gone,
-        changed.added,
-        reader,
-        path,
-        null,
-    );
+    return content.updateFile(gpa, pool, index, changed.gone, changed.added, reader, path, null);
+}
+
+/// `buildNext` when the cache file could not be written: the next index in
+/// memory, served from there until a save succeeds (`retrySave`).
+fn buildNextInMemory(
+    service: *ContentService,
+    input: BuildInput,
+    reader: content.TextReader,
+) content.BuildError!content.Index {
+    return switch (input) {
+        .whole => |docs| content.build(service.gpa, service.build_pool, docs, reader, null),
+        .update => |changed| content.update(
+            service.gpa,
+            service.build_pool,
+            &service.index.?,
+            changed.gone,
+            changed.added,
+            reader,
+            null,
+        ),
+    };
 }
 
 fn retrySave(service: *ContentService) void {
