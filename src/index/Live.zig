@@ -36,14 +36,30 @@ pub const compact_interval_ns: u64 = std.math.maxInt(u64);
 
 /// Distinguishes delta ids from base ids. inotify events arrive as (watch,
 /// name) and every watch must map to *some* entry; directories created after
-/// the scan only exist in the delta, so both need one id space.
+/// the scan only exist in the delta, so both need one id space. A base id is
+/// the entry's index in `base`; a delta id is this bit and the entry's index
+/// in the delta. `deltaId`, `isDelta` and `deltaIndex` are the only places
+/// that know it.
 const delta_bit: u32 = 1 << 31;
+
+comptime {
+    // Base ids stay below the bit: a store has fewer than 2^31 entries.
+    assert(delta_bit == std.math.maxInt(u32) / 2 + 1);
+}
+
+/// The id of entry `delta_index` of the delta.
+fn deltaId(delta_index: u32) u32 {
+    assert(delta_index < delta_bit);
+    return delta_bit | delta_index;
+}
 
 fn isDelta(id: u32) bool {
     return id & delta_bit != 0;
 }
 
+/// The delta index of a delta id (see `deltaId`).
 fn deltaIndex(id: u32) u32 {
+    assert(isDelta(id));
     return id & ~delta_bit;
 }
 
@@ -305,7 +321,7 @@ fn childOf(live: *Live, parent: u32, name: []const u8) ?u32 {
     }
     const delta_parent = live.deltaParent(parent) orelse return null;
     const delta_index = live.deltaChild(delta_parent, name) orelse return null;
-    return delta_bit | delta_index;
+    return deltaId(delta_index);
 }
 
 fn remove(live: *Live, parent: u32, name: []const u8) bool {
@@ -607,7 +623,7 @@ pub fn addScans(live: *Live, scans: *Scans) std.mem.Allocator.Error!void {
             const id: u32 = @intCast(sub_index);
             if (!sub.isDir(id)) continue;
             const path = pathZ(sub, id, &buf) orelse continue;
-            const delta_id = delta_bit | map[sub_index];
+            const delta_id = deltaId(map[sub_index]);
             try live.watcher.watchBestEffort(live.gpa, path, delta_id, .below_root);
         }
         live.stats.added += sub.len() - 1;
