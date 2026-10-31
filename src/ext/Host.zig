@@ -647,11 +647,10 @@ fn closeAll(host: *Host) void {
 fn reloadExecute(host: *Host) void {
     host.closeAll();
     host.registry_gen +%= 1;
-    const registry = host.gpa.create(Registry) catch {
-        log.warn("reload: out of memory", .{});
-        return;
-    };
-    registry.* = .{ .gen = host.registry_gen, .arena = .init(host.gpa) };
+    const registry = host.answerCreate(Registry, "reload", .{
+        .gen = host.registry_gen,
+        .arena = .init(host.gpa),
+    }) orelse return;
     var load: Load = .{ .arena = registry.arena.allocator() };
     host.loadAll(&load);
     host.registryFill(registry, &load);
@@ -1278,16 +1277,12 @@ fn requested(host: *Host, registry_gen: u32, command: u16) ?*WorkerCommand {
 }
 
 fn listExecute(host: *Host, request: *const ListRequest) void {
-    const result = host.gpa.create(ListResult) catch {
-        log.warn("list: out of memory, no answer", .{});
-        return;
-    };
-    result.* = .{
+    const result = host.answerCreate(ListResult, "list", .{
         .gen = request.request_gen,
         .command = request.command,
         .query = "",
         .arena = .init(host.gpa),
-    };
+    }) orelse return;
     defer host.deliver(.{ .list = result });
     const arena = result.arena.allocator();
     const query = request.query.slice();
@@ -1366,11 +1361,11 @@ fn keep(L: *lua.State, kept: *Kept, rows: c_int, list_gen: u32) void {
 // ----------------------------------------------------------------- root
 
 fn rootSearchExecute(host: *Host, request: *const RootSearchRequest) void {
-    const result = host.gpa.create(RootResult) catch {
-        log.warn("root: out of memory, no answer", .{});
-        return;
-    };
-    result.* = .{ .gen = request.request_gen, .query = "", .arena = .init(host.gpa) };
+    const result = host.answerCreate(RootResult, "root", .{
+        .gen = request.request_gen,
+        .query = "",
+        .arena = .init(host.gpa),
+    }) orelse return;
     defer host.deliver(.{ .root = result });
     const arena = result.arena.allocator();
     const query = request.query.slice();
@@ -1464,11 +1459,10 @@ const RootSearchContext = struct {
 
 fn submitExecute(host: *Host, request: *SubmitRequest) void {
     defer request.destroy(host.gpa);
-    const result = host.gpa.create(ActResult) catch {
-        log.warn("submit: out of memory, no answer", .{});
-        return;
-    };
-    result.* = .{ .gen = request.request_gen, .arena = .init(host.gpa) };
+    const result = host.answerCreate(ActResult, "submit", .{
+        .gen = request.request_gen,
+        .arena = .init(host.gpa),
+    }) orelse return;
     defer host.deliver(.{ .act = result });
     const worker_command = host.requested(request.registry_gen, request.command) orelse {
         result.err = reloaded;
@@ -1537,11 +1531,10 @@ fn outcomeOf(L: *lua.State) Outcome {
 // ------------------------------------------------------------------ act
 
 fn actExecute(host: *Host, request: ActRequest) void {
-    const result = host.gpa.create(ActResult) catch {
-        log.warn("action: out of memory, no answer", .{});
-        return;
-    };
-    result.* = .{ .gen = request.request_gen, .arena = .init(host.gpa) };
+    const result = host.answerCreate(ActResult, "action", .{
+        .gen = request.request_gen,
+        .arena = .init(host.gpa),
+    }) orelse return;
     defer host.deliver(.{ .act = result });
     const worker_command = host.requested(request.registry_gen, request.command) orelse {
         result.err = reloaded;
@@ -1622,6 +1615,21 @@ fn pushRowAction(
 }
 
 // ------------------------------------------------------------- delivery
+
+/// An answer for the window (a Registry, ListResult, ActResult or
+/// RootResult), owned by it once delivered. Null when out of memory: the
+/// request then gets no answer, as if a newer one had replaced it, and the
+/// log says which kind was dropped.
+fn answerCreate(host: *Host, comptime T: type, what: []const u8, answer: T) ?*T {
+    comptime assert(@hasField(T, "gen"));
+    comptime assert(@hasField(T, "arena"));
+    const created = host.gpa.create(T) catch {
+        log.warn("{s}: out of memory, no answer", .{what});
+        return null;
+    };
+    created.* = answer;
+    return created;
+}
 
 /// An answer the worker hands to the main loop, which owns it from then on.
 const Answer = union(enum) {
