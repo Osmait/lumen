@@ -33,7 +33,7 @@ total: u32 = 0,
 context: *anyopaque = undefined,
 callback: *const fn (*anyopaque, usize) void = undefined,
 stopping: std.atomic.Value(bool) = .init(false),
-/// One run at a time.
+/// Held by the run in progress: one run at a time.
 run_lock: Io.Mutex = .init,
 
 pub const CreateError = std.mem.Allocator.Error || std.Thread.SpawnError;

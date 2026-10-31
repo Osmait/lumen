@@ -136,7 +136,9 @@ pub fn score(name: []const u8, query: []const u8) ?i32 {
 /// is `bonus`, given the row of the previous query letter. Part of the
 /// measured hot loop of `score`, hence inline.
 inline fn matchCell(previous: *const Row, bonus: i32, i: usize, j: usize) Cell {
-    if (i == 0) return .{ .score = score_match + bonus * first_char_multiplier, .run_bonus = bonus };
+    if (i == 0) {
+        return .{ .score = score_match + bonus * first_char_multiplier, .run_bonus = bonus };
+    }
     var cell: Cell = .{ .score = unreached, .run_bonus = 0 };
     if (j == 0) return cell;
     // Continue a run: the run keeps the bonus of its first letter, or

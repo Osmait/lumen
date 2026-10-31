@@ -416,7 +416,7 @@ fn applyEvents(service: *Service, arena: std.mem.Allocator) bool {
         };
         if (!service.live.scansPending()) return service.rescanDue();
         scans = service.live.takeScans();
-        entries_max = service.live.limits.delta_max;
+        entries_max = service.live.limits.delta_entries_max;
     }
     // New directories are read without the lock: a large tree moved in
     // held it, and every search with it, for as long as reading took.
@@ -430,7 +430,7 @@ fn applyEvents(service: *Service, arena: std.mem.Allocator) bool {
     return service.rescanDue();
 }
 
-/// Under the lock.
+/// Called with the lock held.
 fn rescanDue(service: *const Service) bool {
     if (service.live.pending_resync) return true;
     return service.live.needsCompaction();
@@ -829,7 +829,7 @@ test "service: the delta threshold triggers a compaction" {
     try settle(service);
 
     service.lock.lockUncancelable(service.io);
-    service.live.limits.delta_max = 3;
+    service.live.limits.delta_entries_max = 3;
     service.lock.unlock(service.io);
     const rescans = service.status().rescans;
     for (0..5) |i| {

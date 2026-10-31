@@ -44,7 +44,7 @@ pub fn main(init: std.process.Init) !void {
     if (command != .bench) return printTop(gpa, pool, &store, first);
 
     // Save and map back: the start-up path.
-    var temporary: TempDir = try .create();
+    var temporary: TemporaryFolder = try .create();
     defer temporary.remove();
     var index_path_buffer: index.paths.Buffer = undefined;
     const index_path = try temporary.file(&index_path_buffer, "files.idx");
@@ -73,7 +73,7 @@ fn scanRoot(gpa: std.mem.Allocator, pool: *index.Pool, root: []const u8) !Store 
         .{
             scan_ms,
             store.len(),
-            stats.dirs,
+            stats.directories,
             stats.errors,
             entries / (scan_ms * 1000),
             bytes / 1e6,
@@ -207,15 +207,15 @@ fn ms(duration_ns: u64) f64 {
 
 /// A folder of our own under /tmp for the files a bench writes: a fixed
 /// name there could be anyone's (a link planted to a file of yours).
-const TempDir = struct {
+const TemporaryFolder = struct {
     /// The folder's path is `path_buffer[0..path_length]`.
     path_buffer: [64]u8 = undefined,
     path_length: usize = 0,
     files: [2][:0]const u8 = undefined,
     files_count: usize = 0,
 
-    fn create() !TempDir {
-        var temporary: TempDir = .{};
+    fn create() !TemporaryFolder {
+        var temporary: TemporaryFolder = .{};
         const linux = std.os.linux;
         for (0..100) |attempt| {
             const unique = .{ linux.getpid(), sys.monotonicNs(), attempt };
@@ -227,11 +227,11 @@ const TempDir = struct {
                 return temporary;
             }
         }
-        return error.TempDir;
+        return error.TemporaryFolder;
     }
 
     /// `name` inside it, removed with it.
-    fn file(temporary: *TempDir, path_buffer: []u8, name: []const u8) ![:0]const u8 {
+    fn file(temporary: *TemporaryFolder, path_buffer: []u8, name: []const u8) ![:0]const u8 {
         const folder = temporary.path_buffer[0..temporary.path_length];
         const path = try std.mem.printSentinel(path_buffer, "{s}/{s}", .{ folder, name }, 0);
         temporary.files[temporary.files_count] = path;
@@ -241,7 +241,7 @@ const TempDir = struct {
 
     /// Deletes the files and the folder. A file the bench never wrote is not
     /// there to delete; anything else left behind is said.
-    fn remove(temporary: *TempDir) void {
+    fn remove(temporary: *TemporaryFolder) void {
         const linux = std.os.linux;
         for (temporary.files[0..temporary.files_count]) |path| {
             const unlinked = linux.errno(linux.unlink(path));
@@ -290,7 +290,7 @@ fn contentBench(
     var build_stats: index.content.BuildStats = .{};
     var reader_context: u8 = 0;
     // Written to the file as it grows, as the daemon builds it.
-    var temporary: TempDir = try .create();
+    var temporary: TemporaryFolder = try .create();
     defer temporary.remove();
     var index_path_buffer: index.paths.Buffer = undefined;
     const index_path = try temporary.file(&index_path_buffer, "content.idx");

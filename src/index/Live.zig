@@ -120,7 +120,7 @@ pub const Stats = struct {
 /// When the layers on top are worth a rescan. A field, not constants, so
 /// tests can reach the thresholds without creating 20k files.
 pub const Limits = struct {
-    delta_max: usize = 20_000,
+    delta_entries_max: usize = 20_000,
     graves_min: usize = 1_000,
     /// Tombstones must also exceed 1/graves_divisor of the base (5%).
     graves_divisor: usize = 20,
@@ -177,7 +177,7 @@ pub const Scan = struct {
     depth: u16,
     hidden: u8,
     sub: ?Store = null,
-    /// Over `Limits.delta_max` entries: a rescan instead, which adding it
+    /// Over `Limits.delta_entries_max` entries: a rescan instead, which adding it
     /// would ask for anyway.
     too_big: bool = false,
 
@@ -658,7 +658,7 @@ pub fn addScans(live: *Live, scans: *Scans) std.mem.Allocator.Error!void {
 /// for callers that hold it anyway (tests).
 pub fn finishScans(live: *Live) std.mem.Allocator.Error!void {
     var scans = live.takeScans();
-    readScans(live.gpa, live.scan_pool, live.config, scans.items, live.limits.delta_max);
+    readScans(live.gpa, live.scan_pool, live.config, scans.items, live.limits.delta_entries_max);
     try live.addScans(&scans);
 }
 
@@ -884,7 +884,7 @@ fn slowMountsOf(gpa: std.mem.Allocator, config: *const scan.Config) std.mem.Allo
 pub fn needsCompaction(live: *const Live) bool {
     const graves = live.graves;
     const limits = live.limits;
-    const delta_full = live.delta.store.len() > limits.delta_max;
+    const delta_full = live.delta.store.len() > limits.delta_entries_max;
     const graves_share = live.base.len() / limits.graves_divisor;
     const graves_many = graves > limits.graves_min and graves > graves_share;
     if (delta_full or graves_many) return true;
@@ -1373,7 +1373,7 @@ test "live: compaction thresholds" {
     try testing.expect(!tree.live.needsCompaction());
 
     // Delta: strictly more than the limit.
-    tree.live.limits.delta_max = 3;
+    tree.live.limits.delta_entries_max = 3;
     tree.make("a.txt");
     tree.make("b.txt");
     _ = try tree.sync();
@@ -1383,7 +1383,7 @@ test "live: compaction thresholds" {
     tree.make("c.txt");
     _ = try tree.sync();
     try testing.expect(tree.live.needsCompaction());
-    tree.live.limits.delta_max = 20_000;
+    tree.live.limits.delta_entries_max = 20_000;
 
     // Tombstones: over the minimum *and* over 5% of the base (41 entries:
     // root and 40 files -> 5% is 2).
@@ -1607,7 +1607,7 @@ test "live: a folder swapped for a link is never followed" {
 test "live: a large directory moved in asks for a rescan instead" {
     const tree = try Tree.create(&sample_tree);
     defer tree.destroy();
-    tree.live.limits.delta_max = 4;
+    tree.live.limits.delta_entries_max = 4;
     for ([_][]const u8{ "a", "b", "c", "d", "e", "f" }) |letter| {
         var path_buffer: [64]u8 = undefined;
         const path = try std.mem.print(&path_buffer, "outside/grande/sub/pieza_{s}.txt", .{letter});

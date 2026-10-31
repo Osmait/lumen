@@ -58,7 +58,7 @@ pub const skip_default = [_][]const u8{
 
 pub const Stats = struct {
     files: u64 = 0,
-    dirs: u64 = 0,
+    directories: u64 = 0,
     errors: u64 = 0,
     elapsed_ns: u64 = 0,
     /// Stopped at `Config.entries_max`: the store holds part of the tree.
@@ -120,7 +120,7 @@ fn addLevel(
                 stats.files += 1;
                 continue;
             }
-            stats.dirs += 1;
+            stats.directories += 1;
             if (!level.descend) continue;
             const separator = paths.separatorAfter(parent.path);
             const child = try gpa.printSentinel("{s}{s}{s}", .{ parent.path, separator, name }, 0);
@@ -194,7 +194,7 @@ fn addRoots(
 ) std.mem.Allocator.Error!void {
     for (roots) |root| {
         const id = try builder.push(gpa, root, store_mod.no_parent, store_mod.flag_dir, 0);
-        totals.dirs += 1;
+        totals.directories += 1;
         try frontier.append(gpa, .{
             .id = id,
             .path = try gpa.dupeSentinel(u8, root, 0),
