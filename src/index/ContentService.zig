@@ -358,7 +358,11 @@ fn textOf(
     buf.clearRetainingCapacity();
     const fd = sys.openRegular(text_path) catch return false;
     defer sys.close(fd);
-    try sys.readUpTo(gpa, fd, buf, extracted_bytes_max);
+    sys.readUpTo(gpa, fd, buf, extracted_bytes_max) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // Part of the text is not the document's text.
+        error.ReadFailed => return false,
+    };
     return buf.items.len > 0;
 }
 

@@ -265,7 +265,11 @@ pub fn slowMounts(gpa: std.mem.Allocator, under: []const u8) std.mem.Allocator.E
     defer close(fd);
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(gpa);
-    try readUpTo(gpa, fd, &text, mountinfo_bytes_max);
+    readUpTo(gpa, fd, &text, mountinfo_bytes_max) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // Part of the list would leave mounts out: none, as if unreadable.
+        error.ReadFailed => return &.{},
+    };
     var out: std.ArrayList([]u8) = .empty;
     errdefer {
         for (out.items) |mount| gpa.free(mount);
@@ -413,14 +417,18 @@ pub fn writeAllAt(fd: i32, data: []const u8, at: ?usize) Error!void {
     assert(written == data.len);
 }
 
+pub const ReadUpToError = std.mem.Allocator.Error || error{ReadFailed};
+
 /// Reads `fd` into `buf` until its end or `buf` holds `bytes_max` (it can
-/// hold a little more: a read is not cut short). A read error ends it.
+/// hold a little more: a read is not cut short). A read that fails is
+/// `error.ReadFailed`, with what was read before it left in `buf`: it is
+/// not the whole file, so it must not be taken for it.
 pub fn readUpTo(
     gpa: std.mem.Allocator,
     fd: i32,
     buf: *std.ArrayList(u8),
     bytes_max: usize,
-) std.mem.Allocator.Error!void {
+) ReadUpToError!void {
     while (buf.items.len < bytes_max) {
         try buf.ensureUnusedCapacity(gpa, read_chunk_bytes);
         const spare = buf.unusedCapacitySlice();
@@ -431,7 +439,7 @@ pub fn readUpTo(
                 buf.items.len += bytes_read;
             },
             .INTR => {},
-            else => return,
+            else => return error.ReadFailed,
         }
     }
 }
@@ -816,6 +824,31 @@ test "openDirNoFollow refuses a link to a folder, openDir follows it" {
         close(fd);
         return error.TestUnexpectedResult;
     } else |_| {}
+}
+
+test "readUpTo tells a failed read from the end of the file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try tmpDirPath(&tmp, &dir_buffer);
+    var file_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const file = try std.mem.printSentinel(&file_buffer, "{s}/text", .{dir}, 0);
+    try writeFile(file, "hello");
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    const file_fd = try openRegular(file);
+    defer close(file_fd);
+    try readUpTo(std.testing.allocator, file_fd, &text, 1024);
+    try std.testing.expectEqualStrings("hello", text.items);
+    // A folder opens, but reading it fails (EISDIR): not an empty file.
+    var dir_z_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_fd = try openDir(try std.mem.printSentinel(&dir_z_buffer, "{s}", .{dir}, 0));
+    defer close(dir_fd);
+    text.clearRetainingCapacity();
+    try std.testing.expectError(
+        error.ReadFailed,
+        readUpTo(std.testing.allocator, dir_fd, &text, 1024),
+    );
 }
 
 test "mkdirP makes the missing folders, and says when it could not" {

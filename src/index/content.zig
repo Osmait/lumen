@@ -698,7 +698,11 @@ pub fn readPlain(
     const fd = sys.openRegular(path_z) catch return false;
     defer sys.close(fd);
     // One byte past the limit tells a file over it.
-    try sys.readUpTo(gpa, fd, buf, text_bytes_max + 1);
+    sys.readUpTo(gpa, fd, buf, text_bytes_max + 1) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        // Part of the file is not its text: left out, as if unreadable.
+        error.ReadFailed => return false,
+    };
     if (buf.items.len > text_bytes_max) return false;
     const head = buf.items[0..@min(buf.items.len, 8000)];
     return std.mem.findScalar(u8, head, 0) == null;
