@@ -90,41 +90,44 @@ const LevelCtx = struct {
     follow: bool,
 };
 
+/// One level of the walk: how deep its entries are, and whether the
+/// folders among them are read next.
+const Level = struct { depth: u16, descend: bool };
+
 /// Adds what one level's folders hold to the index, and the folders among
-/// it to `next` (when the walk goes `deeper`).
+/// it to `next` (when the walk descends from this level).
 fn addLevel(
     gpa: std.mem.Allocator,
-    b: *Builder,
+    builder: *Builder,
     frontier: []const Frontier,
     batches: []const Batch,
-    depth: u16,
-    deeper: bool,
+    level: Level,
     next: *std.ArrayList(Frontier),
-    st: *Stats,
+    stats: *Stats,
 ) std.mem.Allocator.Error!void {
     for (frontier, batches) |parent, *batch| {
-        st.errors += batch.errors;
+        stats.errors += batch.errors;
         var start: usize = 0;
-        for (batch.ends.items, batch.flags.items) |end, fl0| {
+        for (batch.ends.items, batch.flags.items) |end, flags_read| {
             const name = batch.names.items[start..end];
             start = end;
             // Hidden is inherited: everything under a dot-dir is noise
             // even if its own name has no dot.
-            const fl = if (parent.hidden) fl0 | store_mod.flag_hidden else fl0;
-            const id = try b.push(gpa, name, parent.id, fl, depth);
-            if (fl & store_mod.flag_dir == 0) {
-                st.files += 1;
+            const flags = if (parent.hidden) flags_read | store_mod.flag_hidden else flags_read;
+            const id = try builder.push(gpa, name, parent.id, flags, level.depth);
+            if (flags & store_mod.flag_dir == 0) {
+                stats.files += 1;
                 continue;
             }
-            st.dirs += 1;
-            if (!deeper) continue;
+            stats.dirs += 1;
+            if (!level.descend) continue;
             const sep = if (std.mem.endsWith(u8, parent.path, "/")) "" else "/";
             const child = try gpa.printSentinel("{s}{s}{s}", .{ parent.path, sep, name }, 0);
             errdefer gpa.free(child);
             try next.append(gpa, .{
                 .id = id,
                 .path = child,
-                .hidden = fl & store_mod.flag_hidden != 0,
+                .hidden = flags & store_mod.flag_hidden != 0,
             });
         }
     }
@@ -192,7 +195,8 @@ pub fn scan(
             for (next.items) |f| gpa.free(f.path);
             next.deinit(gpa);
         }
-        try addLevel(gpa, &b, frontier.items, batches, depth, depth < cfg.depth_max, &next, &st);
+        const level: Level = .{ .depth = depth, .descend = depth < cfg.depth_max };
+        try addLevel(gpa, &b, frontier.items, batches, level, &next, &st);
         for (frontier.items) |f| gpa.free(f.path);
         frontier.deinit(gpa);
         frontier = next;

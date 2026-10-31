@@ -583,14 +583,14 @@ pub fn isUnder(path: []const u8, dir: []const u8) bool {
 /// Coarse on purpose: today vs this month vs old.
 fn recencyBonus(ctx: *const RecencyCtx, id: u32, buf: *[4096]u8) i32 {
     const now = ctx.now;
-    const p = ctx.store.path(id, buf[0 .. buf.len - 1]) orelse return 0;
-    if (p.len == 0) return 0;
-    for (ctx.no_stat) |dir| if (isUnder(p, dir)) return 0;
-    buf[p.len] = 0;
-    const mt = sys.mtime(buf[0..p.len :0]) orelse return 0;
-    if (mt > now) return recency_max;
+    const path = ctx.store.path(id, buf[0 .. buf.len - 1]) orelse return 0;
+    if (path.len == 0) return 0;
+    for (ctx.no_stat) |dir| if (isUnder(path, dir)) return 0;
+    buf[path.len] = 0;
+    const mtime = sys.mtime(buf[0..path.len :0]) orelse return 0;
+    if (mtime > now) return recency_max;
     // Saturating: an mtime is whatever the file system says.
-    return switch (@divTrunc(now -| mt, 86_400)) {
+    return switch (@divTrunc(now -| mtime, std.time.s_per_day)) {
         0 => 300,
         1...6 => 220,
         7...29 => 140,

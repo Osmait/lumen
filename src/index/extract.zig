@@ -116,7 +116,7 @@ fn runTool(
     limit_ms: u64,
     cancel: ?*const std.atomic.Value(bool),
 ) ExtractError![]u8 {
-    const r = sys.child.run(gpa, io, argv, .{
+    const result = sys.child.run(gpa, io, argv, .{
         .stdin = .{ .fd = input },
         .stderr = .ignore,
         .environ = .empty,
@@ -128,22 +128,23 @@ fn runTool(
         error.FileNotFound => error.ToolMissing,
         else => |e| e,
     };
-    gpa.free(r.stderr);
-    errdefer gpa.free(r.stdout);
-    if (r.timed_out) return error.Timeout;
-    if (r.capped) return r.stdout;
-    const code = r.code orelse return error.ToolFailed;
+    gpa.free(result.stderr);
+    errdefer gpa.free(result.stdout);
+    if (result.timed_out) return error.Timeout;
+    if (result.capped) return result.stdout;
+    const code = result.code orelse return error.ToolFailed;
     if (std.mem.findScalar(u8, ok_codes, code) == null) return error.ToolFailed;
-    return r.stdout;
+    return result.stdout;
 }
 
-/// `s` cut to at most `max` bytes at a UTF-8 boundary, reallocated to fit.
-fn shrink(gpa: std.mem.Allocator, s: []u8, max: usize) ![]u8 {
-    const n = @import("core").utf8.floorBoundary(s, max);
-    if (n == s.len) return s;
-    if (gpa.resize(s, n)) return s[0..n];
-    defer gpa.free(s);
-    return gpa.dupe(u8, s[0..n]);
+/// `text` cut to at most `bytes_max` bytes at a UTF-8 boundary, reallocated
+/// to fit.
+fn shrink(gpa: std.mem.Allocator, text: []u8, bytes_max: usize) ![]u8 {
+    const length = @import("core").utf8.floorBoundary(text, bytes_max);
+    if (length == text.len) return text;
+    if (gpa.resize(text, length)) return text[0..length];
+    defer gpa.free(text);
+    return gpa.dupe(u8, text[0..length]);
 }
 
 /// What a tag does to the surrounding text.
@@ -245,11 +246,11 @@ const TextOut = struct {
         const end = i + (std.mem.findAny(u8, rest, "<&") orelse rest.len);
         if (!skipping) try text_out.raw(xml[i..end]);
         if (end == xml.len or xml[end] != '&') return end;
-        const r = decodeEntity(xml[end..]);
+        const entity = decodeEntity(xml[end..]);
         if (!skipping) {
-            if (r.len == 0) {
+            if (entity.len == 0) {
                 try text_out.text("&");
-            } else if (r.cp) |cp| switch (cp) {
+            } else if (entity.cp) |cp| switch (cp) {
                 '\n' => text_out.sep(.newline),
                 ' ', '\t', '\r' => text_out.sep(.space),
                 else => {
@@ -259,7 +260,7 @@ const TextOut = struct {
                 },
             };
         }
-        return end + @max(r.len, 1);
+        return end + @max(entity.len, 1);
     }
 
     /// A comment, CDATA section, declaration or doctype at `i`: where it
@@ -302,28 +303,28 @@ const Tag = struct {
     /// The tag starting at `xml[i]` ('<'); null when the input ends inside
     /// it. `>` may appear inside quoted attribute values.
     fn parse(xml: []const u8, i: usize) ?Tag {
-        var e = i + 1;
+        var tag_end = i + 1;
         var quote: u8 = 0;
-        while (e < xml.len) : (e += 1) {
-            const c = xml[e];
+        while (tag_end < xml.len) : (tag_end += 1) {
+            const byte = xml[tag_end];
             if (quote != 0) {
-                if (c == quote) quote = 0;
-            } else if (c == '"' or c == '\'') {
-                quote = c;
-            } else if (c == '>') break;
+                if (byte == quote) quote = 0;
+            } else if (byte == '"' or byte == '\'') {
+                quote = byte;
+            } else if (byte == '>') break;
         }
-        if (e >= xml.len) return null;
+        if (tag_end >= xml.len) return null;
         const closing = xml[i + 1] == '/';
         const name_start = i + 1 + @intFromBool(closing);
         var name_end = name_start;
-        while (name_end < e and !isSpace(xml[name_end]) and xml[name_end] != '/') name_end += 1;
+        while (name_end < tag_end and !isSpace(xml[name_end]) and xml[name_end] != '/') name_end += 1;
         const name = xml[name_start..name_end];
         return .{
             .name = name,
             .local = name[if (std.mem.findScalarLast(u8, name, ':')) |c| c + 1 else 0..],
             .closing = closing,
-            .self_closing = xml[e - 1] == '/',
-            .end = e,
+            .self_closing = xml[tag_end - 1] == '/',
+            .end = tag_end,
         };
     }
 };
@@ -353,13 +354,13 @@ fn isSpace(c: u8) bool {
 
 /// `&...;` at the start of `s`: bytes consumed (0 if not an entity) and the
 /// code point (null for an invalid numeric reference, which is dropped).
-fn decodeEntity(s: []const u8) struct { len: usize, cp: ?u21 } {
+fn decodeEntity(text: []const u8) struct { len: usize, cp: ?u21 } {
     const semi = std.mem.findScalar(
         u8,
-        s[0..@min(s.len, 12)],
+        text[0..@min(text.len, 12)],
         ';',
     ) orelse return .{ .len = 0, .cp = null };
-    const body = s[1..semi];
+    const body = text[1..semi];
     const named = [_]struct { []const u8, u21 }{
         .{ "amp", '&' },
         .{ "lt", '<' },
@@ -367,15 +368,18 @@ fn decodeEntity(s: []const u8) struct { len: usize, cp: ?u21 } {
         .{ "quot", '"' },
         .{ "apos", '\'' },
     };
-    for (named) |n| if (std.mem.eql(u8, body, n[0])) return .{ .len = semi + 1, .cp = n[1] };
+    for (named) |entity| {
+        if (std.mem.eql(u8, body, entity[0])) return .{ .len = semi + 1, .cp = entity[1] };
+    }
     if (body.len < 2 or body[0] != '#') return .{ .len = 0, .cp = null };
-    const v = if (body[1] == 'x' or body[1] == 'X')
+    const parsed = if (body[1] == 'x' or body[1] == 'X')
         std.fmt.parseInt(u32, body[2..], 16)
     else
         std.fmt.parseInt(u32, body[1..], 10);
-    const n = v catch return .{ .len = 0, .cp = null };
-    const valid = n != 0 and n <= 0x10FFFF and !(n >= 0xD800 and n <= 0xDFFF);
-    return .{ .len = semi + 1, .cp = if (valid) @intCast(n) else null };
+    const code_point = parsed catch return .{ .len = 0, .cp = null };
+    const surrogate = code_point >= 0xD800 and code_point <= 0xDFFF;
+    const valid = code_point != 0 and code_point <= 0x10FFFF and !surrogate;
+    return .{ .len = semi + 1, .cp = if (valid) @intCast(code_point) else null };
 }
 
 // ---------------------------------------------------------------- tests

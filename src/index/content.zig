@@ -1051,9 +1051,9 @@ fn toMemory(sink: *Sink, header: Header) BuildError!Index {
 
 fn toFile(sink: *Sink, header: Header, path_z: [:0]const u8) FileError!Index {
     try sink.flush();
-    const f = sink.file.?;
-    try f.writeAt(&header.encode(), 0);
-    try f.commit();
+    const file = sink.file.?;
+    try file.writeAt(&header.encode(), 0);
+    try file.commit();
     return Index.open(path_z);
 }
 

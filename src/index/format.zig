@@ -15,8 +15,8 @@ pub fn release(buf: []align(8) u8, mapped: bool, gpa: std.mem.Allocator) void {
 
 /// Smith input for a fuzz test that starts with one `slice()`.
 pub fn corpusEntry(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
-    const e = try gpa.alloc(u8, 4 + bytes.len);
-    std.mem.writeInt(u32, e[0..4], @intCast(bytes.len), .little);
-    @memcpy(e[4..], bytes);
-    return e;
+    const entry = try gpa.alloc(u8, 4 + bytes.len);
+    std.mem.writeInt(u32, entry[0..4], @intCast(bytes.len), .little);
+    @memcpy(entry[4..], bytes);
+    return entry;
 }

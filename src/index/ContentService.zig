@@ -305,32 +305,33 @@ pub fn readText(
     extracted: bool,
     lines: u32,
 ) ?[]const u8 {
-    var pbuf: [4096]u8 = undefined;
-    const doc = std.mem.printSentinel(&pbuf, "{s}", .{path}, 0) catch return null;
-    var tbuf: [4096]u8 = undefined;
-    const p: [:0]const u8 = if (extracted) blk: {
-        const st = content_list.stat(doc, .document) orelse return null;
-        break :blk service.textPath(&tbuf, .{
+    var path_buffer: [4096]u8 = undefined;
+    const doc_path = std.mem.printSentinel(&path_buffer, "{s}", .{path}, 0) catch return null;
+    var text_path_buffer: [4096]u8 = undefined;
+    const text_path: [:0]const u8 = if (extracted) blk: {
+        const doc_stat = content_list.stat(doc_path, .document) orelse return null;
+        break :blk service.textPath(&text_path_buffer, .{
             .path = path,
             .mtime = mtime,
-            .size = st.size,
+            .size = doc_stat.size,
             .source = .extracted,
         }) orelse return null;
-    } else doc;
-    const fd = sys.openRegular(p) catch return null;
+    } else doc_path;
+    const fd = sys.openRegular(text_path) catch return null;
     defer sys.close(fd);
-    const cap: usize = if (extracted) extracted_bytes_max else content.text_bytes_max;
-    var buf: std.ArrayList(u8) = .empty;
-    var seen: u32 = 0;
-    while (buf.items.len < cap and seen < lines) {
-        buf.ensureUnusedCapacity(arena, 16 * 1024) catch return null;
-        const spare = buf.unusedCapacitySlice();
-        const n = std.os.linux.read(fd, spare.ptr, @min(spare.len, cap - buf.items.len));
-        if (std.os.linux.errno(n) != .SUCCESS or n == 0) break;
-        seen += @intCast(std.mem.count(u8, spare[0..n], "\n"));
-        buf.items.len += n;
+    const text_bytes_max: usize = if (extracted) extracted_bytes_max else content.text_bytes_max;
+    var text: std.ArrayList(u8) = .empty;
+    var lines_seen: u32 = 0;
+    while (text.items.len < text_bytes_max and lines_seen < lines) {
+        text.ensureUnusedCapacity(arena, 16 * 1024) catch return null;
+        const spare = text.unusedCapacitySlice();
+        const bytes_wanted = @min(spare.len, text_bytes_max - text.items.len);
+        const bytes_read = std.os.linux.read(fd, spare.ptr, bytes_wanted);
+        if (std.os.linux.errno(bytes_read) != .SUCCESS or bytes_read == 0) break;
+        lines_seen += @intCast(std.mem.count(u8, spare[0..bytes_read], "\n"));
+        text.items.len += bytes_read;
     }
-    return buf.items;
+    return text.items;
 }
 
 /// Text of a document: the file itself, or its cached extraction.
@@ -933,23 +934,23 @@ fn sweepText(service: *ContentService) void {
         }) catch return;
         keep.put(arena, old, name) catch return;
     }
-    var dbuf: [4096]u8 = undefined;
-    const dir = std.mem.printSentinel(&dbuf, "{s}", .{service.text_dir}, 0) catch return;
+    var dir_buffer: [4096]u8 = undefined;
+    const dir = std.mem.printSentinel(&dir_buffer, "{s}", .{service.text_dir}, 0) catch return;
     const fd = sys.openDir(dir) catch return;
     defer sys.close(fd);
-    var it: sys.DirIter = .{ .fd = fd };
-    while (it.next() catch return) |e| {
-        if (e.kind == std.os.linux.DT.DIR) continue;
-        var nbuf: [256]u8 = undefined;
-        const name = std.mem.printSentinel(&nbuf, "{s}", .{e.name}, 0) catch continue;
-        const want = keep.get(e.name) orelse {
+    var iterator: sys.DirIter = .{ .fd = fd };
+    while (iterator.next() catch return) |entry| {
+        if (entry.kind == std.os.linux.DT.DIR) continue;
+        var name_buffer: [256]u8 = undefined;
+        const name = std.mem.printSentinel(&name_buffer, "{s}", .{entry.name}, 0) catch continue;
+        const name_wanted = keep.get(entry.name) orelse {
             _ = std.os.linux.unlinkat(fd, name, 0);
             continue;
         };
-        if (std.mem.eql(u8, want, e.name)) continue;
-        var wbuf: [64]u8 = undefined;
-        const to = std.mem.printSentinel(&wbuf, "{s}", .{want}, 0) catch continue;
-        _ = std.os.linux.renameat(fd, name, fd, to);
+        if (std.mem.eql(u8, name_wanted, entry.name)) continue;
+        var wanted_buffer: [64]u8 = undefined;
+        const target = std.mem.printSentinel(&wanted_buffer, "{s}", .{name_wanted}, 0) catch continue;
+        _ = std.os.linux.renameat(fd, name, fd, target);
     }
 }
 

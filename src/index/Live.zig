@@ -763,49 +763,47 @@ pub fn search(
     out: *std.ArrayList(Hit),
 ) std.mem.Allocator.Error!void {
     const limit = opts.limit;
-    var o = opts;
-    o.no_stat = live.slow_mounts;
+    var engine_options = opts;
+    engine_options.no_stat = live.slow_mounts;
     out.clearRetainingCapacity();
     var hits: std.ArrayList(engine.Hit) = .empty;
     defer hits.deinit(live.gpa);
-    var buf: [4096]u8 = undefined;
-    try live.engine_base.search(live.gpa, pool, &live.base, query, o, &hits);
+    var path_buffer: [4096]u8 = undefined;
+    try live.engine_base.search(live.gpa, pool, &live.base, query, engine_options, &hits);
     // A path that does not fit (deeper than PATH_MAX) cannot be opened:
     // left out, where it used to come out as "" (and dedup as one).
-    for (hits.items) |h| try out.append(arena, .{
-        .path = try arena.dupe(u8, live.base.path(h.id, &buf) orelse continue),
-        .score = h.score,
-        .is_dir = live.base.isDir(h.id),
+    for (hits.items) |hit| try out.append(arena, .{
+        .path = try arena.dupe(u8, live.base.path(hit.id, &path_buffer) orelse continue),
+        .score = hit.score,
+        .is_dir = live.base.isDir(hit.id),
     });
     if (live.delta.store.len() > 0) {
-        try live.delta.engine.search(live.gpa, pool, &live.delta.store, query, o, &hits);
-        for (hits.items) |h| try out.append(arena, .{
-            .path = try arena.dupe(u8, live.delta.store.path(h.id, &buf) orelse continue),
-            .score = h.score,
-            .is_dir = live.delta.store.isDir(h.id),
+        try live.delta.engine.search(live.gpa, pool, &live.delta.store, query, engine_options, &hits);
+        for (hits.items) |hit| try out.append(arena, .{
+            .path = try arena.dupe(u8, live.delta.store.path(hit.id, &path_buffer) orelse continue),
+            .score = hit.score,
+            .is_dir = live.delta.store.isDir(hit.id),
         });
     }
-    std.mem.sort(Hit, out.items, {}, struct {
-        fn lt(_: void, a: Hit, b: Hit) bool {
-            return a.score > b.score or (a.score == b.score and std.mem.order(
-                u8,
-                a.path,
-                b.path,
-            ) == .lt);
-        }
-    }.lt);
+    std.mem.sort(Hit, out.items, {}, hitBefore);
     // Something can be in both (created during a rescan): keep the best.
     // By set, not by neighbour: the two copies need not score the same, and
     // another hit between them left both in.
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     defer seen.deinit(live.gpa);
-    var w: usize = 0;
-    for (out.items) |h| {
-        if ((try seen.getOrPut(live.gpa, h.path)).found_existing) continue;
-        out.items[w] = h;
-        w += 1;
+    var kept_count: usize = 0;
+    for (out.items) |hit| {
+        if ((try seen.getOrPut(live.gpa, hit.path)).found_existing) continue;
+        out.items[kept_count] = hit;
+        kept_count += 1;
     }
-    out.shrinkRetainingCapacity(@min(w, limit));
+    out.shrinkRetainingCapacity(@min(kept_count, limit));
+}
+
+/// Best score first; equal scores by path, so the order is stable.
+fn hitBefore(_: void, a: Hit, b: Hit) bool {
+    if (a.score != b.score) return a.score > b.score;
+    return std.mem.order(u8, a.path, b.path) == .lt;
 }
 
 pub const Replaced = struct { base: Store, watcher: *Watcher };
@@ -881,33 +879,33 @@ pub fn prepareCompaction(
     cfg: *const scan.Config,
     cache_path: ?[:0]const u8,
 ) (std.mem.Allocator.Error || Watcher.CreateError)!Replaced {
-    const w = try Watcher.create(gpa);
-    errdefer w.destroy(gpa);
-    var base = try scan.scan(gpa, pool, cfg, w, null);
+    const watcher = try Watcher.create(gpa);
+    errdefer watcher.destroy(gpa);
+    var base = try scan.scan(gpa, pool, cfg, watcher, null);
     errdefer base.deinit(gpa);
-    if (cache_path) |p| {
-        if (std.mem.findScalarLast(u8, p, '/')) |slash| sys.mkdirP(p[0..slash]);
-        base.save(p) catch |err| {
+    if (cache_path) |path| {
+        if (std.mem.findScalarLast(u8, path, '/')) |slash| sys.mkdirP(path[0..slash]);
+        base.save(path) catch |err| {
             // Served from memory; the next rescan saves again.
             log.warn("saving the file index: {t}", .{err});
-            return .{ .base = base, .watcher = w };
+            return .{ .base = base, .watcher = watcher };
         };
         // Swap the heap copy for a mapping of what was just written: same
         // bytes, but clean page cache the kernel can reclaim instead of
         // ~80 MB of anonymous memory.
-        if (Store.open(p)) |mapped| {
+        if (Store.open(path)) |mapped| {
             base.deinit(gpa);
             base = mapped;
         } else |_| {}
     }
-    return .{ .base = base, .watcher = w };
+    return .{ .base = base, .watcher = watcher };
 }
 
 fn pathZ(store: *const Store, id: u32, buf: *[4096]u8) ?[*:0]const u8 {
-    const p = store.path(id, buf[0 .. buf.len - 1]) orelse return null;
-    if (p.len == 0) return null;
-    buf[p.len] = 0;
-    return buf[0..p.len :0];
+    const path = store.path(id, buf[0 .. buf.len - 1]) orelse return null;
+    if (path.len == 0) return null;
+    buf[path.len] = 0;
+    return buf[0..path.len :0];
 }
 
 // ---------------------------------------------------------------- tests
