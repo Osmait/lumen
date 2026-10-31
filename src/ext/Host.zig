@@ -138,7 +138,7 @@ pub const Registry = registry_mod.Registry;
 
 /// A command's rows. Owned by the receiver: `destroy`.
 pub const ListResult = struct {
-    gen: RequestGeneration,
+    generation: RequestGeneration,
     command: CommandIndex,
     query: []const u8,
     items: []Item = &.{},
@@ -156,7 +156,7 @@ pub const Outcome = enum { close, stay, refresh };
 
 /// What a Lua action asked for. Owned by the receiver: `destroy`.
 pub const ActResult = struct {
-    gen: RequestGeneration,
+    generation: RequestGeneration,
     outcome: Outcome = .close,
     err: ?[:0]const u8 = null,
     arena: std.heap.ArenaAllocator,
@@ -170,7 +170,7 @@ pub const ActResult = struct {
 /// Rows extensions give for a root search, a section per command.
 /// Owned by the receiver: `destroy`.
 pub const RootResult = struct {
-    gen: RequestGeneration,
+    generation: RequestGeneration,
     query: []const u8,
     sections: []const RootSection = &.{},
     arena: std.heap.ArenaAllocator,
@@ -383,7 +383,7 @@ const ActRequest = struct {
         /// The row came from the root search, not from the command's list.
         from_root_search: bool,
         /// The list the row came from.
-        list_gen: RequestGeneration,
+        list_generation: RequestGeneration,
         row_index: u32,
         action_index: u8,
     };
@@ -617,7 +617,7 @@ pub fn act(
     return request_generation;
 }
 
-/// The window keeps 0 for "no request pending" (`ext_act_gen`), so 0 is
+/// The window keeps 0 for "no request pending" (`ext_act_generation`), so 0 is
 /// never handed out, even after the counter wraps.
 fn requestGenerationNext(host: *Host) RequestGeneration {
     host.request_generation_last = host.request_generation_last.next();
@@ -686,7 +686,7 @@ fn reloadExecute(host: *Host) void {
     host.closeAll();
     host.registry_generation = host.registry_generation.next();
     const registry = host.answerCreate(Registry, "reload", .{
-        .gen = host.registry_generation,
+        .generation = host.registry_generation,
         .arena = .init(host.gpa),
     }) orelse return;
     var load: Load = .{ .arena = registry.arena.allocator() };
@@ -1339,7 +1339,7 @@ fn extensionOf(host: *const Host, worker_command: *const WorkerCommand) *Extensi
 
 fn listExecute(host: *Host, request: *const ListRequest) void {
     const result = host.answerCreate(ListResult, "list", .{
-        .gen = request.request_generation,
+        .generation = request.request_generation,
         .command = request.command,
         .query = "",
         .arena = .init(host.gpa),
@@ -1423,7 +1423,7 @@ fn keep(L: *lua.State, kept: *Kept, rows: c_int, list_generation: RequestGenerat
 
 fn rootSearchExecute(host: *Host, request: *const RootSearchRequest) void {
     const result = host.answerCreate(RootResult, "root", .{
-        .gen = request.request_generation,
+        .generation = request.request_generation,
         .query = "",
         .arena = .init(host.gpa),
     }) orelse return;
@@ -1522,7 +1522,7 @@ const RootSearchContext = struct {
 fn submitExecute(host: *Host, request: *SubmitRequest) void {
     defer request.destroy(host.gpa);
     const result = host.answerCreate(ActResult, "submit", .{
-        .gen = request.request_generation,
+        .generation = request.request_generation,
         .arena = .init(host.gpa),
     }) orelse return;
     defer host.deliver(.{ .act = result });
@@ -1594,7 +1594,7 @@ fn outcomeOf(L: *lua.State) Outcome {
 
 fn actExecute(host: *Host, request: ActRequest) void {
     const result = host.answerCreate(ActResult, "action", .{
-        .gen = request.request_generation,
+        .generation = request.request_generation,
         .arena = .init(host.gpa),
     }) orelse return;
     defer host.deliver(.{ .act = result });
@@ -1651,7 +1651,7 @@ fn pushRowAction(
         &worker_command.root_search_kept
     else
         &worker_command.list_kept;
-    if (kept.reference == c_noref or kept.list_generation != row_action.list_gen) {
+    if (kept.reference == c_noref or kept.list_generation != row_action.list_generation) {
         lua.raise(L, "the list changed meanwhile; try again", .{});
     }
     _ = lua.pushRef(L, kept.reference);
@@ -1683,7 +1683,7 @@ fn pushRowAction(
 /// request then gets no answer, as if a newer one had replaced it, and the
 /// log says which kind was dropped.
 fn answerCreate(host: *Host, comptime T: type, what: []const u8, answer: T) ?*T {
-    comptime assert(@hasField(T, "gen"));
+    comptime assert(@hasField(T, "generation"));
     comptime assert(@hasField(T, "arena"));
     const created = host.gpa.create(T) catch {
         log.warn("{s}: out of memory, no answer", .{what});
@@ -1988,10 +1988,10 @@ test "extensions load, list, search and run actions" {
     try testing.expect(std.mem.find(u8, registry.problems[0].message, "title is missing") != null);
 
     // A list command's rows.
-    const fruits_generation = host.list(registry.gen, .from(1), "");
+    const fruits_generation = host.list(registry.generation, .from(1), "");
     const fruits = try probe.take("list");
     defer fruits.destroy(testing.allocator);
-    try testing.expectEqual(fruits_generation, fruits.gen);
+    try testing.expectEqual(fruits_generation, fruits.generation);
     try testing.expect(fruits.err == null);
     try testing.expectEqual(@as(usize, 2), fruits.items.len);
     try testing.expectEqualStrings("Apple", fruits.items[0].title);
@@ -2009,78 +2009,78 @@ test "extensions load, list, search and run actions" {
 
     // Its Lua action runs against that list, and changes state other
     // commands of the extension see.
-    const action_generation = host.act(registry.gen, .from(1), .{ .row_action = .{
+    const action_generation = host.act(registry.generation, .from(1), .{ .row_action = .{
         .from_root_search = false,
-        .list_gen = fruits.gen,
+        .list_generation = fruits.generation,
         .row_index = 1,
         .action_index = 1,
     } });
     const done = try probe.take("act");
     defer done.destroy(testing.allocator);
-    try testing.expectEqual(action_generation, done.gen);
+    try testing.expectEqual(action_generation, done.generation);
     try testing.expect(done.err == null);
     try testing.expectEqual(Outcome.close, done.outcome);
     // The action took its row's actions away: pressing it again is an
     // error, not a read of whatever `row.actions` is now.
-    _ = host.act(registry.gen, .from(1), .{ .row_action = .{
+    _ = host.act(registry.generation, .from(1), .{ .row_action = .{
         .from_root_search = false,
-        .list_gen = fruits.gen,
+        .list_generation = fruits.generation,
         .row_index = 1,
         .action_index = 1,
     } });
     const again = try probe.take("act");
     defer again.destroy(testing.allocator);
     try testing.expect(std.mem.find(u8, again.err.?, "no actions") != null);
-    _ = host.list(registry.gen, .from(3), "");
+    _ = host.list(registry.generation, .from(3), "");
     const eaten = try probe.take("list");
     defer eaten.destroy(testing.allocator);
     try testing.expectEqualStrings("Banana", eaten.items[0].title);
 
     // A search command gets the query, and lumen.exec runs programs.
-    _ = host.list(registry.gen, .from(2), "it's \"quoted\"");
+    _ = host.list(registry.generation, .from(2), "it's \"quoted\"");
     const echo = try probe.take("list");
     defer echo.destroy(testing.allocator);
     try testing.expect(echo.err == null);
     try testing.expectEqualStrings("you typed it's \"quoted\"", echo.items[0].title);
 
     // A run command's return value.
-    _ = host.act(registry.gen, .from(0), .command_run);
+    _ = host.act(registry.generation, .from(0), .command_run);
     const hello = try probe.take("act");
     defer hello.destroy(testing.allocator);
     try testing.expectEqual(Outcome.stay, hello.outcome);
 
     // Root search: rows from providers, their Lua actions run there.
-    const root_generation = host.root(registry.gen, "21");
+    const root_generation = host.root(registry.generation, "21");
     const root_answer = try probe.take("root");
     defer root_answer.destroy(testing.allocator);
-    try testing.expectEqual(root_generation, root_answer.gen);
+    try testing.expectEqual(root_generation, root_answer.generation);
     try testing.expectEqual(@as(usize, 1), root_answer.sections.len);
     try testing.expectEqual(CommandIndex.from(4), root_answer.sections[0].command);
     const doubled = root_answer.sections[0].items[0];
     try testing.expectEqualStrings("42", doubled.title);
     try testing.expect(doubled.action.ext_item.from_root_search);
-    _ = host.act(registry.gen, .from(4), .{ .row_action = .{
+    _ = host.act(registry.generation, .from(4), .{ .row_action = .{
         .from_root_search = true,
-        .list_gen = doubled.action.ext_item.list_generation,
+        .list_generation = doubled.action.ext_item.list_generation,
         .row_index = 0,
         .action_index = 0,
     } });
     (try probe.take("act")).destroy(testing.allocator);
-    _ = host.list(registry.gen, .from(3), "");
+    _ = host.list(registry.generation, .from(3), "");
     const noted = try probe.take("list");
     defer noted.destroy(testing.allocator);
     try testing.expectEqualStrings("42", noted.items[0].title);
-    _ = host.root(registry.gen, "not a number");
+    _ = host.root(registry.generation, "not a number");
     const none = try probe.take("root");
     defer none.destroy(testing.allocator);
     try testing.expectEqual(@as(usize, 0), none.sections.len);
 
     // An action against a list that has been replaced is refused.
-    _ = host.list(registry.gen, .from(1), "");
+    _ = host.list(registry.generation, .from(1), "");
     (try probe.take("list")).destroy(testing.allocator);
-    _ = host.act(registry.gen, .from(1), .{ .row_action = .{
+    _ = host.act(registry.generation, .from(1), .{ .row_action = .{
         .from_root_search = false,
-        .list_gen = fruits.gen,
+        .list_generation = fruits.generation,
         .row_index = 1,
         .action_index = 1,
     } });
@@ -2091,7 +2091,7 @@ test "extensions load, list, search and run actions" {
     // After a reload, requests against the old registry are refused.
     host.reload();
     try probe.wait("registry");
-    _ = host.list(registry.gen, .from(1), "");
+    _ = host.list(registry.generation, .from(1), "");
     const old = try probe.take("list");
     defer old.destroy(testing.allocator);
     try testing.expectEqualStrings("Extensions were reloaded", old.err.?);
@@ -2143,17 +2143,17 @@ test "errors in extensions come back as messages" {
         }
     }
 
-    _ = host.list(registry.gen, .from(0), "");
+    _ = host.list(registry.generation, .from(0), "");
     const boom = try probe.take("list");
     defer boom.destroy(testing.allocator);
     try testing.expect(std.mem.find(u8, boom.err.?, "kaboom") != null);
 
-    _ = host.list(registry.gen, .from(2), "");
+    _ = host.list(registry.generation, .from(2), "");
     const bad_row = try probe.take("list");
     defer bad_row.destroy(testing.allocator);
     try testing.expect(std.mem.find(u8, bad_row.err.?, "items[1].title is missing") != null);
 
-    _ = host.act(registry.gen, .from(3), .command_run);
+    _ = host.act(registry.generation, .from(3), .command_run);
     const bad_return = try probe.take("act");
     defer bad_return.destroy(testing.allocator);
     try testing.expect(std.mem.find(u8, bad_return.err.?, "must return") != null);
@@ -2204,16 +2204,16 @@ test "preferences read Settings' file over their defaults; storage persists" {
         "data/extensions/kv/preferences.json",
     ));
 
-    _ = host.list(registry.gen, .from(0), "");
+    _ = host.list(registry.generation, .from(0), "");
     const before = try probe.take("list");
     defer before.destroy(testing.allocator);
     const want = [_][]const u8{ "nobody", "true", "s", "nil", "false" };
     try testing.expect(before.err == null);
     for (want, before.items) |wanted, row| try testing.expectEqualStrings(wanted, row.title);
 
-    _ = host.act(registry.gen, .from(1), .command_run);
+    _ = host.act(registry.generation, .from(1), .command_run);
     (try probe.take("act")).destroy(testing.allocator);
-    _ = host.act(registry.gen, .from(1), .command_run);
+    _ = host.act(registry.generation, .from(1), .command_run);
     (try probe.take("act")).destroy(testing.allocator);
     // Storage outlives a reload (a new Lua state reads the file).
     probe.registry = null;
@@ -2221,7 +2221,7 @@ test "preferences read Settings' file over their defaults; storage persists" {
     host.reload();
     try probe.wait("registry");
     const registry_reloaded = probe.registry.?;
-    _ = host.list(registry_reloaded.gen, .from(0), "");
+    _ = host.list(registry_reloaded.generation, .from(0), "");
     const after = try probe.take("list");
     defer after.destroy(testing.allocator);
     try testing.expectEqualStrings("2", after.items[3].title);
@@ -2261,7 +2261,7 @@ test "storage never writes over what it cannot read, and reads back what it wrot
         try testing.expect(std.mem.find(u8, registry_problem.message, "are taken") != null);
     }
 
-    _ = host.list(registry.gen, .from(0), "");
+    _ = host.list(registry.generation, .from(0), "");
     const broken = try probe.take("list");
     defer broken.destroy(testing.allocator);
     try testing.expect(broken.err == null);
@@ -2270,7 +2270,7 @@ test "storage never writes over what it cannot read, and reads back what it wrot
         try testing.expectEqualStrings(wanted, row.title);
     }
 
-    _ = host.list(registry.gen, .from(1), "");
+    _ = host.list(registry.generation, .from(1), "");
     const bytes = try probe.take("list");
     defer bytes.destroy(testing.allocator);
     try testing.expect(bytes.err == null);
@@ -2320,12 +2320,12 @@ test "rows are kept to a size, and lumen.exec's strings outlive its options" {
     const registry = probe.registry.?;
 
     // One string 1000 rows copy: 5 GB outside the state's memory cap.
-    _ = host.list(registry.gen, .from(0), "");
+    _ = host.list(registry.generation, .from(0), "");
     const big = try probe.take("list");
     defer big.destroy(testing.allocator);
     try testing.expectEqualStrings(rows_too_big, big.err.?);
 
-    _ = host.list(registry.gen, .from(1), "");
+    _ = host.list(registry.generation, .from(1), "");
     const long = try probe.take("list");
     defer long.destroy(testing.allocator);
     try testing.expect(long.err == null);
@@ -2335,7 +2335,7 @@ test "rows are kept to a size, and lumen.exec's strings outlive its options" {
     try testing.expectEqual(@as(usize, rows_mod.detail_bytes_max), row.detail.len);
     try testing.expectEqual(@as(usize, rows_mod.line_bytes_max), row.meta[0].value.len);
 
-    _ = host.list(registry.gen, .from(2), "");
+    _ = host.list(registry.generation, .from(2), "");
     const ran = try probe.take("list");
     defer ran.destroy(testing.allocator);
     try testing.expect(ran.err == null);

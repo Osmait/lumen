@@ -12,11 +12,11 @@ const std = @import("std");
 const assert = std.debug.assert;
 const core = @import("core");
 
-/// `Result` must have a `gen` field: the generation it answers, an integer
+/// `Result` must have a `generation` field: the generation it answers, an integer
 /// or an enum (the extension host's are enums; content search's is the
 /// worker's futex word, a u32).
 pub fn Inflight(comptime Result: type, comptime asked_bytes_max: usize) type {
-    const Generation = @FieldType(Result, "gen");
+    const Generation = @FieldType(Result, "generation");
     return struct {
         /// Generation of the last request sent; answers of others are stale.
         generation: Generation = std.mem.zeroes(Generation),
@@ -47,7 +47,7 @@ pub fn Inflight(comptime Result: type, comptime asked_bytes_max: usize) type {
 
         /// Whether `answer` answers the last request sent.
         pub fn current(self: *const Self, answer: *const Result) bool {
-            return answer.gen == self.generation;
+            return answer.generation == self.generation;
         }
 
         /// Takes `answer` (current) as the latest and returns the one it
@@ -85,10 +85,10 @@ pub fn Inflight(comptime Result: type, comptime asked_bytes_max: usize) type {
 }
 
 test "inflight: stale answers are not current, taking hands back the old one" {
-    const Answer = struct { gen: u32 };
+    const Answer = struct { generation: u32 };
     var inflight: Inflight(Answer, 16) = .{};
-    var first: Answer = .{ .gen = 1 };
-    var second: Answer = .{ .gen = 2 };
+    var first: Answer = .{ .generation = 1 };
+    var second: Answer = .{ .generation = 2 };
 
     inflight.sent(1, "ab");
     try std.testing.expect(inflight.asking("ab"));
@@ -102,7 +102,7 @@ test "inflight: stale answers are not current, taking hands back the old one" {
     inflight.shown = inflight.latest;
     try std.testing.expect(inflight.showingLatest());
     inflight.sent(3, "abcd");
-    var third: Answer = .{ .gen = 3 };
+    var third: Answer = .{ .generation = 3 };
     try std.testing.expectEqual(&second, inflight.take(&third).?);
     try std.testing.expect(!inflight.showingLatest());
     try std.testing.expectEqual(&third, inflight.forget().?);

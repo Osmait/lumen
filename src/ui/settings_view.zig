@@ -712,8 +712,8 @@ fn themeItem(
 pub fn swatchOf(theme: *const themes.Theme) item_mod.Icon {
     return .{ .swatch = .{
         .id = theme.id,
-        .bg = theme.bg,
-        .fg = theme.fg,
+        .background = theme.background,
+        .foreground = theme.foreground,
         .accent = theme.accent,
     } };
 }

@@ -15,10 +15,10 @@ pub const Theme = struct {
     name: [:0]const u8,
     dark: bool,
     /// Window background.
-    bg: u24,
+    background: u24,
     /// Raised surfaces: the action panel.
     surface: u24,
-    fg: u24,
+    foreground: u24,
     ink: u24,
     /// Caret, selection, search highlights, warnings.
     accent: u24,
@@ -34,9 +34,9 @@ pub const all = [_]Theme{
         .id = "lumen-dark",
         .name = "Lumen Dark",
         .dark = true,
-        .bg = 0x1b1b1e,
+        .background = 0x1b1b1e,
         .surface = 0x28282c,
-        .fg = 0xececee,
+        .foreground = 0xececee,
         .ink = 0xffffff,
         .accent = 0xff6363,
     },
@@ -44,9 +44,9 @@ pub const all = [_]Theme{
         .id = "lumen-light",
         .name = "Lumen Light",
         .dark = false,
-        .bg = 0xf5f7fb,
+        .background = 0xf5f7fb,
         .surface = 0xffffff,
-        .fg = 0x10131a,
+        .foreground = 0x10131a,
         .ink = 0x000000,
         .accent = 0x3a5bd9,
     },
@@ -54,9 +54,9 @@ pub const all = [_]Theme{
         .id = "catppuccin-mocha",
         .name = "Catppuccin Mocha",
         .dark = true,
-        .bg = 0x1e1e2e,
+        .background = 0x1e1e2e,
         .surface = 0x313244,
-        .fg = 0xcdd6f4,
+        .foreground = 0xcdd6f4,
         .ink = 0xcdd6f4,
         .accent = 0xcba6f7,
     },
@@ -64,9 +64,9 @@ pub const all = [_]Theme{
         .id = "catppuccin-latte",
         .name = "Catppuccin Latte",
         .dark = false,
-        .bg = 0xeff1f5,
+        .background = 0xeff1f5,
         .surface = 0xe6e9ef,
-        .fg = 0x4c4f69,
+        .foreground = 0x4c4f69,
         .ink = 0x11111b,
         .accent = 0x8839ef,
     },
@@ -74,9 +74,9 @@ pub const all = [_]Theme{
         .id = "dracula",
         .name = "Dracula",
         .dark = true,
-        .bg = 0x282a36,
+        .background = 0x282a36,
         .surface = 0x343746,
-        .fg = 0xf8f8f2,
+        .foreground = 0xf8f8f2,
         .ink = 0xf8f8f2,
         .accent = 0xbd93f9,
     },
@@ -84,9 +84,9 @@ pub const all = [_]Theme{
         .id = "nord",
         .name = "Nord",
         .dark = true,
-        .bg = 0x2e3440,
+        .background = 0x2e3440,
         .surface = 0x3b4252,
-        .fg = 0xeceff4,
+        .foreground = 0xeceff4,
         .ink = 0xd8dee9,
         .accent = 0x88c0d0,
     },
@@ -94,9 +94,9 @@ pub const all = [_]Theme{
         .id = "gruvbox-dark",
         .name = "Gruvbox Dark",
         .dark = true,
-        .bg = 0x282828,
+        .background = 0x282828,
         .surface = 0x3c3836,
-        .fg = 0xebdbb2,
+        .foreground = 0xebdbb2,
         .ink = 0xebdbb2,
         .accent = 0xfe8019,
     },
@@ -104,9 +104,9 @@ pub const all = [_]Theme{
         .id = "gruvbox-light",
         .name = "Gruvbox Light",
         .dark = false,
-        .bg = 0xfbf1c7,
+        .background = 0xfbf1c7,
         .surface = 0xf2e5bc,
-        .fg = 0x3c3836,
+        .foreground = 0x3c3836,
         .ink = 0x1d2021,
         .accent = 0xaf3a03,
     },
@@ -114,9 +114,9 @@ pub const all = [_]Theme{
         .id = "tokyo-night",
         .name = "Tokyo Night",
         .dark = true,
-        .bg = 0x1a1b26,
+        .background = 0x1a1b26,
         .surface = 0x24283b,
-        .fg = 0xc0caf5,
+        .foreground = 0xc0caf5,
         .ink = 0xc0caf5,
         .accent = 0x7aa2f7,
     },
@@ -124,9 +124,9 @@ pub const all = [_]Theme{
         .id = "rose-pine",
         .name = "Rosé Pine",
         .dark = true,
-        .bg = 0x191724,
+        .background = 0x191724,
         .surface = 0x1f1d2e,
-        .fg = 0xe0def4,
+        .foreground = 0xe0def4,
         .ink = 0xe0def4,
         .accent = 0xebbcba,
     },
@@ -134,9 +134,9 @@ pub const all = [_]Theme{
         .id = "one-dark",
         .name = "One Dark",
         .dark = true,
-        .bg = 0x282c34,
+        .background = 0x282c34,
         .surface = 0x2f343f,
-        .fg = 0xabb2bf,
+        .foreground = 0xabb2bf,
         .ink = 0xdcdfe4,
         .accent = 0x61afef,
     },
@@ -144,9 +144,9 @@ pub const all = [_]Theme{
         .id = "solarized-dark",
         .name = "Solarized Dark",
         .dark = true,
-        .bg = 0x002b36,
+        .background = 0x002b36,
         .surface = 0x073642,
-        .fg = 0x93a1a1,
+        .foreground = 0x93a1a1,
         .ink = 0xfdf6e3,
         .accent = 0x268bd2,
     },
@@ -154,9 +154,9 @@ pub const all = [_]Theme{
         .id = "solarized-light",
         .name = "Solarized Light",
         .dark = false,
-        .bg = 0xfdf6e3,
+        .background = 0xfdf6e3,
         .surface = 0xeee8d5,
-        .fg = 0x586e75,
+        .foreground = 0x586e75,
         .ink = 0x002b36,
         .accent = 0x268bd2,
     },
@@ -198,9 +198,9 @@ pub fn css(
     const scale = textScale(settings_now.text_size);
     const opacity = @as(f32, @floatFromInt(settings_now.opacity)) / 100;
     try writer.writeAll(":root {\n");
-    try rgba(writer, "bg", theme.bg, opacity);
+    try rgba(writer, "bg", theme.background, opacity);
     try rgba(writer, "surface", theme.surface, @min(1, opacity + surface_opacity_extra));
-    try rgba(writer, "fg", theme.fg, 1);
+    try rgba(writer, "fg", theme.foreground, 1);
     try rgba(writer, "ink", theme.ink, 1);
     try rgba(writer, "accent", theme.accent, 1);
     try rgba(writer, "accent-soft", theme.accent, accent_soft_opacity);
@@ -322,14 +322,15 @@ fn srgbToLinear(channel: f64) f64 {
 test "every theme is readable" {
     for (all) |theme| {
         // Body text: WCAG AA for normal text.
-        try std.testing.expect(contrast(theme.fg, theme.bg) >= 4.5);
+        try std.testing.expect(contrast(theme.foreground, theme.background) >= 4.5);
         // The selected row is an accent fill with text on it.
         try std.testing.expect(contrast(onAccent(&theme), theme.accent) >= 4.5);
         // The caret and highlights must stand out from the background.
-        try std.testing.expect(contrast(theme.accent, theme.bg) >= 2.5);
+        try std.testing.expect(contrast(theme.accent, theme.background) >= 2.5);
         // Secondary text is ink at 42%: it must still be legible.
-        try std.testing.expect(contrast(mix(theme.ink, theme.bg, 0.42), theme.bg) >= 2.4);
-        try std.testing.expect(theme.dark == (luminance(theme.bg) < 0.2));
+        const secondary = mix(theme.ink, theme.background, 0.42);
+        try std.testing.expect(contrast(secondary, theme.background) >= 2.4);
+        try std.testing.expect(theme.dark == (luminance(theme.background) < 0.2));
     }
 }
 

@@ -128,7 +128,7 @@ pub const Problem = struct {
 
 /// Everything the files define. Owned by the receiver: `destroy`.
 pub const Registry = struct {
-    gen: RegistryGeneration,
+    generation: RegistryGeneration,
     commands: []const Command = &.{},
     themes: []const themes.Theme = &.{},
     keymaps: []const Keymap = &.{},

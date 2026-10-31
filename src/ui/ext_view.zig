@@ -208,7 +208,7 @@ pub fn addRootSections(ui: *Ui, query: []const u8) void {
         return;
     };
     if (ui.ext_root_search.asking(query)) return;
-    ui.ext_root_search.sent(host.root(registry.gen, query), query);
+    ui.ext_root_search.sent(host.root(registry.generation, query), query);
 }
 
 fn listCallback(answer: *Host.ListResult, context: ?*anyopaque) void {
@@ -237,7 +237,7 @@ fn listCallback(answer: *Host.ListResult, context: ?*anyopaque) void {
 fn actCallback(answer: *Host.ActResult, context: ?*anyopaque) void {
     const ui: *Ui = @ptrCast(@alignCast(context.?));
     defer answer.destroy(ui.gpa);
-    if (answer.gen != ui.ext_act_generation) return;
+    if (answer.generation != ui.ext_act_generation) return;
     ui.ext_act_generation = .none;
     if (answer.err) |message| {
         log.warn("action: {s}", .{message});
@@ -439,7 +439,7 @@ pub fn prepare(ui: *Ui, query: []const u8) bool {
 fn ask(ui: *Ui, query: []const u8) void {
     const host = ui.ext_host orelse return;
     const registry = ui.ext_registry orelse return;
-    ui.ext_list.sent(host.list(registry.gen, ui.ext_command, query), query);
+    ui.ext_list.sent(host.list(registry.generation, ui.ext_command, query), query);
 }
 
 /// The ext view's empty row: the command's error, Loading, or a hint.
@@ -481,7 +481,7 @@ pub fn activate(ui: *Ui, command_index: Host.CommandIndex) void {
     switch (activated.mode) {
         .run => {
             const host = ui.ext_host orelse return;
-            ui.ext_act_generation = host.act(registry.gen, command_index, .command_run);
+            ui.ext_act_generation = host.act(registry.generation, command_index, .command_run);
             ui.showRunning();
         },
         .form => form_view.open(ui, command_index),
@@ -505,9 +505,9 @@ pub fn perform(ui: *Ui, action_index: u8) void {
         .lua => {
             const host = ui.ext_host orelse return;
             const registry = ui.ext_registry orelse return;
-            ui.ext_act_generation = host.act(registry.gen, row.command, .{ .row_action = .{
+            ui.ext_act_generation = host.act(registry.generation, row.command, .{ .row_action = .{
                 .from_root_search = row.from_root_search,
-                .list_gen = row.list_generation,
+                .list_generation = row.list_generation,
                 .row_index = row.row_index,
                 .action_index = action_index,
             } });
@@ -687,13 +687,13 @@ test "indexes into the registry follow their ids across a reload" {
         testPref("b", "key", .text),
     };
     const old: Host.Registry = .{
-        .gen = @fromBackingInt(@as(u32, 1)),
+        .generation = @fromBackingInt(@as(u32, 1)),
         .commands = &old_commands,
         .prefs = &old_prefs,
         .arena = undefined,
     };
     const new: Host.Registry = .{
-        .gen = @fromBackingInt(@as(u32, 2)),
+        .generation = @fromBackingInt(@as(u32, 2)),
         .commands = &new_commands,
         .prefs = &new_prefs,
         .arena = undefined,

@@ -1058,7 +1058,7 @@ pub fn applyAppearance(self: *Ui, preview: ?*const themes.Theme) void {
     self.appendUserCss(&out.writer) catch return;
     out.writer.writeByte(0) catch return;
     const text = out.written();
-    _ = themes.hex(&self.appearance.highlight_foreground, theme.fg);
+    _ = themes.hex(&self.appearance.highlight_foreground, theme.foreground);
     _ = themes.hex(&self.appearance.highlight_background, theme.accent);
     const hash = std.hash.Wyhash.hash(0, text);
     if (hash == self.appearance.css_hash) return;

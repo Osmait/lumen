@@ -47,7 +47,7 @@ pub const Result = struct {
     /// The request it answers. A plain u32, unlike the extension host's
     /// generations: it is the worker's futex word as well (`submit` bumps
     /// it and wakes the worker on it).
-    gen: u32,
+    generation: u32,
     /// When the keystroke that asked for it happened (latency stats).
     start_ns: u64,
     search_ns: u64,
@@ -147,7 +147,7 @@ fn run(content_search: *ContentSearch) void {
             continue;
         };
         result.* = .{
-            .gen = 0,
+            .generation = 0,
             .start_ns = 0,
             .search_ns = 0,
             .query = "",
@@ -161,7 +161,7 @@ fn run(content_search: *ContentSearch) void {
             seen = content_search.generation.load(.acquire);
             // Unless shutting down, which may have set it just before.
             content_search.newer.store(content_search.stop.load(.acquire), .release);
-            result.gen = seen;
+            result.generation = seen;
             result.start_ns = content_search.query_start_ns;
             result.query = arena.dupe(u8, content_search.query.slice()) catch |err| blk: {
                 result.err = err;

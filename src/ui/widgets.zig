@@ -425,7 +425,11 @@ pub fn iconWidget(look: *const RowLook, icon: item_mod.Icon, size_px: c_int) *c.
             return gtk.widget(image);
         },
         .swatch => |colors| {
-            const texture = swatchTexture(colors.bg, colors.fg, colors.accent) orelse {
+            const texture = swatchTexture(
+                colors.background,
+                colors.foreground,
+                colors.accent,
+            ) orelse {
                 return iconWidget(look, .none, size_px);
             };
             const image = gtk.imageFromPaintable(texture);

@@ -154,6 +154,6 @@ pub fn submit(ui: *Ui) void {
         };
     }
     const form_values = values[0..form.fields.len];
-    ui.ext_act_generation = host.submit(registry.gen, ui.form_command, form_values);
+    ui.ext_act_generation = host.submit(registry.generation, ui.form_command, form_values);
     ui.showRunning();
 }

@@ -25,7 +25,7 @@ pub const Icon = union(enum) {
     /// A language's official logo (`ui/logos.zig`).
     logo: core.file_badge.Logo,
     /// A theme's colours, as a small preview tile.
-    swatch: struct { id: []const u8, bg: u24, fg: u24, accent: u24 },
+    swatch: struct { id: []const u8, background: u24, foreground: u24, accent: u24 },
 
     /// An icon given by name: a path is a file, "*-symbolic" goes on a grey
     /// tile, anything else shows in full colour. `name` must outlive the
