@@ -29,6 +29,9 @@ pub fn clip(query: []const u8) []const u8 {
 
 /// Owned by the receiver of `Callback`, which frees it with `destroy`.
 pub const Result = struct {
+    /// The request it answers. A plain u32, unlike the extension host's
+    /// generations: it is the worker's futex word as well (`submit` bumps
+    /// it and wakes the worker on it).
     gen: u32,
     /// When the keystroke that asked for it happened (latency stats).
     start_ns: u64,

@@ -284,7 +284,7 @@ ext_list: Inflight(ExtHost.ListResult, ext_query_bytes_max) = .{},
 /// Extension rows asked for the root search, and their answers.
 ext_root_search: Inflight(ExtHost.RootResult, ext_query_bytes_max) = .{},
 /// The Lua action running (0: none); its answer decides what happens.
-ext_act_gen: u32 = 0,
+ext_act_gen: ExtHost.RequestGeneration = .none,
 /// The extension whose preferences the prefs view lists.
 prefs_ext: core.FixedStr(extension_id_bytes_max) = .{},
 /// What the input view edits: a preference (index in the registry) or a

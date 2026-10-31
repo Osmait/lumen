@@ -137,7 +137,7 @@ pub const ExtItem = struct {
     command: u16,
     from_root_search: bool = false,
     /// The list result it came from: its Lua actions run against that one.
-    list_generation: u32,
+    list_generation: @import("ext/generation.zig").RequestGeneration,
     /// Position in the list the extension returned.
     row_index: u32,
     actions: []const ExtAction,

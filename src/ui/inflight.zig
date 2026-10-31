@@ -12,12 +12,14 @@ const std = @import("std");
 const assert = std.debug.assert;
 const core = @import("core");
 
-/// `Result` must have a `gen: u32` field: the generation it answers.
+/// `Result` must have a `gen` field: the generation it answers, an integer
+/// or an enum (the extension host's are enums; content search's is the
+/// worker's futex word, a u32).
 pub fn Inflight(comptime Result: type, comptime asked_bytes_max: usize) type {
-    comptime assert(@FieldType(Result, "gen") == u32);
+    const Generation = @FieldType(Result, "gen");
     return struct {
         /// Generation of the last request sent; answers of others are stale.
-        generation: u32 = 0,
+        generation: Generation = std.mem.zeroes(Generation),
         /// True from sending a request until an answer to it is taken.
         pending: bool = false,
         /// The query of the last request sent.
@@ -32,7 +34,7 @@ pub fn Inflight(comptime Result: type, comptime asked_bytes_max: usize) type {
         const Self = @This();
 
         /// A request for `query` went out with `generation`.
-        pub fn sent(self: *Self, generation: u32, query: []const u8) void {
+        pub fn sent(self: *Self, generation: Generation, query: []const u8) void {
             self.generation = generation;
             self.pending = true;
             self.asked.set(query);
@@ -71,7 +73,7 @@ pub fn Inflight(comptime Result: type, comptime asked_bytes_max: usize) type {
             const latest = self.latest;
             self.latest = null;
             self.pending = false;
-            self.generation = 0;
+            self.generation = std.mem.zeroes(Generation);
             return latest;
         }
 

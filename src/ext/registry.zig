@@ -7,6 +7,7 @@ const std = @import("std");
 const item_mod = @import("../item.zig");
 const themes = @import("../ui/themes.zig");
 const layout_mod = @import("../layout.zig");
+const RegistryGeneration = @import("generation.zig").RegistryGeneration;
 
 /// Cells to a line in a grid command that does not say.
 pub const grid_columns_default = 5;
@@ -118,7 +119,7 @@ pub const Problem = struct {
 
 /// Everything the files define. Owned by the receiver: `destroy`.
 pub const Registry = struct {
-    gen: u32,
+    gen: RegistryGeneration,
     commands: []const Command = &.{},
     themes: []const themes.Theme = &.{},
     keymaps: []const Keymap = &.{},

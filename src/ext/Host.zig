@@ -22,6 +22,7 @@ const lua = @import("luart").lua;
 const api = @import("api.zig");
 const rows_mod = @import("rows.zig");
 const registry_mod = @import("registry.zig");
+const generation_mod = @import("generation.zig");
 const os = @import("os");
 const core = @import("core");
 const item_mod = @import("../item.zig");
@@ -94,7 +95,7 @@ lock: std.Io.Mutex = .init,
 wake_sequence: std.atomic.Value(u32) = .init(0),
 stop: std.atomic.Value(bool) = .init(false),
 /// The last request number handed out. Main thread only.
-request_gen_last: u32 = 0,
+request_gen_last: RequestGeneration = .none,
 /// Under `lock`.
 pending: Pending = .{},
 /// The style to load before init.lua; empty is none. Under `lock`.
@@ -105,7 +106,7 @@ extensions: std.ArrayList(*Ext) = .empty,
 /// Where the worker finds each command of the current registry, in the
 /// registry's order.
 worker_commands: []WorkerCommand = &.{},
-registry_gen: u32 = 0,
+registry_gen: RegistryGeneration = .none,
 /// Extension ids and folders; reset on reload.
 worker_arena: std.heap.ArenaAllocator,
 
@@ -114,6 +115,8 @@ worker_arena: std.heap.ArenaAllocator,
 /// The registry's types live in registry.zig; they are re-exported here
 /// because the window names them through Host.
 pub const Mode = registry_mod.Mode;
+pub const RegistryGeneration = generation_mod.RegistryGeneration;
+pub const RequestGeneration = generation_mod.RequestGeneration;
 pub const config_extension_id = registry_mod.config_extension_id;
 pub const grid_columns_default = registry_mod.grid_columns_default;
 pub const style_extension_id = registry_mod.style_extension_id;
@@ -132,7 +135,7 @@ pub const Registry = registry_mod.Registry;
 
 /// A command's rows. Owned by the receiver: `destroy`.
 pub const ListResult = struct {
-    gen: u32,
+    gen: RequestGeneration,
     command: u16,
     query: []const u8,
     items: []Item = &.{},
@@ -150,7 +153,7 @@ pub const Outcome = enum { close, stay, refresh };
 
 /// What a Lua action asked for. Owned by the receiver: `destroy`.
 pub const ActResult = struct {
-    gen: u32,
+    gen: RequestGeneration,
     outcome: Outcome = .close,
     err: ?[:0]const u8 = null,
     arena: std.heap.ArenaAllocator,
@@ -164,7 +167,7 @@ pub const ActResult = struct {
 /// Rows extensions give for a root search, a section per command.
 /// Owned by the receiver: `destroy`.
 pub const RootResult = struct {
-    gen: u32,
+    gen: RequestGeneration,
     query: []const u8,
     sections: []const RootSection = &.{},
     arena: std.heap.ArenaAllocator,
@@ -333,7 +336,7 @@ const WorkerCommand = struct {
 const Kept = struct {
     ref: c_int = c_noref,
     /// The request that produced it.
-    list_gen: u32 = 0,
+    list_gen: RequestGeneration = .none,
 };
 
 /// Requests the worker has not taken yet. A newer request of a kind
@@ -348,22 +351,22 @@ const Pending = struct {
 };
 
 const ListRequest = struct {
-    registry_gen: u32,
+    registry_gen: RegistryGeneration,
     command: u16,
-    request_gen: u32,
+    request_gen: RequestGeneration,
     query: core.FixedStr(query_bytes_max),
 };
 
 const RootSearchRequest = struct {
-    registry_gen: u32,
-    request_gen: u32,
+    registry_gen: RegistryGeneration,
+    request_gen: RequestGeneration,
     query: core.FixedStr(query_bytes_max),
 };
 
 const ActRequest = struct {
-    registry_gen: u32,
+    registry_gen: RegistryGeneration,
     command: u16,
-    request_gen: u32,
+    request_gen: RequestGeneration,
     target: Target,
 
     pub const Target = union(enum) {
@@ -377,7 +380,7 @@ const ActRequest = struct {
         /// The row came from the root search, not from the command's list.
         from_root_search: bool,
         /// The list the row came from.
-        list_gen: u32,
+        list_gen: RequestGeneration,
         row_index: u32,
         action_index: u8,
     };
@@ -385,9 +388,9 @@ const ActRequest = struct {
 
 /// A form submitted; owns copies of its values.
 const SubmitRequest = struct {
-    registry_gen: u32,
+    registry_gen: RegistryGeneration,
     command: u16,
-    request_gen: u32,
+    request_gen: RequestGeneration,
     values: []FormValue,
     arena: std.heap.ArenaAllocator,
 
@@ -472,7 +475,12 @@ pub fn reload(host: *Host) void {
 /// Asks for command `command`'s rows (`query` for search commands; longer
 /// queries are cut). Returns the request's generation; a newer list request
 /// replaces one not started yet.
-pub fn list(host: *Host, registry_gen: u32, command: u16, query: []const u8) u32 {
+pub fn list(
+    host: *Host,
+    registry_gen: RegistryGeneration,
+    command: u16,
+    query: []const u8,
+) RequestGeneration {
     const request_gen = host.requestGenNext();
     var request: ListRequest = .{
         .registry_gen = registry_gen,
@@ -492,7 +500,12 @@ pub fn list(host: *Host, registry_gen: u32, command: u16, query: []const u8) u32
 
 /// Calls form `command`'s submit with `values` (copied). Its answer comes
 /// like an action's.
-pub fn submit(host: *Host, registry_gen: u32, command: u16, values: []const FormValue) u32 {
+pub fn submit(
+    host: *Host,
+    registry_gen: RegistryGeneration,
+    command: u16,
+    values: []const FormValue,
+) RequestGeneration {
     // The window sends one value per field of the form, and a form has at
     // most `form_fields_max`.
     assert(values.len >= 1);
@@ -525,9 +538,9 @@ pub fn submit(host: *Host, registry_gen: u32, command: u16, values: []const Form
 /// empty.
 fn submitRequestCreate(
     gpa: std.mem.Allocator,
-    registry_gen: u32,
+    registry_gen: RegistryGeneration,
     command: u16,
-    request_gen: u32,
+    request_gen: RequestGeneration,
     values: []const FormValue,
 ) error{OutOfMemory}!*SubmitRequest {
     const request = try gpa.create(SubmitRequest);
@@ -554,7 +567,11 @@ fn submitRequestCreate(
 
 /// Asks every command with `root` for rows for `query`; a newer root
 /// request replaces one not started yet.
-pub fn root(host: *Host, registry_gen: u32, query: []const u8) u32 {
+pub fn root(
+    host: *Host,
+    registry_gen: RegistryGeneration,
+    query: []const u8,
+) RequestGeneration {
     const request_gen = host.requestGenNext();
     var request: RootSearchRequest = .{
         .registry_gen = registry_gen,
@@ -576,7 +593,12 @@ pub fn root(host: *Host, registry_gen: u32, query: []const u8) u32 {
 pub const ActTarget = ActRequest.Target;
 
 /// Runs a Lua action of `command`; see `ActTarget`.
-pub fn act(host: *Host, registry_gen: u32, command: u16, target: ActTarget) u32 {
+pub fn act(
+    host: *Host,
+    registry_gen: RegistryGeneration,
+    command: u16,
+    target: ActTarget,
+) RequestGeneration {
     const request_gen = host.requestGenNext();
     {
         host.lock.lockUncancelable(host.io);
@@ -594,10 +616,8 @@ pub fn act(host: *Host, registry_gen: u32, command: u16, target: ActTarget) u32 
 
 /// The window keeps 0 for "no request pending" (`ext_act_gen`), so 0 is
 /// never handed out, even after the counter wraps.
-fn requestGenNext(host: *Host) u32 {
-    host.request_gen_last +%= 1;
-    if (host.request_gen_last == 0) host.request_gen_last = 1;
-    assert(host.request_gen_last != 0);
+fn requestGenNext(host: *Host) RequestGeneration {
+    host.request_gen_last = host.request_gen_last.next();
     return host.request_gen_last;
 }
 
@@ -661,7 +681,7 @@ fn closeAll(host: *Host) void {
 
 fn reloadExecute(host: *Host) void {
     host.closeAll();
-    host.registry_gen +%= 1;
+    host.registry_gen = host.registry_gen.next();
     const registry = host.answerCreate(Registry, "reload", .{
         .gen = host.registry_gen,
         .arena = .init(host.gpa),
@@ -1283,7 +1303,7 @@ const reloaded = "Extensions were reloaded";
 /// The command a request names; null when the files were reloaded after
 /// the request was made (its command index is from a registry that is
 /// gone, and may name another command now).
-fn requested(host: *Host, registry_gen: u32, command: u16) ?*WorkerCommand {
+fn requested(host: *Host, registry_gen: RegistryGeneration, command: u16) ?*WorkerCommand {
     if (registry_gen != host.registry_gen) return null;
     // The registry the UI holds has as many commands as there are worker
     // commands; anything past them is not a command of this registry.
@@ -1371,7 +1391,7 @@ const ListContext = struct {
 };
 
 /// Keeps the list at `rows` for its rows' actions, until the next one.
-fn keep(L: *lua.State, kept: *Kept, rows: c_int, list_gen: u32) void {
+fn keep(L: *lua.State, kept: *Kept, rows: c_int, list_gen: RequestGeneration) void {
     if (kept.ref != c_noref) {
         lua.unref(L, kept.ref);
         kept.ref = c_noref;
@@ -1845,11 +1865,15 @@ fn testHost(probe: *Probe, dir: []const u8) !*Host {
     });
 }
 
-test "request generations skip 0, which the window keeps for none pending" {
+test "request generations skip none, which the window keeps for nothing pending" {
     var host: Host = undefined;
-    host.request_gen_last = std.math.maxInt(u32);
-    try testing.expectEqual(1, host.requestGenNext());
-    try testing.expectEqual(2, host.requestGenNext());
+    host.request_gen_last = @fromBackingInt(@intCast(std.math.maxInt(u32)));
+    try testing.expectEqual(@as(RequestGeneration, @fromBackingInt(@intCast(1))), host.requestGenNext());
+    try testing.expectEqual(@as(RequestGeneration, @fromBackingInt(@intCast(2))), host.requestGenNext());
+}
+
+test {
+    _ = generation_mod;
 }
 
 test "extensions load, list, search and run actions" {

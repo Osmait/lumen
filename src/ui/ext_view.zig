@@ -241,7 +241,7 @@ fn actCallback(answer: *Host.ActResult, ctx: ?*anyopaque) void {
     const ui: *Ui = @ptrCast(@alignCast(ctx.?));
     defer answer.destroy(ui.gpa);
     if (answer.gen != ui.ext_act_gen) return;
-    ui.ext_act_gen = 0;
+    ui.ext_act_gen = .none;
     if (answer.err) |message| {
         log.warn("action: {s}", .{message});
         ui.showFailure(firstLine(ui.query_arena.allocator(), message));
@@ -672,13 +672,13 @@ test "indexes into the registry follow their ids across a reload" {
         testPref("b", "key", .text),
     };
     const old: Host.Registry = .{
-        .gen = 1,
+        .gen = @fromBackingInt(@as(u32, 1)),
         .commands = &old_cmds,
         .prefs = &old_prefs,
         .arena = undefined,
     };
     const new: Host.Registry = .{
-        .gen = 2,
+        .gen = @fromBackingInt(@as(u32, 2)),
         .commands = &new_cmds,
         .prefs = &new_prefs,
         .arena = undefined,
