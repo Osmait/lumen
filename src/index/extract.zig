@@ -317,7 +317,9 @@ const Tag = struct {
         const closing = xml[i + 1] == '/';
         const name_start = i + 1 + @intFromBool(closing);
         var name_end = name_start;
-        while (name_end < tag_end and !isSpace(xml[name_end]) and xml[name_end] != '/') name_end += 1;
+        while (name_end < tag_end) : (name_end += 1) {
+            if (isSpace(xml[name_end]) or xml[name_end] == '/') break;
+        }
         const name = xml[name_start..name_end];
         return .{
             .name = name,

@@ -732,7 +732,8 @@ fn listingReason(service: *const ContentService, names: ?u64, now_ns: u64) ?List
     const names_now = names orelse return .names_unknown;
     const names_listed = service.worker.listed_names orelse return .names_unknown;
     if (names_now != names_listed) return .names_changed;
-    if (now_ns - service.worker.listed_at_ns >= service.opts.list_interval_ns) return .listing_stale;
+    const listing_age_ns = now_ns - service.worker.listed_at_ns;
+    if (listing_age_ns >= service.opts.list_interval_ns) return .listing_stale;
     return null;
 }
 

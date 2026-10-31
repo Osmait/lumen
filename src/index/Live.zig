@@ -778,7 +778,8 @@ pub fn search(
         .is_dir = live.base.isDir(hit.id),
     });
     if (live.delta.store.len() > 0) {
-        try live.delta.engine.search(live.gpa, pool, &live.delta.store, query, engine_options, &hits);
+        const delta = &live.delta;
+        try delta.engine.search(live.gpa, pool, &delta.store, query, engine_options, &hits);
         for (hits.items) |hit| try out.append(arena, .{
             .path = try arena.dupe(u8, live.delta.store.path(hit.id, &path_buffer) orelse continue),
             .score = hit.score,
