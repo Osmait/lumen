@@ -4,9 +4,9 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-pub const Rect = struct { x: i32, y: i32, w: i32, h: i32 };
+pub const Rect = struct { x: i32, y: i32, width: i32, height: i32 };
 
-pub const Size = struct { w: i32, h: i32 };
+pub const Size = struct { width: i32, height: i32 };
 
 pub const Monitor = struct {
     x: i32,
@@ -61,8 +61,8 @@ pub const Monitor = struct {
         return .{
             .x = monitor.x + reserved_left,
             .y = monitor.y + reserved_top,
-            .w = logical_width - reserved_left - reserved_right,
-            .h = logical_height - reserved_top - reserved_bottom,
+            .width = logical_width - reserved_left - reserved_right,
+            .height = logical_height - reserved_top - reserved_bottom,
         };
     }
 };
@@ -87,33 +87,47 @@ pub fn place(layout: Layout, outer: Rect, current: Size, gap_px: i32) Rect {
     const area: Rect = .{
         .x = outer.x + gap_px,
         .y = outer.y + gap_px,
-        .w = outer.w - 2 * gap_px,
-        .h = outer.h - 2 * gap_px,
+        .width = outer.width - 2 * gap_px,
+        .height = outer.height - 2 * gap_px,
     };
-    const half_width = @divTrunc(area.w - gap_px, 2);
-    const half_height = @divTrunc(area.h - gap_px, 2);
-    const third = @divTrunc(area.w - 2 * gap_px, 3);
+    const half_width = @divTrunc(area.width - gap_px, 2);
+    const half_height = @divTrunc(area.height - gap_px, 2);
+    const third = @divTrunc(area.width - 2 * gap_px, 3);
     const placed: Rect = switch (layout) {
-        .left_half => .{ .x = area.x, .y = area.y, .w = half_width, .h = area.h },
+        .left_half => .{ .x = area.x, .y = area.y, .width = half_width, .height = area.height },
         .right_half => .{
-            .x = area.x + area.w - half_width,
+            .x = area.x + area.width - half_width,
             .y = area.y,
-            .w = half_width,
-            .h = area.h,
+            .width = half_width,
+            .height = area.height,
         },
-        .top_half => .{ .x = area.x, .y = area.y, .w = area.w, .h = half_height },
+        .top_half => .{ .x = area.x, .y = area.y, .width = area.width, .height = half_height },
         .bottom_half => .{
             .x = area.x,
-            .y = area.y + area.h - half_height,
-            .w = area.w,
-            .h = half_height,
+            .y = area.y + area.height - half_height,
+            .width = area.width,
+            .height = half_height,
         },
         .maximize => area,
         .almost_maximize => shrinkCentered(area, 0.9),
-        .center => centered(area, @min(current.w, area.w), @min(current.h, area.h)),
-        .first_third => .{ .x = area.x, .y = area.y, .w = third, .h = area.h },
-        .center_third => .{ .x = area.x + third + gap_px, .y = area.y, .w = third, .h = area.h },
-        .last_third => .{ .x = area.x + area.w - third, .y = area.y, .w = third, .h = area.h },
+        .center => centered(
+            area,
+            @min(current.width, area.width),
+            @min(current.height, area.height),
+        ),
+        .first_third => .{ .x = area.x, .y = area.y, .width = third, .height = area.height },
+        .center_third => .{
+            .x = area.x + third + gap_px,
+            .y = area.y,
+            .width = third,
+            .height = area.height,
+        },
+        .last_third => .{
+            .x = area.x + area.width - third,
+            .y = area.y,
+            .width = third,
+            .height = area.height,
+        },
     };
     // On any area with room for the gaps, the window stays inside it.
     const room_for_gaps = third >= 0 and half_width >= 0 and half_height >= 0;
@@ -125,24 +139,24 @@ pub fn place(layout: Layout, outer: Rect, current: Size, gap_px: i32) Rect {
 fn contains(outer: Rect, inner: Rect) bool {
     if (inner.x < outer.x) return false;
     if (inner.y < outer.y) return false;
-    if (inner.x + inner.w > outer.x + outer.w) return false;
-    if (inner.y + inner.h > outer.y + outer.h) return false;
+    if (inner.x + inner.width > outer.x + outer.width) return false;
+    if (inner.y + inner.height > outer.y + outer.height) return false;
     return true;
 }
 
 fn shrinkCentered(area: Rect, factor: f64) Rect {
-    const width_px: i32 = @intFromFloat(@as(f64, @floatFromInt(area.w)) * factor);
-    const height_px: i32 = @intFromFloat(@as(f64, @floatFromInt(area.h)) * factor);
+    const width_px: i32 = @intFromFloat(@as(f64, @floatFromInt(area.width)) * factor);
+    const height_px: i32 = @intFromFloat(@as(f64, @floatFromInt(area.height)) * factor);
     return centered(area, width_px, height_px);
 }
 
 /// A rectangle of `width_px` by `height_px` in the middle of `area`.
 fn centered(area: Rect, width_px: i32, height_px: i32) Rect {
     return .{
-        .x = area.x + @divTrunc(area.w - width_px, 2),
-        .y = area.y + @divTrunc(area.h - height_px, 2),
-        .w = width_px,
-        .h = height_px,
+        .x = area.x + @divTrunc(area.width - width_px, 2),
+        .y = area.y + @divTrunc(area.height - height_px, 2),
+        .width = width_px,
+        .height = height_px,
     };
 }
 
@@ -158,20 +172,20 @@ test "usable area honours rotation and bars" {
         .reserved = .{ 0, 38, 0, 0 },
     };
     const usable = monitor.usable();
-    try std.testing.expectEqual(Rect{ .x = 4307, .y = 38, .w = 900, .h = 1562 }, usable);
+    try std.testing.expectEqual(Rect{ .x = 4307, .y = 38, .width = 900, .height = 1562 }, usable);
 }
 
 test "halves split the area without overlap" {
-    const area: Rect = .{ .x = 0, .y = 38, .w = 1920, .h = 1042 };
-    const left = place(.left_half, area, .{ .w = 0, .h = 0 }, 8);
-    const right = place(.right_half, area, .{ .w = 0, .h = 0 }, 8);
-    try std.testing.expect(left.x + left.w <= right.x);
-    try std.testing.expectEqual(left.w, right.w);
-    try std.testing.expectEqual(@as(i32, 8 + 1920 - 8), right.x + right.w + 8);
+    const area: Rect = .{ .x = 0, .y = 38, .width = 1920, .height = 1042 };
+    const left = place(.left_half, area, .{ .width = 0, .height = 0 }, 8);
+    const right = place(.right_half, area, .{ .width = 0, .height = 0 }, 8);
+    try std.testing.expect(left.x + left.width <= right.x);
+    try std.testing.expectEqual(left.width, right.width);
+    try std.testing.expectEqual(@as(i32, 8 + 1920 - 8), right.x + right.width + 8);
 }
 
 test "center keeps size" {
-    const area: Rect = .{ .x = 0, .y = 0, .w = 1000, .h = 800 };
-    const center = place(.center, area, .{ .w = 400, .h = 300 }, 0);
-    try std.testing.expectEqual(Rect{ .x = 300, .y = 250, .w = 400, .h = 300 }, center);
+    const area: Rect = .{ .x = 0, .y = 0, .width = 1000, .height = 800 };
+    const center = place(.center, area, .{ .width = 400, .height = 300 }, 0);
+    try std.testing.expectEqual(Rect{ .x = 300, .y = 250, .width = 400, .height = 300 }, center);
 }

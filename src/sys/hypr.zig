@@ -484,7 +484,7 @@ pub fn layoutCommands(
 ) std.mem.Allocator.Error![]const []const u8 {
     // activeWindow returns no window without an address.
     assert(window.address.len > 0);
-    const current_size: geometry.Size = .{ .w = window.size[0], .h = window.size[1] };
+    const current_size: geometry.Size = .{ .width = window.size[0], .height = window.size[1] };
     const placed = geometry.place(layout, monitor_area.usable(), current_size, layout_gap_px);
     var commands: std.ArrayList([]const u8) = .empty;
     if (window.fullscreen != 0) try commands.append(arena, "fullscreen 0");
@@ -493,7 +493,7 @@ pub fn layoutCommands(
     }
     try commands.append(arena, try arena.print(
         "resizewindowpixel exact {d} {d},address:{s}",
-        .{ placed.w, placed.h, window.address },
+        .{ placed.width, placed.height, window.address },
     ));
     try commands.append(arena, try arena.print(
         "movewindowpixel exact {d} {d},address:{s}",
@@ -527,13 +527,12 @@ test "monitors: rotation and scale give the usable area" {
     try testing.expectEqualStrings("DP-1", focusedName(monitors).?);
     // HDMI-A-1: 1600x900 rotated 270° -> 900x1600 logical, bar on top.
     const hdmi = findMonitor(monitors, 0).?.usable();
-    try testing.expectEqual(geometry.Rect{ .x = 4307, .y = 38, .w = 900, .h = 1562 }, hdmi);
+    const hdmi_want: geometry.Rect = .{ .x = 4307, .y = 38, .width = 900, .height = 1562 };
+    try testing.expectEqual(hdmi_want, hdmi);
     // DP-1: 1920x1080 at scale 1.25 -> 1536x864 logical.
     const display_port = findMonitor(monitors, 1).?.usable();
-    try testing.expectEqual(
-        geometry.Rect{ .x = 2387, .y = 38, .w = 1536, .h = 826 },
-        display_port,
-    );
+    const display_port_want: geometry.Rect = .{ .x = 2387, .y = 38, .width = 1536, .height = 826 };
+    try testing.expectEqual(display_port_want, display_port);
     try testing.expect(findMonitor(monitors, 7) == null);
 
     // Replies no monitor gives are refused, not computed with.
