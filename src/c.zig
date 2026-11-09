@@ -529,6 +529,9 @@ pub extern fn gtk_widget_set_hexpand(widget: *GtkWidget, hexpand: gboolean) void
 pub extern fn gtk_widget_set_vexpand(widget: *GtkWidget, vexpand: gboolean) void;
 pub extern fn gtk_widget_set_halign(widget: *GtkWidget, alignment: c_int) void;
 pub extern fn gtk_widget_set_valign(widget: *GtkWidget, alignment: c_int) void;
+pub extern fn gtk_widget_get_valign(widget: *GtkWidget) c_int;
+pub extern fn gtk_widget_get_last_child(widget: *GtkWidget) ?*GtkWidget;
+pub extern fn gtk_widget_get_prev_sibling(widget: *GtkWidget) ?*GtkWidget;
 pub extern fn gtk_widget_get_size_request(widget: *GtkWidget, width: ?*c_int, height: ?*c_int) void;
 pub extern fn gtk_widget_set_size_request(widget: *GtkWidget, width: c_int, height: c_int) void;
 pub extern fn gtk_widget_set_margin_top(widget: *GtkWidget, margin: c_int) void;

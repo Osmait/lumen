@@ -69,6 +69,33 @@ pub fn show(panel: *ActionPanel, entries: []const item_mod.Entry) void {
     gtk.setVisible(panel.box, true);
 }
 
+/// Stands the panel on the pieces. Opening from the bottom (a footer, or
+/// the search bar below) it is aligned to the surface's bottom edge, and the
+/// surface keeps its full height while the pieces are only as tall as their
+/// rows: with few results the panel hung in the clear part under them. The
+/// clear height under the last piece showing is added to its bottom margin.
+pub fn standOn(panel: *ActionPanel, column: *c.GtkBox) void {
+    const box = gtk.widget(panel.box);
+    c.gtk_widget_set_margin_bottom(box, 0);
+    if (c.gtk_widget_get_valign(box) != c.GTK_ALIGN_END) return;
+    const pieces = gtk.widget(column);
+    const surface = c.gtk_widget_get_parent(pieces) orelse return;
+    var last = c.gtk_widget_get_last_child(pieces);
+    while (last) |piece| {
+        if (c.gtk_widget_get_visible(piece) != 0) break;
+        last = c.gtk_widget_get_prev_sibling(piece);
+    }
+    const piece = last orelse return;
+    var column_bounds: c.graphene_rect_t = undefined;
+    var piece_bounds: c.graphene_rect_t = undefined;
+    if (c.gtk_widget_compute_bounds(pieces, surface, &column_bounds) == 0) return;
+    if (c.gtk_widget_compute_bounds(piece, surface, &piece_bounds) == 0) return;
+    const column_bottom = column_bounds.origin.y + column_bounds.size.height;
+    const piece_bottom = piece_bounds.origin.y + piece_bounds.size.height;
+    const clear_px: c_int = @intFromFloat(@max(column_bottom - piece_bottom, 0));
+    c.gtk_widget_set_margin_bottom(box, clear_px);
+}
+
 pub fn close(panel: *ActionPanel) void {
     panel.entries = &.{};
     gtk.setVisible(panel.box, false);
