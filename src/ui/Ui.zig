@@ -662,6 +662,7 @@ pub fn selectedItem(self: *Ui) ?*Item {
 pub fn openPanel(self: *Ui) void {
     assert(self.built);
     const item = self.selectedItem() orelse return;
+    self.panel.standOn(self.column);
     self.panel.show(item_mod.actionsFor(item));
 }
 

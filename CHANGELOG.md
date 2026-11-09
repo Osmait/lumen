@@ -21,6 +21,9 @@ All notable changes are listed here. The format follows
 
 ### Fixed
 
+- With a footer, or the search bar at the bottom, the action panel (Ctrl K)
+  hung below the window when there were only a few results. It now sits on
+  the footer.
 - The window could freeze while the content index extracted documents or
   verified a slow search, and while a large folder was moved.
 - A crash when an extension's root-search rows were replaced as you typed
