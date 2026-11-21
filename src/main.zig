@@ -24,6 +24,7 @@ const ipc = @import("ipc.zig");
 const cli = @import("cli.zig");
 const ipc_server = @import("sys/ipc_server.zig");
 const proc = @import("sys/proc.zig");
+const os = @import("os");
 
 const version_line = std.fmt.comptimePrint("{s}\n", .{@import("build_options").version});
 
@@ -95,6 +96,7 @@ const malloc_arenas_max = 4;
 const stdin_buffer_bytes = 16 << 10;
 
 pub fn main(init: std.process.Init) !void {
+    os.unix.ignoreSigpipe();
     stats.started_ns = stats.now();
     // glibc raises its mmap threshold every time a large mmap'd block is
     // freed, so after one index build every later big buffer comes from the

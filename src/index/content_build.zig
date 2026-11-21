@@ -241,11 +241,15 @@ pub fn appendFile(
     try file.sync();
     try file.writeAt(&header.encode(), 0);
     try file.sync();
-    const index = try Index.open(path_z);
-    // Read back as written (the pair of `finish`'s assertions).
-    assert(index.docs_count == header.docs_count);
-    assert(index.segments_count == header.segments_count);
-    assert(index.file.len == header.size_total);
+    var index = try Index.open(path_z);
+    errdefer index.deinit(gpa);
+    // Another writer could have replaced the path between sync and reopen.
+    if (index.docs_count != header.docs_count or
+        index.segments_count != header.segments_count or
+        index.file.len != header.size_total)
+    {
+        return error.BadIndex;
+    }
     return index;
 }
 

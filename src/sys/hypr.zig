@@ -202,7 +202,7 @@ comptime {
 fn talk(arena: std.mem.Allocator, message: []const u8) ?[]const u8 {
     const fd = connect(.requests, .{}) orelse return null;
     defer _ = linux.close(fd);
-    if (!os.unix.writeAll(fd, message)) return null;
+    if (!os.unix.sendAll(fd, message)) return null;
     const deadline_ns = os.monotonicNs() + answer_timeout_ns;
     var answer: std.ArrayList(u8) = .empty;
     while (true) {
@@ -226,11 +226,17 @@ fn talk(arena: std.mem.Allocator, message: []const u8) ?[]const u8 {
 fn dispatchOver(message: []const u8) bool {
     const fd = connect(.requests, .{}) orelse return false;
     defer _ = linux.close(fd);
-    const written = linux.write(fd, message.ptr, message.len);
-    if (os.unix.failed(written) != null) return false;
+    const written = while (true) {
+        const result = os.unix.send(fd, message);
+        if (os.unix.failed(result)) |errno| switch (errno) {
+            .INTR => continue,
+            else => return false,
+        };
+        break result;
+    };
     if (written == 0) return false;
     // Partly sent: the rest goes too, never again from the start.
-    if (written < message.len and !os.unix.writeAll(fd, message[written..])) {
+    if (written < message.len and !os.unix.sendAll(fd, message[written..])) {
         log.warn("dispatch partly sent: {d} of {d} bytes", .{ written, message.len });
     }
     const deadline_ns = os.monotonicNs() + answer_timeout_ns;

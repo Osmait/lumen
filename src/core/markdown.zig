@@ -71,14 +71,16 @@ const Heading = struct { level: u8, text: []const u8 };
 const heading_level_max = 6;
 
 fn heading(line: []const u8) ?Heading {
-    var level: u8 = 0;
-    while (level < line.len and line[level] == '#') level += 1;
+    var level: usize = 0;
+    while (level < line.len and line[level] == '#') {
+        level += 1;
+        if (level > heading_level_max) return null;
+    }
     if (level == 0) return null;
-    if (level > heading_level_max) return null;
     // "#" alone, or "#title" with no space, is text.
     if (level == line.len) return null;
     if (line[level] != ' ') return null;
-    return .{ .level = @min(level, 3), .text = std.mem.trim(u8, line[level..], " #") };
+    return .{ .level = @intCast(@min(level, 3)), .text = std.mem.trim(u8, line[level..], " #") };
 }
 
 fn isRule(line: []const u8) bool {
@@ -318,6 +320,9 @@ test "unclosed or stray markers stay as text" {
     try expectMarkup("[not a link] (x)", "[not a link] (x)");
     try expectMarkup("`open", "`open");
     try expectMarkup("#nohash", "#nohash");
+    var many_hashes: [263]u8 = @splat('#');
+    @memcpy(many_hashes[257..], " title");
+    try expectMarkup(&many_hashes, &many_hashes);
     try expectMarkup("a < b > c \"q\"", "a &lt; b &gt; c &quot;q&quot;");
 }
 

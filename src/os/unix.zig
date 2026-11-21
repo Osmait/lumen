@@ -37,6 +37,18 @@ pub fn connect(path: []const u8, options: ConnectOptions) ?linux.fd_t {
     return fd;
 }
 
+/// Ignores SIGPIPE process-wide so writing to a closed pipe or socket
+/// returns EPIPE instead of killing the process (Zig's start code no longer
+/// ignores it).
+pub fn ignoreSigpipe() void {
+    const action: linux.Sigaction = .{
+        .handler = .{ .handler = linux.SIG.IGN },
+        .mask = linux.sigemptyset(),
+        .flags = 0,
+    };
+    _ = linux.sigaction(.PIPE, &action, null);
+}
+
 /// Writes all of `bytes`; false when the descriptor failed first.
 pub fn writeAll(fd: linux.fd_t, bytes: []const u8) bool {
     os.writeAll(fd, bytes) catch return false;

@@ -463,7 +463,7 @@ pub fn onRowActivated(
     const ui: *Ui = @ptrCast(@alignCast(data));
     const row_tag = @intFromPtr(c.g_object_get_data(row, row_index_data_key));
     // 0 is no data at all: a row Lumen did not build (the empty text).
-    if (row_tag == 0) return;
+    if (row_tag == 0 or row_tag - 1 >= ui.rows.items.len) return;
     select(ui, row_tag - 1);
     const item = ui.selectedItem() orelse return;
     ui.performEntry(item_mod.actionsFor(item)[0]);

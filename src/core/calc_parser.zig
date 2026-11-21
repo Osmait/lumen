@@ -85,7 +85,9 @@ pub const Parser = struct {
             } else if (parser.eatWord("mod")) {
                 parser.saw_operator = true;
                 const operand = try parser.parseUnary();
-                if (operand == 0) return error.Domain;
+                if (!std.math.isFinite(value) or !(operand > 0) or !std.math.isFinite(operand)) {
+                    return error.Domain;
+                }
                 value = @mod(value, operand);
             } else if (parser.eatWord("of")) {
                 parser.saw_operator = true;
@@ -219,12 +221,17 @@ pub const Parser = struct {
         return std.fmt.parseFloat(f64, digits_buffer[0..digits_len]) catch error.Syntax;
     }
 
-    /// After an "e" at `offset`: a digit or a minus sign, as in "1e3" or "1e-3".
+    /// After an "e" at `offset`: a digit or a sign followed by a digit, as in
+    /// "1e3", "1e+3" or "1e-3".
     fn startsExponent(parser: *Parser) bool {
         const after = parser.offset + 1;
-        if (after == parser.source.len) return false;
+        if (after >= parser.source.len) return false;
         const char = parser.source[after];
-        return std.ascii.isDigit(char) or char == '-';
+        if (std.ascii.isDigit(char)) return true;
+        if ((char == '+' or char == '-') and after + 1 < parser.source.len) {
+            return std.ascii.isDigit(parser.source[after + 1]);
+        }
+        return false;
     }
 
     fn skipWhile(parser: *Parser, comptime accept: fn (u8) bool) void {

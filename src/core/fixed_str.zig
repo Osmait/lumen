@@ -26,10 +26,11 @@ pub fn FixedStr(comptime capacity_bytes: usize) type {
         pub fn print(fixed: *Self, comptime fmt: []const u8, args: anytype) void {
             var writer: std.Io.Writer = .fixed(fixed.bytes[0..capacity_bytes]);
             writer.print(fmt, args) catch |err| switch (err) {
-                // Full: what fit is kept, cut below like `set` cuts.
+                // Full: what fit is kept, cut below so a partial UTF-8
+                // character at the end is dropped.
                 error.WriteFailed => {},
             };
-            fixed.len = utf8.floorBoundary(writer.buffered(), writer.buffered().len);
+            fixed.len = utf8.validPrefix(writer.buffered()).len;
             fixed.bytes[fixed.len] = 0;
             fixed.assertValid();
         }
@@ -64,6 +65,10 @@ test "FixedStr cuts between characters and stays terminated" {
     try std.testing.expectEqual(@as(u8, 0), fixed.slice().ptr[fixed.len]);
     fixed.print("{s}:{d}", .{ "k", 12345 });
     try std.testing.expectEqualStrings("k:12", fixed.slice());
+    // Truncation mid-character during print drops the partial UTF-8 sequence.
+    fixed.print("{s}", .{"aé€"});
+    try std.testing.expectEqualStrings("aé", fixed.slice());
+    try std.testing.expect(std.unicode.utf8ValidateSlice(fixed.slice()));
     fixed.clear();
     try std.testing.expect(fixed.eql(""));
 }

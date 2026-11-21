@@ -58,17 +58,14 @@ fn splitConversion(text: []const u8) ?Result {
         const target_name = std.mem.trim(u8, text[target_start..], " ");
         const target = units.find(target_name) orelse continue;
 
-        // The source unit is the trailing word of the left side; it may be
-        // glued to the number ("10km").
-        var split = left.len;
-        while (split > 0 and !endsAmount(left[split - 1])) {
-            split -= 1;
-        }
-        const source_name = std.mem.trim(u8, left[split..], " ");
-        const source = units.find(source_name) orelse continue;
+        // The source unit is the trailing unit name of the left side; it may
+        // contain digits or spaces ("m2", "fl oz") or be glued to the number
+        // ("10km", "10m2").
+        const found = units.findSuffix(left) orelse continue;
+        const source = found.unit;
         if (source.dimension != target.dimension) continue;
 
-        const expression = std.mem.trim(u8, left[0..split], " ");
+        const expression = std.mem.trim(u8, left[0..found.split], " ");
         var parser: Parser = .{ .source = expression };
         const amount = parser.parseExpression() catch continue;
         parser.skipSpaces();
@@ -81,12 +78,6 @@ fn splitConversion(text: []const u8) ?Result {
         return .{ .value = converted, .unit = target.names[0], .from_unit = source.names[0] };
     }
     return null;
-}
-
-/// A character that ends the amount before a unit name: "10 km", "10km",
-/// "(5 + 5) km".
-fn endsAmount(char: u8) bool {
-    return std.ascii.isDigit(char) or char == ' ' or char == ')';
 }
 
 fn lastIndexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
@@ -191,6 +182,13 @@ test "arithmetic and precedence" {
     try expectValue("10 / 4", 2.5);
     try expectValue("7 mod 3", 1);
     try expectValue("1,000 * 2", 2000);
+    try expectValue("1e+3 + 1", 1001);
+    try expectValue("1e-3 * 1000", 1);
+    try expectValue("2e + 1", 2 * std.math.e + 1);
+    try std.testing.expect(evaluate("7 mod -3") == null);
+    try std.testing.expect(evaluate("7 mod (-1)^0.5") == null);
+    try std.testing.expect(evaluate("(1e308 * 10) mod 3") == null);
+    try std.testing.expect(evaluate("(-1)^0.5 mod 3") == null);
 }
 
 test "functions, constants, postfix" {
@@ -217,6 +215,11 @@ test "unit conversions" {
     try expectValue("1 gb to mb", 1024);
     try expectValue("90 min in h", 1.5);
     try expectValue("2*5kg to lb", 22.046226218487757);
+    try expectValue("10 m2 to ft2", 10.0 / 0.09290304);
+    try expectValue("10m2 to ft2", 10.0 / 0.09290304);
+    try expectValue("1 km2 to ha", 100);
+    try expectValue("10 ft2 in m2", 0.9290304);
+    try expectValue("10 fl oz to ml", 295.735295625);
     try std.testing.expect(evaluate("10 km to kg") == null);
     try std.testing.expectEqualStrings("mi", evaluate("1 km to miles").?.unit);
 }
