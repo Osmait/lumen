@@ -469,9 +469,58 @@ pub const Builder = struct {
         return @intCast(builder.name_offsets.items.len);
     }
 
+    pub fn name(builder: *const Builder, id: u32) []const u8 {
+        assert(id < builder.len());
+        const offset = builder.name_offsets.items[id];
+        return builder.names.items[offset..][0..builder.name_sizes.items[id]];
+    }
+
+    /// Absolute path of `id`, written into `out`; null if `id` is out of
+    /// bounds, does not fit `out`, or its parent chain does not reach a root.
+    pub fn path(builder: *const Builder, id: u32, out: []u8) ?[]const u8 {
+        const entries_count = builder.len();
+        const parents_all = builder.parents.items;
+        var path_size: usize = 0;
+        var entry = id;
+        var steps: usize = 0;
+        while (true) : (steps += 1) {
+            if (entry >= entries_count) return null;
+            if (steps >= entries_count) return null;
+            path_size += builder.name(entry).len;
+            const parent = parents_all[entry];
+            if (parent == no_parent) break;
+            if (parent >= entries_count) return null;
+            path_size += paths.separatorAfter(builder.name(parent)).len;
+            if (path_size > out.len) return null;
+            entry = parent;
+        }
+        if (path_size > out.len) return null;
+        var end = path_size;
+        entry = id;
+        for (0..steps + 1) |_| {
+            const entry_name = builder.name(entry);
+            if (entry_name.len > end) return null;
+            @memcpy(out[end - entry_name.len .. end], entry_name);
+            end -= entry_name.len;
+            const parent = parents_all[entry];
+            if (parent == no_parent) {
+                if (end != 0) return null;
+                return out[0..path_size];
+            }
+            if (parent >= entries_count) return null;
+            const separator = paths.separatorAfter(builder.name(parent));
+            if (end < separator.len) return null;
+            end -= separator.len;
+            @memcpy(out[end..][0..separator.len], separator);
+            entry = parent;
+        }
+        return null;
+    }
+
     /// Adds an entry under `parent` (an earlier entry, or `no_parent` for a
     /// root). A name longer than a u16 can measure is cut (Linux names stop
-    /// at 255 bytes; a root is a whole path, at most 4096).
+    /// at 255 bytes; a root is a whole path, at most 4096). Atomic on OOM:
+    /// all 7 columns stay the same length if any reservation fails.
     pub fn push(
         builder: *Builder,
         gpa: std.mem.Allocator,
@@ -486,13 +535,23 @@ pub const Builder = struct {
         // roots, which come after other entries.
         if (parent != no_parent) assert(parent < id);
         const short = entry_name[0..@min(entry_name.len, std.math.maxInt(u16))];
-        try builder.name_offsets.append(gpa, @intCast(builder.names.items.len));
-        try builder.names.appendSlice(gpa, short);
-        try builder.name_sizes.append(gpa, @intCast(short.len));
-        try builder.parents.append(gpa, parent);
-        try builder.flags.append(gpa, flags);
-        try builder.masks.append(gpa, charMask(short));
-        try builder.depths.append(gpa, depth);
+        if (builder.names.items.len + short.len > std.math.maxInt(u32)) {
+            return error.OutOfMemory;
+        }
+        try builder.name_offsets.ensureUnusedCapacity(gpa, 1);
+        try builder.names.ensureUnusedCapacity(gpa, short.len);
+        try builder.name_sizes.ensureUnusedCapacity(gpa, 1);
+        try builder.parents.ensureUnusedCapacity(gpa, 1);
+        try builder.flags.ensureUnusedCapacity(gpa, 1);
+        try builder.masks.ensureUnusedCapacity(gpa, 1);
+        try builder.depths.ensureUnusedCapacity(gpa, 1);
+        builder.name_offsets.appendAssumeCapacity(@intCast(builder.names.items.len));
+        builder.names.appendSliceAssumeCapacity(short);
+        builder.name_sizes.appendAssumeCapacity(@intCast(short.len));
+        builder.parents.appendAssumeCapacity(parent);
+        builder.flags.appendAssumeCapacity(flags);
+        builder.masks.appendAssumeCapacity(charMask(short));
+        builder.depths.appendAssumeCapacity(depth);
         return id;
     }
 
@@ -515,14 +574,13 @@ pub const Builder = struct {
         builder.masks.items[id] = 0;
     }
 
-    /// Builds the store and empties the builder. On error the builder is
-    /// left as it was.
-    pub fn finish(builder: *Builder, gpa: std.mem.Allocator) std.mem.Allocator.Error!Store {
+    /// Builds a `Store` snapshot without emptying the builder. On error the
+    /// builder is left as it was.
+    pub fn toStore(builder: *const Builder, gpa: std.mem.Allocator) std.mem.Allocator.Error!Store {
         const layout = Layout.init(builder.len(), builder.names.items.len);
         assert(layout.entries_count < no_parent);
         assert(layout.names_size <= std.math.maxInt(u32));
         const bytes = try gpa.alignedAlloc(u8, .@"8", layout.size_total);
-        defer builder.deinit(gpa);
         @memset(bytes, 0);
         const header: Header = .{
             .magic = magic.*,
@@ -538,6 +596,14 @@ pub const Builder = struct {
         put(bytes, layout.flags_offset, builder.flags.items);
         put(bytes, layout.names_offset, builder.names.items);
         return .{ .bytes = bytes, .backing = .heap, .layout = layout };
+    }
+
+    /// Builds the store and empties the builder. On error the builder is
+    /// left as it was.
+    pub fn finish(builder: *Builder, gpa: std.mem.Allocator) std.mem.Allocator.Error!Store {
+        const built = try builder.toStore(gpa);
+        builder.deinit(gpa);
+        return built;
     }
 };
 
@@ -870,4 +936,38 @@ fn fuzzBuilt(_: void, smith: *testing.Smith) anyerror!void {
 
 test "fuzz: every index the builder writes is accepted" {
     try testing.fuzz({}, fuzzBuilt, .{});
+}
+
+test "Builder.push keeps all columns aligned on OOM and Builder.path resolves entries" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 10 });
+    for (0..12) |fail_at| {
+        failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_at });
+        const allocator = failing.allocator();
+        var builder: Builder = .empty;
+        defer builder.deinit(allocator);
+        _ = builder.push(allocator, "/root", no_parent, flag_dir, 0) catch {};
+        if (builder.len() > 0) {
+            _ = builder.push(allocator, "child", 0, 0, 1) catch {};
+        }
+        const n = builder.len();
+        try testing.expectEqual(n, @as(u32, @intCast(builder.name_offsets.items.len)));
+        try testing.expectEqual(n, @as(u32, @intCast(builder.name_sizes.items.len)));
+        try testing.expectEqual(n, @as(u32, @intCast(builder.parents.items.len)));
+        try testing.expectEqual(n, @as(u32, @intCast(builder.flags.items.len)));
+        try testing.expectEqual(n, @as(u32, @intCast(builder.masks.items.len)));
+        try testing.expectEqual(n, @as(u32, @intCast(builder.depths.items.len)));
+    }
+
+    var builder: Builder = .empty;
+    defer builder.deinit(testing.allocator);
+    const root_id = try builder.push(testing.allocator, "/home", no_parent, flag_dir, 0);
+    const sub_id = try builder.push(testing.allocator, "docs", root_id, flag_dir, 1);
+    const file_id = try builder.push(testing.allocator, "a.txt", sub_id, 0, 2);
+    var path_buffer: paths.Buffer = undefined;
+    try testing.expectEqualStrings("/home/docs/a.txt", builder.path(file_id, &path_buffer).?);
+    try testing.expect(builder.path(99, &path_buffer) == null);
+    var snapshot = try builder.toStore(testing.allocator);
+    defer snapshot.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 3), builder.len());
+    try testing.expectEqualStrings("/home/docs/a.txt", snapshot.path(file_id, &path_buffer).?);
 }

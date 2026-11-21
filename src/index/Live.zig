@@ -606,17 +606,21 @@ fn pruneWatches(live: *Live) void {
 }
 
 /// The path of entry `id`, or null if it is gone or does not fit
-/// `path_buffer`.
+/// `path_buffer`. Reads `delta.builder` for delta entries so paths created
+/// earlier in the same `apply()` batch resolve before `delta.rebuild()`.
 pub fn pathOf(live: *const Live, id: EntryId, path_buffer: []u8) ?[]const u8 {
-    const store = if (id.in_delta) &live.delta.store else &live.base;
-    if (id.index >= store.len()) return null;
-    return store.path(id.index, path_buffer);
+    if (id.in_delta) return live.delta.builder.path(id.index, path_buffer);
+    if (id.index >= live.base.len()) return null;
+    return live.base.path(id.index, path_buffer);
 }
 
 fn depthOf(live: *const Live, id: EntryId) u16 {
-    const store = if (id.in_delta) &live.delta.store else &live.base;
-    if (id.index >= store.len()) return 0;
-    return store.depths()[id.index];
+    if (id.in_delta) {
+        if (id.index >= live.delta.len()) return 0;
+        return live.delta.builder.depths.items[id.index];
+    }
+    if (id.index >= live.base.len()) return 0;
+    return live.base.depths()[id.index];
 }
 
 /// Searches base and delta and merges by score. Paths are allocated in

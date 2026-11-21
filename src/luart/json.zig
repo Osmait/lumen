@@ -19,15 +19,22 @@ const depth_max = 200;
 /// `lumen.json.decode(text)`: pushes the decoded value. Parsing allocates
 /// from `gpa`, freed before returning; the push runs under `tryCall`.
 pub fn decode(L: *lua.State, gpa: std.mem.Allocator, text: []const u8) lua.Error!void {
-    var capped: lua.Capped = .leftIn(L, gpa);
-    var parsed = std.json.parseFromSlice(std.json.Value, capped.allocator(), text, .{}) catch |err|
-        return lua.fail(L, "json.decode: {s}", .{switch (err) {
-            error.OutOfMemory => "out of memory",
-            error.SyntaxError, error.UnexpectedEndOfInput => "invalid JSON",
-            else => @errorName(err),
-        }});
-    defer parsed.deinit();
-    if (!lua.tryCall(L, std.json.Value, &parsed.value, pushRoot, 0, 1)) return error.Raise;
+    const status = blk: {
+        var capped: lua.Capped = .leftIn(L, gpa);
+        var parsed = std.json.parseFromSlice(std.json.Value, capped.allocator(), text, .{}) catch |err|
+            return lua.fail(L, "json.decode: {s}", .{switch (err) {
+                error.OutOfMemory => "out of memory",
+                error.SyntaxError, error.UnexpectedEndOfInput => "invalid JSON",
+                else => @errorName(err),
+            }});
+        defer parsed.deinit();
+        break :blk lua.tryCall(L, std.json.Value, &parsed.value, pushRoot, 0, 1);
+    };
+    return switch (status) {
+        .ok => {},
+        .raised => error.Raise,
+        .stack_overflow => lua.fail(L, "Lua stack overflow", .{}),
+    };
 }
 
 fn pushRoot(L: *lua.State, value: *std.json.Value) void {
@@ -75,14 +82,22 @@ fn push(L: *lua.State, value: std.json.Value, depth: usize) void {
 pub fn encode(L: *lua.State, gpa: std.mem.Allocator, index: c_int) lua.Error!void {
     // Shared tables are written once per reference: `t = {t, t}` forty
     // times over is 2^40 values in a few bytes of Lua.
-    var capped: lua.Capped = .leftIn(L, gpa);
-    var output: std.Io.Writer.Allocating = .init(capped.allocator());
-    defer output.deinit();
-    var encoder: Encoder = .{ .writer = &output.writer };
-    c.lua_pushvalue(L, index);
-    if (!lua.tryCall(L, Encoder, &encoder, Encoder.run, 1, 0)) return error.Raise;
-    var text: Text = .{ .bytes = output.written() };
-    if (!lua.tryCall(L, Text, &text, Text.push, 0, 1)) return error.Raise;
+    const status: lua.TryCallResult = blk: {
+        var capped: lua.Capped = .leftIn(L, gpa);
+        var output: std.Io.Writer.Allocating = .init(capped.allocator());
+        defer output.deinit();
+        var encoder: Encoder = .{ .writer = &output.writer };
+        c.lua_pushvalue(L, index);
+        const encoded = lua.tryCall(L, Encoder, &encoder, Encoder.run, 1, 0);
+        if (encoded != .ok) break :blk encoded;
+        var text: Text = .{ .bytes = output.written() };
+        break :blk lua.tryCall(L, Text, &text, Text.push, 0, 1);
+    };
+    return switch (status) {
+        .ok => {},
+        .raised => error.Raise,
+        .stack_overflow => lua.fail(L, "Lua stack overflow", .{}),
+    };
 }
 
 const Text = struct {
