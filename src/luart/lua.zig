@@ -302,12 +302,16 @@ pub fn protect(
     return arena.dupeSentinel(u8, message, 0) catch "error (out of memory)";
 }
 
+pub const TryCallResult = enum { ok, raised, stack_overflow };
+
 /// Calls `handler(L, context)` in protected mode with the top
-/// `arguments_count` values as its arguments (at stack index 2 on). On
-/// success leaves `results_count` values and returns true; on a Lua error
-/// leaves the error value and returns false.
-/// For Zig functions called from Lua that hold resources: free them, then
-/// raise the error (`return error.Raise`).
+/// `arguments_count` values as its arguments (at stack index 2 on). Never
+/// longjmps:
+/// - `.ok`: leaves `results_count` values on the stack.
+/// - `.raised`: leaves the error value on the stack (`return error.Raise`).
+/// - `.stack_overflow`: pops the arguments and pushes nothing (pushing in
+///   OOM could longjmp and skip caller defers); free Zig resources first,
+///   then `return lua.fail(L, "Lua stack overflow", .{})`.
 pub fn tryCall(
     L: *State,
     comptime Context: type,
@@ -315,20 +319,22 @@ pub fn tryCall(
     comptime handler: fn (*State, *Context) void,
     arguments_count: c_int,
     results_count: c_int,
-) bool {
+) TryCallResult {
     assert(arguments_count >= 0);
     assert(arguments_count <= c.lua_gettop(L));
     assert(results_count >= 0);
     if (c.lua_checkstack(L, 2) == 0) {
         pop(L, arguments_count);
-        _ = c.lua_pushstring(L, "Lua stack overflow");
-        return false;
+        return .stack_overflow;
     }
     c.lua_pushcclosure(L, &Trampoline(Context, handler).call, 0);
     c.lua_pushlightuserdata(L, context);
     // The function and its context go under the arguments.
     c.lua_rotate(L, -arguments_count - 2, 2);
-    return c.lua_pcallk(L, arguments_count + 1, results_count, 0, 0, null) == c.LUA_OK;
+    return if (c.lua_pcallk(L, arguments_count + 1, results_count, 0, 0, null) == c.LUA_OK)
+        .ok
+    else
+        .raised;
 }
 
 /// The C function `protect` and `tryCall` call. Its context is its first
@@ -391,11 +397,30 @@ pub fn fail(L: *State, comptime format: []const u8, args: anytype) Error {
     return error.Raise;
 }
 
-/// Pushes a formatted string (cut at 512 bytes).
+/// Pushes a formatted string (cut at 512 bytes, between UTF-8 characters).
 pub fn pushFmt(L: *State, comptime format: []const u8, args: anytype) void {
     var message_buffer: [512]u8 = undefined;
-    const message = std.mem.print(&message_buffer, format, args) catch message_buffer[0..];
+    var writer: std.Io.Writer = .fixed(&message_buffer);
+    writer.print(format, args) catch |err| switch (err) {
+        error.WriteFailed => {},
+    };
+    const message = dropPartialTail(writer.buffered());
     _ = c.lua_pushlstring(L, message.ptr, message.len);
+}
+
+/// Drops an incomplete UTF-8 sequence at the very end of `text` (from a
+/// fixed-buffer print that stopped mid-character).
+fn dropPartialTail(text: []const u8) []const u8 {
+    if (text.len == 0) return text;
+    var start = text.len - 1;
+    var steps: usize = 0;
+    while (start > 0 and steps < 3 and text[start] & 0xC0 == 0x80) {
+        start -= 1;
+        steps += 1;
+    }
+    const expected = std.unicode.utf8ByteSequenceLength(text[start]) catch return text;
+    if (start + expected > text.len) return text[0..start];
+    return text;
 }
 
 /// Raises a formatted error now. Only inside `protect` handlers and from
@@ -838,4 +863,27 @@ test "strings are cut between characters" {
     // "é" is two bytes: cutting inside it drops it whole.
     try testing.expectEqualStrings("a", cut("aé", 2));
     try testing.expectEqualStrings("aé", cut("aéz", 3));
+}
+
+test "pushFmt never reads uninitialized tail bytes and keeps UTF-8 valid" {
+    var budget: Budget = .{ .bytes_max = 8 << 20 };
+    const L = try testState(&budget);
+    defer c.lua_close(L);
+
+    // 510 'a' bytes + 3-byte '€' overflows the 512-byte buffer mid-character.
+    var prefix: [510]u8 = @splat('a');
+    pushFmt(L, "{s}€", .{&prefix});
+    const pushed = toSlice(L, -1).?;
+    try testing.expectEqual(@as(usize, 510), pushed.len);
+    try testing.expect(std.unicode.utf8ValidateSlice(pushed));
+    pop(L, 1);
+
+    // A number that fails to fit near the end leaves only the written prefix.
+    var prefix2: [508]u8 = @splat('b');
+    pushFmt(L, "{s}{d}", .{ &prefix2, @as(u64, 1234567890) });
+    const pushed2 = toSlice(L, -1).?;
+    try testing.expect(pushed2.len >= 508 and pushed2.len <= 512);
+    try testing.expectEqualStrings(&prefix2, pushed2[0..508]);
+    for (pushed2[508..]) |ch| try testing.expect(std.ascii.isDigit(ch));
+    pop(L, 1);
 }

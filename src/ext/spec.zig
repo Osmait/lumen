@@ -40,12 +40,15 @@ comptime {
 /// and commands.
 pub fn parseExtension(L: *lua.State, context: *LoadContext, spec: c_int) void {
     const arena = context.load.arena;
-    const title = lua.fieldString(L, arena, spec, "title", "extension") orelse
-        context.extension.id;
+    // Duplicate into the registry arena: `context.extension.id` lives in
+    // `Host.worker_arena`, which is reset on the next reload while GTK still
+    // reads the previous registry.
+    const extension_id = arena.dupeSentinel(u8, context.extension.id, 0) catch lua.oom(L);
+    const title = lua.fieldString(L, arena, spec, "title", "extension") orelse extension_id;
     context.title = title;
     const icon_default = rows_mod.fieldIcon(L, arena, spec, "extension.icon") orelse addon_icon;
-    parsePreferences(L, context, spec, title);
-    parseCommands(L, context, spec, title, icon_default);
+    parsePreferences(L, context, spec, extension_id, title);
+    parseCommands(L, context, spec, extension_id, title, icon_default);
 }
 
 /// The icon of an extension's commands when neither it nor they name one.
@@ -58,6 +61,7 @@ fn parsePreferences(
     L: *lua.State,
     context: *LoadContext,
     spec: c_int,
+    extension_id: [:0]const u8,
     extension_title: [:0]const u8,
 ) void {
     const mark: lua.StackMark = .init(L);
@@ -71,8 +75,8 @@ fn parsePreferences(
         const where = std.mem.print(&where_buffer, "preferences[{d}]", .{preference_number}) catch
             "preferences";
         const field_table = lua.tableAt(L, preferences, preference_number, where);
-        const preference = parseField(L, context, field_table, where, extension_title);
-        if (preferenceDeclared(context.load, context.extension.id, preference.name)) {
+        const preference = parseField(L, context, field_table, where, extension_id, extension_title);
+        if (preferenceDeclared(context.load, extension_id, preference.name)) {
             lua.raise(L, "two preferences named \"{s}\"", .{preference.name});
         }
         context.load.preferences.append(context.load.arena, preference) catch lua.oom(L);
@@ -91,6 +95,7 @@ fn parseCommands(
     L: *lua.State,
     context: *LoadContext,
     spec: c_int,
+    extension_id: [:0]const u8,
     extension_title: [:0]const u8,
     icon_default: item_mod.Icon,
 ) void {
@@ -109,7 +114,7 @@ fn parseCommands(
         const where = std.mem.print(&where_buffer, "commands[{d}]", .{command_number}) catch
             "commands";
         const command_table = lua.tableAt(L, commands, command_number, where);
-        parseCommand(L, context, command_table, where, extension_title, icon_default);
+        parseCommand(L, context, command_table, where, extension_id, extension_title, icon_default);
     }
 }
 
@@ -167,6 +172,7 @@ fn parseField(
     context: *LoadContext,
     field_table: c_int,
     where: []const u8,
+    extension_id: [:0]const u8,
     extension_title: [:0]const u8,
 ) Preference {
     const arena = context.load.arena;
@@ -180,7 +186,7 @@ fn parseField(
     const file = arena.printSentinel("{s}/preferences.json", .{context.extension.data}, 0) catch
         lua.oom(L);
     var preference: Preference = .{
-        .extension = context.extension.id,
+        .extension = extension_id,
         .extension_title = extension_title,
         .file = file,
         .name = name,
@@ -251,6 +257,7 @@ fn formFields(
     command_table: c_int,
     is_form: bool,
     where: []const u8,
+    extension_id: [:0]const u8,
     extension_title: [:0]const u8,
 ) []const Preference {
     const mark: lua.StackMark = .init(L);
@@ -281,7 +288,7 @@ fn formFields(
             .{ where, field_number },
         ) catch where;
         const field_table = lua.tableAt(L, field_list, field_number, field_where);
-        field.* = parseField(L, context, field_table, field_where, extension_title);
+        field.* = parseField(L, context, field_table, field_where, extension_id, extension_title);
         for (fields[0 .. field_number - 1]) |previous| {
             if (std.mem.eql(u8, previous.name, field.name)) {
                 lua.raise(L, "{s}: two fields named \"{s}\"", .{ where, field.name });
@@ -326,6 +333,7 @@ fn parseCommand(
     context: *LoadContext,
     command_table: c_int,
     where: []const u8,
+    extension_id: [:0]const u8,
     extension_title: [:0]const u8,
     icon_default: item_mod.Icon,
 ) void {
@@ -355,7 +363,7 @@ fn parseCommand(
         .mode = mode,
         .detail = lua.fieldBool(L, command_table, "detail", false, where),
         .answers_root_search = answers_root_search,
-        .fields = formFields(L, context, command_table, mode == .form, where, extension_title),
+        .fields = formFields(L, context, command_table, mode == .form, where, extension_id, extension_title),
         .submit_title = lua.fieldString(L, arena, command_table, "submit_title", where) orelse
             "Submit",
         .grid = lua.fieldBool(L, command_table, "grid", false, where),

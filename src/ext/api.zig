@@ -326,10 +326,13 @@ fn lumenExec(L: *lua.State) lua.Error!c_int {
         lua.pushFmt(L, "lumen.exec: {s} timed out", .{argv[0]});
         return 2;
     }
-    const pushed = lua.tryCall(L, child.Result, &result, pushExec, 0, 3);
+    const status = lua.tryCall(L, child.Result, &result, pushExec, 0, 3);
     result.deinit(extension.gpa());
-    if (!pushed) return error.Raise;
-    return 3;
+    return switch (status) {
+        .ok => 3,
+        .raised => error.Raise,
+        .stack_overflow => lua.fail(L, "Lua stack overflow", .{}),
+    };
 }
 
 fn pushExec(L: *lua.State, result: *child.Result) void {

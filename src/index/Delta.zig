@@ -185,30 +185,11 @@ pub fn appendStore(
 }
 
 /// Makes `store` match `builder`. Ids stay the same (`kids` relies on it).
-/// On error the builder may be partly consumed: the caller asks for a
-/// rescan.
+/// Atomic on OOM: `builder` and `store` stay untouched if allocation fails.
 pub fn rebuild(delta: *Delta, gpa: std.mem.Allocator) std.mem.Allocator.Error!void {
-    // Refill a builder from the new store so more can be added; scaffolding
-    // stays mask 0. Both are complete before anything is replaced.
-    var fresh = try delta.builder.finish(gpa);
-    errdefer fresh.deinit(gpa);
-    var refilled: Builder = .empty;
-    errdefer refilled.deinit(gpa);
-    const parents = fresh.parents();
-    const fresh_flags = fresh.flags();
-    const depths = fresh.depths();
-    for (0..fresh.len()) |i| {
-        const id: u32 = @intCast(i);
-        const name = fresh.name(id);
-        if (fresh.isTombstoned(id)) {
-            _ = try refilled.pushStructural(gpa, name, parents[i], fresh_flags[i], depths[i]);
-        } else {
-            _ = try refilled.push(gpa, name, parents[i], fresh_flags[i], depths[i]);
-        }
-    }
+    const fresh = try delta.builder.toStore(gpa);
     delta.store.deinit(gpa);
     delta.store = fresh;
-    delta.builder = refilled;
     // Ids changed: the engine's cached candidates mean nothing now.
     delta.engine.reset();
 }
