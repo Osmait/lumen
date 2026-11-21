@@ -38,9 +38,11 @@ pub fn floorBoundary(text: []const u8, len_max: usize) usize {
     if (len_max >= text.len) return text.len;
     var end = len_max;
     // Cut before the lead byte of the character `len_max` falls in.
+    // Stray leading continuation bytes stop at 0 rather than asserting byte 0
+    // is a lead byte.
     while (end > 0 and isContinuation(text[end])) end -= 1;
     assert(end <= len_max);
-    assert(!isContinuation(text[end]));
+    assert(end == 0 or !isContinuation(text[end]));
     return end;
 }
 
@@ -92,4 +94,5 @@ test "validWindow and floorBoundary never split a character" {
     try std.testing.expectEqual(@as(usize, 1), floorBoundary("x€", 3));
     try std.testing.expectEqual(@as(usize, 4), floorBoundary("x€", 4));
     try std.testing.expectEqual(@as(usize, 4), floorBoundary("x€", 9));
+    try std.testing.expectEqual(@as(usize, 0), floorBoundary("\x80\x80\x80\x80", 2));
 }

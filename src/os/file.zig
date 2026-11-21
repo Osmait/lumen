@@ -207,12 +207,30 @@ pub const AppendFile = struct {
     /// Null when the file is not `expect_len` bytes long (someone else wrote
     /// it): the caller rewrites it whole instead.
     pub fn open(path: [*:0]const u8, expect_len: usize) Error!?AppendFile {
-        const fd: i32 = @intCast(try check(linux.open(
+        const open_result = linux.open(
             path,
-            .{ .ACCMODE = .WRONLY, .CLOEXEC = true },
+            .{
+                .ACCMODE = .WRONLY,
+                .CLOEXEC = true,
+                .NOFOLLOW = true,
+                .NONBLOCK = true,
+                .NOCTTY = true,
+            },
             0,
-        )));
+        );
+        // O_WRONLY|O_NONBLOCK on a FIFO with no reader returns ENXIO; O_NOFOLLOW
+        // on a symlink returns ELOOP; a directory returns EISDIR.
+        switch (linux.errno(open_result)) {
+            .NXIO, .LOOP, .ISDIR => return error.NotRegular,
+            else => {},
+        }
+        const fd: i32 = @intCast(try check(open_result));
         errdefer close(fd);
+        var stx: linux.Statx = undefined;
+        const stx_result = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stx);
+        if (linux.errno(stx_result) != .SUCCESS or stx.mode & linux.S.IFMT != linux.S.IFREG) {
+            return error.NotRegular;
+        }
         const size = try check(linux.lseek(fd, 0, linux.SEEK.END));
         if (size != expect_len) {
             close(fd);
@@ -283,6 +301,11 @@ test "special files are refused without blocking" {
     // Each of these used to block forever on a FIFO with no writer.
     try std.testing.expectEqualStrings("", readHead(fifo, &head_buffer));
     try std.testing.expectError(error.NotRegular, mapPrivate(fifo));
+    try std.testing.expectError(error.NotRegular, AppendFile.open(fifo, 0));
+    var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const link = try std.mem.printSentinel(&link_buffer, "{s}/link", .{dir}, 0);
+    try expectSuccess(linux.symlink(fifo, link));
+    try std.testing.expectError(error.NotRegular, AppendFile.open(link, 0));
     try std.testing.expect(!os.isRegular(fifo));
     try std.testing.expectEqualStrings("", readHead("/dev/null", &head_buffer));
     try std.testing.expect(os.isRegular("/proc/self/status"));

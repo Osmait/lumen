@@ -110,9 +110,12 @@ pub fn run(
             else => {},
         } else |_| {}
     }
+    const stdout = try pump.stdout.toOwnedSlice(gpa);
+    errdefer gpa.free(stdout);
+    const stderr = try pump.stderr.toOwnedSlice(gpa);
     return .{
-        .stdout = try pump.stdout.toOwnedSlice(gpa),
-        .stderr = try pump.stderr.toOwnedSlice(gpa),
+        .stdout = stdout,
+        .stderr = stderr,
         .code = code,
         .timed_out = timed_out,
         .capped = end == .capped,

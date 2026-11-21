@@ -107,3 +107,29 @@ pub fn find(name: []const u8) ?*const Unit {
     }
     return null;
 }
+
+/// The longest unit name at the end of `left` preceded by an amount boundary
+/// ("10 km", "10km", "10 m2", "10 fl oz", "(5 + 5) km"), or null.
+pub fn findSuffix(left: []const u8) ?struct { unit: *const Unit, split: usize } {
+    var best_unit: ?*const Unit = null;
+    var best_len: usize = 0;
+    for (&units) |*unit| {
+        for (unit.names) |unit_name| {
+            if (unit_name.len <= best_len or unit_name.len >= left.len) continue;
+            const split = left.len - unit_name.len;
+            if (!endsAmount(left[split - 1])) continue;
+            if (!std.ascii.eqlIgnoreCase(left[split..], unit_name)) continue;
+            best_unit = unit;
+            best_len = unit_name.len;
+        }
+    }
+    const unit = best_unit orelse return null;
+    return .{ .unit = unit, .split = left.len - best_len };
+}
+
+/// A character that ends the amount before a unit name: "10 km", "10km",
+/// "(5 + 5) km", "5! km".
+fn endsAmount(char: u8) bool {
+    return std.ascii.isDigit(char) or
+        char == ' ' or char == ')' or char == '.' or char == '!' or char == '%';
+}

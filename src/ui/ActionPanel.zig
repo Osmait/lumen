@@ -111,6 +111,8 @@ pub fn select(panel: *ActionPanel, entry_index: usize) void {
 
 fn onRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, data: ?*anyopaque) callconv(.c) void {
     const ui: *Ui = @ptrCast(@alignCast(data));
-    const entry_index: usize = @intCast(c.gtk_list_box_row_get_index(row));
+    const raw_index = c.gtk_list_box_row_get_index(row);
+    if (raw_index < 0) return;
+    const entry_index: usize = @intCast(raw_index);
     if (entry_index < ui.panel.entries.len) ui.performEntry(ui.panel.entries[entry_index]);
 }

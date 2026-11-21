@@ -463,14 +463,38 @@ pub const Settings = struct {
         }
     }
 
-    /// Reads `path`; a missing or unreadable file gives the defaults.
+    /// Reads `path`; a missing or unreadable file gives the defaults. When the
+    /// file exists but cannot be read (permissions, I/O error, non-regular
+    /// file, or larger than the buffer), `incomplete` is set so a later `save`
+    /// refuses to overwrite the user's file with defaults.
     pub fn load(gpa: std.mem.Allocator, path: [*:0]const u8) Settings {
         var buffer: [64 * 1024]u8 = undefined;
-        const text = sys.readHead(path, &buffer);
-        var settings = parse(gpa, text);
+        const fd = sys.openRegular(path) catch |err| {
+            var defaults = Settings.init(gpa);
+            if (err != error.NotFound) defaults.incomplete = true;
+            return defaults;
+        };
+        defer sys.close(fd);
+        var len: usize = 0;
+        while (len < buffer.len) {
+            const result = std.os.linux.read(fd, buffer[len..].ptr, buffer.len - len);
+            switch (std.os.linux.errno(result)) {
+                .SUCCESS => {
+                    if (result == 0) break;
+                    len += result;
+                },
+                .INTR => continue,
+                else => {
+                    var defaults = Settings.init(gpa);
+                    defaults.incomplete = true;
+                    return defaults;
+                },
+            }
+        }
+        var settings = parse(gpa, buffer[0..len]);
         // Filled up: the file goes on past what was read, and saving would
         // cut it there.
-        if (text.len == buffer.len) settings.incomplete = true;
+        if (len == buffer.len) settings.incomplete = true;
         return settings;
     }
 
@@ -489,6 +513,7 @@ pub const Settings = struct {
         if (std.mem.findScalarLast(u8, path, '/')) |slash| try sys.mkdirP(path[0..slash]);
         var file = if (kept.len > 0) load(gpa, path.ptr) else Settings.init(gpa);
         defer file.deinit();
+        if (file.incomplete) return error.Incomplete;
         var output: std.Io.Writer.Allocating = .init(gpa);
         defer output.deinit();
         try settings.writeKeeping(&output.writer, &file, kept);
@@ -695,6 +720,19 @@ test "save is atomic and owner-only; load survives a missing file" {
     defer kept.deinit();
     try testing.expectEqual(Width.default, kept.width);
     try testing.expectEqual(TextSize.small, kept.text_size);
+
+    // An existing unreadable / non-regular path marks `incomplete` so save()
+    // never clobbers it with defaults.
+    const fifo_path = try std.mem.printSentinel(&path_buffer, "{s}/settings.fifo", .{dir_path}, 0);
+    try testing.expectEqual(
+        linux.E.SUCCESS,
+        linux.errno(linux.mknodat(linux.AT.FDCWD, fifo_path, linux.S.IFIFO | 0o600, 0)),
+    );
+    var unreadable = Settings.load(testing.allocator, fifo_path);
+    defer unreadable.deinit();
+    try testing.expect(unreadable.incomplete);
+    try testing.expectError(error.Incomplete, unreadable.save(testing.allocator, fifo_path, &.{}));
+    try testing.expectError(error.Incomplete, settings.save(testing.allocator, fifo_path, &.{"width"}));
 }
 
 test "each text choice sets its own field" {
