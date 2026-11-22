@@ -50,6 +50,8 @@ file: []const u8,
 segments: []const SegmentEntry,
 /// Documents flagged removed: their ids stay, queries skip them.
 docs_removed_count: usize,
+/// Live documents whose text was extracted (`extractedLive`).
+extracted_live_count: usize,
 /// Bytes the header refers to; the rest of the file is what updates
 /// left behind (old doc tables, merged segments).
 bytes_live: usize,
@@ -63,9 +65,11 @@ const DocColumns = struct {
     path_sizes: []const u16,
     sources: []const u8,
     flags: []u8,
-    /// Bytes of all paths, and documents marked removed.
+    /// Bytes of all paths, documents marked removed, and live documents
+    /// whose text was extracted.
     paths_size_total: usize,
     docs_removed_count: usize,
+    extracted_live_count: usize,
 
     fn parse(
         file: Bytes,
@@ -102,9 +106,12 @@ const DocColumns = struct {
             if (std.enums.fromInt(Source, source) == null) return error.BadIndex;
         }
         columns.docs_removed_count = 0;
-        for (columns.flags) |flags| {
+        columns.extracted_live_count = 0;
+        for (columns.flags, columns.sources) |flags, source| {
             if (flags & ~flag_removed != 0) return error.BadIndex;
             columns.docs_removed_count += flags & flag_removed;
+            const extracted = source == @backingInt(Source.extracted);
+            columns.extracted_live_count += @intFromBool(extracted and flags & flag_removed == 0);
         }
         return columns;
     }
@@ -138,13 +145,11 @@ pub fn extractedLive(index: *const ContentIndex, doc: u32) bool {
         index.sources[doc] == @backingInt(Source.extracted);
 }
 
-/// How many documents `extractedLive` is true for.
+/// How many documents `extractedLive` is true for: counted once, when
+/// the index is parsed (it never changes after), not on every status.
 pub fn extractedCount(index: *const ContentIndex) usize {
-    var count: usize = 0;
-    for (0..index.docs_count) |doc_index| {
-        count += @intFromBool(index.extractedLive(@intCast(doc_index)));
-    }
-    return count;
+    assert(index.extracted_live_count <= index.live());
+    return index.extracted_live_count;
 }
 
 pub fn docIn(index: *const ContentIndex, doc: u32) DocIn {
@@ -246,6 +251,7 @@ pub fn parse(whole: Bytes, backing: format.Backing) error{BadIndex}!ContentIndex
         .file = file,
         .segments = segments,
         .docs_removed_count = columns.docs_removed_count,
+        .extracted_live_count = columns.extracted_live_count,
         .bytes_live = bytes_live,
     };
 }

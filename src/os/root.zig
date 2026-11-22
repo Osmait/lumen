@@ -64,6 +64,7 @@ pub const mapPrivate = file.mapPrivate;
 pub const unmap = file.unmap;
 
 pub const slowMounts = mounts.slowMounts;
+pub const isAtOrBelow = mounts.isAtOrBelow;
 pub const freeList = mounts.freeList;
 
 pub const nowSeconds = time.nowSeconds;

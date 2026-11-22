@@ -366,11 +366,10 @@ fn siftChunk(
     const kept_max = context.kept_max;
     const compact_at = kept_max * 2;
     try partial.top.ensureTotalCapacity(context.gpa, compact_at);
-    // Room for the chunk's candidates at once, not grown one by one.
-    if (context.candidates_max > 0) {
-        const candidates_room = @min(end - start, context.candidates_max);
-        try partial.candidates.ensureTotalCapacity(context.gpa, candidates_room);
-    }
+    // Candidates grow as they come: room for the whole chunk up front was
+    // ~32 KB for each of ~196 chunks per keystroke, when a selective query
+    // keeps a handful.
+
     var threshold: i32 = std.math.minInt(i32);
 
     var position = start;

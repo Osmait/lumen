@@ -93,14 +93,22 @@ pub fn title(ui: *Ui) [*:0]const u8 {
 pub fn candidates(ui: *Ui, arena: std.mem.Allocator) []Item {
     const registry = ui.ext_registry orelse return &.{};
     var out: std.ArrayList(Item) = .empty;
+    // An extension's preferences share one file: read and parsed once for
+    // all of them, not once per row.
+    var stored_file: []const u8 = "";
+    var stored: Stored = .absent;
     for (registry.preferences, 0..) |preference, i| {
         if (!std.mem.eql(u8, preference.extension, extensionId(ui))) continue;
+        if (!std.mem.eql(u8, preference.file, stored_file)) {
+            stored = readStored(arena, preference.file);
+            stored_file = preference.file;
+        }
         out.append(arena, .{
             .key = arena.print("pref:{s}", .{preference.name}) catch continue,
             .section = "Preferences",
             .title = preference.title,
             .subtitle = preference.description,
-            .accessory = display(arena, &preference, current(arena, &preference)),
+            .accessory = display(arena, &preference, currentIn(stored, &preference)),
             .icon = iconOf(preference.kind),
             .action = .{ .setting = .{ .pref = .from(i) } },
         }) catch break;
@@ -188,15 +196,21 @@ const Stored = union(enum) { absent, unreadable, values: std.json.ObjectMap };
 /// refused instead of parsed.
 const preferences_bytes_max = 1 << 20;
 
-/// The preferences file at `file`, parsed into `arena`.
+/// The preferences file at `file`, parsed into `arena`. Read from a
+/// descriptor checked to be a regular file (a FIFO would block the window)
+/// and no further than `preferences_bytes_max`: the size is known before
+/// the whole file is in memory.
 fn readStored(arena: std.mem.Allocator, file: [:0]const u8) Stored {
-    if (os.info(file.ptr) == null) return .absent;
-    var contents: ?[*:0]u8 = null;
-    var length: usize = 0;
-    if (c.g_file_get_contents(file.ptr, &contents, &length, null) == 0) return .unreadable;
-    defer c.g_free(contents);
-    if (length > preferences_bytes_max) return .unreadable;
-    const text = contents.?[0..length];
+    const fd = os.openRegular(file) catch |err| return switch (err) {
+        error.NotFound => .absent,
+        else => .unreadable,
+    };
+    defer os.close(fd);
+    var contents: std.ArrayList(u8) = .empty;
+    // One byte past the limit tells a file over it.
+    os.readUpTo(arena, fd, &contents, preferences_bytes_max + 1) catch return .unreadable;
+    if (contents.items.len > preferences_bytes_max) return .unreadable;
+    const text = contents.items;
     if (std.mem.trim(u8, text, " \t\r\n").len == 0) return .absent;
     const parsed = std.json.parseFromSliceLeaky(
         std.json.Value,
@@ -209,7 +223,12 @@ fn readStored(arena: std.mem.Allocator, file: [:0]const u8) Stored {
 
 /// The saved value as text ("true"/"false" for toggles), else the default.
 pub fn current(arena: std.mem.Allocator, preference: *const Host.Preference) []const u8 {
-    const stored = switch (readStored(arena, preference.file)) {
+    return currentIn(readStored(arena, preference.file), preference);
+}
+
+/// `current` from the file read already.
+fn currentIn(stored_file: Stored, preference: *const Host.Preference) []const u8 {
+    const stored = switch (stored_file) {
         .values => |values| values,
         .absent, .unreadable => return preference.default,
     };

@@ -253,7 +253,11 @@ pub fn fullyArmed(live: *const Live) bool {
 /// Entries a search can find, in the base and the delta. The delta's
 /// scaffolding and its own tombstones are not counted.
 pub fn entriesLive(live: *const Live) usize {
-    return live.base.liveCount() + live.delta.store.liveCount();
+    // The base's from `graves`, kept as entries are tombstoned: counting its
+    // live masks was a pass over ~1.6 M of them under the lock, on every
+    // status. The delta is small.
+    assert(live.graves <= live.base.len());
+    return live.base.len() - live.graves + live.delta.store.liveCount();
 }
 
 /// Bytes the two stores take, mapped or in memory.
@@ -1211,6 +1215,9 @@ test "live: adopt leaves a clean index that finds the same" {
     try testing.expect(tree.live.dirty);
     try testing.expect(tree.live.delta.store.len() > 0);
     try testing.expect(tree.live.base.liveCount() < tree.live.base.len());
+    // The count kept from `graves` is the one a pass over the masks gives.
+    const counted = tree.live.base.liveCount() + tree.live.delta.store.liveCount();
+    try testing.expectEqual(counted, tree.live.entriesLive());
 
     const arena = tree.arena.allocator();
     var before: std.ArrayList([]const u8) = .empty;

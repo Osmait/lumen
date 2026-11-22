@@ -359,6 +359,7 @@ pub extern fn g_application_command_line_set_exit_status(
     status: c_int,
 ) void;
 pub extern fn g_object_ref(object: *anyopaque) *anyopaque;
+pub extern fn g_object_ref_sink(object: *anyopaque) *anyopaque;
 pub extern fn g_cancellable_new() *GCancellable;
 pub extern fn g_cancellable_cancel(cancellable: *GCancellable) void;
 pub extern fn g_input_stream_read_bytes_async(

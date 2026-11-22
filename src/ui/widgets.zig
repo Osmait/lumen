@@ -140,9 +140,17 @@ fn TextureRing(comptime capacity: usize, comptime Key: type) type {
             return null;
         }
 
-        /// Takes `texture`'s reference.
+        /// Takes `texture`'s reference. A key already in the ring gets the
+        /// new texture in its slot: a second slot for it would only push out
+        /// another key and leave a stale copy behind.
         fn put(ring: *Ring, key: Key, texture: ?*c.GdkTexture) void {
             assert(ring.count <= capacity);
+            for (ring.keys[0..ring.count], ring.textures[0..ring.count]) |slot_key, *slot_texture| {
+                if (slot_key != key) continue;
+                if (slot_texture.*) |old| c.g_object_unref(old);
+                slot_texture.* = texture;
+                return;
+            }
             const slot = if (ring.count < capacity) ring.count else ring.next;
             if (ring.count < capacity) {
                 ring.count += 1;
@@ -323,7 +331,10 @@ const GridPictures = struct {
         icon: *c.GtkWidget,
     ) void {
         const wait = std.heap.c_allocator.create(Wait) catch return;
-        _ = c.g_object_ref(box);
+        // The cell is not in the grid yet: its reference is still floating.
+        // A plain ref left it floating, so the grid's ref_sink took that one
+        // and a cell never added leaked; sunk here, the grid adds its own.
+        _ = c.g_object_ref_sink(box);
         _ = c.g_object_ref(icon);
         wait.* = .{ .key = key, .height_px = height_px, .box = box, .icon = icon };
         const lane = &pictures.grid_lane;

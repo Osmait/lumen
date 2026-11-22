@@ -79,6 +79,7 @@ pub const count_cap = content_search.count_cap;
 pub const candidates_verified_max = content_search.candidates_verified_max;
 pub const Span = content_find.Span;
 pub const findFold = content_find.findFold;
+pub const findFolded = content_find.findFolded;
 pub const findCI = content_find.findCI;
 
 test {

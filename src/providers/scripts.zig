@@ -80,10 +80,13 @@ const FolderStamp = union(enum) {
 fn stamp(path: [:0]const u8) FolderStamp {
     const dir_handle = c.g_dir_open(path.ptr, 0, null) orelse return .missing;
     defer c.g_dir_close(dir_handle);
-    var hasher: std.hash.Wyhash = .init(0);
+    // Each file hashed on its own, the hashes summed: readdir gives them in
+    // the file system's order, which can differ for the same files.
+    var files_sum: u64 = 0;
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     while (c.g_dir_read_name(dir_handle)) |name_terminated| {
         const name = std.mem.span(name_terminated);
+        var hasher: std.hash.Wyhash = .init(0);
         hasher.update(name);
         const file_path = std.mem.printSentinel(
             &path_buffer,
@@ -94,8 +97,9 @@ fn stamp(path: [:0]const u8) FolderStamp {
         if (os.info(file_path)) |file_info| {
             hasher.update(std.mem.asBytes(&.{ file_info.mtime, file_info.size }));
         }
+        files_sum +%= hasher.final();
     }
-    return .{ .hashed = hasher.final() };
+    return .{ .hashed = files_sum };
 }
 
 /// Scans the scripts directory at `path`. Everything lives in `arena`.
@@ -149,11 +153,49 @@ fn itemOf(
     };
 }
 
-/// Non-ASCII and short: an emoji, not an icon name.
+/// The longest emoji taken, in bytes: a family or a flag with joiners and
+/// modifiers runs to ~30 ("👨‍👩‍👧‍👦" is 25).
+const emoji_bytes_max = 64;
+
+/// An emoji, not an icon name: one that starts with an emoji character and
+/// has no letter or digit after (joiners, variation selectors and skin
+/// tones are fine). "Ñandú" starts with a non-ASCII letter: not an emoji.
 fn looksLikeEmoji(icon: []const u8) bool {
-    if (icon.len == 0) return false;
-    if (icon.len > 8) return false;
-    return icon[0] >= 0x80;
+    if (icon.len == 0 or icon.len > emoji_bytes_max) return false;
+    const view = std.unicode.Utf8View.init(icon) catch return false;
+    var codepoints = view.iterator();
+    const first = codepoints.nextCodepoint() orelse return false;
+    if (!isEmojiStart(first)) return false;
+    while (codepoints.nextCodepoint()) |codepoint| {
+        if (codepoint < 0x80 and std.ascii.isAlphanumeric(@intCast(codepoint))) return false;
+    }
+    return true;
+}
+
+/// The blocks emoji start in: pictographs, symbols, dingbats, arrows,
+/// geometric shapes and the few older ones (©, ™, ‼...).
+fn isEmojiStart(codepoint: u21) bool {
+    return switch (codepoint) {
+        0x1F000...0x1FAFF, // pictographs, emoticons, flags, transport...
+        0x2600...0x27BF, // miscellaneous symbols, dingbats
+        0x2300...0x23FF, // technical (⌚, ⏰)
+        0x2B00...0x2BFF, // arrows and stars (⭐)
+        0x2190...0x21FF, // arrows
+        0x25A0...0x25FF, // geometric shapes (▶)
+        0x2900...0x297F, // supplemental arrows
+        0x00A9,
+        0x00AE,
+        0x203C,
+        0x2049,
+        0x2122,
+        0x2139,
+        0x3030,
+        0x303D,
+        0x3297,
+        0x3299,
+        => true,
+        else => false,
+    };
 }
 
 test "a missing folder and an empty one stamp differently, and edits show" {
@@ -173,4 +215,17 @@ test "a missing folder and an empty one stamp differently, and edits show" {
     try std.testing.expect(one_file == .hashed);
     try std.testing.expect(!std.meta.eql(empty, one_file));
     try std.testing.expect(std.meta.eql(one_file, stamp(missing)));
+}
+
+test "emoji icons, joined ones included, and names that are not" {
+    try std.testing.expect(looksLikeEmoji("🚀"));
+    try std.testing.expect(looksLikeEmoji("👨‍💻"));
+    try std.testing.expect(looksLikeEmoji("🏳️‍🌈"));
+    try std.testing.expect(looksLikeEmoji("👍🏽"));
+    try std.testing.expect(looksLikeEmoji("⭐"));
+    try std.testing.expect(!looksLikeEmoji("Ñandú"));
+    try std.testing.expect(!looksLikeEmoji("émoji"));
+    try std.testing.expect(!looksLikeEmoji("utilities-terminal"));
+    try std.testing.expect(!looksLikeEmoji(""));
+    try std.testing.expect(!looksLikeEmoji("\xff\xfe"));
 }

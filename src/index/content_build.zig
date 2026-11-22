@@ -510,6 +510,14 @@ fn indexDocs(
         gpa.free(task_pairs);
     }
     for (task_pairs) |*out| out.* = .empty;
+    // Per task, for the whole build: a 2 MiB bitset made per round was
+    // gigabytes of allocation and page faults over a large build.
+    const scratches = try gpa.alloc(TaskScratch, tasks);
+    defer {
+        for (scratches) |*task_scratch| task_scratch.deinit(gpa);
+        gpa.free(scratches);
+    }
+    for (scratches) |*task_scratch| task_scratch.* = .{};
     const spans = try gpa.alloc(Pairs, round_docs_max);
     defer gpa.free(spans);
 
@@ -524,6 +532,7 @@ fn indexDocs(
             .end = round_end,
             .text = text,
             .task_pairs = task_pairs,
+            .scratches = scratches,
             .spans = spans,
             .next = .init(round_start),
         };
@@ -560,12 +569,30 @@ const ExtractRound = struct {
     /// Per task: the (trigram, doc) pairs of the documents it read, in the
     /// order read.
     task_pairs: []std.ArrayList(u64),
+    /// Per task: what reading a document needs, kept across rounds.
+    scratches: []TaskScratch,
     /// Per document of the round: where its pairs are in `task_pairs`.
     spans: []Pairs,
     next: std.atomic.Value(usize),
     /// Set by a task that ran out of memory: the build fails (and is retried
     /// later) instead of indexing its documents as empty.
     out_of_memory: std.atomic.Value(bool) = .init(false),
+};
+
+/// One task's buffers for reading documents, reused from round to round.
+const TaskScratch = struct {
+    /// One bit per possible trigram: dedup in O(n) without sorting. Made on
+    /// the first document with text, kept clear between documents (each
+    /// clears the bits it set, key by key).
+    seen: std.DynamicBitSetUnmanaged = .{},
+    keys: std.ArrayList(u32) = .empty,
+    text: std.ArrayList(u8) = .empty,
+
+    fn deinit(scratch: *TaskScratch, gpa: std.mem.Allocator) void {
+        scratch.seen.deinit(gpa);
+        scratch.keys.deinit(gpa);
+        scratch.text.deinit(gpa);
+    }
 };
 
 /// Where one document's pairs are: `task_pairs[task][start..][0..count]`.
@@ -577,14 +604,10 @@ fn extractTask(round: *ExtractRound, task: usize) void {
 
 fn extractTaskOrFail(round: *ExtractRound, task: usize) std.mem.Allocator.Error!void {
     const gpa = round.gpa;
-    // One bit per possible trigram: dedup in O(n) without sorting. Made on
-    // the first document with text, then reused and cleared key by key.
-    var seen: std.DynamicBitSetUnmanaged = .{};
-    defer seen.deinit(gpa);
-    var keys: std.ArrayList(u32) = .empty;
-    defer keys.deinit(gpa);
-    var text: std.ArrayList(u8) = .empty;
-    defer text.deinit(gpa);
+    const scratch = &round.scratches[task];
+    const seen = &scratch.seen;
+    const keys = &scratch.keys;
+    const text = &scratch.text;
     const out = &round.task_pairs[task];
     while (true) {
         const doc = round.next.fetchAdd(1, .monotonic);
@@ -595,8 +618,8 @@ fn extractTaskOrFail(round: *ExtractRound, task: usize) std.mem.Allocator.Error!
             .start = start,
             .count = out.items.len - start,
         };
-        if (!try round.text.read(round.text.context, round.docs[doc], &text, gpa)) continue;
-        if (seen.bit_length == 0) seen = try .initEmpty(gpa, trigrams_count);
+        if (!try round.text.read(round.text.context, round.docs[doc], text, gpa)) continue;
+        if (seen.bit_length == 0) seen.* = try .initEmpty(gpa, trigrams_count);
         keys.clearRetainingCapacity();
         var trigrams: Trigrams = .{ .text = text.items };
         while (trigrams.next()) |key| {

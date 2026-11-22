@@ -6,6 +6,7 @@
 //! stores the value where it belongs and goes back.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const c = @import("c");
 const core = @import("core");
 const item_mod = @import("../item.zig");
@@ -194,8 +195,9 @@ fn programOptions(
         .value = "",
         .label = arena.printSentinel("Automatic ({s})", .{automatic_name}, 0) catch "Automatic",
     });
-    for (programs) |program| {
-        if (proc.have(program.command)) {
+    const installed = installedOf(programs);
+    for (programs, installed) |program, is_installed| {
+        if (is_installed) {
             appendRow(Option, arena, &out, .{
                 .value = program.command,
                 .label = program.title,
@@ -203,6 +205,55 @@ fn programOptions(
         }
     }
     return out.items;
+}
+
+/// Most programs in one of Settings' lists (`settings_mod.terminals`,
+/// `settings_mod.editors`).
+const programs_max = @max(settings_mod.terminals.len, settings_mod.editors.len);
+
+/// Which programs of a list are on PATH, kept until PATH or one of its
+/// folders changes: Settings searched PATH for 15+ programs for each of its
+/// rows, every time it showed or a setting changed.
+const InstalledCache = struct {
+    stamp: ?u64 = null,
+    installed: [programs_max]bool = undefined,
+};
+var terminals_installed: InstalledCache = .{};
+var editors_installed: InstalledCache = .{};
+
+/// Whether each of `programs` is installed, from the cache while PATH is
+/// unchanged. Main thread.
+fn installedOf(programs: []const settings_mod.Program) []const bool {
+    const cache = if (programs.ptr == &settings_mod.terminals)
+        &terminals_installed
+    else if (programs.ptr == &settings_mod.editors)
+        &editors_installed
+    else
+        unreachable;
+    assert(programs.len <= programs_max);
+    const stamp = pathStamp();
+    if (cache.stamp != stamp) {
+        for (programs, cache.installed[0..programs.len]) |program, *installed| {
+            installed.* = proc.have(program.command);
+        }
+        cache.stamp = stamp;
+    }
+    return cache.installed[0..programs.len];
+}
+
+/// $PATH and the stat of each of its folders: installing or removing a
+/// program changes its folder's mtime.
+fn pathStamp() u64 {
+    var hasher: std.hash.Wyhash = .init(0);
+    const path_env = std.mem.span(c.g_getenv("PATH") orelse "");
+    hasher.update(path_env);
+    var folders = std.mem.tokenizeScalar(u8, path_env, ':');
+    while (folders.next()) |folder| {
+        var folder_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const folder_z = std.mem.printSentinel(&folder_buffer, "{s}", .{folder}, 0) catch continue;
+        hasher.update(std.mem.asBytes(&os.Stamp.of(folder_z.ptr)));
+    }
+    return hasher.final();
 }
 
 /// The options of a setting stored as one of `Enum`'s tags, in the tags'
@@ -253,15 +304,46 @@ fn notAnIconTheme(name: []const u8) bool {
     return false;
 }
 
-/// "Automatic", then the icon themes installed (folders under the icon
-/// directories with an index.theme that lists icon directories: cursor
-/// themes have none), by their names.
+/// The icon themes found, kept until one of the icon folders changes:
+/// Settings read every theme's index.theme (8 KB each, dozens of themes)
+/// for each row it showed and each setting changed. Main thread.
+var icon_themes_cache: struct {
+    stamp: ?u64 = null,
+    arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator),
+    options: []const Option = &.{},
+} = .{};
+
+/// "Automatic", then the icon themes installed, in `arena`; from the cache
+/// while the icon folders are unchanged (a theme added or removed changes
+/// its folder's mtime).
 fn iconThemes(arena: std.mem.Allocator) []const Option {
-    var out: std.ArrayList(Option) = .empty;
-    out.append(
-        arena,
-        .{ .value = "", .label = "Automatic (the desktop's)" },
-    ) catch return out.items;
+    const roots = iconRoots(arena);
+    var hasher: std.hash.Wyhash = .init(0);
+    for (roots) |root| {
+        hasher.update(root);
+        const root_z = arena.dupeSentinel(u8, root, 0) catch continue;
+        hasher.update(std.mem.asBytes(&os.Stamp.of(root_z.ptr)));
+    }
+    const stamp = hasher.final();
+    const cache = &icon_themes_cache;
+    if (cache.stamp != stamp) {
+        _ = cache.arena.reset(.retain_capacity);
+        cache.options = scanIconThemes(cache.arena.allocator(), roots);
+        cache.stamp = stamp;
+    }
+    // Copied: a row may still hold them when the cache is made again.
+    const options = arena.alloc(Option, cache.options.len) catch return &.{};
+    for (cache.options, options) |cached, *option| {
+        option.* = .{
+            .value = arena.dupeSentinel(u8, cached.value, 0) catch "",
+            .label = arena.dupeSentinel(u8, cached.label, 0) catch "",
+        };
+    }
+    return options;
+}
+
+/// The folders icon themes are installed in, in `arena`.
+fn iconRoots(arena: std.mem.Allocator) []const []const u8 {
     // Out of memory, a folder is left out of the list: the themes in the
     // others still show.
     var roots: std.ArrayList([]const u8) = .empty;
@@ -274,7 +356,19 @@ fn iconThemes(arena: std.mem.Allocator) []const Option {
         const root = arena.print("{s}/icons", .{std.mem.span(data_dir)}) catch "";
         appendRow([]const u8, arena, &roots, root);
     }
-    for (roots.items) |root| {
+    return roots.items;
+}
+
+/// "Automatic", then the icon themes installed (folders under `roots` with
+/// an index.theme that lists icon directories: cursor themes have none),
+/// by their names.
+fn scanIconThemes(arena: std.mem.Allocator, roots: []const []const u8) []const Option {
+    var out: std.ArrayList(Option) = .empty;
+    out.append(
+        arena,
+        .{ .value = "", .label = "Automatic (the desktop's)" },
+    ) catch return out.items;
+    for (roots) |root| {
         const root_z = arena.dupeSentinel(u8, root, 0) catch continue;
         const folder = c.g_dir_open(root_z.ptr, 0, null) orelse continue;
         defer c.g_dir_close(folder);

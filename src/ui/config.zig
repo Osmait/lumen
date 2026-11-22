@@ -216,14 +216,52 @@ fn appendStyleCss(ui: *Ui, writer: *std.Io.Writer) std.Io.Writer.Error!void {
     var path_bytes: [4096]u8 = undefined;
     const path = std.mem.printSentinel(&path_bytes, "{s}/style.css", .{folder}, 0) catch return;
     ui.appearance.style_css_stamp = settings_mod.Stamp.of(path.ptr);
-    var contents: ?[*:0]u8 = null;
-    var length: usize = 0;
-    if (c.g_file_get_contents(path.ptr, &contents, &length, null) == 0) return;
-    defer c.g_free(contents);
+    const contents = style_css_file.read(path, ui.appearance.style_css_stamp) orelse return;
     try writer.print("\n/* {s} */\n", .{path});
-    try writer.writeAll(contents.?[0..length]);
+    try writer.writeAll(contents);
     try writer.writeByte('\n');
 }
+
+/// The most CSS read from one file: a style sheet is a few KB, and the
+/// whole text is parsed again on every change.
+const css_bytes_max = 1 << 20;
+
+/// What a CSS file held, kept while its stamp stays the same: moving
+/// through Change Theme builds the CSS again on every arrow key, and read
+/// both files from disk each time. Main thread.
+const CssFile = struct {
+    path_hash: u64 = 0,
+    stamp: settings_mod.Stamp = .none,
+    text: std.ArrayList(u8) = .empty,
+
+    /// The text of `path`, whose stamp is `stamp`: from memory when it is
+    /// the one read last, else from a descriptor checked to be a regular
+    /// file (a FIFO would block the window), `css_bytes_max` at most. Null
+    /// when it cannot be read or is larger.
+    fn read(file: *CssFile, path: [:0]const u8, stamp: settings_mod.Stamp) ?[]const u8 {
+        const path_hash = std.hash.Wyhash.hash(0, path);
+        const known = file.path_hash == path_hash and file.stamp.eql(stamp);
+        if (known and !stamp.eql(.none)) return file.text.items;
+        const gpa = std.heap.c_allocator;
+        file.text.clearRetainingCapacity();
+        file.path_hash = 0;
+        file.stamp = .none;
+        const fd = os.openRegular(path) catch return null;
+        defer os.close(fd);
+        // One byte past the limit tells a file over it.
+        os.readUpTo(gpa, fd, &file.text, css_bytes_max + 1) catch return null;
+        if (file.text.items.len > css_bytes_max) {
+            log.warn("{s}: over {d} bytes, not used", .{ path, css_bytes_max });
+            file.text.clearAndFree(gpa);
+            return null;
+        }
+        file.path_hash = path_hash;
+        file.stamp = stamp;
+        return file.text.items;
+    }
+};
+var style_css_file: CssFile = .{};
+var user_css_file: CssFile = .{};
 
 /// $XDG_CONFIG_HOME/lumen/style.css, after Lumen's rules so it wins. The
 /// classes it can use are listed in EXTENSIONS.md.
@@ -236,12 +274,9 @@ fn appendUserCss(ui: *Ui, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         0,
     ) catch return;
     ui.appearance.user_css_stamp = settings_mod.Stamp.of(path.ptr);
-    var contents: ?[*:0]u8 = null;
-    var length: usize = 0;
-    if (c.g_file_get_contents(path.ptr, &contents, &length, null) == 0) return;
-    defer c.g_free(contents);
+    const contents = user_css_file.read(path, ui.appearance.user_css_stamp) orelse return;
     try writer.writeAll("\n/* ~/.config/lumen/style.css */\n");
-    try writer.writeAll(contents.?[0..length]);
+    try writer.writeAll(contents);
     try writer.writeByte('\n');
 }
 

@@ -26,6 +26,19 @@ const keywords_bytes_max = 4096;
 const path_bytes_max = 4096;
 /// A row's `detail` or `markdown`.
 pub const detail_bytes_max = 128 << 10;
+/// The most markdown a detail pane shows, as the plain text one does
+/// (`detail_pane.detail_text_bytes_max`): GTK lays the whole label out at
+/// several widths per frame.
+const markdown_shown_bytes_max = 20_000;
+
+/// `markdown` cut to `markdown_shown_bytes_max` at the end of a line: the
+/// markup is made line by line, so a cut there leaves no tag open.
+fn markdownShown(markdown: []const u8) []const u8 {
+    if (markdown.len <= markdown_shown_bytes_max) return markdown;
+    const head = markdown[0..markdown_shown_bytes_max];
+    const line_end = std.mem.findScalarLast(u8, head, '\n') orelse return core.utf8.validPrefix(head);
+    return head[0..line_end];
+}
 /// Label and value pairs of a row's `metadata`.
 const metadata_max = item_mod.metadata_max;
 /// A short text that starts with a byte past ASCII is an emoji icon; any
@@ -117,7 +130,7 @@ fn parseItem(L: *lua.State, arena: std.mem.Allocator, row: c_int, source: RowSou
     if (fieldIcon(L, arena, row, where)) |icon| item.icon = icon;
     if (lua.fieldStringMax(L, arena, row, "markdown", where, detail_bytes_max)) |markdown| {
         var markup: std.Io.Writer.Allocating = .init(arena);
-        core.markdown.toMarkup(&markup.writer, markdown) catch lua.oom(L);
+        core.markdown.toMarkup(&markup.writer, markdownShown(markdown)) catch lua.oom(L);
         item.detail = markup.written();
         item.markup = true;
     }
@@ -488,4 +501,14 @@ pub fn parseIcon(
             lua.raise(L, "{s}.icon: string or table expected, got {s}", .{ where, type_name });
         },
     }
+}
+
+test "long markdown is cut at a line's end, short markdown is whole" {
+    try std.testing.expectEqualStrings("# a\nb", markdownShown("# a\nb"));
+    var long: [markdown_shown_bytes_max + 100]u8 = undefined;
+    @memset(&long, 'x');
+    long[100] = '\n';
+    long[markdown_shown_bytes_max - 10] = '\n';
+    const shown = markdownShown(&long);
+    try std.testing.expectEqual(@as(usize, markdown_shown_bytes_max - 10), shown.len);
 }

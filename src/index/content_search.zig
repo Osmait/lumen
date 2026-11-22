@@ -24,7 +24,7 @@ const DocIn = content_format.DocIn;
 const trigram_chars = content_format.trigram_chars;
 const Index = @import("ContentIndex.zig");
 const readPlain = @import("content_build.zig").readPlain;
-const findFold = @import("content_find.zig").findFold;
+const findFolded = @import("content_find.zig").findFolded;
 
 pub const Match = struct {
     doc: u32,
@@ -102,12 +102,6 @@ pub fn search(
     defer gpa.free(ordered);
 
     const tasks = pool.threads.len + 1;
-    const arenas = try gpa.alloc(std.heap.ArenaAllocator, tasks);
-    defer {
-        for (arenas) |*task_arena| task_arena.deinit();
-        gpa.free(arenas);
-    }
-    for (arenas) |*task_arena| task_arena.* = .init(gpa);
     const top = try gpa.alloc(Match, limit);
     defer gpa.free(top);
     var context: VerifyContext = .{
@@ -120,7 +114,6 @@ pub fn search(
         .text_path = text_path,
         .text_context = text_context,
         .stop = options.stop,
-        .arenas = arenas,
         .now_s = now_s,
         .top = top,
         .arena = arena,
@@ -136,7 +129,14 @@ pub const candidates_verified_max = 4000;
 
 /// A candidate in verification order: by `bound`, the most its score can
 /// be once its text is read.
-const Candidate = struct { doc: u32, bound: i32, maybe_phrase: bool };
+const Candidate = struct {
+    doc: u32,
+    bound: i32,
+    maybe_phrase: bool,
+    /// `staticScore`, kept for the final score: it walks the name for each
+    /// word, and verification would otherwise do it again.
+    static: i32,
+};
 
 /// The candidates, best bound first: what is known without reading them
 /// (recency, depth, name) plus the most reading can add, so verification
@@ -173,10 +173,12 @@ fn orderCandidates(
             phrase_items[phrase_index] == doc;
         const maybe_phrase = several and (!phrase_known or phrase_has_doc);
         const bound_phrase: i32 = if (maybe_phrase) phrase_max else 0;
+        const static = staticScore(index.docIn(doc), words, now_s);
         candidate.* = .{
             .doc = doc,
             .maybe_phrase = maybe_phrase,
-            .bound = staticScore(index.docIn(doc), words, now_s) + count_max + bound_phrase,
+            .static = static,
+            .bound = static + count_max + bound_phrase,
         };
     }
     std.mem.sort(Candidate, ordered, {}, struct {
@@ -200,10 +202,11 @@ const name_word_score = 150;
 /// Penalty for each folder between the root and the file.
 const depth_penalty = 5;
 
-/// More hits, a matching file name, recent edits and shallow paths first.
-fn rank(doc: DocIn, count: u32, words: []const []const u8, now_s: i64) i32 {
+/// More hits, a matching file name, recent edits and shallow paths first
+/// (`static`: `staticScore`, from `orderCandidates`).
+fn rank(count: u32, static: i32) i32 {
     const counted: i32 = @intCast(@min(count, count_cap));
-    return counted * count_score + staticScore(doc, words, now_s);
+    return counted * count_score + static;
 }
 
 /// The part of the score known without opening the file.
@@ -211,7 +214,8 @@ fn staticScore(doc: DocIn, words: []const []const u8, now_s: i64) i32 {
     var score: i32 = 0;
     const name = std.Io.Dir.path.basename(doc.path);
     for (words) |word| {
-        if (findFold(name, word, 0) != null) score += name_word_score;
+        // Words come folded (`splitWords`).
+        if (findFolded(name, word, 0) != null) score += name_word_score;
     }
     // Saturating: mtimes come from the index file, which may be damaged.
     score += recency.bonus(now_s -| doc.mtime);
@@ -232,7 +236,6 @@ const VerifyContext = struct {
     text_path: PathFn,
     text_context: *anyopaque,
     stop: ?*const std.atomic.Value(bool),
-    arenas: []std.heap.ArenaAllocator,
     now_s: i64,
     next: std.atomic.Value(usize) = .init(0),
     /// The worst score among the best `top.len`, once there are that many.
@@ -253,6 +256,8 @@ const VerifyContext = struct {
             slot = worst(context.top);
             if (!matchRanksBefore(match, context.top[slot])) return;
         }
+        // The one copy of the snippet: it pointed into the candidate's text,
+        // which the task reuses or unmaps next.
         var copy = match;
         copy.snippet = context.arena.dupe(u8, match.snippet) catch {
             context.out_of_memory.store(true, .release);
@@ -266,11 +271,10 @@ const VerifyContext = struct {
     }
 };
 
-fn verifyTask(context: *VerifyContext, task: usize) void {
+fn verifyTask(context: *VerifyContext, _: usize) void {
     var path_buffer: paths.Buffer = undefined;
     var plain_text: std.ArrayList(u8) = .empty;
     defer plain_text.deinit(context.gpa);
-    const arena = context.arenas[task].allocator();
     while (true) {
         if (context.stop) |stop| {
             if (stop.load(.acquire)) return;
@@ -283,7 +287,6 @@ fn verifyTask(context: *VerifyContext, task: usize) void {
             context.next.store(context.candidates.len, .monotonic);
             return;
         }
-        defer _ = context.arenas[task].reset(.retain_capacity);
         const doc = context.index.docIn(candidate.doc);
         const text_context = context.text_context;
         const text_path = context.text_path(text_context, doc, &path_buffer) orelse continue;
@@ -306,7 +309,7 @@ fn verifyTask(context: *VerifyContext, task: usize) void {
             },
         };
         const maybe_phrase = candidate.maybe_phrase;
-        const verified = verify(text, context.words, context.phrase, maybe_phrase, arena) orelse
+        const verified = verify(text, context.words, context.phrase, maybe_phrase) orelse
             continue;
         const phrase_bonus: i32 = if (verified.phrase) phrase_max else 0;
         context.offer(.{
@@ -314,7 +317,7 @@ fn verifyTask(context: *VerifyContext, task: usize) void {
             .count = verified.count,
             .line = verified.line,
             .snippet = verified.snippet,
-            .score = rank(doc, verified.count, context.words, context.now_s) + phrase_bonus,
+            .score = rank(verified.count, candidate.static) + phrase_bonus,
         });
     }
 }
@@ -370,16 +373,15 @@ pub fn verify(
     words: []const []const u8,
     phrase: []const u8,
     maybe_phrase: bool,
-    arena: std.mem.Allocator,
 ) ?Verified {
     if (words.len == 0) return null;
     // The phrase holds every word: found, they need no looking for. Not
     // looked for where its trigrams are not all present (`maybe_phrase`).
-    const phrase_hit = if (words.len > 1 and maybe_phrase) findFold(text, phrase, 0) else null;
+    const phrase_hit = if (words.len > 1 and maybe_phrase) findFolded(text, phrase, 0) else null;
     var first = phrase_hit;
     if (phrase_hit == null) {
         for (words, 0..) |word, word_index| {
-            const word_hit = findFold(text, word, 0) orelse return null;
+            const word_hit = findFolded(text, word, 0) orelse return null;
             if (word_index == 0) first = word_hit;
         }
     }
@@ -392,7 +394,7 @@ pub fn verify(
     var occurrence = hit;
     while (count < count_cap) {
         count += 1;
-        occurrence = findFold(text, counted, occurrence.end) orelse break;
+        occurrence = findFolded(text, counted, occurrence.end) orelse break;
     }
     const newline_before = std.mem.findScalarLast(u8, text[0..hit_start], '\n');
     const line_start = if (newline_before) |newline| newline + 1 else 0;
@@ -406,7 +408,8 @@ pub fn verify(
     return .{
         .count = count,
         .line = line_number,
-        .snippet = arena.dupe(u8, utf8.validWindow(snippet)) catch "",
+        // Into `text`: copied once, by whoever keeps it.
+        .snippet = utf8.validWindow(snippet),
         .phrase = phrase_hit != null,
     };
 }
@@ -422,12 +425,12 @@ test "verify finds the line and counts hits" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const text = "first line\n  const a = ArenaAllocator.init(gpa);\nArenaAllocator again\n";
-    const verified = verify(text, &.{"arenaallocator"}, "arenaallocator", true, arena.allocator()).?;
+    const verified = verify(text, &.{"arenaallocator"}, "arenaallocator", true).?;
     try testing.expectEqual(@as(u32, 2), verified.line);
     try testing.expectEqual(@as(u32, 2), verified.count);
     try testing.expectEqualStrings("const a = ArenaAllocator.init(gpa);", verified.snippet);
     try testing.expect(
-        verify(text, &.{ "arena", "missing" }, "arena missing", true, arena.allocator()) == null,
+        verify(text, &.{ "arena", "missing" }, "arena missing", true) == null,
     );
     // The phrase wins over the first word's first occurrence.
     const phrase_verified = verify(
@@ -435,7 +438,6 @@ test "verify finds the line and counts hits" {
         &.{ "arenaallocator", "again" },
         "arenaallocator again",
         true,
-        arena.allocator(),
     ).?;
     try testing.expectEqual(@as(u32, 2), phrase_verified.line);
     try testing.expect(phrase_verified.phrase);
@@ -448,7 +450,7 @@ test "verify: folded matches, line and snippet from the original text" {
     const arena = arena_state.allocator();
     for ([_][]const u8{ "accion", "ACCIÓN", "acción" }) |query| {
         const words = try splitWords(arena, query);
-        const verified = verify(text, words, words[0], true, arena).?;
+        const verified = verify(text, words, words[0], true).?;
         try testing.expectEqual(@as(u32, 2), verified.line);
         try testing.expectEqualStrings("Una ACCIÓN rápida", verified.snippet);
     }
@@ -457,14 +459,13 @@ test "verify: folded matches, line and snippet from the original text" {
         try splitWords(arena, "nandu corre"),
         try fold.foldAlloc(arena, "nandu corre"),
         true,
-        arena,
     ).?;
     try testing.expectEqual(@as(u32, 3), verified.line);
     try testing.expect(verified.phrase);
     // Two hits of different lengths, counted without overlap.
     try testing.expectEqual(
         @as(u32, 3),
-        verify("acción accion ACCIÓN", &.{"accion"}, "accion", true, arena).?.count,
+        verify("acción accion ACCIÓN", &.{"accion"}, "accion", true).?.count,
     );
 }
 
@@ -549,14 +550,15 @@ test "search: the top matches equal reading every document and ranking them all"
         const phrase = try fold.foldAlloc(arena, std.mem.trim(u8, query, " \t"));
         for (docs, 0..) |doc, i| {
             if (!try readPlain(gpa, doc.path, &doc_text)) continue;
-            const verified = verify(doc_text.items, words, phrase, true, arena) orelse continue;
+            const verified = verify(doc_text.items, words, phrase, true) orelse continue;
             const bonus: i32 = if (verified.phrase) phrase_max else 0;
             try want.append(arena, .{
                 .doc = @intCast(i),
                 .count = verified.count,
                 .line = verified.line,
-                .snippet = verified.snippet,
-                .score = rank(doc, verified.count, words, now) + bonus,
+                // Into `doc_text`, which the next document overwrites.
+                .snippet = try arena.dupe(u8, verified.snippet),
+                .score = rank(verified.count, staticScore(doc, words, now)) + bonus,
             });
         }
         sortMatches(want.items);
@@ -667,7 +669,7 @@ fn fuzzVerify(_: void, smith: *testing.Smith) anyerror!void {
     const query_used = query[0..smith.sliceWeightedBytes(&query, weights)];
     const words = try splitWords(arena, query_used);
     const phrase = try fold.foldAlloc(arena, std.mem.trim(u8, query_used, " \t"));
-    if (verify(text_used, words, phrase, true, arena)) |verified| {
+    if (verify(text_used, words, phrase, true)) |verified| {
         try testing.expect(std.unicode.utf8ValidateSlice(verified.snippet));
         try testing.expect(verified.count >= 1);
         try testing.expect(verified.count <= count_cap);
