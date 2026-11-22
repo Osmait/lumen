@@ -44,6 +44,11 @@ pub const Config = struct {
     /// Stops after the level that passes this many entries (and says so in
     /// `Stats.truncated`): past it the caller rescans instead.
     entries_max: usize = std.math.maxInt(usize),
+    /// Directories (absolute paths) indexed but never opened: mount points
+    /// whose file system can hang a call (NFS, sshfs, FUSE: `sys.slowMounts`).
+    /// A dead server blocked a pool worker in `readDir`, the rescan with it,
+    /// and the daemon's exit after it.
+    not_opened: []const []const u8 = &.{},
 };
 
 pub const skip_default = [_][]const u8{
@@ -356,6 +361,17 @@ fn endsWithComponents(path: []const u8, tail: []const u8) bool {
 /// `skip` rules, and caches marked by a CACHEDIR.TAG. The scan decides by
 /// it, and so does `Live` for a directory created after the scan.
 pub fn shouldDescend(parent: []const u8, name: []const u8, config: *const Config) bool {
+    if (config.not_opened.len > 0) {
+        var full_path_buffer: paths.Buffer = undefined;
+        const full_path = std.mem.print(&full_path_buffer, "{s}{s}{s}", .{
+            parent,
+            paths.separatorAfter(parent),
+            name,
+        }) catch return false;
+        for (config.not_opened) |mount| {
+            if (std.mem.eql(u8, std.mem.trimEnd(u8, mount, "/"), full_path)) return false;
+        }
+    }
     for (config.skip) |rule| {
         if (std.mem.findScalarLast(u8, rule, '/')) |slash| {
             // "a/b": a directory `b` inside one whose path ends in `a`.
@@ -467,6 +483,14 @@ test "scan: a root may be a link, nothing below one is followed" {
     defer unfollowed.deinit(testing.allocator);
     try testing.expectEqual(1, unfollowed.len());
     try testing.expectEqual(1, stats.errors);
+}
+
+test "slow mount points are indexed but not opened" {
+    const not_opened = [_][]const u8{"/home/u/nas"};
+    const config: Config = .{ .roots = &.{}, .cachedir_probe = &.{}, .not_opened = &not_opened };
+    try std.testing.expect(!shouldDescend("/home/u", "nas", &config));
+    try std.testing.expect(shouldDescend("/home/u", "nasty", &config));
+    try std.testing.expect(shouldDescend("/home/u/x", "nas", &config));
 }
 
 test "skip rules with a parent match it as whole components" {

@@ -150,6 +150,11 @@ fn cLibraries(
         lua.linkSystemLibrary(lua_package, .{});
     }
     const libraries: CLibraries = .{ .sqlite = sqlite.createModule(), .lua = lua.createModule() };
+    // Lua's pattern matching with deadline checks (src/luart/lstrmatch.c):
+    // the extensions' string.find/match/gmatch/gsub. Public API only, so it
+    // builds against the system's Lua as well as the bundled one.
+    const lua_flags = [_][]const u8{"-DLUA_COMPAT_5_3"};
+    libraries.lua.addCSourceFile(.{ .file = b.path("src/luart/lstrmatch.c"), .flags = &lua_flags });
     if (system_libraries) return libraries;
 
     const sqlite_source = b.dependency("sqlite", .{});
@@ -164,6 +169,7 @@ fn cLibraries(
     }));
     const lua_source = b.dependency("lua", .{});
     lua.addIncludePath(lua_source.path("src"));
+    libraries.lua.addIncludePath(lua_source.path("src"));
     libraries.lua.linkLibrary(cLibrary(b, .{
         .target = target,
         .optimize = hot,

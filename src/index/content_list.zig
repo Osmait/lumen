@@ -41,7 +41,41 @@ pub const ListOptions = struct {
     /// Once it is set, the listing is given up (error.Canceled) within
     /// ~0.1 s. Shutting down waited for ripgrep, up to its minute.
     stop: ?*const std.atomic.Value(bool) = null,
+    /// Mount points below the root whose file system can hang a call (NFS,
+    /// sshfs, FUSE: `sys.slowMounts`): ripgrep is told to skip them and
+    /// nothing below them is stat'ed. A dead server hung the listing until
+    /// ripgrep's timeout, and every stat after it.
+    not_under: []const []const u8 = &.{},
 };
+
+/// Whether `path` is one of `mounts` or below one.
+pub fn underAny(path: []const u8, mounts: []const []const u8) bool {
+    for (mounts) |mount| {
+        if (sys.isAtOrBelow(path, mount)) return true;
+    }
+    return false;
+}
+
+/// `-g !/<mount>` for each of `mounts` below `root`, as ripgrep globs
+/// (anchored at the root it lists, special characters escaped).
+fn excludeMounts(
+    arena: std.mem.Allocator,
+    argv: *std.ArrayList([]const u8),
+    root: []const u8,
+    mounts: []const []const u8,
+) std.mem.Allocator.Error!void {
+    for (mounts) |mount| {
+        if (mount.len <= root.len or !sys.isAtOrBelow(mount, root)) continue;
+        const relative = std.mem.trimStart(u8, mount[root.len..], "/");
+        var glob: std.ArrayList(u8) = .empty;
+        try glob.appendSlice(arena, "!/");
+        for (relative) |byte| {
+            if (std.mem.findScalar(u8, "*?[]{}\\!", byte) != null) try glob.append(arena, '\\');
+            try glob.append(arena, byte);
+        }
+        try argv.appendSlice(arena, &.{ "-g", glob.items });
+    }
+}
 
 /// Documents to index, sorted by path (stable doc ids between builds).
 /// Paths are owned by `arena`.
@@ -67,6 +101,7 @@ pub fn list(
         "--no-ignore-parent",
     });
     for (excludes) |glob| try argv.appendSlice(arena, &.{ "-g", glob });
+    try excludeMounts(arena, &argv, root, options.not_under);
     // Run inside the root and list ".": rg matches globs against the path it
     // prints, so with the root as argument a root below any excluded name
     // (a home in /srv/build, the tests' .zig-cache/tmp) listed nothing.
@@ -90,6 +125,7 @@ pub fn list(
         const kind: Kind = if (documentKind(path)) .document else .text;
         if (kind == .document and !options.documents) continue;
         if (kind == .text and binaryByName(path)) continue;
+        if (underAny(path, options.not_under)) continue;
         const file_stat = stat(path_z, kind) orelse continue;
         try docs.append(arena, .{
             .path = try arena.dupe(u8, path),
@@ -481,4 +517,19 @@ test "documentKind" {
     try testing.expect(documentKind("x.odp"));
     try testing.expect(!documentKind("x.doc"));
     try testing.expect(!documentKind("pdf"));
+}
+
+test "slow mounts below the root become anchored, escaped ripgrep excludes" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var argv: std.ArrayList([]const u8) = .empty;
+    const mounts = [_][]const u8{ "/home/u/nas", "/home/u/we[i]rd", "/home/u", "/mnt/elsewhere" };
+    try excludeMounts(arena, &argv, "/home/u", &mounts);
+    // The root itself and mounts outside it give no exclude.
+    try std.testing.expectEqual(@as(usize, 4), argv.items.len);
+    try std.testing.expectEqualStrings("!/nas", argv.items[1]);
+    try std.testing.expectEqualStrings("!/we\\[i\\]rd", argv.items[3]);
+    try std.testing.expect(underAny("/home/u/nas/a.txt", &mounts));
+    try std.testing.expect(!underAny("/home/u2/a.txt", mounts[0..2]));
 }
