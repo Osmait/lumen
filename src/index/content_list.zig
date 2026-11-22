@@ -392,7 +392,10 @@ test "list: what is indexed and what is excluded" {
     const got = try listTree(arena, &tree, true);
 
     var want: std.ArrayList([]const u8) = .empty;
-    for (keep ++ docs) |name| try want.append(arena, try arena.print("{s}/{s}", .{ tree.absolute, name }));
+    for (keep ++ docs) |name| try want.append(
+        arena,
+        try arena.print("{s}/{s}", .{ tree.absolute, name }),
+    );
     std.mem.sort([]const u8, want.items, {}, struct {
         fn lt(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.order(u8, a, b) == .lt;

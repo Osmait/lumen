@@ -199,7 +199,10 @@ test "kinds from MIME type and name" {
     try testing.expectEqual(Kind.text, of("application/octet-stream", "main.zig", .file));
     try testing.expectEqual(Kind.text, of("video/mp2t", "app.ts", .file));
     try testing.expectEqual(@as(?Kind, null), of("application/x-executable", "a.out", .file));
-    try testing.expectEqual(@as(?Kind, null), of("application/octet-stream", "firmware.bin", .file));
+    try testing.expectEqual(
+        @as(?Kind, null),
+        of("application/octet-stream", "firmware.bin", .file),
+    );
     try testing.expectEqual(Kind.text, Kind.markdown.fallback().?);
 }
 

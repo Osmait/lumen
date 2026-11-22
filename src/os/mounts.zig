@@ -31,7 +31,11 @@ pub fn slowMounts(gpa: std.mem.Allocator, under: []const u8) std.mem.Allocator.E
         log.warn("/proc/self/mountinfo is over {d} bytes: the mounts past them are not checked", .{
             mountinfo_bytes_max,
         });
-        const last_newline = std.mem.findScalarLast(u8, text.items[0..mountinfo_bytes_max], '\n') orelse 0;
+        const last_newline = std.mem.findScalarLast(
+            u8,
+            text.items[0..mountinfo_bytes_max],
+            '\n',
+        ) orelse 0;
         text.shrinkRetainingCapacity(last_newline);
     }
     var out: std.ArrayList([]u8) = .empty;

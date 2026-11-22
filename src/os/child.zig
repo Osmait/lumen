@@ -73,7 +73,12 @@ fn applyLimits(pid: linux.pid_t, limits: Limits) void {
     const ioprio_who_process = 1;
     const ioprio_class_idle: usize = 3;
     const ioprio_class_shift = 13;
-    _ = linux.syscall3(.ioprio_set, ioprio_who_process, pid_word, ioprio_class_idle << ioprio_class_shift);
+    _ = linux.syscall3(
+        .ioprio_set,
+        ioprio_who_process,
+        pid_word,
+        ioprio_class_idle << ioprio_class_shift,
+    );
 }
 
 /// What one read of a program's output takes: a pipe holds 64 KB.
@@ -396,8 +401,16 @@ test "limits are put on the program" {
         return error.TestUnexpectedResult;
     const line_end = std.mem.findScalarPos(u8, result.stdout, address_space, '\n') orelse
         result.stdout.len;
-    try testing.expect(std.mem.find(u8, result.stdout[address_space..line_end], "536870912") != null);
-    const cpu = std.mem.find(u8, result.stdout, "Max cpu time") orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.find(
+        u8,
+        result.stdout[address_space..line_end],
+        "536870912",
+    ) != null);
+    const cpu = std.mem.find(
+        u8,
+        result.stdout,
+        "Max cpu time",
+    ) orelse return error.TestUnexpectedResult;
     try testing.expect(std.mem.find(u8, result.stdout[cpu..][0..60], " 7 ") != null);
 }
 

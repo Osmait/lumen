@@ -278,7 +278,10 @@ pub fn selectAfterRefresh(ui: *Ui) void {
         // Among the rows built, else built up to it from those queued:
         // building them all, to look, cost dmenu ~115 ms a tick while its
         // input streamed in.
-        first = rowOfKey(ui, wanted_key) orelse if (pendingOfKey(ui, wanted_key)) |pending_index| blk: {
+        first = rowOfKey(
+            ui,
+            wanted_key,
+        ) orelse if (pendingOfKey(ui, wanted_key)) |pending_index| blk: {
             buildPending(ui, pending_index + 1);
             break :blk rowOfKey(ui, wanted_key) orelse first;
         } else first;

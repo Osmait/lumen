@@ -138,7 +138,8 @@ fn listHeightMax(ui: *const Ui) c_int {
     const gap_px: c_int = if (ui.layout.panels == .split) pieces_gap_px else 0;
     const footer_px: c_int = if (ui.layout.footer) footer_height_px + gap_px else 0;
     const results_frame_px = 2 * (style_css.results_padding_px + style_css.results_border_px);
-    const left_px = panelHeight(ui) - style_css.search_height_px - results_frame_px - gap_px - footer_px;
+    const pieces_px = style_css.search_height_px + results_frame_px + gap_px + footer_px;
+    const left_px = panelHeight(ui) - pieces_px;
     return @max(left_px, 0);
 }
 

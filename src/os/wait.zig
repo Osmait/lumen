@@ -66,31 +66,55 @@ pub fn waitEvents(fd: i32, wake: ?i32) bool {
     return ready_count > 0 and poll_fds[0].revents & linux.POLL.IN != 0;
 }
 
-/// Waits until `fd` is readable (up to `timeout_ms`; negative waits forever),
-/// retrying on `EINTR` with the remaining timeout.
-pub fn waitReadable(fd: i32, timeout_ms: i32) bool {
-    const deadline_ns: ?u64 = if (timeout_ms > 0)
-        os.monotonicNs() + @as(u64, @intCast(timeout_ms)) * std.time.ns_per_ms
-    else
-        null;
+/// No deadline: `pollUntil` waits as long as it takes.
+pub const deadline_ns_none: u64 = std.math.maxInt(u64);
+
+pub const Readiness = enum {
+    ready,
+    timed_out,
+    /// poll refused `fd` (closed, invalid: POLLNVAL) or failed: waiting
+    /// again would fail again.
+    failed,
+};
+
+/// Polls `fd` for `events` until it has one or `deadline_ns` (monotonic;
+/// `deadline_ns_none`: no limit) passes, retrying signals with the time
+/// left. The one place Lumen waits on a single descriptor: the copies it
+/// replaced rounded the time left each their own way, and one spun on a
+/// descriptor poll refused.
+pub fn pollUntil(fd: i32, events: i16, deadline_ns: u64) Readiness {
     while (true) {
-        const left_ms: i32 = if (deadline_ns) |limit_ns| blk: {
+        const timeout_ms: i32 = if (deadline_ns == deadline_ns_none) -1 else blk: {
             const now_ns = os.monotonicNs();
-            if (now_ns >= limit_ns) return false;
-            const left_ns = limit_ns - now_ns;
-            break :blk @intCast(@min(
-                (left_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms,
-                std.math.maxInt(i32),
-            ));
-        } else timeout_ms;
-        var poll_fds = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
-        const ready_count = linux.poll(&poll_fds, 1, left_ms);
+            if (now_ns >= deadline_ns) break :blk 0;
+            // Rounded up: a deadline 0.4 ms away is waited for, not spun on.
+            const left_ms = (deadline_ns - now_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms;
+            break :blk @intCast(@min(left_ms, std.math.maxInt(i32)));
+        };
+        var poll_fds = [1]linux.pollfd{.{ .fd = fd, .events = events, .revents = 0 }};
+        const ready_count = linux.poll(&poll_fds, 1, timeout_ms);
         switch (linux.errno(ready_count)) {
-            .SUCCESS => return ready_count > 0,
+            .SUCCESS => {},
             .INTR => continue,
-            else => return false,
+            else => return .failed,
         }
+        if (ready_count == 0) {
+            if (timeout_ms == 0 or os.monotonicNs() >= deadline_ns) return .timed_out;
+            continue;
+        }
+        if (poll_fds[0].revents & linux.POLL.NVAL != 0) return .failed;
+        return .ready;
     }
+}
+
+/// Waits until `fd` is readable (up to `timeout_ms`; negative waits forever,
+/// 0 only looks).
+pub fn waitReadable(fd: i32, timeout_ms: i32) bool {
+    const deadline_ns = if (timeout_ms < 0)
+        deadline_ns_none
+    else
+        os.monotonicNs() + @as(u64, @intCast(timeout_ms)) * std.time.ns_per_ms;
+    return pollUntil(fd, linux.POLL.IN, deadline_ns) == .ready;
 }
 
 test "waitExitCancelable returns immediately when pidfd_open fails" {

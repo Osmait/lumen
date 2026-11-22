@@ -102,7 +102,10 @@ fn outputWithin(argv: []const [:0]const u8, timeout_ms: u64, bytes_max: usize) ?
         var chunk: [output_chunk_bytes]u8 = undefined;
         const chunk_len = os.unix.readSome(stdout_fd, &chunk, deadline_ns) catch |read_err| {
             switch (read_err) {
-                error.Timeout => log.warn("{s}: no answer in {d} ms, stopped", .{ argv[0], timeout_ms }),
+                error.Timeout => log.warn(
+                    "{s}: no answer in {d} ms, stopped",
+                    .{ argv[0], timeout_ms },
+                ),
                 error.Syscall => log.warn("{s}: reading its output failed, stopped", .{argv[0]}),
             }
             return null;
@@ -164,7 +167,11 @@ pub fn pipeToThen(argv: []const [:0]const u8, input: []const u8, then: ?Then) vo
     c.g_subprocess_communicate_async(subprocess, bytes, null, &pipeToCallback, then_owned);
 }
 
-fn pipeToCallback(source: ?*c.GObject, result: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) void {
+fn pipeToCallback(
+    source: ?*c.GObject,
+    result: *c.GAsyncResult,
+    data: ?*anyopaque,
+) callconv(.c) void {
     const subprocess: *c.GSubprocess = @ptrCast(source.?);
     defer c.g_object_unref(subprocess);
     var err: ?*c.GError = null;

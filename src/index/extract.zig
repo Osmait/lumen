@@ -696,7 +696,11 @@ fn zipInto(test_dir: *TestDir, folder: []const u8, name: []const u8) !void {
 /// `zipInto` with more options for zip.
 fn zipWith(test_dir: *TestDir, folder: []const u8, name: []const u8, options: []const u8) !void {
     var folder_buffer: [256]u8 = undefined;
-    const folder_path = try std.mem.print(&folder_buffer, "{s}/{s}", .{ test_dir.absolute, folder });
+    const folder_path = try std.mem.print(
+        &folder_buffer,
+        "{s}/{s}",
+        .{ test_dir.absolute, folder },
+    );
     var script_buffer: [256]u8 = undefined;
     const script = try std.mem.print(
         &script_buffer,
@@ -856,7 +860,16 @@ test "runTool: size cap and timeout kill the tool" {
     defer sys.close(input);
 
     // Endless output: cut at the cap, the tool killed and reaped.
-    const yes = try runTool(gpa, testing.io, &.{ "sh", "-c", "exec yes" }, input, 1000, &.{0}, 10_000, null);
+    const yes = try runTool(
+        gpa,
+        testing.io,
+        &.{ "sh", "-c", "exec yes" },
+        input,
+        1000,
+        &.{0},
+        10_000,
+        null,
+    );
     defer gpa.free(yes);
     try testing.expectEqual(@as(usize, 1000), yes.len);
 

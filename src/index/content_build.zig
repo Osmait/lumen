@@ -495,32 +495,13 @@ fn indexDocs(
     defer pairs.deinit(gpa);
     var scratch: std.ArrayList(u64) = .empty;
     defer scratch.deinit(gpa);
-    var initial_offset: usize = 0;
-    while (initial_offset < initial.len) {
-        const take = @min(segment_pairs_max, initial.len - initial_offset);
-        try pairs.appendSlice(gpa, initial[initial_offset..][0..take]);
-        initial_offset += take;
-        if (pairs.items.len >= segment_pairs_max) {
-            try closePairs(sink, directory, &pairs, &scratch, build_stats);
-        }
-    }
+    try addInitialPairs(sink, directory, &pairs, &scratch, build_stats, initial);
     const tasks = pool.threads.len + 1;
-    const task_pairs = try gpa.alloc(std.ArrayList(u64), tasks);
-    defer {
-        for (task_pairs) |*out| out.deinit(gpa);
-        gpa.free(task_pairs);
-    }
-    for (task_pairs) |*out| out.* = .empty;
-    // Per task, for the whole build: a 2 MiB bitset made per round was
-    // gigabytes of allocation and page faults over a large build.
-    const scratches = try gpa.alloc(TaskScratch, tasks);
-    defer {
-        for (scratches) |*task_scratch| task_scratch.deinit(gpa);
-        gpa.free(scratches);
-    }
-    for (scratches) |*task_scratch| task_scratch.* = .{};
-    const spans = try gpa.alloc(Pairs, round_docs_max);
-    defer gpa.free(spans);
+    const buffers: RoundBuffers = try .init(gpa, tasks);
+    defer buffers.deinit(gpa);
+    const task_pairs = buffers.task_pairs;
+    const scratches = buffers.scratches;
+    const spans = buffers.spans;
 
     var round_start = from;
     while (round_start < docs.len) {
@@ -558,6 +539,55 @@ fn indexDocs(
     }
     if (pairs.items.len > 0) try closePairs(sink, directory, &pairs, &scratch, build_stats);
 }
+
+/// The pairs of the segments being merged (lower ids), first, closing a
+/// segment each time it fills.
+fn addInitialPairs(
+    sink: *Sink,
+    directory: *std.ArrayList(SegmentEntry),
+    pairs: *std.ArrayList(u64),
+    scratch: *std.ArrayList(u64),
+    build_stats: *BuildStats,
+    initial: []const u64,
+) FileError!void {
+    var initial_offset: usize = 0;
+    while (initial_offset < initial.len) {
+        const take = @min(segment_pairs_max, initial.len - initial_offset);
+        try pairs.appendSlice(sink.gpa, initial[initial_offset..][0..take]);
+        initial_offset += take;
+        if (pairs.items.len >= segment_pairs_max) {
+            try closePairs(sink, directory, pairs, scratch, build_stats);
+        }
+    }
+}
+
+/// What `indexDocs`' rounds reuse: each task's pairs and scratch, for the
+/// whole build (a 2 MiB bitset made per round was gigabytes of allocation
+/// and page faults over a large build), and where each document's pairs are.
+const RoundBuffers = struct {
+    task_pairs: []std.ArrayList(u64),
+    scratches: []TaskScratch,
+    spans: []Pairs,
+
+    fn init(gpa: std.mem.Allocator, tasks: usize) std.mem.Allocator.Error!RoundBuffers {
+        const task_pairs = try gpa.alloc(std.ArrayList(u64), tasks);
+        errdefer gpa.free(task_pairs);
+        for (task_pairs) |*out| out.* = .empty;
+        const scratches = try gpa.alloc(TaskScratch, tasks);
+        errdefer gpa.free(scratches);
+        for (scratches) |*task_scratch| task_scratch.* = .{};
+        const spans = try gpa.alloc(Pairs, round_docs_max);
+        return .{ .task_pairs = task_pairs, .scratches = scratches, .spans = spans };
+    }
+
+    fn deinit(buffers: RoundBuffers, gpa: std.mem.Allocator) void {
+        for (buffers.task_pairs) |*out| out.deinit(gpa);
+        gpa.free(buffers.task_pairs);
+        for (buffers.scratches) |*task_scratch| task_scratch.deinit(gpa);
+        gpa.free(buffers.scratches);
+        gpa.free(buffers.spans);
+    }
+};
 
 /// One round of reading: documents `start..end`, each taken by the next free
 /// task (no fixed shares, so nobody waits for the slowest file of a share).
@@ -1170,7 +1200,11 @@ test "building high-entropy text: memory stays bounded by rounds and segments" {
         prng.random().bytes(bytes);
         text.* = bytes;
         made += 1;
-        doc.* = .{ .path = try std.mem.print(name, "{d}", .{i}), .mtime = 0, .size = text_bytes_max };
+        doc.* = .{
+            .path = try std.mem.print(name, "{d}", .{i}),
+            .mtime = 0,
+            .size = text_bytes_max,
+        };
     }
     var peak_allocator: PeakAllocator = .{ .child = testing.allocator };
     const gpa = peak_allocator.allocator();

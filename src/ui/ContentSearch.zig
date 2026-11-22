@@ -182,19 +182,7 @@ fn run(content_search: *ContentSearch) void {
             .arena = .init(content_search.gpa),
         };
         const arena = result.arena.allocator();
-        {
-            content_search.lock.lockUncancelable(content_search.io);
-            defer content_search.lock.unlock(content_search.io);
-            seen = content_search.generation.load(.acquire);
-            // Unless shutting down, which may have set it just before.
-            content_search.newer.store(content_search.stop.load(.acquire), .release);
-            result.generation = seen;
-            result.start_ns = content_search.query_start_ns;
-            result.query = arena.dupe(u8, content_search.query.slice()) catch |err| blk: {
-                result.err = err;
-                break :blk "";
-            };
-        }
+        seen = content_search.takeQuery(result);
 
         const now_ns = os.monotonicNs();
         var hits: std.ArrayList(index.ContentService.Hit) = .empty;
@@ -212,36 +200,59 @@ fn run(content_search: *ContentSearch) void {
         result.search_ns = os.monotonicNs() - now_ns;
         result.hits = hits.items;
         // A newer query arrived meanwhile, or shutdown began: drop it.
-        if (content_search.stop.load(.acquire) or content_search.generation.load(.acquire) != seen) {
+        const superseded = content_search.generation.load(.acquire) != seen;
+        if (content_search.stop.load(.acquire) or superseded) {
             result.destroy(content_search.gpa);
             continue;
         }
-        const hop = content_search.gpa.create(Hop) catch {
-            result.destroy(content_search.gpa);
-            continue;
-        };
-        hop.* = .{ .content_search = content_search, .result = result };
-        content_search.delivery_lock.lockUncancelable(content_search.io);
-        if (content_search.stop.load(.acquire)) {
-            content_search.delivery_lock.unlock(content_search.io);
-            result.destroy(content_search.gpa);
-            content_search.gpa.destroy(hop);
-            return;
-        }
-        hop.next = content_search.pending_hops;
-        if (content_search.pending_hops) |head| head.prev = hop;
-        content_search.pending_hops = hop;
-        const source_id = c.g_idle_add(&deliver, hop);
-        hop.source_id = source_id;
-        if (source_id == 0) {
-            content_search.unlinkHop(hop);
-            content_search.delivery_lock.unlock(content_search.io);
-            result.destroy(content_search.gpa);
-            content_search.gpa.destroy(hop);
-            continue;
-        }
-        content_search.delivery_lock.unlock(content_search.io);
+        if (!content_search.handOver(result)) return;
     }
+}
+
+/// The query asked for, into `result` (its generation, start, text); the
+/// generation it is, which the worker has now seen.
+fn takeQuery(content_search: *ContentSearch, result: *Result) u32 {
+    const arena = result.arena.allocator();
+    content_search.lock.lockUncancelable(content_search.io);
+    defer content_search.lock.unlock(content_search.io);
+    const seen = content_search.generation.load(.acquire);
+    // Unless shutting down, which may have set it just before.
+    content_search.newer.store(content_search.stop.load(.acquire), .release);
+    result.generation = seen;
+    result.start_ns = content_search.query_start_ns;
+    result.query = arena.dupe(u8, content_search.query.slice()) catch |err| blk: {
+        result.err = err;
+        break :blk "";
+    };
+    return seen;
+}
+
+/// Hands `result` to the GTK main loop (`deliver`), or drops it. False
+/// once shutdown has begun: the worker is to return.
+fn handOver(content_search: *ContentSearch, result: *Result) bool {
+    const hop = content_search.gpa.create(Hop) catch {
+        result.destroy(content_search.gpa);
+        return true;
+    };
+    hop.* = .{ .content_search = content_search, .result = result };
+    content_search.delivery_lock.lockUncancelable(content_search.io);
+    defer content_search.delivery_lock.unlock(content_search.io);
+    if (content_search.stop.load(.acquire)) {
+        result.destroy(content_search.gpa);
+        content_search.gpa.destroy(hop);
+        return false;
+    }
+    hop.next = content_search.pending_hops;
+    if (content_search.pending_hops) |head| head.prev = hop;
+    content_search.pending_hops = hop;
+    const source_id = c.g_idle_add(&deliver, hop);
+    hop.source_id = source_id;
+    if (source_id == 0) {
+        content_search.unlinkHop(hop);
+        result.destroy(content_search.gpa);
+        content_search.gpa.destroy(hop);
+    }
+    return true;
 }
 
 fn deliver(data: ?*anyopaque) callconv(.c) c.gboolean {

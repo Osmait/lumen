@@ -27,7 +27,11 @@ const units = [_]Unit{
         .dimension = .length,
         .factor = 0.01,
     },
-    .{ .names = &.{ "m", "meter", "meters", "metre", "metres" }, .dimension = .length, .factor = 1 },
+    .{
+        .names = &.{ "m", "meter", "meters", "metre", "metres" },
+        .dimension = .length,
+        .factor = 1,
+    },
     .{
         .names = &.{ "km", "kilometer", "kilometers", "kilometre" },
         .dimension = .length,
@@ -40,7 +44,11 @@ const units = [_]Unit{
     // Masses, in kilograms.
     .{ .names = &.{ "mg", "milligram", "milligrams" }, .dimension = .mass, .factor = 1e-6 },
     .{ .names = &.{ "g", "gram", "grams" }, .dimension = .mass, .factor = 0.001 },
-    .{ .names = &.{ "kg", "kilogram", "kilograms", "kilo", "kilos" }, .dimension = .mass, .factor = 1 },
+    .{
+        .names = &.{ "kg", "kilogram", "kilograms", "kilo", "kilos" },
+        .dimension = .mass,
+        .factor = 1,
+    },
     .{ .names = &.{ "t", "ton", "tons", "tonne", "tonnes" }, .dimension = .mass, .factor = 1000 },
     .{ .names = &.{ "oz", "ounce", "ounces" }, .dimension = .mass, .factor = 0.028349523125 },
     .{ .names = &.{ "lb", "lbs", "pound", "pounds" }, .dimension = .mass, .factor = 0.45359237 },
@@ -55,7 +63,11 @@ const units = [_]Unit{
     // Data sizes, in bytes. The multiples are binary, as file managers show them.
     .{ .names = &.{ "b", "byte", "bytes" }, .dimension = .data, .factor = 1 },
     .{ .names = &.{ "kb", "kib", "kilobyte", "kilobytes" }, .dimension = .data, .factor = 1024 },
-    .{ .names = &.{ "mb", "mib", "megabyte", "megabytes" }, .dimension = .data, .factor = 1024 * 1024 },
+    .{
+        .names = &.{ "mb", "mib", "megabyte", "megabytes" },
+        .dimension = .data,
+        .factor = 1024 * 1024,
+    },
     .{
         .names = &.{ "gb", "gib", "gigabyte", "gigabytes" },
         .dimension = .data,
@@ -67,7 +79,12 @@ const units = [_]Unit{
         .factor = 1024 * 1024 * 1024 * 1024,
     },
     // Temperatures, in kelvin.
-    .{ .names = &.{ "c", "celsius", "°c" }, .dimension = .temperature, .factor = 1, .offset = 273.15 },
+    .{
+        .names = &.{ "c", "celsius", "°c" },
+        .dimension = .temperature,
+        .factor = 1,
+        .offset = 273.15,
+    },
     .{
         .names = &.{ "f", "fahrenheit", "°f" },
         .dimension = .temperature,
@@ -81,7 +98,11 @@ const units = [_]Unit{
         .dimension = .volume,
         .factor = 0.001,
     },
-    .{ .names = &.{ "l", "liter", "liters", "litre", "litres" }, .dimension = .volume, .factor = 1 },
+    .{
+        .names = &.{ "l", "liter", "liters", "litre", "litres" },
+        .dimension = .volume,
+        .factor = 1,
+    },
     .{ .names = &.{ "gal", "gallon", "gallons" }, .dimension = .volume, .factor = 3.785411784 },
     .{ .names = &.{ "cup", "cups" }, .dimension = .volume, .factor = 0.2365882365 },
     .{ .names = &.{ "floz", "fl oz" }, .dimension = .volume, .factor = 0.0295735295625 },

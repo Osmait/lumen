@@ -581,7 +581,10 @@ test "a focus change among Hyprland's events" {
     _ = linux.close(pair[1]);
     focus_waiter = .{ .events_fd = pair[0], .watch_source = 1 };
     defer focus_waiter.stop();
-    try std.testing.expectEqual(@as(c.gboolean, 0), afterFocusChangeEventsCallback(pair[0], 0, null));
+    try std.testing.expectEqual(
+        @as(c.gboolean, 0),
+        afterFocusChangeEventsCallback(pair[0], 0, null),
+    );
     try std.testing.expectEqual(@as(c_uint, 0), focus_waiter.watch_source);
     try std.testing.expectEqual(@as(linux.fd_t, -1), focus_waiter.events_fd);
 }

@@ -595,7 +595,11 @@ fn set(L: *lua.State) lua.Error!c_int {
                 // 97.5 read as 0, and "0 is not a value" misled.
                 if (is_integer == 0) {
                     const number = lua.c.lua_tonumberx(L, -1, null);
-                    return lua.fail(L, "lumen.set: {s} takes a whole number, not {d}", .{ key, number });
+                    return lua.fail(
+                        L,
+                        "lumen.set: {s} takes a whole number, not {d}",
+                        .{ key, number },
+                    );
                 }
                 // 64 bytes hold any integer.
                 break :blk std.mem.print(&number_buffer, "{d}", .{integer}) catch unreachable;

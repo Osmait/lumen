@@ -76,6 +76,9 @@ pub const waitExit = wait.waitExit;
 pub const waitExitCancelable = wait.waitExitCancelable;
 pub const waitEvents = wait.waitEvents;
 pub const waitReadable = wait.waitReadable;
+pub const pollUntil = wait.pollUntil;
+pub const deadline_ns_none = wait.deadline_ns_none;
+pub const Readiness = wait.Readiness;
 
 pub const TestDir = test_dir.TestDir;
 pub const tmpDirAbs = test_dir.tmpDirAbs;

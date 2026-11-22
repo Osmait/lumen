@@ -588,7 +588,10 @@ test "a live daemon's socket is left alone, and only ours is removed" {
     const runtime_dir = try os.tmpDirPath(&tmp_dir, &runtime_buffer);
     const first = server;
     server = .{};
-    try testing.expectError(error.InUse, listenIn(testing.allocator, runtime_dir, "t", &testHandler));
+    try testing.expectError(
+        error.InUse,
+        listenIn(testing.allocator, runtime_dir, "t", &testHandler),
+    );
     server = first;
     const still = os.unix.connect(socket_path, .{}) orelse return error.TestUnexpectedResult;
     _ = linux.close(still);

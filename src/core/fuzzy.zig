@@ -266,8 +266,14 @@ test "a prepared query scores as the raw one does" {
     var query_buffer: [text_chars_max]u8 = undefined;
     const query = prepare(&query_buffer, "CONFIGURACIÓN");
     const fields = [_][]const u8{ "Ajustes", "Configuración del sistema" };
-    try std.testing.expectEqual(scoreFields("CONFIGURACIÓN", &fields), scoreFieldsQuery(query, &fields));
-    try std.testing.expectEqual(score("vsc", "Visual Studio Code"), scoreQuery(prepare(&query_buffer, "vsc"), "Visual Studio Code"));
+    try std.testing.expectEqual(
+        scoreFields("CONFIGURACIÓN", &fields),
+        scoreFieldsQuery(query, &fields),
+    );
+    try std.testing.expectEqual(
+        score("vsc", "Visual Studio Code"),
+        scoreQuery(prepare(&query_buffer, "vsc"), "Visual Studio Code"),
+    );
     try std.testing.expectEqual(@as(i32, 0), scoreQuery(prepare(&query_buffer, ""), "anything"));
 }
 

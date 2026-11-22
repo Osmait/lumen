@@ -219,7 +219,11 @@ const RowIcons = struct {
     /// a box that the picture replaces once decoded.
     fn widget(look: *const RowLook, path: [:0]const u8, size_px: c_int) *c.GtkWidget {
         const decode_px = size_px * 2;
-        const key = fileKey(path.ptr, decode_px, decode_px) orelse return iconWidget(look, .none, size_px);
+        const key = fileKey(
+            path.ptr,
+            decode_px,
+            decode_px,
+        ) orelse return iconWidget(look, .none, size_px);
         if (ring.get(key)) |cached| {
             const texture = cached orelse return iconWidget(look, .none, size_px);
             return image(texture, size_px);
@@ -255,7 +259,10 @@ const RowIcons = struct {
         }
         // Dropped for a newer build before it was decoded: nothing learnt.
         if (decoded == null and !current) return;
-        const texture_or_none = if (decoded) |pixbuf| c.gdk_texture_new_for_pixbuf(pixbuf) else null;
+        const texture_or_none = if (decoded) |pixbuf|
+            c.gdk_texture_new_for_pixbuf(pixbuf)
+        else
+            null;
         ring.put(wait.key, texture_or_none);
         // The row may be gone (another keystroke): the next build finds the
         // picture in the ring.

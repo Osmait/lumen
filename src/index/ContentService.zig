@@ -602,7 +602,10 @@ fn commitRetry(service: *ContentService, retry: []const content.DocIn) void {
     service.worker.retry = copy;
 }
 
-fn copyDocs(arena: std.mem.Allocator, docs: []const content.DocIn) std.mem.Allocator.Error![]content.DocIn {
+fn copyDocs(
+    arena: std.mem.Allocator,
+    docs: []const content.DocIn,
+) std.mem.Allocator.Error![]content.DocIn {
     const copy = try arena.alloc(content.DocIn, docs.len);
     for (docs, copy) |doc, *dst| {
         dst.* = doc;
@@ -780,7 +783,11 @@ fn slowMountsBelow(arena: std.mem.Allocator, root: []const u8) []const []const u
     const mounts = sys.slowMounts(arena, root) catch return &.{};
     var below: std.ArrayList([]const u8) = .empty;
     for (mounts) |mount| {
-        if (std.mem.eql(u8, std.mem.trimEnd(u8, mount, "/"), std.mem.trimEnd(u8, root, "/"))) continue;
+        if (std.mem.eql(
+            u8,
+            std.mem.trimEnd(u8, mount, "/"),
+            std.mem.trimEnd(u8, root, "/"),
+        )) continue;
         below.append(arena, mount) catch return below.items;
     }
     return below.items;
@@ -1446,9 +1453,17 @@ test "content service: Office documents are extracted once per version" {
 
     var hash_hex: [32]u8 = undefined;
     var prefix_buffer: [40]u8 = undefined;
-    const prefix = try std.mem.print(&prefix_buffer, "{s}-", .{TextCache.pathHashHex(&hash_hex, report)});
+    const prefix = try std.mem.print(
+        &prefix_buffer,
+        "{s}-",
+        .{TextCache.pathHashHex(&hash_hex, report)},
+    );
     var legacy_prefix_buffer: [32]u8 = undefined;
-    const legacy_prefix = try std.mem.print(&legacy_prefix_buffer, "{x:0>16}-", .{std.hash.Wyhash.hash(0, report)});
+    const legacy_prefix = try std.mem.print(
+        &legacy_prefix_buffer,
+        "{x:0>16}-",
+        .{std.hash.Wyhash.hash(0, report)},
+    );
     const mtime_second = sys.nowSeconds() - 100;
 
     {
@@ -1634,7 +1649,12 @@ test "a shared index outlives the service's reference while a search holds one" 
     const pool = try Pool.create(gpa, testing.io, 1);
     defer pool.destroy();
     const Empty = struct {
-        fn read(_: *anyopaque, _: content.DocIn, _: *std.ArrayList(u8), _: std.mem.Allocator) std.mem.Allocator.Error!bool {
+        fn read(
+            _: *anyopaque,
+            _: content.DocIn,
+            _: *std.ArrayList(u8),
+            _: std.mem.Allocator,
+        ) std.mem.Allocator.Error!bool {
             return false;
         }
     };

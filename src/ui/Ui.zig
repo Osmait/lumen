@@ -22,6 +22,7 @@ const assert = std.debug.assert;
 const c = @import("c");
 const gtk = @import("gtk.zig");
 const core = @import("core");
+const os = @import("os");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
 pub const View = item_mod.View;
@@ -145,8 +146,6 @@ grid_mode: bool = false,
 grid_columns: c_int = ExtHost.grid_columns_default,
 /// How result rows look, for the row builders in widgets.zig.
 row_look: widgets.RowLook = .{},
-/// Icons made for the current rows; released on the next refresh.
-icons: std.ArrayList(*c.GIcon) = .empty,
 /// What Enter does on the selected row, shown inside it.
 primary: [:0]const u8 = "",
 /// Key of the destructive item waiting for its second Enter.
@@ -405,7 +404,7 @@ pub fn showWith(self: *Ui, view: View, text: ?[*:0]const u8) void {
     _ = self.frecency_arena.reset(.retain_capacity);
     // Without it, results are ranked by match quality alone.
     const frecency_arena = self.frecency_arena.allocator();
-    self.frecency = self.db.loadFrecency(frecency_arena, labels.now()) catch .empty;
+    self.frecency = self.db.loadFrecency(frecency_arena, os.nowSeconds()) catch .empty;
     if (!gtk.isVisible(self.window)) {
         // The settings file may have been edited by hand since the window
         // last opened.
@@ -638,9 +637,6 @@ pub fn refresh(self: *Ui) void {
     c.gtk_flow_box_remove_all(self.grid);
     widgets.forgetGridPictures();
     widgets.forgetRowIcons();
-    // The rows holding the previous icons are gone; GtkImage kept its refs.
-    for (self.icons.items) |icon| c.g_object_unref(icon);
-    self.icons.clearRetainingCapacity();
 
     const arena = self.query_arena.allocator();
     const query_text = std.mem.trim(u8, self.query(), " ");
@@ -710,7 +706,7 @@ pub fn perform(self: *Ui, operation: item_mod.Operation) void {
     // Ranking only, and Db logs its own failures: the action goes ahead
     // whether or not the use was recorded.
     if (primary and item.key.len > 0 and item.action != .setting) {
-        self.db.recordUse(item.key, labels.now()) catch {};
+        self.db.recordUse(item.key, os.nowSeconds()) catch {};
     }
     if (primary and item.action == .ext_command) {
         return ext_view.activate(self, item.action.ext_command.index);

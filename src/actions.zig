@@ -9,6 +9,7 @@ const Db = @import("sys/Db.zig");
 const proc = @import("sys/proc.zig");
 const hypr = @import("sys/hypr.zig");
 const core = @import("core");
+const os = @import("os");
 const settings_mod = @import("settings.zig");
 const Settings = settings_mod.Settings;
 
@@ -159,7 +160,7 @@ fn fileOf(item: *const Item) @FieldType(item_mod.Action, "file") {
 /// goes ahead even if this fails, and Db logs the failure.
 fn touchClip(context: Context, item: *const Item) void {
     assert(item.action == .clip);
-    context.db.touchClip(item.action.clip, now()) catch {};
+    context.db.touchClip(item.action.clip, os.nowSeconds()) catch {};
 }
 
 fn trash(path: [:0]const u8) Outcome {
@@ -743,8 +744,4 @@ test "terminals get Ctrl+Shift+V, everything else Ctrl+V" {
     try std.testing.expectEqual(Chord.ctrl_v, pasteChord("discord"));
     try std.testing.expectEqual(Chord.ctrl_v, pasteChord("brave-browser"));
     try std.testing.expectEqual(Chord.ctrl_v, pasteChord(""));
-}
-
-fn now() i64 {
-    return @divTrunc(c.g_get_real_time(), std.time.us_per_s);
 }

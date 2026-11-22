@@ -98,7 +98,6 @@ pub fn buildDetail(ui: *Ui) void {
     gtk.setVisible(ui.detail.box, false);
 }
 
-/// The lines around the match, words highlighted.
 /// The pane's parts for `view`, before a row fills them: the Information
 /// block and its labels, and whether the text wraps.
 pub fn prepareFor(detail: *DetailPane, view: Ui.View) void {

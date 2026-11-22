@@ -85,7 +85,8 @@ pub fn writeAllAt(fd: i32, data: []const u8, offset: ?usize) Error!void {
             // A descriptor someone left non-blocking (a pipe from a parent):
             // wait until it takes more, as a blocking one would.
             .AGAIN => {
-                waitWritable(fd);
+                // Failed: the write says why.
+                _ = os.pollUntil(fd, linux.POLL.OUT, os.deadline_ns_none);
                 continue;
             },
             else => {},
@@ -93,16 +94,6 @@ pub fn writeAllAt(fd: i32, data: []const u8, offset: ?usize) Error!void {
         written += try check(result);
     }
     assert(written == data.len);
-}
-
-/// Waits until `fd` can be written to (or poll fails: the write then says
-/// why).
-fn waitWritable(fd: i32) void {
-    var poll_fds = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.OUT, .revents = 0 }};
-    while (true) {
-        const result = linux.poll(&poll_fds, 1, -1);
-        if (linux.errno(result) != .INTR) return;
-    }
 }
 
 pub const ReadUpToError = std.mem.Allocator.Error || error{ReadFailed};
@@ -504,7 +495,10 @@ test "readUpTo never reads past bytes_max" {
 
 test "writeAll waits on a non-blocking descriptor instead of failing" {
     var fds: [2]i32 = undefined;
-    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    try std.testing.expectEqual(
+        .SUCCESS,
+        linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true })),
+    );
     defer close(fds[0]);
     const Reader = struct {
         fn drain(fd: i32, total: *usize) void {

@@ -65,18 +65,7 @@ fn connectTo(fd: linux.fd_t, address: *const linux.sockaddr.un) bool {
 /// Waits for a connect in progress on `fd`; whether it succeeded.
 fn connectFinished(fd: linux.fd_t) bool {
     const deadline_ns = os.monotonicNs() + connect_wait_ms * std.time.ns_per_ms;
-    while (true) {
-        const now_ns = os.monotonicNs();
-        if (now_ns >= deadline_ns) return false;
-        const left_ms: i32 = @intCast((deadline_ns - now_ns) / std.time.ns_per_ms + 1);
-        var poll_fds = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.OUT, .revents = 0 }};
-        const ready_count = linux.poll(&poll_fds, 1, left_ms);
-        if (failed(ready_count)) |errno| switch (errno) {
-            .INTR => continue,
-            else => return false,
-        };
-        if (ready_count > 0) break;
-    }
+    if (os.pollUntil(fd, linux.POLL.OUT, deadline_ns) != .ready) return false;
     var socket_error: i32 = 0;
     var socket_error_len: linux.socklen_t = @sizeOf(i32);
     const result = linux.getsockopt(
@@ -151,55 +140,34 @@ pub fn peerUid(fd: linux.fd_t) ?u32 {
 pub const ReadError = error{ Timeout, Syscall };
 
 /// No deadline: wait as long as the peer takes.
-pub const deadline_ns_none: u64 = std.math.maxInt(u64);
+pub const deadline_ns_none = os.deadline_ns_none;
 
 /// One read into `bytes` once `fd` is readable, waiting until `deadline_ns`
 /// (monotonic) at most: 0 at end of input. A descriptor poll cannot wait on
 /// (closed, invalid) is `error.Syscall`, not a wait that spins.
 pub fn readSome(fd: linux.fd_t, bytes: []u8, deadline_ns: u64) ReadError!usize {
     while (true) {
-        if (deadline_ns != deadline_ns_none) {
-            const now_ns = os.monotonicNs();
-            if (now_ns >= deadline_ns) return error.Timeout;
-            const left_ms: i32 = @intCast(@min(
-                (deadline_ns - now_ns) / std.time.ns_per_ms + 1,
-                std.math.maxInt(i32),
-            ));
-            switch (pollReadable(fd, left_ms)) {
-                .ready => {},
-                .not_yet => continue,
-                .failed => return error.Syscall,
-            }
-        }
+        // With a deadline, input is waited for first: a read cannot be timed.
+        if (deadline_ns != deadline_ns_none) switch (os.pollUntil(fd, linux.POLL.IN, deadline_ns)) {
+            .ready => {},
+            .timed_out => return error.Timeout,
+            .failed => return error.Syscall,
+        };
         const bytes_read = linux.read(fd, bytes.ptr, bytes.len);
         if (failed(bytes_read)) |errno| switch (errno) {
             .INTR => continue,
             // A non-blocking descriptor with nothing yet (a stdin left
             // O_NONBLOCK): wait for it rather than spin on read.
             .AGAIN => {
-                if (deadline_ns == deadline_ns_none and pollReadable(fd, -1) == .failed) {
-                    return error.Syscall;
-                }
+                if (deadline_ns != deadline_ns_none) continue;
+                const readiness = os.pollUntil(fd, linux.POLL.IN, deadline_ns_none);
+                if (readiness == .failed) return error.Syscall;
                 continue;
             },
             else => return error.Syscall,
         };
         return bytes_read;
     }
-}
-
-const Readiness = enum { ready, not_yet, failed };
-
-/// One poll for input on `fd`, up to `timeout_ms` (-1: no limit). A signal
-/// or the timeout is `not_yet`; a descriptor poll rejects is `failed`.
-fn pollReadable(fd: linux.fd_t, timeout_ms: i32) Readiness {
-    var poll_fds = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
-    const ready_count = linux.poll(&poll_fds, 1, timeout_ms);
-    if (failed(ready_count)) |errno| return if (errno == .INTR) .not_yet else .failed;
-    if (ready_count == 0) return .not_yet;
-    // Not open: a read would fail every time.
-    if (poll_fds[0].revents & linux.POLL.NVAL != 0) return .failed;
-    return .ready;
 }
 
 /// Reads until end of input or `bytes` is full; how many bytes it read.

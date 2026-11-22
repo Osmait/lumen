@@ -261,7 +261,12 @@ pub fn sliceAt(comptime T: type, bytes: Bytes, offset: usize, count: usize) []T 
 }
 
 /// `sliceAt` over bytes only read: no `@constCast` needed.
-pub fn sliceAtConst(comptime T: type, bytes: format.BytesConst, offset: usize, count: usize) []const T {
+pub fn sliceAtConst(
+    comptime T: type,
+    bytes: format.BytesConst,
+    offset: usize,
+    count: usize,
+) []const T {
     assert(offset % @alignOf(T) == 0);
     assert(offset + count * @sizeOf(T) <= bytes.len);
     const items: [*]const T = @ptrCast(@alignCast(bytes.ptr + offset));

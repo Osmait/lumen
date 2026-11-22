@@ -497,35 +497,29 @@ pub const Settings = struct {
     /// file, or larger than the buffer), `incomplete` is set so a later `save`
     /// refuses to overwrite the user's file with defaults.
     pub fn load(gpa: std.mem.Allocator, path: [*:0]const u8) Settings {
-        var buffer: [64 * 1024]u8 = undefined;
         const fd = sys.openRegular(path) catch |err| {
             var defaults = Settings.init(gpa);
             if (err != error.NotFound) defaults.incomplete = true;
             return defaults;
         };
         defer sys.close(fd);
-        var len: usize = 0;
-        while (len < buffer.len) {
-            const result = std.os.linux.read(fd, buffer[len..].ptr, buffer.len - len);
-            switch (std.os.linux.errno(result)) {
-                .SUCCESS => {
-                    if (result == 0) break;
-                    len += result;
-                },
-                .INTR => continue,
-                else => {
-                    var defaults = Settings.init(gpa);
-                    defaults.incomplete = true;
-                    return defaults;
-                },
-            }
-        }
-        var settings = parse(gpa, buffer[0..len]);
-        // Filled up: the file goes on past what was read, and saving would
-        // cut it there.
-        if (len == buffer.len) settings.incomplete = true;
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(gpa);
+        // One byte past the limit tells a file longer than it.
+        sys.readUpTo(gpa, fd, &text, file_bytes_max + 1) catch {
+            var defaults = Settings.init(gpa);
+            defaults.incomplete = true;
+            return defaults;
+        };
+        const whole = text.items.len <= file_bytes_max;
+        var settings = parse(gpa, text.items[0..@min(text.items.len, file_bytes_max)]);
+        // The file goes on past what was read: saving would cut it there.
+        if (!whole) settings.incomplete = true;
         return settings;
     }
+
+    /// The largest settings file read: Lumen writes a few KB.
+    const file_bytes_max = 64 * 1024;
 
     pub const SaveError = sys.Error || std.Io.Writer.Error || error{Incomplete};
 
@@ -806,7 +800,10 @@ test "save is atomic and owner-only; load survives a missing file" {
     defer unreadable.deinit();
     try testing.expect(unreadable.incomplete);
     try testing.expectError(error.Incomplete, unreadable.save(testing.allocator, fifo_path, &.{}));
-    try testing.expectError(error.Incomplete, settings.save(testing.allocator, fifo_path, &.{"width"}));
+    try testing.expectError(
+        error.Incomplete,
+        settings.save(testing.allocator, fifo_path, &.{"width"}),
+    );
 }
 
 test "each text choice sets its own field" {
@@ -843,7 +840,13 @@ test "saving through a link writes where it points, the link stays" {
     try testing.expectEqualStrings("hx", back.editor);
     try testing.expectEqualStrings("dracula", back.theme);
     var stx: std.os.linux.Statx = undefined;
-    _ = std.os.linux.statx(std.os.linux.AT.FDCWD, link, std.os.linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &stx);
+    _ = std.os.linux.statx(
+        std.os.linux.AT.FDCWD,
+        link,
+        std.os.linux.AT.SYMLINK_NOFOLLOW,
+        .{ .TYPE = true },
+        &stx,
+    );
     try testing.expect(stx.mode & std.os.linux.S.IFMT == std.os.linux.S.IFLNK);
 }
 
