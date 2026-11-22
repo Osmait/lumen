@@ -31,7 +31,50 @@ pub const Options = struct {
     /// Set: the program is killed as if past its deadline, within 100 ms
     /// (a service shutting down does not wait for its tools).
     cancel: ?*const std.atomic.Value(bool) = null,
+    /// Put on the program as soon as it is started: for tools run on
+    /// untrusted input (a crafted PDF), whose memory, CPU and writes must
+    /// not reach the rest of the machine. Null: none.
+    limits: ?Limits = null,
 };
+
+/// Resource limits for a program (`Options.limits`), set with prlimit right
+/// after it starts: std.process.spawn runs nothing in the child before
+/// exec. Lowering a limit below what the program uses already only makes
+/// its next allocations fail, which is what is wanted.
+pub const Limits = struct {
+    /// RLIMIT_AS: its whole address space.
+    memory_bytes_max: u64,
+    /// RLIMIT_CPU: past it, SIGXCPU then SIGKILL.
+    cpu_s_max: u64,
+    /// RLIMIT_FSIZE: the largest file it may write (0: none; pipes are not
+    /// files, so its output still flows).
+    file_bytes_max: u64 = 0,
+    /// Its nice value (higher: lower priority), and the idle I/O class.
+    nice: i32 = 10,
+};
+
+/// Applies `limits` to process `pid`. Best effort: a limit that cannot be
+/// set (an old kernel) leaves the deadline and the output cap in force.
+fn applyLimits(pid: linux.pid_t, limits: Limits) void {
+    const pairs = [_]struct { linux.rlimit_resource, u64 }{
+        .{ .AS, limits.memory_bytes_max },
+        .{ .CPU, limits.cpu_s_max },
+        .{ .FSIZE, limits.file_bytes_max },
+    };
+    for (pairs) |pair| {
+        const resource, const value = pair;
+        const limit: linux.rlimit = .{ .cur = value, .max = value };
+        _ = linux.prlimit(pid, resource, &limit, null);
+    }
+    const prio_process = 0;
+    const pid_word: usize = @bitCast(@as(isize, pid));
+    const nice_word: usize = @bitCast(@as(isize, limits.nice));
+    _ = linux.syscall3(.setpriority, prio_process, pid_word, nice_word);
+    const ioprio_who_process = 1;
+    const ioprio_class_idle: usize = 3;
+    const ioprio_class_shift = 13;
+    _ = linux.syscall3(.ioprio_set, ioprio_who_process, pid_word, ioprio_class_idle << ioprio_class_shift);
+}
 
 /// What one read of a program's output takes: a pipe holds 64 KB.
 const read_chunk_bytes = 64 << 10;
@@ -78,6 +121,7 @@ pub fn run(
         .stdout = .pipe,
         .stderr = if (options.stderr == .collect) .pipe else .ignore,
     });
+    if (options.limits) |limits| applyLimits(child.id.?, limits);
     // `kill` sends SIGTERM and waits: after a SIGKILL it only reaps. The
     // child is not reaped yet, so the SIGKILL cannot miss it.
     defer if (child.id) |pid| {
@@ -337,6 +381,24 @@ test "input left once the outputs close is ended, not held until the deadline" {
     try testing.expect(!result.timed_out);
     try testing.expectEqual(@as(?u8, 0), result.code);
     try testing.expect(os.monotonicNs() - start_ns < 3 * std.time.ns_per_s);
+}
+
+test "limits are put on the program" {
+    // Read after a pause: the limits are set right after the start.
+    const argv = &.{ "sh", "-c", "sleep 0.3; cat /proc/$$/limits" };
+    var result = try run(testing.allocator, testing.io, argv, .{
+        .deadline_ns = deadline(5000),
+        .limits = .{ .memory_bytes_max = 512 << 20, .cpu_s_max = 7 },
+    });
+    defer result.deinit(testing.allocator);
+    try testing.expectEqual(@as(?u8, 0), result.code);
+    const address_space = std.mem.find(u8, result.stdout, "Max address space") orelse
+        return error.TestUnexpectedResult;
+    const line_end = std.mem.findScalarPos(u8, result.stdout, address_space, '\n') orelse
+        result.stdout.len;
+    try testing.expect(std.mem.find(u8, result.stdout[address_space..line_end], "536870912") != null);
+    const cpu = std.mem.find(u8, result.stdout, "Max cpu time") orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.find(u8, result.stdout[cpu..][0..60], " 7 ") != null);
 }
 
 test "a descriptor that cannot be made non-blocking is an error" {

@@ -127,28 +127,53 @@ pub fn free(text: [:0]u8) void {
 /// written from the main loop as the program reads it, so one that does not
 /// read cannot hold the window.
 pub fn pipeTo(argv: []const [:0]const u8, input: []const u8) void {
+    pipeToThen(argv, input, null);
+}
+
+/// Called once a `pipeToThen` program has taken all its input and exited
+/// (successfully or not, `ok` says), with the context it was given.
+pub const Then = struct {
+    callback: *const fn (context: usize, ok: bool) void,
+    context: usize,
+};
+
+/// `pipeTo`, then `then` once the program is done: wl-copy exits once it
+/// owns the selection, so a paste sent after it pastes this text.
+pub fn pipeToThen(argv: []const [:0]const u8, input: []const u8, then: ?Then) void {
     var argv_buffer: Argv = undefined;
     const argv_z = argv_buffer.of(argv) orelse return;
     var err: ?*c.GError = null;
     const flags = c.G_SUBPROCESS_FLAGS_STDIN_PIPE;
     const subprocess = c.g_subprocess_newv(argv_z, flags, &err) orelse {
         logError("pipe", argv[0], err);
+        if (then) |done| done.callback(done.context, false);
         return;
     };
+    const then_owned: ?*Then = if (then) |done| blk: {
+        const owned = gpa.create(Then) catch {
+            done.callback(done.context, false);
+            break :blk null;
+        };
+        owned.* = done;
+        break :blk owned;
+    } else null;
     // A copy: `input` is the caller's only until this returns.
     const bytes = c.g_bytes_new(input.ptr, input.len);
     defer c.g_bytes_unref(bytes);
     // `subprocess` is released once the program has its input and exited.
-    c.g_subprocess_communicate_async(subprocess, bytes, null, &pipeToCallback, null);
+    c.g_subprocess_communicate_async(subprocess, bytes, null, &pipeToCallback, then_owned);
 }
 
-fn pipeToCallback(source: ?*c.GObject, result: *c.GAsyncResult, _: ?*anyopaque) callconv(.c) void {
+fn pipeToCallback(source: ?*c.GObject, result: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) void {
     const subprocess: *c.GSubprocess = @ptrCast(source.?);
     defer c.g_object_unref(subprocess);
     var err: ?*c.GError = null;
-    if (c.g_subprocess_communicate_finish(subprocess, result, null, null, &err) == 0) {
-        warnError(.proc, err, "write to a program", .{});
-    }
+    const finished = c.g_subprocess_communicate_finish(subprocess, result, null, null, &err) != 0;
+    if (!finished) warnError(.proc, err, "write to a program", .{});
+    const then: *Then = @ptrCast(@alignCast(data orelse return));
+    defer gpa.destroy(then);
+    const ok = finished and c.g_subprocess_get_successful(subprocess) != 0;
+    then.callback(then.context, ok);
 }
 
 /// Whether `name` is on PATH.
@@ -224,4 +249,30 @@ test "output: a program that writes past the cap is stopped and dropped" {
     const argv = &.{ "sh", "-c", "exec yes" };
     try std.testing.expect(outputWithin(argv, 5000, 64 << 10) == null);
     try std.testing.expect(os.monotonicNs() - start_ns < 5 * std.time.ns_per_s);
+}
+
+test "pipeToThen calls back once the program has its input and exited" {
+    const Seen = struct {
+        var calls: usize = 0;
+        var ok_last = false;
+        fn done(context: usize, ok: bool) void {
+            std.debug.assert(context == 42);
+            calls += 1;
+            ok_last = ok;
+        }
+    };
+    const then: Then = .{ .callback = &Seen.done, .context = 42 };
+    const cases = [_]struct { argv: []const [:0]const u8, ok: bool }{
+        .{ .argv = &.{ "sh", "-c", "cat >/dev/null" }, .ok = true },
+        .{ .argv = &.{ "sh", "-c", "cat >/dev/null; exit 3" }, .ok = false },
+    };
+    for (cases, 1..) |case, calls_expected| {
+        pipeToThen(case.argv, "hello", then);
+        const deadline_ns = os.monotonicNs() + 5 * std.time.ns_per_s;
+        while (Seen.calls < calls_expected and os.monotonicNs() < deadline_ns) {
+            _ = c.g_main_context_iteration(null, 1);
+        }
+        try std.testing.expectEqual(calls_expected, Seen.calls);
+        try std.testing.expectEqual(case.ok, Seen.ok_last);
+    }
 }

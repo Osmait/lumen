@@ -35,7 +35,15 @@ pub const Budget = struct {
     /// Set once the deadline expires so `pcall`/`xpcall`/coroutines cannot
     /// swallow the timeout and keep spinning.
     timed_out: bool = false,
+    /// Files the state holds open (`io.open`, lfiles.c), up to
+    /// `open_files_max`.
+    open_files: u32 = 0,
 };
+
+/// Files one state may hold open at once: each takes one of the daemon's
+/// descriptors, which its socket, SQLite and GTK need too (the soft limit
+/// is usually 1024).
+pub const open_files_max = 64;
 
 /// The budget a state was made with (its allocator's user data).
 pub fn budgetOf(L: *State) *Budget {
@@ -78,6 +86,7 @@ pub fn openLibs(L: *State) void {
     c.luaL_openlibs(L);
     // Before the sandbox below: it keeps no reference to the originals.
     _ = luart_open_patterns(L);
+    _ = luart_open_files(L);
     const sandbox =
         \\local refuse, timed_out, arm_hook = ...
         \\debug = nil; package.loaded.debug = nil
@@ -106,13 +115,36 @@ pub fn openLibs(L: *State) void {
         \\  if why then return nil, why end
         \\  return open(checked, ...)
         \\end
-        \\for _, name in ipairs({ "lines", "input", "output" }) do
-        \\  local f = io[name]
-        \\  io[name] = function(path, ...)
-        \\    local checked, why = check_path(path)
-        \\    if why then error(why, 2) end
-        \\    return f(checked, ...)
+        \\local raw_input, raw_output, raw_lines = io.input, io.output, io.lines
+        \\local function opened(path, mode)
+        \\  local checked, why = check_path(path)
+        \\  if why then error(why, 3) end
+        \\  local f, err = open(checked, mode)
+        \\  if not f then error(err, 3) end
+        \\  return f
+        \\end
+        \\local function named(path) return type(path) == "string" or type(path) == "number" end
+        \\function io.input(path)
+        \\  if named(path) then return raw_input(opened(path, "r")) end
+        \\  return raw_input(path)
+        \\end
+        \\function io.output(path)
+        \\  if named(path) then return raw_output(opened(path, "w")) end
+        \\  return raw_output(path)
+        \\end
+        \\function io.lines(path, ...)
+        \\  if path == nil then return raw_lines(nil, ...) end
+        \\  local f = opened(path, "r")
+        \\  local next_line = f:lines(...)
+        \\  local done = false
+        \\  local function finish(...)
+        \\    if (...) == nil then done = true; f:close() end
+        \\    return ...
         \\  end
+        \\  return function()
+        \\    if done then return nil end
+        \\    return finish(next_line())
+        \\  end, nil, nil, f
         \\end
         \\local raw_move, tointeger, maxinteger = table.move, math.tointeger, math.maxinteger
         \\local move_chunk = 4096
@@ -345,6 +377,23 @@ fn alloc(
 }
 
 extern fn luart_open_patterns(L: *State) c_int;
+extern fn luart_open_files(L: *State) c_int;
+
+/// For io.open (lfiles.c): takes one of the state's `open_files_max`
+/// slots; 0 when none is left.
+export fn luart_file_opened(L: *State) c_int {
+    const budget = budgetOf(L);
+    if (budget.open_files >= open_files_max) return 0;
+    budget.open_files += 1;
+    return 1;
+}
+
+/// For io.open (lfiles.c): a file was closed or never opened.
+export fn luart_file_closed(L: *State) void {
+    const budget = budgetOf(L);
+    assert(budget.open_files > 0);
+    budget.open_files -= 1;
+}
 
 /// For the pattern matcher (lstrmatch.c), every few thousand steps: its
 /// backtracking runs in C, where `hook` never does. Nonzero once the
@@ -1006,6 +1055,54 @@ test "loops in C stop at the deadline too: table.move and patterns" {
         \\assert(("x"):rep(3):find("x", 1, true) == 1)
     ;
     try testing.expect(runCode(L, arena, checks) == null);
+}
+
+/// Descriptors of this process without close-on-exec.
+fn inheritableFds() usize {
+    const linux = std.os.linux;
+    var count: usize = 0;
+    var fd: i32 = 0;
+    while (fd < 4096) : (fd += 1) {
+        const flags = linux.fcntl(fd, linux.F.GETFD, 0);
+        if (linux.errno(flags) != .SUCCESS) continue;
+        if (flags & linux.FD_CLOEXEC == 0) count += 1;
+    }
+    return count;
+}
+
+test "extensions open files close-on-exec, and only so many at once" {
+    var budget: Budget = .{ .bytes_max = 8 << 20 };
+    const L = try testState(&budget);
+    defer c.lua_close(L);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const inheritable_before = inheritableFds();
+    const fill =
+        \\files = {}
+        \\for i = 1, 64 do files[i] = assert(io.open("/dev/null")) end
+        \\local extra, why = io.open("/dev/null")
+        \\assert(extra == nil and why:find("too many files"))
+        \\assert(io.tmpfile() == nil)
+    ;
+    try testing.expect(runCode(L, arena, fill) == null);
+    try testing.expectEqual(@as(u32, open_files_max), budget.open_files);
+    // None of them reaches a program lumen.exec starts.
+    try testing.expectEqual(inheritable_before, inheritableFds());
+    const release =
+        \\files[1]:close(); io.close(files[2]); files[3] = nil
+        \\collectgarbage()
+        \\local again = assert(io.open("/dev/null")); again:close()
+        \\for i = 4, 64 do files[i]:close() end
+        \\files = nil
+        \\local n = 0 for _ in io.lines("/proc/self/status") do n = n + 1 end
+        \\assert(n > 0)
+        \\for line in io.lines("/proc/self/status") do break end
+    ;
+    try testing.expect(runCode(L, arena, release) == null);
+    _ = c.lua_gc(L, c.LUA_GCCOLLECT, @as(c_int, 0));
+    // Closed, collected, or read to their end: every slot came back.
+    try testing.expectEqual(@as(u32, 0), budget.open_files);
 }
 
 test "a runaway loop stops at its deadline" {

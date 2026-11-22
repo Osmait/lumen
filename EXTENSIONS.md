@@ -276,6 +276,11 @@ Anywhere an icon is given (commands, rows, `lumen.icons`):
 | `lumen.set(settings)` | Fixes settings (see [init.lua](#initlua)). |
 | `lumen.layout(options)` | The window's structure (see [Layout](#layout)). |
 
+`lumen.theme`, `lumen.keymap`, `lumen.set`, `lumen.layout` and `lumen.icons`
+change Lumen itself, so only `init.lua` may call them (a
+[style](#styles) may call `lumen.theme`, `lumen.set` and `lumen.layout`).
+In any other extension they raise an error.
+
 `require("name")` loads `name.lua` or `name/init.lua` from the extension's
 folder. The standard library is there except `os.exit`, `os.execute`,
 `os.setlocale`, `io.popen`, `debug` and native modules. Use `lumen.exec` to

@@ -127,6 +127,10 @@ const unzip_exit = struct {
 /// bytes of its stdout. Reaching that cap kills the tool and keeps what was
 /// read; the timeout kills it and fails (what it printed may be any part of
 /// the text); otherwise its exit code must be in `exit_codes_ok`.
+/// The address space an extraction tool may take: pdftotext reads a
+/// 400 KB manual in under 256 MB; a decompression bomb stops here.
+const tool_memory_bytes_max = 1 << 30;
+
 fn runTool(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -145,6 +149,12 @@ fn runTool(
         .at_cap = .kill,
         .deadline_ns = sys.monotonicNs() + limit_ms * std.time.ns_per_ms,
         .cancel = cancel,
+        // The documents are anyone's (a download): a crafted one must not
+        // take the machine's memory, nor write anywhere.
+        .limits = .{
+            .memory_bytes_max = tool_memory_bytes_max,
+            .cpu_s_max = limit_ms / std.time.ms_per_s + 1,
+        },
     }) catch |err| return switch (err) {
         error.FileNotFound => error.ToolMissing,
         else => |other| other,

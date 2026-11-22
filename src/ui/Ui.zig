@@ -281,7 +281,7 @@ const Navigation = struct {
 /// the list is read once this long after the last one.
 const apps_reload_delay_ms = 500;
 /// Bytes of an extension query kept with its request (`Inflight.asked`).
-const ext_query_bytes_max = 256;
+const ext_query_bytes_max = ExtHost.query_bytes_max;
 /// Monitors that get a backdrop; past these, a click on one more monitor
 /// does not close Lumen.
 const backdrops_max = 8;
@@ -637,6 +637,7 @@ pub fn refresh(self: *Ui) void {
     self.confirm_key = "";
     c.gtk_flow_box_remove_all(self.grid);
     widgets.forgetGridPictures();
+    widgets.forgetRowIcons();
     // The rows holding the previous icons are gone; GtkImage kept its refs.
     for (self.icons.items) |icon| c.g_object_unref(icon);
     self.icons.clearRetainingCapacity();

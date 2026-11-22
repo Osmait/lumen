@@ -625,12 +625,19 @@ pub fn readScans(
     scans: []Scan,
     entries_max: usize,
 ) void {
+    // For the whole batch, not each directory: 300 new folders of 15 k
+    // entries each were all read, then added under the lock.
+    var entries_left = entries_max;
     for (scans) |*scan_job| {
+        if (entries_left == 0) {
+            scan_job.outcome = .too_big;
+            continue;
+        }
         var sub_config = config.*;
         const roots = [_][]const u8{scan_job.path};
         sub_config.roots = &roots;
         sub_config.follow_roots = false;
-        sub_config.entries_max = entries_max;
+        sub_config.entries_max = entries_left;
         var scan_stats: scan.Stats = .{};
         var sub = scan.scan(gpa, pool, &sub_config, null, &scan_stats) catch {
             scan_job.outcome = .failed;
@@ -641,6 +648,7 @@ pub fn readScans(
             scan_job.outcome = .too_big;
             continue;
         }
+        entries_left -|= sub.len();
         scan_job.outcome = .{ .read = sub };
     }
 }
