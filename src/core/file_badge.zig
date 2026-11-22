@@ -64,20 +64,44 @@ const named = [_]struct { []const u8, []const u8, Color }{
     .{ ".env", "ENV", .yellow },
 };
 
+// The tables above as maps, built at compile time: a row looked a name up
+// in up to 85 entries one by one.
+const named_badges = stringMap(struct { []const u8, Color }, &named, struct {
+    fn value(entry: @TypeOf(named[0])) struct { []const u8, Color } {
+        return .{ entry[1], entry[2] };
+    }
+}.value);
+const themed_extensions = stringMap(void, &themed, struct {
+    fn value(_: []const u8) void {}
+}.value);
+const known_colors: std.StaticStringMap(Color) = .initComptime(known);
+
+/// A map from the first field of each of `entries` (the entry itself when
+/// it is a string) to `valueOf(entry)`.
+fn stringMap(
+    comptime V: type,
+    comptime entries: anytype,
+    comptime valueOf: anytype,
+) std.StaticStringMap(V) {
+    const Entry = @TypeOf(entries[0]);
+    const Pair = struct { []const u8, V };
+    comptime var pairs: [entries.len]Pair = undefined;
+    inline for (entries, &pairs) |entry, *pair| {
+        const key = if (Entry == []const u8) entry else entry[0];
+        pair.* = .{ key, valueOf(entry) };
+    }
+    return .initComptime(pairs);
+}
+
 /// Badge for a file name, or null when the theme icon fits better (media,
 /// documents, archives, no extension at all). Unknown short extensions get a
 /// gray badge: still more telling than a blank page.
 pub fn of(name: []const u8, text_buffer: *[4]u8) ?Badge {
-    for (named) |entry| {
-        const file_name, const text, const color = entry;
-        if (std.mem.eql(u8, name, file_name)) return .{ .text = text, .color = color };
-    }
+    if (named_badges.get(name)) |entry| return .{ .text = entry[0], .color = entry[1] };
     var extension_buffer: [16]u8 = undefined;
     const lower = lowerExtension(&extension_buffer, name) orelse return null;
     const extension = name[name.len - lower.len ..];
-    for (themed) |themed_extension| {
-        if (std.mem.eql(u8, lower, themed_extension)) return null;
-    }
+    if (themed_extensions.has(lower)) return null;
     const color = knownColor(lower);
     if (color == null and extension.len > text_buffer.len) return null;
     // Only letters and digits make a badge: "tar.gz~" or "c++" do not.
@@ -90,19 +114,13 @@ pub fn of(name: []const u8, text_buffer: *[4]u8) ?Badge {
 }
 
 fn knownColor(lower_extension: []const u8) ?Color {
-    for (known) |entry| {
-        const known_extension, const color = entry;
-        if (std.mem.eql(u8, lower_extension, known_extension)) return color;
-    }
-    return null;
+    return known_colors.get(lower_extension);
 }
 
 /// A language or text format Lumen knows by name, not merely a short
 /// extension (those get a gray badge but may be anything, binaries too).
 pub fn isKnown(name: []const u8) bool {
-    for (named) |entry| {
-        if (std.mem.eql(u8, name, entry[0])) return true;
-    }
+    if (named_badges.has(name)) return true;
     var extension_buffer: [16]u8 = undefined;
     const lower = lowerExtension(&extension_buffer, name) orelse return false;
     return knownColor(lower) != null;
@@ -208,19 +226,15 @@ pub const logo_names = [_]struct { []const u8, Logo }{
     .{ ".gitattributes", .{ .name = "git" } },   .{ ".gitmodules", .{ .name = "git" } },
 };
 
+const logos_by_name: std.StaticStringMap(Logo) = .initComptime(logo_names);
+const logos_by_extension: std.StaticStringMap(Logo) = .initComptime(logos);
+
 /// The official logo for a file name, or null (then `of` gives a badge).
 pub fn logoOf(name: []const u8) ?Logo {
-    for (logo_names) |entry| {
-        const file_name, const logo = entry;
-        if (std.mem.eql(u8, name, file_name)) return logo;
-    }
+    if (logos_by_name.get(name)) |logo| return logo;
     var extension_buffer: [16]u8 = undefined;
     const lower = lowerExtension(&extension_buffer, name) orelse return null;
-    for (logos) |entry| {
-        const logo_extension, const logo = entry;
-        if (std.mem.eql(u8, lower, logo_extension)) return logo;
-    }
-    return null;
+    return logos_by_extension.get(lower);
 }
 
 test "logos for languages, badges stay for the rest" {
@@ -230,4 +244,16 @@ test "logos for languages, badges stay for the rest" {
     try std.testing.expectEqualStrings("docker", logoOf("Dockerfile").?.name);
     try std.testing.expect(logoOf("Cargo.toml") == null);
     try std.testing.expect(logoOf("photo.png") == null);
+}
+
+test "the maps answer what the tables say, for every entry" {
+    for (named) |entry| {
+        var text_buffer: [4]u8 = undefined;
+        const badge = of(entry[0], &text_buffer).?;
+        try std.testing.expectEqualStrings(entry[1], badge.text);
+        try std.testing.expectEqual(entry[2], badge.color);
+    }
+    for (known) |entry| try std.testing.expectEqual(entry[1], knownColor(entry[0]).?);
+    for (themed) |extension| try std.testing.expect(themed_extensions.has(extension));
+    for (logo_names) |entry| try std.testing.expectEqualStrings(entry[1].name, logoOf(entry[0]).?.name);
 }

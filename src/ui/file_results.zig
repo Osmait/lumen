@@ -63,7 +63,7 @@ pub fn itemsFromHits(
             // The list is narrow beside the preview: the folder goes to the
             // detail pane, the name keeps the room.
             .accessory = arena.printSentinel("line {d}", .{hit.line}, 0) catch "",
-            .where = labels.homeRelative(arena, hit.path[0..slash]),
+            .where = labels.homeRelative(arena, folderOf(hit.path, slash)),
             .fact = (if (hit.count > 1)
                 arena.printSentinel(
                     "line {d} · {d}{s} matches",
@@ -118,7 +118,7 @@ pub fn fileItems(ui: *Ui, arena: std.mem.Allocator, query: []const u8, limit: us
     for (hits.items) |hit| {
         const path = arena.dupeSentinel(u8, hit.path, 0) catch continue;
         const slash = std.mem.findScalarLast(u8, hit.path, '/') orelse 0;
-        const where = labels.homeRelative(arena, hit.path[0..slash]);
+        const where = labels.homeRelative(arena, folderOf(hit.path, slash));
         out.append(arena, .{
             .key = arena.print(file_key_prefix ++ "{s}", .{hit.path}) catch "",
             .title = labels.displayText(arena, hit.path[slash + 1 ..]),
@@ -181,13 +181,22 @@ fn typeIcon(content_type: [*:0]const u8) ?*c.GIcon {
     if (type_icons.get(key)) |icon| return icon;
     const icon = c.g_content_type_get_icon(content_type);
     const gpa = std.heap.c_allocator;
-    const owned = gpa.dupe(u8, key) catch return null;
+    const owned = gpa.dupe(u8, key) catch {
+        c.g_object_unref(icon);
+        return null;
+    };
     type_icons.put(gpa, owned, icon) catch {
         gpa.free(owned);
         c.g_object_unref(icon);
         return null;
     };
     return icon;
+}
+
+/// The folder of `path`, whose last '/' is at `slash`: "/" for a file at
+/// the root, not an empty string.
+fn folderOf(path: []const u8, slash: usize) []const u8 {
+    return if (slash == 0) "/" else path[0..slash];
 }
 
 /// The files view's empty row with nothing typed.
@@ -198,4 +207,9 @@ pub fn filesHint(ui: *Ui, arena: std.mem.Allocator) [:0]const u8 {
     var count_bytes: [32]u8 = undefined;
     const count_text = core.calc.formatDisplay(&count_bytes, @floatFromInt(status.entries));
     return arena.printSentinel("Type to search {s} files", .{count_text}, 0) catch "";
+}
+
+test "a file at the root is in \"/\"" {
+    try std.testing.expectEqualStrings("/", folderOf("/vmlinuz", 0));
+    try std.testing.expectEqualStrings("/home/u", folderOf("/home/u/a.txt", 7));
 }

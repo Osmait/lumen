@@ -28,7 +28,8 @@ var answer_buffer: [answer_bytes_max]u8 = undefined;
 pub fn main(init: std.process.Init.Minimal) void {
     const argv = init.args.vector;
     const envp: [*:null]const ?[*:0]const u8 = init.environ.block.slice.ptr;
-    const arguments = argv[1..];
+    // A process can be started with no argv at all (execve with argc 0).
+    const arguments = if (argv.len > 1) argv[1..] else argv[0..0];
     const only_flag: ?cli.Flag = if (arguments.len == 1)
         cli.parse(std.mem.span(arguments[0]))
     else

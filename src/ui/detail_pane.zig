@@ -201,7 +201,7 @@ fn showImage(detail: *DetailPane, path: [:0]const u8, mtime: i64) void {
 fn forgetImage(detail: *DetailPane) void {
     pictures.preview_lane.forget();
     detail.image_path_length = 0;
-    c.gtk_picture_set_paintable(gtk.widget(detail.picture), null);
+    c.gtk_picture_set_paintable(detail.picture, null);
 }
 
 fn requestPictureCallback(context: ?*anyopaque, decoded: ?*c.GdkPixbuf, current: bool) void {
@@ -210,7 +210,7 @@ fn requestPictureCallback(context: ?*anyopaque, decoded: ?*c.GdkPixbuf, current:
     const pixbuf = decoded orelse return;
     const texture = c.gdk_texture_new_for_pixbuf(pixbuf);
     defer c.g_object_unref(texture);
-    c.gtk_picture_set_paintable(gtk.widget(detail.picture), texture);
+    c.gtk_picture_set_paintable(detail.picture, texture);
 }
 
 pub fn showFileDetail(ui: *Ui, item: *const Item) void {

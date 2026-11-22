@@ -6,7 +6,14 @@
 //! are cut from.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
+
+comptime {
+    // `findFoldImpl` bit-casts a @Vector(32, bool) to a u32 and takes bit i
+    // as byte i of the chunk: true on a little-endian target only.
+    assert(builtin.cpu.arch.endian() == .little);
+}
 const fold = @import("core").fold;
 
 /// Where a folded match lies in the ORIGINAL text: [start, end). Folding

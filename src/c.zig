@@ -47,6 +47,7 @@ pub const GDateTime = opaque {};
 pub const GIcon = opaque {};
 pub const GAppInfo = opaque {};
 pub const GDesktopAppInfo = opaque {};
+pub const GType = usize;
 pub const GAppInfoMonitor = opaque {};
 pub const GAppLaunchContext = opaque {};
 pub const GApplication = opaque {};
@@ -290,6 +291,8 @@ pub extern fn g_app_info_launch_uris(
     err: ?*?*GError,
 ) gboolean;
 pub extern fn g_desktop_app_info_new(desktop_id: [*:0]const u8) ?*GDesktopAppInfo;
+pub extern fn g_desktop_app_info_get_type() GType;
+pub extern fn g_type_check_instance_is_a(instance: *anyopaque, iface_type: GType) gboolean;
 pub extern fn g_settings_schema_source_get_default() ?*GSettingsSchemaSource;
 pub extern fn g_settings_schema_source_lookup(
     source: *GSettingsSchemaSource,
@@ -818,7 +821,7 @@ pub extern fn g_task_return_pointer(
 ) void;
 pub extern fn g_task_propagate_pointer(task: *GTask, err: ?*?*GError) ?*anyopaque;
 pub extern fn gdk_texture_new_from_filename(path: [*:0]const u8, err: ?*?*GError) ?*GdkTexture;
-pub extern fn gtk_picture_set_paintable(picture: *GtkWidget, paintable: ?*anyopaque) void;
+pub extern fn gtk_picture_set_paintable(picture: *GtkPicture, paintable: ?*anyopaque) void;
 
 // ------------------------------------- pictures decoded from bytes (widgets.zig)
 

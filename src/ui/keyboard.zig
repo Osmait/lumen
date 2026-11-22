@@ -163,9 +163,8 @@ fn panelKey(ui: *Ui, key: KeyPress) void {
     assert(ui.panel.isOpen());
     assert(ui.panel.entries.len > 0);
     assert(ui.panel.selected < ui.panel.entries.len);
-    const closes = key.keyval == c.GDK_KEY_Escape or
-        (key.ctrl and key.keyval == c.GDK_KEY_k and key.vertical == null);
-    if (closes) {
+    // Ctrl+K inside the panel moves up (`decode`); Escape closes it.
+    if (key.keyval == c.GDK_KEY_Escape) {
         ui.panel.close();
     } else if (key.vertical) |vertical| switch (vertical) {
         .down => ui.panel.select(@min(ui.panel.selected + 1, ui.panel.entries.len - 1)),

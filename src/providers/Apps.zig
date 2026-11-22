@@ -80,10 +80,12 @@ pub fn reload(self: *Apps) void {
 fn itemOf(arena: std.mem.Allocator, app_info: *c.GAppInfo) std.mem.Allocator.Error!?Item {
     const id = std.mem.span(c.g_app_info_get_id(app_info) orelse return null);
     const name = std.mem.span(c.g_app_info_get_display_name(app_info) orelse return null);
-    const desktop_app_info: *c.GDesktopAppInfo = @ptrCast(app_info);
+    const desktop_app_info = asDesktop(app_info);
     var generic_name: [:0]const u8 = "";
-    if (c.g_desktop_app_info_get_generic_name(desktop_app_info)) |generic_name_terminated| {
-        generic_name = std.mem.span(generic_name_terminated);
+    if (desktop_app_info) |desktop| {
+        if (c.g_desktop_app_info_get_generic_name(desktop)) |generic_name_terminated| {
+            generic_name = std.mem.span(generic_name_terminated);
+        }
     }
     return .{
         .key = try arena.print("app:{s}", .{id}),
@@ -102,9 +104,10 @@ pub fn iconForClass(self: *const Apps, class: []const u8) ?*c.GIcon {
     if (class.len == 0) return null;
     for (self.items) |item| {
         const app_info = item.action.app;
-        const desktop_app_info: *c.GDesktopAppInfo = @ptrCast(app_info);
-        if (c.g_desktop_app_info_get_startup_wm_class(desktop_app_info)) |wm_class| {
-            if (std.ascii.eqlIgnoreCase(std.mem.span(wm_class), class)) return iconOf(item);
+        if (asDesktop(app_info)) |desktop_app_info| {
+            if (c.g_desktop_app_info_get_startup_wm_class(desktop_app_info)) |wm_class| {
+                if (std.ascii.eqlIgnoreCase(std.mem.span(wm_class), class)) return iconOf(item);
+            }
         }
         const id = std.mem.span(c.g_app_info_get_id(app_info) orelse continue);
         const suffix = ".desktop";
@@ -118,6 +121,15 @@ pub fn iconForClass(self: *const Apps, class: []const u8) ?*c.GIcon {
     return null;
 }
 
+/// `app_info` as the GDesktopAppInfo it is, or null when it is another
+/// kind: g_app_info_get_all gives those on Linux, but GAppInfo is only an
+/// interface, so the type is checked before the cast, not assumed.
+fn asDesktop(app_info: *c.GAppInfo) ?*c.GDesktopAppInfo {
+    const desktop_type = c.g_desktop_app_info_get_type();
+    if (c.g_type_check_instance_is_a(app_info, desktop_type) == 0) return null;
+    return @ptrCast(app_info);
+}
+
 fn iconOf(item: Item) ?*c.GIcon {
     return switch (item.icon) {
         .gicon => |gicon| gicon,
@@ -128,11 +140,12 @@ fn iconOf(item: Item) ?*c.GIcon {
 /// Keywords and the executable's name, space separated, in `arena`.
 fn keywords(
     arena: std.mem.Allocator,
-    desktop_app_info: *c.GDesktopAppInfo,
+    desktop_app_info: ?*c.GDesktopAppInfo,
     app_info: *c.GAppInfo,
 ) std.mem.Allocator.Error![]const u8 {
     var joined: std.ArrayList(u8) = .empty;
-    if (c.g_desktop_app_info_get_keywords(desktop_app_info)) |keywords_terminated| {
+    const app_keywords = if (desktop_app_info) |desktop| c.g_desktop_app_info_get_keywords(desktop) else null;
+    if (app_keywords) |keywords_terminated| {
         var keyword_index: usize = 0;
         while (keywords_terminated[keyword_index]) |keyword| : (keyword_index += 1) {
             try joined.appendSlice(arena, std.mem.span(keyword));

@@ -260,6 +260,14 @@ pub fn sliceAt(comptime T: type, bytes: Bytes, offset: usize, count: usize) []T 
     return items[0..count];
 }
 
+/// `sliceAt` over bytes only read: no `@constCast` needed.
+pub fn sliceAtConst(comptime T: type, bytes: format.BytesConst, offset: usize, count: usize) []const T {
+    assert(offset % @alignOf(T) == 0);
+    assert(offset + count * @sizeOf(T) <= bytes.len);
+    const items: [*]const T = @ptrCast(@alignCast(bytes.ptr + offset));
+    return items[0..count];
+}
+
 pub fn dedupSorted(comptime T: type, items: []T) []T {
     if (items.len == 0) return items;
     var unique_count: usize = 1;
