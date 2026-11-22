@@ -42,6 +42,7 @@ pub const info = stat.info;
 
 pub const openDir = folder.openDir;
 pub const openDirNoFollow = folder.openDirNoFollow;
+pub const openDirBeneath = folder.openDirBeneath;
 pub const DirIter = folder.DirIter;
 pub const subdirs = folder.subdirs;
 pub const mkdirP = folder.mkdirP;

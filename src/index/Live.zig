@@ -193,7 +193,24 @@ pub const Recheck = struct {
 pub const Rechecks = std.ArrayList(Recheck);
 
 /// What `adopt` hands back: the index and the watcher it replaced.
-pub const Replaced = struct { base: Store, watcher: *Watcher };
+pub const Replaced = struct {
+    base: Store,
+    watcher: *Watcher,
+    /// What `adopt` needs that takes a pass over the index or a read of
+    /// /proc, done by `prepareCompaction` without the lock (searches wait
+    /// on it): `base`'s tombstones, and the slow mounts under the roots
+    /// (null: unknown, the old list stays). On the replaced index: its old
+    /// list, freed with it.
+    graves: usize = 0,
+    slow_mounts: ?[][]u8 = null,
+
+    pub fn deinit(replaced: Replaced, gpa: std.mem.Allocator) void {
+        var base = replaced.base;
+        base.deinit(gpa);
+        replaced.watcher.destroy(gpa);
+        if (replaced.slow_mounts) |mounts| sys.freeList(gpa, mounts);
+    }
+};
 
 /// Takes a store (mapped or fresh) with no watches armed yet: searchable
 /// right away, watches armed in batches by `armProgress`. Owns `base` once
@@ -505,7 +522,8 @@ fn add(live: *Live, parent: EntryId, name: []const u8, is_dir: bool) !bool {
         const path = try live.gpa.dupeSentinel(u8, full, 0);
         errdefer live.gpa.free(path);
         try live.scans.ensureUnusedCapacity(live.gpa, 1);
-        const id = try live.delta.push(live.gpa, name, root, store_mod.flag_dir | hidden, depth);
+        const folder_flags = store_mod.flag_dir | store_mod.flag_folder;
+        const id = try live.delta.push(live.gpa, name, root, folder_flags | hidden, depth);
         live.scans.appendAssumeCapacity(.{
             .directory = id,
             .path = path,
@@ -515,7 +533,8 @@ fn add(live: *Live, parent: EntryId, name: []const u8, is_dir: bool) !bool {
     } else {
         // A file, or a directory skipped like the scan does: searchable,
         // never opened.
-        _ = try live.delta.push(live.gpa, name, root, hidden, depth);
+        const folder: u8 = if (is_dir) store_mod.flag_folder else 0;
+        _ = try live.delta.push(live.gpa, name, root, hidden | folder, depth);
     }
     live.stats.added += 1;
     return true;
@@ -774,7 +793,7 @@ pub fn search(
     for (hits.items) |hit| try out.append(arena, .{
         .path = try arena.dupe(u8, live.base.path(hit.id, &path_buffer) orelse continue),
         .score = hit.score,
-        .is_dir = live.base.isDir(hit.id),
+        .is_dir = live.base.isFolder(hit.id),
     });
     if (live.delta.store.len() > 0) {
         const delta = &live.delta;
@@ -782,7 +801,7 @@ pub fn search(
         for (hits.items) |hit| try out.append(arena, .{
             .path = try arena.dupe(u8, live.delta.store.path(hit.id, &path_buffer) orelse continue),
             .score = hit.score,
-            .is_dir = live.delta.store.isDir(hit.id),
+            .is_dir = live.delta.store.isFolder(hit.id),
         });
     }
     std.mem.sort(Hit, out.items, {}, hitBefore);
@@ -817,12 +836,13 @@ fn hitBefore(_: void, a: Hit, b: Hit) bool {
 /// milliseconds; done here it would be done with the lock held (worst
 /// search went from 1.7 to 19.8 ms in the Rust version). On error nothing
 /// changed and `base` and `watcher` are still the caller's.
-pub fn adopt(live: *Live, base: Store, watcher: *Watcher) std.mem.Allocator.Error!Replaced {
+pub fn adopt(live: *Live, fresh: Replaced) std.mem.Allocator.Error!Replaced {
     // The only fallible step, first: the new index starts with an empty delta.
     const delta: Delta = try .init(live.gpa);
-    const old: Replaced = .{ .base = live.base, .watcher = live.watcher };
-    live.base = base;
-    live.graves = base.len() - base.liveCount();
+    var old: Replaced = .{ .base = live.base, .watcher = live.watcher };
+    live.base = fresh.base;
+    live.graves = fresh.graves;
+    const watcher = fresh.watcher;
     live.watcher = watcher;
     live.stats.watches = watcher.count();
     // A rescan's watcher was armed as it scanned.
@@ -836,12 +856,12 @@ pub fn adopt(live: *Live, base: Store, watcher: *Watcher) std.mem.Allocator.Erro
     live.dirty = false;
     live.last_compact_ns = sys.monotonicNs();
     live.engine_base.reset();
-    // A few lines of /proc: what was mounted since the last rescan. Out of
-    // memory, the old list stays.
-    if (slowMountsOf(live.gpa, live.config)) |mounts| {
-        sys.freeList(live.gpa, live.slow_mounts);
+    // What was mounted since the last rescan; the old list goes with the
+    // old index, freed outside the lock.
+    if (fresh.slow_mounts) |mounts| {
+        old.slow_mounts = live.slow_mounts;
         live.slow_mounts = mounts;
-    } else |_| {}
+    }
     return old;
 }
 
@@ -888,7 +908,13 @@ pub fn prepareCompaction(
     const watcher = try Watcher.create(gpa);
     errdefer watcher.destroy(gpa);
     const base = try scanSaved(gpa, pool, config, watcher, cache_path);
-    return .{ .base = base, .watcher = watcher };
+    return .{
+        .base = base,
+        .watcher = watcher,
+        .graves = base.len() - base.liveCount(),
+        // Out of memory: unknown, the list before stays.
+        .slow_mounts = slowMountsOf(gpa, config) catch null,
+    };
 }
 
 /// A fresh scan, saved to `cache_path` when there is one and returned
@@ -1083,10 +1109,8 @@ const Tree = struct {
     /// Stands in for `Service.rescan`, without the lock to release.
     fn compact(tree: *Tree) !void {
         const fresh = try prepareCompaction(testing.allocator, tree.pool, &tree.config, null);
-        const old = try tree.live.adopt(fresh.base, fresh.watcher);
-        var old_base = old.base;
-        old_base.deinit(testing.allocator);
-        old.watcher.destroy(testing.allocator);
+        const old = try tree.live.adopt(fresh);
+        old.deinit(testing.allocator);
     }
 
     fn scoreOf(tree: *Tree, query: []const u8, relative: []const u8) !?i32 {
@@ -1292,10 +1316,9 @@ test "live: an event for something already indexed adds no duplicate" {
     try watcher.watch(gpa, try std.mem.printSentinel(&path_buffer, "{s}", .{tree.root}, 0), 0);
     tree.make("durante.rs");
     const base = try scan.scan(gpa, tree.pool, &tree.config, watcher, null);
-    const old = try tree.live.adopt(base, watcher);
-    var old_base = old.base;
-    old_base.deinit(gpa);
-    old.watcher.destroy(gpa);
+    const graves = base.len() - base.liveCount();
+    const old = try tree.live.adopt(.{ .base = base, .watcher = watcher, .graves = graves });
+    old.deinit(gpa);
 
     try testing.expectEqual(0, try tree.sync());
     try testing.expectEqual(1, try tree.count("durante", "durante.rs"));
@@ -1323,10 +1346,8 @@ test "live: a rescan watches before reading, so nothing after it is lost" {
     // Changes between the scan and the swap wait in the new watcher.
     tree.make("src/entre.rs");
     tree.remove("Cargo.toml");
-    const old = try tree.live.adopt(fresh.base, fresh.watcher);
-    var old_base = old.base;
-    old_base.deinit(testing.allocator);
-    old.watcher.destroy(testing.allocator);
+    const old = try tree.live.adopt(fresh);
+    old.deinit(testing.allocator);
     _ = try tree.sync();
     try testing.expect(try tree.found("entre", "src/entre.rs"));
     try testing.expect(!try tree.found("cargo", "Cargo.toml"));

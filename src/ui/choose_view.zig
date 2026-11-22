@@ -390,11 +390,12 @@ fn scanIconThemes(arena: std.mem.Allocator, roots: []const []const u8) []const O
             const name_key = "\nName=";
             if (std.mem.find(u8, text, name_key)) |name_at| {
                 const rest = text[name_at + name_key.len ..];
-                label = rest[0 .. std.mem.findScalar(u8, rest, '\n') orelse rest.len];
+                label = std.mem.trimEnd(u8, rest[0 .. std.mem.findScalar(u8, rest, '\n') orelse rest.len], "\r");
             }
             out.append(arena, .{
                 .value = arena.dupeSentinel(u8, name, 0) catch continue,
-                .label = arena.dupeSentinel(u8, label, 0) catch continue,
+                // A theme's own file: any bytes, made valid UTF-8.
+                .label = labels.displayText(arena, label),
             }) catch break;
         }
     }

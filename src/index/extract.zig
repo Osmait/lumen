@@ -104,7 +104,15 @@ pub fn extractText(
     return shrink(gpa, try xmlToText(gpa, xml, bytes_max), bytes_max);
 }
 
-pub const Error = sys.Error || error{ ToolMissing, ToolFailed, Timeout };
+pub const Error = sys.Error || error{
+    ToolMissing,
+    /// The tool ran and refused the document: it will refuse it again.
+    ToolFailed,
+    /// Ended by a signal (the OOM killer, its CPU limit): another time it
+    /// may finish, so this says nothing about the document.
+    ToolKilled,
+    Timeout,
+};
 
 /// How many bytes of markup an Office document may have per byte of text
 /// wanted, and the most markup read whatever the text: markup outweighs
@@ -163,7 +171,7 @@ fn runTool(
     errdefer gpa.free(result.stdout);
     if (result.timed_out) return error.Timeout;
     if (result.capped) return result.stdout;
-    const code = result.code orelse return error.ToolFailed;
+    const code = result.code orelse return error.ToolKilled;
     if (std.mem.findScalar(u8, exit_codes_ok, code) == null) return error.ToolFailed;
     return result.stdout;
 }
@@ -898,6 +906,17 @@ test "runTool: size cap and timeout kill the tool" {
         gpa,
         testing.io,
         &.{ "sh", "-c", "exit 3" },
+        input,
+        1000,
+        &.{0},
+        10_000,
+        null,
+    ));
+    // Ended by a signal (the OOM killer would): not the document's fault.
+    try testing.expectError(error.ToolKilled, runTool(
+        gpa,
+        testing.io,
+        &.{ "sh", "-c", "kill -9 $$" },
         input,
         1000,
         &.{0},

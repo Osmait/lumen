@@ -410,6 +410,20 @@ pub extern fn g_subprocess_communicate_utf8_finish(
 ) gboolean;
 pub extern fn g_subprocess_get_successful(subprocess: *GSubprocess) gboolean;
 pub extern fn g_subprocess_get_stdout_pipe(subprocess: *GSubprocess) *GInputStream;
+pub extern fn g_subprocess_force_exit(subprocess: *GSubprocess) void;
+pub const GSubprocessLauncher = opaque {};
+pub extern fn g_subprocess_launcher_new(flags: c_int) *GSubprocessLauncher;
+pub extern fn g_subprocess_launcher_setenv(
+    launcher: *GSubprocessLauncher,
+    variable: [*:0]const u8,
+    value: [*:0]const u8,
+    overwrite: gboolean,
+) void;
+pub extern fn g_subprocess_launcher_spawnv(
+    launcher: *GSubprocessLauncher,
+    argv: [*]const ?[*:0]const u8,
+    err: ?*?*GError,
+) ?*GSubprocess;
 pub extern fn g_subprocess_wait_async(
     subprocess: *GSubprocess,
     cancellable: ?*GCancellable,

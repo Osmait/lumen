@@ -227,8 +227,9 @@ pub fn updateFile(
 /// rewriting all of it (79 MB and an fsync for 49 k documents, every time
 /// a few files changed): the new documents' segment, a new doc table and a
 /// directory that refers to `old`'s segments where they are; then the
-/// header, last. Bytes already there never change, so `old`'s mapping stays
-/// good; what the previous table and directory took is left behind
+/// header, last. Bytes already there never change but the 64-byte header,
+/// which only `parse` reads (once, from the mapping it makes), so `old`'s
+/// mapping stays good; what the previous table and directory took is left behind
 /// (`bytes_live` says how much is still used). A run of small segments at
 /// the end (one per update) is merged into the new one, without the
 /// postings of removed documents. Null when the file is not as `old` saw it.

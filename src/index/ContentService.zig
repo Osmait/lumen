@@ -428,23 +428,23 @@ fn cachedTextBytes(context: *anyopaque, doc: content.DocIn) u64 {
     return service.text_cache.size(doc);
 }
 
-/// Extracts what is missing from the text cache, on the background pool
-/// (a PDF takes 10-40 ms, a whole book up to ~0.7 s). Documents that cannot
-/// be extracted (a corrupt file, a tool error) get an empty file, so they
-/// are not retried every refresh. Passing failures (out of memory, a
-/// timeout, a missing tool) leave nothing: those documents are taken out
-/// of `docs` (what is left is returned) and into `retry`, so that the index
-/// does not remember them as textless and the next check tries again.
-/// Null when out of memory: nothing is to be indexed then.
+/// What `extractMissing` leaves: the documents to index, and those to try
+/// again at the next check.
 const ExtractOutcome = struct {
     docs: []content.DocIn,
     retry: []content.DocIn,
 };
 
-/// Extracts every document in `docs` whose version is not yet in `text_cache`.
-/// Documents that fail transiently (timeout, tool missing, cache write error)
-/// are left out of `docs` and returned in `retry` so `refresh` commits them
-/// only once the build finishes.
+/// Extracts what is missing from the text cache, on the background pool
+/// (a PDF takes 10-40 ms, a whole book up to ~0.7 s). Documents that cannot
+/// be extracted (a corrupt file, a tool error) get an empty file, so they
+/// are not retried every refresh. Passing failures (out of memory, a
+/// timeout, a missing tool, a tool killed, a cache write error) leave
+/// nothing: those documents are taken out of `docs` (what is left is
+/// returned) and into `retry`, so that the index does not remember them as
+/// textless and the next check tries again; `refresh` commits `retry` only
+/// once the build finishes. Null when out of memory: nothing is to be
+/// indexed then.
 fn extractMissing(
     service: *ContentService,
     arena: std.mem.Allocator,
@@ -510,8 +510,10 @@ const ExtractContext = struct {
             &service.stop,
         ) catch |err| switch (err) {
             // For good: an empty text, so that it is not tried again until
-            // the document changes.
-            error.ToolFailed, error.NotRegular, error.Access, error.NotFound => "",
+            // the document changes. Not a tool killed by a signal, nor a
+            // document unreadable for now (a chmod changes neither its
+            // mtime nor its size, the cache's key): those are retried.
+            error.ToolFailed, error.NotRegular, error.NotFound => "",
             else => {
                 context.failed[missing_index] = err;
                 return;
@@ -555,8 +557,14 @@ fn leaveOut(
             .{ failed_count, docs[missing[first]].path, failed[first].? },
         );
     }
-    const retry = arena.alloc(content.DocIn, failed_count) catch return null;
-    const dropped = arena.alloc(bool, docs.len) catch return null;
+    const retry = arena.alloc(content.DocIn, failed_count) catch {
+        logOutOfMemory("setting documents aside to retry");
+        return null;
+    };
+    const dropped = arena.alloc(bool, docs.len) catch {
+        logOutOfMemory("setting documents aside to retry");
+        return null;
+    };
     @memset(dropped, false);
     var retry_index: usize = 0;
     for (failed, missing) |failure, doc_index| {
@@ -577,19 +585,34 @@ fn leaveOut(
     return .{ .docs = docs[0..kept_count], .retry = retry };
 }
 
-/// Persists `retry` in `worker.retry_arena` once a refresh finishes.
+/// Persists `retry` in `worker.retry_arena` once a refresh finishes. Copied
+/// into a new arena first: out of memory, the list before stays (reset
+/// first, a failure emptied it, and those documents waited for the next
+/// full listing).
 fn commitRetry(service: *ContentService, retry: []const content.DocIn) void {
     service.assertWorkerThread();
-    _ = service.worker.retry_arena.reset(.retain_capacity);
-    service.worker.retry = &.{};
-    if (retry.len == 0) return;
-    const retry_arena = service.worker.retry_arena.allocator();
-    const copy = retry_arena.alloc(content.DocIn, retry.len) catch return;
-    for (retry, copy) |doc, *dst| {
-        dst.* = doc;
-        dst.path = retry_arena.dupe(u8, doc.path) catch return;
-    }
+    var fresh_arena: std.heap.ArenaAllocator = .init(service.gpa);
+    const copy = copyDocs(fresh_arena.allocator(), retry) catch {
+        fresh_arena.deinit();
+        logOutOfMemory("keeping the documents to retry");
+        return;
+    };
+    service.worker.retry_arena.deinit();
+    service.worker.retry_arena = fresh_arena;
     service.worker.retry = copy;
+}
+
+fn copyDocs(arena: std.mem.Allocator, docs: []const content.DocIn) std.mem.Allocator.Error![]content.DocIn {
+    const copy = try arena.alloc(content.DocIn, docs.len);
+    for (docs, copy) |doc, *dst| {
+        dst.* = doc;
+        dst.path = try arena.dupe(u8, doc.path);
+    }
+    return copy;
+}
+
+fn logOutOfMemory(what: []const u8) void {
+    log.warn("{s}: out of memory, tried again at the next check", .{what});
 }
 
 /// How the listed documents differ from the index: ids whose document
@@ -706,7 +729,11 @@ fn indexedChanges(
             .plain => .text,
         });
         if (stat_now) |stat| {
-            if (stat.mtime == doc.mtime and stat.size == doc.size) continue;
+            const same = stat.mtime == doc.mtime and stat.size == doc.size;
+            // Its extracted text gone from the cache (a cleaner emptied it):
+            // indexed but never found, until the document changed. As if it
+            // had: extracted again.
+            if (same and (doc.source == .plain or service.textCached(doc))) continue;
         }
         try gone.append(arena, id);
         // Gone, or out of bounds now: only removed.
@@ -731,6 +758,13 @@ fn indexedChanges(
         });
     }
     return .{ .gone = gone.items, .added = added.items };
+}
+
+/// Whether the extracted text of `doc` is in the text cache.
+fn textCached(service: *ContentService, doc: content.DocIn) bool {
+    var text_path_buffer: paths.Buffer = undefined;
+    const text_path = service.text_cache.path(&text_path_buffer, doc) orelse return false;
+    return sys.exists(text_path);
 }
 
 /// The service thread is the only one that replaces the index and the only
@@ -780,7 +814,7 @@ fn refresh(service: *ContentService) void {
     // A whole build indexes every file: they must be listed.
     if (whole and docs == null) {
         docs = service.listAll(arena, name_changes, &listed) orelse return;
-        changed = service.diff(arena, docs.?) catch return;
+        changed = service.diff(arena, docs.?) catch return logOutOfMemory("comparing the listing");
     }
     var start_ns = sys.monotonicNs();
     const extracted = if (whole)
@@ -838,9 +872,15 @@ fn changes(
     const start_ns = sys.monotonicNs();
     if (service.listingReason(name_changes, start_ns) != null) {
         docs.* = service.listAll(arena, name_changes, listed) orelse return null;
-        return service.diff(arena, docs.*.?) catch null;
+        return service.diff(arena, docs.*.?) catch {
+            logOutOfMemory("comparing the listing");
+            return null;
+        };
     }
-    const changed = service.indexedChanges(arena) catch return null;
+    const changed = service.indexedChanges(arena) catch {
+        logOutOfMemory("checking the indexed files");
+        return null;
+    };
     service.counters.stat_ns_last.store(sys.monotonicNs() - start_ns, .monotonic);
     return changed;
 }

@@ -16,6 +16,7 @@ const core = @import("core");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
 const row_list = @import("row_list.zig");
+const labels = @import("labels.zig");
 const Ui = @import("Ui.zig");
 
 const log = std.log.scoped(.dmenu);
@@ -107,7 +108,8 @@ pub fn start(
         .prompt = "",
         .ui = ui,
     };
-    session.prompt = session.arena.allocator().dupeSentinel(u8, prompt orelse "", 0) catch "";
+    // Shown in labels: whatever bytes `-p` was given, made valid UTF-8.
+    session.prompt = labels.displayText(session.arena.allocator(), prompt orelse "");
     ui.picker = session;
     if (session.stream == null) session.done_reading = true else readMore(session);
     ui.showWith(.dmenu, query);
@@ -221,10 +223,15 @@ fn addLine(session: *Session, raw: []const u8) void {
             const option = std.meta.stringToEnum(RofiOption, key) orelse continue;
             switch (option) {
                 .icon => {
-                    const name = arena.dupeSentinel(u8, value, 0) catch continue;
-                    // A first byte past ASCII starts a character, not an icon name.
+                    // A first byte past ASCII starts a character, not an icon
+                    // name: drawn as text, so made valid UTF-8.
                     const is_character = value.len > 0 and value[0] >= 0x80;
-                    line.icon = if (is_character) .{ .emoji = name } else .byName(name);
+                    if (is_character) {
+                        line.icon = .{ .emoji = labels.displayText(arena, value) };
+                    } else {
+                        const name = arena.dupeSentinel(u8, value, 0) catch continue;
+                        line.icon = .byName(name);
+                    }
                 },
                 .meta => line.meta = arena.dupe(u8, value) catch "",
                 .nonselectable => line.selectable = !std.mem.eql(u8, value, rofi_true),

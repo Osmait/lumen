@@ -243,9 +243,23 @@ const Link = struct {
         const url = line[close + 2 .. paren];
         if (url.len == 0) return null;
         if (std.mem.findScalar(u8, url, ' ') != null) return null;
+        // Any other scheme stays text: GTK opens a link with the system's
+        // app for it, and an extension's `file:///...desktop` or a scheme
+        // of some app's own ran that app, past the actions it declares.
+        if (!linkAllowed(url)) return null;
         return .{ .text = line[start + 1 .. close], .url = url, .end = paren + 1 };
     }
 };
+
+/// The schemes a link may have: web pages and mail.
+const link_schemes = [_][]const u8{ "https://", "http://", "mailto:" };
+
+fn linkAllowed(url: []const u8) bool {
+    for (link_schemes) |scheme| {
+        if (url.len >= scheme.len and std.ascii.eqlIgnoreCase(url[0..scheme.len], scheme)) return true;
+    }
+    return false;
+}
 
 /// Text as markup: valid UTF-8 whatever the input (U+FFFD for each byte
 /// that does not start a character), without NUL. GTK refuses markup that
@@ -305,6 +319,13 @@ test "inline spans" {
         "see [docs](https://ziglang.org)",
         "see <a href=\"https://ziglang.org\">docs</a>",
     );
+    // Only web pages and mail: anything else stays text.
+    try expectMarkup("[run](file:///usr/share/applications/x.desktop)", "[run](file:///usr/share/applications/x.desktop)");
+    try expectMarkup("[mail](MAILTO:a@b.c)", "<a href=\"MAILTO:a@b.c\">mail</a>");
+    try expectMarkup(
+        "[app](steam://run/1)",
+        "[app](steam://run/1)",
+    );
     try expectMarkup("**bold _and it_**", "<b>bold <i>and it</i></b>");
     try expectMarkup("`<b>` is & stays", "<tt>&lt;b&gt;</tt> is &amp; stays");
 }
@@ -340,8 +361,8 @@ test "unclosed or stray markers stay as text" {
 test "the markup is valid UTF-8 without NUL, whatever the bytes" {
     try expectMarkup("caf\xc3 \xff**b\x00**", "caf\u{FFFD} \u{FFFD}<b>b\u{FFFD}</b>");
     try expectMarkup(
-        "ok é `\xe2\x82` [x\xff](u)",
-        "ok é <tt>\u{FFFD}\u{FFFD}</tt> <a href=\"u\">x\u{FFFD}</a>",
+        "ok é `\xe2\x82` [x\xff](https://u)",
+        "ok é <tt>\u{FFFD}\u{FFFD}</tt> <a href=\"https://u\">x\u{FFFD}</a>",
     );
     // Characters of several bytes around markers stay whole.
     try expectMarkup("*ñ*_ü_", "<i>ñ</i><i>ü</i>");

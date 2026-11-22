@@ -85,7 +85,40 @@ const extensions = [_][]const u8{
     ".toml", ".rs", ".md", ".zig", ".json", ".png", ".go", ".ts", "",
 };
 
-/// ~1M entries: 25k directories over three levels, 40 files each.
+/// One synthetic folder's entries, sorted by name before they are pushed:
+/// what the scanner leaves (`Store` checks it).
+const FolderEntries = struct {
+    const entries_max = 70;
+    const name_bytes_max = 64;
+    const Entry = struct { name: []const u8, is_dir: bool };
+    texts: [entries_max][name_bytes_max]u8 = undefined,
+    entries: [entries_max]Entry = undefined,
+    count: usize = 0,
+
+    fn add(folder: *FolderEntries, is_dir: bool, comptime fmt: []const u8, args: anytype) void {
+        std.debug.assert(folder.count < entries_max);
+        const text = &folder.texts[folder.count];
+        const name = std.mem.print(text, fmt, args) catch unreachable;
+        folder.entries[folder.count] = .{ .name = name, .is_dir = is_dir };
+        folder.count += 1;
+    }
+
+    fn sorted(folder: *FolderEntries) []const Entry {
+        const entries = folder.entries[0..folder.count];
+        std.mem.sort(Entry, entries, {}, struct {
+            fn lessThan(_: void, a: Entry, b: Entry) bool {
+                return std.mem.order(u8, a.name, b.name) == .lt;
+            }
+        }.lessThan);
+        return entries;
+    }
+};
+
+const files_per_directory = 40;
+
+/// ~1M entries: 26k directories over three levels, 40 files in each of the
+/// deepest, in the order the scanner leaves (level by level, each folder's
+/// names sorted: `Store` checks both).
 fn syntheticNames(gpa: std.mem.Allocator) !store_mod.Store {
     var prng = std.Random.DefaultPrng.init(1);
     const random = prng.random();
@@ -94,40 +127,27 @@ fn syntheticNames(gpa: std.mem.Allocator) !store_mod.Store {
     var level: std.ArrayList(u32) = .empty;
     defer level.deinit(gpa);
     try level.append(gpa, root);
-    var name_text: [64]u8 = undefined;
-    // Directories level by level (BFS order, as the scanner produces).
-    var directories: std.ArrayList(u32) = .empty;
-    defer directories.deinit(gpa);
     for ([_]usize{ 30, 30, 28 }, 1..) |fan, depth| {
         var next: std.ArrayList(u32) = .empty;
         for (level.items) |parent| {
-            for (0..fan) |i| {
-                const name = try std.mem.print(&name_text, "{s}-{d}", .{
-                    words[random.uintLessThan(usize, words.len)],
-                    i,
-                });
-                try next.append(gpa, try builder.push(
-                    gpa,
-                    name,
-                    parent,
-                    store_mod.flag_dir,
-                    @intCast(depth),
-                ));
+            var folder: FolderEntries = .{};
+            for (0..fan) |i| folder.add(true, "{s}-{d}", .{ words[random.uintLessThan(usize, words.len)], i });
+            for (folder.sorted()) |entry| {
+                const id = try builder.push(gpa, entry.name, parent, store_mod.flag_dir, @intCast(depth));
+                try next.append(gpa, id);
             }
         }
-        try directories.appendSlice(gpa, next.items);
         level.deinit(gpa);
         level = next;
     }
-    for (directories.items) |directory| {
-        for (0..40) |_| {
-            const name = try std.mem.print(&name_text, "{s}_{s}{s}", .{
-                words[random.uintLessThan(usize, words.len)],
-                words[random.uintLessThan(usize, words.len)],
-                extensions[random.uintLessThan(usize, extensions.len)],
-            });
-            _ = try builder.push(gpa, name, directory, 0, 4);
-        }
+    for (level.items) |directory| {
+        var folder: FolderEntries = .{};
+        for (0..files_per_directory) |_| folder.add(false, "{s}_{s}{s}", .{
+            words[random.uintLessThan(usize, words.len)],
+            words[random.uintLessThan(usize, words.len)],
+            extensions[random.uintLessThan(usize, extensions.len)],
+        });
+        for (folder.sorted()) |entry| _ = try builder.push(gpa, entry.name, directory, 0, 4);
     }
     return builder.finish(gpa);
 }

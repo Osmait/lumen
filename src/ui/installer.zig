@@ -44,9 +44,19 @@ const Job = struct {
     subprocess: *c.GSubprocess,
     kind: Kind,
     name: core.FixedStr(extension_name_bytes_max) = .{},
-    /// What removeTreeThenReload deletes on failure: whole, never cut (see
-    /// `start`).
+    /// The folder the job is about: the extension's (or extensions/, for
+    /// the update of every one). Marked busy (`busy`) while the job runs.
     folder: core.FixedStr(std.Io.Dir.max_path_bytes) = .{},
+    /// The folder the command writes, and what removeTreeThenReload deletes
+    /// on failure: whole, never cut (see `start`). An install clones into a
+    /// folder of its own (`installingFolder`), renamed into place once it
+    /// is an extension: a failure never deletes a folder another job made.
+    work: core.FixedStr(std.Io.Dir.max_path_bytes) = .{},
+    /// Cancels the read of the output when `timer` fires.
+    cancellable: *c.GCancellable,
+    /// `job_timeout_s` from the start; 0 once fired or removed.
+    timer: c_uint = 0,
+    timed_out: bool = false,
     /// The end of what the job printed: only its last lines are ever shown,
     /// and git's output is not bounded (a clone with progress, a pull
     /// over many extensions).
@@ -81,7 +91,52 @@ const Job = struct {
     fn folderPath(job: *Job) [:0]const u8 {
         return job.folder.slice();
     }
+
+    fn workPath(job: *Job) [:0]const u8 {
+        return job.work.slice();
+    }
 };
+
+/// How long a job may run: git asking nothing (see `start`) still waited on
+/// a remote that stopped answering, and the caller's `lumen --install`
+/// with it.
+const job_timeout_s = 600;
+
+/// Folders a job is working on (`Job.folder`), in `std.heap.c_allocator`.
+/// Main thread only. Two installs of one name at once had the second's
+/// failure delete the first's clone.
+var busy: std.ArrayList([]u8) = .empty;
+
+/// Whether a job works on `folder`, on a folder in it, or on one it is in
+/// (the update of every extension against any other job).
+fn busyWith(folder: []const u8) bool {
+    for (busy.items) |held| {
+        if (os.isAtOrBelow(held, folder) or os.isAtOrBelow(folder, held)) return true;
+    }
+    return false;
+}
+
+fn markBusy(folder: []const u8) std.mem.Allocator.Error!void {
+    const gpa = std.heap.c_allocator;
+    const owned = try gpa.dupe(u8, folder);
+    errdefer gpa.free(owned);
+    try busy.append(gpa, owned);
+}
+
+fn unmarkBusy(folder: []const u8) void {
+    for (busy.items, 0..) |held, i| {
+        if (!std.mem.eql(u8, held, folder)) continue;
+        std.heap.c_allocator.free(busy.swapRemove(i));
+        return;
+    }
+}
+
+/// Where an install of `name` clones before it is an extension: beside
+/// extensions/ (on the same file system, so the rename is atomic), outside
+/// it (a reload in between does not load half a clone).
+fn installingFolder(ui: *Ui, out: []u8, name: []const u8) ?[:0]const u8 {
+    return std.mem.printSentinel(out, "{s}/.installing-{s}", .{ ui.config_dir, name }, 0) catch null;
+}
 
 /// The folder an extension `name` lives in, written to `out`.
 fn extensionFolder(ui: *Ui, out: []u8, name: []const u8) ?[:0]const u8 {
@@ -210,11 +265,19 @@ pub fn install(
     const url_z = std.mem.printSentinel(&url_buffer, "{s}", .{url}, 0) catch {
         return fail(ui, caller, "URL too long", .{});
     };
+    var installing_bytes: [4096]u8 = undefined;
+    const installing = installingFolder(ui, &installing_bytes, name) orelse {
+        return fail(ui, caller, "path too long", .{});
+    };
+    if (!busyWith(folder) and os.info(installing) != null) {
+        const left = "{s} is left from an install that stopped: remove it, then install again";
+        return fail(ui, caller, left, .{installing});
+    }
     // "--": a URL starting with "-" is not an option.
     var argv = [_:null]?[*:0]const u8{
-        "git", "clone", "--depth", "1", "--", url_z.ptr, folder.ptr,
+        "git", "clone", "--depth", "1", "--", url_z.ptr, installing.ptr,
     };
-    start(ui, caller, .install, name, folder, &argv);
+    start(ui, caller, .install, name, folder, installing, &argv);
 }
 
 pub fn update(ui: *Ui, caller: ?*c.GApplicationCommandLine, name: ?[]const u8) void {
@@ -230,7 +293,7 @@ pub fn update(ui: *Ui, caller: ?*c.GApplicationCommandLine, name: ?[]const u8) v
             return fail(ui, caller, "no extension named \"{s}\"", .{extension_name});
         }
         var argv = [_:null]?[*:0]const u8{ "git", "-C", folder.ptr, "pull", "--ff-only" };
-        return start(ui, caller, .update, extension_name, folder, &argv);
+        return start(ui, caller, .update, extension_name, folder, folder, &argv);
     }
     // Every extension that is a git checkout.
     const folder = std.mem.printSentinel(
@@ -261,7 +324,7 @@ pub fn update(ui: *Ui, caller: ?*c.GApplicationCommandLine, name: ?[]const u8) v
         ,
         "lumen-update", folder.ptr,
     };
-    start(ui, caller, .update, "", folder, &argv);
+    start(ui, caller, .update, "", folder, folder, &argv);
 }
 
 pub fn uninstall(ui: *Ui, caller: ?*c.GApplicationCommandLine, name: []const u8) void {
@@ -274,7 +337,7 @@ pub fn uninstall(ui: *Ui, caller: ?*c.GApplicationCommandLine, name: []const u8)
         return fail(ui, caller, "no extension named \"{s}\"", .{name});
     }
     var argv = [_:null]?[*:0]const u8{ "rm", "-rf", "--", folder.ptr };
-    start(ui, caller, .uninstall, name, folder, &argv);
+    start(ui, caller, .uninstall, name, folder, folder, &argv);
 }
 
 fn start(
@@ -283,20 +346,31 @@ fn start(
     kind: Kind,
     name: []const u8,
     folder: []const u8,
+    work: []const u8,
     argv: [*:null]?[*:0]const u8,
 ) void {
+    if (busyWith(folder)) {
+        return fail(ui, caller, "{s}: another install, update or removal is running on it", .{folder});
+    }
+    markBusy(folder) catch return fail(ui, caller, "out of memory", .{});
+    const flags = c.G_SUBPROCESS_FLAGS_STDOUT_PIPE | c.G_SUBPROCESS_FLAGS_STDERR_MERGE;
+    const launcher = c.g_subprocess_launcher_new(flags);
+    defer c.g_object_unref(launcher);
+    // Nobody can answer a prompt: git asked for credentials or a host key
+    // on the terminal the daemon was started from, and waited for ever.
+    c.g_subprocess_launcher_setenv(launcher, "GIT_TERMINAL_PROMPT", "0", 1);
+    c.g_subprocess_launcher_setenv(launcher, "GIT_SSH_COMMAND", "ssh -oBatchMode=yes", 1);
     var err: ?*c.GError = null;
-    const subprocess = c.g_subprocess_newv(
-        argv,
-        c.G_SUBPROCESS_FLAGS_STDOUT_PIPE | c.G_SUBPROCESS_FLAGS_STDERR_MERGE,
-        &err,
-    ) orelse {
+    const subprocess = c.g_subprocess_launcher_spawnv(launcher, argv, &err) orelse {
+        unmarkBusy(folder);
         const reason = if (err) |gerror| std.mem.span(gerror.message) else "cannot start";
         fail(ui, caller, "{s}: {s}", .{ std.mem.span(argv[0].?), reason });
         if (err) |gerror| c.g_error_free(gerror);
         return;
     };
     const job = ui.gpa.create(Job) catch {
+        unmarkBusy(folder);
+        c.g_subprocess_force_exit(subprocess);
         c.g_object_unref(subprocess);
         return fail(ui, caller, "out of memory", .{});
     };
@@ -305,11 +379,15 @@ fn start(
         .caller = if (caller) |command_line| @ptrCast(c.g_object_ref(command_line)) else null,
         .subprocess = subprocess,
         .kind = kind,
+        .cancellable = c.g_cancellable_new(),
     };
     job.name.set(name);
-    // extensionFolder builds it in a buffer of this size: it always fits.
+    // extensionFolder builds them in buffers of this size: they always fit.
     std.debug.assert(folder.len <= @TypeOf(job.folder).capacity);
+    std.debug.assert(work.len <= @TypeOf(job.work).capacity);
     job.folder.set(folder);
+    job.work.set(work);
+    job.timer = c.g_timeout_add_seconds(job_timeout_s, &onTimeout, job);
     // Read as bytes, chunk by chunk, keeping only the end: git prints file
     // names and messages in any encoding, and how much it prints has no
     // bound (communicate kept all of it).
@@ -323,10 +401,21 @@ fn readOutput(job: *Job) void {
         &job.chunk,
         job.chunk.len,
         c.G_PRIORITY_DEFAULT,
-        null,
+        job.cancellable,
         &onOutput,
         job,
     );
+}
+
+/// Past `job_timeout_s`: the command is killed and the read of its output
+/// given up (a child of git's may hold the pipe open), so the job ends.
+fn onTimeout(data: ?*anyopaque) callconv(.c) c.gboolean {
+    const job: *Job = @ptrCast(@alignCast(data.?));
+    job.timer = 0;
+    job.timed_out = true;
+    c.g_subprocess_force_exit(job.subprocess);
+    c.g_cancellable_cancel(job.cancellable);
+    return 0;
 }
 
 fn onOutput(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) void {
@@ -359,7 +448,12 @@ fn onDone(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
     const job: *Job = @ptrCast(@alignCast(data.?));
     const ui = job.ui;
     const caller = job.caller;
+    // Unless the removal of a failed clone has it now (`removeTreeThenReload`).
+    var busy_handed_over = false;
     defer {
+        if (job.timer != 0) _ = c.g_source_remove(job.timer);
+        c.g_object_unref(job.cancellable);
+        if (!busy_handed_over) unmarkBusy(job.folderPath());
         c.g_object_unref(job.subprocess);
         // The caller's `lumen --install` returns once this is released.
         if (caller) |command_line| c.g_object_unref(command_line);
@@ -370,12 +464,22 @@ fn onDone(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
     defer if (err) |gerror| c.g_error_free(gerror);
     const output = outputText(job);
     defer c.g_free(output.ptr);
-    const succeeded = ran and err == null and c.g_subprocess_get_successful(job.subprocess) != 0;
+    const succeeded = !job.timed_out and ran and err == null and
+        c.g_subprocess_get_successful(job.subprocess) != 0;
     if (!succeeded) {
         // A failed clone can leave half a folder behind, and the next
         // install would find it there. The extensions reload once it is
         // gone; otherwise now: half a pull changed files too.
-        if (job.kind == .install) removeTreeThenReload(ui, job.folderPath()) else ext_view.reload(ui);
+        if (job.kind == .install) {
+            removeTreeThenReload(ui, job.workPath(), job.folderPath());
+            busy_handed_over = true;
+        } else {
+            ext_view.reload(ui);
+        }
+        if (job.timed_out) {
+            const stopped = "{s} stopped: no end after {d} s";
+            return fail(ui, caller, stopped, .{ @tagName(job.kind), job_timeout_s });
+        }
         const why = if (err) |gerror|
             std.mem.span(gerror.message)
         else
@@ -383,12 +487,13 @@ fn onDone(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
         const end = tail(why, failure_output_bytes_max);
         return fail(ui, caller, "{s} failed:\n{s}{s}", .{ @tagName(job.kind), end[0], end[1] });
     }
-    reportSuccess(job, output);
+    busy_handed_over = reportSuccess(job, output);
 }
 
 /// The outcome of a job that succeeded: to the caller, or on the selected
-/// row.
-fn reportSuccess(job: *Job, output: [:0]const u8) void {
+/// row. True when it handed the job's folder over to a removal
+/// (`removeTreeThenReload`), which marks it free once done.
+fn reportSuccess(job: *Job, output: [:0]const u8) bool {
     const ui = job.ui;
     const caller = job.caller;
     switch (job.kind) {
@@ -397,22 +502,24 @@ fn reportSuccess(job: *Job, output: [:0]const u8) void {
             const init_path = std.mem.printSentinel(
                 &init_path_bytes,
                 "{s}/init.lua",
-                .{job.folderPath()},
+                .{job.workPath()},
                 0,
             ) catch {
-                // Not known to be missing: the clone stays.
-                ext_view.reload(ui);
-                return fail(ui, caller, "{s}: path too long to check its init.lua", .{job.folderPath()});
+                // Not known to be missing: the clone stays where it is.
+                fail(ui, caller, "{s}: path too long to check its init.lua", .{job.workPath()});
+                return false;
             };
             if (os.info(init_path) == null) {
-                removeTreeThenReload(ui, job.folderPath());
-                return fail(
-                    ui,
-                    caller,
-                    "{s} has no init.lua: it is not a Lumen extension",
-                    .{job.nameSlice()},
-                );
+                removeTreeThenReload(ui, job.workPath(), job.folderPath());
+                fail(ui, caller, "{s} has no init.lua: it is not a Lumen extension", .{job.nameSlice()});
+                return true;
             }
+            // Into place, whole: until now nothing loaded it.
+            os.rename(job.workPath(), job.folderPath()) catch |err| {
+                removeTreeThenReload(ui, job.workPath(), job.folderPath());
+                fail(ui, caller, "could not move the clone to {s}: {t}", .{ job.folderPath(), err });
+                return true;
+            };
             print(
                 ui,
                 caller,
@@ -435,6 +542,7 @@ fn reportSuccess(job: *Job, output: [:0]const u8) void {
     // shown, has nothing left to show.
     const on_its_page = ui.view == .prefs and std.mem.eql(u8, ui.prefs_ext.slice(), job.nameSlice());
     if (caller == null and job.kind == .uninstall and on_its_page) ui.goBack();
+    return false;
 }
 
 /// Whether an update changed anything: a line "NAME: updated" from the
@@ -463,26 +571,45 @@ fn print(
 }
 
 /// Removes `folder` like rm -rf without waiting for it (the GTK thread
-/// must not: a large tree takes seconds), then reloads the extensions.
-fn removeTreeThenReload(ui: *Ui, folder: [:0]const u8) void {
+/// must not: a large tree takes seconds), then reloads the extensions and
+/// marks `busy_folder` free (it stays busy meanwhile: a new install of the
+/// same name would clone where this removal deletes).
+fn removeTreeThenReload(ui: *Ui, folder: [:0]const u8, busy_folder: []const u8) void {
+    const removal = std.heap.c_allocator.create(Removal) catch {
+        unmarkBusy(busy_folder);
+        return ext_view.reload(ui);
+    };
+    removal.* = .{ .ui = ui };
+    removal.busy_folder.set(busy_folder);
     var argv = [_:null]?[*:0]const u8{ "rm", "-rf", "--", folder.ptr };
     var err: ?*c.GError = null;
     const subprocess = c.g_subprocess_newv(@ptrCast(&argv), c.G_SUBPROCESS_FLAGS_NONE, &err) orelse {
         proc.warnError(.install, err, "rm {s}", .{folder});
-        return ext_view.reload(ui);
+        return removal.finish();
     };
-    c.g_subprocess_wait_check_async(subprocess, null, &onRemoved, ui);
+    c.g_subprocess_wait_check_async(subprocess, null, &onRemoved, removal);
 }
 
+const Removal = struct {
+    ui: *Ui,
+    busy_folder: core.FixedStr(std.Io.Dir.max_path_bytes) = .{},
+
+    fn finish(removal: *Removal) void {
+        unmarkBusy(removal.busy_folder.slice());
+        ext_view.reload(removal.ui);
+        std.heap.c_allocator.destroy(removal);
+    }
+};
+
 fn onRemoved(source: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) void {
-    const ui: *Ui = @ptrCast(@alignCast(data.?));
+    const removal: *Removal = @ptrCast(@alignCast(data.?));
     const subprocess: *c.GSubprocess = @ptrCast(source.?);
     defer c.g_object_unref(subprocess);
     var err: ?*c.GError = null;
     if (c.g_subprocess_wait_check_finish(subprocess, async_result, &err) == 0) {
         proc.warnError(.install, err, "rm", .{});
     }
-    ext_view.reload(ui);
+    removal.finish();
 }
 
 test "long output keeps its end, and messages stay valid UTF-8" {
@@ -550,4 +677,17 @@ test "an update says Updated only when something changed" {
     try std.testing.expect(!anyUpdated(false, ""));
     try std.testing.expect(!anyUpdated(false, "Already up to date.\n"));
     try std.testing.expect(anyUpdated(false, "Updating 1a2b..3c4d\nFast-forward\n"));
+}
+
+test "busy folders: one job per folder, and the update of all against any" {
+    defer {
+        for (busy.items) |held| std.heap.c_allocator.free(held);
+        busy.clearAndFree(std.heap.c_allocator);
+    }
+    try markBusy("/c/extensions/weather");
+    try std.testing.expect(busyWith("/c/extensions/weather"));
+    try std.testing.expect(busyWith("/c/extensions"));
+    try std.testing.expect(!busyWith("/c/extensions/clock"));
+    unmarkBusy("/c/extensions/weather");
+    try std.testing.expect(!busyWith("/c/extensions"));
 }

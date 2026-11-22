@@ -271,19 +271,17 @@ pub fn selectAfterRefresh(ui: *Ui) void {
     var first = nextSelectable(ui, null, 1);
     const top = first;
     if (ui.reselect.len > 0) {
-        // The row to select back may be any of them.
-        ensureRows(ui);
         // A copy: clearing writes into the buffer `slice` points at.
         const reselect = ui.reselect;
         ui.reselect.clear();
         const wanted_key = reselect.slice();
-        for (ui.rows.items, 0..) |row, i| {
-            const item_index = row.item orelse continue;
-            if (std.mem.eql(u8, ui.items.items[item_index].key, wanted_key)) {
-                first = i;
-                break;
-            }
-        }
+        // Among the rows built, else built up to it from those queued:
+        // building them all, to look, cost dmenu ~115 ms a tick while its
+        // input streamed in.
+        first = rowOfKey(ui, wanted_key) orelse if (pendingOfKey(ui, wanted_key)) |pending_index| blk: {
+            buildPending(ui, pending_index + 1);
+            break :blk rowOfKey(ui, wanted_key) orelse first;
+        } else first;
     }
     assert(ui.reselect.len == 0);
     if (first) |row_first| assert(ui.rows.items[row_first].item != null);
@@ -292,6 +290,24 @@ pub fn selectAfterRefresh(ui: *Ui) void {
     ui.scroll.suppressed = first == top;
     select(ui, first);
     ui.scroll.suppressed = false;
+}
+
+/// The built row showing the item `key`.
+fn rowOfKey(ui: *const Ui, key: []const u8) ?usize {
+    for (ui.rows.items, 0..) |row, i| {
+        const item_index = row.item orelse continue;
+        if (std.mem.eql(u8, ui.items.items[item_index].key, key)) return i;
+    }
+    return null;
+}
+
+/// Where the item `key` is among the rows queued (`pending`).
+fn pendingOfKey(ui: *const Ui, key: []const u8) ?usize {
+    for (ui.pending.items, 0..) |pending_row, i| switch (pending_row) {
+        .item => |item_index| if (std.mem.eql(u8, ui.items.items[item_index].key, key)) return i,
+        .section => {},
+    };
+    return null;
 }
 
 /// The first row after `from` (or from either end, when null) in

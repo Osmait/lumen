@@ -34,6 +34,31 @@ pub fn openDirNoFollow(path: [*:0]const u8) Error!i32 {
     return @intCast(fd);
 }
 
+/// The folder at `relative` below the open folder `base`, through no
+/// symbolic link at all and never leaving `base` (openat2 with
+/// RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS). `openDirNoFollow` only refuses a
+/// link as the last component: a parent swapped for one between two reads
+/// of a tree was walked through. Where the kernel has no openat2 (before
+/// 5.6, or a seccomp filter refusing it): `openDirNoFollow` on `path`, the
+/// same folder by its full path.
+pub fn openDirBeneath(base: i32, relative: [*:0]const u8, path: [*:0]const u8) Error!i32 {
+    const OpenHow = extern struct { flags: u64, mode: u64, resolve: u64 };
+    const resolve_no_symlinks = 0x04;
+    const resolve_beneath = 0x08;
+    const flags: linux.O = .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true };
+    const how: OpenHow = .{
+        .flags = @as(u32, @bitCast(flags)),
+        .mode = 0,
+        .resolve = resolve_beneath | resolve_no_symlinks,
+    };
+    const base_word: usize = @bitCast(@as(isize, base));
+    const result = linux.syscall4(.openat2, base_word, @intFromPtr(relative), @intFromPtr(&how), @sizeOf(OpenHow));
+    switch (linux.errno(result)) {
+        .NOSYS, .PERM => return openDirNoFollow(path),
+        else => return @intCast(try check(result)),
+    }
+}
+
 /// What getdents64 fills per call: a few hundred entries.
 const dir_entries_buffer_bytes = 32 << 10;
 
@@ -264,4 +289,31 @@ test "Lumen's files and directories are owner-only" {
     try expectSuccess(linux.symlink(other, link));
     makePrivate(link);
     try std.testing.expectEqual(@as(u32, 0o755), try mode(other));
+}
+
+test "openDirBeneath goes through no link and never above its base" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var dir_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try os.tmpDirPath(&tmp_dir, &dir_buffer);
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    try mkdirP(try std.mem.print(&path_buffer, "{s}/a/b", .{dir}));
+    const link = try std.mem.printSentinel(&path_buffer, "{s}/c", .{dir}, 0);
+    try std.testing.expectEqual(@as(usize, 0), linux.symlink("a", link));
+    var dir_z_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base = try openDir(try std.mem.printSentinel(&dir_z_buffer, "{s}", .{dir}, 0));
+    defer close(base);
+    var full_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const real = try openDirBeneath(base, "a/b", try std.mem.printSentinel(&full_buffer, "{s}/a/b", .{dir}, 0));
+    close(real);
+    // "c" is a link to "a": the path is refused, whichever component it is.
+    const through_link = try std.mem.printSentinel(&full_buffer, "{s}/c/b", .{dir}, 0);
+    if (openDirBeneath(base, "c/b", through_link)) |fd| {
+        close(fd);
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    if (openDirBeneath(base, "..", "/")) |fd| {
+        close(fd);
+        return error.TestUnexpectedResult;
+    } else |_| {}
 }
