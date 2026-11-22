@@ -354,6 +354,8 @@ fn rootSearchCommand(
 }
 
 fn rootSearchSuperseded(host: *Host) bool {
+    // Shutting down: nobody waits for the rest.
+    if (host.stop.load(.acquire)) return true;
     host.lock.lockUncancelable(host.io);
     defer host.lock.unlock(host.io);
     return host.pending.root_search != null;

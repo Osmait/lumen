@@ -51,6 +51,9 @@ pub fn create(host: *Host, id: []const u8, folder: []const u8) ?*Extension {
     const folder_copy = worker_arena.dupeSentinel(u8, folder, 0) catch return null;
     const extension = host.gpa.create(Extension) catch return null;
     extension.* = .{ .host = host, .id = id_copy, .folder = folder_copy, .data = data };
+    // A shutdown stops what it runs at once, not at its deadline (30 s for
+    // an action).
+    extension.budget.cancel = &host.stop;
     // Without it, the extension runs; lumen.storage fails and says so.
     os.mkdirP(extension.data) catch |err| log.warn("{s}: {t}", .{ extension.data, err });
     extension.L = lua.newState(&extension.budget) orelse {

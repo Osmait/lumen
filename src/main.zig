@@ -126,6 +126,15 @@ pub fn main(init: std.process.Init) !void {
     if (arguments.len == 1 and first_flag == .version) return printToStdout(init.io, version_line);
 
     if (c.g_getenv(ipc.env.app_id)) |app_id| daemon.app_id = std.mem.span(app_id);
+    // GLib's rules, not ipc.validAppId's (which only keeps the socket's
+    // path sound): GTK returned null for "lumen-test", and the null went
+    // on as an application.
+    if (c.g_application_id_is_valid(daemon.app_id.ptr) == 0) {
+        std.process.fatal("{s}={s} is not a valid application id (like org.example.Name)", .{
+            ipc.env.app_id,
+            daemon.app_id,
+        });
+    }
     // Commands that only talk to a running daemon must not become one: with
     // none running GApplication makes the caller the primary instance, so
     // `lumen --stats` would start a whole new daemon and never return. As a
@@ -134,7 +143,9 @@ pub fn main(init: std.process.Init) !void {
     const client_only = if (first_flag) |flag| cli.specs.get(flag).needs_daemon else false;
     const launcher = if (client_only) c.G_APPLICATION_IS_LAUNCHER else 0;
     const flags = c.G_APPLICATION_HANDLES_COMMAND_LINE | launcher;
-    const gtk_app = c.gtk_application_new(daemon.app_id.ptr, flags);
+    const gtk_app = c.gtk_application_new(daemon.app_id.ptr, flags) orelse {
+        std.process.fatal("cannot create the application {s}", .{daemon.app_id});
+    };
     defer c.g_object_unref(gtk_app);
     daemon.app = @ptrCast(gtk_app);
     // Zig's default in ReleaseSafe is a checking allocator over mmap (every
@@ -260,6 +271,10 @@ fn commandLineCallback(
     const argv = c.g_application_command_line_get_arguments(command_line, &argc);
     defer c.g_strfreev(argv);
     var arguments: [ipc.arguments_max][:0]const u8 = undefined;
+    // More than the socket takes is refused as it refuses them: cut, a
+    // different command ran.
+    const given_count: usize = @intCast(@max(argc - 1, 0));
+    if (given_count > arguments.len) return usage(&.{ .command_line = command_line });
     var arguments_count: usize = 0;
     // From 1: without the program's name.
     var argv_index: usize = 1;

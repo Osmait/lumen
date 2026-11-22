@@ -546,7 +546,26 @@ pub const Settings = struct {
         var output: std.Io.Writer.Allocating = .init(gpa);
         defer output.deinit();
         try settings.writeKeeping(&output.writer, &file, kept);
-        try sys.writeFileAtomic(path, output.written());
+        // Written where a link points: the rename of the atomic write
+        // replaced the link itself, and a settings.conf kept in a dotfiles
+        // repository (stow, home-manager) silently became a copy.
+        var target_buffer: [std.c.PATH_MAX:0]u8 = undefined;
+        const target = linkTarget(path, &target_buffer) orelse path;
+        try sys.writeFileAtomic(target, output.written());
+    }
+
+    /// What `path` resolves to when it is a symbolic link to an existing
+    /// file, in `buffer`; null when it is not a link (or a dangling one,
+    /// written over as before).
+    fn linkTarget(path: [:0]const u8, buffer: *[std.c.PATH_MAX:0]u8) ?[:0]const u8 {
+        var stx: std.os.linux.Statx = undefined;
+        const linux = std.os.linux;
+        const no_follow = linux.AT.SYMLINK_NOFOLLOW;
+        const result = linux.statx(linux.AT.FDCWD, path, no_follow, .{ .TYPE = true }, &stx);
+        if (linux.errno(result) != .SUCCESS) return null;
+        if (stx.mode & linux.S.IFMT != linux.S.IFLNK) return null;
+        const resolved = std.c.realpath(path, buffer) orelse return null;
+        return std.mem.span(resolved);
     }
 
     pub const Check = enum { ok, unknown_key, bad_value };
@@ -801,6 +820,31 @@ test "each text choice sets its own field" {
     try testing.expectEqualStrings("Papirus", settings.icon_theme);
     try testing.expect(!settings.setChoice(.editor, "rm -rf"));
     try testing.expectEqualStrings("hx", settings.editor);
+}
+
+test "saving through a link writes where it points, the link stays" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var dir_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try sys.tmpDirPath(&tmp_dir, &dir_buffer);
+    var real_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const real = try std.mem.printSentinel(&real_buffer, "{s}/repo-settings.conf", .{dir}, 0);
+    var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const link = try std.mem.printSentinel(&link_buffer, "{s}/settings.conf", .{dir}, 0);
+    try sys.writeFile(real, "theme = dracula\n");
+    // Relative to the link's folder, as a dotfiles manager makes them.
+    try testing.expectEqual(@as(usize, 0), std.os.linux.symlink("repo-settings.conf", link));
+    var settings = Settings.load(testing.allocator, link.ptr);
+    defer settings.deinit();
+    try testing.expect(settings.setChoice(.editor, "hx"));
+    try settings.save(testing.allocator, link, &.{});
+    var back = Settings.load(testing.allocator, real.ptr);
+    defer back.deinit();
+    try testing.expectEqualStrings("hx", back.editor);
+    try testing.expectEqualStrings("dracula", back.theme);
+    var stx: std.os.linux.Statx = undefined;
+    _ = std.os.linux.statx(std.os.linux.AT.FDCWD, link, std.os.linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true }, &stx);
+    try testing.expect(stx.mode & std.os.linux.S.IFMT == std.os.linux.S.IFLNK);
 }
 
 test "check tells unknown keys from bad values" {

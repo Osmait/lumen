@@ -32,6 +32,11 @@ const load_budget_ns = 5 * std.time.ns_per_s;
 /// one runaway extension cannot starve the rest.
 const load_bytes_max = 16 << 20;
 const extension_load_bytes_max = 4 << 20;
+/// What failed files may leave in the registry arena on top of
+/// `load_bytes_max`: their bytes stay until the next reload (the arena
+/// frees nothing), but four extensions failing at their own cap used up
+/// the total, and every one after them failed for "out of memory".
+const failed_load_bytes_max = 16 << 20;
 
 /// Closes every state and forgets the commands of the registry they made.
 pub fn closeAll(host: *Host) void {
@@ -51,7 +56,7 @@ pub fn reloadExecute(host: *Host) void {
         .arena = .init(host.gpa),
     }) orelse return;
     var capped: lua.Capped = .{ .child = registry.arena.allocator(), .bytes_max = load_bytes_max };
-    var load: Load = .{ .arena = capped.allocator() };
+    var load: Load = .{ .arena = capped.allocator(), .failed_bytes_left = failed_load_bytes_max };
     loadAll(host, &load, &capped);
     registryFill(host, registry, &load);
     for (registry.problems) |file_problem| {
@@ -82,7 +87,11 @@ fn loadAll(host: *Host, load: *Load, cap: *lua.Capped) void {
         load.problem(config_extension_id, "out of memory");
     }
 
-    for (extensionDirs(host, worker_arena)) |id| loadExtension(host, load, cap, id);
+    for (extensionDirs(host, worker_arena)) |id| {
+        // Shutting down: the files left would each wait out their time.
+        if (host.stop.load(.acquire)) break;
+        loadExtension(host, load, cap, id);
+    }
 }
 
 /// The extension in extensions/<id>, when its folder name is one.
@@ -135,8 +144,9 @@ fn loadStyle(host: *Host, load: *Load, cap: *lua.Capped, name: []const u8) void 
     }
     const worker_arena = host.worker_arena.allocator();
     const folder = worker_arena.printSentinel("{s}/styles/{s}", .{ host.config_dir, name }, 0) catch
-        return;
-    const path = worker_arena.printSentinel("{s}/init.lua", .{folder}, 0) catch return;
+        return load.problem(style_extension_id, "out of memory");
+    const path = worker_arena.printSentinel("{s}/init.lua", .{folder}, 0) catch
+        return load.problem(style_extension_id, "out of memory");
     if (os.isRegular(path)) {
         loadSource(host, load, cap, style_extension_id, folder, .{ .file = path });
     } else if (os.info(folder) != null) {
@@ -176,7 +186,8 @@ fn loadSource(
         return;
     };
     const before = load.mark();
-    const saved_bytes_max = cap.bytes_max;
+    const used_before = cap.used_bytes;
+    var saved_bytes_max = cap.bytes_max;
     cap.bytes_max = @min(saved_bytes_max, cap.used_bytes +| extension_load_bytes_max);
     defer cap.bytes_max = saved_bytes_max;
     extension.load = load;
@@ -207,6 +218,12 @@ fn loadSource(
         }
     }
     load.rollback(before);
+    // Its bytes stay counted (the arena keeps them), and the ceiling rises
+    // by as much, so the files after it have the room they had.
+    const failed_bytes = cap.used_bytes -| used_before;
+    const allowance = @min(failed_bytes, load.failed_bytes_left);
+    load.failed_bytes_left -= allowance;
+    saved_bytes_max +|= allowance;
     load.problem(id, failure orelse "out of memory");
     extension.destroy();
 }

@@ -20,24 +20,20 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    // The search loops (fuzzy and folded matching, trigram lists, the
-    // content scan) are 10-25 % faster without safety checks (lumen-find,
-    // measured). The index validates what it maps from disk on open, and its
-    // decoders never read past their input, so a ReleaseSafe build compiles
-    // these two modules ReleaseFast; the rest keeps its checks.
-    const safe_index = b.option(
-        bool,
-        "safe-index",
-        "Keep safety checks in the core and index modules in ReleaseSafe",
-    ) orelse false;
-    const hot = if (optimize == .safe and !safe_index) .fast else optimize;
+    // The bundled C libraries (SQLite, Lua) are built optimized in a
+    // ReleaseSafe build: their checks are their own. Lumen's modules keep
+    // Zig's safety checks in every safe build, core and index included:
+    // `zig build perf` measured no difference beyond noise with them on,
+    // and without them an assertion or a bound broken by a corrupt index
+    // file was undefined behaviour instead of a panic.
+    const c_optimize: std.builtin.OptimizeMode = if (optimize == .safe) .fast else optimize;
 
     // The version both binaries print (`lumen --version`).
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", resolveVersion(b));
 
-    const base = baseModules(b, target, hot);
-    const libraries = cLibraries(b, target, optimize, hot);
+    const base = baseModules(b, target, optimize);
+    const libraries = cLibraries(b, target, optimize, c_optimize);
     const luart = b.createModule(.{
         .root_source_file = b.path("src/luart/root.zig"),
         .target = target,

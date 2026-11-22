@@ -590,7 +590,13 @@ fn set(L: *lua.State) lua.Error!c_int {
             lua.c.LUA_TBOOLEAN => Host.toggleText(lua.c.lua_toboolean(L, -1) != 0),
             lua.c.LUA_TSTRING => lua.toSlice(L, -1).?,
             lua.c.LUA_TNUMBER => blk: {
-                const integer = lua.c.lua_tointegerx(L, -1, null);
+                var is_integer: c_int = 0;
+                const integer = lua.c.lua_tointegerx(L, -1, &is_integer);
+                // 97.5 read as 0, and "0 is not a value" misled.
+                if (is_integer == 0) {
+                    const number = lua.c.lua_tonumberx(L, -1, null);
+                    return lua.fail(L, "lumen.set: {s} takes a whole number, not {d}", .{ key, number });
+                }
                 // 64 bytes hold any integer.
                 break :blk std.mem.print(&number_buffer, "{d}", .{integer}) catch unreachable;
             },

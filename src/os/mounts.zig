@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const os = @import("root.zig");
+const log = std.log.scoped(.os);
 
 /// mountinfo is a line per mount: a few hundred of them take ~50 KB.
 const mountinfo_bytes_max = 4 << 20;
@@ -17,11 +18,22 @@ pub fn slowMounts(gpa: std.mem.Allocator, under: []const u8) std.mem.Allocator.E
     defer os.close(fd);
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(gpa);
-    os.readUpTo(gpa, fd, &text, mountinfo_bytes_max) catch |err| switch (err) {
+    // One byte past the limit tells a list longer than it.
+    os.readUpTo(gpa, fd, &text, mountinfo_bytes_max + 1) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         // Part of the list would leave mounts out: none, as if unreadable.
         error.ReadFailed => return &.{},
     };
+    if (text.items.len > mountinfo_bytes_max) {
+        // Thousands of mounts (containers): the complete lines read are
+        // still what they say, and leaving them out would leave the slow
+        // mounts among them in. The cut last line is not one of them.
+        log.warn("/proc/self/mountinfo is over {d} bytes: the mounts past them are not checked", .{
+            mountinfo_bytes_max,
+        });
+        const last_newline = std.mem.findScalarLast(u8, text.items[0..mountinfo_bytes_max], '\n') orelse 0;
+        text.shrinkRetainingCapacity(last_newline);
+    }
     var out: std.ArrayList([]u8) = .empty;
     errdefer {
         for (out.items) |mount| gpa.free(mount);
@@ -36,7 +48,7 @@ pub fn slowMounts(gpa: std.mem.Allocator, under: []const u8) std.mem.Allocator.E
         const escaped = fields.next() orelse continue;
         var tail = std.mem.tokenizeScalar(u8, line[dash + 3 ..], ' ');
         if (!mayHang(tail.next() orelse continue)) continue;
-        const mount = try unescapeMount(gpa, escaped);
+        const mount = try unescapeMount(gpa, escaped) orelse continue;
         if (!isAtOrBelow(mount, under)) {
             gpa.free(mount);
             continue;
@@ -81,7 +93,8 @@ fn mayHang(fstype: []const u8) bool {
 }
 
 /// mountinfo writes space, tab, newline and backslash as `\ooo`.
-fn unescapeMount(gpa: std.mem.Allocator, escaped: []const u8) std.mem.Allocator.Error![]u8 {
+/// Null for a path longer than a path can be: cut, it would name another.
+fn unescapeMount(gpa: std.mem.Allocator, escaped: []const u8) std.mem.Allocator.Error!?[]u8 {
     var unescaped: [4096]u8 = undefined;
     var unescaped_len: usize = 0;
     var escaped_index: usize = 0;
@@ -97,14 +110,20 @@ fn unescapeMount(gpa: std.mem.Allocator, escaped: []const u8) std.mem.Allocator.
         unescaped[unescaped_len] = rest[0];
         escaped_index += 1;
     }
-    return gpa.dupe(u8, unescaped[0..unescaped_len]);
+    if (escaped_index < escaped.len) return null;
+    return try gpa.dupe(u8, unescaped[0..unescaped_len]);
 }
 
 test "slow mounts: escapes undone, only below the root" {
     const gpa = std.testing.allocator;
-    const mount = try unescapeMount(gpa, "/home/u/my\\040share");
+    const mount = (try unescapeMount(gpa, "/home/u/my\\040share")).?;
     defer gpa.free(mount);
     try std.testing.expectEqualStrings("/home/u/my share", mount);
+    // Longer than a path can be: skipped, not cut into another path.
+    const long = try gpa.alloc(u8, 5000);
+    defer gpa.free(long);
+    @memset(long, 'a');
+    try std.testing.expect(try unescapeMount(gpa, long) == null);
     for ([_][]const u8{ "fuse.sshfs", "nfs4" }) |fstype| try std.testing.expect(mayHang(fstype));
     for ([_][]const u8{ "fuseblk", "ext4", "btrfs", "tmpfs" }) |fstype| {
         try std.testing.expect(!mayHang(fstype));

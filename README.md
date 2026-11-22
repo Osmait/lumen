@@ -240,6 +240,10 @@ lumen --install https://github.com/someone/lumen-weather
 lumen --update            # git pull every installed extension
 ```
 
+An extension is a program, not a sandboxed plugin: it runs as you, can run
+any command and read or write your files. Install the ones you have read or
+trust, as you would a shell script ([Safety](EXTENSIONS.md#safety)).
+
 [EXTENSIONS.md](EXTENSIONS.md) is the full guide.
 [`examples/`](examples) has a GitHub extension (your pull requests, issues
 and repositories through `gh`), a process list, quick notes, a world clock,
