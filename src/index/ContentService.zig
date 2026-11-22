@@ -369,11 +369,20 @@ fn cachedTextBytes(context: *anyopaque, doc: content.DocIn) u64 {
 /// of `docs` (what is left is returned) and into `retry`, so that the index
 /// does not remember them as textless and the next check tries again.
 /// Null when out of memory: nothing is to be indexed then.
+const ExtractOutcome = struct {
+    docs: []content.DocIn,
+    retry: []content.DocIn,
+};
+
+/// Extracts every document in `docs` whose version is not yet in `text_cache`.
+/// Documents that fail transiently (timeout, tool missing, cache write error)
+/// are left out of `docs` and returned in `retry` so `refresh` commits them
+/// only once the build finishes.
 fn extractMissing(
     service: *ContentService,
     arena: std.mem.Allocator,
     docs: []content.DocIn,
-) ?[]content.DocIn {
+) ?ExtractOutcome {
     var missing: std.ArrayList(usize) = .empty;
     var path_buffer: paths.Buffer = undefined;
     for (docs, 0..) |doc, doc_index| {
@@ -386,7 +395,7 @@ fn extractMissing(
         };
     }
     // Nothing to extract: nothing to retry either.
-    if (missing.items.len == 0) return service.leaveOut(arena, docs, &.{}, &.{});
+    if (missing.items.len == 0) return .{ .docs = docs, .retry = &.{} };
     const failed = arena.alloc(?anyerror, missing.items.len) catch {
         log.warn("extracting documents: out of memory", .{});
         return null;
@@ -444,21 +453,23 @@ const ExtractContext = struct {
         defer if (text.len > 0) service.gpa.free(text);
         sys.writeFileAtomic(text_path, text) catch |err| {
             log.warn("caching text of {s}: {t}", .{ doc.path, err });
+            context.failed[missing_index] = err;
+            return;
         };
         _ = service.counters.extractions.fetchAdd(1, .release);
     }
 };
 
 /// `docs` without those whose extraction `failed` (`missing` says which),
-/// which become the documents to retry. Logged when that list changes, not
-/// on every check while a tool stays missing.
+/// and the documents to retry (committed to `worker.retry` by `commitRetry`
+/// only after the refresh succeeds). Logged when that count changes.
 fn leaveOut(
     service: *ContentService,
     arena: std.mem.Allocator,
     docs: []content.DocIn,
     missing: []const usize,
     failed: []const ?anyerror,
-) ?[]content.DocIn {
+) ?ExtractOutcome {
     service.assertWorkerThread();
     assert(missing.len == failed.len);
     var failed_count: usize = 0;
@@ -468,20 +479,16 @@ fn leaveOut(
         failed_count += 1;
         if (failed_first == null) failed_first = missing_index;
     }
-    const retry_count_before = service.worker.retry.len;
-    _ = service.worker.retry_arena.reset(.retain_capacity);
-    service.worker.retry = &.{};
-    if (failed_count == 0) return docs;
+    if (failed_count == 0) return .{ .docs = docs, .retry = &.{} };
 
     const first = failed_first.?;
-    if (failed_count != retry_count_before) {
+    if (failed_count != service.worker.retry.len) {
         log.warn(
             "extracting {d} documents failed for now ({s}: {t}), will retry",
             .{ failed_count, docs[missing[first]].path, failed[first].? },
         );
     }
-    const retry_arena = service.worker.retry_arena.allocator();
-    const retry = retry_arena.alloc(content.DocIn, failed_count) catch return null;
+    const retry = arena.alloc(content.DocIn, failed_count) catch return null;
     const dropped = arena.alloc(bool, docs.len) catch return null;
     @memset(dropped, false);
     var retry_index: usize = 0;
@@ -489,11 +496,9 @@ fn leaveOut(
         if (failure == null) continue;
         dropped[doc_index] = true;
         retry[retry_index] = docs[doc_index];
-        retry[retry_index].path = retry_arena.dupe(u8, docs[doc_index].path) catch return null;
         retry_index += 1;
     }
     assert(retry_index == failed_count);
-    service.worker.retry = retry;
 
     var kept_count: usize = 0;
     for (docs, dropped) |doc, doc_dropped| {
@@ -502,7 +507,22 @@ fn leaveOut(
         kept_count += 1;
     }
     assert(kept_count + failed_count == docs.len);
-    return docs[0..kept_count];
+    return .{ .docs = docs[0..kept_count], .retry = retry };
+}
+
+/// Persists `retry` in `worker.retry_arena` once a refresh finishes.
+fn commitRetry(service: *ContentService, retry: []const content.DocIn) void {
+    service.assertWorkerThread();
+    _ = service.worker.retry_arena.reset(.retain_capacity);
+    service.worker.retry = &.{};
+    if (retry.len == 0) return;
+    const retry_arena = service.worker.retry_arena.allocator();
+    const copy = retry_arena.alloc(content.DocIn, retry.len) catch return;
+    for (retry, copy) |doc, *dst| {
+        dst.* = doc;
+        dst.path = retry_arena.dupe(u8, doc.path) catch return;
+    }
+    service.worker.retry = copy;
 }
 
 /// How the listed documents differ from the index: ids whose document
@@ -553,13 +573,20 @@ fn unchanged(index: *const content.Index, id: u32, doc: content.DocIn) bool {
     return index.sources[id] == @backingInt(doc.source);
 }
 
+const ListingStamp = struct {
+    name_changes: ?u64,
+    listed_at_ns: u64,
+};
+
 /// Every file to index, listed by ripgrep; `name_changes` is what the name
 /// index said before listing, so a change during the listing lists again
-/// next time.
+/// next time. Recorded in `listed` and committed to `worker` only once the
+/// refresh succeeds.
 fn listAll(
     service: *ContentService,
     arena: std.mem.Allocator,
     name_changes: ?u64,
+    listed: *?ListingStamp,
 ) ?[]content.DocIn {
     service.assertWorkerThread();
     const start_ns = sys.monotonicNs();
@@ -572,9 +599,15 @@ fn listAll(
     };
     service.counters.list_ns_last.store(sys.monotonicNs() - start_ns, .monotonic);
     _ = service.counters.listings.fetchAdd(1, .release);
-    service.worker.listed_name_changes = name_changes;
-    service.worker.listed_at_ns = start_ns;
+    listed.* = .{ .name_changes = name_changes, .listed_at_ns = start_ns };
     return docs;
+}
+
+fn commitListing(service: *ContentService, listed: ?ListingStamp) void {
+    service.assertWorkerThread();
+    const stamp = listed orelse return;
+    service.worker.listed_name_changes = stamp.name_changes;
+    service.worker.listed_at_ns = stamp.listed_at_ns;
 }
 
 /// Changes to the files already indexed, without listing: edits in place
@@ -642,9 +675,11 @@ fn refresh(service: *ContentService) void {
     const arena = arena_state.allocator();
     const name_changes = if (service.options.names) |names| names.nameChanges() else null;
     var docs: ?[]content.DocIn = null;
-    var changed = service.changes(arena, name_changes, &docs) orelse return;
+    var listed: ?ListingStamp = null;
+    var changed = service.changes(arena, name_changes, &docs, &listed) orelse return;
     if (service.stop.load(.acquire)) return;
     if (service.index != null and changed.gone.len == 0 and changed.added.len == 0) {
+        service.commitListing(listed);
         if (service.worker.unsaved) service.retrySave();
         return;
     }
@@ -655,19 +690,23 @@ fn refresh(service: *ContentService) void {
     const whole = service.wantsWhole(changed);
     // A whole build indexes every file: they must be listed.
     if (whole and docs == null) {
-        docs = service.listAll(arena, name_changes) orelse return;
+        docs = service.listAll(arena, name_changes, &listed) orelse return;
         changed = service.diff(arena, docs.?) catch return;
     }
     var start_ns = sys.monotonicNs();
-    if (whole) {
-        docs = service.extractMissing(arena, docs.?) orelse return;
-    } else {
-        changed.added = service.extractMissing(arena, changed.added) orelse return;
-    }
+    const extracted = if (whole)
+        service.extractMissing(arena, docs.?) orelse return
+    else
+        service.extractMissing(arena, changed.added) orelse return;
+    if (whole) docs = extracted.docs else changed.added = extracted.docs;
     service.counters.extract_ns_last.store(sys.monotonicNs() - start_ns, .monotonic);
     if (service.stop.load(.acquire)) return;
     // Only documents to retry, which failed again.
-    if (!whole and changed.gone.len == 0 and changed.added.len == 0) return;
+    if (!whole and changed.gone.len == 0 and changed.added.len == 0) {
+        service.commitListing(listed);
+        service.commitRetry(extracted.retry);
+        return;
+    }
     start_ns = sys.monotonicNs();
     const input: BuildInput = if (whole) .{ .whole = docs.? } else .{ .update = changed };
     const fresh = service.buildNext(input) orelse return;
@@ -682,6 +721,8 @@ fn refresh(service: *ContentService) void {
         service.index = fresh;
         break :blk old;
     };
+    service.commitListing(listed);
+    service.commitRetry(extracted.retry);
     if (old) |*old_index| {
         service.text_cache.dropStale(old_index, changed.gone);
         old_index.deinit(service.gpa);
@@ -697,10 +738,11 @@ fn changes(
     arena: std.mem.Allocator,
     name_changes: ?u64,
     docs: *?[]content.DocIn,
+    listed: *?ListingStamp,
 ) ?Diff {
     const start_ns = sys.monotonicNs();
     if (service.listingReason(name_changes, start_ns) != null) {
-        docs.* = service.listAll(arena, name_changes) orelse return null;
+        docs.* = service.listAll(arena, name_changes, listed) orelse return null;
         return service.diff(arena, docs.*.?) catch null;
     }
     const changed = service.indexedChanges(arena) catch return null;
@@ -739,7 +781,8 @@ fn wantsWhole(service: *const ContentService, changed: Diff) bool {
     const docs_count = index.docs_count + changed.added.len;
     if (removed_count * 100 > docs_count * service.options.removed_percent_max) return true;
     if (index.segments_count >= service.options.segments_max) return true;
-    return index.bytes.len * 100 > index.bytes_live * (100 + garbage_percent_max);
+    return @as(u128, index.bytes.len) * 100 >
+        @as(u128, index.bytes_live) * (100 + garbage_percent_max);
 }
 
 /// What the next index is made from.
@@ -837,7 +880,7 @@ fn buildNextToFile(
     switch (strategy) {
         .build_whole => unreachable,
         .append_to_mapped_file => {
-            const appended = try content.appendFile(
+            const appended = content.appendFile(
                 gpa,
                 pool,
                 index,
@@ -846,10 +889,15 @@ fn buildNextToFile(
                 reader,
                 path,
                 null,
-            );
+            ) catch |err| switch (err) {
+                // Appending pushed the doc table past u32 offsets (4 GiB):
+                // rewrite the file from offset 64 instead of wedging updates.
+                error.IndexTooLarge => null,
+                else => return err,
+            };
             if (appended) |fresh| return fresh;
-            // The file is not the one the index was mapped from any more:
-            // rewritten instead.
+            // The file is not the one the index was mapped from any more (or
+            // grew past 4 GiB): rewritten instead.
         },
         .rewrite_file => {},
     }
@@ -1259,8 +1307,11 @@ test "content service: Office documents are extracted once per version" {
     // Not a zip: extraction fails, leaving an empty text so it is not retried.
     try fixture.root.write("docs/broken.docx", "garbage, not a zip");
 
-    var prefix_buffer: [32]u8 = undefined;
-    const prefix = try std.mem.print(&prefix_buffer, "{x:0>16}-", .{std.hash.Wyhash.hash(0, report)});
+    var hash_hex: [32]u8 = undefined;
+    var prefix_buffer: [40]u8 = undefined;
+    const prefix = try std.mem.print(&prefix_buffer, "{s}-", .{TextCache.pathHashHex(&hash_hex, report)});
+    var legacy_prefix_buffer: [32]u8 = undefined;
+    const legacy_prefix = try std.mem.print(&legacy_prefix_buffer, "{x:0>16}-", .{std.hash.Wyhash.hash(0, report)});
     const mtime_second = sys.nowSeconds() - 100;
 
     {
@@ -1348,7 +1399,7 @@ test "content service: Office documents are extracted once per version" {
     }, 0);
     const old_name = try std.mem.printSentinel(&old_name_buffer, "{s}/text/{s}{d}.txt", .{
         fixture.cache.absolute,
-        prefix,
+        legacy_prefix,
         mtime_second,
     }, 0);
     try sys.rename(now_name, old_name);
@@ -1412,7 +1463,9 @@ test "content service: a document whose extraction failed in passing is left out
     try testing.expectEqualStrings(pdf, docs[0].path);
 
     // Timed out: left out (indexed, it stayed textless until it changed).
-    const kept = service.leaveOut(arena, docs, &.{0}, &[_]?anyerror{error.Timeout}).?;
+    const first = service.leaveOut(arena, docs, &.{0}, &[_]?anyerror{error.Timeout}).?;
+    service.commitRetry(first.retry);
+    const kept = first.docs;
     try testing.expectEqual(@as(usize, 1), kept.len);
     try testing.expect(std.mem.endsWith(u8, kept[0].path, "/b.txt"));
     try testing.expectEqual(@as(usize, 1), service.worker.retry.len);
@@ -1428,7 +1481,8 @@ test "content service: a document whose extraction failed in passing is left out
     try testing.expectEqualStrings(pdf, changes_found.added[0].path);
     try testing.expectEqual(content.Source.extracted, changes_found.added[0].source);
     // Extracted this time: indexed, nothing left to retry.
-    const all = service.leaveOut(arena, changes_found.added, &.{0}, &[_]?anyerror{null}).?;
-    try testing.expectEqual(@as(usize, 1), all.len);
+    const second = service.leaveOut(arena, changes_found.added, &.{0}, &[_]?anyerror{null}).?;
+    service.commitRetry(second.retry);
+    try testing.expectEqual(@as(usize, 1), second.docs.len);
     try testing.expectEqual(@as(usize, 0), service.worker.retry.len);
 }

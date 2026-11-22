@@ -404,8 +404,13 @@ fn appendInto(
     try directory.appendSlice(gpa, old.segments[0..segments_kept_count]);
     var pairs_merged: std.ArrayList(u64) = .empty;
     defer pairs_merged.deinit(gpa);
+    var merge_scratch: std.ArrayList(u64) = .empty;
+    defer merge_scratch.deinit(gpa);
     for (old.segments[segments_kept_count..]) |segment| {
         try segmentPairs(gpa, old, segment, flags, &pairs_merged);
+        if (pairs_merged.items.len >= segment_pairs_max) {
+            try closePairs(sink, &directory, &pairs_merged, &merge_scratch, &build_stats);
+        }
     }
     try indexDocs(
         sink,
@@ -476,9 +481,17 @@ fn indexDocs(
     const gpa = sink.gpa;
     var pairs: std.ArrayList(u64) = .empty;
     defer pairs.deinit(gpa);
-    try pairs.appendSlice(gpa, initial);
     var scratch: std.ArrayList(u64) = .empty;
     defer scratch.deinit(gpa);
+    var initial_offset: usize = 0;
+    while (initial_offset < initial.len) {
+        const take = @min(segment_pairs_max, initial.len - initial_offset);
+        try pairs.appendSlice(gpa, initial[initial_offset..][0..take]);
+        initial_offset += take;
+        if (pairs.items.len >= segment_pairs_max) {
+            try closePairs(sink, directory, &pairs, &scratch, build_stats);
+        }
+    }
     const tasks = pool.threads.len + 1;
     const task_pairs = try gpa.alloc(std.ArrayList(u64), tasks);
     defer {

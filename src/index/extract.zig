@@ -101,7 +101,7 @@ pub fn extractText(
         cancel,
     );
     defer gpa.free(xml);
-    return shrink(gpa, try xmlToText(gpa, xml), bytes_max);
+    return shrink(gpa, try xmlToText(gpa, xml, bytes_max), bytes_max);
 }
 
 pub const Error = sys.Error || error{ ToolMissing, ToolFailed, Timeout };
@@ -159,9 +159,21 @@ fn runTool(
 }
 
 /// `text` cut to at most `bytes_max` bytes at a UTF-8 boundary, reallocated
-/// to fit.
+/// to fit. Also drops an incomplete trailing UTF-8 sequence when the input
+/// itself was already capped at `bytes_max` (e.g. by `runTool`).
 fn shrink(gpa: std.mem.Allocator, text: []u8, bytes_max: usize) ![]u8 {
-    const length = @import("core").utf8.floorBoundary(text, bytes_max);
+    var length = @import("core").utf8.floorBoundary(text, bytes_max);
+    if (length > 0) {
+        var start = length - 1;
+        var steps: usize = 0;
+        while (start > 0 and steps < 3 and text[start] & 0xC0 == 0x80) {
+            start -= 1;
+            steps += 1;
+        }
+        if (std.unicode.utf8ByteSequenceLength(text[start])) |expected| {
+            if (start + expected > length) length = start;
+        } else |_| {}
+    }
     if (length == text.len) return text;
     if (gpa.resize(text, length)) return text[0..length];
     defer gpa.free(text);
@@ -196,15 +208,17 @@ fn skipped(local: []const u8) bool {
 /// boundaries as newlines and cell/tab boundaries as spaces, whitespace runs
 /// collapsed, trimmed. Runs (`w:r`, `text:span`) are not boundaries: Word
 /// splits words across them. Tolerates truncated input.
-fn xmlToText(gpa: std.mem.Allocator, xml: []const u8) ![]u8 {
+fn xmlToText(gpa: std.mem.Allocator, xml: []const u8, bytes_max: usize) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
-    // A guess that saves most regrowth: text is a fraction of its markup.
-    try out.ensureTotalCapacity(gpa, xml.len / xml_per_text_guess + 16);
-    var text_out: TextOut = .{ .out = &out, .gpa = gpa };
+    // A guess that saves most regrowth: text is a fraction of its markup,
+    // capped so a pathological XML zip-bomb cannot allocate past `bytes_max`.
+    const initial_cap = @min(xml.len / xml_per_text_guess + 16, bytes_max +| 16);
+    try out.ensureTotalCapacity(gpa, initial_cap);
+    var text_out: TextOut = .{ .out = &out, .gpa = gpa, .bytes_max = bytes_max };
     var skip: Skip = .{};
     var i: usize = 0;
-    while (i < xml.len) {
+    while (i < xml.len and !text_out.full()) {
         if (xml[i] != '<') {
             i = try text_out.charData(xml, i, skip.name != null);
             continue;
@@ -230,7 +244,13 @@ fn xmlToText(gpa: std.mem.Allocator, xml: []const u8) ![]u8 {
 const TextOut = struct {
     out: *std.ArrayList(u8),
     gpa: std.mem.Allocator,
+    bytes_max: usize,
     gap: Gap = .none,
+    truncated: bool = false,
+
+    fn full(text_out: *const TextOut) bool {
+        return text_out.truncated or text_out.out.items.len >= text_out.bytes_max;
+    }
 
     /// A gap at least as wide as `gap` before the next text.
     fn widenGap(text_out: *TextOut, gap: Gap) void {
@@ -238,12 +258,20 @@ const TextOut = struct {
     }
 
     fn text(text_out: *TextOut, bytes: []const u8) !void {
+        if (text_out.full()) return;
         if (text_out.gap != .none and text_out.out.items.len > 0) {
             const separator: u8 = if (text_out.gap == .newline) '\n' else ' ';
             try text_out.out.append(text_out.gpa, separator);
         }
         text_out.gap = .none;
-        try text_out.out.appendSlice(text_out.gpa, bytes);
+        const room = text_out.bytes_max -| text_out.out.items.len;
+        if (bytes.len <= room) {
+            try text_out.out.appendSlice(text_out.gpa, bytes);
+            return;
+        }
+        const take = @import("core").utf8.floorBoundary(bytes, room);
+        try text_out.out.appendSlice(text_out.gpa, bytes[0..take]);
+        text_out.truncated = true;
     }
 
     /// Character data, entities not decoded (CDATA) or already decoded.
@@ -416,7 +444,7 @@ fn decodeEntity(text: []const u8) Entity {
 const testing = std.testing;
 
 fn expectText(xml: []const u8, want: []const u8) !void {
-    const got = try xmlToText(testing.allocator, xml);
+    const got = try xmlToText(testing.allocator, xml, std.math.maxInt(usize));
     defer testing.allocator.free(got);
     try testing.expectEqualStrings(want, got);
 }
@@ -527,6 +555,10 @@ test "xmlToText: truncated input" {
     try expectText("<w:p><w:t>abc</w:t></w:p><w:p attr=\"x", "abc");
     try expectText("<t>a &am", "a &am");
     try expectText("<t>a<![CDATA[bc", "abc");
+    // Output stops at bytes_max rather than decoding an unbounded XML payload.
+    const capped = try xmlToText(testing.allocator, "<p>abcdefghij</p><p>klmnopqrst</p>", 5);
+    defer testing.allocator.free(capped);
+    try testing.expectEqualStrings("abcde", capped);
 }
 
 test "shrink cuts at a UTF-8 boundary" {
@@ -930,7 +962,7 @@ fn fuzzXml(_: void, smith: *testing.Smith) anyerror!void {
     };
     var input: [1024]u8 = undefined;
     const xml = input[0..smith.sliceWeightedBytes(&input, weights)];
-    const text = try xmlToText(testing.allocator, xml);
+    const text = try xmlToText(testing.allocator, xml, std.math.maxInt(usize));
     defer testing.allocator.free(text);
     // Text is cut only at ASCII markup, and entities decode to valid code
     // points: valid UTF-8 in, valid UTF-8 out.
