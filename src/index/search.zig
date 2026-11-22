@@ -28,16 +28,16 @@ const recency = @import("recency.zig");
 
 /// Candidates one pool task scores.
 const chunk_entries = 8192;
-/// Floor of candidates kept per chunk, in multiples of `limit`: keeping
-/// `limit` per chunk guarantees the global top-`limit` by cheap score is
-/// never lost (an item in the global top-`limit` is beaten by at most
-/// `limit-1` others, so it is in its own chunk's top-`limit`).
-const per_chunk_factor = 1;
-/// Finalists that reach the fine scorer, in multiples of `limit`. The Rust
-/// version measured 100% recall with 16 on its author's disk; `zig build
-/// perf` (1M synthetic names built from 24 words, full of near-ties) found
-/// "hndlr" at 3/20 with 16, 8/20 with 32 and 20/20 with 64, for ~0.3 ms
-/// more per query. Near-ties are where cheap and fine scores disagree most.
+/// Candidates a chunk keeps on the first pass, in multiples of its share
+/// of the finalists: with names spread evenly, a chunk rarely holds more
+/// than twice its share of the global top, so rarely needs a second pass.
+const share_factor = 2;
+/// Finalists that reach the fine scorer, in multiples of `limit`: the
+/// global top by cheap score (`Engine.sift`). Names the fine scorer ranks
+/// higher but the cheap one lower can still miss it: on `zig build perf`'s
+/// home (1M names built from 24 words, full of near-ties, ~1,100 folders
+/// named `handler-N`), "hndlr" finds none of the right 60 with 16, all with
+/// 32; 64 keeps twice that margin for ~0.3 ms more per query.
 const finalist_factor = 64;
 /// Recency `stat` cap, in multiples of `limit`.
 const recency_factor = 16;
@@ -79,6 +79,15 @@ const Pair = struct {
     /// deterministic.
     fn better(pair: Pair, other: Pair) bool {
         return pair.score > other.score or (pair.score == other.score and pair.id < other.id);
+    }
+
+    /// `better` as one number: `a.better(b)` exactly when `a.rank() >
+    /// b.rank()`. The score's sign bit flipped sorts it as unsigned; the id
+    /// inverted puts the lower id higher.
+    fn rank(pair: Pair) u64 {
+        const score_bits: u32 = @bitCast(pair.score);
+        const score_key: u64 = score_bits ^ 0x8000_0000;
+        return score_key << 32 | (std.math.maxInt(u32) - pair.id);
     }
 };
 
@@ -239,28 +248,28 @@ pub const Engine = struct {
         const cacheable = options.cacheable;
         const keep = limit * finalist_factor;
         const source_count: usize = if (refine) engine.last_candidates.items.len else store.len();
-        // Fewer chunks when refining: split the finalist budget among them,
-        // or the incremental case runs short of finalists (recall fell to
-        // 52% with a fixed K in the Rust version).
         const chunks_count = @max(std.math.divCeil(usize, source_count, chunk_entries) catch 1, 1);
-        const kept_max = @max(
-            limit * per_chunk_factor,
-            std.math.divCeil(usize, keep, chunks_count) catch keep,
-        );
         const partials = try gpa.alloc(Partial, chunks_count);
         defer {
             for (partials) |*partial| partial.deinit(gpa);
             gpa.free(partials);
         }
         for (partials) |*partial| partial.* = .{};
+        // First pass: each chunk keeps its share. Cheap, and exact unless
+        // the best names crowd a few chunks: the scanner writes a home
+        // level by level, so the shallow ones, which `adjust` favors, come
+        // first (MYP-185).
         var context: SiftContext = .{
             .gpa = gpa,
             .store = store,
             .ids = if (refine) engine.last_candidates.items else null,
-            .source_count = source_count,
             .query_mask = query_mask,
             .query_folded = query_folded,
-            .kept_max = kept_max,
+            .kept_max = @min(keep, @max(limit, share_factor * (std.math.divCeil(
+                usize,
+                keep,
+                chunks_count,
+            ) catch keep))),
             .candidates_max = if (cacheable) cache_entries_max else 0,
             .partials = partials,
         };
@@ -268,22 +277,61 @@ pub const Engine = struct {
 
         var sifted: Sifted = .{};
         errdefer sifted.deinit(gpa);
-        for (partials) |*partial| {
-            try sifted.finalists.appendSlice(gpa, partial.top.items);
-            sifted.overflow = sifted.overflow or partial.overflow;
-        }
+        for (partials) |*partial| sifted.overflow = sifted.overflow or partial.overflow;
         if (cacheable and !sifted.overflow) {
             for (partials) |*partial| {
                 try sifted.candidates.appendSlice(gpa, partial.candidates.items);
             }
         }
-        if (sifted.finalists.items.len > keep) {
-            selectTop(sifted.finalists.items, keep);
-            sifted.finalists.shrinkRetainingCapacity(keep);
-        }
+        try mergeTops(gpa, partials, keep, &sifted.finalists);
+        try siftCrowded(pool, &context, source_count, keep, &sifted);
         return sifted;
     }
 };
+
+/// The second pass of `Engine.sift`, over the chunks that dropped a name
+/// ranked above the merged top's last: every name of the true top ranks at
+/// least that, so these chunks are the only ones that could have lost one.
+/// They keep everything from there on, up to `keep`.
+fn siftCrowded(
+    pool: *Pool,
+    context: *SiftContext,
+    source_count: usize,
+    keep: usize,
+    sifted: *Engine.Sifted,
+) std.mem.Allocator.Error!void {
+    const floor = if (sifted.finalists.items.len == keep)
+        worst(sifted.finalists.items).rank()
+    else
+        0;
+    var crowded = false;
+    for (context.partials) |*partial| {
+        partial.rescan = partial.cut > floor;
+        crowded = crowded or partial.rescan;
+    }
+    if (!crowded) return;
+    context.kept_max = keep;
+    context.floor = floor;
+    context.candidates_max = 0;
+    pool.runBlocks(source_count, chunk_entries, context, siftChunkCallback);
+    for (context.partials) |*partial| sifted.overflow = sifted.overflow or partial.overflow;
+    try mergeTops(context.gpa, context.partials, keep, &sifted.finalists);
+}
+
+/// The best `keep` of the chunks' tops, in `finalists` (cleared first).
+fn mergeTops(
+    gpa: std.mem.Allocator,
+    partials: []const Partial,
+    keep: usize,
+    finalists: *std.ArrayList(Pair),
+) std.mem.Allocator.Error!void {
+    finalists.clearRetainingCapacity();
+    for (partials) |*partial| try finalists.appendSlice(gpa, partial.top.items);
+    if (finalists.items.len > keep) {
+        selectTop(finalists.items, keep);
+        finalists.shrinkRetainingCapacity(keep);
+    }
+}
 
 /// Spaces separate words but are not part of what is matched: "cargo toml"
 /// becomes "cargotoml", a subsequence of "Cargo.toml" (the Rust version
@@ -321,6 +369,11 @@ const Partial = struct {
     top: std.ArrayList(Pair) = .empty,
     candidates: std.ArrayList(u32) = .empty,
     overflow: bool = false,
+    /// Every pair the chunk dropped ranks below this `Pair.rank`; 0 when
+    /// it dropped none.
+    cut: u64 = 0,
+    /// Sift the chunk again on the second pass.
+    rescan: bool = true,
 
     fn deinit(partial: *Partial, gpa: std.mem.Allocator) void {
         partial.top.deinit(gpa);
@@ -333,16 +386,20 @@ const SiftContext = struct {
     store: *const Store,
     /// Candidate ids when refining; null = every entry.
     ids: ?[]const u32,
-    source_count: usize,
     query_mask: u64,
     query_folded: []const u8,
+    /// Pairs each chunk keeps, at most.
     kept_max: usize,
+    /// Matches kept for refining the next keystroke; 0 = none.
     candidates_max: usize,
     partials: []Partial,
+    /// The `Pair.rank` a pair needs to be kept at all.
+    floor: u64 = 0,
 };
 
 fn siftChunkCallback(context: *SiftContext, start: usize, end: usize) void {
     const chunk_index = start / chunk_entries;
+    if (!context.partials[chunk_index].rescan) return;
     // Out of memory: the chunk's candidates are incomplete, so they must not
     // be refined on the next keystroke as if they were all of them.
     siftChunk(context, chunk_index, start, end) catch {
@@ -361,16 +418,18 @@ fn siftChunk(
     end: usize,
 ) std.mem.Allocator.Error!void {
     const partial = &context.partials[chunk_index];
+    partial.top.clearRetainingCapacity();
+    partial.cut = 0;
     const masks = context.store.masks();
     const query_folded = context.query_folded;
     const kept_max = context.kept_max;
     const compact_at = kept_max * 2;
-    try partial.top.ensureTotalCapacity(context.gpa, compact_at);
-    // Candidates grow as they come: room for the whole chunk up front was
-    // ~32 KB for each of ~196 chunks per keystroke, when a selective query
-    // keeps a handful.
+    // Both grow as they come: room for the whole top up front was 60 KB for
+    // each of ~130 chunks per keystroke on the second pass, when a
+    // selective query keeps a handful.
 
-    var threshold: i32 = std.math.minInt(i32);
+    // A `Pair.rank`, raised as the top fills.
+    var threshold = context.floor;
 
     var position = start;
     while (position < end) : (position += 1) {
@@ -378,16 +437,11 @@ fn siftChunk(
         if (masks[id] & context.query_mask != context.query_mask) continue;
         const name = context.store.name(id);
         const cheap_score = cheap.scoreMasked(name, query_folded, masks[id]) orelse continue;
-        const score = adjust(context.store, id, cheap_score);
-        // `>=`: on equal scores the id breaks the tie, so an equal can still
-        // displace the k-th.
-        if (score >= threshold) {
-            partial.top.appendAssumeCapacity(.{ .score = score, .id = id });
-            if (partial.top.items.len == compact_at) {
-                selectTop(partial.top.items, kept_max);
-                partial.top.shrinkRetainingCapacity(kept_max);
-                threshold = worst(partial.top.items).score;
-            }
+        const pair: Pair = .{ .score = adjust(context.store, id, cheap_score), .id = id };
+        // `>=`: the floor's own pair is still in the top.
+        if (pair.rank() >= threshold) {
+            try partial.top.append(context.gpa, pair);
+            if (partial.top.items.len == compact_at) threshold = compact(partial, kept_max);
         }
         if (context.candidates_max > 0) {
             if (partial.candidates.items.len < context.candidates_max) {
@@ -397,10 +451,19 @@ fn siftChunk(
             }
         }
     }
-    if (partial.top.items.len > kept_max) {
-        selectTop(partial.top.items, kept_max);
-        partial.top.shrinkRetainingCapacity(kept_max);
-    }
+    if (partial.top.items.len > kept_max) _ = compact(partial, kept_max);
+}
+
+/// Cuts `partial`'s top to its best `kept_max` and returns the rank of the
+/// worst: what a pair needs from now on to be kept.
+fn compact(partial: *Partial, kept_max: usize) u64 {
+    assert(partial.top.items.len > kept_max);
+    selectTop(partial.top.items, kept_max);
+    partial.top.shrinkRetainingCapacity(kept_max);
+    const cut = worst(partial.top.items).rank();
+    assert(cut >= partial.cut);
+    partial.cut = cut;
+    return cut;
 }
 
 fn worst(items: []const Pair) Pair {
@@ -585,7 +648,7 @@ pub fn searchExhaustive(
 
 const testing = std.testing;
 
-test "selectTop keeps the best k" {
+test "selectTop keeps the best k; rank orders as better" {
     var prng = std.Random.DefaultPrng.init(7);
     const random = prng.random();
     var items: [500]Pair = undefined;
@@ -595,6 +658,19 @@ test "selectTop keeps the best k" {
     };
     var sorted = items;
     std.mem.sort(Pair, &sorted, {}, lessThan);
+    for (sorted[0 .. sorted.len - 1], sorted[1..]) |better, worse| {
+        try testing.expect(better.rank() > worse.rank());
+    }
+    const extremes = [_]Pair{
+        .{ .score = std.math.maxInt(i32), .id = 0 },
+        .{ .score = 1, .id = std.math.maxInt(u32) },
+        .{ .score = 0, .id = 0 },
+        .{ .score = -1, .id = 0 },
+        .{ .score = std.math.minInt(i32), .id = std.math.maxInt(u32) },
+    };
+    for (extremes[0 .. extremes.len - 1], extremes[1..]) |better, worse| {
+        try testing.expect(better.better(worse) and better.rank() > worse.rank());
+    }
     selectTop(&items, 37);
     std.mem.sort(Pair, items[0..37], {}, lessThan);
     try testing.expectEqualSlices(Pair, sorted[0..37], items[0..37]);
@@ -692,6 +768,61 @@ test "cascade matches the exhaustive reference (recall 100%)" {
             try testing.expectEqual(wanted.score, found.score);
         }
     }
+}
+
+/// A home in the order the scanner writes it (level by level, each
+/// folder's names sorted): 100 `handler-N` folders and two shallow files
+/// first, then 24k deeper files. The shallow files rank first but score
+/// below the folders cheaply, and all of them land in the first chunk.
+fn scanOrdered(gpa: std.mem.Allocator) !Store {
+    var builder: store_mod.Builder = .empty;
+    const root = try builder.push(gpa, "/r", store_mod.no_parent, store_mod.flag_dir, 0);
+    const folders_count = 100;
+    var folder_names: [folders_count][16]u8 = undefined;
+    var sorted: [folders_count][]const u8 = undefined;
+    for (&folder_names, &sorted, 0..) |*text, *entry_name, i| {
+        entry_name.* = try std.mem.print(text, "handler-{d}", .{i});
+    }
+    std.mem.sort([]const u8, &sorted, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+    var folders: [folders_count]u32 = undefined;
+    const folder_flags = store_mod.flag_dir | store_mod.flag_folder;
+    for (sorted, &folders) |entry_name, *folder| {
+        folder.* = try builder.push(gpa, entry_name, root, folder_flags, 1);
+    }
+    _ = try builder.push(gpa, "handler_readme.ts", root, 0, 1);
+    _ = try builder.push(gpa, "handler_readme.zig", root, 0, 1);
+    for (folders) |folder| {
+        for (0..240) |i| {
+            var text: [32]u8 = undefined;
+            const entry_name = try std.mem.print(&text, "notes_{d:0>3}.md", .{i});
+            _ = try builder.push(gpa, entry_name, folder, 0, 2);
+        }
+    }
+    return builder.finish(gpa);
+}
+
+test "shallow files crowded into the first chunk still reach the finalists" {
+    const gpa = testing.allocator;
+    var store = try scanOrdered(gpa);
+    defer store.deinit(gpa);
+    try testing.expect(store.len() > 2 * chunk_entries);
+    const pool = try Pool.create(gpa, testing.io, 3);
+    defer pool.destroy();
+    var engine: Engine = .empty;
+    defer engine.deinit(gpa);
+    var got: std.ArrayList(Hit) = .empty;
+    defer got.deinit(gpa);
+    var want: std.ArrayList(Hit) = .empty;
+    defer want.deinit(gpa);
+    try searchExhaustive(gpa, &store, "hndlr", 2, &want);
+    for (want.items) |hit| try testing.expect(!store.isFolder(hit.id));
+    try engine.search(gpa, pool, &store, "hndlr", .{ .limit = 2, .recency = false }, &got);
+    try testing.expectEqual(want.items.len, got.items.len);
+    for (want.items, got.items) |wanted, found| try testing.expectEqual(wanted, found);
 }
 
 fn smallStore(gpa: std.mem.Allocator, names: []const []const u8) !Store {
