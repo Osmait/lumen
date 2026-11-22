@@ -153,7 +153,12 @@ pub fn sweep(cache: TextCache, gpa: std.mem.Allocator, index: *const Index) void
         };
         if (std.mem.eql(u8, name_wanted, entry.name)) continue;
         var wanted_buffer: [name_bytes_max]u8 = undefined;
-        const target = std.mem.printSentinel(&wanted_buffer, "{s}", .{name_wanted}, 0) catch continue;
+        const target = std.mem.printSentinel(
+            &wanted_buffer,
+            "{s}",
+            .{name_wanted},
+            0,
+        ) catch continue;
         // RENAME_NOREPLACE: never clobber a fresher cached entry already at
         // `target`. If one already exists, unlink the obsolete legacy file.
         const result = linux.renameat2(fd, name, fd, target, .{ .NOREPLACE = true });

@@ -131,9 +131,19 @@ fn syntheticNames(gpa: std.mem.Allocator) !store_mod.Store {
         var next: std.ArrayList(u32) = .empty;
         for (level.items) |parent| {
             var folder: FolderEntries = .{};
-            for (0..fan) |i| folder.add(true, "{s}-{d}", .{ words[random.uintLessThan(usize, words.len)], i });
+            for (0..fan) |i| folder.add(
+                true,
+                "{s}-{d}",
+                .{ words[random.uintLessThan(usize, words.len)], i },
+            );
             for (folder.sorted()) |entry| {
-                const id = try builder.push(gpa, entry.name, parent, store_mod.flag_dir, @intCast(depth));
+                const id = try builder.push(
+                    gpa,
+                    entry.name,
+                    parent,
+                    store_mod.flag_dir,
+                    @intCast(depth),
+                );
                 try next.append(gpa, id);
             }
         }

@@ -108,216 +108,8 @@ pub fn openLibs(L: *State) void {
     // Before the sandbox below: it keeps no reference to the originals.
     _ = luart_open_patterns(L);
     _ = luart_open_files(L);
-    const sandbox =
-        \\local refuse, timed_out, arm_hook = ...
-        \\debug = nil; package.loaded.debug = nil
-        \\os.exit, os.execute, os.setlocale = nil, nil, nil
-        \\io.popen = nil
-        \\package.loadlib = nil; package.cpath = ""
-        \\package.searchers[4] = nil; package.searchers[3] = nil
-        \\local setmt, rawget, type, error, tostring, select =
-        \\  setmetatable, rawget, type, error, tostring, select
-        \\function setmetatable(t, mt)
-        \\  if type(mt) == "table" and rawget(mt, "__gc") ~= nil then
-        \\    error("setmetatable: __gc is not available (finalizers run past the time limit)", 2)
-        \\  end
-        \\  return setmt(t, mt)
-        \\end
-        \\getmetatable(io.stdout).__metatable = false
-        \\pcall(io.input, "/dev/null")
-        \\io.stdin = nil
-        \\local function check_path(path)
-        \\  if type(path) == "number" then path = tostring(path) end
-        \\  return path, refuse(path)
-        \\end
-        \\local open = io.open
-        \\function io.open(path, ...)
-        \\  local checked, why = check_path(path)
-        \\  if why then return nil, why end
-        \\  return open(checked, ...)
-        \\end
-        \\local raw_input, raw_output, raw_lines = io.input, io.output, io.lines
-        \\local function opened(path, mode)
-        \\  local checked, why = check_path(path)
-        \\  if why then error(why, 3) end
-        \\  local f, err = open(checked, mode)
-        \\  if not f then error(err, 3) end
-        \\  return f
-        \\end
-        \\local function named(path) return type(path) == "string" or type(path) == "number" end
-        \\function io.input(path)
-        \\  if named(path) then return raw_input(opened(path, "r")) end
-        \\  return raw_input(path)
-        \\end
-        \\function io.output(path)
-        \\  if named(path) then return raw_output(opened(path, "w")) end
-        \\  return raw_output(path)
-        \\end
-        \\function io.lines(path, ...)
-        \\  if path == nil then return raw_lines(nil, ...) end
-        \\  local f = opened(path, "r")
-        \\  local next_line = f:lines(...)
-        \\  local done = false
-        \\  local function finish(...)
-        \\    if (...) == nil then done = true; f:close() end
-        \\    return ...
-        \\  end
-        \\  return function()
-        \\    if done then return nil end
-        \\    return finish(next_line())
-        \\  end, nil, nil, f
-        \\end
-        \\local raw_move, tointeger, maxinteger = table.move, math.tointeger, math.maxinteger
-        \\local move_chunk = 4096
-        \\function table.move(a1, f, e, t, a2)
-        \\  if a2 == nil then a2 = a1 end
-        \\  local fi, ei, ti = tointeger(f), tointeger(e), tointeger(t)
-        \\  if not (fi and ei and ti) or ei - fi < move_chunk or not (fi > 0 or ei < maxinteger + fi) then
-        \\    return raw_move(a1, f, e, t, a2)
-        \\  end
-        \\  local count = ei - fi + 1
-        \\  if ti > maxinteger - count + 1 then return raw_move(a1, f, e, t, a2) end
-        \\  if ti > ei or ti <= fi or a1 ~= a2 then
-        \\    local from = fi
-        \\    while from <= ei do
-        \\      local last = from + move_chunk - 1
-        \\      if last > ei then last = ei end
-        \\      raw_move(a1, from, last, ti + (from - fi), a2)
-        \\      from = last + 1
-        \\    end
-        \\  else
-        \\    local last = ei
-        \\    while last >= fi do
-        \\      local from = last - move_chunk + 1
-        \\      if from < fi then from = fi end
-        \\      raw_move(a1, from, last, ti + (from - fi), a2)
-        \\      last = from - 1
-        \\    end
-        \\  end
-        \\  return a2
-        \\end
-        \\local raw_load = load
-        \\function load(chunk, chunkname, mode, ...)
-        \\  if mode ~= nil and mode ~= "t" then
-        \\    return nil, "load: binary chunks are not allowed"
-        \\  end
-        \\  if select("#", ...) > 0 then
-        \\    return raw_load(chunk, chunkname, "t", ...)
-        \\  end
-        \\  return raw_load(chunk, chunkname, "t")
-        \\end
-        \\local raw_loadfile = loadfile
-        \\function loadfile(path, mode, ...)
-        \\  if path == nil then error("loadfile: a file name expected", 2) end
-        \\  local checked, why = check_path(path)
-        \\  if why then error(why, 2) end
-        \\  if mode ~= nil and mode ~= "t" then
-        \\    return nil, "loadfile: binary chunks are not allowed"
-        \\  end
-        \\  if select("#", ...) > 0 then
-        \\    return raw_loadfile(checked, "t", ...)
-        \\  end
-        \\  return raw_loadfile(checked, "t")
-        \\end
-        \\function dofile(path)
-        \\  if path == nil then error("dofile: a file name expected", 2) end
-        \\  local chunk, err = loadfile(path, "t")
-        \\  if not chunk then error(err, 2) end
-        \\  return chunk()
-        \\end
-        \\local concat = table.concat
-        \\function package.searchpath(name, path, sep, rep)
-        \\  if type(name) ~= "string" then error("bad argument #1 to 'searchpath' (string expected)", 2) end
-        \\  if type(path) ~= "string" then error("bad argument #2 to 'searchpath' (string expected)", 2) end
-        \\  sep = sep or "."
-        \\  rep = rep or "/"
-        \\  if sep ~= "" then
-        \\    local esc = sep:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1")
-        \\    local rep_esc = rep:gsub("%%", "%%%%")
-        \\    name = name:gsub(esc, rep_esc)
-        \\  end
-        \\  local repl = name:gsub("%%", "%%%%")
-        \\  local msg = {}
-        \\  for template in (path .. ";"):gmatch("([^;]*);") do
-        \\    if template ~= "" then
-        \\      local filename = template:gsub("%?", repl)
-        \\      local checked, why = check_path(filename)
-        \\      if why then
-        \\        msg[#msg + 1] = "\n\t" .. why
-        \\      else
-        \\        local f = open(checked, "r")
-        \\        if f then
-        \\          f:close()
-        \\          return checked
-        \\        end
-        \\        msg[#msg + 1] = "\n\tno file '" .. checked .. "'"
-        \\      end
-        \\    end
-        \\  end
-        \\  return nil, concat(msg)
-        \\end
-        \\local searchpath = package.searchpath
-        \\package.searchers[2] = function(name)
-        \\  local filename, err = searchpath(name, package.path)
-        \\  if not filename then return err end
-        \\  local checked, why = check_path(filename)
-        \\  if why then error(why, 2) end
-        \\  local chunk, lerr = raw_loadfile(checked, "t")
-        \\  if not chunk then
-        \\    error("error loading module '" .. tostring(name) .. "' from file '" .. checked .. "':\n\t" .. tostring(lerr), 2)
-        \\  end
-        \\  return chunk, checked
-        \\end
-        \\local function rethrow_if_timed_out(ok, ...)
-        \\  if not ok and timed_out() then error("timed out", 0) end
-        \\  return ok, ...
-        \\end
-        \\local raw_pcall, raw_xpcall = pcall, xpcall
-        \\function pcall(...)
-        \\  if timed_out() then error("timed out", 0) end
-        \\  return rethrow_if_timed_out(raw_pcall(...))
-        \\end
-        \\function xpcall(...)
-        \\  if timed_out() then error("timed out", 0) end
-        \\  return rethrow_if_timed_out(raw_xpcall(...))
-        \\end
-        \\if type(coroutine) == "table" then
-        \\  local raw_create, raw_resume, raw_close = coroutine.create, coroutine.resume, coroutine.close
-        \\  function coroutine.create(f)
-        \\    local co = raw_create(f)
-        \\    arm_hook(co)
-        \\    return co
-        \\  end
-        \\  function coroutine.wrap(f)
-        \\    local co = raw_create(f)
-        \\    arm_hook(co)
-        \\    local function unwrap(ok, ...)
-        \\      if not ok then
-        \\        if timed_out() then error("timed out", 0) end
-        \\        error((...), 2)
-        \\      end
-        \\      return ...
-        \\    end
-        \\    return function(...)
-        \\      if timed_out() then error("timed out", 0) end
-        \\      arm_hook(co)
-        \\      return unwrap(raw_resume(co, ...))
-        \\    end
-        \\  end
-        \\  function coroutine.resume(co, ...)
-        \\    if timed_out() then error("timed out", 0) end
-        \\    arm_hook(co)
-        \\    return rethrow_if_timed_out(raw_resume(co, ...))
-        \\  end
-        \\  if raw_close then
-        \\    function coroutine.close(...)
-        \\      if timed_out() then error("timed out", 0) end
-        \\      return rethrow_if_timed_out(raw_close(...))
-        \\    end
-        \\  end
-        \\end
-    ;
-    if (c.luaL_loadbufferx(L, sandbox.ptr, sandbox.len, "=sandbox", "t") != c.LUA_OK) {
+    const prelude = sandbox_prelude;
+    if (c.luaL_loadbufferx(L, prelude.ptr, prelude.len, "=sandbox", "t") != c.LUA_OK) {
         _ = c.lua_error(L);
     }
     c.lua_pushcclosure(L, wrap(refuseOpen), 0);
@@ -325,6 +117,219 @@ pub fn openLibs(L: *State) void {
     c.lua_pushcclosure(L, wrap(armThreadHook), 0);
     c.lua_callk(L, 3, 0, 0, null);
 }
+
+/// Run by `openLibs` once the libraries are open, with `refuseOpen`,
+/// `isTimedOut` and `armThreadHook` as its arguments: what it replaces and
+/// why is said there.
+const sandbox_prelude =
+    \\local refuse, timed_out, arm_hook = ...
+    \\debug = nil; package.loaded.debug = nil
+    \\os.exit, os.execute, os.setlocale = nil, nil, nil
+    \\io.popen = nil
+    \\package.loadlib = nil; package.cpath = ""
+    \\package.searchers[4] = nil; package.searchers[3] = nil
+    \\local setmt, rawget, type, error, tostring, select =
+    \\  setmetatable, rawget, type, error, tostring, select
+    \\function setmetatable(t, mt)
+    \\  if type(mt) == "table" and rawget(mt, "__gc") ~= nil then
+    \\    error("setmetatable: __gc is not available (finalizers run past the time limit)", 2)
+    \\  end
+    \\  return setmt(t, mt)
+    \\end
+    \\getmetatable(io.stdout).__metatable = false
+    \\pcall(io.input, "/dev/null")
+    \\io.stdin = nil
+    \\local function check_path(path)
+    \\  if type(path) == "number" then path = tostring(path) end
+    \\  return path, refuse(path)
+    \\end
+    \\local open = io.open
+    \\function io.open(path, ...)
+    \\  local checked, why = check_path(path)
+    \\  if why then return nil, why end
+    \\  return open(checked, ...)
+    \\end
+    \\local raw_input, raw_output, raw_lines = io.input, io.output, io.lines
+    \\local function opened(path, mode)
+    \\  local checked, why = check_path(path)
+    \\  if why then error(why, 3) end
+    \\  local f, err = open(checked, mode)
+    \\  if not f then error(err, 3) end
+    \\  return f
+    \\end
+    \\local function named(path) return type(path) == "string" or type(path) == "number" end
+    \\function io.input(path)
+    \\  if named(path) then return raw_input(opened(path, "r")) end
+    \\  return raw_input(path)
+    \\end
+    \\function io.output(path)
+    \\  if named(path) then return raw_output(opened(path, "w")) end
+    \\  return raw_output(path)
+    \\end
+    \\function io.lines(path, ...)
+    \\  if path == nil then return raw_lines(nil, ...) end
+    \\  local f = opened(path, "r")
+    \\  local next_line = f:lines(...)
+    \\  local done = false
+    \\  local function finish(...)
+    \\    if (...) == nil then done = true; f:close() end
+    \\    return ...
+    \\  end
+    \\  return function()
+    \\    if done then return nil end
+    \\    return finish(next_line())
+    \\  end, nil, nil, f
+    \\end
+    \\local raw_move, tointeger, maxinteger = table.move, math.tointeger, math.maxinteger
+    \\local move_chunk = 4096
+    \\function table.move(a1, f, e, t, a2)
+    \\  if a2 == nil then a2 = a1 end
+    \\  local fi, ei, ti = tointeger(f), tointeger(e), tointeger(t)
+    \\  if not (fi and ei and ti) or ei - fi < move_chunk or not (fi > 0 or ei < maxinteger + fi) then
+    \\    return raw_move(a1, f, e, t, a2)
+    \\  end
+    \\  local count = ei - fi + 1
+    \\  if ti > maxinteger - count + 1 then return raw_move(a1, f, e, t, a2) end
+    \\  if ti > ei or ti <= fi or a1 ~= a2 then
+    \\    local from = fi
+    \\    while from <= ei do
+    \\      local last = from + move_chunk - 1
+    \\      if last > ei then last = ei end
+    \\      raw_move(a1, from, last, ti + (from - fi), a2)
+    \\      from = last + 1
+    \\    end
+    \\  else
+    \\    local last = ei
+    \\    while last >= fi do
+    \\      local from = last - move_chunk + 1
+    \\      if from < fi then from = fi end
+    \\      raw_move(a1, from, last, ti + (from - fi), a2)
+    \\      last = from - 1
+    \\    end
+    \\  end
+    \\  return a2
+    \\end
+    \\local raw_load = load
+    \\function load(chunk, chunkname, mode, ...)
+    \\  if mode ~= nil and mode ~= "t" then
+    \\    return nil, "load: binary chunks are not allowed"
+    \\  end
+    \\  if select("#", ...) > 0 then
+    \\    return raw_load(chunk, chunkname, "t", ...)
+    \\  end
+    \\  return raw_load(chunk, chunkname, "t")
+    \\end
+    \\local raw_loadfile = loadfile
+    \\function loadfile(path, mode, ...)
+    \\  if path == nil then error("loadfile: a file name expected", 2) end
+    \\  local checked, why = check_path(path)
+    \\  if why then error(why, 2) end
+    \\  if mode ~= nil and mode ~= "t" then
+    \\    return nil, "loadfile: binary chunks are not allowed"
+    \\  end
+    \\  if select("#", ...) > 0 then
+    \\    return raw_loadfile(checked, "t", ...)
+    \\  end
+    \\  return raw_loadfile(checked, "t")
+    \\end
+    \\function dofile(path)
+    \\  if path == nil then error("dofile: a file name expected", 2) end
+    \\  local chunk, err = loadfile(path, "t")
+    \\  if not chunk then error(err, 2) end
+    \\  return chunk()
+    \\end
+    \\local concat = table.concat
+    \\function package.searchpath(name, path, sep, rep)
+    \\  if type(name) ~= "string" then error("bad argument #1 to 'searchpath' (string expected)", 2) end
+    \\  if type(path) ~= "string" then error("bad argument #2 to 'searchpath' (string expected)", 2) end
+    \\  sep = sep or "."
+    \\  rep = rep or "/"
+    \\  if sep ~= "" then
+    \\    local esc = sep:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1")
+    \\    local rep_esc = rep:gsub("%%", "%%%%")
+    \\    name = name:gsub(esc, rep_esc)
+    \\  end
+    \\  local repl = name:gsub("%%", "%%%%")
+    \\  local msg = {}
+    \\  for template in (path .. ";"):gmatch("([^;]*);") do
+    \\    if template ~= "" then
+    \\      local filename = template:gsub("%?", repl)
+    \\      local checked, why = check_path(filename)
+    \\      if why then
+    \\        msg[#msg + 1] = "\n\t" .. why
+    \\      else
+    \\        local f = open(checked, "r")
+    \\        if f then
+    \\          f:close()
+    \\          return checked
+    \\        end
+    \\        msg[#msg + 1] = "\n\tno file '" .. checked .. "'"
+    \\      end
+    \\    end
+    \\  end
+    \\  return nil, concat(msg)
+    \\end
+    \\local searchpath = package.searchpath
+    \\package.searchers[2] = function(name)
+    \\  local filename, err = searchpath(name, package.path)
+    \\  if not filename then return err end
+    \\  local checked, why = check_path(filename)
+    \\  if why then error(why, 2) end
+    \\  local chunk, lerr = raw_loadfile(checked, "t")
+    \\  if not chunk then
+    \\    error("error loading module '" .. tostring(name) .. "' from file '" .. checked .. "':\n\t" .. tostring(lerr), 2)
+    \\  end
+    \\  return chunk, checked
+    \\end
+    \\local function rethrow_if_timed_out(ok, ...)
+    \\  if not ok and timed_out() then error("timed out", 0) end
+    \\  return ok, ...
+    \\end
+    \\local raw_pcall, raw_xpcall = pcall, xpcall
+    \\function pcall(...)
+    \\  if timed_out() then error("timed out", 0) end
+    \\  return rethrow_if_timed_out(raw_pcall(...))
+    \\end
+    \\function xpcall(...)
+    \\  if timed_out() then error("timed out", 0) end
+    \\  return rethrow_if_timed_out(raw_xpcall(...))
+    \\end
+    \\if type(coroutine) == "table" then
+    \\  local raw_create, raw_resume, raw_close = coroutine.create, coroutine.resume, coroutine.close
+    \\  function coroutine.create(f)
+    \\    local co = raw_create(f)
+    \\    arm_hook(co)
+    \\    return co
+    \\  end
+    \\  function coroutine.wrap(f)
+    \\    local co = raw_create(f)
+    \\    arm_hook(co)
+    \\    local function unwrap(ok, ...)
+    \\      if not ok then
+    \\        if timed_out() then error("timed out", 0) end
+    \\        error((...), 2)
+    \\      end
+    \\      return ...
+    \\    end
+    \\    return function(...)
+    \\      if timed_out() then error("timed out", 0) end
+    \\      arm_hook(co)
+    \\      return unwrap(raw_resume(co, ...))
+    \\    end
+    \\  end
+    \\  function coroutine.resume(co, ...)
+    \\    if timed_out() then error("timed out", 0) end
+    \\    arm_hook(co)
+    \\    return rethrow_if_timed_out(raw_resume(co, ...))
+    \\  end
+    \\  if raw_close then
+    \\    function coroutine.close(...)
+    \\      if timed_out() then error("timed out", 0) end
+    \\      return rethrow_if_timed_out(raw_close(...))
+    \\    end
+    \\  end
+    \\end
+;
 
 fn isTimedOut(L: *State) Error!c_int {
     c.lua_pushboolean(L, @intFromBool(budgetOf(L).timed_out));
@@ -1168,7 +1173,11 @@ test "a cancelled state stops at once, and long errors are cut" {
     try testing.expect(std.mem.find(u8, stopped, "timed out") != null);
     try testing.expect(os.monotonicNs() - start_ns < std.time.ns_per_s);
     cancel.store(false, .release);
-    const long = runCode(L, arena, "error(('x'):rep(1000000))") orelse return error.TestUnexpectedResult;
+    const long = runCode(
+        L,
+        arena,
+        "error(('x'):rep(1000000))",
+    ) orelse return error.TestUnexpectedResult;
     try testing.expect(long.len <= error_message_bytes_max);
 }
 
@@ -1203,7 +1212,11 @@ test "a runaway loop stops at its deadline" {
 
     // State remains usable once deadline is restored.
     budget.deadline_ns = std.math.maxInt(u64);
-    try testing.expect(runCode(L, arena_state.allocator(), "assert(pcall(function() return 1 end))") == null);
+    try testing.expect(runCode(
+        L,
+        arena_state.allocator(),
+        "assert(pcall(function() return 1 end))",
+    ) == null);
 }
 
 test "memory is capped per state" {

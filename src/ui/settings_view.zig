@@ -44,28 +44,93 @@ const RowSpec = struct { [:0]const u8, [:0]const u8, RowSource, []const u8 };
 const setting_rows = [_]struct { [:0]const u8, item_mod.Color, []const RowSpec }{
     .{ "Appearance", .purple, &.{
         .{ "Theme", "applications-graphics-symbolic", .theme, "color dark light appearance" },
-        .{ "Text Size", "preferences-desktop-font-symbolic", .{ .choice = .text_size }, "font scale zoom bigger smaller" },
-        .{ "Window Opacity", "display-brightness-symbolic", .{ .choice = .opacity }, "transparency translucent background" },
-        .{ "Window Position", "preferences-desktop-display-symbolic", .{ .choice = .position }, "center top place" },
-        .{ "Icon Theme", "preferences-desktop-icons-symbolic", .{ .choice = .icon_theme }, "icons pack papirus adwaita" },
+        .{
+            "Text Size",
+            "preferences-desktop-font-symbolic",
+            .{ .choice = .text_size },
+            "font scale zoom bigger smaller",
+        },
+        .{
+            "Window Opacity",
+            "display-brightness-symbolic",
+            .{ .choice = .opacity },
+            "transparency translucent background",
+        },
+        .{
+            "Window Position",
+            "preferences-desktop-display-symbolic",
+            .{ .choice = .position },
+            "center top place",
+        },
+        .{
+            "Icon Theme",
+            "preferences-desktop-icons-symbolic",
+            .{ .choice = .icon_theme },
+            "icons pack papirus adwaita",
+        },
     } },
     .{ "Layout", .green, &.{
         .{ "Window Width", "view-dual-symbolic", .{ .choice = .width }, "size wide narrow layout" },
-        .{ "Window Height", "view-list-symbolic", .{ .choice = .height }, "size tall short rows results layout" },
-        .{ "Density", "view-grid-symbolic", .{ .choice = .density }, "compact comfortable spacing icons rows layout" },
+        .{
+            "Window Height",
+            "view-list-symbolic",
+            .{ .choice = .height },
+            "size tall short rows results layout",
+        },
+        .{
+            "Density",
+            "view-grid-symbolic",
+            .{ .choice = .density },
+            "compact comfortable spacing icons rows layout",
+        },
     } },
     .{ "Search", .orange, &.{
-        .{ "Show Files in Main Search", "folder-saved-search-symbolic", .{ .toggle = .files_in_root }, "results" },
-        .{ "Show Suggestions", "starred-symbolic", .{ .toggle = .suggestions }, "frecency recent most used" },
+        .{
+            "Show Files in Main Search",
+            "folder-saved-search-symbolic",
+            .{ .toggle = .files_in_root },
+            "results",
+        },
+        .{
+            "Show Suggestions",
+            "starred-symbolic",
+            .{ .toggle = .suggestions },
+            "frecency recent most used",
+        },
     } },
     .{ "Clipboard", .red, &.{
-        .{ "Clipboard History", "edit-paste-symbolic", .{ .toggle = .clipboard }, "copy paste record" },
-        .{ "Clipboard Entries to Keep", "document-open-recent-symbolic", .{ .choice = .clipboard_keep }, "history size limit" },
+        .{
+            "Clipboard History",
+            "edit-paste-symbolic",
+            .{ .toggle = .clipboard },
+            "copy paste record",
+        },
+        .{
+            "Clipboard Entries to Keep",
+            "document-open-recent-symbolic",
+            .{ .choice = .clipboard_keep },
+            "history size limit",
+        },
     } },
     .{ "Apps", .blue, &.{
-        .{ "Default Apps", "applications-system-symbolic", .default_apps, "open with file types associations mime" },
-        .{ "Terminal", "utilities-terminal-symbolic", .{ .choice = .terminal }, "console shell emulator" },
-        .{ "Editor for Open at Line", "accessories-text-editor-symbolic", .{ .choice = .editor }, "code vim nvim" },
+        .{
+            "Default Apps",
+            "applications-system-symbolic",
+            .default_apps,
+            "open with file types associations mime",
+        },
+        .{
+            "Terminal",
+            "utilities-terminal-symbolic",
+            .{ .choice = .terminal },
+            "console shell emulator",
+        },
+        .{
+            "Editor for Open at Line",
+            "accessories-text-editor-symbolic",
+            .{ .choice = .editor },
+            "code vim nvim",
+        },
     } },
 };
 

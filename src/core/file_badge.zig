@@ -255,5 +255,8 @@ test "the maps answer what the tables say, for every entry" {
     }
     for (known) |entry| try std.testing.expectEqual(entry[1], knownColor(entry[0]).?);
     for (themed) |extension| try std.testing.expect(themed_extensions.has(extension));
-    for (logo_names) |entry| try std.testing.expectEqualStrings(entry[1].name, logoOf(entry[0]).?.name);
+    for (logo_names) |entry| try std.testing.expectEqualStrings(
+        entry[1].name,
+        logoOf(entry[0]).?.name,
+    );
 }

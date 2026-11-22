@@ -198,7 +198,7 @@ fn startupCallback(gtk_app: *c.GtkApplication, data: ?*anyopaque) callconv(.c) v
         log.err("cannot open {s}: {t}", .{ path, err });
         return;
     };
-    db.pruneFrecency(nowSeconds()) catch |err| {
+    db.pruneFrecency(os.nowSeconds()) catch |err| {
         // Only the table grows until the next start; Db logged SQLite's word.
         log.warn("frecency prune: {t}", .{err});
     };
@@ -222,10 +222,6 @@ fn startupCallback(gtk_app: *c.GtkApplication, data: ?*anyopaque) callconv(.c) v
     // Prewarm once the main loop is idle, so it does not delay startup.
     _ = c.g_idle_add(&prewarmCallback, null);
     stats.startup_ns = stats.now() - stats.started_ns;
-}
-
-fn nowSeconds() i64 {
-    return @divTrunc(c.g_get_real_time(), std.time.us_per_s);
 }
 
 /// Where a command's answer goes: the GApplication command line that ran
@@ -709,7 +705,7 @@ fn storeClip(content: []const u8) void {
     const ui = readyUi() orelse return;
     if (!ui.settings.clipboard) return;
     if (!std.unicode.utf8ValidateSlice(content)) return;
-    ui.db.addClip(content, nowSeconds(), ui.settings.clipboard_keep) catch |err| {
+    ui.db.addClip(content, os.nowSeconds(), ui.settings.clipboard_keep) catch |err| {
         log.warn("clipboard: {t}", .{err});
     };
 }
@@ -751,7 +747,7 @@ fn clipStore(init: std.process.Init) !void {
     defer c.g_free(path);
     var db = try Db.open(std.mem.span(path));
     defer db.close();
-    try db.addClip(content, nowSeconds(), settings.clipboard_keep);
+    try db.addClip(content, os.nowSeconds(), settings.clipboard_keep);
 }
 
 test "requests: flags in order, values, and what is refused" {

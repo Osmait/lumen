@@ -215,11 +215,6 @@ pub fn formatSize(arena: std.mem.Allocator, bytes: u64) [:0]const u8 {
         arena.printSentinel("{d:.1} {s}", .{ amount, units[unit_index] }, 0)) catch "";
 }
 
-/// The time now, in seconds since the Unix epoch.
-pub fn now() i64 {
-    return @divTrunc(c.g_get_real_time(), std.time.us_per_s);
-}
-
 /// Today's midnight, local time, in seconds since the Unix epoch.
 pub fn startOfToday() i64 {
     // Null only for a date GLib cannot represent: then everything is "Earlier".

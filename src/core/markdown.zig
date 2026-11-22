@@ -256,7 +256,10 @@ const link_schemes = [_][]const u8{ "https://", "http://", "mailto:" };
 
 fn linkAllowed(url: []const u8) bool {
     for (link_schemes) |scheme| {
-        if (url.len >= scheme.len and std.ascii.eqlIgnoreCase(url[0..scheme.len], scheme)) return true;
+        if (url.len >= scheme.len and std.ascii.eqlIgnoreCase(
+            url[0..scheme.len],
+            scheme,
+        )) return true;
     }
     return false;
 }
@@ -320,7 +323,10 @@ test "inline spans" {
         "see <a href=\"https://ziglang.org\">docs</a>",
     );
     // Only web pages and mail: anything else stays text.
-    try expectMarkup("[run](file:///usr/share/applications/x.desktop)", "[run](file:///usr/share/applications/x.desktop)");
+    try expectMarkup(
+        "[run](file:///usr/share/applications/x.desktop)",
+        "[run](file:///usr/share/applications/x.desktop)",
+    );
     try expectMarkup("[mail](MAILTO:a@b.c)", "<a href=\"MAILTO:a@b.c\">mail</a>");
     try expectMarkup(
         "[app](steam://run/1)",

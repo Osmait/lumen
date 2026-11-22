@@ -36,7 +36,11 @@ const markdown_shown_bytes_max = 20_000;
 fn markdownShown(markdown: []const u8) []const u8 {
     if (markdown.len <= markdown_shown_bytes_max) return markdown;
     const head = markdown[0..markdown_shown_bytes_max];
-    const line_end = std.mem.findScalarLast(u8, head, '\n') orelse return core.utf8.validPrefix(head);
+    const line_end = std.mem.findScalarLast(
+        u8,
+        head,
+        '\n',
+    ) orelse return core.utf8.validPrefix(head);
     return head[0..line_end];
 }
 /// Label and value pairs of a row's `metadata`.

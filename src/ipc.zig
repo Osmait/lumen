@@ -191,7 +191,18 @@ test "socket paths" {
         socketPath(&path_buffer, "/run/user/1000", app_id_default).?,
     );
     try std.testing.expect(socketPath(&path_buffer, "", app_id_default) == null);
-    for ([_][]const u8{ "", ".", "..", ".hidden", "../evil", "a/b", "a\\b", "a b", "a\x00b", "a\nb" }) |bad| {
+    for ([_][]const u8{
+        "",
+        ".",
+        "..",
+        ".hidden",
+        "../evil",
+        "a/b",
+        "a\\b",
+        "a b",
+        "a\x00b",
+        "a\nb",
+    }) |bad| {
         try std.testing.expect(socketPath(&path_buffer, "/run/user/1000", bad) == null);
     }
     var long: [121]u8 = @splat('x');

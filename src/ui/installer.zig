@@ -27,6 +27,13 @@ comptime {
     std.debug.assert(extension_name_bytes_max >= Host.id_bytes_max);
 }
 
+/// A folder's path, as Job keeps it: whole, never cut.
+const path_bytes_max = std.Io.Dir.max_path_bytes;
+/// The longest URL `--install` takes.
+const url_bytes_max = 2048;
+/// What makes a clone an extension.
+const init_lua = "/init.lua";
+
 /// How much of a job's output is kept: its end, more than any message
 /// shows (`print_bytes_max`).
 const output_kept_bytes = 16 << 10;
@@ -76,7 +83,11 @@ const Job = struct {
         const room = job.output.len - job.output_len;
         if (bytes.len > room) {
             const dropped = bytes.len - room;
-            std.mem.copyForwards(u8, job.output[0 .. job.output_len - dropped], job.output[dropped..job.output_len]);
+            std.mem.copyForwards(
+                u8,
+                job.output[0 .. job.output_len - dropped],
+                job.output[dropped..job.output_len],
+            );
             job.output_len -= dropped;
         }
         @memcpy(job.output[job.output_len..][0..bytes.len], bytes);
@@ -135,7 +146,12 @@ fn unmarkBusy(folder: []const u8) void {
 /// extensions/ (on the same file system, so the rename is atomic), outside
 /// it (a reload in between does not load half a clone).
 fn installingFolder(ui: *Ui, out: []u8, name: []const u8) ?[:0]const u8 {
-    return std.mem.printSentinel(out, "{s}/.installing-{s}", .{ ui.config_dir, name }, 0) catch null;
+    return std.mem.printSentinel(
+        out,
+        "{s}/.installing-{s}",
+        .{ ui.config_dir, name },
+        0,
+    ) catch null;
 }
 
 /// The folder an extension `name` lives in, written to `out`.
@@ -229,7 +245,7 @@ pub fn install(
     url: []const u8,
     name_given: ?[]const u8,
 ) void {
-    var name_bytes: [64]u8 = undefined;
+    var name_bytes: [extension_name_bytes_max]u8 = undefined;
     const name = name_given orelse nameFromUrl(&name_bytes, url);
     if (!Host.validId(name)) {
         return fail(
@@ -247,7 +263,7 @@ pub fn install(
             .{name},
         );
     }
-    var folder_bytes: [4096]u8 = undefined;
+    var folder_bytes: [path_bytes_max]u8 = undefined;
     const folder = extensionFolder(ui, &folder_bytes, name) orelse {
         return fail(ui, caller, "path too long", .{});
     };
@@ -261,11 +277,11 @@ pub fn install(
     os.mkdirP(parent) catch |err| {
         return fail(ui, caller, "Could not make {s}: {t}", .{ parent, err });
     };
-    var url_buffer: [2048]u8 = undefined;
+    var url_buffer: [url_bytes_max]u8 = undefined;
     const url_z = std.mem.printSentinel(&url_buffer, "{s}", .{url}, 0) catch {
         return fail(ui, caller, "URL too long", .{});
     };
-    var installing_bytes: [4096]u8 = undefined;
+    var installing_bytes: [path_bytes_max]u8 = undefined;
     const installing = installingFolder(ui, &installing_bytes, name) orelse {
         return fail(ui, caller, "path too long", .{});
     };
@@ -281,7 +297,7 @@ pub fn install(
 }
 
 pub fn update(ui: *Ui, caller: ?*c.GApplicationCommandLine, name: ?[]const u8) void {
-    var folder_bytes: [4096]u8 = undefined;
+    var folder_bytes: [path_bytes_max]u8 = undefined;
     if (name) |extension_name| {
         if (!Host.validId(extension_name)) {
             return fail(ui, caller, "no extension named \"{s}\"", .{extension_name});
@@ -329,7 +345,7 @@ pub fn update(ui: *Ui, caller: ?*c.GApplicationCommandLine, name: ?[]const u8) v
 
 pub fn uninstall(ui: *Ui, caller: ?*c.GApplicationCommandLine, name: []const u8) void {
     if (!Host.validId(name)) return fail(ui, caller, "no extension named \"{s}\"", .{name});
-    var folder_bytes: [4096]u8 = undefined;
+    var folder_bytes: [path_bytes_max]u8 = undefined;
     const folder = extensionFolder(ui, &folder_bytes, name) orelse {
         return fail(ui, caller, "path too long", .{});
     };
@@ -498,10 +514,10 @@ fn reportSuccess(job: *Job, output: [:0]const u8) bool {
     const caller = job.caller;
     switch (job.kind) {
         .install => {
-            var init_path_bytes: [4200]u8 = undefined;
+            var init_path_bytes: [path_bytes_max + init_lua.len]u8 = undefined;
             const init_path = std.mem.printSentinel(
                 &init_path_bytes,
-                "{s}/init.lua",
+                "{s}" ++ init_lua,
                 .{job.workPath()},
                 0,
             ) catch {
@@ -517,7 +533,12 @@ fn reportSuccess(job: *Job, output: [:0]const u8) bool {
             // Into place, whole: until now nothing loaded it.
             os.rename(job.workPath(), job.folderPath()) catch |err| {
                 removeTreeThenReload(ui, job.workPath(), job.folderPath());
-                fail(ui, caller, "could not move the clone to {s}: {t}", .{ job.folderPath(), err });
+                fail(
+                    ui,
+                    caller,
+                    "could not move the clone to {s}: {t}",
+                    .{ job.folderPath(), err },
+                );
                 return true;
             };
             print(
@@ -532,7 +553,13 @@ fn reportSuccess(job: *Job, output: [:0]const u8) bool {
             print(ui, caller, "{s}{s}", .{ end[0], end[1] });
         } else {
             // git's own lines are too long for a row: a summary shows instead.
-            note(ui, if (anyUpdated(job.nameSlice().len == 0, output)) "Updated" else "Already up to date");
+            note(
+                ui,
+                if (anyUpdated(
+                    job.nameSlice().len == 0,
+                    output,
+                )) "Updated" else "Already up to date",
+            );
         },
         .uninstall => print(ui, caller, "Removed {s}\n", .{job.nameSlice()}),
     }
@@ -540,7 +567,11 @@ fn reportSuccess(job: *Job, output: [:0]const u8) bool {
     if (caller) |command_line| c.g_application_command_line_set_exit_status(command_line, 0);
     // From Settings: the removed extension's page, if it is still the one
     // shown, has nothing left to show.
-    const on_its_page = ui.view == .prefs and std.mem.eql(u8, ui.prefs_ext.slice(), job.nameSlice());
+    const on_its_page = ui.view == .prefs and std.mem.eql(
+        u8,
+        ui.prefs_ext.slice(),
+        job.nameSlice(),
+    );
     if (caller == null and job.kind == .uninstall and on_its_page) ui.goBack();
     return false;
 }
@@ -583,7 +614,11 @@ fn removeTreeThenReload(ui: *Ui, folder: [:0]const u8, busy_folder: []const u8) 
     removal.busy_folder.set(busy_folder);
     var argv = [_:null]?[*:0]const u8{ "rm", "-rf", "--", folder.ptr };
     var err: ?*c.GError = null;
-    const subprocess = c.g_subprocess_newv(@ptrCast(&argv), c.G_SUBPROCESS_FLAGS_NONE, &err) orelse {
+    const subprocess = c.g_subprocess_newv(
+        @ptrCast(&argv),
+        c.G_SUBPROCESS_FLAGS_NONE,
+        &err,
+    ) orelse {
         proc.warnError(.install, err, "rm {s}", .{folder});
         return removal.finish();
     };
@@ -601,7 +636,11 @@ const Removal = struct {
     }
 };
 
-fn onRemoved(source: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) void {
+fn onRemoved(
+    source: ?*c.GObject,
+    async_result: *c.GAsyncResult,
+    data: ?*anyopaque,
+) callconv(.c) void {
     const removal: *Removal = @ptrCast(@alignCast(data.?));
     const subprocess: *c.GSubprocess = @ptrCast(source.?);
     defer c.g_object_unref(subprocess);
@@ -627,7 +666,7 @@ test "long output keeps its end, and messages stay valid UTF-8" {
 }
 
 test "extension names come from the repository" {
-    var name_bytes: [64]u8 = undefined;
+    var name_bytes: [extension_name_bytes_max]u8 = undefined;
     try std.testing.expectEqualStrings("weather", nameFromUrl(
         &name_bytes,
         "https://github.com/me/lumen-weather.git",

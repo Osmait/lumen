@@ -50,7 +50,14 @@ pub fn parseExtension(L: *lua.State, context: *LoadContext, spec: c_int) void {
     // `Host.worker_arena`, which is reset on the next reload while GTK still
     // reads the previous registry.
     const extension_id = arena.dupeSentinel(u8, context.extension.id, 0) catch lua.oom(L);
-    const title = lua.fieldStringMax(L, arena, spec, "title", "extension", spec_text_bytes_max) orelse
+    const title = lua.fieldStringMax(
+        L,
+        arena,
+        spec,
+        "title",
+        "extension",
+        spec_text_bytes_max,
+    ) orelse
         extension_id;
     context.title = title;
     const icon_default = rows_mod.fieldIcon(L, arena, spec, "extension.icon") orelse addon_icon;
@@ -88,7 +95,14 @@ fn parsePreferences(
         const where = std.mem.print(&where_buffer, "preferences[{d}]", .{preference_number}) catch
             "preferences";
         const field_table = lua.tableAt(L, preferences, preference_number, where);
-        const preference = parseField(L, context, field_table, where, extension_id, extension_title);
+        const preference = parseField(
+            L,
+            context,
+            field_table,
+            where,
+            extension_id,
+            extension_title,
+        );
         if (preferenceDeclared(context.load, extension_id, preference.name)) {
             lua.raise(L, "two preferences named \"{s}\"", .{preference.name});
         }
@@ -175,9 +189,23 @@ fn prefChoices(
                 lua.oom(L);
             choice.* = .{ .value = value, .label = value };
         } else if (lua.c.lua_type(L, -1) == lua.c.LUA_TTABLE) {
-            const value = lua.fieldStringMax(L, arena, -1, "value", where, spec_text_bytes_max) orelse
+            const value = lua.fieldStringMax(
+                L,
+                arena,
+                -1,
+                "value",
+                where,
+                spec_text_bytes_max,
+            ) orelse
                 lua.raise(L, "{s}.choices[{d}].value is missing", .{ where, choice_number });
-            const label = lua.fieldStringMax(L, arena, -1, "title", where, spec_text_bytes_max) orelse
+            const label = lua.fieldStringMax(
+                L,
+                arena,
+                -1,
+                "title",
+                where,
+                spec_text_bytes_max,
+            ) orelse
                 value;
             choice.* = .{ .value = value, .label = label };
         } else {
@@ -211,7 +239,14 @@ fn parseField(
         .extension_title = extension_title,
         .file = file,
         .name = name,
-        .title = lua.fieldStringMax(L, arena, field_table, "title", where, spec_text_bytes_max) orelse
+        .title = lua.fieldStringMax(
+            L,
+            arena,
+            field_table,
+            "title",
+            where,
+            spec_text_bytes_max,
+        ) orelse
             name,
         .description = lua.fieldStringMax(
             L,
@@ -381,7 +416,14 @@ fn parseCommand(
 ) void {
     const arena = context.load.arena;
     const id = commandId(L, context, command_table, where);
-    const title = lua.fieldStringMax(L, arena, command_table, "title", where, spec_text_bytes_max) orelse
+    const title = lua.fieldStringMax(
+        L,
+        arena,
+        command_table,
+        "title",
+        where,
+        spec_text_bytes_max,
+    ) orelse
         lua.raise(L, "{s}.title is missing", .{where});
     const answers_root_search = commandAnswersRootSearch(L, command_table, where);
     const mode_given = commandMode(L, command_table, where);
@@ -418,7 +460,15 @@ fn parseCommand(
         .mode = mode,
         .detail = lua.fieldBool(L, command_table, "detail", false, where),
         .answers_root_search = answers_root_search,
-        .fields = formFields(L, context, command_table, mode == .form, where, extension_id, extension_title),
+        .fields = formFields(
+            L,
+            context,
+            command_table,
+            mode == .form,
+            where,
+            extension_id,
+            extension_title,
+        ),
         .submit_title = lua.fieldStringMax(
             L,
             arena,

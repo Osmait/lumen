@@ -99,7 +99,11 @@ const DocColumns = struct {
         for (columns.path_offsets, columns.path_sizes) |path_offset, path_size| {
             if (path_size > 0 and path_offset < header_size) return error.BadIndex;
             if (@as(u64, path_offset) + path_size > file.len) return error.BadIndex;
-            columns.paths_size_total = std.math.add(usize, columns.paths_size_total, path_size) catch
+            columns.paths_size_total = std.math.add(
+                usize,
+                columns.paths_size_total,
+                path_size,
+            ) catch
                 return error.BadIndex;
             if (columns.paths_size_total > file.len) return error.BadIndex;
         }
@@ -214,29 +218,15 @@ pub fn parse(whole: Bytes, backing: format.Backing) error{BadIndex}!ContentIndex
     const segments = sliceAt(SegmentEntry, file, directory_offset, segments_count);
     var bytes_live: usize = header_size;
     bytes_live = std.math.add(usize, bytes_live, docs_count * doc_size) catch return error.BadIndex;
-    bytes_live = std.math.add(usize, bytes_live, columns.paths_size_total) catch return error.BadIndex;
+    bytes_live = std.math.add(
+        usize,
+        bytes_live,
+        columns.paths_size_total,
+    ) catch return error.BadIndex;
     bytes_live = std.math.add(usize, bytes_live, segments_count * @sizeOf(SegmentEntry)) catch
         return error.BadIndex;
     if (bytes_live > file.len) return error.BadIndex;
-    for (segments) |segment| {
-        try checkSegment(file, segment);
-        const keys_count: usize = @intCast(segment.keys_count);
-        // Keys, and one more offset than keys.
-        const seg_tables = std.math.add(
-            usize,
-            keys_count * @sizeOf(u32),
-            (keys_count + 1) * @sizeOf(u32),
-        ) catch return error.BadIndex;
-        const seg_bytes = std.math.add(
-            usize,
-            seg_tables,
-            @intCast(segment.postings_size),
-        ) catch return error.BadIndex;
-        bytes_live = std.math.add(usize, bytes_live, seg_bytes) catch return error.BadIndex;
-        // Overlapping segments in a corrupt index must not inflate bytes_live
-        // past the file itself.
-        if (bytes_live > file.len) return error.BadIndex;
-    }
+    bytes_live = try addSegments(file, segments, bytes_live);
 
     return .{
         .bytes = whole,
@@ -382,15 +372,45 @@ fn region(
     return @intCast(offset);
 }
 
+/// `bytes_live` with what each of `segments` takes, each checked to lie
+/// inside `file` (`checkSegment`).
+fn addSegments(file: BytesConst, segments: []const SegmentEntry, bytes_live_before: usize) error{BadIndex}!usize {
+    var bytes_live = bytes_live_before;
+    for (segments) |segment| {
+        try checkSegment(file, segment);
+        const keys_count: usize = @intCast(segment.keys_count);
+        // Keys, and one more offset than keys.
+        const tables_bytes = std.math.add(
+            usize,
+            keys_count * @sizeOf(u32),
+            (keys_count + 1) * @sizeOf(u32),
+        ) catch return error.BadIndex;
+        const postings_bytes: usize = @intCast(segment.postings_size);
+        const segment_bytes = std.math.add(usize, tables_bytes, postings_bytes) catch
+            return error.BadIndex;
+        bytes_live = std.math.add(usize, bytes_live, segment_bytes) catch return error.BadIndex;
+        // Overlapping segments in a corrupt index must not inflate bytes_live
+        // past the file itself.
+        if (bytes_live > file.len) return error.BadIndex;
+    }
+    return bytes_live;
+}
+
 fn checkSegment(file: BytesConst, segment: SegmentEntry) error{BadIndex}!void {
     const keys_offset = try region(file.len, segment.keys_offset, segment.keys_count, 4, 4);
     const keys_count: usize = @intCast(segment.keys_count); // Fits: bounded by file.len.
     const offsets_count = std.math.add(u64, segment.keys_count, 1) catch return error.BadIndex;
     const offsets_offset = try region(file.len, segment.offsets_offset, offsets_count, 4, 4);
-    const postings_offset = try region(file.len, segment.postings_offset, segment.postings_size, 1, 1);
-    if (keys_offset < header_size or offsets_offset < header_size or postings_offset < header_size) {
-        return error.BadIndex;
-    }
+    const postings_offset = try region(
+        file.len,
+        segment.postings_offset,
+        segment.postings_size,
+        1,
+        1,
+    );
+    if (keys_offset < header_size) return error.BadIndex;
+    if (offsets_offset < header_size) return error.BadIndex;
+    if (postings_offset < header_size) return error.BadIndex;
     const keys = sliceAtConst(u32, file, keys_offset, keys_count);
     const offsets = sliceAtConst(u32, file, offsets_offset, keys_count + 1);
     if (!strictlyAscending(u32, keys)) return error.BadIndex;

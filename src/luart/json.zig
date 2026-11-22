@@ -21,7 +21,12 @@ const depth_max = 200;
 pub fn decode(L: *lua.State, gpa: std.mem.Allocator, text: []const u8) lua.Error!void {
     const status = blk: {
         var capped: lua.Capped = .leftIn(L, gpa);
-        var parsed = std.json.parseFromSlice(std.json.Value, capped.allocator(), text, .{}) catch |err|
+        var parsed = std.json.parseFromSlice(
+            std.json.Value,
+            capped.allocator(),
+            text,
+            .{},
+        ) catch |err|
             return lua.fail(L, "json.decode: {s}", .{switch (err) {
                 error.OutOfMemory => "out of memory",
                 error.SyntaxError, error.UnexpectedEndOfInput => "invalid JSON",

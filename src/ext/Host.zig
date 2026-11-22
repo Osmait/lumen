@@ -1062,7 +1062,11 @@ test "storage never writes over what it cannot read, and reads back what it wrot
     try writeTestFile(folder, "extensions/broken/init.lua", read_back);
     try writeTestFile(folder, "data/extensions/broken/storage.json", "{\"a\": 1, oops");
     // Bytes that are not UTF-8 are stored as U+FFFD, so the file still reads.
-    try writeTestFile(folder, "extensions/bytes/init.lua", "lumen.storage.set('x', 'a\\xffb')\n" ++ read_back);
+    try writeTestFile(
+        folder,
+        "extensions/bytes/init.lua",
+        "lumen.storage.set('x', 'a\\xffb')\n" ++ read_back,
+    );
     // Folders named like init.lua and the style would share their files.
     try writeTestFile(folder, "extensions/config/init.lua", "return nil");
     try writeTestFile(folder, "extensions/style/init.lua", "return nil");

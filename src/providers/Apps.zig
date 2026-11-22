@@ -144,7 +144,10 @@ fn keywords(
     app_info: *c.GAppInfo,
 ) std.mem.Allocator.Error![]const u8 {
     var joined: std.ArrayList(u8) = .empty;
-    const app_keywords = if (desktop_app_info) |desktop| c.g_desktop_app_info_get_keywords(desktop) else null;
+    const app_keywords = if (desktop_app_info) |desktop|
+        c.g_desktop_app_info_get_keywords(desktop)
+    else
+        null;
     if (app_keywords) |keywords_terminated| {
         var keyword_index: usize = 0;
         while (keywords_terminated[keyword_index]) |keyword| : (keyword_index += 1) {

@@ -548,7 +548,10 @@ test "damaged rows (negative count, non-positive clip id) and symlinks are handl
     try std.testing.expectEqual(@as(usize, 2), clips.len);
     try std.testing.expectEqualStrings("good", clips[0].head);
     try std.testing.expectEqualStrings("bad", clips[1].head);
-    try std.testing.expectEqualStrings("bad", (try db.clipContent(arena.allocator(), clips[1].id)).?);
+    try std.testing.expectEqualStrings(
+        "bad",
+        (try db.clipContent(arena.allocator(), clips[1].id)).?,
+    );
     try db.deleteClip(clips[1].id);
 
     var test_dir: @import("os").TestDir = try .init();
@@ -562,6 +565,9 @@ test "damaged rows (negative count, non-positive clip id) and symlinks are handl
     try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.symlink(target, link)));
     try std.testing.expectError(error.DbOpen, Db.open(link));
     var stx: linux.Statx = undefined;
-    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(linux.AT.FDCWD, target, 0, .{ .MODE = true }, &stx)));
+    try std.testing.expectEqual(
+        linux.E.SUCCESS,
+        linux.errno(linux.statx(linux.AT.FDCWD, target, 0, .{ .MODE = true }, &stx)),
+    );
     try std.testing.expectEqual(@as(u16, 0o644), stx.mode & 0o777);
 }

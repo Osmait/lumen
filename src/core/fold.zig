@@ -292,7 +292,18 @@ test "invalid and truncated UTF-8 passes through" {
 test "folding is idempotent and never lengthens" {
     var prng = std.Random.DefaultPrng.init(11);
     const random = prng.random();
-    const pieces = [_][]const u8{ "a", "Z", "é", "Ñ", "×", "\xC3", "\xA1", "\xC5", "ŉ", " ", "日", "ſ" };
+    const pieces = [_][]const u8{
+        "a",    "Z",
+        "é",
+        "Ñ",
+        "×",
+        "\xC3", "\xA1",
+        "\xC5",
+        "ŉ",
+        " ",
+        "日",
+        "ſ",
+    };
     var text: [64]u8 = undefined;
     var once: [64]u8 = undefined;
     var twice: [64]u8 = undefined;

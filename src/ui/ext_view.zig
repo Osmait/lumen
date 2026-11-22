@@ -155,7 +155,11 @@ fn rootCallback(answer: *Host.RootResult, context: ?*anyopaque) void {
         if (registry.command(section.command)) |section_command| item.icon = section_command.icon;
     };
     const latest = ui.ext_root_search.latest;
-    const typed: ?[]const u8 = if (ui.view == .root) Host.clipQuery(std.mem.trim(u8, ui.query(), " ")) else null;
+    const typed: ?[]const u8 = if (ui.view == .root) Host.clipQuery(std.mem.trim(
+        u8,
+        ui.query(),
+        " ",
+    )) else null;
     const latest_query = if (latest) |latest_answer| latest_answer.query else null;
     const decision = rootAnswer(typed, latest_query, answer.query, answer.sections.len > 0);
     switch (decision) {
