@@ -43,6 +43,8 @@ LUMEN_APP_ID=dev.example.LumenDev zig-out/bin/lumen
 ```sh
 zig build test      # unit and integration tests
 zig build perf      # performance regressions (PERF_SCALE=2 on slower machines)
+tools/perf-compare.sh   # perf against origin/main, side by side (CI does it
+                        # on every PR; label `perf-accepted` to only report)
 zig build e2e       # end-to-end, needs a Wayland session with the monitors on
 zig fmt --check src build.zig
 ```
@@ -82,11 +84,10 @@ where they fit a desktop program:
   is written and where it is read: rows follow their items, a function Lua
   calls returns no more values than it pushed, the content index writes what
   its validation accepts. Not as a quota per function.
-- **Validate at the boundary.** `core` and `index` are compiled ReleaseFast
-  even in a ReleaseSafe build, so their assertions and overflow checks are
-  gone there: data from disk, Hyprland or the database is checked where it
-  comes in (`findMonitor`, `Index.validate`), and arithmetic on it
-  saturates.
+- **Validate at the boundary.** Assertions and overflow checks stay on in a
+  ReleaseSafe build, but a panic is a crash all the same: data from disk,
+  Hyprland or the database is checked where it comes in (`findMonitor`,
+  `Index.validate`), and arithmetic on it saturates.
 - **Put a limit on every loop fed from outside**: bytes read from a socket,
   reads and connections per turn of the main loop, lines from stdin, Lua
   instructions and memory. A deadline covers the whole operation, not each

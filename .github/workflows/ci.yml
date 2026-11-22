@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+    # `labeled`: adding `perf-accepted` re-runs the comparison below.
+    types: [opened, synchronize, reopened, labeled]
 
 permissions:
   contents: read
@@ -23,6 +25,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The base branch too, for the performance comparison.
+          fetch-depth: 0
 
       # The version build.zig.zon asks for (minimum_zig_version).
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -48,3 +52,18 @@ jobs:
         env:
           PERF_SCALE: "4"
         run: zig build perf
+
+      # The same checks on the base branch, side by side, alternating: fails
+      # on a check more than 25% slower, which the limits above (4-5x, and
+      # PERF_SCALE) never catch. A PR that trades speed on purpose, or
+      # changes what perf measures, carries the `perf-accepted` label: the
+      # comparison is still printed, and no longer fails the run.
+      - name: Performance against the base branch
+        if: github.event_name == 'pull_request'
+        continue-on-error: ${{ contains(github.event.pull_request.labels.*.name, 'perf-accepted') }}
+        env:
+          PERF_SCALE: "4"
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          tools/perf-compare.sh "origin/$BASE_REF"

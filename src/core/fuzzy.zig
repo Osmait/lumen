@@ -94,6 +94,9 @@ pub fn scoreQuery(query_prepared: Query, text_in: []const u8) i32 {
         assert(result >= Score.substring_floor);
         return result;
     }
+    // Most texts do not even hold the letters in order: one pass says so,
+    // before `scoreFuzzy`'s 16 KB frame is set up.
+    if (!isSubsequence(query, text)) return no_match;
     const result = scoreFuzzy(text, upper, query);
     if (result != no_match) {
         const letters: i32 = @intCast(query.len);
@@ -131,67 +134,99 @@ fn scoreSubstring(
 /// A gap costs `min(distance, fuzzy_gap_penalty_max)`, so only the last
 /// `fuzzy_gap_penalty_max` positions need looking at one by one; anything
 /// further costs the same, and its best is kept as it goes (`far_best`).
-fn scoreFuzzy(text: []const u8, upper: []const bool, query: []const u8) i32 {
+/// Each row visits only the places its letter is, from just after the
+/// previous row's first reached one (MYP-188).
+///
+/// Out of line: its rows are 16 KB, which every call of an inlined
+/// `scoreQuery` set up, matching or not.
+noinline fn scoreFuzzy(text: []const u8, upper: []const bool, query: []const u8) i32 {
     assert(query.len > 0);
     assert(text.len <= text_chars_max);
-    // Most texts do not even hold the letters in order: one pass says so.
-    if (!isSubsequence(query, text)) return no_match;
     const unreached = no_match;
     var rows: [2][text_chars_max]i32 = undefined;
     var previous = &rows[0];
     var current = &rows[1];
-    for (text, 0..) |char, k| {
-        previous[k] = unreached;
-        if (char != query[0] or !isBoundary(text, upper, k)) continue;
+    @memset(previous[0..text.len], unreached);
+    // The first position any letter of the previous row reached.
+    var previous_first: usize = text.len;
+    var k_first = std.mem.findScalar(u8, text, query[0]);
+    while (k_first) |k| : (k_first = std.mem.findScalarPos(u8, text, k + 1, query[0])) {
+        if (!isBoundary(text, upper, k)) continue;
         const first_penalty: i32 = @intCast(@min(k, Score.fuzzy_first_penalty_max));
         previous[k] = Score.fuzzy_letter + Score.fuzzy_boundary_bonus - first_penalty;
+        previous_first = @min(previous_first, k);
     }
-    const gap_max = Score.fuzzy_gap_penalty_max;
+    if (previous_first == text.len) return no_match;
     for (query[1..]) |letter| {
-        var far_best: i32 = unreached;
-        var reached = false;
-        for (text, 0..) |char, k| {
-            // `j = k - gap_max` joins the positions whose gap costs the most.
-            if (k >= gap_max) far_best = @max(far_best, previous[k - gap_max]);
-            current[k] = unreached;
-            if (char != letter) continue;
-            var best: i32 = unreached;
-            if (k > 0 and previous[k - 1] != unreached) {
-                best = previous[k - 1] + Score.fuzzy_run_bonus;
-            }
-            const boundary = isBoundary(text, upper, k);
-            if (boundary) {
-                if (far_best != unreached) best = @max(best, far_best - gap_max);
-                // Gaps of 2 to gap_max - 1 (a gap of 1 is a run).
-                var distance: usize = 2;
-                while (distance < gap_max and distance <= k) : (distance += 1) {
-                    const before = previous[k - distance];
-                    if (before == unreached) continue;
-                    best = @max(best, before - @as(i32, @intCast(distance)));
-                }
-            }
-            if (best == unreached) continue;
-            const boundary_bonus: i32 = if (boundary) Score.fuzzy_boundary_bonus else 0;
-            current[k] = best + Score.fuzzy_letter + boundary_bonus;
-            reached = true;
-        }
+        @memset(current[0..text.len], unreached);
+        const first = rowFrom(text, upper, letter, previous, current, previous_first + 1);
         // No place for this letter: none for the ones after it either.
-        if (!reached) return no_match;
+        if (first == text.len) return no_match;
+        previous_first = first;
         std.mem.swap(*[text_chars_max]i32, &previous, &current);
     }
     var result: i32 = unreached;
-    for (previous[0..text.len]) |score_at| result = @max(result, score_at);
+    for (previous[previous_first..text.len]) |score_at| result = @max(result, score_at);
     return result;
 }
 
-/// Whether the letters of `query` appear in `text` in order.
-fn isSubsequence(query: []const u8, text: []const u8) bool {
-    var query_index: usize = 0;
-    for (text) |char| {
-        if (query_index == query.len) break;
-        if (char == query[query_index]) query_index += 1;
+/// One row of `scoreFuzzy`: `letter` at each of its places in `text` from
+/// `start` on, given the previous letter's row. Returns the first position
+/// reached, or `text.len` for none.
+inline fn rowFrom(
+    text: []const u8,
+    upper: []const bool,
+    letter: u8,
+    previous: *const [text_chars_max]i32,
+    current: *[text_chars_max]i32,
+    start: usize,
+) usize {
+    const unreached = no_match;
+    const gap_max = Score.fuzzy_gap_penalty_max;
+    var first: usize = text.len;
+    // The best of `previous[0..far_end]`, the places whose gap costs the
+    // most: everything at or before `k - gap_max`.
+    var far_best: i32 = unreached;
+    var far_end: usize = 0;
+    var next = if (start < text.len) std.mem.findScalarPos(u8, text, start, letter) else null;
+    while (next) |k| : (next = std.mem.findScalarPos(u8, text, k + 1, letter)) {
+        if (k >= gap_max) {
+            while (far_end <= k - gap_max) : (far_end += 1) {
+                far_best = @max(far_best, previous[far_end]);
+            }
+        }
+        var best: i32 = unreached;
+        if (previous[k - 1] != unreached) best = previous[k - 1] + Score.fuzzy_run_bonus;
+        const boundary = isBoundary(text, upper, k);
+        if (boundary) {
+            if (far_best != unreached) best = @max(best, far_best - gap_max);
+            // Gaps of 2 to gap_max - 1 (a gap of 1 is a run).
+            var distance: usize = 2;
+            while (distance < gap_max and distance <= k) : (distance += 1) {
+                const before = previous[k - distance];
+                if (before == unreached) continue;
+                best = @max(best, before - @as(i32, @intCast(distance)));
+            }
+        }
+        if (best == unreached) continue;
+        const boundary_bonus: i32 = if (boundary) Score.fuzzy_boundary_bonus else 0;
+        current[k] = best + Score.fuzzy_letter + boundary_bonus;
+        first = @min(first, k);
     }
-    return query_index == query.len;
+    return first;
+}
+
+/// Whether the letters of `query` appear in `text` in order. One search
+/// per letter: a loop over the text advancing the query on each match was
+/// compiled branch-free, every byte waiting on the previous comparison, and
+/// made a launcher list that matches nothing 25% slower (MYP-188).
+fn isSubsequence(query: []const u8, text: []const u8) bool {
+    var position: usize = 0;
+    for (query) |letter| {
+        const found = std.mem.findScalarPos(u8, text, position, letter) orelse return false;
+        position = found + 1;
+    }
+    return true;
 }
 
 /// Best score over several fields (title, keywords, subtitle). Later fields
@@ -299,4 +334,87 @@ test "accents and case fold both ways" {
     // Symbols are not letters.
     try std.testing.expectEqual(no_match, score("x", "×"));
     try std.testing.expect(score("×", "3×4") > 0);
+}
+
+test "the DP scores as the one that visited every position (MYP-188)" {
+    var prng = std.Random.DefaultPrng.init(188);
+    const random = prng.random();
+    const alphabet = "aabbcdeAEB -_./";
+    const query_letters = "abcde";
+    for (0..20_000) |_| {
+        var raw: [48]u8 = undefined;
+        const raw_len = random.uintAtMost(usize, raw.len);
+        for (raw[0..raw_len]) |*char| char.* = alphabet[random.uintLessThan(usize, alphabet.len)];
+        var query_buffer: [6]u8 = undefined;
+        const query_len = random.intRangeAtMost(usize, 1, query_buffer.len);
+        for (query_buffer[0..query_len]) |*char| {
+            char.* = query_letters[random.uintLessThan(usize, query_letters.len)];
+        }
+        const query = query_buffer[0..query_len];
+        var text_buffer: [text_chars_max]u8 = undefined;
+        var upper_buffer: [text_chars_max]bool = undefined;
+        const text_len = fold.foldCase(&text_buffer, &upper_buffer, raw[0..raw_len]);
+        const text = text_buffer[0..text_len];
+        const upper = upper_buffer[0..text_len];
+        if (query.len > text.len or !isSubsequence(query, text)) continue;
+        try std.testing.expectEqual(
+            scoreFuzzyReference(text, upper, query),
+            scoreFuzzy(text, upper, query),
+        );
+    }
+}
+
+/// `scoreFuzzy` before MYP-188, visiting every position: the reference
+/// the faster one must match.
+fn scoreFuzzyReference(text: []const u8, upper: []const bool, query: []const u8) i32 {
+    assert(query.len > 0);
+    assert(text.len <= text_chars_max);
+    // Most texts do not even hold the letters in order: one pass says so.
+    if (!isSubsequence(query, text)) return no_match;
+    const unreached = no_match;
+    var rows: [2][text_chars_max]i32 = undefined;
+    var previous = &rows[0];
+    var current = &rows[1];
+    for (text, 0..) |char, k| {
+        previous[k] = unreached;
+        if (char != query[0] or !isBoundary(text, upper, k)) continue;
+        const first_penalty: i32 = @intCast(@min(k, Score.fuzzy_first_penalty_max));
+        previous[k] = Score.fuzzy_letter + Score.fuzzy_boundary_bonus - first_penalty;
+    }
+    const gap_max = Score.fuzzy_gap_penalty_max;
+    for (query[1..]) |letter| {
+        var far_best: i32 = unreached;
+        var reached = false;
+        for (text, 0..) |char, k| {
+            // `j = k - gap_max` joins the positions whose gap costs the most.
+            if (k >= gap_max) far_best = @max(far_best, previous[k - gap_max]);
+            current[k] = unreached;
+            if (char != letter) continue;
+            var best: i32 = unreached;
+            if (k > 0 and previous[k - 1] != unreached) {
+                best = previous[k - 1] + Score.fuzzy_run_bonus;
+            }
+            const boundary = isBoundary(text, upper, k);
+            if (boundary) {
+                if (far_best != unreached) best = @max(best, far_best - gap_max);
+                // Gaps of 2 to gap_max - 1 (a gap of 1 is a run).
+                var distance: usize = 2;
+                while (distance < gap_max and distance <= k) : (distance += 1) {
+                    const before = previous[k - distance];
+                    if (before == unreached) continue;
+                    best = @max(best, before - @as(i32, @intCast(distance)));
+                }
+            }
+            if (best == unreached) continue;
+            const boundary_bonus: i32 = if (boundary) Score.fuzzy_boundary_bonus else 0;
+            current[k] = best + Score.fuzzy_letter + boundary_bonus;
+            reached = true;
+        }
+        // No place for this letter: none for the ones after it either.
+        if (!reached) return no_match;
+        std.mem.swap(*[text_chars_max]i32, &previous, &current);
+    }
+    var result: i32 = unreached;
+    for (previous[0..text.len]) |score_at| result = @max(result, score_at);
+    return result;
 }

@@ -1,15 +1,21 @@
-//! Performance regression tests: `zig build perf` (ReleaseFast).
+//! Performance regression tests: `zig build perf`, built as a release is
+//! (Lumen's modules ReleaseSafe, the C libraries optimized).
 //!
 //! Synthetic, deterministic data (no dependence on this machine's files):
-//! a 1M-entry name index and a 3,000-document content corpus. Each check has
-//! a limit around 4-5x what it measures on the development machine (Ryzen
-//! 5600X, 12 threads), so it catches regressions without flaking; scale the
-//! limits with PERF_SCALE=2 (etc.) on slower machines. Latency is
-//! asserted, recall is asserted exactly.
+//! a 1M-entry name index, a 3,000-document content corpus, a 26k-entry
+//! tree on disk to scan, 50k launcher lines to fuzzy-score and Lua pattern
+//! work. Each check has a limit around 4-5x what it measures on the
+//! development machine (Ryzen 5600X, 12 threads), so it catches gross
+//! regressions without flaking; scale the limits with PERF_SCALE=2 (etc.)
+//! on slower machines. Latency is asserted, recall is asserted exactly.
+//! Smaller regressions are what `tools/perf-compare.sh` is for: the same
+//! checks on two commits, side by side.
 
 const std = @import("std");
 const index = @import("index");
 const sys = @import("os");
+const core = @import("core");
+const lua = @import("luart").lua;
 const store_mod = index.store;
 const content = index.content;
 
@@ -44,6 +50,23 @@ fn checkMB(name: []const u8, got_mb: f64, limit_mb: f64) void {
         got_mb,
         limit_scaled_mb,
     });
+}
+
+/// The median of `runs` timings of `work(context)`: one sample is at the
+/// mercy of whatever else the machine does.
+fn medianNs(
+    comptime runs: usize,
+    context: anytype,
+    comptime work: fn (@TypeOf(context)) anyerror!void,
+) !u64 {
+    var times: [runs]u64 = undefined;
+    for (&times) |*time| {
+        const start_ns = sys.monotonicNs();
+        try work(context);
+        time.* = sys.monotonicNs() - start_ns;
+    }
+    std.mem.sort(u64, &times, {}, std.sort.asc(u64));
+    return times[runs / 2];
 }
 
 fn peakRssMB() f64 {
@@ -215,14 +238,39 @@ fn coldQueries(gpa: std.mem.Allocator, pool: *index.Pool, mapped: *const store_m
     };
     for (cold) |case| {
         const query, const limit_ms = case;
-        var engine: index.search.Engine = .empty;
-        defer engine.deinit(gpa);
-        const start_ns = sys.monotonicNs();
-        try engine.search(gpa, pool, mapped, query, .{ .limit = 60, .recency = false }, &hits);
+        const Cold = struct {
+            gpa: std.mem.Allocator,
+            pool: *index.Pool,
+            mapped: *const store_mod.Store,
+            query: []const u8,
+            hits: *std.ArrayList(index.search.Hit),
+
+            fn run(cold_query: *const @This()) !void {
+                var engine: index.search.Engine = .empty;
+                defer engine.deinit(cold_query.gpa);
+                const options: index.search.Options = .{ .limit = 60, .recency = false };
+                try engine.search(
+                    cold_query.gpa,
+                    cold_query.pool,
+                    cold_query.mapped,
+                    cold_query.query,
+                    options,
+                    cold_query.hits,
+                );
+            }
+        };
+        const cold_query: Cold = .{
+            .gpa = gpa,
+            .pool = pool,
+            .mapped = mapped,
+            .query = query,
+            .hits = &hits,
+        };
+        const duration_ns = try medianNs(7, &cold_query, Cold.run);
         var label: [64]u8 = undefined;
         check(
             try std.mem.print(&label, "cold query \"{s}\"", .{query}),
-            ms(sys.monotonicNs() - start_ns),
+            ms(duration_ns),
             limit_ms,
         );
         // Recall against the exhaustive reference: exact, not timed.
@@ -385,6 +433,178 @@ fn contents(gpa: std.mem.Allocator, pool: *index.Pool, directory: []const u8) !v
     }
 }
 
+/// A tree to scan, written to disk: 40 folders of 40, 15 files in each of
+/// the 1,600 (~26k entries). Many small folders: what a folder costs
+/// (open, read, close) is what changes most from one scanner to another.
+fn scanning(gpa: std.mem.Allocator, pool: *index.Pool, directory: []const u8) !void {
+    std.debug.print("scan\n", .{});
+    var root_buffer: index.paths.Buffer = undefined;
+    const root = try std.mem.print(&root_buffer, "{s}/tree", .{directory});
+    var path_buffer: index.paths.Buffer = undefined;
+    for (0..40) |i| for (0..40) |j| {
+        const folder = try std.mem.printSentinel(
+            &path_buffer,
+            "{s}/{s}-{d}/{s}-{d}",
+            .{ root, words[i % words.len], i, words[j % words.len], j },
+            0,
+        );
+        try sys.mkdirP(folder);
+        for (0..15) |k| {
+            var file_buffer: index.paths.Buffer = undefined;
+            const file = try std.mem.printSentinel(
+                &file_buffer,
+                "{s}/{s}_{d}{s}",
+                .{ folder, words[k % words.len], k, extensions[k % extensions.len] },
+                0,
+            );
+            try sys.writeFile(file, "");
+        }
+    };
+    const Scan = struct {
+        gpa: std.mem.Allocator,
+        pool: *index.Pool,
+        config: index.scan.Config,
+        entries: usize = 0,
+
+        fn run(scan: *@This()) !void {
+            var store = try index.scan.scan(scan.gpa, scan.pool, &scan.config, null, null);
+            defer store.deinit(scan.gpa);
+            scan.entries = store.len();
+        }
+    };
+    var scan: Scan = .{ .gpa = gpa, .pool = pool, .config = .{ .roots = &.{root} } };
+    const duration_ns = try medianNs(5, &scan, Scan.run);
+    std.debug.print("       {d} entries\n", .{scan.entries});
+    check("scan a 26k-entry tree", ms(duration_ns), 12);
+}
+
+/// `core.fuzzy` over 50k lines, the scale of a large `dmenu` list: one
+/// keystroke's work on the GTK thread.
+fn fuzzyScoring(gpa: std.mem.Allocator) !void {
+    std.debug.print("fuzzy (launcher, dmenu)\n", .{});
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var prng = std.Random.DefaultPrng.init(3);
+    const random = prng.random();
+    const lines = try arena.alloc([]const u8, 50_000);
+    for (lines, 0..) |*line, i| {
+        var text: std.ArrayList(u8) = .empty;
+        // A third look like applications, the rest like paths.
+        const application = i % 3 == 0;
+        if (!application) try text.appendSlice(arena, "/home/u");
+        for (0..@as(usize, if (application) 3 else 5)) |_| {
+            try text.appendSlice(arena, if (application) " " else "/");
+            try text.appendSlice(arena, words[random.uintLessThan(usize, words.len)]);
+        }
+        if (!application) try text.appendSlice(arena, "_Text Editor.zig");
+        line.* = text.items;
+    }
+    const Score = struct {
+        lines: []const []const u8,
+        query: []const u8,
+        matched: usize = 0,
+
+        fn run(scoring: *@This()) !void {
+            scoring.matched = 0;
+            for (scoring.lines) |line| {
+                const score = core.fuzzy.scoreFields(scoring.query, &.{line});
+                scoring.matched += @intFromBool(score != core.fuzzy.no_match);
+            }
+        }
+    };
+    // Substring, scattered word starts, no match, and a long query.
+    const queries = [_]struct { []const u8, f64 }{
+        .{ "c", 30 },
+        .{ "ted", 80 },
+        .{ "xyz", 50 },
+        .{ "homeuconfigmain", 50 },
+    };
+    for (queries) |case| {
+        const query, const limit_ms = case;
+        var scoring: Score = .{ .lines = lines, .query = query };
+        const duration_ns = try medianNs(5, &scoring, Score.run);
+        var label: [64]u8 = undefined;
+        check(
+            try std.mem.print(&label, "50k lines \"{s}\" ({d} match)", .{ query, scoring.matched }),
+            ms(duration_ns),
+            limit_ms,
+        );
+    }
+}
+
+/// Lua's pattern matching as extensions use it, through Lumen's copy with
+/// deadline checks (lstrmatch.c).
+fn luaPatterns(gpa: std.mem.Allocator) !void {
+    std.debug.print("lua (extensions)\n", .{});
+    var budget: lua.Budget = .{ .bytes_max = 64 << 20 };
+    const L = lua.newState(&budget) orelse return error.OutOfMemory;
+    defer lua.c.lua_close(L);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const Run = struct {
+        L: *lua.State,
+        arena: std.mem.Allocator,
+        code: [:0]const u8,
+
+        fn open(state: *lua.State, _: *@This()) void {
+            lua.openLibs(state);
+        }
+
+        fn call(state: *lua.State, run: *@This()) void {
+            if (lua.c.luaL_loadstring(state, run.code.ptr) != lua.c.LUA_OK) {
+                _ = lua.c.lua_error(state);
+            }
+            lua.c.lua_callk(state, 0, 0, 0, null);
+        }
+
+        fn timed(run: *@This()) !void {
+            if (lua.protect(run.L, run.arena, @This(), run, call)) |message| {
+                std.debug.print("lua: {s}\n", .{message});
+                return error.LuaFailed;
+            }
+        }
+    };
+    var opener: Run = .{ .L = L, .arena = arena_state.allocator(), .code = "" };
+    if (lua.protect(L, opener.arena, Run, &opener, Run.open)) |message| {
+        std.debug.print("lua: {s}\n", .{message});
+        return error.LuaFailed;
+    }
+    const cases = [_]struct { []const u8, [:0]const u8, f64 }{
+        .{
+            "find, match",
+            \\local s = string.rep('lorem ipsum dolor sit amet, key=value; ', 20)
+            \\for i = 1, 20000 do
+            \\  local a = s:find('amet', 1, true)
+            \\  local k, v = s:match('(%w+)=(%w+)')
+            \\end
+            ,
+            120,
+        },
+        .{
+            "gmatch",
+            \\local s = string.rep('alpha beta gamma delta ', 500)
+            \\for r = 1, 40 do for w in s:gmatch('%a+') do end end
+            ,
+            30,
+        },
+        .{
+            "gsub",
+            \\local s = string.rep('Hello World foo_bar ', 500)
+            \\for r = 1, 60 do local t = s:gsub('%u', string.lower):gsub('_', '-') end
+            ,
+            60,
+        },
+    };
+    for (cases) |case| {
+        const name, const code, const limit_ms = case;
+        var run: Run = .{ .L = L, .arena = arena_state.allocator(), .code = code };
+        const duration_ns = try medianNs(5, &run, Run.timed);
+        var label: [64]u8 = undefined;
+        check(try std.mem.print(&label, "patterns: {s}", .{name}), ms(duration_ns), limit_ms);
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const gpa = std.heap.c_allocator;
     if (init.environ_map.get("PERF_SCALE")) |scale_text| {
@@ -409,6 +629,9 @@ pub fn main(init: std.process.Init) !void {
 
     try names(gpa, pool, directory);
     try contents(gpa, pool, directory);
+    try scanning(gpa, pool, directory);
+    try fuzzyScoring(gpa);
+    try luaPatterns(gpa);
     std.debug.print("memory\n", .{});
     checkMB("peak RSS of the whole run", peakRssMB(), 1200);
 

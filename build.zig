@@ -23,9 +23,10 @@ pub fn build(b: *std.Build) void {
     // The bundled C libraries (SQLite, Lua) are built optimized in a
     // ReleaseSafe build: their checks are their own. Lumen's modules keep
     // Zig's safety checks in every safe build, core and index included:
-    // `zig build perf` measured no difference beyond noise with them on,
-    // and without them an assertion or a bound broken by a corrupt index
-    // file was undefined behaviour instead of a panic.
+    // without them an assertion or a bound broken by a corrupt index file
+    // was undefined behaviour instead of a panic. They cost ~25% on the
+    // name search and the fuzzy scorer's hot loops (MYP-189 measured it;
+    // the earlier "no difference" came from a `perf` built ReleaseFast).
     const c_optimize: std.builtin.OptimizeMode = if (optimize == .safe) .fast else optimize;
 
     // The version both binaries print (`lumen --version`).
@@ -33,15 +34,14 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "version", resolveVersion(b));
 
     const base = baseModules(b, target, optimize);
-    const libraries = cLibraries(b, target, optimize, c_optimize);
-    const luart = b.createModule(.{
-        .root_source_file = b.path("src/luart/root.zig"),
+    const c_options = CLibrariesOptions.fromCommandLine(b);
+    const libraries = cLibraries(b, .{
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
+        .hot = c_optimize,
+        .options = c_options,
     });
-    luart.addImport("lua", libraries.lua);
-    luart.addImport("os", base.os);
+    const luart = luartModule(b, target, optimize, libraries.lua, base.os);
     const daemon = daemonModule(b, .{
         .target = target,
         .optimize = optimize,
@@ -57,6 +57,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .executable = executable,
         .base = base,
+        .c_options = c_options,
     });
 
     const test_step = b.step("test", "Run unit tests");
@@ -101,32 +102,68 @@ fn baseModules(
     return .{ .core = core, .os = os, .index = index };
 }
 
-const CLibraries = struct { sqlite: *std.Build.Module, lua: *std.Build.Module };
-
-/// SQLite and Lua through translate-c, with their libraries: built in from
-/// build.zig.zon's sources (in `hot` mode), or the system's.
-fn cLibraries(
+/// Lua for extensions (src/luart), over `lua` (`cLibraries`).
+fn luartModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    lua: *std.Build.Module,
+    os: *std.Build.Module,
+) *std.Build.Module {
+    const luart = b.createModule(.{
+        .root_source_file = b.path("src/luart/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    luart.addImport("lua", lua);
+    luart.addImport("os", os);
+    return luart;
+}
+
+const CLibraries = struct { sqlite: *std.Build.Module, lua: *std.Build.Module };
+
+/// Where SQLite and Lua come from, read once from the command line: the
+/// app and `zig build perf` each build their own.
+const CLibrariesOptions = struct {
+    system_libraries: bool,
+    lua_package: []const u8,
+
+    fn fromCommandLine(b: *std.Build) CLibrariesOptions {
+        return .{
+            // SQLite and Lua are built in, so a release binary does not
+            // depend on how each distribution names Lua 5.4
+            // (liblua5.4.so.5.4 on Arch, liblua5.4.so.0 on Debian, gone from
+            // Fedora for 5.5). Packagers who want the system's: -Dsystem-libs.
+            .system_libraries = b.option(
+                bool,
+                "system-libs",
+                "Link the system's SQLite and Lua 5.4 instead of the bundled ones",
+            ) orelse false,
+            // Lua 5.4's pkg-config name differs between distributions:
+            // lua5.4 on Arch and Debian, lua on Fedora.
+            .lua_package = b.option(
+                []const u8,
+                "lua-pkg",
+                "With -Dsystem-libs: pkg-config name of Lua 5.4 (default lua5.4)",
+            ) orelse "lua5.4",
+        };
+    }
+};
+
+/// SQLite and Lua through translate-c, with their libraries: built in from
+/// build.zig.zon's sources (in `hot` mode), or the system's.
+fn cLibraries(b: *std.Build, options: struct {
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
     hot: std.builtin.OptimizeMode,
-) CLibraries {
-    // SQLite and Lua are built in, so a release binary does not depend on
-    // how each distribution names Lua 5.4 (liblua5.4.so.5.4 on Arch,
-    // liblua5.4.so.0 on Debian, gone from Fedora for 5.5). Packagers who
-    // want the system's: -Dsystem-libs.
-    const system_libraries = b.option(
-        bool,
-        "system-libs",
-        "Link the system's SQLite and Lua 5.4 instead of the bundled ones",
-    ) orelse false;
-    // Lua 5.4's pkg-config name differs between distributions: lua5.4 on
-    // Arch and Debian, lua on Fedora.
-    const lua_package = b.option(
-        []const u8,
-        "lua-pkg",
-        "With -Dsystem-libs: pkg-config name of Lua 5.4 (default lua5.4)",
-    ) orelse "lua5.4";
+    options: CLibrariesOptions,
+}) CLibraries {
+    const target = options.target;
+    const optimize = options.optimize;
+    const hot = options.hot;
+    const system_libraries = options.options.system_libraries;
+    const lua_package = options.options.lua_package;
     const sqlite = b.addTranslateC(.{
         .root_source_file = b.path("src/sqlite.h"),
         .target = target,
@@ -146,14 +183,12 @@ fn cLibraries(
         lua.linkSystemLibrary(lua_package, .{});
     }
     const libraries: CLibraries = .{ .sqlite = sqlite.createModule(), .lua = lua.createModule() };
-    // Lua's pattern matching with deadline checks (src/luart/lstrmatch.c):
-    // the extensions' string.find/match/gmatch/gsub. Public API only, so it
-    // builds against the system's Lua as well as the bundled one.
-    const lua_flags = [_][]const u8{"-DLUA_COMPAT_5_3"};
-    libraries.lua.addCSourceFile(.{ .file = b.path("src/luart/lstrmatch.c"), .flags = &lua_flags });
-    // io.open and io.tmpfile: close-on-exec, and counted per state.
-    libraries.lua.addCSourceFile(.{ .file = b.path("src/luart/lfiles.c"), .flags = &lua_flags });
-    if (system_libraries) return libraries;
+    const luart_c = luartCLibrary(b, target, hot);
+    libraries.lua.linkLibrary(luart_c);
+    if (system_libraries) {
+        luart_c.root_module.linkSystemLibrary(lua_package, .{});
+        return libraries;
+    }
 
     const sqlite_source = b.dependency("sqlite", .{});
     sqlite.addIncludePath(sqlite_source.path(""));
@@ -168,6 +203,7 @@ fn cLibraries(
     const lua_source = b.dependency("lua", .{});
     lua.addIncludePath(lua_source.path("src"));
     libraries.lua.addIncludePath(lua_source.path("src"));
+    luart_c.root_module.addIncludePath(lua_source.path("src"));
     libraries.lua.linkLibrary(cLibrary(b, .{
         .target = target,
         .optimize = hot,
@@ -177,6 +213,28 @@ fn cLibraries(
         .flags = &.{ "-DLUA_USE_LINUX", "-DLUA_COMPAT_5_3" },
     }));
     return libraries;
+}
+
+/// Lumen's C beside Lua: pattern matching with deadline checks (the
+/// extensions' string.find/match/gmatch/gsub, lstrmatch.c) and io.open /
+/// io.tmpfile close-on-exec and counted per state (lfiles.c). Public API
+/// only, so it builds against the system's Lua as well as the bundled one;
+/// and built like Lua itself (`hot`, no UBSan): in the module, in a
+/// ReleaseSafe build, UBSan made patterns 23-39% slower than Lua's own
+/// (MYP-186).
+fn luartCLibrary(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    hot: std.builtin.OptimizeMode,
+) *std.Build.Step.Compile {
+    return cLibrary(b, .{
+        .target = target,
+        .optimize = hot,
+        .name = "luart_c",
+        .root = b.path("src/luart"),
+        .files = &.{ "lstrmatch.c", "lfiles.c" },
+        .flags = &.{"-DLUA_COMPAT_5_3"},
+    });
 }
 
 /// The daemon's root module (src/main.zig) with everything it imports.
@@ -282,6 +340,7 @@ fn toolSteps(b: *std.Build, options: struct {
     optimize: std.builtin.OptimizeMode,
     executable: *std.Build.Step.Compile,
     base: BaseModules,
+    c_options: CLibrariesOptions,
 }) void {
     const run = b.addRunArtifact(options.executable);
     run.step.dependOn(b.getInstallStep());
@@ -299,16 +358,30 @@ fn toolSteps(b: *std.Build, options: struct {
     find.addImport("os", options.base.os);
     b.installArtifact(b.addExecutable(.{ .name = "lumen-find", .root_module = find }));
 
-    // Performance regression checks, always optimized: `zig build perf`.
+    // Performance regression checks: `zig build perf`. Built as a release
+    // is, whatever -Doptimize says: Lumen's modules ReleaseSafe, the C
+    // libraries optimized. Built ReleaseFast, it measured code that never
+    // ships and missed what safety checks cost (MYP-189).
     const perf = b.createModule(.{
         .root_source_file = b.path("src/index/perf.zig"),
         .target = options.target,
-        .optimize = .fast,
+        .optimize = .safe,
         .link_libc = true,
     });
-    const perf_base = baseModules(b, options.target, .fast);
+    const perf_base = baseModules(b, options.target, .safe);
+    const perf_libraries = cLibraries(b, .{
+        .target = options.target,
+        .optimize = .safe,
+        .hot = .fast,
+        .options = options.c_options,
+    });
     perf.addImport("index", perf_base.index);
     perf.addImport("os", perf_base.os);
+    perf.addImport("core", perf_base.core);
+    perf.addImport(
+        "luart",
+        luartModule(b, options.target, .safe, perf_libraries.lua, perf_base.os),
+    );
     const perf_run = b.addRunArtifact(b.addExecutable(.{
         .name = "lumen-perf",
         .root_module = perf,

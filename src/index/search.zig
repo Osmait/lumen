@@ -29,9 +29,11 @@ const recency = @import("recency.zig");
 /// Candidates one pool task scores.
 const chunk_entries = 8192;
 /// Candidates a chunk keeps on the first pass, in multiples of its share
-/// of the finalists: with names spread evenly, a chunk rarely holds more
-/// than twice its share of the global top, so rarely needs a second pass.
-const share_factor = 2;
+/// of the finalists. A real home is not spread evenly: on a 1.5M-entry one
+/// (182 chunks), "c" sifted 58 chunks again with 2, 14 with 8 and 5 with
+/// 16; 8 was the fastest, the larger first pass costing more than the
+/// chunks it saves (MYP-187).
+const share_factor = 8;
 /// Finalists that reach the fine scorer, in multiples of `limit`: the
 /// global top by cheap score (`Engine.sift`). Names the fine scorer ranks
 /// higher but the cheap one lower can still miss it: on `zig build perf`'s
@@ -304,19 +306,46 @@ fn siftCrowded(
         worst(sifted.finalists.items).rank()
     else
         0;
-    var crowded = false;
-    for (context.partials) |*partial| {
-        partial.rescan = partial.cut > floor;
-        crowded = crowded or partial.rescan;
+    var crowded_count: usize = 0;
+    for (context.partials) |*partial| crowded_count += @intFromBool(partial.cut > floor);
+    if (crowded_count == 0) return;
+    const chunks = try context.gpa.alloc(u32, crowded_count);
+    defer context.gpa.free(chunks);
+    var chunk_count: usize = 0;
+    for (context.partials, 0..) |*partial, chunk_index| {
+        if (partial.cut <= floor) continue;
+        chunks[chunk_count] = @intCast(chunk_index);
+        chunk_count += 1;
     }
-    if (!crowded) return;
+    assert(chunk_count == crowded_count);
     context.kept_max = keep;
     context.floor = floor;
     context.candidates_max = 0;
-    pool.runBlocks(source_count, chunk_entries, context, siftChunkCallback);
+    // Only these chunks: dispatching all ~180 for most to return at once
+    // cost more than sifting the few that work.
+    const crowded: Crowded = .{
+        .context = context,
+        .chunks = chunks,
+        .source_count = source_count,
+    };
+    pool.run(chunks.len, &crowded, Crowded.one);
     for (context.partials) |*partial| sifted.overflow = sifted.overflow or partial.overflow;
     try mergeTops(context.gpa, context.partials, keep, &sifted.finalists);
 }
+
+/// The chunks `siftCrowded` sifts again, one pool task each.
+const Crowded = struct {
+    context: *SiftContext,
+    chunks: []const u32,
+    source_count: usize,
+
+    fn one(crowded: *const Crowded, index: usize) void {
+        const start = @as(usize, crowded.chunks[index]) * chunk_entries;
+        assert(start < crowded.source_count);
+        const end = @min(start + chunk_entries, crowded.source_count);
+        siftChunkCallback(crowded.context, start, end);
+    }
+};
 
 /// The best `keep` of the chunks' tops, in `finalists` (cleared first).
 fn mergeTops(
@@ -372,8 +401,6 @@ const Partial = struct {
     /// Every pair the chunk dropped ranks below this `Pair.rank`; 0 when
     /// it dropped none.
     cut: u64 = 0,
-    /// Sift the chunk again on the second pass.
-    rescan: bool = true,
 
     fn deinit(partial: *Partial, gpa: std.mem.Allocator) void {
         partial.top.deinit(gpa);
@@ -399,7 +426,6 @@ const SiftContext = struct {
 
 fn siftChunkCallback(context: *SiftContext, start: usize, end: usize) void {
     const chunk_index = start / chunk_entries;
-    if (!context.partials[chunk_index].rescan) return;
     // Out of memory: the chunk's candidates are incomplete, so they must not
     // be refined on the next keystroke as if they were all of them.
     siftChunk(context, chunk_index, start, end) catch {
