@@ -132,12 +132,14 @@ pub fn panelHeight(ui: *const Ui) c_int {
 
 /// The list's height limit: what is left beside the search bar, the
 /// results' padding and border, the footer and the gaps between pieces
-/// (none in a single panel).
+/// (none in a single panel). Never below 0: lumen.layout's height can leave
+/// no room for the list (`height = 60, footer = true`).
 fn listHeightMax(ui: *const Ui) c_int {
     const gap_px: c_int = if (ui.layout.panels == .split) pieces_gap_px else 0;
     const footer_px: c_int = if (ui.layout.footer) footer_height_px + gap_px else 0;
     const results_frame_px = 2 * (style_css.results_padding_px + style_css.results_border_px);
-    return panelHeight(ui) - style_css.search_height_px - results_frame_px - gap_px - footer_px;
+    const left_px = panelHeight(ui) - style_css.search_height_px - results_frame_px - gap_px - footer_px;
+    return @max(left_px, 0);
 }
 
 /// A grid cell's content width for `ui.grid_columns` cells across the
@@ -412,7 +414,9 @@ pub fn applyLayout(ui: *Ui) void {
     if (!ui.built) return;
     const width_px = panelWidth(ui);
     const height_px = panelHeight(ui);
-    c.gtk_scrolled_window_set_max_content_height(ui.scroller, listHeightMax(ui));
+    // Before the early return: the detail pane's side can change while the
+    // window's size does not.
+    sizeList(ui, gtk.isVisible(ui.detail.box));
     var width_current_px: c_int = 0;
     var height_current_px: c_int = 0;
     c.gtk_widget_get_size_request(gtk.widget(ui.column), &width_current_px, &height_current_px);
@@ -428,10 +432,24 @@ pub fn applyLayout(ui: *Ui) void {
         gtk.setVisible(ui.window, true);
         _ = c.gtk_widget_grab_focus(gtk.widget(ui.search_bar.entry));
     }
-    // The list beside a detail pane keeps ~40% of the width.
-    if (gtk.isVisible(ui.detail.box)) {
-        gtk.setSizeRequest(ui.scroller, @divTrunc(width_px * 2, 5), -1);
-    }
+}
+
+/// The list's size, with or without the detail pane: beside it the list
+/// takes ~40% of the width; above it (`detail = "bottom"`) the full width
+/// and ~half the height.
+fn sizeList(ui: *Ui, has_detail: bool) void {
+    const detail_below = ui.layout.detail == .bottom;
+    c.gtk_widget_set_size_request(
+        gtk.widget(ui.scroller),
+        if (has_detail and !detail_below) @divTrunc(panelWidth(ui) * 2, 5) else -1,
+        -1,
+    );
+    gtk.setHexpand(ui.scroller, !has_detail or detail_below);
+    const list_height_max = listHeightMax(ui);
+    c.gtk_scrolled_window_set_max_content_height(
+        ui.scroller,
+        if (has_detail and detail_below) @divTrunc(list_height_max, 2) else list_height_max,
+    );
 }
 
 /// The window's parts for `view`: the detail pane and what it shows, the
@@ -456,19 +474,7 @@ pub fn layoutFor(ui: *Ui, view: View) void {
     gtk.setVisible(ui.detail.box, has_detail);
     // A preview needs room: the results take the full height then.
     gtk.setVexpand(ui.results, has_detail);
-    // Beside the detail pane the list takes ~40%; above it, ~half the height.
-    const detail_below = ui.layout.detail == .bottom;
-    c.gtk_widget_set_size_request(
-        gtk.widget(ui.scroller),
-        if (has_detail and !detail_below) @divTrunc(panelWidth(ui) * 2, 5) else -1,
-        -1,
-    );
-    gtk.setHexpand(ui.scroller, !has_detail or detail_below);
-    const list_height_max = listHeightMax(ui);
-    c.gtk_scrolled_window_set_max_content_height(
-        ui.scroller,
-        if (has_detail and detail_below) @divTrunc(list_height_max, 2) else list_height_max,
-    );
+    sizeList(ui, has_detail);
     detail_pane.prepareFor(&ui.detail, view);
 }
 

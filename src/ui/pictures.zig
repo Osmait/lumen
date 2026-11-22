@@ -14,17 +14,32 @@ const c = @import("c");
 const os = @import("os");
 const image_size = @import("image_size.zig");
 
-pub const Limits = struct { bytes: usize, pixels: u64 };
+pub const Limits = struct {
+    bytes: usize,
+    pixels: u64,
+    /// An SVG's own cap: its size says nothing of what drawing it costs
+    /// (parsing, paths, filters), and an icon's is drawn on the UI thread.
+    svg_bytes: usize,
+};
 
 /// Previews and grid pictures: a 48 MP photo fits; 256 MB at most while it
 /// decodes, one at a time.
-pub const picture_limits: Limits = .{ .bytes = 64 << 20, .pixels = 8192 * 8192 };
-/// Icons in rows, decoded on the UI thread.
-pub const icon_limits: Limits = .{ .bytes = 4 << 20, .pixels = 2048 * 2048 };
+pub const picture_limits: Limits = .{
+    .bytes = 64 << 20,
+    .pixels = 8192 * 8192,
+    .svg_bytes = 8 << 20,
+};
+/// Icons in rows, decoded on the UI thread: icon themes' SVGs are a few KB.
+pub const icon_limits: Limits = .{
+    .bytes = 4 << 20,
+    .pixels = 2048 * 2048,
+    .svg_bytes = 512 << 10,
+};
 
 /// `path` decoded to fit `width_px`×`height_px` (never larger than it is), or null: not a
 /// regular file, over `limits`, or not an image whose size `image_size`
-/// reads (SVG excepted: it is drawn at the size asked for). Thread-safe.
+/// reads (SVG excepted: it is drawn at the size asked for, which must be
+/// within `limits.pixels`, from no more than `limits.svg_bytes`). Thread-safe.
 /// The bytes come from a descriptor opened non-blocking and checked to be a
 /// regular file: decoding by path opened the file again, and a FIFO swapped
 /// in meanwhile blocked forever.
@@ -64,7 +79,14 @@ fn decodeSize(data: []const u8, width_px: c_int, height_px: c_int, limits: Limit
             @intCast(@min(size.height_px, @as(u64, @intCast(height_px)))),
         };
     }
-    return if (isSvg(data)) .{ width_px, height_px } else null;
+    if (!isSvg(data)) return null;
+    // Drawn at the size asked for, whatever width and height it declares:
+    // that size, and the text drawn from, are what it costs.
+    if (data.len > limits.svg_bytes) return null;
+    if (width_px <= 0 or height_px <= 0) return null;
+    const pixels = @as(u64, @intCast(width_px)) * @as(u64, @intCast(height_px));
+    if (pixels > limits.pixels) return null;
+    return .{ width_px, height_px };
 }
 
 /// How far into a file `isSvg` looks for the `<svg` tag: past an XML
@@ -225,7 +247,7 @@ fn finishRequest(request: *Request, pixbuf: ?*c.GdkPixbuf, current: bool) void {
 
 test "a picture over the limits is never decoded" {
     const testing = std.testing;
-    const limits: Limits = .{ .bytes = 1 << 20, .pixels = 4096 * 4096 };
+    const limits: Limits = .{ .bytes = 1 << 20, .pixels = 4096 * 4096, .svg_bytes = 64 << 10 };
     const bomb = "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x4e\x20\x00\x00\x4e\x20\x08\x02";
     try testing.expect(decodeSize(bomb, 512, 512, limits) == null);
     // Within the limits: never decoded larger than it is.
@@ -235,6 +257,14 @@ test "a picture over the limits is never decoded" {
     // SVG is drawn at the size asked for; an unknown format is not decoded.
     const svg = "\xef\xbb\xbf<?xml version=\"1.0\"?>\n<svg width=\"30000\" height=\"30000\"/>";
     try testing.expectEqual([2]c_int{ 64, 64 }, decodeSize(svg, 64, 64, limits).?);
+    // ...but not at a size over the pixel limit, nor from too much text.
+    try testing.expect(decodeSize(svg, 8192, 8192, limits) == null);
+    try testing.expect(decodeSize(svg, 0, 64, limits) == null);
+    const svg_big = try testing.allocator.alloc(u8, limits.svg_bytes + 1);
+    defer testing.allocator.free(svg_big);
+    @memset(svg_big, ' ');
+    @memcpy(svg_big[0..svg.len], svg);
+    try testing.expect(decodeSize(svg_big, 64, 64, limits) == null);
     try testing.expect(decodeSize("P6 30000 30000 255 ", 64, 64, limits) == null);
 
     var test_dir: os.TestDir = try .init();

@@ -27,6 +27,16 @@ comptime {
     std.debug.assert(extension_name_bytes_max >= Host.id_bytes_max);
 }
 
+/// How much of a job's output is kept: its end, more than any message
+/// shows (`print_bytes_max`).
+const output_kept_bytes = 16 << 10;
+/// What one read of that output takes.
+const output_chunk_bytes = 4096;
+
+comptime {
+    assert(output_kept_bytes >= print_bytes_max);
+}
+
 const Job = struct {
     ui: *Ui,
     /// The caller's command line; null when started from Settings.
@@ -34,8 +44,35 @@ const Job = struct {
     subprocess: *c.GSubprocess,
     kind: Kind,
     name: core.FixedStr(extension_name_bytes_max) = .{},
-    /// What removeTree deletes on failure: whole, never cut (see `start`).
+    /// What removeTreeThenReload deletes on failure: whole, never cut (see
+    /// `start`).
     folder: core.FixedStr(std.Io.Dir.max_path_bytes) = .{},
+    /// The end of what the job printed: only its last lines are ever shown,
+    /// and git's output is not bounded (a clone with progress, a pull
+    /// over many extensions).
+    output: [output_kept_bytes]u8 = undefined,
+    output_len: usize = 0,
+    /// Where the next read lands.
+    chunk: [output_chunk_bytes]u8 = undefined,
+
+    /// Keeps `bytes` after what is kept, dropping the oldest to stay
+    /// within `output_kept_bytes`.
+    fn keepOutput(job: *Job, bytes: []const u8) void {
+        if (bytes.len >= job.output.len) {
+            @memcpy(&job.output, bytes[bytes.len - job.output.len ..]);
+            job.output_len = job.output.len;
+            return;
+        }
+        const room = job.output.len - job.output_len;
+        if (bytes.len > room) {
+            const dropped = bytes.len - room;
+            std.mem.copyForwards(u8, job.output[0 .. job.output_len - dropped], job.output[dropped..job.output_len]);
+            job.output_len -= dropped;
+        }
+        @memcpy(job.output[job.output_len..][0..bytes.len], bytes);
+        job.output_len += bytes.len;
+        assert(job.output_len <= job.output.len);
+    }
 
     fn nameSlice(job: *const Job) []const u8 {
         return job.name.slice();
@@ -209,7 +246,16 @@ pub fn update(ui: *Ui, caller: ?*c.GApplicationCommandLine, name: ?[]const u8) v
         \\for d in */; do
         \\  [ -d "$d.git" ] || continue
         \\  printf '%s: ' "${d%/}"
-        \\  git -C "$d" pull --ff-only --quiet && echo up to date || status=1
+        \\  before=$(git -C "$d" rev-parse HEAD 2>/dev/null)
+        \\  if git -C "$d" pull --ff-only --quiet; then
+        \\    if [ "$(git -C "$d" rev-parse HEAD 2>/dev/null)" = "$before" ]; then
+        \\      echo up to date
+        \\    else
+        \\      echo updated
+        \\    fi
+        \\  else
+        \\    status=1
+        \\  fi
         \\done
         \\exit $status
         ,
@@ -264,18 +310,46 @@ fn start(
     // extensionFolder builds it in a buffer of this size: it always fits.
     std.debug.assert(folder.len <= @TypeOf(job.folder).capacity);
     job.folder.set(folder);
-    // As bytes: git prints file names and messages in any encoding, and the
-    // UTF-8 variant fails on the first byte that is not.
-    c.g_subprocess_communicate_async(subprocess, null, null, &onDone, job);
+    // Read as bytes, chunk by chunk, keeping only the end: git prints file
+    // names and messages in any encoding, and how much it prints has no
+    // bound (communicate kept all of it).
+    readOutput(job);
+}
+
+fn readOutput(job: *Job) void {
+    const stdout = c.g_subprocess_get_stdout_pipe(job.subprocess);
+    c.g_input_stream_read_async(
+        stdout,
+        &job.chunk,
+        job.chunk.len,
+        c.G_PRIORITY_DEFAULT,
+        null,
+        &onOutput,
+        job,
+    );
+}
+
+fn onOutput(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) void {
+    const job: *Job = @ptrCast(@alignCast(data.?));
+    var err: ?*c.GError = null;
+    const stdout = c.g_subprocess_get_stdout_pipe(job.subprocess);
+    const bytes_read = c.g_input_stream_read_finish(stdout, async_result, &err);
+    if (bytes_read > 0) {
+        job.keepOutput(job.chunk[0..@intCast(bytes_read)]);
+        return readOutput(job);
+    }
+    // The end of the output, or a read that failed: the exit decides. A
+    // failed read closes the pipe, or a program still writing would block
+    // on it and never exit.
+    if (err != null) _ = c.g_input_stream_close(stdout, null, null);
+    proc.warnError(.install, err, "reading {s}'s output", .{@tagName(job.kind)});
+    c.g_subprocess_wait_async(job.subprocess, null, &onDone, job);
 }
 
 /// What the job printed, as UTF-8 (U+FFFD for what is not, NUL included):
 /// it goes to the caller over D-Bus and onto a row. Free with g_free.
-fn outputText(bytes: ?*c.GBytes) [:0]u8 {
-    var length: usize = 0;
-    const received = if (bytes) |output| c.g_bytes_get_data(output, &length) else null;
-    const data: [*]const u8 = received orelse "";
-    return std.mem.span(c.g_utf8_make_valid(data, @intCast(length)));
+fn outputText(job: *const Job) [:0]u8 {
+    return std.mem.span(c.g_utf8_make_valid(&job.output, @intCast(job.output_len)));
 }
 
 /// What git says last on a failure, in bytes: the message has to fit 1 KB.
@@ -291,28 +365,17 @@ fn onDone(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
         if (caller) |command_line| c.g_object_unref(command_line);
         ui.gpa.destroy(job);
     }
-    var out: ?*c.GBytes = null;
     var err: ?*c.GError = null;
-    const finished = c.g_subprocess_communicate_finish(
-        job.subprocess,
-        async_result,
-        &out,
-        null,
-        &err,
-    );
-    const ran = finished != 0;
+    const ran = c.g_subprocess_wait_finish(job.subprocess, async_result, &err) != 0;
     defer if (err) |gerror| c.g_error_free(gerror);
-    defer if (out) |output_bytes| c.g_bytes_unref(output_bytes);
-    const output = outputText(out);
+    const output = outputText(job);
     defer c.g_free(output.ptr);
-    // Failed or not, the files may have changed (half a pull, a clone
-    // removed again): the extensions load again, after the message.
-    defer ext_view.reload(ui);
     const succeeded = ran and err == null and c.g_subprocess_get_successful(job.subprocess) != 0;
     if (!succeeded) {
         // A failed clone can leave half a folder behind, and the next
-        // install would find it there.
-        if (job.kind == .install) removeTree(job.folderPath());
+        // install would find it there. The extensions reload once it is
+        // gone; otherwise now: half a pull changed files too.
+        if (job.kind == .install) removeTreeThenReload(ui, job.folderPath()) else ext_view.reload(ui);
         const why = if (err) |gerror|
             std.mem.span(gerror.message)
         else
@@ -336,9 +399,13 @@ fn reportSuccess(job: *Job, output: [:0]const u8) void {
                 "{s}/init.lua",
                 .{job.folderPath()},
                 0,
-            ) catch "";
+            ) catch {
+                // Not known to be missing: the clone stays.
+                ext_view.reload(ui);
+                return fail(ui, caller, "{s}: path too long to check its init.lua", .{job.folderPath()});
+            };
             if (os.info(init_path) == null) {
-                removeTree(job.folderPath());
+                removeTreeThenReload(ui, job.folderPath());
                 return fail(
                     ui,
                     caller,
@@ -358,14 +425,23 @@ fn reportSuccess(job: *Job, output: [:0]const u8) void {
             print(ui, caller, "{s}{s}", .{ end[0], end[1] });
         } else {
             // git's own lines are too long for a row: a summary shows instead.
-            const none = output.len == 0 or std.mem.find(u8, output, "Already up to date") != null;
-            note(ui, if (none) "Already up to date" else "Updated");
+            note(ui, if (anyUpdated(job.nameSlice().len == 0, output)) "Updated" else "Already up to date");
         },
         .uninstall => print(ui, caller, "Removed {s}\n", .{job.nameSlice()}),
     }
+    ext_view.reload(ui);
     if (caller) |command_line| c.g_application_command_line_set_exit_status(command_line, 0);
-    // From Settings: the removed extension's page has nothing left to show.
-    if (caller == null and job.kind == .uninstall and ui.view == .prefs) ui.goBack();
+    // From Settings: the removed extension's page, if it is still the one
+    // shown, has nothing left to show.
+    const on_its_page = ui.view == .prefs and std.mem.eql(u8, ui.prefs_ext.slice(), job.nameSlice());
+    if (caller == null and job.kind == .uninstall and on_its_page) ui.goBack();
+}
+
+/// Whether an update changed anything: a line "NAME: updated" from the
+/// update of every extension (`all`), or git's own output for one.
+fn anyUpdated(all: bool, output: []const u8) bool {
+    if (all) return std.mem.find(u8, output, ": updated\n") != null;
+    return output.len > 0 and std.mem.find(u8, output, "Already up to date") == null;
 }
 
 /// What an install, update or removal prints: the success line and git's
@@ -386,24 +462,27 @@ fn print(
     c.g_application_command_line_print(command_line, "%s", message.ptr);
 }
 
-/// Removes `folder` like rm -rf and waits for it: a fresh clone is small
-/// and local.
-fn removeTree(folder: [:0]const u8) void {
+/// Removes `folder` like rm -rf without waiting for it (the GTK thread
+/// must not: a large tree takes seconds), then reloads the extensions.
+fn removeTreeThenReload(ui: *Ui, folder: [:0]const u8) void {
     var argv = [_:null]?[*:0]const u8{ "rm", "-rf", "--", folder.ptr };
     var err: ?*c.GError = null;
-    const spawned = c.g_spawn_sync(
-        null,
-        @ptrCast(&argv),
-        null,
-        c.G_SPAWN_SEARCH_PATH,
-        null,
-        null,
-        null,
-        null,
-        null,
-        &err,
-    );
-    if (spawned == 0) proc.warnError(.install, err, "rm {s}", .{folder});
+    const subprocess = c.g_subprocess_newv(@ptrCast(&argv), c.G_SUBPROCESS_FLAGS_NONE, &err) orelse {
+        proc.warnError(.install, err, "rm {s}", .{folder});
+        return ext_view.reload(ui);
+    };
+    c.g_subprocess_wait_check_async(subprocess, null, &onRemoved, ui);
+}
+
+fn onRemoved(source: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) void {
+    const ui: *Ui = @ptrCast(@alignCast(data.?));
+    const subprocess: *c.GSubprocess = @ptrCast(source.?);
+    defer c.g_object_unref(subprocess);
+    var err: ?*c.GError = null;
+    if (c.g_subprocess_wait_check_finish(subprocess, async_result, &err) == 0) {
+        proc.warnError(.install, err, "rm", .{});
+    }
+    ext_view.reload(ui);
 }
 
 test "long output keeps its end, and messages stay valid UTF-8" {
@@ -439,4 +518,36 @@ test "extension names come from the repository" {
         &name_bytes,
         "https://github.com/x/lumen",
     ));
+}
+
+test "a job keeps the end of its output, whatever its length" {
+    const job = try std.testing.allocator.create(Job);
+    defer std.testing.allocator.destroy(job);
+    job.output_len = 0;
+    job.keepOutput("hello ");
+    job.keepOutput("world");
+    try std.testing.expectEqualStrings("hello world", job.output[0..job.output_len]);
+    // Past the cap: the oldest bytes go, the newest stay.
+    const long = try std.testing.allocator.alloc(u8, output_kept_bytes - 3);
+    defer std.testing.allocator.free(long);
+    @memset(long, 'x');
+    job.keepOutput(long);
+    try std.testing.expectEqual(@as(usize, output_kept_bytes), job.output_len);
+    // 11 + (cap - 3) bytes: the first 8 went, "rld" leads.
+    try std.testing.expectEqualStrings("rldxx", job.output[0..5]);
+    const huge = try std.testing.allocator.alloc(u8, output_kept_bytes * 2);
+    defer std.testing.allocator.free(huge);
+    @memset(huge, 'y');
+    huge[huge.len - 1] = 'z';
+    job.keepOutput(huge);
+    try std.testing.expectEqual(@as(usize, output_kept_bytes), job.output_len);
+    try std.testing.expectEqual(@as(u8, 'z'), job.output[output_kept_bytes - 1]);
+}
+
+test "an update says Updated only when something changed" {
+    try std.testing.expect(!anyUpdated(true, "a: up to date\nb: up to date\n"));
+    try std.testing.expect(anyUpdated(true, "a: up to date\nb: updated\n"));
+    try std.testing.expect(!anyUpdated(false, ""));
+    try std.testing.expect(!anyUpdated(false, "Already up to date.\n"));
+    try std.testing.expect(anyUpdated(false, "Updating 1a2b..3c4d\nFast-forward\n"));
 }

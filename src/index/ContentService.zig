@@ -298,28 +298,30 @@ fn pathOf(context: *anyopaque, doc: content.DocIn, path_buffer: []u8) ?[:0]const
 /// The first `lines` lines of a hit's text (for the preview), in `arena`;
 /// null if it cannot be read. Reads no further than that: the preview runs
 /// on the UI thread, and a match near the top of a 4 MB extraction needs a
-/// few KB of it. `mtime` is the document's as it is now; so is its size,
-/// which keys the text cache too.
+/// few KB of it. `mtime` and `size` are the document's as the hit has them
+/// (`Hit.mtime`, `Hit.size`): they key the text cache, and taking them from
+/// the hit spares the UI thread a stat.
 pub fn readText(
     service: *ContentService,
     arena: std.mem.Allocator,
     path: []const u8,
     mtime: i64,
+    size: u64,
     source: content.Source,
     lines: u32,
 ) ?[]const u8 {
     var path_buffer: paths.Buffer = undefined;
     const doc_path = std.mem.printSentinel(&path_buffer, "{s}", .{path}, 0) catch return null;
     var text_path_buffer: paths.Buffer = undefined;
-    const text_path: [:0]const u8 = if (source == .extracted) blk: {
-        const doc_stat = content_list.stat(doc_path, .document) orelse return null;
-        break :blk service.text_cache.path(&text_path_buffer, .{
+    const text_path: [:0]const u8 = if (source == .extracted)
+        service.text_cache.path(&text_path_buffer, .{
             .path = path,
             .mtime = mtime,
-            .size = doc_stat.size,
+            .size = size,
             .source = .extracted,
-        }) orelse return null;
-    } else doc_path;
+        }) orelse return null
+    else
+        doc_path;
     const fd = sys.openRegular(text_path) catch return null;
     defer sys.close(fd);
     const text_bytes_max: usize = switch (source) {
@@ -333,7 +335,11 @@ pub fn readText(
         const spare = text.unusedCapacitySlice();
         const bytes_wanted = @min(spare.len, text_bytes_max - text.items.len);
         const bytes_read = std.os.linux.read(fd, spare.ptr, bytes_wanted);
-        if (std.os.linux.errno(bytes_read) != .SUCCESS or bytes_read == 0) break;
+        switch (std.os.linux.errno(bytes_read)) {
+            .SUCCESS => if (bytes_read == 0) break,
+            .INTR => continue,
+            else => break,
+        }
         lines_seen += @intCast(std.mem.count(u8, spare[0..bytes_read], "\n"));
         text.items.len += bytes_read;
     }
@@ -826,6 +832,7 @@ fn buildNext(service: *ContentService, input: BuildInput) ?content.Index {
         .read = textOf,
         .context = service,
         .extracted_bytes = cachedTextBytes,
+        .stop = &service.stop,
     };
     if (std.mem.findScalarLast(u8, service.cache_path, '/')) |slash| {
         // The save below fails and says so; the index is served from memory.
@@ -838,6 +845,8 @@ fn buildNext(service: *ContentService, input: BuildInput) ?content.Index {
         if (fresh.backing == .mapped) service.worker.unsaved = false;
         return fresh;
     } else |err| switch (err) {
+        // Shutting down: the index on disk stays the last finished one.
+        error.Cancelled => return null,
         error.OutOfMemory => {
             log.warn("building the content index: out of memory", .{});
             return null;
@@ -1117,6 +1126,7 @@ test "content service: finds, follows edits and deletions, rebuilds only on chan
             fixture.arena_state.allocator(),
             hits[0].path,
             hits[0].mtime,
+            hits[0].size,
             .plain,
             std.math.maxInt(u32),
         ).?;
@@ -1331,6 +1341,7 @@ test "content service: Office documents are extracted once per version" {
             fixture.arena_state.allocator(),
             hits[0].path,
             hits[0].mtime,
+            hits[0].size,
             .extracted,
             std.math.maxInt(u32),
         ).?;
@@ -1340,6 +1351,7 @@ test "content service: Office documents are extracted once per version" {
             fixture.arena_state.allocator(),
             hits[0].path,
             hits[0].mtime,
+            hits[0].size,
             .plain,
             std.math.maxInt(u32),
         );

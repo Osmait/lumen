@@ -120,6 +120,8 @@ pub fn prepareFor(detail: *DetailPane, view: Ui.View) void {
         if (wrap) c.PANGO_ELLIPSIZE_NONE else c.PANGO_ELLIPSIZE_END,
     );
     gtk.setVisible(detail.picture, false);
+    // Only an extension row shows markdown: `showExtDetail` sets it again.
+    gtk.setClass(detail.text, markdown_class, false);
 }
 
 pub fn showContentDetail(ui: *Ui, item: *const Item) void {
@@ -130,14 +132,15 @@ pub fn showContentDetail(ui: *Ui, item: *const Item) void {
     const arena = arena_instance.allocator();
     gtk.setVisible(ui.detail.picture, false);
 
-    const info = os.info(file.path);
     const service = ui.contents orelse return;
+    // The document as the search found it: no stat on the UI thread.
     const text = service.readText(
         arena,
         file.path,
-        if (info) |file_info| file_info.mtime else 0,
+        item.time_s,
+        file.size,
         if (file.extracted) .extracted else .plain,
-        line + labels.context_lines_after,
+        line +| labels.context_lines_after,
     ) orelse item.detail;
     const words = index.content.splitWords(arena, ui.query()) catch return;
     // The theme's accent behind matches, its text colour on top.
@@ -158,7 +161,7 @@ pub fn showContentDetail(ui: *Ui, item: *const Item) void {
     setMeta(&ui.detail, .{
         labels.kindLabel(arena, file.path, false, guessed_type),
         item.fact,
-        if (info) |file_info| labels.formatWhen(arena, file_info.mtime) else no_value,
+        if (item.time_s != 0) labels.formatWhen(arena, item.time_s) else no_value,
         item.where,
     });
 }

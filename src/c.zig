@@ -102,6 +102,8 @@ pub const G_APPLICATION_HANDLES_COMMAND_LINE: c_int = 1 << 3;
 pub const G_SPAWN_DO_NOT_REAP_CHILD: c_int = 1 << 1;
 pub const G_SPAWN_SEARCH_PATH: c_int = 1 << 2;
 pub const G_SPAWN_STDERR_TO_DEV_NULL: c_int = 1 << 4;
+pub const G_PRIORITY_DEFAULT: c_int = 0;
+pub const G_SUBPROCESS_FLAGS_NONE: c_int = 0;
 pub const G_SUBPROCESS_FLAGS_STDIN_PIPE: c_int = 1 << 0;
 pub const G_SUBPROCESS_FLAGS_STDOUT_PIPE: c_int = 1 << 2;
 pub const G_SUBPROCESS_FLAGS_STDERR_MERGE: c_int = 1 << 6;
@@ -403,6 +405,48 @@ pub extern fn g_subprocess_communicate_utf8_finish(
     err: ?*?*GError,
 ) gboolean;
 pub extern fn g_subprocess_get_successful(subprocess: *GSubprocess) gboolean;
+pub extern fn g_subprocess_get_stdout_pipe(subprocess: *GSubprocess) *GInputStream;
+pub extern fn g_subprocess_wait_async(
+    subprocess: *GSubprocess,
+    cancellable: ?*GCancellable,
+    callback: GAsyncReadyCallback,
+    data: ?*anyopaque,
+) void;
+pub extern fn g_subprocess_wait_finish(
+    subprocess: *GSubprocess,
+    result: *GAsyncResult,
+    err: ?*?*GError,
+) gboolean;
+pub extern fn g_subprocess_wait_check_async(
+    subprocess: *GSubprocess,
+    cancellable: ?*GCancellable,
+    callback: GAsyncReadyCallback,
+    data: ?*anyopaque,
+) void;
+pub extern fn g_subprocess_wait_check_finish(
+    subprocess: *GSubprocess,
+    result: *GAsyncResult,
+    err: ?*?*GError,
+) gboolean;
+pub extern fn g_input_stream_read_async(
+    stream: *GInputStream,
+    buffer: *anyopaque,
+    count: usize,
+    priority: c_int,
+    cancellable: ?*GCancellable,
+    callback: GAsyncReadyCallback,
+    data: ?*anyopaque,
+) void;
+pub extern fn g_input_stream_close(
+    stream: *GInputStream,
+    cancellable: ?*GCancellable,
+    err: ?*?*GError,
+) gboolean;
+pub extern fn g_input_stream_read_finish(
+    stream: *GInputStream,
+    result: *GAsyncResult,
+    err: ?*?*GError,
+) isize;
 pub extern fn g_output_stream_write_all(
     stream: *GOutputStream,
     buffer: *const anyopaque,

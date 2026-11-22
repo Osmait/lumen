@@ -110,6 +110,9 @@ pub const Action = union(enum) {
         line: ?u32 = null,
         /// The match is in text extracted from a PDF/Office document.
         extracted: bool = false,
+        /// The document's size when a content search found it (0: unknown):
+        /// with `Item.time_s`, it names its cached extraction.
+        size: u64 = 0,
 
         pub fn entry(file: @This()) core.file_kind.Entry {
             return if (file.is_dir) .folder else .file;

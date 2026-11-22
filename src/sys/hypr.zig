@@ -32,9 +32,10 @@ const log = std.log.scoped(.hypr);
 // ---------------------------------------------------------------- queries
 
 pub const Client = struct {
-    address: []const u8,
-    title: []const u8,
-    class: []const u8,
+    // Defaults: `activewindow` answers `{}` when no window has the focus.
+    address: []const u8 = "",
+    title: []const u8 = "",
+    class: []const u8 = "",
     workspace: struct { id: i64 = 0, name: []const u8 = "" } = .{},
     at: [2]i32 = .{ 0, 0 },
     size: [2]i32 = .{ 0, 0 },
@@ -210,8 +211,9 @@ fn talk(arena: std.mem.Allocator, message: []const u8) ?[]const u8 {
             log.warn("{s}: answer over {d} bytes, dropped", .{ message, answer_bytes_max });
             return null;
         }
-        answer.ensureUnusedCapacity(arena, answer_chunk_bytes) catch return null;
-        const spare = answer.unusedCapacitySlice();
+        const room = answer_bytes_max - answer.items.len;
+        answer.ensureUnusedCapacity(arena, @min(answer_chunk_bytes, room)) catch return null;
+        const spare = answer.unusedCapacitySlice()[0..@min(answer.unusedCapacitySlice().len, room)];
         const chunk_len = os.unix.readSome(fd, spare, deadline_ns) catch return null;
         if (chunk_len == 0) break;
         answer.items.len += chunk_len;
@@ -346,6 +348,14 @@ pub fn sendAfterHide() void {
 }
 
 /// Sends what `batch` queued; hyprctl if the socket cannot be reached.
+/// At shutdown: dispatches still queued go now (they were asked for), and
+/// the GLib sources and the event socket this file holds are let go.
+pub fn shutdown() void {
+    dispatch_queue.cancelIdle();
+    sendQueued();
+    focus_waiter.stop();
+}
+
 pub fn sendQueued() void {
     if (dispatch_queue.len == 0) return;
     const queued = dispatch_queue.buffer[0..dispatch_queue.len];
@@ -637,6 +647,15 @@ test "clients: recorded output, extra fields ignored, ordered by focus" {
     // The one on the special workspace is not mapped: the UI skips it.
     try testing.expect(!all[1].mapped);
     try testing.expectEqual(@as(i64, -99), all[1].workspace.id);
+}
+
+test "activewindow with no window focused parses as an empty client" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    // What Hyprland answers when nothing has the focus.
+    const window = parse(Client, arena.allocator(), "{}") orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("", window.address);
+    try testing.expectEqualStrings("", window.class);
 }
 
 test "monitors: rotation and scale give the usable area" {

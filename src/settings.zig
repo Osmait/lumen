@@ -131,6 +131,9 @@ pub const Settings = struct {
     open_with: std.array_hash_map.String([]const u8) = .empty,
     /// `key = value` lines this version does not know, kept as they were.
     unknown: std.ArrayList([]const u8) = .empty,
+    /// Sections this version does not know (`[name]` and the lines under
+    /// it), kept as they were: written back after `[open-with]`.
+    unknown_sections: std.ArrayList([]const u8) = .empty,
     /// Memory ran out while reading the file, or it was longer than what was
     /// read: some of it is missing here, so `save` refuses to write this
     /// back over it.
@@ -152,26 +155,34 @@ pub const Settings = struct {
     /// Settings from the text of a settings file.
     pub fn parse(gpa: std.mem.Allocator, text: []const u8) Settings {
         var settings = Settings.init(gpa);
-        var section_open_with = false;
+        var section: enum { top, open_with, other } = .top;
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |raw_line| {
             const line = withoutComment(std.mem.trim(u8, raw_line, " \t\r"));
             if (line.len == 0) continue;
             if (line[0] == '[') {
-                section_open_with = std.mem.eql(u8, line, open_with_section);
+                section = if (std.mem.eql(u8, line, open_with_section)) .open_with else .other;
+            }
+            // Another version's section: none of its keys are ours, but it
+            // survives a save.
+            if (section == .other) {
+                settings.keepLine(&settings.unknown_sections, line) catch {
+                    settings.incomplete = true;
+                };
                 continue;
             }
+            if (line[0] == '[') continue;
             const equals = std.mem.findScalar(u8, line, '=') orelse continue;
             const key = std.mem.trim(u8, line[0..equals], " \t");
             const value = std.mem.trim(u8, line[equals + 1 ..], " \t");
-            if (section_open_with) {
+            if (section == .open_with) {
                 settings.setOpenWith(key, value) catch |err| switch (err) {
                     // A bad line is ignored, like a bad value anywhere else.
                     error.BadKey, error.BadApp => {},
                     error.OutOfMemory => settings.incomplete = true,
                 };
             } else if (!settings.set(key, value) and isToken(key)) {
-                settings.keepUnknown(line) catch {
+                settings.keepLine(&settings.unknown, line) catch {
                     settings.incomplete = true;
                 };
             }
@@ -187,9 +198,13 @@ pub const Settings = struct {
         return std.mem.trimEnd(u8, line[0..comment], " \t");
     }
 
-    fn keepUnknown(settings: *Settings, line: []const u8) std.mem.Allocator.Error!void {
+    fn keepLine(
+        settings: *Settings,
+        lines: *std.ArrayList([]const u8),
+        line: []const u8,
+    ) std.mem.Allocator.Error!void {
         const arena = settings.allocator();
-        try settings.unknown.append(arena, try arena.dupe(u8, line));
+        try lines.append(arena, try arena.dupe(u8, line));
     }
 
     /// Sets a top-level key from its text value. False when the key is not
@@ -385,6 +400,7 @@ pub const Settings = struct {
         try writeKnown(writer, source);
         try settings.writeUnknown(writer);
         try settings.writeOpenWith(writer);
+        try settings.writeUnknownSections(writer);
     }
 
     /// The keys this version knows, with comments that say what each takes.
@@ -450,6 +466,17 @@ pub const Settings = struct {
         if (settings.unknown.items.len == 0) return;
         try writer.writeAll("\n# Not known to this version of Lumen\n");
         for (settings.unknown.items) |line| try writer.print("{s}\n", .{line});
+    }
+
+    /// The sections read that this version does not know, as they were.
+    fn writeUnknownSections(
+        settings: *const Settings,
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        for (settings.unknown_sections.items) |line| {
+            if (line[0] == '[') try writer.writeAll("\n");
+            try writer.print("{s}\n", .{line});
+        }
     }
 
     /// The `[open-with]` section: the app chosen for each kind or extension.
@@ -666,6 +693,32 @@ test "written settings read back the same, unknown keys kept" {
     try testing.expectEqualStrings("office.desktop", back.appFor(".csv", null).?);
     try testing.expectEqual(@as(usize, 1), back.unknown.items.len);
     try testing.expectEqualStrings("future_option = 42", back.unknown.items[0]);
+}
+
+test "unknown sections are not top-level keys, and survive a save" {
+    var settings = Settings.parse(testing.allocator,
+        \\editor = hx
+        \\[future]
+        \\editor = rm
+        \\theme = other
+        \\[open-with]
+        \\markdown = md.desktop
+    );
+    defer settings.deinit();
+    // The section's keys are not ours: they do not override the top level.
+    try testing.expectEqualStrings("hx", settings.editor);
+    try testing.expectEqualStrings(theme_default, settings.theme);
+    try testing.expectEqual(@as(usize, 0), settings.unknown.items.len);
+    try testing.expectEqualStrings("md.desktop", settings.appFor("", .markdown).?);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try settings.write(&out.writer);
+    var back = Settings.parse(testing.allocator, out.written());
+    defer back.deinit();
+    try testing.expectEqualStrings("hx", back.editor);
+    try testing.expectEqual(@as(usize, 3), back.unknown_sections.items.len);
+    try testing.expectEqualStrings("[future]", back.unknown_sections.items[0]);
+    try testing.expectEqualStrings("md.desktop", back.appFor("", .markdown).?);
 }
 
 test "open-with: extension beats kind, Markdown falls back to text" {

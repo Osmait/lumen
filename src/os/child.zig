@@ -96,6 +96,12 @@ pub fn run(
     errdefer pump.stdout.deinit(gpa);
     errdefer pump.stderr.deinit(gpa);
     const end = try pump.loop();
+    // Outputs closed with input still unwritten: a program that now waits
+    // for EOF on its stdin would otherwise hang until the deadline.
+    if (child.stdin) |stdin| {
+        stdin.close(io);
+        child.stdin = null;
+    }
 
     // Both outputs closed, but the program may live on (it closed them, or
     // a background child holds them): wait for its exit up to the deadline.
@@ -313,6 +319,24 @@ test "a program that closes its output but keeps running still times out" {
     var result = try run(testing.allocator, testing.io, argv, .{ .deadline_ns = deadline(150) });
     defer result.deinit(testing.allocator);
     try testing.expect(result.timed_out);
+}
+
+test "input left once the outputs close is ended, not held until the deadline" {
+    // More than a pipe holds, read only after both outputs are closed: it
+    // exits on EOF, which comes only if stdin is closed after the loop.
+    const big = try testing.allocator.alloc(u8, 1 << 20);
+    defer testing.allocator.free(big);
+    @memset(big, 'x');
+    const argv = &.{ "sh", "-c", "exec >&- 2>&-; sleep 0.2; cat >/dev/null" };
+    const start_ns = os.monotonicNs();
+    var result = try run(testing.allocator, testing.io, argv, .{
+        .stdin = .{ .bytes = big },
+        .deadline_ns = deadline(5000),
+    });
+    defer result.deinit(testing.allocator);
+    try testing.expect(!result.timed_out);
+    try testing.expectEqual(@as(?u8, 0), result.code);
+    try testing.expect(os.monotonicNs() - start_ns < 3 * std.time.ns_per_s);
 }
 
 test "a descriptor that cannot be made non-blocking is an error" {

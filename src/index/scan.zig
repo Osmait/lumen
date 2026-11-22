@@ -344,6 +344,14 @@ pub fn hiddenByName(name: []const u8) bool {
     return std.ascii.findIgnoreCase(name, hidden_word) != null;
 }
 
+/// Whether `path` ends in the whole components `tail`: "/x/a" ends in "a",
+/// "/x/ba" does not.
+fn endsWithComponents(path: []const u8, tail: []const u8) bool {
+    if (!std.mem.endsWith(u8, path, tail)) return false;
+    if (path.len == tail.len) return true;
+    return path[path.len - tail.len - 1] == '/';
+}
+
 /// Whether directory `name` in `parent` is opened, or only indexed: the
 /// `skip` rules, and caches marked by a CACHEDIR.TAG. The scan decides by
 /// it, and so does `Live` for a directory created after the scan.
@@ -354,7 +362,7 @@ pub fn shouldDescend(parent: []const u8, name: []const u8, config: *const Config
             const rule_name = rule[slash + 1 ..];
             const rule_parent = rule[0..slash];
             if (!std.mem.eql(u8, rule_name, name)) continue;
-            if (std.mem.endsWith(u8, parent, rule_parent)) return false;
+            if (endsWithComponents(parent, rule_parent)) return false;
         } else {
             if (std.mem.eql(u8, rule, name)) return false;
         }
@@ -459,6 +467,15 @@ test "scan: a root may be a link, nothing below one is followed" {
     defer unfollowed.deinit(testing.allocator);
     try testing.expectEqual(1, unfollowed.len());
     try testing.expectEqual(1, stats.errors);
+}
+
+test "skip rules with a parent match it as whole components" {
+    const config: Config = .{ .roots = &.{}, .skip = &.{"a/b"}, .cachedir_probe = &.{} };
+    try std.testing.expect(!shouldDescend("/x/a", "b", &config));
+    try std.testing.expect(!shouldDescend("a", "b", &config));
+    // Its parent only ends in the letter: not the rule's "a".
+    try std.testing.expect(shouldDescend("/x/ba", "b", &config));
+    try std.testing.expect(shouldDescend("/x/a", "c", &config));
 }
 
 test "scan: each folder's entries come sorted by name" {

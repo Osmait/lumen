@@ -116,8 +116,8 @@ fn isDirEntry(path: [:0]const u8, entry: DirIter.Entry) bool {
 }
 
 /// Makes `path` and the folders above it that are missing, owner-only
-/// (existing ones are untouched). Succeeds when `path` exists afterwards,
-/// made here or before.
+/// (existing ones are untouched). Succeeds when `path` is a folder
+/// afterwards, made here or before: an existing file there is an error.
 pub fn mkdirP(path: []const u8) Error!void {
     var prefix_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     if (path.len >= prefix_buffer.len) return error.NameTooLong;
@@ -132,7 +132,11 @@ pub fn mkdirP(path: []const u8) Error!void {
         prefix_buffer[end] = 0;
         const result = linux.mkdir(@ptrCast(&prefix_buffer), 0o700);
         if (end < path.len) continue;
-        if (linux.errno(result) == .EXIST) return;
+        if (linux.errno(result) == .EXIST) {
+            const existing = os.info(@ptrCast(&prefix_buffer)) orelse return error.Syscall;
+            if (!existing.is_dir) return error.Syscall;
+            return;
+        }
         _ = try check(result);
     }
 }
@@ -223,6 +227,8 @@ test "mkdirP makes the missing folders, and says when it could not" {
     var under_file_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const under_file = try std.mem.print(&under_file_buffer, "{s}/file/sub", .{dir});
     try std.testing.expectError(error.NotFound, mkdirP(under_file));
+    // The path itself is a file: not a folder made "before".
+    try std.testing.expectError(error.Syscall, mkdirP(file));
 }
 
 test "Lumen's files and directories are owner-only" {

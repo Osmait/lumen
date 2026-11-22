@@ -36,6 +36,8 @@ const Server = struct {
     handler: Handler = undefined,
     gpa: std.mem.Allocator = undefined,
     connections_open: usize = 0,
+    /// The connections open, so a shutdown can end them; null slots free.
+    connections: [connections_max]?*Connection = @splat(null),
 
     /// What brings the listening socket's watch back.
     const Accepting = union(enum) {
@@ -142,6 +144,18 @@ fn listenAt(socket_path: [:0]const u8) ListenError!linux.fd_t {
         log.warn("could not make {s} owner-only: {t}", .{ socket_path, errno });
     }
     return fd;
+}
+
+/// Stops listening (`stop`) and ends the connections still open: an answer
+/// not sent yet gets one last try, without waiting. Main thread only.
+pub fn shutdown() void {
+    stop();
+    for (server.connections) |slot| {
+        const connection = slot orelse continue;
+        if (connection.phase == .answer) connection.sendWithoutWaiting();
+        connection.close();
+    }
+    assert(server.connections_open == 0);
 }
 
 /// Closes the socket and removes its file; the connections still open end
@@ -274,6 +288,11 @@ const Connection = struct {
             return;
         };
         self.* = .{ .fd = fd };
+        // Accepting pauses at connections_max: a slot is always free.
+        const slot = for (&server.connections) |*slot| {
+            if (slot.* == null) break slot;
+        } else unreachable;
+        slot.* = self;
         server.connections_open += 1;
         assert(server.connections_open <= connections_max);
         self.watch = c.g_unix_fd_add(fd, c.G_IO_IN, &readableCallback, self);
@@ -287,6 +306,9 @@ const Connection = struct {
         if (self.timer != 0) _ = c.g_source_remove(self.timer);
         _ = linux.close(self.fd);
         self.bytes.deinit(server.gpa);
+        for (&server.connections) |*slot| {
+            if (slot.* == self) slot.* = null;
+        }
         server.gpa.destroy(self);
         assert(server.connections_open > 0);
         server.connections_open -= 1;
@@ -397,6 +419,18 @@ const Connection = struct {
         }
         assert(self.sent == self.bytes.items.len);
         self.close();
+    }
+
+    /// What of the answer the socket takes right now; the rest is dropped.
+    fn sendWithoutWaiting(self: *Connection) void {
+        while (self.sent < self.bytes.items.len) {
+            const bytes_sent = os.unix.send(self.fd, self.bytes.items[self.sent..]);
+            if (failed(bytes_sent)) |errno| switch (errno) {
+                .INTR => continue,
+                else => return,
+            };
+            self.sent += bytes_sent;
+        }
     }
 
     /// The client takes no more for now: `flush` again once it can. The
@@ -600,4 +634,28 @@ test "a large answer goes out as the client takes it, the main loop turning" {
     try testing.expect(longest_ns < 400 * std.time.ns_per_ms);
     _ = iterateUntil(&Done.closed);
     try testing.expectEqual(@as(usize, 0), server.connections_open);
+}
+
+test "shutdown ends the connections still open" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var socket_path_buffer: [256]u8 = undefined;
+    const socket_path = try testListen(&tmp_dir, &socket_path_buffer);
+    defer stop();
+
+    // Connected, silent: accepted by the main loop, then held open.
+    const silent = os.unix.connect(socket_path, .{}).?;
+    defer _ = linux.close(silent);
+    const deadline_ns = os.monotonicNs() + 2 * std.time.ns_per_s;
+    while (server.connections_open == 0 and os.monotonicNs() < deadline_ns) {
+        _ = c.g_main_context_iteration(null, 0);
+    }
+    try testing.expectEqual(@as(usize, 1), server.connections_open);
+    shutdown();
+    try testing.expectEqual(@as(usize, 0), server.connections_open);
+    try testing.expect(!server.listening());
+    // Its end of the socket is closed: the client reads the end of input.
+    var got: [8]u8 = undefined;
+    const bytes_read = try os.unix.readSome(silent, &got, os.monotonicNs() + std.time.ns_per_s);
+    try testing.expectEqual(@as(usize, 0), bytes_read);
 }

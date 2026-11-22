@@ -24,6 +24,7 @@ const ipc = @import("ipc.zig");
 const cli = @import("cli.zig");
 const ipc_server = @import("sys/ipc_server.zig");
 const proc = @import("sys/proc.zig");
+const hypr = @import("sys/hypr.zig");
 const os = @import("os");
 
 const version_line = std.fmt.comptimePrint("{s}\n", .{@import("build_options").version});
@@ -496,9 +497,12 @@ fn usage(reply: *const Reply) c_int {
 
 fn shutdownCallback(_: *c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
     daemon.shutting_down = true;
-    ipc_server.stop();
+    // The socket, and the clients still connected to it.
+    ipc_server.shutdown();
     if (daemon.clipboard_watcher.pid) |pid| _ = c.kill(pid, c.SIGTERM);
+    hypr.shutdown();
     const ui = readyUi() orelse return;
+    ui.removeSources();
     Ui.ext_view.shutdown(ui);
     // Saves what the index learned this session, so it is there tomorrow.
     if (ui.content_search) |content_search| {
@@ -513,6 +517,9 @@ fn shutdownCallback(_: *c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
         ui.files = null;
         file_service.shutdown();
     }
+    // Last: nothing above reads the history or the ranking any more.
+    ui.db.close();
+    daemon.ui = null;
 }
 
 /// Content results a query shows at most.

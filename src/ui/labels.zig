@@ -12,11 +12,20 @@ const widgets = @import("widgets.zig");
 /// `path` with the home folder as "~", fit for a label.
 pub fn homeRelative(arena: std.mem.Allocator, path: []const u8) [:0]const u8 {
     const home = std.mem.span(c.g_get_home_dir());
-    const shown = (if (std.mem.startsWith(u8, path, home))
-        arena.print("~{s}", .{path[home.len..]})
+    const shown = (if (belowHome(path, home)) |rest|
+        arena.print("~{s}", .{rest})
     else
         arena.dupe(u8, path)) catch return "";
     return displayText(arena, shown);
+}
+
+/// What follows `home` in `path` ("" or "/..."), when `path` is `home` or
+/// below it: "/home/user2" is not below "/home/user".
+fn belowHome(path: []const u8, home: []const u8) ?[]const u8 {
+    if (home.len == 0 or !std.mem.startsWith(u8, path, home)) return null;
+    const rest = path[home.len..];
+    if (rest.len > 0 and rest[0] != '/') return null;
+    return rest;
 }
 
 /// Text fit for a GtkLabel. Linux file names are bytes: they can hold invalid
@@ -259,6 +268,13 @@ pub fn firstLine(arena: std.mem.Allocator, text: []const u8) [:0]const u8 {
         return displayText(arena, core.utf8.validPrefix(title));
     }
     return "";
+}
+
+test "only paths at or below home are shown from ~" {
+    try std.testing.expectEqualStrings("", belowHome("/home/user", "/home/user").?);
+    try std.testing.expectEqualStrings("/a.txt", belowHome("/home/user/a.txt", "/home/user").?);
+    try std.testing.expect(belowHome("/home/user2/a.txt", "/home/user") == null);
+    try std.testing.expect(belowHome("/etc", "/home/user") == null);
 }
 
 test "displayText makes any file name safe for a label" {
