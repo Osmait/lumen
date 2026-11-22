@@ -116,9 +116,10 @@ const FolderEntries = struct {
 
 const files_per_directory = 40;
 
-/// ~1M entries: 26k directories over three levels, 40 files in each of the
-/// deepest, in the order the scanner leaves (level by level, each folder's
-/// names sorted: `Store` checks both).
+/// ~1.07M entries in the shape of a real home: 26k folders over three
+/// levels, each with 40 files next to its subfolders, so files sit at every
+/// depth. In the order the scanner leaves: level by level, each folder's
+/// names sorted (`Store` checks both).
 fn syntheticNames(gpa: std.mem.Allocator) !store_mod.Store {
     var prng = std.Random.DefaultPrng.init(1);
     const random = prng.random();
@@ -127,8 +128,11 @@ fn syntheticNames(gpa: std.mem.Allocator) !store_mod.Store {
     var level: std.ArrayList(u32) = .empty;
     defer level.deinit(gpa);
     try level.append(gpa, root);
-    for ([_]usize{ 30, 30, 28 }, 1..) |fan, depth| {
+    // Subfolders per folder at each depth; the deepest folders hold files only.
+    const fans = [_]usize{ 30, 30, 28, 0 };
+    for (fans, 1..) |fan, depth| {
         var next: std.ArrayList(u32) = .empty;
+        errdefer next.deinit(gpa);
         for (level.items) |parent| {
             var folder: FolderEntries = .{};
             for (0..fan) |i| folder.add(
@@ -136,28 +140,20 @@ fn syntheticNames(gpa: std.mem.Allocator) !store_mod.Store {
                 "{s}-{d}",
                 .{ words[random.uintLessThan(usize, words.len)], i },
             );
+            for (0..files_per_directory) |_| folder.add(false, "{s}_{s}{s}", .{
+                words[random.uintLessThan(usize, words.len)],
+                words[random.uintLessThan(usize, words.len)],
+                extensions[random.uintLessThan(usize, extensions.len)],
+            });
             for (folder.sorted()) |entry| {
-                const id = try builder.push(
-                    gpa,
-                    entry.name,
-                    parent,
-                    store_mod.flag_dir,
-                    @intCast(depth),
-                );
-                try next.append(gpa, id);
+                const folder_flags = store_mod.flag_dir | store_mod.flag_folder;
+                const flags: u8 = if (entry.is_dir) folder_flags else 0;
+                const id = try builder.push(gpa, entry.name, parent, flags, @intCast(depth));
+                if (entry.is_dir) try next.append(gpa, id);
             }
         }
         level.deinit(gpa);
         level = next;
-    }
-    for (level.items) |directory| {
-        var folder: FolderEntries = .{};
-        for (0..files_per_directory) |_| folder.add(false, "{s}_{s}{s}", .{
-            words[random.uintLessThan(usize, words.len)],
-            words[random.uintLessThan(usize, words.len)],
-            extensions[random.uintLessThan(usize, extensions.len)],
-        });
-        for (folder.sorted()) |entry| _ = try builder.push(gpa, entry.name, directory, 0, 4);
     }
     return builder.finish(gpa);
 }
