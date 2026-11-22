@@ -128,15 +128,7 @@ const cancel_poll_ms = 100;
 /// Whether the program exited before its deadline, looked at every
 /// `cancel_poll_ms` when it can be cancelled.
 fn waitExit(pid: linux.pid_t, options: *const Options) bool {
-    const cancel = options.cancel orelse return os.waitExit(pid, options.deadline_ns);
-    while (!cancel.load(.acquire)) {
-        const now_ns = os.monotonicNs();
-        if (now_ns >= options.deadline_ns) return false;
-        const slice_ns = cancel_poll_ms * std.time.ns_per_ms;
-        const slice_end_ns = @min(options.deadline_ns, now_ns + slice_ns);
-        if (os.waitExit(pid, slice_end_ns)) return true;
-    }
-    return false;
+    return os.waitExitCancelable(pid, options.deadline_ns, options.cancel, cancel_poll_ms);
 }
 
 /// A running program's pipes: stdin written and both outputs read in one

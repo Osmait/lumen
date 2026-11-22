@@ -71,28 +71,7 @@ pub fn open(path: [:0]const u8) Error!Db {
 /// earlier versions are fixed too. A file that cannot be made owner-only
 /// fails the open: copies would go on landing where others can read them.
 fn makePrivate(path: [:0]const u8) Error!void {
-    const linux = std.os.linux;
-    const open_result = linux.open(
-        path,
-        .{ .ACCMODE = .RDONLY, .CREAT = true, .CLOEXEC = true, .NONBLOCK = true, .NOCTTY = true },
-        0o600,
-    );
-    switch (linux.errno(open_result)) {
-        .SUCCESS => {},
-        else => |errno| {
-            log.warn("open {s}: {t}", .{ path, errno });
-            return error.DbOpen;
-        },
-    }
-    const fd: i32 = @intCast(open_result);
-    defer _ = linux.close(fd);
-    switch (linux.errno(linux.fchmod(fd, 0o600))) {
-        .SUCCESS => {},
-        else => |errno| {
-            log.warn("could not make {s} owner-only: {t}", .{ path, errno });
-            return error.DbOpen;
-        },
-    }
+    try makeRegularFilePrivate(path, true);
     for ([_][]const u8{ "-wal", "-shm" }) |suffix| {
         var side_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const side_path = std.mem.printSentinel(
@@ -101,14 +80,50 @@ fn makePrivate(path: [:0]const u8) Error!void {
             .{ path, suffix },
             0,
         ) catch continue;
-        switch (linux.errno(linux.chmod(side_path, 0o600))) {
-            // SQLite has not made it yet: it will, with the database's mode.
-            .SUCCESS, .NOENT => {},
-            else => |errno| {
-                log.warn("could not make {s} owner-only: {t}", .{ side_path, errno });
-                return error.DbOpen;
-            },
-        }
+        try makeRegularFilePrivate(side_path, false);
+    }
+}
+
+fn makeRegularFilePrivate(path: [:0]const u8, create: bool) Error!void {
+    const linux = std.os.linux;
+    const open_result = linux.open(
+        path,
+        .{
+            .ACCMODE = .RDONLY,
+            .CREAT = create,
+            .NOFOLLOW = true,
+            .CLOEXEC = true,
+            .NONBLOCK = true,
+            .NOCTTY = true,
+        },
+        0o600,
+    );
+    switch (linux.errno(open_result)) {
+        .SUCCESS => {},
+        // SQLite has not made -wal/-shm yet: it will, with the database's mode.
+        .NOENT => if (!create) return else {
+            log.warn("open {s}: NOENT", .{path});
+            return error.DbOpen;
+        },
+        else => |errno| {
+            log.warn("open {s}: {t}", .{ path, errno });
+            return error.DbOpen;
+        },
+    }
+    const fd: i32 = @intCast(open_result);
+    defer _ = linux.close(fd);
+    var stx: linux.Statx = undefined;
+    const stx_result = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stx);
+    if (linux.errno(stx_result) != .SUCCESS or stx.mode & linux.S.IFMT != linux.S.IFREG) {
+        log.warn("{s}: not a regular file", .{path});
+        return error.DbOpen;
+    }
+    switch (linux.errno(linux.fchmod(fd, 0o600))) {
+        .SUCCESS => {},
+        else => |errno| {
+            log.warn("could not make {s} owner-only: {t}", .{ path, errno });
+            return error.DbOpen;
+        },
     }
 }
 
@@ -236,18 +251,24 @@ pub fn pruneFrecency(db: *Db, now: i64) Error!void {
         const key = arena.dupe(u8, columnText(select_stmt, 0)) catch continue;
         stale.append(arena, key) catch continue;
     }
+    if (stale.items.len == 0) return;
+    _ = c.sqlite3_reset(select_stmt);
+    try db.exec("BEGIN IMMEDIATE");
+    errdefer _ = c.sqlite3_exec(db.handle, "ROLLBACK", null, null, null);
     for (stale.items) |key| {
         // reset only repeats the result of the last step, checked by run.
         _ = c.sqlite3_reset(delete_stmt);
         try db.bind(delete_stmt, .{key});
         try db.run(delete_stmt);
     }
+    try db.exec("COMMIT");
 }
 
-/// A use count read from the database. A count beyond u32 (a foreign or
-/// damaged file) saturates.
+/// A use count read from the database. Negative counts become 0 and counts
+/// beyond u32 saturate (a foreign or damaged file).
 fn columnCount(stmt: *c.sqlite3_stmt, column: c_int) u32 {
     const count = c.sqlite3_column_int64(stmt, column);
+    if (count <= 0) return 0;
     return std.math.cast(u32, count) orelse std.math.maxInt(u32);
 }
 
@@ -283,9 +304,11 @@ pub fn addClip(db: *Db, content: []const u8, now: i64, keep: u32) Error!void {
     if (content.len > clip_bytes_max) return;
     if (std.mem.trim(u8, content, " \t\r\n").len == 0) return;
     const hash: i64 = @bitCast(std.hash.Wyhash.hash(0, content));
+    try db.exec("BEGIN IMMEDIATE");
+    errdefer _ = c.sqlite3_exec(db.handle, "ROLLBACK", null, null, null);
     try db.execArgs(
         \\INSERT INTO clipboard (hash, content, created_at, last_copied) VALUES (?1, ?2, ?3, ?3)
-        \\ON CONFLICT(hash) DO UPDATE SET last_copied = ?3
+        \\ON CONFLICT(hash) DO UPDATE SET content = ?2, last_copied = ?3
     , .{ hash, content, now });
     // What is past the newest `keep`, found through the index (scanned
     // backwards: newest first, ties by id); NOT IN read the whole table.
@@ -293,22 +316,21 @@ pub fn addClip(db: *Db, content: []const u8, now: i64, keep: u32) Error!void {
         \\DELETE FROM clipboard WHERE id IN
         \\  (SELECT id FROM clipboard ORDER BY last_copied DESC, id DESC LIMIT -1 OFFSET ?1)
     , .{@max(keep, 1)});
+    try db.exec("COMMIT");
 }
 
 /// A clipboard entry's rowid, so it cannot be passed where a time (the
-/// other i64 these functions take) is meant. SQLite's rowids start at 1.
+/// other i64 these functions take) is meant. SQLite rowids are signed 64-bit
+/// integers (normally >= 1, though foreign/damaged rows may have any i64).
 pub const ClipId = enum(i64) {
     _,
 
     fn of(row: i64) ClipId {
-        assert(row > 0);
         return @fromBackingInt(row);
     }
 
     fn rowid(id: ClipId) i64 {
-        const value = @backingInt(id);
-        assert(value > 0);
-        return value;
+        return @backingInt(id);
     }
 };
 
@@ -502,4 +524,44 @@ test "a failed write is an error, not silence" {
     try db.addClip("secret", 1, Db.clip_entries_max);
     try std.testing.expectError(error.DbStep, db.deleteClip(.of(1)));
     try std.testing.expectError(error.DbExec, db.clearClips());
+    // Trimming failure rolls back the insert atomically.
+    try std.testing.expectError(error.DbStep, db.addClip("second", 2, 1));
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const clips = try db.recentClips(arena.allocator(), 10);
+    try std.testing.expectEqual(@as(usize, 1), clips.len);
+    try std.testing.expectEqualStrings("secret", clips[0].head);
+}
+
+test "damaged rows (negative count, non-positive clip id) and symlinks are handled safely" {
+    const linux = std.os.linux;
+    var db = try Db.open(Db.in_memory);
+    defer db.close();
+    try db.exec("INSERT INTO frecency (key, count, last_used) VALUES ('neg', -5, 100);");
+    try db.exec("INSERT INTO clipboard (id, hash, content, created_at, last_copied) VALUES (-1, 1, 'bad', 1, 1);");
+    try db.addClip("good", 2, Db.clip_entries_max);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const map = try db.loadFrecency(arena.allocator(), 100);
+    try std.testing.expectEqual(@as(f64, 0), map.get("neg").?);
+    const clips = try db.recentClips(arena.allocator(), 10);
+    try std.testing.expectEqual(@as(usize, 2), clips.len);
+    try std.testing.expectEqualStrings("good", clips[0].head);
+    try std.testing.expectEqualStrings("bad", clips[1].head);
+    try std.testing.expectEqualStrings("bad", (try db.clipContent(arena.allocator(), clips[1].id)).?);
+    try db.deleteClip(clips[1].id);
+
+    var test_dir: @import("os").TestDir = try .init();
+    defer test_dir.deinit();
+    var target_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var link_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    try test_dir.write("victim", "");
+    const target = try test_dir.path(&target_buf, "victim");
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(target, 0o644)));
+    const link = try test_dir.path(&link_buf, "lumen.db");
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.symlink(target, link)));
+    try std.testing.expectError(error.DbOpen, Db.open(link));
+    var stx: linux.Statx = undefined;
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(linux.AT.FDCWD, target, 0, .{ .MODE = true }, &stx)));
+    try std.testing.expectEqual(@as(u16, 0o644), stx.mode & 0o777);
 }

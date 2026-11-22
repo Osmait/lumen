@@ -10,12 +10,46 @@ const os = @import("root.zig");
 /// descriptor) it does not wait: false, so the caller kills it, and
 /// reaping a killed child cannot hang.
 pub fn waitExit(pid: linux.pid_t, deadline_ns: u64) bool {
+    return waitExitCancelable(pid, deadline_ns, null, 0);
+}
+
+/// Like `waitExit`, opening `pidfd_open` once and checking `cancel` every
+/// `poll_ms` ms when `cancel` is non-null. Returns false immediately if
+/// `pidfd_open` fails or `poll` errors, never busy-spinning.
+pub fn waitExitCancelable(
+    pid: linux.pid_t,
+    deadline_ns: u64,
+    cancel: ?*const std.atomic.Value(bool),
+    poll_ms: u64,
+) bool {
     const fd = linux.pidfd_open(pid, 0);
     if (linux.errno(fd) != .SUCCESS) return false;
     defer os.close(@intCast(fd));
-    const left_ns = deadline_ns -| os.monotonicNs();
-    const left_ms: i32 = @intCast(@min(left_ns / std.time.ns_per_ms, std.math.maxInt(i32)));
-    return waitReadable(@intCast(fd), left_ms);
+    const pidfd: i32 = @intCast(fd);
+    while (true) {
+        if (cancel) |flag| if (flag.load(.acquire)) return false;
+        const now_ns = os.monotonicNs();
+        if (now_ns >= deadline_ns) return false;
+        const left_ns = deadline_ns - now_ns;
+        const slice_ns = if (cancel != null and poll_ms > 0)
+            @min(left_ns, poll_ms * std.time.ns_per_ms)
+        else
+            left_ns;
+        const slice_ms: i32 = @intCast(@min(
+            (slice_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms,
+            std.math.maxInt(i32),
+        ));
+        var poll_fds = [1]linux.pollfd{.{ .fd = pidfd, .events = linux.POLL.IN, .revents = 0 }};
+        const ready_count = linux.poll(&poll_fds, 1, slice_ms);
+        switch (linux.errno(ready_count)) {
+            .SUCCESS => {
+                if (ready_count > 0) return true;
+                if (cancel == null) return false;
+            },
+            .INTR => continue,
+            else => return false,
+        }
+    }
 }
 
 /// Waits until `fd` is readable (true) or `wake` is written (false). Without
@@ -32,8 +66,37 @@ pub fn waitEvents(fd: i32, wake: ?i32) bool {
     return ready_count > 0 and poll_fds[0].revents & linux.POLL.IN != 0;
 }
 
+/// Waits until `fd` is readable (up to `timeout_ms`; negative waits forever),
+/// retrying on `EINTR` with the remaining timeout.
 pub fn waitReadable(fd: i32, timeout_ms: i32) bool {
-    var poll_fds = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
-    const ready_count = linux.poll(&poll_fds, 1, timeout_ms);
-    return linux.errno(ready_count) == .SUCCESS and ready_count > 0;
+    const deadline_ns: ?u64 = if (timeout_ms > 0)
+        os.monotonicNs() + @as(u64, @intCast(timeout_ms)) * std.time.ns_per_ms
+    else
+        null;
+    while (true) {
+        const left_ms: i32 = if (deadline_ns) |limit_ns| blk: {
+            const now_ns = os.monotonicNs();
+            if (now_ns >= limit_ns) return false;
+            const left_ns = limit_ns - now_ns;
+            break :blk @intCast(@min(
+                (left_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms,
+                std.math.maxInt(i32),
+            ));
+        } else timeout_ms;
+        var poll_fds = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+        const ready_count = linux.poll(&poll_fds, 1, left_ms);
+        switch (linux.errno(ready_count)) {
+            .SUCCESS => return ready_count > 0,
+            .INTR => continue,
+            else => return false,
+        }
+    }
+}
+
+test "waitExitCancelable returns immediately when pidfd_open fails" {
+    var cancel: std.atomic.Value(bool) = .init(false);
+    const start_ns = os.monotonicNs();
+    const ok = waitExitCancelable(-1, start_ns + 5 * std.time.ns_per_s, &cancel, 50);
+    try std.testing.expect(!ok);
+    try std.testing.expect(os.monotonicNs() - start_ns < std.time.ns_per_s);
 }

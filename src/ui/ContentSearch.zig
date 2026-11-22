@@ -33,6 +33,8 @@ on_result: Callback,
 context: ?*anyopaque,
 thread: std.Thread = undefined,
 lock: std.Io.Mutex = .init,
+delivery_lock: std.Io.Mutex = .init,
+pending_hops: ?*Hop = null,
 /// Bumped by every `submit`; the worker sleeps on it.
 generation: std.atomic.Value(u32) = .init(0),
 /// Set by `submit` (and `shutdown`), cleared by the worker when it takes
@@ -68,7 +70,13 @@ pub const Callback = *const fn (result: *Result, context: ?*anyopaque) void;
 
 pub const StartError = std.mem.Allocator.Error || std.Thread.SpawnError;
 
-const Hop = struct { content_search: *ContentSearch, result: *Result };
+const Hop = struct {
+    content_search: *ContentSearch,
+    result: *Result,
+    source_id: c_uint = 0,
+    prev: ?*Hop = null,
+    next: ?*Hop = null,
+};
 
 /// The part of `query` a search runs: whole UTF-8 characters, at most
 /// `query_bytes_max` bytes.
@@ -101,16 +109,35 @@ pub fn start(
     return content_search;
 }
 
-/// Stops and joins the worker. Call once the GTK main loop has stopped:
-/// a result still queued with g_idle_add would otherwise reach a freed
-/// `content_search`.
+/// Stops and joins the worker, and cancels any results still queued on
+/// the GTK main loop. Main thread only.
 pub fn shutdown(content_search: *ContentSearch) void {
     content_search.stop.store(true, .release);
     content_search.newer.store(true, .release);
     _ = content_search.generation.fetchAdd(1, .release);
     content_search.io.futexWake(u32, &content_search.generation.raw, 1);
     content_search.thread.join();
+    var cursor = content_search.pending_hops;
+    content_search.pending_hops = null;
+    while (cursor) |hop| {
+        const next = hop.next;
+        if (hop.source_id != 0) _ = c.g_source_remove(hop.source_id);
+        hop.result.destroy(content_search.gpa);
+        content_search.gpa.destroy(hop);
+        cursor = next;
+    }
     content_search.gpa.destroy(content_search);
+}
+
+fn unlinkHop(content_search: *ContentSearch, hop: *Hop) void {
+    if (hop.prev) |prev| {
+        prev.next = hop.next;
+    } else if (content_search.pending_hops == hop) {
+        content_search.pending_hops = hop.next;
+    }
+    if (hop.next) |next| next.prev = hop.prev;
+    hop.prev = null;
+    hop.next = null;
 }
 
 /// Asks for `clip(query)`; returns its generation. Results of older
@@ -184,8 +211,8 @@ fn run(content_search: *ContentSearch) void {
         }
         result.search_ns = os.monotonicNs() - now_ns;
         result.hits = hits.items;
-        // A newer query arrived meanwhile: this answer is already stale.
-        if (content_search.generation.load(.acquire) != seen) {
+        // A newer query arrived meanwhile, or shutdown began: drop it.
+        if (content_search.stop.load(.acquire) or content_search.generation.load(.acquire) != seen) {
             result.destroy(content_search.gpa);
             continue;
         }
@@ -194,13 +221,41 @@ fn run(content_search: *ContentSearch) void {
             continue;
         };
         hop.* = .{ .content_search = content_search, .result = result };
-        _ = c.g_idle_add(&deliver, hop);
+        content_search.delivery_lock.lockUncancelable(content_search.io);
+        if (content_search.stop.load(.acquire)) {
+            content_search.delivery_lock.unlock(content_search.io);
+            result.destroy(content_search.gpa);
+            content_search.gpa.destroy(hop);
+            return;
+        }
+        hop.next = content_search.pending_hops;
+        if (content_search.pending_hops) |head| head.prev = hop;
+        content_search.pending_hops = hop;
+        const source_id = c.g_idle_add(&deliver, hop);
+        hop.source_id = source_id;
+        if (source_id == 0) {
+            content_search.unlinkHop(hop);
+            content_search.delivery_lock.unlock(content_search.io);
+            result.destroy(content_search.gpa);
+            content_search.gpa.destroy(hop);
+            continue;
+        }
+        content_search.delivery_lock.unlock(content_search.io);
     }
 }
 
 fn deliver(data: ?*anyopaque) callconv(.c) c.gboolean {
     const hop: *Hop = @ptrCast(@alignCast(data.?));
-    defer hop.content_search.gpa.destroy(hop);
-    hop.content_search.on_result(hop.result, hop.content_search.context);
+    const content_search = hop.content_search;
+    content_search.delivery_lock.lockUncancelable(content_search.io);
+    content_search.unlinkHop(hop);
+    const stopped = content_search.stop.load(.acquire);
+    content_search.delivery_lock.unlock(content_search.io);
+    defer content_search.gpa.destroy(hop);
+    if (stopped) {
+        hop.result.destroy(content_search.gpa);
+        return 0;
+    }
+    content_search.on_result(hop.result, content_search.context);
     return 0;
 }

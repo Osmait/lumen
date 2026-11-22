@@ -1169,21 +1169,19 @@ test "content service: a cache it cannot write still serves from memory, and sav
     try fixture.init();
     defer fixture.deinit();
     try fixture.root.write("a.txt", "an unwritable cache lemur\n");
-    // A directory where the index's temporary file goes: writing it fails.
-    var blocker_buffer: paths.Buffer = undefined;
-    const blocker = try fixture.cache.path(&blocker_buffer, "content.idx.tmp");
-    try testing.expect(linux.errno(linux.mkdir(blocker, 0o700)) == .SUCCESS);
+    // A directory where the index file goes: renaming the temporary onto it fails.
+    var saved_buffer: paths.Buffer = undefined;
+    const saved = try fixture.cache.path(&saved_buffer, "content.idx");
+    try testing.expect(linux.errno(linux.mkdir(saved, 0o700)) == .SUCCESS);
     const service = try fixture.start();
     defer service.shutdown();
     try waitChecks(service, 1);
     try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "lemur")).len);
-    var saved_buffer: paths.Buffer = undefined;
-    const saved = try fixture.cache.path(&saved_buffer, "content.idx");
-    try testing.expect(!sys.exists(saved));
+    try testing.expect(!sys.isRegular(saved));
     // Writable again: the next check saves it, though nothing changed.
-    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.rmdir(blocker)));
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.rmdir(saved)));
     try pokeAndWait(service);
-    try testing.expect(sys.exists(saved));
+    try testing.expect(sys.isRegular(saved));
     try testing.expectEqual(@as(u32, 1), service.status().builds);
 }
 

@@ -71,6 +71,7 @@ pub const monotonicNs = time.monotonicNs;
 pub const sleepUs = time.sleepUs;
 
 pub const waitExit = wait.waitExit;
+pub const waitExitCancelable = wait.waitExitCancelable;
 pub const waitEvents = wait.waitEvents;
 pub const waitReadable = wait.waitReadable;
 
