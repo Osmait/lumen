@@ -79,6 +79,12 @@ const Batch = struct {
     ends: std.ArrayList(u32) = .empty,
     flags: std.ArrayList(u8) = .empty,
     errors: u64 = 0,
+    /// Memory ran out while reading or sorting it: part of the folder is
+    /// missing, so the whole scan fails (`scan` returns OutOfMemory) rather
+    /// than index it as if that were all.
+    out_of_memory: bool = false,
+    /// Stopped at `Config.entries_max` entries: the scan is truncated.
+    over_cap: bool = false,
 
     fn deinit(batch: *Batch, gpa: std.mem.Allocator) void {
         batch.names.deinit(gpa);
@@ -170,6 +176,11 @@ pub fn scan(
         }
         const batches = try readLevel(gpa, pool, config, frontier.items, follow);
         defer freeBatches(gpa, batches);
+        for (batches) |batch| {
+            // A folder read in part must not pass for the whole of it.
+            if (batch.out_of_memory) return error.OutOfMemory;
+            if (batch.over_cap) totals.truncated = true;
+        }
 
         var next: std.ArrayList(Frontier) = .empty;
         errdefer freeFrontier(gpa, &next);
@@ -177,7 +188,7 @@ pub fn scan(
         try addLevel(gpa, &builder, frontier.items, batches, level, &next, &totals);
         freeFrontier(gpa, &frontier);
         frontier = next;
-        if (builder.len() > config.entries_max) {
+        if (totals.truncated or builder.len() > config.entries_max) {
             totals.truncated = true;
             break;
         }
@@ -245,13 +256,14 @@ fn freeBatches(gpa: std.mem.Allocator, batches: []Batch) void {
 fn readLevelCallback(context: *LevelContext, i: usize) void {
     const batch = &context.batches[i];
     const follow = context.follow;
-    readDir(context.gpa, context.frontier[i].path, context.config, follow, batch) catch {
+    readDir(context.gpa, context.frontier[i].path, context.config, follow, batch) catch |err| {
         batch.errors += 1;
+        if (err == error.OutOfMemory) batch.out_of_memory = true;
     };
     sortBatch(context.gpa, batch) catch {
         // Unsorted, `Store.findChild` would miss names: nothing at all.
         batch.deinit(context.gpa);
-        batch.* = .{ .errors = batch.errors + 1 };
+        batch.* = .{ .errors = batch.errors + 1, .out_of_memory = true };
     };
 }
 
@@ -310,6 +322,12 @@ fn readDir(
     defer sys.close(fd);
     var entries: sys.DirIter = .{ .fd = fd };
     while (try entries.next()) |entry| {
+        // One folder of millions was read whole before the scan's cap was
+        // looked at, after the level.
+        if (batch.ends.items.len >= config.entries_max) {
+            batch.over_cap = true;
+            return;
+        }
         var kind = entry.kind;
         if (kind == sys.Kind.unknown) {
             var full_path_buffer: paths.Buffer = undefined;
@@ -330,9 +348,13 @@ fn readDir(
         // A skipped directory is still indexed (searchable), just not opened.
         const descend = kind == sys.Kind.directory and shouldDescend(path, entry.name, config);
         if (descend) flags |= store_mod.flag_dir;
-        try batch.names.appendSlice(gpa, entry.name);
-        try batch.ends.append(gpa, @intCast(batch.names.items.len));
-        try batch.flags.append(gpa, flags);
+        // All three or none: `ends` and `flags` are read in step.
+        try batch.names.ensureUnusedCapacity(gpa, entry.name.len);
+        try batch.ends.ensureUnusedCapacity(gpa, 1);
+        try batch.flags.ensureUnusedCapacity(gpa, 1);
+        batch.names.appendSliceAssumeCapacity(entry.name);
+        batch.ends.appendAssumeCapacity(@intCast(batch.names.items.len));
+        batch.flags.appendAssumeCapacity(flags);
     }
 }
 
@@ -544,4 +566,17 @@ test "scan: stops past entries_max and says so" {
     defer all.deinit(testing.allocator);
     try testing.expect(!all_stats.truncated);
     try testing.expectEqual(1, ScanTree.named(&all, "deep.txt"));
+}
+
+test "scan: one folder over entries_max stops being read at the cap" {
+    var tree = try ScanTree.init();
+    defer tree.temporary.cleanup();
+    var name_buffer: [32]u8 = undefined;
+    for (0..40) |i| tree.file(try std.mem.print(&name_buffer, "r/many/f{d}.txt", .{i}));
+    var stats: Stats = .{};
+    var store = try tree.scanOf("r", .{ .roots = &.{}, .entries_max = 10 }, &stats);
+    defer store.deinit(testing.allocator);
+    try testing.expect(stats.truncated);
+    // Not the 40 files: the folder stopped at the cap.
+    try testing.expect(store.len() <= 1 + 1 + 10);
 }

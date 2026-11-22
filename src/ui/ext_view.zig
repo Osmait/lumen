@@ -155,7 +155,7 @@ fn rootCallback(answer: *Host.RootResult, context: ?*anyopaque) void {
         if (registry.command(section.command)) |section_command| item.icon = section_command.icon;
     };
     const latest = ui.ext_root_search.latest;
-    const typed: ?[]const u8 = if (ui.view == .root) std.mem.trim(u8, ui.query(), " ") else null;
+    const typed: ?[]const u8 = if (ui.view == .root) Host.clipQuery(std.mem.trim(u8, ui.query(), " ")) else null;
     const latest_query = if (latest) |latest_answer| latest_answer.query else null;
     const decision = rootAnswer(typed, latest_query, answer.query, answer.sections.len > 0);
     switch (decision) {
@@ -208,7 +208,9 @@ const root_query_bytes_min = 2;
 
 /// Extension rows for the root search `query`: shown when they answer it,
 /// asked for otherwise (they arrive with rootCallback).
-pub fn addRootSections(ui: *Ui, query: []const u8) void {
+pub fn addRootSections(ui: *Ui, query_typed: []const u8) void {
+    // As the answer carries it: longer, it never matched and was asked again.
+    const query = Host.clipQuery(query_typed);
     const registry = ui.ext_registry orelse return;
     const host = ui.ext_host orelse return;
     var any = false;
@@ -441,7 +443,8 @@ pub fn enter(ui: *Ui) void {
 /// rows on screen are the last answer's and stay as they are (rebuilding
 /// them cost a frame per keystroke; `listCallback` rebuilds when it comes).
 /// True when the request is made and nothing else is to be done.
-pub fn waitingForSearch(ui: *Ui, query: []const u8) bool {
+pub fn waitingForSearch(ui: *Ui, query_typed: []const u8) bool {
+    const query = Host.clipQuery(query_typed);
     const open_command = command(ui) orelse return false;
     if (open_command.mode != .search) return false;
     if (!ui.ext_list.showingLatest()) return false;
@@ -454,7 +457,10 @@ pub fn waitingForSearch(ui: *Ui, query: []const u8) bool {
 /// On each refresh: search commands ask for the query typed, unless it is
 /// already answered or on its way. True when the rows are local (filtered
 /// by Lumen).
-pub fn prepare(ui: *Ui, query: []const u8) bool {
+pub fn prepare(ui: *Ui, query_typed: []const u8) bool {
+    // As the answer carries it: past 1 KB the answer never matched the
+    // query typed, and each one asked again, for ever.
+    const query = Host.clipQuery(query_typed);
     const open_command = command(ui) orelse return true;
     if (open_command.mode != .search) return true;
     const answered = if (ui.ext_list.latest) |result|

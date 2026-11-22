@@ -580,11 +580,43 @@ pub fn copy(text: []const u8) void {
 }
 
 /// Copies, then sends Ctrl+V to whatever gets focus once the window hides:
-/// as soon as Hyprland says the focus moved (~2 ms), else after
-/// `paste_focus_wait_ms`.
+/// once both the focus is back (Hyprland says so, ~2 ms, else after
+/// `paste_focus_wait_ms`) and wl-copy owns the selection (it exits then).
+/// Sent on the focus alone, a busy machine pasted the previous clipboard.
 pub fn pasteText(text: []const u8) void {
-    copy(text);
-    hypr.afterFocusChange(&pasteNow, paste_focus_wait_ms);
+    paste_wait = .{ .generation = paste_wait.generation +% 1 };
+    proc.pipeToThen(&.{"wl-copy"}, text, .{
+        .callback = &pasteCopied,
+        .context = paste_wait.generation,
+    });
+    hypr.afterFocusChange(&pasteFocused, paste_focus_wait_ms);
+}
+
+/// The paste in progress: what it still waits for. Main thread only.
+const PasteWait = struct {
+    /// Bumped by each paste: a copy that finishes for an older one does
+    /// not count for this one.
+    generation: usize = 0,
+    copied: bool = false,
+    focused: bool = false,
+};
+var paste_wait: PasteWait = .{};
+
+fn pasteCopied(generation: usize, ok: bool) void {
+    if (generation != paste_wait.generation) return;
+    // Not copied: Ctrl+V would paste something else.
+    if (!ok) {
+        log.warn("paste: wl-copy failed, nothing pasted", .{});
+        paste_wait.focused = false;
+        return;
+    }
+    paste_wait.copied = true;
+    if (paste_wait.focused) pasteNow();
+}
+
+fn pasteFocused() void {
+    paste_wait.focused = true;
+    if (paste_wait.copied) pasteNow();
 }
 
 /// How much Volume Up and Down change the volume, and how loud Volume Up
@@ -597,6 +629,8 @@ const paste_focus_wait_ms = 120;
 const active_window_answer_bytes_max = 64 * 1024;
 
 fn pasteNow() void {
+    paste_wait.copied = false;
+    paste_wait.focused = false;
     sendPaste();
 }
 

@@ -246,6 +246,15 @@ pub fn start(
     return host;
 }
 
+/// The part of `query` a list or root search request runs, and its answer
+/// carries: whole UTF-8 characters, `requests.query_bytes_max` bytes at
+/// most. The window compares queries cut the same way.
+pub const query_bytes_max = requests.query_bytes_max;
+
+pub fn clipQuery(query: []const u8) []const u8 {
+    return query[0..core.utf8.floorBoundary(query, query_bytes_max)];
+}
+
 /// How long `shutdown` waits for the worker to return. Lua stops at its
 /// deadline, but a call into C that never returns (a library of an
 /// extension's own, a blocking read the sandbox missed) must not keep the
@@ -826,6 +835,17 @@ test "extensions load, list, search and run actions" {
     try testing.expect(echo.error_message == null);
     try testing.expectEqualStrings("you typed it's \"quoted\"", echo.items[0].title);
 
+    // A query past the cap: the answer carries it cut as `clipQuery` cuts
+    // it (the window compares the two), never inside a character.
+    var long_query: [query_bytes_max + 100]u8 = undefined;
+    @memset(&long_query, 'a');
+    @memcpy(long_query[query_bytes_max - 1 ..][0..2], "é");
+    _ = host.list(registry.generation, .from(2), &long_query);
+    const long_echo = try probe.take("list");
+    defer long_echo.destroy(testing.allocator);
+    try testing.expectEqualStrings(clipQuery(&long_query), long_echo.query);
+    try testing.expectEqual(@as(usize, query_bytes_max - 1), long_echo.query.len);
+
     // A run command's return value.
     _ = host.act(registry.generation, .from(0), .command_run);
     const hello = try probe.take("act");
@@ -898,6 +918,17 @@ test "errors in extensions come back as messages" {
     try writeTestFile(folder, "extensions/keys/init.lua", "lumen.keymap('g', 'x.y')");
     try writeTestFile(folder, "extensions/sets/init.lua", "lumen.set { widht = 'wide' }");
     try writeTestFile(folder, "extensions/lay/init.lua", "lumen.layout { panels = 'triple' }");
+    // init.lua may call them: their own errors, checked here (a failed
+    // assert would be a sixth problem).
+    try writeTestFile(folder, "init.lua",
+        \\local function fails(f, needle, ...)
+        \\  local ok, why = pcall(f, ...)
+        \\  assert(not ok and why:find(needle, 1, true), why)
+        \\end
+        \\fails(lumen.keymap, "needs ctrl", "g", "x.y")
+        \\fails(lumen.set, 'no setting named "widht"', { widht = "wide" })
+        \\fails(lumen.layout, "bad value for panels", { panels = "triple" })
+    );
 
     var probe: Probe = .{};
     defer probe.deinit();
@@ -913,9 +944,10 @@ test "errors in extensions come back as messages" {
     // file with a syntax error.
     const messages_expected = std.StaticStringMap([]const u8).initComptime(.{
         .{ "Bad Name", "folder names" },
-        .{ "keys", "needs ctrl" },
-        .{ "sets", "no setting named \"widht\"" },
-        .{ "lay", "bad value for panels" },
+        // Lumen's settings, keys and look are init.lua's (and a style's).
+        .{ "keys", "lumen.keymap works only in init.lua" },
+        .{ "sets", "lumen.set works only in init.lua or a style" },
+        .{ "lay", "lumen.layout works only in init.lua or a style" },
     });
     for (registry.problems) |problem_reported| {
         const message_expected = messages_expected.get(problem_reported.extension) orelse

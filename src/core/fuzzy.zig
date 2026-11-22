@@ -121,35 +121,77 @@ fn scoreSubstring(
     return result;
 }
 
+/// The best fuzzy alignment of `query` in `text`: every letter at a word
+/// start or right after the previous one (a run), scored as `Score` says.
+/// Taking each letter at its first such place missed matches: "ted" in
+/// "Text Editor" took the "e" of "Text" and found no "d" after it.
+///
+/// Dynamic programming over (query letter, text position), one row per
+/// letter: `previous[j]` is the best score with the previous letter at `j`.
+/// A gap costs `min(distance, fuzzy_gap_penalty_max)`, so only the last
+/// `fuzzy_gap_penalty_max` positions need looking at one by one; anything
+/// further costs the same, and its best is kept as it goes (`far_best`).
 fn scoreFuzzy(text: []const u8, upper: []const bool, query: []const u8) i32 {
-    var result: i32 = 0;
-    var query_index: usize = 0;
-    var previous_match: ?usize = null;
-    var first_match: ?usize = null;
-    for (text, 0..) |char, text_index| {
-        if (query_index == query.len) break;
-        if (char != query[query_index]) continue;
-        // Letters out of the blue (not a word start, not continuing a run)
-        // are what make fuzzy matching noisy; skip them.
-        const boundary = isBoundary(text, upper, text_index);
-        const run = previous_match != null and previous_match.? + 1 == text_index;
-        if (!run and !boundary) continue;
-        if (first_match == null) first_match = text_index;
-        result += Score.fuzzy_letter;
-        if (boundary) result += Score.fuzzy_boundary_bonus;
-        if (previous_match) |previous| {
-            if (run) {
-                result += Score.fuzzy_run_bonus;
-            } else {
-                result -= @intCast(@min(text_index - previous, Score.fuzzy_gap_penalty_max));
-            }
-        }
-        previous_match = text_index;
-        query_index += 1;
+    assert(query.len > 0);
+    assert(text.len <= text_chars_max);
+    // Most texts do not even hold the letters in order: one pass says so.
+    if (!isSubsequence(query, text)) return no_match;
+    const unreached = no_match;
+    var rows: [2][text_chars_max]i32 = undefined;
+    var previous = &rows[0];
+    var current = &rows[1];
+    for (text, 0..) |char, k| {
+        previous[k] = unreached;
+        if (char != query[0] or !isBoundary(text, upper, k)) continue;
+        const first_penalty: i32 = @intCast(@min(k, Score.fuzzy_first_penalty_max));
+        previous[k] = Score.fuzzy_letter + Score.fuzzy_boundary_bonus - first_penalty;
     }
-    if (query_index < query.len) return no_match;
-    result -= @intCast(@min(first_match.?, Score.fuzzy_first_penalty_max));
+    const gap_max = Score.fuzzy_gap_penalty_max;
+    for (query[1..]) |letter| {
+        var far_best: i32 = unreached;
+        var reached = false;
+        for (text, 0..) |char, k| {
+            // `j = k - gap_max` joins the positions whose gap costs the most.
+            if (k >= gap_max) far_best = @max(far_best, previous[k - gap_max]);
+            current[k] = unreached;
+            if (char != letter) continue;
+            var best: i32 = unreached;
+            if (k > 0 and previous[k - 1] != unreached) {
+                best = previous[k - 1] + Score.fuzzy_run_bonus;
+            }
+            const boundary = isBoundary(text, upper, k);
+            if (boundary) {
+                if (far_best != unreached) best = @max(best, far_best - gap_max);
+                // Gaps of 2 to gap_max - 1 (a gap of 1 is a run).
+                var distance: usize = 2;
+                while (distance < gap_max and distance <= k) : (distance += 1) {
+                    const before = previous[k - distance];
+                    if (before == unreached) continue;
+                    best = @max(best, before - @as(i32, @intCast(distance)));
+                }
+            }
+            if (best == unreached) continue;
+            const boundary_bonus: i32 = if (boundary) Score.fuzzy_boundary_bonus else 0;
+            current[k] = best + Score.fuzzy_letter + boundary_bonus;
+            reached = true;
+        }
+        // No place for this letter: none for the ones after it either.
+        if (!reached) return no_match;
+        std.mem.swap(*[text_chars_max]i32, &previous, &current);
+    }
+    var result: i32 = unreached;
+    for (previous[0..text.len]) |score_at| result = @max(result, score_at);
     return result;
+}
+
+/// Whether the letters of `query` appear in `text` in order.
+fn isSubsequence(query: []const u8, text: []const u8) bool {
+    var query_index: usize = 0;
+    for (text) |char| {
+        if (query_index == query.len) break;
+        if (char == query[query_index]) query_index += 1;
+    }
+    return query_index == query.len;
 }
 
 /// Best score over several fields (title, keywords, subtitle). Later fields
@@ -206,6 +248,13 @@ test "a substring outranks a fuzzy match up to the documented query length" {
     const substring_far = score(short, &far_text);
     const fuzzy_best = score(short, words);
     try std.testing.expect(substring_far > fuzzy_best);
+}
+
+test "fuzzy finds the best alignment, not the first" {
+    // The "e" of "Text" is a run but leaves no "d" after it; the one of
+    // "Editor" does.
+    try std.testing.expect(score("ted", "Text Editor") > 0);
+    try std.testing.expect(score("abc", "a_xb ab_c") > 0);
 }
 
 test "letters inside a word only match as a run" {

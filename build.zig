@@ -155,6 +155,8 @@ fn cLibraries(
     // builds against the system's Lua as well as the bundled one.
     const lua_flags = [_][]const u8{"-DLUA_COMPAT_5_3"};
     libraries.lua.addCSourceFile(.{ .file = b.path("src/luart/lstrmatch.c"), .flags = &lua_flags });
+    // io.open and io.tmpfile: close-on-exec, and counted per state.
+    libraries.lua.addCSourceFile(.{ .file = b.path("src/luart/lfiles.c"), .flags = &lua_flags });
     if (system_libraries) return libraries;
 
     const sqlite_source = b.dependency("sqlite", .{});

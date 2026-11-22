@@ -105,7 +105,10 @@ pub const css_class = struct {
 
 /// Icons decoded from files, and grid pictures, kept for the next build:
 /// the same few show again and again.
-const file_icon_cache_entries = 128;
+/// More than the rows a list shows (dmenu's 500 unfiltered): a ring
+/// smaller than one build's icons replaced every one of them, in order, and
+/// never served a single one.
+const file_icon_cache_entries = 512;
 const grid_picture_cache_entries = 128;
 /// A row's title and subtitle ask GTK for at most this many characters of
 /// width. The layer surface grows to its content's natural width, so an
@@ -201,20 +204,72 @@ pub const RowLook = struct {
     parts: layout_mod.Parts(layout_mod.RowPart) = .{},
 };
 
-/// An image file as an icon, decoded at twice `size_px` (sharp on HiDPI) and
-/// kept until the file changes: the same few icons show again and again.
-/// Decoded on the UI thread, so within the small `pictures.icon_limits`.
-fn fileTexture(path: [:0]const u8, size_px: c_int) ?*c.GdkTexture {
-    const Cache = struct {
-        var ring: TextureRing(file_icon_cache_entries, u64) = .{};
-    };
-    const key = fileKey(path.ptr, size_px * 2, size_px * 2) orelse return null;
-    if (Cache.ring.get(key)) |texture| return texture;
-    const decoded = pictures.decodeImage(path.ptr, size_px * 2, size_px * 2, pictures.icon_limits);
-    defer if (decoded) |pixbuf| c.g_object_unref(pixbuf);
-    const texture = if (decoded) |pixbuf| c.gdk_texture_new_for_pixbuf(pixbuf) else null;
-    Cache.ring.put(key, texture);
-    return texture;
+/// Image files as row icons, decoded at twice their size (sharp on HiDPI)
+/// on the pictures worker (`pictures.icon_lane`) and kept until the file
+/// changes. Decoded on the UI thread, a picker of wallpapers read and
+/// decoded every one of its rows' files on every keystroke.
+const RowIcons = struct {
+    var ring: TextureRing(file_icon_cache_entries, u64) = .{};
+
+    /// A row's icon waiting for its picture; its widgets are referenced
+    /// until then.
+    const Wait = struct { key: u64, size_px: c_int, holder: *c.GtkBox, placeholder: *c.GtkWidget };
+
+    /// The icon for the image at `path`: from the ring, or a placeholder in
+    /// a box that the picture replaces once decoded.
+    fn widget(look: *const RowLook, path: [:0]const u8, size_px: c_int) *c.GtkWidget {
+        const decode_px = size_px * 2;
+        const key = fileKey(path.ptr, decode_px, decode_px) orelse return iconWidget(look, .none, size_px);
+        if (ring.get(key)) |cached| {
+            const texture = cached orelse return iconWidget(look, .none, size_px);
+            return image(texture, size_px);
+        }
+        const holder = hbox(0);
+        gtk.setValign(holder, c.GTK_ALIGN_CENTER);
+        const placeholder = iconWidget(look, .none, size_px);
+        gtk.append(holder, placeholder);
+        const wait = std.heap.c_allocator.create(Wait) catch return gtk.widget(holder);
+        // Not in a row yet: its reference is still floating (see GridPictures).
+        _ = c.g_object_ref_sink(holder);
+        _ = c.g_object_ref(placeholder);
+        wait.* = .{ .key = key, .size_px = size_px, .holder = holder, .placeholder = placeholder };
+        const lane = &pictures.icon_lane;
+        pictures.requestPicture(path, decode_px, decode_px, lane, .back, &requestCallback, wait);
+        return gtk.widget(holder);
+    }
+
+    fn image(texture: *c.GdkTexture, size_px: c_int) *c.GtkWidget {
+        const picture = gtk.imageFromPaintable(texture);
+        c.gtk_image_set_pixel_size(picture, size_px);
+        gtk.addClass(picture, "file-icon");
+        gtk.setValign(picture, c.GTK_ALIGN_CENTER);
+        return gtk.widget(picture);
+    }
+
+    fn requestCallback(context: ?*anyopaque, decoded: ?*c.GdkPixbuf, current: bool) void {
+        const wait: *Wait = @ptrCast(@alignCast(context.?));
+        defer {
+            c.g_object_unref(wait.holder);
+            c.g_object_unref(wait.placeholder);
+            std.heap.c_allocator.destroy(wait);
+        }
+        // Dropped for a newer build before it was decoded: nothing learnt.
+        if (decoded == null and !current) return;
+        const texture_or_none = if (decoded) |pixbuf| c.gdk_texture_new_for_pixbuf(pixbuf) else null;
+        ring.put(wait.key, texture_or_none);
+        // The row may be gone (another keystroke): the next build finds the
+        // picture in the ring.
+        const texture = texture_or_none orelse return;
+        if (c.gtk_widget_get_parent(wait.placeholder) != gtk.widget(wait.holder)) return;
+        c.gtk_box_remove(wait.holder, wait.placeholder);
+        gtk.append(wait.holder, image(texture, wait.size_px));
+    }
+};
+
+/// The rows are being built again: their icons asked for and not decoded
+/// yet are not wanted any more.
+pub fn forgetRowIcons() void {
+    pictures.icon_lane.forget();
 }
 
 /// Icon, title over subtitle, accessory, and the hidden hint that shows
@@ -449,16 +504,7 @@ pub fn iconWidget(look: *const RowLook, icon: item_mod.Icon, size_px: c_int) *c.
             return gtk.widget(image);
         },
         .badge => |badge| return badgeIcon(badge),
-        .file => |path| {
-            const texture = fileTexture(path, size_px) orelse {
-                return iconWidget(look, .none, size_px);
-            };
-            const image = gtk.imageFromPaintable(texture);
-            c.gtk_image_set_pixel_size(image, size_px);
-            gtk.addClass(image, "file-icon");
-            gtk.setValign(image, c.GTK_ALIGN_CENTER);
-            return gtk.widget(image);
-        },
+        .file => |path| return RowIcons.widget(look, path, size_px),
         .none => {
             const image = gtk.imageFromIconName("application-x-executable");
             c.gtk_image_set_pixel_size(image, size_px);

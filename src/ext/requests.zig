@@ -41,8 +41,9 @@ const Outcome = Host.Outcome;
 const list_budget_ns = 10 * std.time.ns_per_s;
 const act_budget_ns = 30 * std.time.ns_per_s;
 const root_search_budget_ns = 3 * std.time.ns_per_s;
-/// The most of a query a search command or a root search gets.
-const query_bytes_max = 1024;
+/// The most of a query a search command or a root search gets: what the
+/// answer's `query` holds (`Host.clipQuery`).
+pub const query_bytes_max = 1024;
 
 /// What one answer's rows take in all. They are copied out of the state, so
 /// its memory cap does not hold them: one string that 1000 rows refer to

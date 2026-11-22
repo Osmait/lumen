@@ -8,6 +8,7 @@ const std = @import("std");
 const lua = @import("luart").lua;
 const Host = @import("Host.zig");
 const Extension = @import("Extension.zig");
+const registry_mod = @import("registry.zig");
 const Load = @import("Load.zig");
 const rows = @import("rows.zig");
 const json = @import("luart").json;
@@ -49,6 +50,24 @@ const log_line_bytes_max = 2048;
 /// data, and a field of the extension.
 fn extensionOf(L: *lua.State) *Extension {
     return @fieldParentPtr("budget", lua.budgetOf(L));
+}
+
+/// Who may change Lumen itself while a file loads: init.lua always, a
+/// style (styles/<name>/init.lua) for its look, no other extension.
+const Configurer = enum { init_lua, init_lua_or_style };
+
+/// `loadOf`, for a function only `who` may call: an installed extension
+/// set settings and keys that Settings then showed as "Set in init.lua".
+fn loadOfConfig(L: *lua.State, function_name: []const u8, who: Configurer) lua.Error!*Load {
+    const load = try loadOf(L, function_name);
+    const id = extensionOf(L).id;
+    if (std.mem.eql(u8, id, registry_mod.config_extension_id)) return load;
+    const style = std.mem.eql(u8, id, registry_mod.style_extension_id);
+    if (style and who == .init_lua_or_style) return load;
+    return lua.fail(L, "{s} works only in init.lua{s}", .{
+        function_name,
+        if (who == .init_lua_or_style) " or a style" else "",
+    });
 }
 
 /// The file being loaded, or an error for a function only a file being
@@ -410,7 +429,7 @@ fn writeCut(line: *std.Io.Writer, bytes: []const u8) void {
 fn theme(L: *lua.State) lua.Error!c_int {
     try lua.argTable(L, 1, "lumen.theme");
     const extension = extensionOf(L);
-    const load = try loadOf(L, "lumen.theme");
+    const load = try loadOfConfig(L, "lumen.theme", .init_lua_or_style);
     if (load.themes.items.len >= themes_max) {
         return lua.fail(L, "lumen.theme: at most {d} themes", .{themes_max});
     }
@@ -475,7 +494,7 @@ fn keymap(L: *lua.State) lua.Error!c_int {
     const keys = try lua.argString(L, 1, "lumen.keymap");
     const target = try lua.argString(L, 2, "lumen.keymap");
     const extension = extensionOf(L);
-    const load = try loadOf(L, "lumen.keymap");
+    const load = try loadOfConfig(L, "lumen.keymap", .init_lua);
     if (load.keymaps.items.len >= keymaps_max) {
         return lua.fail(L, "lumen.keymap: at most {d} keymaps", .{keymaps_max});
     }
@@ -553,7 +572,7 @@ fn modifierMask(name: []const u8) ?gtk.GdkModifierType {
 fn set(L: *lua.State) lua.Error!c_int {
     try lua.argTable(L, 1, "lumen.set");
     const extension = extensionOf(L);
-    const load = try loadOf(L, "lumen.set");
+    const load = try loadOfConfig(L, "lumen.set", .init_lua_or_style);
     const arena = load.arena;
     // A style's settings are defaults for when it is chosen; init.lua's fix them.
     const settings = if (std.mem.eql(u8, extension.id, Host.style_extension_id))
@@ -605,7 +624,7 @@ const LayoutKey = enum { searchbar, row, prompt, placeholder, show };
 /// hints = false } }`: the window's structure. Several calls add up.
 fn layout(L: *lua.State) lua.Error!c_int {
     try lua.argTable(L, 1, "lumen.layout");
-    const load = try loadOf(L, "lumen.layout");
+    const load = try loadOfConfig(L, "lumen.layout", .init_lua_or_style);
     var layout_new = load.layout;
     lua.c.lua_pushnil(L);
     while (lua.c.lua_next(L, 1) != 0) {
@@ -731,7 +750,7 @@ fn layoutValue(L: *lua.State, layout_new: *layout_mod.Layout, key: []const u8) l
 /// icons of apps, commands and file kinds replaced. Several calls add up.
 fn icons(L: *lua.State) lua.Error!c_int {
     try lua.argTable(L, 1, "lumen.icons");
-    const load = try loadOf(L, "lumen.icons");
+    const load = try loadOfConfig(L, "lumen.icons", .init_lua);
     const arena = load.arena;
     lua.c.lua_pushnil(L);
     while (lua.c.lua_next(L, 1) != 0) {

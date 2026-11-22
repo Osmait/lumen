@@ -6,7 +6,8 @@
 //! it; scaling on load decodes at full size first), so the size is read
 //! from the file's header (image_size.zig) and a larger image is not
 //! decoded at all.
-//! Previews and grid pictures are decoded on a worker, one at a time.
+//! Previews, grid pictures and rows' icons are decoded on a worker, one at
+//! a time.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -18,23 +19,22 @@ pub const Limits = struct {
     bytes: usize,
     pixels: u64,
     /// An SVG's own cap: its size says nothing of what drawing it costs
-    /// (parsing, paths, filters), and an icon's is drawn on the UI thread.
+    /// (parsing, paths, filters).
     svg_bytes: usize,
 };
 
-/// Previews and grid pictures: a 48 MP photo fits; 256 MB at most while it
+/// Previews, grid pictures and rows' icons: a 48 MP photo fits; 256 MB at most while it
 /// decodes, one at a time.
 pub const picture_limits: Limits = .{
     .bytes = 64 << 20,
     .pixels = 8192 * 8192,
     .svg_bytes = 8 << 20,
 };
-/// Icons in rows, decoded on the UI thread: icon themes' SVGs are a few KB.
-pub const icon_limits: Limits = .{
-    .bytes = 4 << 20,
-    .pixels = 2048 * 2048,
-    .svg_bytes = 512 << 10,
-};
+
+/// What `decodeImage` reads before it looks at the header: where every
+/// format `image_size` knows keeps its size, but for a JPEG with more
+/// metadata than this (then the whole file is read and looked at again).
+const header_probe_bytes = 64 << 10;
 
 /// `path` decoded to fit `width_px`×`height_px` (never larger than it is), or null: not a
 /// regular file, over `limits`, or not an image whose size `image_size`
@@ -55,7 +55,16 @@ pub fn decodeImage(
     {
         const fd = os.openRegular(path) catch return null;
         defer os.close(fd);
-        os.readUpTo(gpa, fd, &data, limits.bytes + 1) catch return null;
+        // The header first: an image over the pixel limit is refused
+        // without reading the whole file (a 4 MB photo for a 32 px icon).
+        const head_bytes = @min(limits.bytes + 1, header_probe_bytes);
+        os.readUpTo(gpa, fd, &data, head_bytes) catch return null;
+        if (data.items.len == head_bytes) {
+            if (image_size.read(data.items)) |size| {
+                if (size.width_px * size.height_px > limits.pixels) return null;
+            }
+            os.readUpTo(gpa, fd, &data, limits.bytes + 1) catch return null;
+        }
     }
     if (data.items.len > limits.bytes) return null;
     const size = decodeSize(data.items, width_px, height_px, limits) orelse return null;
@@ -124,6 +133,9 @@ pub const Lane = struct {
 pub var preview_lane: Lane = .{};
 /// The grid's cell pictures.
 pub var grid_lane: Lane = .{};
+/// Rows' icons given as image files (dmenu's `icon\x1f/path`, an
+/// extension's `icon = "/path"`).
+pub var icon_lane: Lane = .{};
 
 /// Called on the main thread once per request with the picture (borrowed:
 /// take a reference to keep it) or null. `current`: its lane has not moved
@@ -282,6 +294,14 @@ test "a picture over the limits is never decoded" {
     try test_dir.write("big.png", big);
     const big_path = try test_dir.path(&path_bytes, "big.png");
     try testing.expect(decodeImage(big_path, 64, 64, limits) == null);
+    // Larger than the header probe: refused from its first bytes alone.
+    const padded = try testing.allocator.alloc(u8, header_probe_bytes * 2);
+    defer testing.allocator.free(padded);
+    @memset(padded, 0);
+    @memcpy(padded[0..bomb.len], bomb);
+    try test_dir.write("padded.png", padded);
+    const padded_path = try test_dir.path(&path_bytes, "padded.png");
+    try testing.expect(decodeImage(padded_path, 64, 64, limits) == null);
     // A FIFO named like a picture: refused at once, not waited on.
     const fifo = try test_dir.path(&path_bytes, "fifo.png");
     try testing.expect(std.os.linux.mknod(fifo, std.os.linux.S.IFIFO | 0o600, 0) == 0);
