@@ -393,6 +393,12 @@ const terminal_prefixes = [_]TerminalPrefix{
     .{ .names = &.{ "kitty", "foot" }, .words = &.{} },
     .{ .names = &.{"wezterm"}, .words = &.{ "start", "--" } },
     .{ .names = &.{"gnome-terminal"}, .words = &.{"--"} },
+    // Their -e takes one command line as a single word: the line number
+    // and the path never reached the editor. -x takes the rest as argv.
+    .{
+        .names = &.{ "xfce4-terminal", "terminator", "mate-terminal" },
+        .words = &.{"-x"},
+    },
 };
 
 /// The words that make a terminal run a command (most take `-e`), in
@@ -720,6 +726,8 @@ test "editors open at a line, terminal ones inside a terminal" {
     try std.testing.expectEqualStrings("start", (try terminalPrefix(allocator, &.{"wezterm"}))[1]);
     try std.testing.expectEqual(@as(usize, 1), (try terminalPrefix(allocator, &.{"kitty"})).len);
     try std.testing.expectEqualStrings("-e", (try terminalPrefix(allocator, &.{"ghostty"}))[1]);
+    const xfce = try terminalPrefix(allocator, &.{"/usr/bin/xfce4-terminal"});
+    try std.testing.expectEqualStrings("-x", xfce[1]);
     const kitty_words = try words(allocator, "/usr/bin/kitty --single-instance");
     const kitty = try terminalPrefix(allocator, kitty_words);
     try std.testing.expectEqual(@as(usize, 2), kitty.len);

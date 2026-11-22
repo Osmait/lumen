@@ -557,7 +557,9 @@ pub extern fn gdk_monitor_get_geometry(monitor: *GdkMonitor, geometry: *GdkRecta
 
 // ------------------------------------------------------------------- gtk
 
-pub extern fn gtk_application_new(id: [*:0]const u8, flags: c_int) *GtkApplication;
+/// Null when `id` is not a valid application id (`g_application_id_is_valid`).
+pub extern fn gtk_application_new(id: [*:0]const u8, flags: c_int) ?*GtkApplication;
+pub extern fn g_application_id_is_valid(id: [*:0]const u8) gboolean;
 pub extern fn gtk_application_window_new(application: *GtkApplication) *GtkWidget;
 
 pub extern fn gtk_window_set_title(window: *GtkWindow, title: [*:0]const u8) void;

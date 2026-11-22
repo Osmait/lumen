@@ -11,7 +11,12 @@
 //!     work, and report failure by returning `error.Raise` with the message
 //!     pushed; `wrap` raises it once their frames are gone. Work that must
 //!     clean up (a child process, a buffer) is finished, or moved under
-//!     `tryCall`, before anything else touches the stack.
+//!     `tryCall`, before anything else touches the stack. A frame that owns
+//!     nothing to clean up (no `defer`, no `errdefer`, its memory in an
+//!     arena) may also raise directly, through the readers below that do
+//!     (`fail`, `fieldStringMax`, `fieldBool`...): `lumen.theme`,
+//!     `lumen.icons` do. Adding a `defer` to such a frame means moving its
+//!     raising calls out first.
 //!   - Every state has a memory cap and an instruction-count hook that stops
 //!     code still running past its deadline.
 
@@ -35,10 +40,26 @@ pub const Budget = struct {
     /// Set once the deadline expires so `pcall`/`xpcall`/coroutines cannot
     /// swallow the timeout and keep spinning.
     timed_out: bool = false,
+    /// Set by another thread (a shutdown): code running stops as if past
+    /// its deadline, at the next check.
+    cancel: ?*const std.atomic.Value(bool) = null,
     /// Files the state holds open (`io.open`, lfiles.c), up to
     /// `open_files_max`.
     open_files: u32 = 0,
+
+    /// Past its deadline, timed out already, or cancelled.
+    fn expired(budget: *const Budget) bool {
+        if (budget.timed_out) return true;
+        if (budget.cancel) |cancel| {
+            if (cancel.load(.acquire)) return true;
+        }
+        return os.monotonicNs() > budget.deadline_ns;
+    }
 };
+
+/// The most of an error message kept (`protect`): an extension raising a
+/// 30 MB string sent it whole to the window and the log.
+const error_message_bytes_max = 4096;
 
 /// Files one state may hold open at once: each takes one of the daemon's
 /// descriptors, which its socket, SQLite and GTK need too (the soft limit
@@ -327,8 +348,23 @@ fn armThreadHook(L: *State) Error!c_int {
 fn refuseOpen(L: *State) Error!c_int {
     const path = toSlice(L, 1) orelse return 0;
     if (opensSafely(path)) return 0;
-    pushFmt(L, "{s}: not a regular file (Lumen does not open FIFOs, sockets or devices)", .{path});
+    const reason = "Lumen does not open FIFOs, sockets, devices or a process's memory";
+    pushFmt(L, "{s}: not a regular file ({s})", .{ path, reason });
     return 1;
+}
+
+/// Whether `path`, whose status is `status`, is a process's memory under
+/// /proc (`/proc/self/mem` and the like): a regular file to stat, but
+/// writing it patches the daemon, its time limits included. Extensions run
+/// as the user anyway; this keeps one from switching its own limits off.
+fn isProcessMemory(path: [*:0]const u8, status: *const std.os.linux.Statx) bool {
+    const linux = std.os.linux;
+    const name = std.fs.path.basename(std.mem.span(path));
+    if (!std.mem.eql(u8, name, "mem")) return false;
+    var proc_status: linux.Statx = undefined;
+    const proc_result = linux.statx(linux.AT.FDCWD, "/proc", 0, .{ .TYPE = true }, &proc_status);
+    if (linux.errno(proc_result) != .SUCCESS) return false;
+    return status.dev_major == proc_status.dev_major and status.dev_minor == proc_status.dev_minor;
 }
 
 /// Linux's memory devices (major 1) that Lua's file functions may open,
@@ -342,6 +378,7 @@ fn opensSafely(path: [*:0]const u8) bool {
     const result = linux.statx(linux.AT.FDCWD, path, 0, .{ .TYPE = true }, &status);
     // Missing, or out of reach: the open fails on its own.
     if (linux.errno(result) != .SUCCESS) return true;
+    if (isProcessMemory(path, &status)) return false;
     return switch (status.mode & linux.S.IFMT) {
         linux.S.IFREG, linux.S.IFDIR => true,
         // The memory devices: null, zero, full, random and urandom.
@@ -401,7 +438,7 @@ export fn luart_file_closed(L: *State) void {
 /// instruction after it raises again, as after `hook`.
 export fn luart_match_timed_out(L: *State) c_int {
     const budget = budgetOf(L);
-    if (!budget.timed_out and os.monotonicNs() <= budget.deadline_ns) return 0;
+    if (!budget.expired()) return 0;
     budget.timed_out = true;
     c.lua_sethook(L, &hook, c.LUA_MASKCOUNT, 1);
     return 1;
@@ -410,7 +447,7 @@ export fn luart_match_timed_out(L: *State) c_int {
 fn hook(L: ?*State, _: ?*c.lua_Debug) callconv(.c) void {
     const state = L.?;
     const budget = budgetOf(state);
-    if (budget.timed_out or os.monotonicNs() > budget.deadline_ns) {
+    if (budget.expired()) {
         budget.timed_out = true;
         c.lua_sethook(state, &hook, c.LUA_MASKCOUNT, 1);
         _ = c.luaL_error(state, "timed out");
@@ -421,12 +458,9 @@ fn hook(L: ?*State, _: ?*c.lua_Debug) callconv(.c) void {
 /// Zig, where the instruction hook does not run.
 pub fn pastDeadline(L: *State) bool {
     const budget = budgetOf(L);
-    if (budget.timed_out) return true;
-    if (os.monotonicNs() > budget.deadline_ns) {
-        budget.timed_out = true;
-        return true;
-    }
-    return false;
+    if (!budget.expired()) return false;
+    budget.timed_out = true;
+    return true;
 }
 
 /// An allocator over `child` that holds at most `bytes_max` bytes at once:
@@ -565,7 +599,8 @@ pub fn protect(
     if (std.mem.endsWith(u8, message, empty_trace)) {
         message = message[0 .. message.len - empty_trace.len];
     }
-    return arena.dupeSentinel(u8, message, 0) catch "error (out of memory)";
+    return arena.dupeSentinel(u8, cut(message, error_message_bytes_max), 0) catch
+        "error (out of memory)";
 }
 
 pub const TryCallResult = enum { ok, raised, stack_overflow };
@@ -1070,6 +1105,20 @@ fn inheritableFds() usize {
     return count;
 }
 
+test "a process's memory under /proc is not opened" {
+    var budget: Budget = .{ .bytes_max = 8 << 20 };
+    const L = try testState(&budget);
+    defer c.lua_close(L);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const code =
+        \\local f, why = io.open("/proc/self/mem", "r+")
+        \\assert(f == nil and why:find("not a regular file"), why)
+        \\assert(io.open("/proc/self/status")):close()
+    ;
+    try testing.expect(runCode(L, arena_state.allocator(), code) == null);
+}
+
 test "extensions open files close-on-exec, and only so many at once" {
     var budget: Budget = .{ .bytes_max = 8 << 20 };
     const L = try testState(&budget);
@@ -1103,6 +1152,24 @@ test "extensions open files close-on-exec, and only so many at once" {
     _ = c.lua_gc(L, c.LUA_GCCOLLECT, @as(c_int, 0));
     // Closed, collected, or read to their end: every slot came back.
     try testing.expectEqual(@as(u32, 0), budget.open_files);
+}
+
+test "a cancelled state stops at once, and long errors are cut" {
+    var budget: Budget = .{ .bytes_max = 8 << 20 };
+    const L = try testState(&budget);
+    defer c.lua_close(L);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var cancel: std.atomic.Value(bool) = .init(true);
+    budget.cancel = &cancel;
+    const start_ns = os.monotonicNs();
+    const stopped = runCode(L, arena, "while true do end") orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.find(u8, stopped, "timed out") != null);
+    try testing.expect(os.monotonicNs() - start_ns < std.time.ns_per_s);
+    cancel.store(false, .release);
+    const long = runCode(L, arena, "error(('x'):rep(1000000))") orelse return error.TestUnexpectedResult;
+    try testing.expect(long.len <= error_message_bytes_max);
 }
 
 test "a runaway loop stops at its deadline" {

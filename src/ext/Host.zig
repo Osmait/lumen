@@ -928,6 +928,7 @@ test "errors in extensions come back as messages" {
         \\fails(lumen.keymap, "needs ctrl", "g", "x.y")
         \\fails(lumen.set, 'no setting named "widht"', { widht = "wide" })
         \\fails(lumen.layout, "bad value for panels", { panels = "triple" })
+        \\fails(lumen.set, "opacity takes a whole number, not 97.5", { opacity = 97.5 })
     );
 
     var probe: Probe = .{};

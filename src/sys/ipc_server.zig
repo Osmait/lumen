@@ -36,6 +36,9 @@ const Server = struct {
     handler: Handler = undefined,
     gpa: std.mem.Allocator = undefined,
     connections_open: usize = 0,
+    /// The inode of the socket this daemon bound: `stop` removes the file
+    /// only while it is still that one.
+    socket_inode: u64 = 0,
     /// The connections open, so a shutdown can end them; null slots free.
     connections: [connections_max]?*Connection = @splat(null),
 
@@ -68,6 +71,9 @@ pub const ListenError = error{
     /// The socket's folder is a link, someone else's, or open to others.
     FolderNotPrivate,
     Socket,
+    /// Another daemon answers at the socket's path (without D-Bus every
+    /// instance is the primary one): its socket is left alone.
+    InUse,
     Bind,
     Listen,
 };
@@ -124,9 +130,16 @@ fn listenAt(socket_path: [:0]const u8) ListenError!linux.fd_t {
     }
     const fd: linux.fd_t = @intCast(socket_result);
     errdefer _ = linux.close(fd);
-    // A socket left by a daemon that crashed; only the primary instance
-    // gets here, so it is not a live one. Usually there is none; one that
-    // cannot be removed makes the bind below fail, and that is logged.
+    // A socket left by a daemon that crashed is removed; one a live daemon
+    // answers on is not. Only the primary instance gets here, except
+    // without a session bus, where every instance is: the second one took
+    // the first one's socket. One that cannot be removed makes the bind
+    // below fail, and that is logged.
+    if (os.unix.connect(socket_path, .{})) |live_fd| {
+        _ = linux.close(live_fd);
+        log.warn("{s}: another Lumen daemon answers there", .{socket_path});
+        return error.InUse;
+    }
     _ = linux.unlink(socket_path.ptr);
     var address: linux.sockaddr.un = .{ .path = @splat(0) };
     @memcpy(address.path[0..socket_path.len], socket_path);
@@ -143,6 +156,7 @@ fn listenAt(socket_path: [:0]const u8) ListenError!linux.fd_t {
     if (failed(linux.chmod(socket_path.ptr, 0o600))) |errno| {
         log.warn("could not make {s} owner-only: {t}", .{ socket_path, errno });
     }
+    server.socket_inode = os.Stamp.of(socket_path.ptr).inode;
     return fd;
 }
 
@@ -169,7 +183,11 @@ pub fn stop() void {
     server.accepting = .paused;
     _ = linux.close(server.listen_fd);
     server.listen_fd = -1;
-    _ = linux.unlink(server.path.ptr);
+    // Another daemon's socket at the same path since (it removed ours
+    // first) stays.
+    if (os.Stamp.of(server.path.ptr).inode == server.socket_inode) {
+        _ = linux.unlink(server.path.ptr);
+    }
 }
 
 /// Whether `dir` is a real folder (not a link to one), ours, and owner-only;
@@ -558,6 +576,27 @@ fn testListen(tmp_dir: *std.testing.TmpDir, socket_path_buffer: []u8) ![:0]const
     try listenIn(testing.allocator, runtime_dir, "t", &testHandler);
     try testing.expect(server.listen_fd >= 0);
     return ipc.socketPath(socket_path_buffer, runtime_dir, "t").?;
+}
+
+test "a live daemon's socket is left alone, and only ours is removed" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var socket_path_buffer: [256]u8 = undefined;
+    const socket_path = try testListen(&tmp_dir, &socket_path_buffer);
+    // A second daemon at the same path: refused, the first one untouched.
+    var runtime_buffer: [256]u8 = undefined;
+    const runtime_dir = try os.tmpDirPath(&tmp_dir, &runtime_buffer);
+    const first = server;
+    server = .{};
+    try testing.expectError(error.InUse, listenIn(testing.allocator, runtime_dir, "t", &testHandler));
+    server = first;
+    const still = os.unix.connect(socket_path, .{}) orelse return error.TestUnexpectedResult;
+    _ = linux.close(still);
+    // Replaced by another file since: `stop` leaves it there.
+    try testing.expect(linux.unlink(socket_path.ptr) == 0);
+    try os.writeFile(socket_path, "someone else's");
+    stop();
+    try testing.expect(os.info(socket_path.ptr) != null);
 }
 
 test "each reason not to listen is an error of its own" {

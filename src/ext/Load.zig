@@ -41,6 +41,9 @@ style_settings: std.ArrayList(SettingOverride) = .empty,
 layout: layout_mod.Layout = .{},
 has_layout: bool = false,
 problems: std.ArrayList(Problem) = .empty,
+/// What files that failed may still leave in the arena without counting
+/// against the others (`loading.loadSource`).
+failed_bytes_left: usize = 0,
 
 /// What a file adds, dropped again if it fails half-way (its problem
 /// and its extension entry are added after it ran).

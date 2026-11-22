@@ -80,10 +80,29 @@ pub fn writeAllAt(fd: i32, data: []const u8, offset: ?usize) Error!void {
             linux.pwrite(fd, rest.ptr, rest.len, @intCast(start + written))
         else
             linux.write(fd, rest.ptr, rest.len);
-        if (linux.errno(result) == .INTR) continue;
+        switch (linux.errno(result)) {
+            .INTR => continue,
+            // A descriptor someone left non-blocking (a pipe from a parent):
+            // wait until it takes more, as a blocking one would.
+            .AGAIN => {
+                waitWritable(fd);
+                continue;
+            },
+            else => {},
+        }
         written += try check(result);
     }
     assert(written == data.len);
+}
+
+/// Waits until `fd` can be written to (or poll fails: the write then says
+/// why).
+fn waitWritable(fd: i32) void {
+    var poll_fds = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.OUT, .revents = 0 }};
+    while (true) {
+        const result = linux.poll(&poll_fds, 1, -1);
+        if (linux.errno(result) != .INTR) return;
+    }
 }
 
 pub const ReadUpToError = std.mem.Allocator.Error || error{ReadFailed};
@@ -416,7 +435,7 @@ test "writeFile enforces 0600 on existing files and refuses symlinks" {
     var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const link = try std.mem.printSentinel(&link_buffer, "{s}/link", .{dir}, 0);
     try expectSuccess(linux.symlink(file, link));
-    try std.testing.expectError(error.Syscall, writeFile(link, "evil"));
+    try std.testing.expectError(error.IsLink, writeFile(link, "evil"));
     var head_buffer: [16]u8 = undefined;
     try std.testing.expectEqualStrings("new", readHead(file, &head_buffer));
 }
@@ -465,4 +484,36 @@ test "readUpTo never reads past bytes_max" {
     const bytes_max = read_chunk_bytes + 100;
     try readUpTo(std.testing.allocator, file_fd, &text, bytes_max);
     try std.testing.expectEqual(bytes_max, text.items.len);
+}
+
+test "writeAll waits on a non-blocking descriptor instead of failing" {
+    var fds: [2]i32 = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true })));
+    defer close(fds[0]);
+    const Reader = struct {
+        fn drain(fd: i32, total: *usize) void {
+            var buffer: [4096]u8 = undefined;
+            while (true) {
+                const result = linux.read(fd, &buffer, buffer.len);
+                switch (linux.errno(result)) {
+                    .SUCCESS => {
+                        if (result == 0) return;
+                        total.* += result;
+                    },
+                    .AGAIN, .INTR => os.sleepUs(1000),
+                    else => return,
+                }
+            }
+        }
+    };
+    var total: usize = 0;
+    const thread = try std.Thread.spawn(.{}, Reader.drain, .{ fds[0], &total });
+    // More than a pipe holds: EAGAIN until the reader makes room.
+    const data = try std.testing.allocator.alloc(u8, 256 << 10);
+    defer std.testing.allocator.free(data);
+    @memset(data, 'x');
+    try writeAll(fds[1], data);
+    close(fds[1]);
+    thread.join();
+    try std.testing.expectEqual(data.len, total);
 }

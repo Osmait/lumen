@@ -548,5 +548,8 @@ time, and a newer query replaces one that has not started yet.
 
 Extensions run as you, inside Lumen. The missing functions above keep a bug
 from taking Lumen down, and the limits stop runaway code. They do not make a
-malicious extension safe: `lumen.exec` can run anything. Install extensions
-you have read, as you would a shell script.
+malicious extension safe: `lumen.exec` can run anything, and `io.open` and
+`os.remove` reach any of your files. There is no sandbox between an
+extension and your account. Install extensions you have read, as you would a
+shell script, and update them knowing that `lumen --update` pulls whatever
+their authors pushed.
