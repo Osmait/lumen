@@ -21,7 +21,9 @@ pub fn stamp(config_dir: []const u8, style: []const u8) u64 {
     }
     hashFolders(&hasher, config_dir, "extensions");
     hasher.update(style);
-    if (style.len > 0) {
+    if (style.len > 0 and !std.mem.eql(u8, style, ".") and !std.mem.eql(u8, style, "..") and
+        std.mem.findScalar(u8, style, '/') == null)
+    {
         const style_dir = std.mem.printSentinel(
             &path_buffer,
             "{s}/styles/{s}",

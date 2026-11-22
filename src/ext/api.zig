@@ -22,9 +22,17 @@ const layout_mod = @import("../layout.zig");
 const log = std.log.scoped(.ext);
 const assert = std.debug.assert;
 
-/// The most words a program's argv takes, in `lumen.exec` and in
-/// `lumen.action.exec`.
+/// The most words a program's argv takes in `lumen.exec`.
 pub const argv_max = 64;
+/// `lumen.action.exec` runs through `proc.spawn`, which caps argv at `proc.argv_max`.
+pub const action_argv_max = proc.argv_max;
+/// Per-extension rate limit for `lumen.notify`.
+const notify_per_second_max = 10;
+/// Upper bounds on per-load declarations to prevent registry arena exhaustion.
+const themes_max = 128;
+const keymaps_max = 256;
+const icons_max = 512;
+const api_text_bytes_max = 256;
 /// The longest `timeout` lumen.exec takes; a longer one is cut to it.
 const exec_timeout_s_max = 3600;
 /// A theme colour as written in Lua: "#" and six hex digits.
@@ -150,7 +158,7 @@ const prelude =
     \\  f:close()
     \\  if text and not text:find("%S") then return {} end
     \\  local ok, value = pcall(lumen.json.decode, text or "")
-    \\  if ok and type(value) == "table" then return value end
+    \\  if ok and type(value) == "table" and #value == 0 then return value end
     \\  return nil, path .. " is not a JSON object"
     \\end
     \\local function write_file(path, text)
@@ -221,13 +229,17 @@ const prelude =
     \\local function check(key)
     \\  if type(key) ~= "string" then error("lumen.storage: keys are strings, not " .. type(key), 3) end
     \\end
-    \\function storage.get(key) check(key) return load()[key] end
-    \\function storage.set(key, value) check(key) save(key, value) end
+    \\local function clone(v)
+    \\  if type(v) ~= "table" then return v end
+    \\  local out = {}
+    \\  for k, item in pairs(v) do out[k] = clone(item) end
+    \\  return out
+    \\end
+    \\function storage.get(key) check(key) return clone(load()[key]) end
+    \\function storage.set(key, value) check(key) save(key, clone(value)) end
     \\function storage.remove(key) check(key) save(key, nil) end
     \\function storage.all()
-    \\  local copy = {}
-    \\  for k, v in pairs(load()) do copy[k] = v end
-    \\  return copy
+    \\  return clone(load())
     \\end
     \\lumen.storage = storage
 ;
@@ -308,6 +320,7 @@ fn lumenExec(L: *lua.State) lua.Error!c_int {
     var result = child.run(extension.gpa(), extension.io(), argv[0..arguments.words_count], .{
         .stdin = .{ .bytes = arguments.stdin },
         .deadline_ns = deadline_ns,
+        .cancel = &extension.host.stop,
     }) catch |err| {
         const why = switch (err) {
             error.FileNotFound => "not found",
@@ -348,6 +361,14 @@ fn notify(L: *lua.State) lua.Error!c_int {
         ""
     else
         try lua.argString(L, 2, "lumen.notify");
+    const extension = extensionOf(L);
+    const now_ns = os.monotonicNs();
+    if (now_ns -| extension.notify_window_start_ns >= std.time.ns_per_s) {
+        extension.notify_window_start_ns = now_ns;
+        extension.notify_window_count = 0;
+    }
+    if (extension.notify_window_count >= notify_per_second_max) return 0;
+    extension.notify_window_count += 1;
     proc.spawn(&notifyArgv(title, body));
     return 0;
 }
@@ -390,8 +411,11 @@ fn theme(L: *lua.State) lua.Error!c_int {
     try lua.argTable(L, 1, "lumen.theme");
     const extension = extensionOf(L);
     const load = try loadOf(L, "lumen.theme");
+    if (load.themes.items.len >= themes_max) {
+        return lua.fail(L, "lumen.theme: at most {d} themes", .{themes_max});
+    }
     const arena = load.arena;
-    const id = lua.fieldString(L, arena, 1, "id", "theme") orelse
+    const id = lua.fieldStringMax(L, arena, 1, "id", "theme", api_text_bytes_max) orelse
         return lua.fail(L, "theme.id is missing", .{});
     if (!Host.validId(id) or std.mem.eql(u8, id, themes.auto_id)) {
         return lua.fail(L, "theme.id: use a-z, 0-9, - and _ (got \"{s}\")", .{id});
@@ -406,7 +430,7 @@ fn theme(L: *lua.State) lua.Error!c_int {
             return lua.fail(L, "two themes named \"{s}\"", .{id});
         }
     }
-    const name = lua.fieldString(L, arena, 1, "name", "theme") orelse
+    const name = lua.fieldStringMax(L, arena, 1, "name", "theme", api_text_bytes_max) orelse
         return lua.fail(L, "theme.name is missing", .{});
     const background = try color(L, arena, "bg", null);
     const foreground = try color(L, arena, "fg", null);
@@ -452,6 +476,12 @@ fn keymap(L: *lua.State) lua.Error!c_int {
     const target = try lua.argString(L, 2, "lumen.keymap");
     const extension = extensionOf(L);
     const load = try loadOf(L, "lumen.keymap");
+    if (load.keymaps.items.len >= keymaps_max) {
+        return lua.fail(L, "lumen.keymap: at most {d} keymaps", .{keymaps_max});
+    }
+    if (target.len > api_text_bytes_max) {
+        return lua.fail(L, "lumen.keymap: target is too long", .{});
+    }
     const parsed = parseKeys(keys) orelse return lua.fail(
         L,
         "lumen.keymap: \"{s}\" is not a key (write it like \"ctrl+g\" or \"alt+shift+F5\")",
@@ -705,12 +735,15 @@ fn icons(L: *lua.State) lua.Error!c_int {
     const arena = load.arena;
     lua.c.lua_pushnil(L);
     while (lua.c.lua_next(L, 1) != 0) {
+        if (load.icons.items.len >= icons_max) {
+            return lua.fail(L, "lumen.icons: at most {d} overrides", .{icons_max});
+        }
         const key = lua.toSlice(L, -2) orelse return lua.fail(
             L,
             "lumen.icons: keys are item keys like \"app:firefox\" or \"cmd:clipboard\"",
             .{},
         );
-        if (std.mem.findScalar(u8, key, ':') == null) {
+        if (key.len > api_text_bytes_max or std.mem.findScalar(u8, key, ':') == null) {
             return lua.fail(
                 L,
                 "lumen.icons: \"{s}\" is not a key (app:, cmd:, sys:, win:, script:, ext:, file:)",
