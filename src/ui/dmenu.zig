@@ -193,6 +193,7 @@ fn rebuildDelay(line_count: usize) c_uint {
 fn onRebuildTimer(data: ?*anyopaque) callconv(.c) c.gboolean {
     const session: *Session = @ptrCast(@alignCast(data.?));
     session.rebuild_timer = 0;
+    if (session.finished) return 0;
     showLines(session);
     return 0;
 }
@@ -257,6 +258,10 @@ pub fn finish(ui: *Ui, choice: ?[]const u8) void {
     // The caller's `lumen --dmenu` returns once this is released.
     c.g_object_unref(session.caller);
     session.finished = true;
+    if (session.rebuild_timer != 0) {
+        _ = c.g_source_remove(session.rebuild_timer);
+        session.rebuild_timer = 0;
+    }
     // The rows point into the session's lines.
     if (ui.view == .dmenu) row_list.clearRows(ui);
     if (session.reading) c.g_cancellable_cancel(session.cancellable) else session.destroy();

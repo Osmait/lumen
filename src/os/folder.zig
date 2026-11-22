@@ -137,16 +137,22 @@ pub fn mkdirP(path: []const u8) Error!void {
     }
 }
 
-/// Makes an existing directory of Lumen's owner-only: caches made by
-/// earlier versions were 0755, with world-readable files inside. A failure
-/// is logged: the files written inside are owner-only all the same.
+/// Makes an existing directory of Lumen's owner-only without following
+/// symbolic links: caches made by earlier versions were 0755, with
+/// world-readable files inside. A failure is logged: the files written
+/// inside are owner-only all the same.
 pub fn makePrivate(path: []const u8) void {
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path_z = std.mem.printSentinel(&path_buffer, "{s}", .{path}, 0) catch {
         log.warn("could not make {s} owner-only: the path is too long", .{path});
         return;
     };
-    switch (linux.errno(linux.chmod(path_z, 0o700))) {
+    const fd = openDirNoFollow(path_z) catch |err| {
+        log.warn("could not make {s} owner-only: {t}", .{ path, err });
+        return;
+    };
+    defer close(fd);
+    switch (linux.errno(linux.fchmod(fd, 0o700))) {
         .SUCCESS => {},
         else => |errno| log.warn("could not make {s} owner-only: {t}", .{ path, errno }),
     }
@@ -242,4 +248,14 @@ test "Lumen's files and directories are owner-only" {
     try expectSuccess(linux.chmod(sub, 0o755));
     makePrivate(sub);
     try std.testing.expectEqual(@as(u32, 0o700), try mode(sub));
+    // A symlink to another folder is never followed.
+    var other_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const other = try std.mem.printSentinel(&other_buffer, "{s}/other", .{dir}, 0);
+    try mkdirP(other);
+    try expectSuccess(linux.chmod(other, 0o755));
+    var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const link = try std.mem.printSentinel(&link_buffer, "{s}/link", .{dir}, 0);
+    try expectSuccess(linux.symlink(other, link));
+    makePrivate(link);
+    try std.testing.expectEqual(@as(u32, 0o755), try mode(other));
 }

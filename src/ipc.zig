@@ -43,15 +43,28 @@ pub const arguments_max = 64;
 /// What a sockaddr_un holds of a path, its terminating zero included.
 const socket_path_bytes = @sizeOf(@FieldType(std.os.linux.sockaddr.un, "path"));
 
+/// Whether `app_id` is safe as a single file name component under
+/// `$XDG_RUNTIME_DIR/lumen/`: non-empty, not starting with '.', and only
+/// ASCII alphanumerics, '.', '-', '_'.
+pub fn validAppId(app_id: []const u8) bool {
+    if (app_id.len == 0 or app_id[0] == '.') return false;
+    for (app_id) |byte| {
+        const ok = std.ascii.isAlphanumeric(byte) or byte == '.' or byte == '-' or byte == '_';
+        if (!ok) return false;
+    }
+    return true;
+}
+
 /// The socket's path, $XDG_RUNTIME_DIR/lumen/<app id>.sock, in
-/// `path_buffer`; null when it does not fit there or in a sockaddr_un.
+/// `path_buffer`; null when it does not fit there or in a sockaddr_un,
+/// or when `app_id` is not a valid file name component.
 pub fn socketPath(
     path_buffer: []u8,
     runtime_dir: []const u8,
     app_id: []const u8,
 ) ?[:0]const u8 {
     if (runtime_dir.len == 0) return null;
-    if (app_id.len == 0) return null;
+    if (!validAppId(app_id)) return null;
     const format = "{s}/lumen/{s}.sock";
     const path = std.mem.printSentinel(path_buffer, format, .{ runtime_dir, app_id }, 0) catch
         return null;
@@ -178,6 +191,9 @@ test "socket paths" {
         socketPath(&path_buffer, "/run/user/1000", app_id_default).?,
     );
     try std.testing.expect(socketPath(&path_buffer, "", app_id_default) == null);
+    for ([_][]const u8{ "", ".", "..", ".hidden", "../evil", "a/b", "a\\b", "a b", "a\x00b", "a\nb" }) |bad| {
+        try std.testing.expect(socketPath(&path_buffer, "/run/user/1000", bad) == null);
+    }
     var long: [121]u8 = @splat('x');
     long[0] = '/';
     try std.testing.expect(socketPath(&path_buffer, &long, app_id_default) == null);

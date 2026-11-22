@@ -166,14 +166,7 @@ fn waitListerExit(
     deadline_ns: u64,
     stop: ?*const std.atomic.Value(bool),
 ) bool {
-    while (true) {
-        if (stop) |stop_flag| if (stop_flag.load(.acquire)) return false;
-        const now_ns = sys.monotonicNs();
-        if (now_ns >= deadline_ns) return false;
-        const slice_ns = list_poll_ms * std.time.ns_per_ms;
-        const slice_end_ns = @min(deadline_ns, now_ns + slice_ns);
-        if (sys.waitExit(pid, slice_end_ns)) return true;
-    }
+    return sys.waitExitCancelable(pid, deadline_ns, stop, list_poll_ms);
 }
 
 pub const Stat = struct { mtime: i64, size: u64 };

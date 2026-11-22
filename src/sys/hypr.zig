@@ -462,22 +462,64 @@ const events_reads_max = 64;
 
 fn afterFocusChangeEventsCallback(fd: c_int, _: c_uint, _: ?*anyopaque) callconv(.c) c.gboolean {
     const waiter = &focus_waiter;
+    var closed = false;
     for (0..events_reads_max) |_| {
-        // Full without a focus event: what came so far is of no use.
-        if (waiter.events_len == waiter.events_buffer.len) waiter.events_len = 0;
+        if (waiter.events_len == waiter.events_buffer.len) {
+            compactEvents(&waiter.events_buffer, &waiter.events_len);
+        }
         const spare = waiter.events_buffer[waiter.events_len..];
         const bytes_read = linux.read(fd, spare.ptr, spare.len);
-        if (linux.errno(bytes_read) != .SUCCESS) break;
-        if (bytes_read == 0) break;
-        waiter.events_len += bytes_read;
+        switch (linux.errno(bytes_read)) {
+            .SUCCESS => {
+                if (bytes_read == 0) {
+                    closed = true;
+                    break;
+                }
+                waiter.events_len += bytes_read;
+                if (focusEvent(waiter.events_buffer[0..waiter.events_len])) {
+                    // The source ends with this call: fire must not remove it again.
+                    waiter.watch_source = 0;
+                    waiter.fire();
+                    return 0;
+                }
+            },
+            .AGAIN => break,
+            .INTR => continue,
+            else => {
+                closed = true;
+                break;
+            },
+        }
     }
-    if (focusEvent(waiter.events_buffer[0..waiter.events_len])) {
-        // The source ends with this call: fire must not remove it again.
+    if (closed) {
+        // Detach the dead socket so GLib does not busy-spin on EOF/HUP;
+        // the fallback timer still fires on schedule.
         waiter.watch_source = 0;
-        waiter.fire();
+        if (waiter.events_fd >= 0) {
+            _ = linux.close(waiter.events_fd);
+            waiter.events_fd = -1;
+        }
         return 0;
     }
     return 1;
+}
+
+/// Compacts a full event buffer after `focusEvent` found no match, keeping any
+/// trailing incomplete line so an event split across the buffer boundary is
+/// still recognized on the next read.
+fn compactEvents(buffer: []u8, len: *usize) void {
+    const used = buffer[0..len.*];
+    if (std.mem.findScalarLast(u8, used, '\n')) |last_newline| {
+        const tail = used[last_newline + 1 ..];
+        std.mem.copyForwards(u8, buffer[0..tail.len], tail);
+        len.* = tail.len;
+    } else {
+        // A single line longer than the buffer did not start with
+        // "activewindow>>"; keep one non-matching byte so its continuation
+        // cannot be mistaken for the start of a new line.
+        buffer[0] = ' ';
+        len.* = 1;
+    }
 }
 
 /// Whether Hyprland's event text holds a focus change.
@@ -493,6 +535,45 @@ test "a focus change among Hyprland's events" {
     try std.testing.expect(focusEvent("closelayer>>lumen\nactivewindow>>kitty,~\n"));
     try std.testing.expect(!focusEvent("closelayer>>lumen\nactivewindowv2>>5619ce\n"));
     try std.testing.expect(!focusEvent("openlayer>>lumen\n"));
+
+    // Split across a buffer compaction boundary: trailing partial line is kept.
+    var buffer: [32]u8 = undefined;
+    const part1 = "openlayer>>lumen\nactivew";
+    @memcpy(buffer[0..part1.len], part1);
+    var len: usize = part1.len;
+    try std.testing.expect(!focusEvent(buffer[0..len]));
+    compactEvents(&buffer, &len);
+    const part2 = "indow>>kitty,~\n";
+    @memcpy(buffer[len..][0..part2.len], part2);
+    len += part2.len;
+    try std.testing.expect(focusEvent(buffer[0..len]));
+
+    // Oversized line without newline: continuation cannot false-match.
+    @memset(&buffer, 'x');
+    len = buffer.len;
+    compactEvents(&buffer, &len);
+    const fake = "activewindow>>fake\n";
+    @memcpy(buffer[len..][0..fake.len], fake);
+    len += fake.len;
+    try std.testing.expect(!focusEvent(buffer[0..len]));
+
+    // EOF on the event socket removes the watch instead of spinning.
+    var pair: [2]i32 = undefined;
+    try std.testing.expectEqual(
+        linux.E.SUCCESS,
+        linux.errno(linux.socketpair(
+            linux.AF.UNIX,
+            linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC,
+            0,
+            &pair,
+        )),
+    );
+    _ = linux.close(pair[1]);
+    focus_waiter = .{ .events_fd = pair[0], .watch_source = 1 };
+    defer focus_waiter.stop();
+    try std.testing.expectEqual(@as(c.gboolean, 0), afterFocusChangeEventsCallback(pair[0], 0, null));
+    try std.testing.expectEqual(@as(c_uint, 0), focus_waiter.watch_source);
+    try std.testing.expectEqual(@as(linux.fd_t, -1), focus_waiter.events_fd);
 }
 
 // ---------------------------------------------------------------- layouts

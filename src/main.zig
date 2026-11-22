@@ -567,13 +567,8 @@ fn dbPath() ?[*:0]u8 {
     defer c.g_free(data_dir);
     if (c.g_mkdir_with_parents(data_dir, 0o700) != 0) return null;
     // Owner-only even if it already existed (made by hand or by another
-    // tool). One that is not ours stays as it is (EPERM): the database
-    // still opens in it, so that is logged and not fatal.
-    const chmod_result = std.os.linux.chmod(data_dir, 0o700);
-    switch (std.os.linux.errno(chmod_result)) {
-        .SUCCESS => {},
-        else => |errno| log.warn("cannot make {s} owner-only: {t}", .{ data_dir, errno }),
-    }
+    // tool), without following symlinks.
+    os.makePrivate(std.mem.span(data_dir));
     return c.g_build_filename(data_dir, "lumen.db", end);
 }
 
@@ -763,6 +758,7 @@ test {
     _ = @import("sys/ipc_server.zig");
     _ = @import("sys/hypr.zig");
     _ = @import("ui/Ui.zig");
+    _ = @import("ui/ContentSearch.zig");
     _ = @import("ui/labels.zig");
     _ = @import("ui/widgets.zig");
     _ = @import("ui/settings_view.zig");

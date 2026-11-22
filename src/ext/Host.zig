@@ -75,6 +75,10 @@ thread: std.Thread = undefined,
 /// Guards `pending` and `style`, which the main thread writes and the
 /// worker reads.
 lock: std.Io.Mutex = .init,
+/// Guards `pending_deliveries`, which the worker appends to before
+/// `g_idle_add` and the main loop unlinks from in `deliverCallback`.
+delivery_lock: std.Io.Mutex = .init,
+pending_deliveries: ?*Delivery = null,
 /// Bumped by every request; the worker sleeps on it (a futex).
 wake_sequence: std.atomic.Value(u32) = .init(0),
 stop: std.atomic.Value(bool) = .init(false),
@@ -240,12 +244,13 @@ pub fn start(
     return host;
 }
 
-/// Stops and joins the worker and closes every state. Call once the GTK
-/// main loop has stopped (a queued result would reach a freed host).
+/// Stops and joins the worker, cancels any queued deliveries on the GTK
+/// main loop, and closes every state. Main thread only.
 pub fn shutdown(host: *Host) void {
     host.stop.store(true, .release);
     host.wake();
     host.thread.join();
+    host.cancelDeliveries();
     if (host.pending.submit) |request| request.destroy(host.gpa);
     loading.closeAll(host);
     host.extensions.deinit(host.gpa);
@@ -253,6 +258,18 @@ pub fn shutdown(host: *Host) void {
     host.gpa.free(host.config_dir);
     host.gpa.free(host.data_dir);
     host.gpa.destroy(host);
+}
+
+fn cancelDeliveries(host: *Host) void {
+    var cursor = host.pending_deliveries;
+    host.pending_deliveries = null;
+    while (cursor) |delivery| {
+        const next = delivery.next;
+        if (delivery.source_id != 0) _ = c.g_source_remove(delivery.source_id);
+        destroyAnswer(host.gpa, delivery.answer);
+        host.gpa.destroy(delivery);
+        cursor = next;
+    }
 }
 
 /// The style loaded before init.lua from the next reload on: a folder in
@@ -457,26 +474,78 @@ pub const Answer = union(enum) {
     root: *RootResult,
 };
 
-const Delivery = struct { host: *Host, answer: Answer };
+fn destroyAnswer(gpa: std.mem.Allocator, answer: Answer) void {
+    switch (answer) {
+        inline else => |result| result.destroy(gpa),
+    }
+}
+
+const Delivery = struct {
+    host: *Host,
+    answer: Answer,
+    source_id: c_uint = 0,
+    prev: ?*Delivery = null,
+    next: ?*Delivery = null,
+};
+
+fn unlinkDelivery(host: *Host, delivery: *Delivery) void {
+    if (delivery.prev) |prev| {
+        prev.next = delivery.next;
+    } else if (host.pending_deliveries == delivery) {
+        host.pending_deliveries = delivery.next;
+    }
+    if (delivery.next) |next| next.prev = delivery.prev;
+    delivery.prev = null;
+    delivery.next = null;
+}
 
 /// Hands `answer` to its callback on the GTK main loop. Worker thread only.
 pub fn deliver(host: *Host, answer: Answer) void {
+    if (host.stop.load(.acquire)) {
+        destroyAnswer(host.gpa, answer);
+        return;
+    }
     const delivery = host.gpa.create(Delivery) catch {
         log.warn("out of memory: an answer for the window is dropped", .{});
-        switch (answer) {
-            inline else => |result| result.destroy(host.gpa),
-        }
+        destroyAnswer(host.gpa, answer);
         return;
     };
     delivery.* = .{ .host = host, .answer = answer };
-    _ = c.g_idle_add(&deliverCallback, delivery);
+    host.delivery_lock.lockUncancelable(host.io);
+    if (host.stop.load(.acquire)) {
+        host.delivery_lock.unlock(host.io);
+        destroyAnswer(host.gpa, answer);
+        host.gpa.destroy(delivery);
+        return;
+    }
+    delivery.next = host.pending_deliveries;
+    if (host.pending_deliveries) |head| head.prev = delivery;
+    host.pending_deliveries = delivery;
+    const source_id = c.g_idle_add(&deliverCallback, delivery);
+    delivery.source_id = source_id;
+    if (source_id == 0) {
+        host.unlinkDelivery(delivery);
+        host.delivery_lock.unlock(host.io);
+        destroyAnswer(host.gpa, answer);
+        host.gpa.destroy(delivery);
+        return;
+    }
+    host.delivery_lock.unlock(host.io);
 }
 
 /// On the GTK main loop: hands the answer to its callback.
 fn deliverCallback(data: ?*anyopaque) callconv(.c) c.gboolean {
     const delivery: *Delivery = @ptrCast(@alignCast(data.?));
     const host = delivery.host;
+    host.delivery_lock.lockUncancelable(host.io);
+    host.unlinkDelivery(delivery);
+    const stopped = host.stop.load(.acquire);
+    host.delivery_lock.unlock(host.io);
     defer host.gpa.destroy(delivery);
+    if (stopped) {
+        destroyAnswer(host.gpa, delivery.answer);
+        return 0;
+    }
     const callbacks = host.callbacks;
     switch (delivery.answer) {
         .registry => |registry| callbacks.registry_callback(registry, callbacks.context),
@@ -1023,4 +1092,31 @@ test "rows are kept to a size, and lumen.exec's strings outlive its options" {
     defer ran.destroy(testing.allocator);
     try testing.expect(ran.error_message == null);
     try testing.expectEqualStrings("true", ran.items[0].title);
+}
+
+test "shutdown cancels queued deliveries without leaking or calling back" {
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const folder = try os.tmpDirPath(&test_dir, &path_buffer);
+    try writeTestFile(folder, "extensions/hi/init.lua",
+        \\return lumen.extension { commands = { { name = "hi", title = "Hi", items = { "a" } } } }
+    );
+    var probe: Probe = .{};
+    defer probe.deinit();
+    const host = try testHost(&probe, folder);
+    host.reload();
+    // Wait until the worker has enqueued the delivery onto the main loop
+    // without pumping GLib, so shutdown must cancel and free it.
+    const until_ns = os.monotonicNs() + 5 * std.time.ns_per_s;
+    while (os.monotonicNs() < until_ns) {
+        host.delivery_lock.lockUncancelable(host.io);
+        const queued = host.pending_deliveries != null;
+        host.delivery_lock.unlock(host.io);
+        if (queued) break;
+        os.sleepUs(1000);
+    }
+    host.shutdown();
+    while (c.g_main_context_iteration(null, 0) != 0) {}
+    try testing.expect(probe.registry == null);
 }

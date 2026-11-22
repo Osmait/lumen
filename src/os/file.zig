@@ -46,14 +46,22 @@ pub fn readHead(path: [*:0]const u8, head_buffer: []u8) []const u8 {
 }
 
 /// Lumen's own files (indexes, extracted text) hold the names and text of
-/// the user's documents: owner-only, never world-readable.
+/// the user's documents: owner-only, never world-readable, never following
+/// a symbolic link.
 pub fn writeFile(path: [*:0]const u8, data: []const u8) Error!void {
     const fd: i32 = @intCast(try check(linux.open(
         path,
-        .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true },
+        .{
+            .ACCMODE = .WRONLY,
+            .CREAT = true,
+            .TRUNC = true,
+            .NOFOLLOW = true,
+            .CLOEXEC = true,
+        },
         0o600,
     )));
     defer close(fd);
+    _ = try check(linux.fchmod(fd, 0o600));
     try writeAll(fd, data);
 }
 
@@ -119,9 +127,12 @@ pub fn writeFileAtomic(path: []const u8, data: []const u8) Error!void {
     try file.commit();
 }
 
-/// `writeFileAtomic` a piece at a time: `<path>.tmp`, written in order, a
-/// header patched in at the end, fsync and rename on `commit`; `abort` (or
-/// a failed commit) leaves `path` as it was.
+/// Per-process sequence for unique temporary file names in `AtomicFile`.
+var temp_sequence: std.atomic.Value(u64) = .init(0);
+
+/// `writeFileAtomic` a piece at a time: a unique `<path>.<pid>.<seq>.tmp`,
+/// written in order, a header patched in at the end, fsync and rename on
+/// `commit`; `abort` (or a failed commit) leaves `path` as it was.
 pub const AtomicFile = struct {
     fd: i32,
     temporary_path: [std.Io.Dir.max_path_bytes]u8 = undefined,
@@ -129,26 +140,18 @@ pub const AtomicFile = struct {
     temporary_path_len: usize = 0,
     final_path_len: usize = 0,
 
+    const create_attempts_max = 64;
+
     pub fn create(path: []const u8) Error!AtomicFile {
         var file: AtomicFile = .{ .fd = -1 };
         const print = std.mem.printSentinel;
         const final_path = print(&file.final_path, "{s}", .{path}, 0) catch {
             return error.NameTooLong;
         };
-        const temporary_path = print(&file.temporary_path, "{s}.tmp", .{path}, 0) catch {
-            return error.NameTooLong;
-        };
         assert(final_path.len > 0);
-        assert(temporary_path.len > final_path.len);
         file.final_path_len = final_path.len;
-        file.temporary_path_len = temporary_path.len;
-        file.fd = try openTemporary(temporary_path);
-        return file;
-    }
 
-    /// A new file, never one that is there: `O_TRUNC` wrote through a link
-    /// planted at `<path>.tmp`. One left by a crash midway is removed first.
-    fn openTemporary(temporary_path: [*:0]const u8) Error!i32 {
+        const pid = linux.getpid();
         const flags: linux.O = .{
             .ACCMODE = .WRONLY,
             .CREAT = true,
@@ -156,13 +159,27 @@ pub const AtomicFile = struct {
             .NOFOLLOW = true,
             .CLOEXEC = true,
         };
-        var result = linux.open(temporary_path, flags, 0o600);
-        if (linux.errno(result) == .EXIST) {
-            // Whether the unlink worked, the second open tells.
-            _ = linux.unlink(temporary_path);
-            result = linux.open(temporary_path, flags, 0o600);
+        var last_result: usize = 0;
+        for (0..create_attempts_max) |_| {
+            const seq = temp_sequence.fetchAdd(1, .monotonic);
+            const temporary_path = print(
+                &file.temporary_path,
+                "{s}.{d}.{d}.tmp",
+                .{ path, pid, seq },
+                0,
+            ) catch return error.NameTooLong;
+            assert(temporary_path.len > final_path.len);
+            const result = linux.open(temporary_path, flags, 0o600);
+            if (linux.errno(result) == .EXIST) {
+                last_result = result;
+                continue;
+            }
+            file.temporary_path_len = temporary_path.len;
+            file.fd = @intCast(try check(result));
+            return file;
         }
-        return @intCast(try check(result));
+        _ = try check(last_result);
+        unreachable;
     }
 
     pub fn write(file: *AtomicFile, data: []const u8) Error!void {
@@ -326,41 +343,81 @@ test "atomic writes replace the file and leave no temporary behind" {
         try std.mem.printSentinel(&path_z_buffer, "{s}", .{path}, 0),
         &head_buffer,
     ));
-    const temporary = try std.mem.printSentinel(&path_z_buffer, "{s}.tmp", .{path}, 0);
-    try std.testing.expect(!os.exists(temporary));
+    var dir_z_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_fd = try os.openDir(try std.mem.printSentinel(&dir_z_buffer, "{s}", .{dir}, 0));
+    defer close(dir_fd);
+    var iter: os.DirIter = .{ .fd = dir_fd };
+    var count: usize = 0;
+    while (try iter.next()) |entry| {
+        try std.testing.expectEqualStrings("f.conf", entry.name);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
     // A directory that is not there: an error, and nothing left over.
     const bad = try std.mem.print(&path_buffer, "{s}/missing/f.conf", .{dir});
     try std.testing.expectError(error.NotFound, writeFileAtomic(bad, "x"));
 }
 
-test "atomic writes never write through a temporary left in the way" {
+test "atomic writes use unique temporaries and never clobber concurrent writers or links" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
     var dir_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const dir = try os.tmpDirPath(&tmp_dir, &dir_buffer);
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try std.mem.print(&path_buffer, "{s}/f.idx", .{dir});
-    var temporary_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const temporary = try std.mem.printSentinel(&temporary_buffer, "{s}.tmp", .{path}, 0);
     var victim_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const victim = try std.mem.printSentinel(&victim_buffer, "{s}/victim", .{dir}, 0);
     var head_buffer: [16]u8 = undefined;
     var path_z_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path_z = try std.mem.printSentinel(&path_z_buffer, "{s}", .{path}, 0);
 
-    // A link to someone else's file: replaced, the file untouched.
+    // Plant a symlink at the very next temporary name: create skips it without
+    // touching the symlink or its target.
     try writeFile(victim, "keep");
-    try expectSuccess(linux.symlink(victim, temporary));
+    var planted_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const next_seq = temp_sequence.load(.monotonic);
+    const planted = try std.mem.printSentinel(
+        &planted_buffer,
+        "{s}.{d}.{d}.tmp",
+        .{ path, linux.getpid(), next_seq },
+        0,
+    );
+    try expectSuccess(linux.symlink(victim, planted));
     try writeFileAtomic(path, "new");
     try std.testing.expectEqualStrings("keep", readHead(victim, &head_buffer));
     try std.testing.expectEqualStrings("new", readHead(path_z, &head_buffer));
-    try std.testing.expect(!os.exists(temporary));
+    // Two concurrent AtomicFiles targeting the same path get distinct temp files.
+    var first = try AtomicFile.create(path);
+    errdefer first.abort();
+    var second = try AtomicFile.create(path);
+    errdefer second.abort();
+    try first.write("first");
+    try second.write("second");
+    try first.commit();
+    try second.commit();
+    try std.testing.expectEqualStrings("second", readHead(path_z, &head_buffer));
+}
 
-    // A crash's leftover: removed, the write goes through.
-    try writeFile(temporary, "half a file");
-    try writeFileAtomic(path, "newer");
-    try std.testing.expectEqualStrings("newer", readHead(path_z, &head_buffer));
-    try std.testing.expect(!os.exists(temporary));
+test "writeFile enforces 0600 on existing files and refuses symlinks" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var dir_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try os.tmpDirPath(&tmp_dir, &dir_buffer);
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const file = try std.mem.printSentinel(&path_buffer, "{s}/secret", .{dir}, 0);
+    try writeFile(file, "old");
+    try expectSuccess(linux.chmod(file, 0o644));
+    try writeFile(file, "new");
+    var stx: linux.Statx = undefined;
+    try expectSuccess(linux.statx(linux.AT.FDCWD, file, 0, .{ .MODE = true }, &stx));
+    try std.testing.expectEqual(@as(u16, 0o600), stx.mode & 0o777);
+
+    var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const link = try std.mem.printSentinel(&link_buffer, "{s}/link", .{dir}, 0);
+    try expectSuccess(linux.symlink(file, link));
+    try std.testing.expectError(error.Syscall, writeFile(link, "evil"));
+    var head_buffer: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("new", readHead(file, &head_buffer));
 }
 
 test "readUpTo tells a failed read from the end of the file" {
