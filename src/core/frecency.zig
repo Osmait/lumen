@@ -25,7 +25,9 @@ pub fn value(count: u32, last_used: i64, now: i64) f64 {
 /// Ranking bonus added to a fuzzy score: grows with use but saturates so a
 /// clearly better text match still wins.
 pub fn boost(frecency: f64) i32 {
-    if (frecency <= 0) return 0;
+    // Written so that NaN gets nothing: `NaN <= 0` is false, and it got
+    // the most.
+    if (!(frecency > 0)) return 0;
     const result: i32 = @intFromFloat(@min(@log2(1 + frecency) * boost_per_doubling, boost_max));
     assert(result >= 0);
     assert(result <= boost_max);
@@ -40,4 +42,10 @@ test "recent beats old with same count" {
 test "boost saturates" {
     try std.testing.expectEqual(@as(i32, boost_max), boost(1e9));
     try std.testing.expectEqual(@as(i32, 0), boost(0));
+}
+
+test "a NaN frecency gets no boost, not the most" {
+    try std.testing.expectEqual(@as(i32, 0), boost(std.math.nan(f64)));
+    try std.testing.expectEqual(@as(i32, 0), boost(-1));
+    try std.testing.expect(boost(10) > 0);
 }

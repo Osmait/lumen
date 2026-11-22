@@ -21,14 +21,19 @@ const Pool = @This();
 io: Io,
 gpa: std.mem.Allocator,
 threads: []std.Thread,
+// Each counter on a cache line of its own: every worker takes items from
+// `next` while the others ack or wait, and sharing one line made each
+// fetchAdd bounce it between cores.
 /// Bumped to wake the workers for a new run.
-generation: std.atomic.Value(u32) = .init(0),
-next: std.atomic.Value(u32) = .init(0),
-done: std.atomic.Value(u32) = .init(0),
-/// Workers that have finished the current generation. A run returns only
-/// once every worker has, so none is still inside `work` (reading `total`,
+generation: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
+/// The next item to take.
+next: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
+/// Workers that have finished the current generation. A worker acks once
+/// its `work` returned, so all its items are done: with the caller's own
+/// `work` returned too, every item is (no separate count of them is
+/// needed). Nor is any worker still inside `work` (reading `total`,
 /// `context`, `callback`) when the next run rewrites them.
-acked: std.atomic.Value(u32) = .init(0),
+acked: std.atomic.Value(u32) align(std.atomic.cache_line) = .init(0),
 total: u32 = 0,
 context: *anyopaque = undefined,
 callback: *const fn (*anyopaque, usize) void = undefined,
@@ -153,7 +158,7 @@ pub fn run(
         for (0..count) |i| callback(context, i);
         return;
     }
-    // `total`, `next` and `done` are u32.
+    // `total` and `next` are u32.
     assert(count <= std.math.maxInt(u32));
     pool.run_lock.lockUncancelable(pool.io);
     defer pool.run_lock.unlock(pool.io);
@@ -161,41 +166,34 @@ pub fn run(
     pool.context = @ptrCast(@constCast(context));
     pool.callback = Erased.call;
     pool.total = @intCast(count);
-    pool.done.store(0, .seq_cst);
-    pool.next.store(0, .seq_cst);
-    pool.acked.store(0, .seq_cst);
-    _ = pool.generation.fetchAdd(1, .seq_cst);
+    // Published to the workers by the release of `generation` below.
+    pool.next.store(0, .monotonic);
+    pool.acked.store(0, .monotonic);
+    _ = pool.generation.fetchAdd(1, .release);
     pool.io.futexWake(u32, &pool.generation.raw, std.math.maxInt(u32));
 
     pool.work();
-    while (true) {
-        const done_count = pool.done.load(.seq_cst);
-        if (done_count == pool.total) break;
-        assert(done_count < pool.total);
-        pool.io.futexWaitUncancelable(u32, &pool.done.raw, done_count);
-    }
     // Every worker wakes for every generation (none can skip one: the next
-    // run waits here first), so this count always reaches the total.
+    // run waits here first), so this count always reaches the total. Its
+    // acquire makes what the workers' items wrote visible here.
     const workers: u32 = @intCast(pool.threads.len);
     while (true) {
-        const acked_count = pool.acked.load(.seq_cst);
+        const acked_count = pool.acked.load(.acquire);
         if (acked_count == workers) break;
         assert(acked_count < workers);
         pool.io.futexWaitUncancelable(u32, &pool.acked.raw, acked_count);
     }
-    // Every item was taken, and done once.
-    assert(pool.next.load(.seq_cst) >= pool.total);
-    assert(pool.done.load(.seq_cst) == pool.total);
+    // Every item was taken.
+    assert(pool.next.load(.monotonic) >= pool.total);
 }
 
 fn work(pool: *Pool) void {
     while (true) {
-        const item = pool.next.fetchAdd(1, .seq_cst);
+        // Only hands out distinct items: what they write is ordered by
+        // `acked`, so no stronger ordering is needed here.
+        const item = pool.next.fetchAdd(1, .monotonic);
         if (item >= pool.total) return;
         pool.callback(pool.context, item);
-        if (pool.done.fetchAdd(1, .seq_cst) + 1 == pool.total) {
-            pool.io.futexWake(u32, &pool.done.raw, 1);
-        }
     }
 }
 
@@ -208,7 +206,7 @@ fn workerMain(pool: *Pool) void {
         seen = pool.generation.load(.acquire);
         if (pool.stopping.load(.acquire)) return;
         pool.work();
-        if (pool.acked.fetchAdd(1, .seq_cst) + 1 == pool.threads.len) {
+        if (pool.acked.fetchAdd(1, .release) + 1 == pool.threads.len) {
             pool.io.futexWake(u32, &pool.acked.raw, 1);
         }
     }

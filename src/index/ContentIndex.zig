@@ -29,6 +29,7 @@ const trigram_mask = content_format.trigram_mask;
 const decodeAll = content_format.decodeAll;
 const intersect = content_format.intersect;
 const sliceAt = content_format.sliceAt;
+const sliceAtConst = content_format.sliceAtConst;
 const dedupSorted = content_format.dedupSorted;
 const strictlyAscending = content_format.strictlyAscending;
 
@@ -257,8 +258,10 @@ pub fn parse(whole: Bytes, backing: format.Backing) error{BadIndex}!ContentIndex
 }
 
 /// Writes the index to `path_z` atomically (see `sys.writeFileAtomic`).
+/// Writes the index to `path_z`: its file up to `Header.size_total`, not
+/// whatever follows in `bytes` (what an aborted append left behind).
 pub fn save(index: *const ContentIndex, path_z: [:0]const u8) sys.Error!void {
-    try sys.writeFileAtomic(path_z, index.bytes);
+    try sys.writeFileAtomic(path_z, index.file);
 }
 
 pub fn open(path_z: [:0]const u8) (sys.Error || error{BadIndex})!ContentIndex {
@@ -271,7 +274,12 @@ pub fn open(path_z: [:0]const u8) (sys.Error || error{BadIndex})!ContentIndex {
 /// absent).
 fn list(index: *const ContentIndex, segment_index: usize, key: u32) []const u8 {
     const segment = index.segments[segment_index];
-    const keys = sliceAt(u32, index.bytes, segment.keys_offset, segment.keys_count);
+    // u64 in the file; checked to fit inside it by `checkSegment`.
+    const keys_offset: usize = @intCast(segment.keys_offset);
+    const keys_count: usize = @intCast(segment.keys_count);
+    const offsets_offset: usize = @intCast(segment.offsets_offset);
+    const postings_offset: usize = @intCast(segment.postings_offset);
+    const keys = sliceAtConst(u32, index.bytes, keys_offset, keys_count);
     var low: usize = 0;
     var high: usize = keys.len;
     while (low < high) {
@@ -280,8 +288,7 @@ fn list(index: *const ContentIndex, segment_index: usize, key: u32) []const u8 {
     }
     if (low == keys.len) return &.{};
     if (keys[low] != key) return &.{};
-    const offsets = sliceAt(u32, index.bytes, segment.offsets_offset, segment.keys_count + 1);
-    const postings_offset = segment.postings_offset;
+    const offsets = sliceAtConst(u32, index.bytes, offsets_offset, keys_count + 1);
     return index.bytes[postings_offset + offsets[low] .. postings_offset + offsets[low + 1]];
 }
 
@@ -314,11 +321,12 @@ pub fn candidates(
     defer docs_next.deinit(gpa);
 
     for (0..index.segments_count) |segment_index| {
-        var some_list_empty = false;
-        for (keys_unique, lists) |key, *list_of_key| {
+        // A key with no list here: the segment has no candidate, and the
+        // keys after it need no looking up.
+        const some_list_empty = for (keys_unique, lists) |key, *list_of_key| {
             list_of_key.* = index.list(segment_index, key);
-            if (list_of_key.len == 0) some_list_empty = true;
-        }
+            if (list_of_key.len == 0) break true;
+        } else false;
         if (some_list_empty) continue;
         // Shortest list first: every intersection only shrinks the set.
         std.mem.sort([]const u8, lists, {}, struct {
@@ -383,8 +391,8 @@ fn checkSegment(file: BytesConst, segment: SegmentEntry) error{BadIndex}!void {
     if (keys_offset < header_size or offsets_offset < header_size or postings_offset < header_size) {
         return error.BadIndex;
     }
-    const keys = sliceAt(u32, @constCast(file), keys_offset, keys_count);
-    const offsets = sliceAt(u32, @constCast(file), offsets_offset, keys_count + 1);
+    const keys = sliceAtConst(u32, file, keys_offset, keys_count);
+    const offsets = sliceAtConst(u32, file, offsets_offset, keys_count + 1);
     if (!strictlyAscending(u32, keys)) return error.BadIndex;
     // Ascending: the last key is the largest.
     if (keys_count > 0 and keys[keys_count - 1] > trigram_mask) return error.BadIndex;

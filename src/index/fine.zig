@@ -98,15 +98,17 @@ pub fn score(name: []const u8, query: []const u8) ?i32 {
         class_before = class;
     }
 
-    // The rows of the previous query letter and of the current one.
-    var previous: Row = undefined;
-    var current: Row = undefined;
+    // The rows of the previous query letter and of the current one, swapped
+    // by pointer after each letter (copying three arrays per letter was).
+    var rows: [2]Row = undefined;
+    var previous: *Row = &rows[0];
+    var current: *Row = &rows[1];
     for (0..query.len) |i| {
         var gapped: i32 = unreached;
         var in_gap = false;
         for (0..folded_length) |j| {
             const cell: Cell = if (folded[j] == query[i])
-                matchCell(&previous, bonus[j], i, j)
+                matchCell(previous, bonus[j], i, j)
             else
                 .{ .score = unreached, .run_bonus = 0 };
             current.matched[j] = cell.score;
@@ -122,9 +124,7 @@ pub fn score(name: []const u8, query: []const u8) ?i32 {
             }
             current.gapped[j] = gapped;
         }
-        @memcpy(previous.matched[0..folded_length], current.matched[0..folded_length]);
-        @memcpy(previous.gapped[0..folded_length], current.gapped[0..folded_length]);
-        @memcpy(previous.run_bonus[0..folded_length], current.run_bonus[0..folded_length]);
+        std.mem.swap(*Row, &previous, &current);
     }
 
     var best: i32 = unreached;

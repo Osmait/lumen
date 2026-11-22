@@ -597,13 +597,13 @@ const paste_focus_wait_ms = 120;
 const active_window_answer_bytes_max = 64 * 1024;
 
 fn pasteNow() void {
-    _ = sendPaste(null);
+    sendPaste();
 }
 
 /// Runs once Lumen has hidden and the previous window has focus again: that
 /// window decides the chord (terminals paste with Ctrl+Shift+V; Ctrl+V there
 /// is a literal ^V or a terminal's own binding).
-fn sendPaste(_: ?*anyopaque) callconv(.c) c.gboolean {
+fn sendPaste() void {
     var answer_buffer: [active_window_answer_bytes_max]u8 = undefined;
     var answer_allocator: std.heap.FixedBufferAllocator = .init(&answer_buffer);
     const window = hypr.activeWindow(answer_allocator.allocator());
@@ -624,7 +624,6 @@ fn sendPaste(_: ?*anyopaque) callconv(.c) c.gboolean {
             "ctrl",
         }),
     }
-    return 0;
 }
 
 pub const Chord = enum { ctrl_v, ctrl_shift_v };

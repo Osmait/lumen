@@ -111,7 +111,8 @@ pub fn main(init: std.process.Init) !void {
     var arguments_iterator = init.minimal.args.iterate();
     while (arguments_iterator.next()) |argument| try argv.append(init.gpa, argument.ptr);
 
-    const arguments = argv.items[1..];
+    // A process can be started with no argv at all (execve with argc 0).
+    const arguments = if (argv.items.len > 1) argv.items[1..] else argv.items[0..0];
     const first_flag: ?cli.Flag = if (arguments.len > 0)
         cli.parse(std.mem.span(arguments[0].?))
     else
