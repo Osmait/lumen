@@ -41,11 +41,14 @@ pub fn stamp(config_dir: []const u8, style: []const u8) u64 {
 /// Past it, edits to the files left out do not reload anything.
 const stamp_entries_max = 1024;
 
-/// The .lua files directly in `folder`.
+/// The .lua files directly in `folder`. Each file is hashed on its own and
+/// the hashes summed: readdir's order is the file system's, and hashing in
+/// it made the same files stamp differently (a reload for nothing).
 fn hashLua(hasher: *std.hash.Wyhash, folder: [:0]const u8) void {
     hasher.update(folder);
     const folder_handle = c.g_dir_open(folder.ptr, 0, null) orelse return;
     defer c.g_dir_close(folder_handle);
+    var files_sum: u64 = 0;
     var entries_count: usize = 0;
     while (c.g_dir_read_name(folder_handle)) |file_name_c| : (entries_count += 1) {
         if (entries_count == stamp_entries_max) break;
@@ -54,8 +57,11 @@ fn hashLua(hasher: *std.hash.Wyhash, folder: [:0]const u8) void {
         var path_buffer: [4096]u8 = undefined;
         const path = std.mem.printSentinel(&path_buffer, "{s}/{s}", .{ folder, file_name }, 0) catch
             continue;
-        hashFile(hasher, path);
+        var file_hasher: std.hash.Wyhash = .init(0);
+        hashFile(&file_hasher, path);
+        files_sum +%= file_hasher.final();
     }
+    hasher.update(std.mem.asBytes(&files_sum));
 }
 
 /// The .lua files in each folder of <config>/<kind>.
@@ -65,6 +71,7 @@ fn hashFolders(hasher: *std.hash.Wyhash, config_dir: []const u8, kind: []const u
         return;
     const folder_handle = c.g_dir_open(top.ptr, 0, null) orelse return;
     defer c.g_dir_close(folder_handle);
+    var folders_sum: u64 = 0;
     var entries_count: usize = 0;
     while (c.g_dir_read_name(folder_handle)) |folder_name_c| : (entries_count += 1) {
         if (entries_count == stamp_entries_max) break;
@@ -76,8 +83,12 @@ fn hashFolders(hasher: *std.hash.Wyhash, config_dir: []const u8, kind: []const u
             .{ top, folder_name },
             0,
         ) catch continue;
-        hashLua(hasher, folder);
+        // Summed, as in `hashLua`: the folders' order is readdir's too.
+        var folder_hasher: std.hash.Wyhash = .init(0);
+        hashLua(&folder_hasher, folder);
+        folders_sum +%= folder_hasher.final();
     }
+    hasher.update(std.mem.asBytes(&folders_sum));
 }
 
 fn hashFile(hasher: *std.hash.Wyhash, path: [:0]const u8) void {

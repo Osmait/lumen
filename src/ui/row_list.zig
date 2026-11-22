@@ -15,6 +15,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const c = @import("c");
+const core = @import("core");
 const gtk = @import("gtk.zig");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
@@ -367,10 +368,29 @@ pub fn select(ui: *Ui, row_index: ?usize) void {
     }
 }
 
+/// The longest hint or footer action shown, in bytes: a failure message
+/// is cut there (GTK ellipsizes it far sooner anyway).
+const hint_bytes_max = 1024;
+
+/// `parts` joined into `buffer`, cut to what fits as valid UTF-8, with its
+/// terminating zero. On the stack: these run on every arrow key, and the
+/// query arena they used to take from is only freed when the query changes.
+fn hintText(buffer: *[hint_bytes_max]u8, parts: []const []const u8) [:0]const u8 {
+    var length: usize = 0;
+    for (parts) |part| {
+        const take = @min(part.len, buffer.len - 1 - length);
+        @memcpy(buffer[length..][0..take], part[0..take]);
+        length += take;
+    }
+    length = core.utf8.validPrefix(buffer[0..length]).len;
+    buffer[length] = 0;
+    return buffer[0..length :0];
+}
+
 /// The footer's "what Enter does" (hidden with nothing selected).
 fn setFooterAction(ui: *Ui, text: []const u8, tone: HintTone) void {
-    const text_z = ui.query_arena.allocator().dupeSentinel(u8, text, 0) catch return;
-    ui.footer.setAction(text_z, tone);
+    var buffer: [hint_bytes_max]u8 = undefined;
+    ui.footer.setAction(hintText(&buffer, &.{text}), tone);
 }
 
 /// The selected row's hint: "Open ↵", or a warning waiting for Enter (and
@@ -386,15 +406,14 @@ pub fn setHint(ui: *Ui, text: []const u8, tone: HintTone) void {
     // Beside the detail pane the list is narrow: the action's name would
     // squeeze the title to a few letters, so only the key shows there.
     const narrow = gtk.isVisible(ui.detail.box);
-    const arena = ui.query_arena.allocator();
+    var buffer: [hint_bytes_max]u8 = undefined;
     const shown = if (warn)
-        text
+        hintText(&buffer, &.{text})
     else if (narrow)
-        window_layout.enter_key_text
+        hintText(&buffer, &.{window_layout.enter_key_text})
     else
-        arena.print("{s}  " ++ window_layout.enter_key_text, .{text}) catch return;
-    const text_z = arena.dupeSentinel(u8, shown, 0) catch return;
-    c.gtk_label_set_text(hint, text_z.ptr);
+        hintText(&buffer, &.{ text, "  ", window_layout.enter_key_text });
+    c.gtk_label_set_text(hint, shown.ptr);
     gtk.setClass(hint, widgets.css_class.warn, warn);
     gtk.setVisible(hint, true);
 }
@@ -480,4 +499,16 @@ pub fn onGridActivated(
     select(ui, @intCast(cell_index));
     const item = ui.selectedItem() orelse return;
     ui.performEntry(item_mod.actionsFor(item)[0]);
+}
+
+test "hint text is joined on the stack, cut as valid UTF-8" {
+    var buffer: [hint_bytes_max]u8 = undefined;
+    try std.testing.expectEqualStrings("Open  ↵", hintText(&buffer, &.{ "Open", "  ", "↵" }));
+    // Longer than the buffer: cut before a split character, zero-terminated.
+    var long: [hint_bytes_max * 2]u8 = undefined;
+    for (0..hint_bytes_max) |i| @memcpy(long[i * 2 ..][0..2], "é");
+    const cut = hintText(&buffer, &.{&long});
+    try std.testing.expect(cut.len < hint_bytes_max);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(cut));
+    try std.testing.expectEqual(@as(u8, 0), cut.ptr[cut.len]);
 }

@@ -305,9 +305,12 @@ pub fn fill(ui: *Ui, arena: std.mem.Allocator, query: []const u8) void {
     }
     const Hit = struct { score: i32, line_index: u32 };
     var hits: std.ArrayList(Hit) = .empty;
+    // Folded once: up to 200 000 lines, two fields each, per keystroke.
+    var query_buffer: [core.fuzzy.text_chars_max]u8 = undefined;
+    const query_prepared = core.fuzzy.prepare(&query_buffer, query);
     for (lines, 0..) |line, i| {
         const fields = [_][]const u8{ matched(line.text), matched(line.meta) };
-        const score = core.fuzzy.scoreFields(query, &fields);
+        const score = core.fuzzy.scoreFieldsQuery(query_prepared, &fields);
         if (score == core.fuzzy.no_match) continue;
         hits.append(arena, .{ .score = score, .line_index = @intCast(i) }) catch break;
     }

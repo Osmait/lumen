@@ -133,8 +133,9 @@ pub fn showContentDetail(ui: *Ui, item: *const Item) void {
     gtk.setVisible(ui.detail.picture, false);
 
     const service = ui.contents orelse return;
-    // The document as the search found it: no stat on the UI thread.
-    const text = service.readText(
+    // The document as the search found it: no stat on the UI thread. On a
+    // network or FUSE mount, not even a read: the snippet shows instead.
+    const text = if (onSlowMount(ui, file.path)) item.detail else service.readText(
         arena,
         file.path,
         item.time_s,
@@ -229,8 +230,11 @@ pub fn showFileDetail(ui: *Ui, item: *const Item) void {
     // checks again on the descriptor it reads).
     const image_type = c.g_content_type_is_a(content_type, mime_image_any) != 0 or
         std.mem.startsWith(u8, std.mem.span(content_type), mime_image_prefix);
-    const image = image_type and os.isRegular(file.path);
-    const info = os.info(file.path);
+    // A network or FUSE mount can hang a stat or a read: nothing of the
+    // file is looked at, only its name.
+    const slow = onSlowMount(ui, file.path);
+    const image = image_type and !slow and os.isRegular(file.path);
+    const info = if (slow) null else os.info(file.path);
     gtk.setVisible(ui.detail.picture, image);
     if (image) {
         showImage(&ui.detail, file.path, if (info) |file_info| file_info.mtime else 0);
@@ -240,7 +244,9 @@ pub fn showFileDetail(ui: *Ui, item: *const Item) void {
 
     // Text preview: the head of anything that is valid UTF-8.
     var text: []const u8 = "";
-    if (!image and !file.is_dir) {
+    if (slow) {
+        text = slow_mount_text;
+    } else if (!image and !file.is_dir) {
         const head = os.readHead(file.path, arena.alloc(u8, preview_head_bytes) catch return);
         const valid = core.utf8.validPrefix(head);
         // A character cut at the end of the head leaves bytes that are not
@@ -270,6 +276,15 @@ pub fn showFileDetail(ui: *Ui, item: *const Item) void {
 
 /// An Information value that does not apply or could not be read.
 const no_value = "—";
+/// The preview of a file on a mount that can hang (`onSlowMount`).
+const slow_mount_text = "On a network or FUSE mount: no preview";
+
+/// Whether `path` is on a mount that can hang a stat or a read, as the file
+/// index knows them; false without it.
+fn onSlowMount(ui: *Ui, path: []const u8) bool {
+    const files = ui.files orelse return false;
+    return files.onSlowMount(path);
+}
 /// How much of a file the preview reads: enough for `preview_lines`.
 const preview_head_bytes = 4096;
 /// Plain detail text (a clipboard entry, an extension row) is cut to this

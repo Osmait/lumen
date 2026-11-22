@@ -38,7 +38,11 @@ search_pool: *Pool,
 build_pool: *Pool,
 options: Options,
 lock: Io.RwLock = .init,
-index: ?content.Index = null,
+/// The index in use, swapped under `lock`. A search takes a reference
+/// (`Shared.acquire`) and lets the lock go before it reads any file: the
+/// swap no longer waits for up to `candidates_verified_max` reads, nor
+/// does every reader queued behind it (`status`, the next query).
+index: ?*Shared = null,
 stop: std.atomic.Value(bool) = .init(false),
 wake: std.atomic.Value(u32) = .init(0),
 thread: ?std.Thread = null,
@@ -160,8 +164,11 @@ pub fn startWith(
     // documents, so close it before anything else.
     sys.makePrivate(cache_dir);
     // Absent or unreadable: built from scratch by the first refresh.
-    service.index = content.Index.open(service.cache_path) catch null;
-    errdefer if (service.index) |*index| index.deinit(gpa);
+    if (content.Index.open(service.cache_path)) |opened| {
+        // Out of memory: built from scratch, as if there were none.
+        service.index = Shared.create(gpa, opened) catch null;
+    } else |_| {}
+    errdefer if (service.index) |shared| shared.release();
     service.thread = try std.Thread.spawn(.{}, run, .{service});
     // A thread without a name works the same; only `top` shows it.
     service.thread.?.setName(io, "lm-content") catch {};
@@ -172,12 +179,54 @@ pub fn shutdown(service: *ContentService) void {
     service.stop.store(true, .release);
     service.poke();
     if (service.thread) |thread| thread.join();
-    if (service.index) |*index| index.deinit(service.gpa);
+    if (service.index) |shared| shared.release();
     service.worker.retry_arena.deinit();
     service.gpa.free(service.root);
     service.gpa.free(service.cache_path);
     service.text_cache.deinit(service.gpa);
     service.gpa.destroy(service);
+}
+
+/// An index and the references to it: the service's own, and one per
+/// search reading it. The last one let go frees it.
+const Shared = struct {
+    index: content.Index,
+    gpa: std.mem.Allocator,
+    refs: std.atomic.Value(u32) = .init(1),
+
+    /// Takes `index`; on error it is freed.
+    fn create(gpa: std.mem.Allocator, index: content.Index) std.mem.Allocator.Error!*Shared {
+        const shared = gpa.create(Shared) catch |err| {
+            var dropped = index;
+            dropped.deinit(gpa);
+            return err;
+        };
+        shared.* = .{ .index = index, .gpa = gpa };
+        return shared;
+    }
+
+    /// Under `ContentService.lock` (shared at least): the index cannot be
+    /// swapped and let go meanwhile.
+    fn acquire(shared: *Shared) void {
+        const before = shared.refs.fetchAdd(1, .monotonic);
+        assert(before > 0);
+    }
+
+    fn release(shared: *Shared) void {
+        const before = shared.refs.fetchSub(1, .acq_rel);
+        assert(before > 0);
+        if (before != 1) return;
+        const gpa = shared.gpa;
+        shared.index.deinit(gpa);
+        gpa.destroy(shared);
+    }
+};
+
+/// The index in use, for the service thread (the only one that swaps it)
+/// or under `lock`.
+fn current(service: *const ContentService) ?*content.Index {
+    const shared = service.index orelse return null;
+    return &shared.index;
 }
 
 /// The window opened: check for changes soon (rate-limited).
@@ -208,7 +257,7 @@ pub const Status = struct {
 pub fn status(service: *ContentService) Status {
     service.lock.lockSharedUncancelable(service.io);
     defer service.lock.unlockShared(service.io);
-    const index: ?*const content.Index = if (service.index) |*index| index else null;
+    const index: ?*const content.Index = service.current();
     return .{
         .docs = if (index) |present| present.live() else 0,
         .building = service.counters.building.load(.acquire),
@@ -262,9 +311,16 @@ pub fn searchUntil(
     out: *std.ArrayList(Hit),
 ) std.mem.Allocator.Error!void {
     out.clearRetainingCapacity();
-    service.lock.lockSharedUncancelable(service.io);
-    defer service.lock.unlockShared(service.io);
-    const index = if (service.index) |*present| present else return;
+    // A reference, not the lock, keeps the index while files are read.
+    const shared = blk: {
+        service.lock.lockSharedUncancelable(service.io);
+        defer service.lock.unlockShared(service.io);
+        const shared = service.index orelse return;
+        shared.acquire();
+        break :blk shared;
+    };
+    defer shared.release();
+    const index = &shared.index;
     var matches: std.ArrayList(content.Match) = .empty;
     try content.search(
         index,
@@ -543,7 +599,7 @@ fn diff(
     docs: []content.DocIn,
 ) std.mem.Allocator.Error!Diff {
     service.assertWorkerThread();
-    const index = if (service.index) |*index| index else return .{ .gone = &.{}, .added = docs };
+    const index = service.current() orelse return .{ .gone = &.{}, .added = docs };
     var ids: std.StringHashMapUnmanaged(u32) = .empty;
     try ids.ensureTotalCapacity(arena, @intCast(index.live()));
     for (0..index.docs_count) |doc_index| {
@@ -625,7 +681,7 @@ fn indexedChanges(
     arena: std.mem.Allocator,
 ) std.mem.Allocator.Error!Diff {
     service.assertWorkerThread();
-    const index = &service.index.?;
+    const index = service.current().?;
     var gone: std.ArrayList(u32) = .empty;
     var added: std.ArrayList(content.DocIn) = .empty;
     var path_buffer: paths.Buffer = undefined;
@@ -715,12 +771,16 @@ fn refresh(service: *ContentService) void {
     }
     start_ns = sys.monotonicNs();
     const input: BuildInput = if (whole) .{ .whole = docs.? } else .{ .update = changed };
-    const fresh = service.buildNext(input) orelse return;
+    const built = service.buildNext(input) orelse return;
+    const fresh = Shared.create(service.gpa, built) catch {
+        log.warn("building the content index: out of memory", .{});
+        return;
+    };
     service.counters.build_ns_last.store(sys.monotonicNs() - start_ns, .monotonic);
     _ = service.counters.builds.fetchAdd(1, .release);
     if (!whole) _ = service.counters.updates.fetchAdd(1, .release);
 
-    var old = blk: {
+    const old = blk: {
         service.lock.lockUncancelable(service.io);
         defer service.lock.unlock(service.io);
         const old = service.index;
@@ -729,9 +789,11 @@ fn refresh(service: *ContentService) void {
     };
     service.commitListing(listed);
     service.commitRetry(extracted.retry);
-    if (old) |*old_index| {
-        service.text_cache.dropStale(old_index, changed.gone);
-        old_index.deinit(service.gpa);
+    if (old) |old_shared| {
+        // The service's reference: a search still reading it keeps it
+        // until it is done.
+        service.text_cache.dropStale(&old_shared.index, changed.gone);
+        old_shared.release();
     }
     if (whole) service.sweepText();
 }
@@ -782,7 +844,7 @@ const garbage_percent_max = 30;
 /// Whole when there is nothing to update, or when what updates leave
 /// behind (removed versions, small segments, unused bytes) has piled up.
 fn wantsWhole(service: *const ContentService, changed: Diff) bool {
-    const index = &(service.index orelse return true);
+    const index = service.current() orelse return true;
     const removed_count = index.docs_removed_count + changed.gone.len;
     const docs_count = index.docs_count + changed.added.len;
     if (removed_count * 100 > docs_count * service.options.removed_percent_max) return true;
@@ -814,7 +876,7 @@ const BuildStrategy = enum {
 fn buildStrategy(service: *const ContentService, input: BuildInput) BuildStrategy {
     service.assertWorkerThread();
     if (input == .whole) return .build_whole;
-    const index = &service.index.?;
+    const index = service.current().?;
     if (index.backing != .mapped) return .rewrite_file;
     if (service.worker.unsaved) return .rewrite_file;
     return .append_to_mapped_file;
@@ -885,7 +947,7 @@ fn buildNextToFile(
         },
         .update => |changed| changed,
     };
-    const index = &service.index.?;
+    const index = service.current().?;
     switch (strategy) {
         .build_whole => unreachable,
         .append_to_mapped_file => {
@@ -925,7 +987,7 @@ fn buildNextInMemory(
         .update => |changed| content.update(
             service.gpa,
             service.build_pool,
-            &service.index.?,
+            service.current().?,
             changed.gone,
             changed.added,
             reader,
@@ -938,7 +1000,7 @@ fn retrySave(service: *ContentService) void {
     service.assertWorkerThread();
     service.lock.lockSharedUncancelable(service.io);
     defer service.lock.unlockShared(service.io);
-    const index = service.index orelse return;
+    const index = service.current() orelse return;
     index.save(service.cache_path) catch |err| {
         log.warn("saving the content index: {t}", .{err});
         return;
@@ -951,7 +1013,7 @@ fn retrySave(service: *ContentService) void {
 /// thread: the one that writes the cache.
 fn sweepText(service: *ContentService) void {
     service.assertWorkerThread();
-    const index = &(service.index orelse return);
+    const index = service.current() orelse return;
     service.text_cache.sweep(service.gpa, index);
 }
 
@@ -1276,7 +1338,7 @@ test "content service: rebuilt whole once removed versions pile up" {
     // Whole again: nothing removed is left.
     service.lock.lockSharedUncancelable(service.io);
     defer service.lock.unlockShared(service.io);
-    try testing.expectEqual(@as(usize, 0), service.index.?.docs_removed_count);
+    try testing.expectEqual(@as(usize, 0), service.index.?.index.docs_removed_count);
 }
 
 test "content service: Office documents are extracted once per version" {
@@ -1481,8 +1543,11 @@ test "content service: a document whose extraction failed in passing is left out
     try testing.expectEqual(@as(usize, 1), service.worker.retry.len);
     try testing.expectEqualStrings(pdf, service.worker.retry[0].path);
     const reader: content.TextReader = .{ .read = textOf, .context = &service };
-    service.index = try content.build(testing.allocator, pool, kept, reader, null);
-    defer service.index.?.deinit(testing.allocator);
+    service.index = try Shared.create(
+        testing.allocator,
+        try content.build(testing.allocator, pool, kept, reader, null),
+    );
+    defer service.index.?.release();
 
     // The next check, though it lists nothing, tries it again.
     const changes_found = try service.indexedChanges(arena);
@@ -1495,4 +1560,27 @@ test "content service: a document whose extraction failed in passing is left out
     service.commitRetry(second.retry);
     try testing.expectEqual(@as(usize, 1), second.docs.len);
     try testing.expectEqual(@as(usize, 0), service.worker.retry.len);
+}
+
+test "a shared index outlives the service's reference while a search holds one" {
+    const gpa = testing.allocator;
+    const pool = try Pool.create(gpa, testing.io, 1);
+    defer pool.destroy();
+    const Empty = struct {
+        fn read(_: *anyopaque, _: content.DocIn, _: *std.ArrayList(u8), _: std.mem.Allocator) std.mem.Allocator.Error!bool {
+            return false;
+        }
+    };
+    var unused: u8 = 0;
+    const reader: content.TextReader = .{ .read = Empty.read, .context = &unused };
+    const docs = [_]content.DocIn{.{ .path = "/a", .mtime = 1, .size = 1 }};
+    const shared = try Shared.create(gpa, try content.build(gpa, pool, &docs, reader, null));
+    // A search takes its reference, then the service swaps and lets go of
+    // its own: the index stays readable (testing.allocator would report a
+    // use after free) until the search is done.
+    shared.acquire();
+    shared.release();
+    try testing.expectEqual(@as(usize, 1), shared.index.docs_count);
+    try testing.expectEqualStrings("/a", shared.index.path(0));
+    shared.release();
 }

@@ -40,6 +40,17 @@ pub fn findFold(hay: []const u8, needle: []const u8, from: usize) ?Span {
     return findFoldImpl(.raw, hay, needle, fold.foldedLen(needle), from);
 }
 
+/// `findFold` for a needle folded already (`fold.foldInto`/`foldAlloc`):
+/// a content query's words are folded once when it is split, and folding
+/// them again for each candidate, and each hit counted, was wasted work.
+pub fn findFolded(hay: []const u8, needle_folded: []const u8, from: usize) ?Span {
+    if (needle_folded.len == 0) return null;
+    // One byte per folded character.
+    const count = needle_folded.len;
+    if (fold.isAscii(needle_folded)) return findFoldImpl(.ascii, hay, needle_folded, count, from);
+    return findFoldImpl(.folded, hay, needle_folded, count, from);
+}
+
 const NeedleKind = enum {
     /// Folded, every byte < 0x80.
     ascii,
@@ -234,6 +245,21 @@ fn repeat(comptime pattern: []const u8, comptime count: usize) *const [pattern.l
         break :blk out;
     };
     return &done;
+}
+
+test "findFolded on a folded needle finds what findFold does" {
+    const hay = "Una ACCIÓN, otra acción y la Accion final; Über Ärger";
+    for ([_][]const u8{ "acción", "ACCION", "über", "ärger", "final", "zz" }) |needle| {
+        var folded_buffer: [64]u8 = undefined;
+        const folded = fold.foldInto(&folded_buffer, needle);
+        var from: usize = 0;
+        while (true) {
+            const expected = findFold(hay, needle, from);
+            const got = findFolded(hay, folded, from);
+            try std.testing.expectEqual(expected, got);
+            from = (expected orelse break).end;
+        }
+    }
 }
 
 test "folded search: accents and case, both ways, positions in the original" {

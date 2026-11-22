@@ -220,6 +220,17 @@ pub fn shutdown(service: *Service) void {
     service.gpa.destroy(service);
 }
 
+/// Whether `path` is on a mount that can hang a stat (`sys.slowMounts`,
+/// under the indexed root): the UI thread must not read or stat it.
+pub fn onSlowMount(service: *Service, path: []const u8) bool {
+    service.lock.lockSharedUncancelable(service.io);
+    defer service.lock.unlockShared(service.io);
+    for (service.live.slow_mounts) |mount| {
+        if (sys.isAtOrBelow(path, mount)) return true;
+    }
+    return false;
+}
+
 /// Top `limit` files for `query`; paths live in `arena`.
 pub fn search(
     service: *Service,

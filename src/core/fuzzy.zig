@@ -12,7 +12,20 @@ pub const no_match: i32 = std.math.minInt(i32);
 
 /// Longest text (and query) compared, in folded characters; the rest of a
 /// longer one is ignored.
-const text_chars_max = 2048;
+pub const text_chars_max = 2048;
+
+/// A query folded once (`prepare`), for scoring it against many texts:
+/// dmenu folded it again for every field of every line, up to 400 000
+/// times per keystroke on the GTK thread.
+pub const Query = struct {
+    folded: []const u8,
+};
+
+/// `query` folded into `buffer`, ready for `scoreQuery` and
+/// `scoreFieldsQuery`; it lives as long as `buffer`.
+pub fn prepare(buffer: *[text_chars_max]u8, query: []const u8) Query {
+    return .{ .folded = fold.foldInto(buffer, query) };
+}
 
 /// What each kind of match is worth. A substring starts at `substring_base`
 /// and loses a point per character before it; a fuzzy match earns points per
@@ -57,11 +70,16 @@ comptime {
 /// Score of `query_in` against `text_in`, or `no_match`. An empty query
 /// matches everything with score 0.
 pub fn score(query_in: []const u8, text_in: []const u8) i32 {
-    if (query_in.len == 0) return 0;
+    var query_buffer: [text_chars_max]u8 = undefined;
+    return scoreQuery(prepare(&query_buffer, query_in), text_in);
+}
+
+/// `score` with the query folded already.
+pub fn scoreQuery(query_prepared: Query, text_in: []const u8) i32 {
+    const query = query_prepared.folded;
+    if (query.len == 0) return 0;
     // Both sides folded; `upper` keeps the case the folded text lost, for
     // camelCase boundaries.
-    var query_buffer: [text_chars_max]u8 = undefined;
-    const query = fold.foldInto(&query_buffer, query_in);
     var text_buffer: [text_chars_max]u8 = undefined;
     var upper_buffer: [text_chars_max]bool = undefined;
     const text_len = fold.foldCase(&text_buffer, &upper_buffer, text_in);
@@ -137,9 +155,15 @@ fn scoreFuzzy(text: []const u8, upper: []const bool, query: []const u8) i32 {
 /// Best score over several fields (title, keywords, subtitle). Later fields
 /// count for less so a title hit wins.
 pub fn scoreFields(query: []const u8, fields: []const []const u8) i32 {
+    var query_buffer: [text_chars_max]u8 = undefined;
+    return scoreFieldsQuery(prepare(&query_buffer, query), fields);
+}
+
+/// `scoreFields` with the query folded already.
+pub fn scoreFieldsQuery(query: Query, fields: []const []const u8) i32 {
     var best: i32 = no_match;
     for (fields, 0..) |field, field_index| {
-        const raw = score(query, field);
+        const raw = scoreQuery(query, field);
         if (raw == no_match) continue;
         const rank: i32 = @intCast(field_index);
         best = @max(best, raw - rank * Score.field_rank_penalty);
@@ -187,6 +211,15 @@ test "a substring outranks a fuzzy match up to the documented query length" {
 test "letters inside a word only match as a run" {
     try std.testing.expect(score("vsc", "Visual Studio Code") > 0);
     try std.testing.expectEqual(no_match, score("vsc", "Viscous"));
+}
+
+test "a prepared query scores as the raw one does" {
+    var query_buffer: [text_chars_max]u8 = undefined;
+    const query = prepare(&query_buffer, "CONFIGURACIÓN");
+    const fields = [_][]const u8{ "Ajustes", "Configuración del sistema" };
+    try std.testing.expectEqual(scoreFields("CONFIGURACIÓN", &fields), scoreFieldsQuery(query, &fields));
+    try std.testing.expectEqual(score("vsc", "Visual Studio Code"), scoreQuery(prepare(&query_buffer, "vsc"), "Visual Studio Code"));
+    try std.testing.expectEqual(@as(i32, 0), scoreQuery(prepare(&query_buffer, ""), "anything"));
 }
 
 test "title outranks subtitle" {

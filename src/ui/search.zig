@@ -252,9 +252,12 @@ fn fillSectioned(ui: *Ui, arena: std.mem.Allocator, query_text: []const u8) void
         return;
     }
     var hits: std.ArrayList(Item) = .empty;
+    // Folded once, not for every field of every row.
+    var query_buffer: [core.fuzzy.text_chars_max]u8 = undefined;
+    const query_prepared = core.fuzzy.prepare(&query_buffer, query_text);
     for (ui.base) |item| {
         const fields = [_][]const u8{ item.title, item.keywords, item.subtitle, item.accessory };
-        const score = core.fuzzy.scoreFields(query_text, &fields);
+        const score = core.fuzzy.scoreFieldsQuery(query_prepared, &fields);
         if (score == core.fuzzy.no_match) continue;
         var copy = item;
         copy.score = score;
@@ -310,9 +313,12 @@ fn fillRoot(ui: *Ui, arena: std.mem.Allocator, query_text: []const u8) void {
     // itself (a deferred timer here counted it twice).
     const search_start_ns = stats.now();
     var hits: std.ArrayList(Item) = .empty;
+    // Folded once, not for every field of every row.
+    var query_buffer: [core.fuzzy.text_chars_max]u8 = undefined;
+    const query_prepared = core.fuzzy.prepare(&query_buffer, query_text);
     for (ui.base) |item| {
         const fields = [_][]const u8{ item.title, item.keywords, item.subtitle };
-        const score = core.fuzzy.scoreFields(query_text, &fields);
+        const score = core.fuzzy.scoreFieldsQuery(query_prepared, &fields);
         if (score == core.fuzzy.no_match) continue;
         var copy = item;
         copy.score = score + core.frecency.boost(ui.frecency.get(item.key) orelse 0);
@@ -369,11 +375,14 @@ fn fillFiltered(
     }
     const search_start_ns = stats.now();
     var hits: std.ArrayList(Item) = .empty;
+    // Folded once, not for every field of every row.
+    var query_buffer: [core.fuzzy.text_chars_max]u8 = undefined;
+    const query_prepared = core.fuzzy.prepare(&query_buffer, query_text);
     for (ui.base) |item| {
         const detail_scored = item.detail[0..@min(item.detail.len, filtered_detail_bytes_max)];
         const text = if (item.detail.len > 0) detail_scored else item.title;
         const fields = [_][]const u8{ text, item.subtitle };
-        const score = core.fuzzy.scoreFields(query_text, &fields);
+        const score = core.fuzzy.scoreFieldsQuery(query_prepared, &fields);
         if (score == core.fuzzy.no_match) continue;
         var copy = item;
         copy.score = score;

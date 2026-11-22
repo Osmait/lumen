@@ -51,7 +51,7 @@ pub fn slowMounts(gpa: std.mem.Allocator, under: []const u8) std.mem.Allocator.E
 
 /// `path` is `root` itself or inside it ("/home/u" is below "/home", and
 /// "/homework" is not).
-fn isAtOrBelow(path: []const u8, root: []const u8) bool {
+pub fn isAtOrBelow(path: []const u8, root: []const u8) bool {
     if (!std.mem.startsWith(u8, path, root)) return false;
     if (path.len == root.len) return true;
     if (std.mem.endsWith(u8, root, "/")) return true;
