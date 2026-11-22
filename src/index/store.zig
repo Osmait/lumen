@@ -25,10 +25,15 @@ pub const no_parent: u32 = std.math.maxInt(u32);
 pub const flag_dir: u8 = 1 << 0;
 pub const flag_symlink: u8 = 1 << 1;
 pub const flag_hidden: u8 = 1 << 2;
+/// A directory, opened or not. `flag_dir` is the structure's bit: a folder
+/// whose children follow (the scan went in). A folder it only indexed
+/// (node_modules, .git, a cache) has this one alone, and showed as a file.
+pub const flag_folder: u8 = 1 << 3;
 
 /// 02: masks are built from folded names (accents and case, `core.fold`).
 /// 03: each directory's children are sorted by name (`findChild`).
-const magic = "LUMIDX03";
+/// 04: `flag_folder` marks every directory, not only those opened.
+const magic = "LUMIDX04";
 
 /// The first bytes of the file. The arrays after it are read in place, in
 /// the host's byte order, and so is this: the format is little-endian, and
@@ -207,9 +212,16 @@ pub const Store = struct {
         return store.bytes[start .. start + name_size];
     }
 
+    /// A folder the scan went into: its children follow (`children`).
     pub fn isDir(store: *const Store, id: u32) bool {
         assert(id < store.layout.entries_count);
         return store.flags()[id] & flag_dir != 0;
+    }
+
+    /// A folder, gone into or only indexed: what a hit shows as one.
+    pub fn isFolder(store: *const Store, id: u32) bool {
+        assert(id < store.layout.entries_count);
+        return store.flags()[id] & (flag_dir | flag_folder) != 0;
     }
 
     /// Absolute path of `id`, written into `out`; null if it does not fit
@@ -320,26 +332,6 @@ pub const Store = struct {
         return null;
     }
 
-    /// Same by linear scan: for stores not built level by level (the delta).
-    pub fn findChildScan(store: *const Store, directory: u32, child_name: []const u8) ?u32 {
-        for (store.parents(), 0..) |parent, entry| {
-            const id: u32 = @intCast(entry);
-            if (parent != directory) continue;
-            if (store.isTombstoned(id)) continue;
-            if (std.mem.eql(u8, store.name(id), child_name)) return id;
-        }
-        return null;
-    }
-
-    pub fn parentsSorted(store: *const Store) bool {
-        const tail = store.parents()[store.rootsCount()..];
-        if (tail.len < 2) return true;
-        for (tail[0 .. tail.len - 1], tail[1..]) |parent, parent_next| {
-            if (parent > parent_next) return false;
-        }
-        return true;
-    }
-
     pub fn liveCount(store: *const Store) usize {
         var live_count: usize = 0;
         for (store.masks()) |mask| live_count += @intFromBool(mask != 0);
@@ -408,6 +400,21 @@ fn validate(bytes: BytesConst) error{BadIndex}!Layout {
     for (parents[roots_count..], roots_count..) |parent, id| {
         // Also rejects a `no_parent` after the roots.
         if (parent >= id) return error.BadIndex;
+    }
+    // `children` and `findChild` binary-search what the scan leaves: the
+    // parents in order, each folder's names sorted. A file without them made
+    // those searches find the wrong entries (and `tombstoneBaseTree` hide
+    // them).
+    const names = bytes[layout.names_offset..][0..layout.names_size];
+    var id = roots_count + 1;
+    while (id < entries_count) : (id += 1) {
+        const parent = parents[id];
+        const parent_before = parents[id - 1];
+        if (parent < parent_before) return error.BadIndex;
+        if (parent != parent_before) continue;
+        const name_before = names[name_offsets[id - 1]..][0..name_sizes[id - 1]];
+        const name = names[name_offsets[id]..][0..name_sizes[id]];
+        if (std.mem.order(u8, name_before, name) == .gt) return error.BadIndex;
     }
     return layout;
 }
@@ -620,7 +627,8 @@ fn sample(gpa: std.mem.Allocator) !Store {
     var builder: Builder = .empty;
     const root = try builder.push(gpa, "/home/u", no_parent, flag_dir, 0);
     const project = try builder.push(gpa, "proj", root, flag_dir, 1);
-    _ = try builder.push(gpa, "notes.md", root, 0, 1);
+    // Each folder's names sorted, as the scan leaves them (`validate`).
+    _ = try builder.push(gpa, "readme.md", root, 0, 1);
     _ = try builder.push(gpa, "Cargo.toml", project, 0, 2);
     _ = try builder.push(gpa, "src", project, flag_dir, 2);
     return builder.finish(gpa);
@@ -658,7 +666,8 @@ test "paths are rebuilt from parents" {
 test "children by binary search and tombstones" {
     var store = try sample(testing.allocator);
     defer store.deinit(testing.allocator);
-    try testing.expect(store.parentsSorted());
+    // What `children` needs; `parse` refuses a file without it.
+    _ = try Store.parse(store.bytes, .mapped);
     const range = store.children(1);
     try testing.expectEqual(@as(u32, 3), range.lo);
     try testing.expectEqual(@as(u32, 5), range.hi);
@@ -764,7 +773,7 @@ test "mask prefilter folds accents and case, both ways" {
 /// store that `parse` accepted.
 fn exercise(store: *const Store) void {
     var path_buffer: [512]u8 = undefined;
-    var sum: usize = store.rootsCount() + @intFromBool(store.parentsSorted()) + store.liveCount();
+    var sum: usize = store.rootsCount() + store.liveCount();
     for (0..store.len()) |i| {
         const id: u32 = @intCast(i);
         const path_length = if (store.path(id, &path_buffer)) |path| path.len else 0;
@@ -773,7 +782,6 @@ fn exercise(store: *const Store) void {
         assert(range.lo <= range.hi);
         assert(range.hi <= store.len());
         if (store.findChild(id, "x")) |child| sum +%= child;
-        if (store.findChildScan(id, "x")) |child| sum +%= child;
     }
     std.mem.doNotOptimizeAway(sum);
 }
@@ -841,6 +849,25 @@ test "corrupt indexes are rejected, not trusted" {
         std.mem.writeInt(u32, bad[parent_at..][0..4], corruption.parent, .little);
         try testing.expectError(error.BadIndex, Store.parse(bad, .heap));
     }
+    // Parents each before their child, but out of order: `children` would
+    // binary-search them.
+    @memcpy(bad, good);
+    std.mem.writeInt(u32, bad[layout.parents_offset + 4 * 4 ..][0..4], 0, .little);
+    try testing.expectError(error.BadIndex, Store.parse(bad, .heap));
+
+    // A folder's names out of order ("src" before "Cargo.toml"): `findChild`
+    // would miss them.
+    @memcpy(bad, good);
+    const offsets_at = layout.name_offsets_offset;
+    const sizes_at = layout.name_sizes_offset;
+    for ([_]struct { usize, usize }{ .{ offsets_at, 4 }, .{ sizes_at, 2 } }) |column| {
+        const at, const width = column;
+        var third: [4]u8 = undefined;
+        @memcpy(third[0..width], bad[at + width * 3 ..][0..width]);
+        @memcpy(bad[at + width * 3 ..][0..width], bad[at + width * 4 ..][0..width]);
+        @memcpy(bad[at + width * 4 ..][0..width], third[0..width]);
+    }
+    try testing.expectError(error.BadIndex, Store.parse(bad, .heap));
 }
 
 test "a truncated index file fails to open" {

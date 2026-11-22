@@ -235,7 +235,12 @@ pub const AtomicFile = struct {
 
 /// Grows a file in place: what is written goes past its current end, then
 /// `writeAt` patches the start (a header pointing at it) and `sync` makes it
-/// durable. Nothing written before is touched, so mappings of it stay valid.
+/// durable. Nothing written before is touched but what `writeAt` patches,
+/// so mappings of it stay valid for everything else. Locked (flock) while
+/// it is open.
+/// flock(2)'s LOCK_EX.
+const lock_exclusive = 2;
+
 pub const AppendFile = struct {
     fd: i32,
     /// Where the next `write` goes.
@@ -267,6 +272,17 @@ pub const AppendFile = struct {
         const stx_result = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stx);
         if (linux.errno(stx_result) != .SUCCESS or stx.mode & linux.S.IFMT != linux.S.IFREG) {
             return error.NotRegular;
+        }
+        // Held until `deinit`: a second process appending at once (the
+        // daemon and lumen-find on one cache) wrote at the same offset, and
+        // the header written last pointed at the other one's bytes. It waits
+        // here, then finds the file longer than it expects (below).
+        while (true) {
+            const lock_result = linux.flock(fd, lock_exclusive);
+            if (linux.errno(lock_result) != .INTR) {
+                _ = try check(lock_result);
+                break;
+            }
         }
         const size = try check(linux.lseek(fd, 0, linux.SEEK.END));
         if (size != expect_len) {
@@ -516,4 +532,37 @@ test "writeAll waits on a non-blocking descriptor instead of failing" {
     close(fds[1]);
     thread.join();
     try std.testing.expectEqual(data.len, total);
+}
+
+test "a second append waits for the first, then sees the file grew" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var dir_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try os.tmpDirPath(&tmp_dir, &dir_buffer);
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.mem.printSentinel(&path_buffer, "{s}/index", .{dir}, 0);
+    try writeFile(path, "0123456789");
+    var first = (try AppendFile.open(path, 10)).?;
+    const Second = struct {
+        fn run(file_path: [:0]const u8, result: *?bool) void {
+            const opened = AppendFile.open(file_path, 10) catch {
+                result.* = null;
+                return;
+            };
+            result.* = opened != null;
+            if (opened) |file| {
+                var owned = file;
+                owned.deinit();
+            }
+        }
+    };
+    var second_opened: ?bool = null;
+    const thread = try std.Thread.spawn(.{}, Second.run, .{ path, &second_opened });
+    // The second one is blocked on the lock meanwhile.
+    os.sleepUs(100 * std.time.us_per_ms);
+    try first.write("abc");
+    first.deinit();
+    thread.join();
+    // Not 10 bytes any more: it rewrites instead of appending over these.
+    try std.testing.expectEqual(@as(?bool, false), second_opened);
 }

@@ -70,7 +70,34 @@ pub const Stats = struct {
     truncated: bool = false,
 };
 
-const Frontier = struct { id: u32, path: [:0]u8, hidden: bool };
+/// A folder to read: its entry, its path, and the root it is below (an
+/// index into the scan's `Roots`).
+const Frontier = struct { id: u32, path: [:0]u8, hidden: bool, root: u16 };
+
+/// The roots of a scan, opened once: the folders below one are opened from
+/// it, through no link (`sys.openDirBeneath`). -1: not opened, by path then.
+const Roots = struct {
+    const roots_max = 16;
+    fds: [roots_max]i32 = @splat(-1),
+    paths: [roots_max][]const u8 = undefined,
+
+    fn open(config: *const Config) Roots {
+        assert(config.roots.len <= roots_max);
+        var roots: Roots = .{};
+        for (config.roots, 0..) |root, i| {
+            roots.paths[i] = root;
+            var path_buffer: paths.Buffer = undefined;
+            const path = std.mem.printSentinel(&path_buffer, "{s}", .{root}, 0) catch continue;
+            const open_root = if (config.follow_roots) &sys.openDir else &sys.openDirNoFollow;
+            roots.fds[i] = open_root(path) catch -1;
+        }
+        return roots;
+    }
+
+    fn close(roots: *const Roots) void {
+        for (roots.fds) |fd| if (fd >= 0) sys.close(fd);
+    }
+};
 
 /// One directory's entries: a shared name buffer instead of one allocation
 /// per file.
@@ -100,6 +127,7 @@ const LevelContext = struct {
     batches: []Batch,
     /// The roots' level, with `Config.follow_roots`.
     follow: bool,
+    roots: *const Roots,
 };
 
 /// One level of the walk: how deep its entries are, and whether the
@@ -140,6 +168,7 @@ fn addLevel(
                 .id = id,
                 .path = child,
                 .hidden = flags & store_mod.flag_hidden != 0,
+                .root = parent.root,
             });
         }
     }
@@ -164,6 +193,8 @@ pub fn scan(
     var frontier: std.ArrayList(Frontier) = .empty;
     defer freeFrontier(gpa, &frontier);
     try addRoots(gpa, &builder, config.roots, &frontier, &totals);
+    const roots: Roots = .open(config);
+    defer roots.close();
 
     var depth: u16 = 1;
     while (frontier.items.len > 0 and depth <= config.depth_max) : (depth +|= 1) {
@@ -174,7 +205,7 @@ pub fn scan(
                 try inotify.watchBestEffort(gpa, folder.path, folder.id, placement);
             }
         }
-        const batches = try readLevel(gpa, pool, config, frontier.items, follow);
+        const batches = try readLevel(gpa, pool, config, frontier.items, follow, &roots);
         defer freeBatches(gpa, batches);
         for (batches) |batch| {
             // A folder read in part must not pass for the whole of it.
@@ -208,13 +239,14 @@ fn addRoots(
     frontier: *std.ArrayList(Frontier),
     totals: *Stats,
 ) std.mem.Allocator.Error!void {
-    for (roots) |root| {
+    for (roots, 0..) |root, root_index| {
         const id = try builder.push(gpa, root, store_mod.no_parent, store_mod.flag_dir, 0);
         totals.directories += 1;
         try frontier.append(gpa, .{
             .id = id,
             .path = try gpa.dupeSentinel(u8, root, 0),
             .hidden = false,
+            .root = @intCast(root_index),
         });
     }
 }
@@ -233,6 +265,7 @@ fn readLevel(
     config: *const Config,
     frontier: []const Frontier,
     follow: bool,
+    roots: *const Roots,
 ) std.mem.Allocator.Error![]Batch {
     const batches = try gpa.alloc(Batch, frontier.len);
     for (batches) |*batch| batch.* = .{};
@@ -242,6 +275,7 @@ fn readLevel(
         .frontier = frontier,
         .batches = batches,
         .follow = follow,
+        .roots = roots,
     };
     pool.run(frontier.len, &context, readLevelCallback);
     return batches;
@@ -256,7 +290,13 @@ fn freeBatches(gpa: std.mem.Allocator, batches: []Batch) void {
 fn readLevelCallback(context: *LevelContext, i: usize) void {
     const batch = &context.batches[i];
     const follow = context.follow;
-    readDir(context.gpa, context.frontier[i].path, context.config, follow, batch) catch |err| {
+    const folder = context.frontier[i];
+    const fd = openFolder(context.roots, folder, follow) catch {
+        batch.errors += 1;
+        return;
+    };
+    defer sys.close(fd);
+    readDir(context.gpa, fd, folder.path, context.config, batch) catch |err| {
         batch.errors += 1;
         if (err == error.OutOfMemory) batch.out_of_memory = true;
     };
@@ -307,19 +347,30 @@ fn sortBatch(gpa: std.mem.Allocator, batch: *Batch) std.mem.Allocator.Error!void
     batch.* = sorted;
 }
 
+/// Opens `folder` for reading: a root by its path (followed when
+/// `follow`), any other folder from its root through no symbolic link
+/// (`sys.openDirBeneath`), or by its path refusing a link as the last
+/// component when its root could not be opened.
+fn openFolder(roots: *const Roots, folder: Frontier, follow: bool) sys.Error!i32 {
+    const root_fd = roots.fds[folder.root];
+    const root_path = roots.paths[folder.root];
+    const is_root = folder.path.len <= root_path.len;
+    if (is_root) return if (follow) sys.openDir(folder.path) else sys.openDirNoFollow(folder.path);
+    if (root_fd < 0) return sys.openDirNoFollow(folder.path);
+    assert(std.mem.startsWith(u8, folder.path, root_path));
+    const relative = std.mem.trimStart(u8, folder.path[root_path.len..], "/");
+    // A suffix of a terminated path is terminated.
+    const relative_z: [*:0]const u8 = @ptrCast(relative.ptr);
+    return sys.openDirBeneath(root_fd, relative_z, folder.path);
+}
+
 fn readDir(
     gpa: std.mem.Allocator,
+    fd: i32,
     path: [:0]const u8,
     config: *const Config,
-    follow: bool,
     batch: *Batch,
 ) !void {
-    const open = if (follow) &sys.openDir else &sys.openDirNoFollow;
-    const fd = open(path) catch {
-        batch.errors += 1;
-        return;
-    };
-    defer sys.close(fd);
     var entries: sys.DirIter = .{ .fd = fd };
     while (try entries.next()) |entry| {
         // One folder of millions was read whole before the scan's cap was
@@ -348,6 +399,8 @@ fn readDir(
         // A skipped directory is still indexed (searchable), just not opened.
         const descend = kind == sys.Kind.directory and shouldDescend(path, entry.name, config);
         if (descend) flags |= store_mod.flag_dir;
+        // A link to a folder is not looked through: the stat could hang.
+        if (kind == sys.Kind.directory) flags |= store_mod.flag_folder;
         // All three or none: `ends` and `flags` are read in step.
         try batch.names.ensureUnusedCapacity(gpa, entry.name.len);
         try batch.ends.ensureUnusedCapacity(gpa, 1);
@@ -475,6 +528,26 @@ const ScanTree = struct {
         return count;
     }
 };
+
+test "scan: a folder it does not open is still a folder" {
+    var tree = try ScanTree.init();
+    defer tree.temporary.cleanup();
+    tree.file("r/app/node_modules/left-pad/index.js");
+    tree.file("r/app/main.js");
+    var store = try tree.scanOf("r", .{ .roots = &.{} }, null);
+    defer store.deinit(testing.allocator);
+    // Skipped (not opened, nothing below it indexed), but shown as a folder.
+    try testing.expectEqual(0, ScanTree.named(&store, "left-pad"));
+    for (0..store.len()) |i| {
+        const id: u32 = @intCast(i);
+        if (std.mem.eql(u8, store.name(id), "node_modules")) {
+            try testing.expect(!store.isDir(id));
+            try testing.expect(store.isFolder(id));
+        }
+        if (std.mem.eql(u8, store.name(id), "main.js")) try testing.expect(!store.isFolder(id));
+        if (std.mem.eql(u8, store.name(id), "app")) try testing.expect(store.isFolder(id));
+    }
+}
 
 test "scan: a root may be a link, nothing below one is followed" {
     var tree = try ScanTree.init();

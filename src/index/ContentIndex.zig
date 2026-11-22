@@ -257,9 +257,9 @@ pub fn parse(whole: Bytes, backing: format.Backing) error{BadIndex}!ContentIndex
     };
 }
 
-/// Writes the index to `path_z` atomically (see `sys.writeFileAtomic`).
-/// Writes the index to `path_z`: its file up to `Header.size_total`, not
-/// whatever follows in `bytes` (what an aborted append left behind).
+/// Writes the index to `path_z` atomically (`sys.writeFileAtomic`): its
+/// file up to `Header.size_total`, not whatever follows in `bytes` (what an
+/// aborted append left behind).
 pub fn save(index: *const ContentIndex, path_z: [:0]const u8) sys.Error!void {
     try sys.writeFileAtomic(path_z, index.file);
 }

@@ -117,7 +117,8 @@ A row is a table, or just a string (a row with that title).
 
 `markdown` understands a small, safe subset: `#`, `##` and `###` headings,
 **bold**, *italic*, `` `code` ``, fenced code blocks, `-` and `1.` lists,
-`>` quotes, `---` rules and `[links](https://...)`. Anything else shows as
+`>` quotes, `---` rules and `[links](https://...)` (`http`, `https` and
+`mailto` only; a link with another scheme shows as text). Anything else shows as
 typed.
 
 ```lua

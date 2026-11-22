@@ -316,9 +316,7 @@ fn prepareCompaction(service: *Service) !Live.Replaced {
 }
 
 fn freeReplaced(gpa: std.mem.Allocator, old: Live.Replaced) void {
-    var base = old.base;
-    base.deinit(gpa);
-    old.watcher.destroy(gpa);
+    old.deinit(gpa);
 }
 
 /// `name_changes`, or null while it cannot be trusted: watches not all
@@ -408,7 +406,7 @@ fn rescan(service: *Service) void {
     const old = blk: {
         service.lock.lockUncancelable(service.io);
         defer service.lock.unlock(service.io);
-        break :blk service.live.adopt(fresh.base, fresh.watcher);
+        break :blk service.live.adopt(fresh);
     };
     // Outside the lock: closing tens of thousands of watches is kernel time
     // no search should pay.

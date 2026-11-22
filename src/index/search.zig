@@ -466,7 +466,8 @@ comptime {
 fn adjust(store: *const Store, id: u32, cheap_score: i32) i32 {
     const entry_flags = store.flags()[id];
     var score = cheap_score;
-    if (entry_flags & store_mod.flag_dir != 0) score += metadata_weight.directory;
+    const folder_flags = store_mod.flag_dir | store_mod.flag_folder;
+    if (entry_flags & folder_flags != 0) score += metadata_weight.directory;
     if (entry_flags & store_mod.flag_hidden != 0) {
         score -= recency_max + metadata_weight.hidden_beyond_recency;
     }
