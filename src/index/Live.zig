@@ -759,6 +759,21 @@ pub fn prepareCompaction(
 ) (std.mem.Allocator.Error || Watcher.CreateError)!Replaced {
     const watcher = try Watcher.create(gpa);
     errdefer watcher.destroy(gpa);
+    const base = try scanSaved(gpa, pool, config, watcher, cache_path);
+    return .{ .base = base, .watcher = watcher };
+}
+
+/// A fresh scan, saved to `cache_path` when there is one and returned
+/// mapped from it if the save worked. With no `watcher`, nothing is
+/// watched: what a shutdown saves is never served (arming ~72 k inotify
+/// watches only to drop them took seconds).
+pub fn scanSaved(
+    gpa: std.mem.Allocator,
+    pool: *Pool,
+    config: *const scan.Config,
+    watcher: ?*Watcher,
+    cache_path: ?[:0]const u8,
+) std.mem.Allocator.Error!Store {
     var base = try scan.scan(gpa, pool, config, watcher, null);
     errdefer base.deinit(gpa);
     if (cache_path) |path| {
@@ -769,7 +784,7 @@ pub fn prepareCompaction(
         base.save(path) catch |err| {
             // Served from memory; the next rescan saves again.
             log.warn("saving the file index: {t}", .{err});
-            return .{ .base = base, .watcher = watcher };
+            return base;
         };
         // Swap the heap copy for a mapping of what was just written: same
         // bytes, but clean page cache the kernel can reclaim instead of
@@ -779,7 +794,7 @@ pub fn prepareCompaction(
             base = mapped;
         } else |_| {}
     }
-    return .{ .base = base, .watcher = watcher };
+    return base;
 }
 
 fn pathZ(store: *const Store, id: u32, path_buffer: *paths.Buffer) ?[*:0]const u8 {

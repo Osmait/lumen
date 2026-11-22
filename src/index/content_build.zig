@@ -73,6 +73,15 @@ pub const TextReader = struct {
     /// is not the size of the file, the size of the cached text is). When it
     /// is null, `extracted_bytes_max`.
     extracted_bytes: ?*const fn (context: *anyopaque, doc: DocIn) u64 = null,
+    /// Set: the build stops at the next round of reading with
+    /// `error.Cancelled` (a service shutting down does not wait for a full
+    /// build, ~1 s and more for 49 k files).
+    stop: ?*const std.atomic.Value(bool) = null,
+
+    fn stopped(reader: TextReader) bool {
+        const stop = reader.stop orelse return false;
+        return stop.load(.acquire);
+    }
 
     /// Most (trigram, doc) pairs reading `doc` can give: one per byte of
     /// text.
@@ -131,6 +140,8 @@ pub const BuildError = std.mem.Allocator.Error || error{
     /// More documents than u32 doc ids can number, or a doc table and its
     /// paths that end past what u32 path offsets reach (4 GiB).
     IndexTooLarge,
+    /// `TextReader.stop` was set: nothing was finished, nothing replaced.
+    Cancelled,
 };
 pub const FileError = BuildError || sys.Error;
 
@@ -256,7 +267,7 @@ pub fn appendFile(
 /// A sink without a file never fails to write one.
 fn memoryOnly(err: FileError) BuildError {
     return switch (err) {
-        error.OutOfMemory, error.BadIndex, error.IndexTooLarge => |kept| kept,
+        error.OutOfMemory, error.BadIndex, error.IndexTooLarge, error.Cancelled => |kept| kept,
         else => unreachable,
     };
 }
@@ -504,6 +515,7 @@ fn indexDocs(
 
     var round_start = from;
     while (round_start < docs.len) {
+        if (text.stopped()) return error.Cancelled;
         const round_end = roundEnd(docs, round_start, text);
         var round: ExtractRound = .{
             .gpa = gpa,
@@ -634,6 +646,24 @@ const content_testing = @import("content_testing.zig");
 const TestDocs = content_testing.TestDocs;
 const smallIndex = content_testing.smallIndex;
 const exerciseIndex = content_testing.exerciseIndex;
+
+test "a build whose stop is set ends with error.Cancelled, nothing leaked" {
+    const gpa = testing.allocator;
+    const pool = try Pool.create(gpa, testing.io, 2);
+    defer pool.destroy();
+    var texts: TestDocs = .{ .texts = &.{ "alpha zanzibar", "bravo kilimanjaro" } };
+    const docs = [_]DocIn{
+        .{ .path = "0", .mtime = 1, .size = 1 },
+        .{ .path = "1", .mtime = 1, .size = 1 },
+    };
+    var stop: std.atomic.Value(bool) = .init(true);
+    const reader: TextReader = .{ .read = TestDocs.readText, .context = &texts, .stop = &stop };
+    try testing.expectError(error.Cancelled, build(gpa, pool, &docs, reader, null));
+    // Not set: the same build finishes.
+    stop.store(false, .release);
+    var index = try build(gpa, pool, &docs, reader, null);
+    index.deinit(gpa);
+}
 
 test "update: edited and deleted documents leave, new ones join, old ids keep their meaning" {
     const gpa = testing.allocator;

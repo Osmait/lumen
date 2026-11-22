@@ -324,8 +324,22 @@ fn remap(ui: *Ui, old: *const Host.Registry, new: *const Host.Registry) bool {
             .field => |field_index| field_index == .gone,
             else => false,
         },
+        // The extension whose preferences show was removed.
+        .prefs => !hasExtension(new, ui.prefs_ext.slice()),
         else => false,
     };
+}
+
+/// Whether extension `id` is in `registry`, loaded or failed to load (its
+/// preferences page shows either way).
+fn hasExtension(registry: *const Host.Registry, id: []const u8) bool {
+    for (registry.extensions) |extension| {
+        if (std.mem.eql(u8, extension.id, id)) return true;
+    }
+    for (registry.problems) |problem| {
+        if (std.mem.eql(u8, problem.extension, id)) return true;
+    }
+    return false;
 }
 
 /// Command `index` of `old` in `new`, by id.
@@ -622,9 +636,24 @@ pub fn openTarget(ui: *Ui, target: []const u8, text: ?[*:0]const u8) bool {
         return true;
     };
     const view = std.meta.stringToEnum(item_mod.View, target) orelse return false;
-    if (view == .ext or view == .choose) return false;
-    if (!gtk.isVisible(ui.window)) ui.showWith(view, text) else ui.navigate(view);
+    if (!openable(view)) return false;
+    if (!gtk.isVisible(ui.window)) {
+        ui.showWith(view, text);
+    } else {
+        ui.navigate(view);
+        if (text) |typed| c.gtk_editable_set_text(gtk.editable(ui.search_bar.entry), typed);
+    }
     return true;
+}
+
+/// Whether a keymap or `lumen --open` may open built-in `view` by name: the
+/// others show what another view set up first (a command, a dmenu's rows,
+/// a preference or form being edited) and are reached only through it.
+fn openable(view: item_mod.View) bool {
+    return switch (view) {
+        .root, .clipboard, .windows, .files, .contents, .settings, .themes, .default_apps => true,
+        .choose, .ext, .dmenu, .prefs, .input, .form => false,
+    };
 }
 
 /// `lumen --key ctrl+g` for keys that are not built in.
@@ -635,6 +664,14 @@ pub fn parseKey(name: []const u8) ?api.Keys {
 // ---------------------------------------------------------------- tests
 
 const testing = std.testing;
+
+test "only views that stand on their own open by name" {
+    try testing.expect(openable(.files));
+    try testing.expect(openable(.root));
+    inline for (.{ .dmenu, .input, .prefs, .form, .ext, .choose }) |view| {
+        try testing.expect(!openable(view));
+    }
+}
 
 test "an answer whose rows may be on screen outlives them" {
     // "ab" shown, "abc" asked, back to "ab" before "abc" was answered: "ab"'s

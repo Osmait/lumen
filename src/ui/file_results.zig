@@ -78,6 +78,7 @@ pub fn itemsFromHits(
                 .is_dir = false,
                 .line = hit.line,
                 .extracted = hit.extracted,
+                .size = hit.size,
             } },
             .detail = hit.snippet,
             .time_s = hit.mtime,

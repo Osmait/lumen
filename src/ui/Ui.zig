@@ -748,6 +748,15 @@ pub fn perform(self: *Ui, operation: item_mod.Operation) void {
 
 // ----------------------------------------------------------------- apps
 
+/// At shutdown: the timers and idle callbacks the window keeps pending,
+/// so none runs against a window being torn down.
+pub fn removeSources(self: *Ui) void {
+    if (self.apps_reload_timer != 0) _ = c.g_source_remove(self.apps_reload_timer);
+    self.apps_reload_timer = 0;
+    if (self.pending_idle != 0) _ = c.g_source_remove(self.pending_idle);
+    self.pending_idle = 0;
+}
+
 /// An install or update changes many .desktop files: one reload (~5 ms of
 /// parsing) for the burst. Hidden, the next show builds its view anew.
 fn onAppsChanged(_: *c.GAppInfoMonitor, data: ?*anyopaque) callconv(.c) void {

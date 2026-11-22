@@ -83,14 +83,21 @@ fn heading(line: []const u8) ?Heading {
     return .{ .level = @intCast(@min(level, 3)), .text = std.mem.trim(u8, line[level..], " #") };
 }
 
+/// Three or more of one marker, spaces between allowed ("- - -"): a lone
+/// "-" followed by spaces is an empty list item, not a rule.
 fn isRule(line: []const u8) bool {
     if (line.len < 3) return false;
     const marker = line[0];
     if (std.mem.findScalar(u8, "-*_", marker) == null) return false;
+    var markers: usize = 0;
     for (line) |char| {
-        if (char != marker and char != ' ') return false;
+        if (char == marker) {
+            markers += 1;
+        } else if (char != ' ') {
+            return false;
+        }
     }
-    return true;
+    return markers >= 3;
 }
 
 fn bullet(line: []const u8) ?[]const u8 {
@@ -311,6 +318,10 @@ test "blocks" {
     try expectMarkup("> quoted", "<span fgalpha=\"70%\"><i>quoted</i></span>");
     try expectMarkup("```\nlet x = <1>;\n```\nafter", "<tt>let x = &lt;1&gt;;</tt>\nafter");
     try expectMarkup("---", "<span fgalpha=\"40%\">────────────────</span>");
+    try expectMarkup("- - -", "<span fgalpha=\"40%\">────────────────</span>");
+    // One marker and trailing spaces: not a rule.
+    try std.testing.expect(!isRule("-  "));
+    try std.testing.expect(!isRule("**  "));
 }
 
 test "unclosed or stray markers stay as text" {

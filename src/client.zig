@@ -93,8 +93,15 @@ fn memfdStdin(bytes: []const u8) bool {
     const memfd_result = linux.memfd_create("lumen-copy", linux.MFD.CLOEXEC);
     if (failed(memfd_result) != null) return false;
     const fd: linux.fd_t = @intCast(memfd_result);
-    if (!writeAll(fd, bytes)) return false;
-    if (failed(linux.lseek(fd, 0, linux.SEEK.SET)) != null) return false;
+    if (!writeAll(fd, bytes) or failed(linux.lseek(fd, 0, linux.SEEK.SET)) != null) {
+        _ = linux.close(fd);
+        return false;
+    }
+    // With stdin closed the memfd is fd 0 itself: dup2 would do nothing and
+    // leave it close-on-exec, so the next program would start without it.
+    if (fd == 0) return failed(linux.fcntl(0, linux.F.SETFD, 0)) == null;
+    // dup2 gives fd 0 without close-on-exec; the memfd's own fd closes.
+    defer _ = linux.close(fd);
     return failed(linux.dup2(fd, 0)) == null;
 }
 
@@ -173,6 +180,7 @@ fn exchange(runtime_dir: []const u8, app_id: []const u8, request_bytes: []const 
     // From here on there is no going back to lumen-gtk: the daemon may act
     // on what it gets.
     if (!unix.sendAll(fd, request_bytes)) {
+        _ = linux.close(fd);
         return failedAnswer("lumen: the daemon closed the connection\n");
     }
     // The daemon reads the request until this end; without it, both would

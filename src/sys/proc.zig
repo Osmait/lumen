@@ -47,18 +47,22 @@ pub fn shell(command: [:0]const u8) void {
 const output_timeout_ms = 2000;
 /// What one read of that output takes (hyprctl's JSON is a few KB).
 const output_chunk_bytes = 16 << 10;
+/// Most output `output` keeps: past it the program is killed and dropped
+/// (`hyprctl -j clients` with 200 windows is ~300 KB).
+const output_bytes_max = 16 << 20;
 
 /// What `output` allocates with.
 const gpa = std.heap.c_allocator;
 
-/// Runs to completion and returns stdout, or null when it could not run or
-/// was still writing after `output_timeout_ms` (then it is killed). Caller owns the
+/// Runs to completion and returns stdout, or null when it could not run,
+/// was still writing after `output_timeout_ms` or wrote more than
+/// `output_bytes_max` (then it is killed). Caller owns the
 /// result and frees it with `free`.
 pub fn output(argv: []const [:0]const u8) ?[:0]u8 {
-    return outputWithin(argv, output_timeout_ms);
+    return outputWithin(argv, output_timeout_ms, output_bytes_max);
 }
 
-fn outputWithin(argv: []const [:0]const u8, timeout_ms: u64) ?[:0]u8 {
+fn outputWithin(argv: []const [:0]const u8, timeout_ms: u64, bytes_max: usize) ?[:0]u8 {
     var argv_buffer: Argv = undefined;
     const argv_z = argv_buffer.of(argv) orelse return null;
     var pid: c.GPid = 0;
@@ -85,6 +89,12 @@ fn outputWithin(argv: []const [:0]const u8, timeout_ms: u64) ?[:0]u8 {
     // kill below cannot hit another process.
     _ = c.g_child_watch_add(pid, &reapCallback, null);
     defer _ = linux.close(stdout_fd);
+    // Any way out but the end of its output (deadline, failed read, cap, no
+    // memory) kills it. Not reaped yet (see above), so the kill cannot miss.
+    var output_ended = false;
+    defer if (!output_ended) {
+        _ = linux.kill(pid, .KILL);
+    };
     var stdout: std.ArrayList(u8) = .empty;
     defer stdout.deinit(gpa);
     const deadline_ns = os.monotonicNs() + timeout_ms * std.time.ns_per_ms;
@@ -92,18 +102,19 @@ fn outputWithin(argv: []const [:0]const u8, timeout_ms: u64) ?[:0]u8 {
         var chunk: [output_chunk_bytes]u8 = undefined;
         const chunk_len = os.unix.readSome(stdout_fd, &chunk, deadline_ns) catch |read_err| {
             switch (read_err) {
-                error.Timeout => {
-                    log.warn("{s}: no answer in {d} ms, stopped", .{ argv[0], timeout_ms });
-                    // Not reaped yet (see above), so the kill cannot miss.
-                    _ = linux.kill(pid, .KILL);
-                },
-                error.Syscall => log.warn("{s}: reading its output failed", .{argv[0]}),
+                error.Timeout => log.warn("{s}: no answer in {d} ms, stopped", .{ argv[0], timeout_ms }),
+                error.Syscall => log.warn("{s}: reading its output failed, stopped", .{argv[0]}),
             }
             return null;
         };
         if (chunk_len == 0) break;
+        if (chunk_len > bytes_max - stdout.items.len) {
+            log.warn("{s}: output over {d} bytes, stopped", .{ argv[0], bytes_max });
+            return null;
+        }
         stdout.appendSlice(gpa, chunk[0..chunk_len]) catch return null;
     }
+    output_ended = true;
     return stdout.toOwnedSliceSentinel(gpa, 0) catch null;
 }
 
@@ -203,6 +214,14 @@ test "output: what a program prints, or nothing once it takes too long" {
 
     const start_ns = os.monotonicNs();
     const argv = &.{ "sh", "-c", "echo partial; exec sleep 30" };
-    try std.testing.expect(outputWithin(argv, 100) == null);
+    try std.testing.expect(outputWithin(argv, 100, output_bytes_max) == null);
     try std.testing.expect(os.monotonicNs() - start_ns < std.time.ns_per_s);
+}
+
+test "output: a program that writes past the cap is stopped and dropped" {
+    const start_ns = os.monotonicNs();
+    // Would write forever: only the cap (or the kill after it) ends it.
+    const argv = &.{ "sh", "-c", "exec yes" };
+    try std.testing.expect(outputWithin(argv, 5000, 64 << 10) == null);
+    try std.testing.expect(os.monotonicNs() - start_ns < 5 * std.time.ns_per_s);
 }

@@ -276,8 +276,14 @@ fn resolveEditor(settings: *const Settings) []const u8 {
 
 /// What "Automatic" means for the editor: $VISUAL, $EDITOR, else nvim.
 pub fn autoEditor() [:0]const u8 {
-    const editor_env = c.g_getenv("VISUAL") orelse c.g_getenv("EDITOR");
-    return if (editor_env) |editor_command| std.mem.span(editor_command) else editor_fallback;
+    return envNamed("VISUAL") orelse envNamed("EDITOR") orelse editor_fallback;
+}
+
+/// The environment variable `name`, or null when it is unset or empty (an
+/// empty $VISUAL names no editor: the next choice is taken).
+fn envNamed(name: [*:0]const u8) ?[:0]const u8 {
+    const value = std.mem.span(c.g_getenv(name) orelse return null);
+    return if (value.len > 0) value else null;
 }
 
 /// What runs when no terminal or editor is set, none of the known ones is
@@ -285,17 +291,16 @@ pub fn autoEditor() [:0]const u8 {
 const terminal_fallback = "xterm";
 const editor_fallback = "nvim";
 
-fn resolveTerminal(settings: *const Settings) [:0]const u8 {
-    for (settings_mod.terminals) |terminal| {
-        if (std.mem.eql(u8, terminal.command, settings.terminal)) return terminal.command;
-    }
-    return autoTerminal();
+/// The terminal set in Settings, one of the known ones or not (settings
+/// only keep a single word there), else "Automatic".
+fn resolveTerminal(settings: *const Settings) []const u8 {
+    return if (settings.terminal.len > 0) settings.terminal else autoTerminal();
 }
 
 /// What "Automatic" means for the terminal: $TERMINAL, else the first one
 /// installed.
 pub fn autoTerminal() [:0]const u8 {
-    if (c.g_getenv("TERMINAL")) |terminal| return std.mem.span(terminal);
+    if (envNamed("TERMINAL")) |terminal| return terminal;
     for (settings_mod.terminals) |terminal| {
         if (proc.have(terminal.command)) return terminal.command;
     }

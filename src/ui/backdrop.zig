@@ -97,7 +97,9 @@ pub fn onWindowPressed(
     data: ?*anyopaque,
 ) callconv(.c) void {
     const self: *Ui = @ptrCast(@alignCast(data));
-    const on_pieces = isOn(self, self.search_bar.box, x, y) or isOn(self, self.results, x, y);
+    const on_pieces = isOn(self, self.search_bar.box, x, y) or
+        isOn(self, self.results, x, y) or
+        isOn(self, self.footer.box, x, y);
     if (self.panel.isOpen()) {
         if (isOn(self, gtk.widget(self.panel.box), x, y)) return;
         // Outside the action panel but on Lumen: only the panel closes.

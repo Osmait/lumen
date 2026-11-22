@@ -88,8 +88,8 @@ pub fn writeAllAt(fd: i32, data: []const u8, offset: ?usize) Error!void {
 
 pub const ReadUpToError = std.mem.Allocator.Error || error{ReadFailed};
 
-/// Reads `fd` into `text` until its end or `text` holds `bytes_max` (it can
-/// hold a little more: a read is not cut short). A read that fails is
+/// Reads `fd` into `text` until its end or `text` holds `bytes_max`, never
+/// more: each read asks only for the room left. A read that fails is
 /// `error.ReadFailed`, with what was read before it left in `text`: it is
 /// not the whole file, so it must not be taken for it.
 pub fn readUpTo(
@@ -99,8 +99,9 @@ pub fn readUpTo(
     bytes_max: usize,
 ) ReadUpToError!void {
     while (text.items.len < bytes_max) {
-        try text.ensureUnusedCapacity(gpa, read_chunk_bytes);
-        const spare = text.unusedCapacitySlice();
+        const room = bytes_max - text.items.len;
+        try text.ensureUnusedCapacity(gpa, @min(read_chunk_bytes, room));
+        const spare = text.unusedCapacitySlice()[0..@min(text.unusedCapacitySlice().len, room)];
         const bytes_read = linux.read(fd, spare.ptr, spare.len);
         switch (linux.errno(bytes_read)) {
             .SUCCESS => {
@@ -443,4 +444,25 @@ test "readUpTo tells a failed read from the end of the file" {
         error.ReadFailed,
         readUpTo(std.testing.allocator, dir_fd, &text, 1024),
     );
+}
+
+test "readUpTo never reads past bytes_max" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var dir_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try os.tmpDirPath(&tmp_dir, &dir_buffer);
+    var file_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const file = try std.mem.printSentinel(&file_buffer, "{s}/big", .{dir}, 0);
+    const data = try std.testing.allocator.alloc(u8, read_chunk_bytes * 3);
+    defer std.testing.allocator.free(data);
+    @memset(data, 'x');
+    try writeFile(file, data);
+    const file_fd = try openRegular(file);
+    defer close(file_fd);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    // Not a multiple of the chunk: the last read must be cut to what is left.
+    const bytes_max = read_chunk_bytes + 100;
+    try readUpTo(std.testing.allocator, file_fd, &text, bytes_max);
+    try std.testing.expectEqual(bytes_max, text.items.len);
 }

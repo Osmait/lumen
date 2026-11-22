@@ -261,18 +261,21 @@ pub fn status(service: *Service) Status {
     };
 }
 
-/// What `shutdown` saves: a fresh scan, adopted as a rescan would.
+/// What `shutdown` saves: a fresh scan, written to the cache. Nothing
+/// watches it and nothing adopts it: the service is torn down right after.
 fn saveOnShutdown(service: *Service) void {
-    const fresh = service.prepareCompaction() catch |err| {
+    const gpa = service.gpa;
+    var base = Live.scanSaved(
+        gpa,
+        service.scan_pool,
+        &service.config,
+        null,
+        service.cache_path,
+    ) catch |err| {
         log.warn("saving the file index: {t}", .{err});
         return;
     };
-    const old = service.live.adopt(fresh.base, fresh.watcher) catch |err| {
-        log.warn("saving the file index: {t}", .{err});
-        freeReplaced(service.gpa, fresh);
-        return;
-    };
-    freeReplaced(service.gpa, old);
+    base.deinit(gpa);
 }
 
 fn prepareCompaction(service: *Service) !Live.Replaced {

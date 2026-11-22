@@ -30,11 +30,63 @@ pub fn connect(path: []const u8, options: ConnectOptions) ?linux.fd_t {
     );
     if (failed(socket_result) != null) return null;
     const fd: linux.fd_t = @intCast(socket_result);
-    if (failed(linux.connect(fd, &address, @sizeOf(linux.sockaddr.un))) != null) {
+    if (!connectTo(fd, &address)) {
         _ = linux.close(fd);
         return null;
     }
     return fd;
+}
+
+/// How many times a connect the listener's full backlog turned away
+/// (EAGAIN, non-blocking) or a signal cut short (EINTR) is tried again.
+const connect_attempts_max = 5;
+/// The pause between those attempts.
+const connect_retry_ms = 10;
+/// How long a connect still in progress (EINPROGRESS) is waited for.
+const connect_wait_ms = 1000;
+
+fn connectTo(fd: linux.fd_t, address: *const linux.sockaddr.un) bool {
+    var attempt: usize = 0;
+    while (attempt < connect_attempts_max) : (attempt += 1) {
+        const errno = failed(linux.connect(fd, address, @sizeOf(linux.sockaddr.un))) orelse
+            return true;
+        switch (errno) {
+            // A retried connect that the first one completed.
+            .ISCONN => return true,
+            .INTR => continue,
+            .AGAIN => os.sleepUs(connect_retry_ms * std.time.us_per_ms),
+            .INPROGRESS, .ALREADY => return connectFinished(fd),
+            else => return false,
+        }
+    }
+    return false;
+}
+
+/// Waits for a connect in progress on `fd`; whether it succeeded.
+fn connectFinished(fd: linux.fd_t) bool {
+    const deadline_ns = os.monotonicNs() + connect_wait_ms * std.time.ns_per_ms;
+    while (true) {
+        const now_ns = os.monotonicNs();
+        if (now_ns >= deadline_ns) return false;
+        const left_ms: i32 = @intCast((deadline_ns - now_ns) / std.time.ns_per_ms + 1);
+        var poll_fds = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.OUT, .revents = 0 }};
+        const ready_count = linux.poll(&poll_fds, 1, left_ms);
+        if (failed(ready_count)) |errno| switch (errno) {
+            .INTR => continue,
+            else => return false,
+        };
+        if (ready_count > 0) break;
+    }
+    var socket_error: i32 = 0;
+    var socket_error_len: linux.socklen_t = @sizeOf(i32);
+    const result = linux.getsockopt(
+        fd,
+        linux.SOL.SOCKET,
+        linux.SO.ERROR,
+        @ptrCast(&socket_error),
+        &socket_error_len,
+    );
+    return failed(result) == null and socket_error == 0;
 }
 
 /// Ignores SIGPIPE process-wide so writing to a closed pipe or socket
@@ -102,7 +154,8 @@ pub const ReadError = error{ Timeout, Syscall };
 pub const deadline_ns_none: u64 = std.math.maxInt(u64);
 
 /// One read into `bytes` once `fd` is readable, waiting until `deadline_ns`
-/// (monotonic) at most: 0 at end of input.
+/// (monotonic) at most: 0 at end of input. A descriptor poll cannot wait on
+/// (closed, invalid) is `error.Syscall`, not a wait that spins.
 pub fn readSome(fd: linux.fd_t, bytes: []u8, deadline_ns: u64) ReadError!usize {
     while (true) {
         if (deadline_ns != deadline_ns_none) {
@@ -112,7 +165,11 @@ pub fn readSome(fd: linux.fd_t, bytes: []u8, deadline_ns: u64) ReadError!usize {
                 (deadline_ns - now_ns) / std.time.ns_per_ms + 1,
                 std.math.maxInt(i32),
             ));
-            if (!os.waitReadable(fd, left_ms)) continue;
+            switch (pollReadable(fd, left_ms)) {
+                .ready => {},
+                .not_yet => continue,
+                .failed => return error.Syscall,
+            }
         }
         const bytes_read = linux.read(fd, bytes.ptr, bytes.len);
         if (failed(bytes_read)) |errno| switch (errno) {
@@ -120,13 +177,29 @@ pub fn readSome(fd: linux.fd_t, bytes: []u8, deadline_ns: u64) ReadError!usize {
             // A non-blocking descriptor with nothing yet (a stdin left
             // O_NONBLOCK): wait for it rather than spin on read.
             .AGAIN => {
-                if (deadline_ns == deadline_ns_none) _ = os.waitReadable(fd, -1);
+                if (deadline_ns == deadline_ns_none and pollReadable(fd, -1) == .failed) {
+                    return error.Syscall;
+                }
                 continue;
             },
             else => return error.Syscall,
         };
         return bytes_read;
     }
+}
+
+const Readiness = enum { ready, not_yet, failed };
+
+/// One poll for input on `fd`, up to `timeout_ms` (-1: no limit). A signal
+/// or the timeout is `not_yet`; a descriptor poll rejects is `failed`.
+fn pollReadable(fd: linux.fd_t, timeout_ms: i32) Readiness {
+    var poll_fds = [1]linux.pollfd{.{ .fd = fd, .events = linux.POLL.IN, .revents = 0 }};
+    const ready_count = linux.poll(&poll_fds, 1, timeout_ms);
+    if (failed(ready_count)) |errno| return if (errno == .INTR) .not_yet else .failed;
+    if (ready_count == 0) return .not_yet;
+    // Not open: a read would fail every time.
+    if (poll_fds[0].revents & linux.POLL.NVAL != 0) return .failed;
+    return .ready;
 }
 
 /// Reads until end of input or `bytes` is full; how many bytes it read.
@@ -166,6 +239,19 @@ test "whole reads and writes over a socket pair" {
     try std.testing.expect(os.monotonicNs() - start_ns < std.time.ns_per_s);
 
     try std.testing.expect(connect("/nonexistent/lumen.sock", .{}) == null);
+}
+
+test "a descriptor poll rejects fails the read instead of spinning to the deadline" {
+    var fds: [2]i32 = undefined;
+    try std.testing.expect(failed(linux.pipe2(&fds, .{ .CLOEXEC = true })) == null);
+    _ = linux.close(fds[1]);
+    // Closed: poll answers POLLNVAL for it at once, every time.
+    _ = linux.close(fds[0]);
+    var received: [16]u8 = undefined;
+    const start_ns = os.monotonicNs();
+    const deadline_ns = start_ns + 5 * std.time.ns_per_s;
+    try std.testing.expectError(error.Syscall, readSome(fds[0], &received, deadline_ns));
+    try std.testing.expect(os.monotonicNs() - start_ns < std.time.ns_per_s);
 }
 
 test "a non-blocking descriptor is waited on, without a deadline too" {
