@@ -23,12 +23,21 @@ const TextCache = @This();
 /// The folder the texts are in, owned.
 directory: []u8,
 
-/// Room for a name: the path's hash in 16 hex digits, an mtime and a size
+/// Room for a name: 32 hex chars of SHA-256 (128 bits), an mtime and a size
 /// (20 digits each at most), two dashes and `.txt`.
-const name_bytes_max = 64;
+const name_bytes_max = 96;
 
 comptime {
-    assert(16 + 1 + 20 + 1 + 20 + ".txt".len <= name_bytes_max);
+    assert(32 + 1 + 20 + 1 + 20 + ".txt".len <= name_bytes_max);
+}
+
+/// First 128 bits of SHA-256(path) as 32 lowercase hex digits.
+pub fn pathHashHex(out: *[32]u8, file_path: []const u8) []const u8 {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(file_path, &digest, .{});
+    const hex = std.fmt.bytesToHex(digest[0..16], .lower);
+    out.* = hex;
+    return out;
 }
 
 /// The cache in `<cache_dir>/text`, created if missing and made private
@@ -59,10 +68,11 @@ pub fn path(cache: TextCache, path_buffer: []u8, doc: DocIn) ?[:0]const u8 {
 }
 
 fn nameOf(name_buffer: *[name_bytes_max]u8, doc: DocIn) []const u8 {
+    var hash_hex: [32]u8 = undefined;
     return std.mem.print(
         name_buffer,
-        "{x:0>16}-{d}-{d}.txt",
-        .{ std.hash.Wyhash.hash(0, doc.path), doc.mtime, doc.size },
+        "{s}-{d}-{d}.txt",
+        .{ pathHashHex(&hash_hex, doc.path), doc.mtime, doc.size },
     ) catch unreachable;
 }
 
@@ -144,17 +154,20 @@ pub fn sweep(cache: TextCache, gpa: std.mem.Allocator, index: *const Index) void
         if (std.mem.eql(u8, name_wanted, entry.name)) continue;
         var wanted_buffer: [name_bytes_max]u8 = undefined;
         const target = std.mem.printSentinel(&wanted_buffer, "{s}", .{name_wanted}, 0) catch continue;
-        // Not renamed, the text is extracted again under its new name.
-        const result = linux.renameat(fd, name, fd, target);
-        if (linux.errno(result) != .SUCCESS) {
-            log.warn("renaming {s}/{s}: {t}", .{ directory, name, linux.errno(result) });
+        // RENAME_NOREPLACE: never clobber a fresher cached entry already at
+        // `target`. If one already exists, unlink the obsolete legacy file.
+        const result = linux.renameat2(fd, name, fd, target, .{ .NOREPLACE = true });
+        switch (linux.errno(result)) {
+            .SUCCESS => {},
+            .EXIST => _ = linux.unlinkat(fd, name, 0),
+            else => |errno| log.warn("renaming {s}/{s}: {t}", .{ directory, name, errno }),
         }
     }
 }
 
 /// The names in the cache that live documents of `index` use, each mapped
-/// to the name it should have: itself, or for the naming before sizes, the
-/// current one.
+/// to the name it should have: itself, or for legacy Wyhash names (with or
+/// without size), the current SHA-256 name.
 fn namesKept(
     arena: std.mem.Allocator,
     index: *const Index,
@@ -167,8 +180,15 @@ fn namesKept(
         var name_buffer: [name_bytes_max]u8 = undefined;
         const name = try arena.dupe(u8, nameOf(&name_buffer, doc));
         try keep.put(arena, name, name);
+        const legacy_hash = std.hash.Wyhash.hash(0, doc.path);
+        const legacy_with_size = try arena.print("{x:0>16}-{d}-{d}.txt", .{
+            legacy_hash,
+            doc.mtime,
+            doc.size,
+        });
+        try keep.put(arena, legacy_with_size, name);
         const old = try arena.print("{x:0>16}-{d}.txt", .{
-            std.hash.Wyhash.hash(0, doc.path),
+            legacy_hash,
             doc.mtime,
         });
         try keep.put(arena, old, name);

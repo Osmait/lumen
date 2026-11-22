@@ -273,7 +273,7 @@ const Lists = struct {
         lists: *Lists,
         gpa: std.mem.Allocator,
         pairs: []const u64,
-    ) std.mem.Allocator.Error!bool {
+    ) (std.mem.Allocator.Error || error{IndexTooLarge})!bool {
         var i: usize = 0;
         while (i < pairs.len) {
             const key = pairKey(pairs[i]);
@@ -281,7 +281,9 @@ const Lists = struct {
                 if (key_previous >= key) return false;
             }
             try lists.keys.append(gpa, key);
-            try lists.offsets.append(gpa, @intCast(lists.postings.items.len));
+            const offset = std.math.cast(u32, lists.postings.items.len) orelse
+                return error.IndexTooLarge;
+            try lists.offsets.append(gpa, offset);
             var doc_previous: u32 = 0;
             var first = true;
             while (i < pairs.len and pairKey(pairs[i]) == key) : (i += 1) {
@@ -292,7 +294,9 @@ const Lists = struct {
                 doc_previous = doc;
             }
         }
-        try lists.offsets.append(gpa, @intCast(lists.postings.items.len));
+        const end_offset = std.math.cast(u32, lists.postings.items.len) orelse
+            return error.IndexTooLarge;
+        try lists.offsets.append(gpa, end_offset);
         assert(lists.offsets.items.len == lists.keys.items.len + 1);
         return true;
     }

@@ -19,7 +19,7 @@ const excludes = [_][]const u8{
     "!*.map",              "!*.lock",        "!*-lock.json",  "!*.svg",
 };
 
-pub const ListError = std.process.RunError || std.mem.Allocator.Error;
+pub const ListError = std.process.RunError || std.mem.Allocator.Error || error{Failed};
 
 /// A hung network or FUSE mount under the root must not hang the content
 /// service forever: ripgrep gets this long, then the current index stays.
@@ -60,6 +60,7 @@ pub fn list(
     // name with a newline was split into two bogus paths and never indexed).
     try argv.appendSlice(arena, &.{
         "rg",
+        "--no-config",
         "--files",
         "--null",
         "--no-messages",
@@ -144,8 +145,35 @@ fn runLister(
         if (reader.reader(0).buffered().len > list_output_bytes_max) return error.StreamTooLong;
     }
     try reader.checkAnyError();
-    _ = try child.wait(io);
+    if (child.id) |pid| {
+        if (!waitListerExit(pid, deadline_ns, stop)) {
+            if (stop) |stop_flag| if (stop_flag.load(.acquire)) return error.Canceled;
+            return error.Timeout;
+        }
+    }
+    const term = try child.wait(io);
+    // rg --files exits 0 when files are found and 1 when none match; exit 2
+    // or a signal (e.g. OOM-kill) must not be mistaken for an empty tree.
+    switch (term) {
+        .exited => |code| if (code != 0 and code != 1) return error.Failed,
+        else => return error.Failed,
+    }
     return reader.toOwnedSlice(0);
+}
+
+fn waitListerExit(
+    pid: linux.pid_t,
+    deadline_ns: u64,
+    stop: ?*const std.atomic.Value(bool),
+) bool {
+    while (true) {
+        if (stop) |stop_flag| if (stop_flag.load(.acquire)) return false;
+        const now_ns = sys.monotonicNs();
+        if (now_ns >= deadline_ns) return false;
+        const slice_ns = list_poll_ms * std.time.ns_per_ms;
+        const slice_end_ns = @min(deadline_ns, now_ns + slice_ns);
+        if (sys.waitExit(pid, slice_end_ns)) return true;
+    }
 }
 
 pub const Stat = struct { mtime: i64, size: u64 };
@@ -444,6 +472,14 @@ test "listing gives up soon after stop is set" {
         &stop,
     ));
     try testing.expect(sys.monotonicNs() - start_ns < 5 * std.time.ns_per_s);
+    // A failing lister (exit 2) must not be mistaken for an empty tree.
+    try testing.expectError(error.Failed, runLister(
+        testing.allocator,
+        testing.io,
+        &.{ "sh", "-c", "exit 2" },
+        tree.absolute,
+        null,
+    ));
 }
 
 test "documentKind" {
