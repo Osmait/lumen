@@ -60,6 +60,10 @@ scan_pool: *Pool,
 content_search_pool: *Pool,
 content_build_pool: *Pool,
 config: scan.Config,
+/// What `config.not_opened` points at: mount points under the root that
+/// can hang a call, read again before every full scan (`refreshSlowMounts`).
+/// Service thread only, like the scans.
+slow_mounts: [][]u8 = &.{},
 roots: [1][]const u8,
 cache_path: [:0]u8,
 /// Names created, removed or moved outside hidden files and directories,
@@ -127,6 +131,8 @@ fn init(
         .config = .{ .roots = &service.roots },
         .cache_path = cache,
     };
+    service.refreshSlowMounts();
+    errdefer sys.freeList(gpa, service.slow_mounts);
     var base = Store.open(service.cache_path) catch blk: {
         var empty: store_mod.Builder = .empty;
         break :blk try empty.finish(gpa);
@@ -160,8 +166,19 @@ fn deinit(service: *Service) void {
         .content_build = service.content_build_pool,
     };
     pools.destroy();
+    sys.freeList(service.gpa, service.slow_mounts);
     service.gpa.free(service.roots[0]);
     service.gpa.free(service.cache_path);
+}
+
+/// Reads the slow mounts under the root again (mounted or unmounted since)
+/// into `config.not_opened`. Unreadable or out of memory, the last list
+/// stays. Service thread, before a full scan: nothing else reads them.
+fn refreshSlowMounts(service: *Service) void {
+    const mounts = sys.slowMounts(service.gpa, service.roots[0]) catch return;
+    sys.freeList(service.gpa, service.slow_mounts);
+    service.slow_mounts = mounts;
+    service.config.not_opened = mounts;
 }
 
 /// The four pools a service owns. Two are its own; the content ones it only
@@ -225,7 +242,11 @@ pub fn shutdown(service: *Service) void {
 pub fn onSlowMount(service: *Service, path: []const u8) bool {
     service.lock.lockSharedUncancelable(service.io);
     defer service.lock.unlockShared(service.io);
+    const root = std.mem.trimEnd(u8, service.roots[0], "/");
     for (service.live.slow_mounts) |mount| {
+        // A root that is such a mount itself (a home on NFS) is still
+        // previewed: only what is mounted below it is not.
+        if (std.mem.eql(u8, std.mem.trimEnd(u8, mount, "/"), root)) continue;
         if (sys.isAtOrBelow(path, mount)) return true;
     }
     return false;
@@ -366,6 +387,7 @@ fn rescan(service: *Service) void {
         }
     }
     const start_ns = sys.monotonicNs();
+    service.refreshSlowMounts();
     // Nobody can tell what changed while the index is rebuilt.
     defer _ = service.name_changes.fetchAdd(1, .release);
     defer {
@@ -425,16 +447,66 @@ fn applyEvents(service: *Service, arena: std.mem.Allocator) bool {
         scans = service.live.takeScans();
         entries_max = service.live.limits.delta_entries_max;
     }
-    // New directories are read without the lock: a large tree moved in
-    // held it, and every search with it, for as long as reading took.
+    var round: usize = 0;
+    while (round < new_directory_rounds_max) : (round += 1) {
+        service.addNewDirectories(arena, &scans, entries_max);
+        if (scans.items.len == 0) break;
+    }
+    // Directories still to read (created as fast as they are read) wait
+    // for the next batch of events; they are in `live.scans`.
+    if (scans.items.len > 0) {
+        service.lock.lockUncancelable(service.io);
+        defer service.lock.unlock(service.io);
+        service.live.scans = scans;
+    }
+    service.lock.lockSharedUncancelable(service.io);
+    defer service.lock.unlockShared(service.io);
+    return service.rescanDue();
+}
+
+/// Rounds of `addNewDirectories` per batch of events: each reads the
+/// directories the round before found inside the ones it added.
+const new_directory_rounds_max = 8;
+
+/// Reads the new directories in `scans` and adds them, then lists each
+/// once more now that it is watched: what was created between the read and
+/// the watch came with no event. Directories found by that second look are
+/// left in `scans` for the next round. Both reads run without the lock: a
+/// large tree moved in held it, and every search with it, for as long as
+/// reading took.
+fn addNewDirectories(
+    service: *Service,
+    arena: std.mem.Allocator,
+    scans: *Live.Scans,
+    entries_max: usize,
+) void {
     Live.readScans(service.gpa, service.scan_pool, &service.config, scans.items, entries_max);
+    var rechecks = blk: {
+        service.lock.lockUncancelable(service.io);
+        defer service.lock.unlock(service.io);
+        service.live.addScans(scans) catch |err| {
+            log.warn("applying file events: {t}", .{err});
+            service.live.pending_resync = true;
+        };
+        scans.* = .empty;
+        break :blk service.live.takeRechecks();
+    };
+    defer Live.freeRechecks(service.gpa, &rechecks);
+    if (rechecks.items.len == 0) return;
+    const read_whole = Live.readRechecks(arena, rechecks.items, entries_max);
     service.lock.lockUncancelable(service.io);
     defer service.lock.unlock(service.io);
-    service.live.addScans(&scans) catch |err| {
+    if (!read_whole) {
+        service.live.pending_resync = true;
+        return;
+    }
+    const added = service.live.applyRechecks(rechecks.items) catch |err| blk: {
         log.warn("applying file events: {t}", .{err});
         service.live.pending_resync = true;
+        break :blk false;
     };
-    return service.rescanDue();
+    if (added) _ = service.name_changes.fetchAdd(1, .release);
+    scans.* = service.live.takeScans();
 }
 
 /// Called with the lock held.

@@ -67,12 +67,17 @@ pub fn newState(budget: *Budget) ?*State {
 /// object for finalization only when its metatable has `__gc` as
 /// `setmetatable` runs, and the files' metatable is hidden so its `__gc`
 /// cannot be replaced), catching timeouts with `pcall`/`xpcall`/coroutines,
-/// the daemon's standard input, and opening a FIFO, a socket or a device
+/// loops in C the hook never interrupts (`table.move` over a huge range runs
+/// in slices of 4096 elements; the pattern functions check the deadline
+/// themselves, lstrmatch.c), the daemon's standard input, and opening a
+/// FIFO, a socket or a device
 /// that a read or write could wait on forever (including through `require`).
 /// Extensions are still trusted code: they run as the user.
 /// Call inside `protect`.
 pub fn openLibs(L: *State) void {
     c.luaL_openlibs(L);
+    // Before the sandbox below: it keeps no reference to the originals.
+    _ = luart_open_patterns(L);
     const sandbox =
         \\local refuse, timed_out, arm_hook = ...
         \\debug = nil; package.loaded.debug = nil
@@ -108,6 +113,35 @@ pub fn openLibs(L: *State) void {
         \\    if why then error(why, 2) end
         \\    return f(checked, ...)
         \\  end
+        \\end
+        \\local raw_move, tointeger, maxinteger = table.move, math.tointeger, math.maxinteger
+        \\local move_chunk = 4096
+        \\function table.move(a1, f, e, t, a2)
+        \\  if a2 == nil then a2 = a1 end
+        \\  local fi, ei, ti = tointeger(f), tointeger(e), tointeger(t)
+        \\  if not (fi and ei and ti) or ei - fi < move_chunk or not (fi > 0 or ei < maxinteger + fi) then
+        \\    return raw_move(a1, f, e, t, a2)
+        \\  end
+        \\  local count = ei - fi + 1
+        \\  if ti > maxinteger - count + 1 then return raw_move(a1, f, e, t, a2) end
+        \\  if ti > ei or ti <= fi or a1 ~= a2 then
+        \\    local from = fi
+        \\    while from <= ei do
+        \\      local last = from + move_chunk - 1
+        \\      if last > ei then last = ei end
+        \\      raw_move(a1, from, last, ti + (from - fi), a2)
+        \\      from = last + 1
+        \\    end
+        \\  else
+        \\    local last = ei
+        \\    while last >= fi do
+        \\      local from = last - move_chunk + 1
+        \\      if from < fi then from = fi end
+        \\      raw_move(a1, from, last, ti + (from - fi), a2)
+        \\      last = from - 1
+        \\    end
+        \\  end
+        \\  return a2
         \\end
         \\local raw_load = load
         \\function load(chunk, chunkname, mode, ...)
@@ -308,6 +342,20 @@ fn alloc(
     const block = std.c.realloc(ptr, nsize) orelse return null;
     budget.used_bytes = used_bytes_after;
     return block;
+}
+
+extern fn luart_open_patterns(L: *State) c_int;
+
+/// For the pattern matcher (lstrmatch.c), every few thousand steps: its
+/// backtracking runs in C, where `hook` never does. Nonzero once the
+/// deadline has passed; the matcher then raises "timed out", and every
+/// instruction after it raises again, as after `hook`.
+export fn luart_match_timed_out(L: *State) c_int {
+    const budget = budgetOf(L);
+    if (!budget.timed_out and os.monotonicNs() <= budget.deadline_ns) return 0;
+    budget.timed_out = true;
+    c.lua_sethook(L, &hook, c.LUA_MASKCOUNT, 1);
+    return 1;
 }
 
 fn hook(L: ?*State, _: ?*c.lua_Debug) callconv(.c) void {
@@ -914,6 +962,50 @@ test "errors come back as messages, and the sandbox holds" {
         runCode(L, arena, "assert(string.format('%d', 3) == '3' and os.time() > 0)") == null,
     );
     try testing.expectEqual(@as(c_int, 0), c.lua_gettop(L));
+}
+
+test "loops in C stop at the deadline too: table.move and patterns" {
+    var budget: Budget = .{ .bytes_max = 8 << 20 };
+    const L = try testState(&budget);
+    defer c.lua_close(L);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Each of these ran in C for seconds to forever, never reaching the
+    // instruction hook.
+    const runaways = [_][:0]const u8{
+        "table.move({}, 1, math.maxinteger - 1, 2)",
+        "string.find(('a'):rep(40), ('a-'):rep(20) .. 'b')",
+        "string.match(('a'):rep(40), ('a-'):rep(20) .. 'b')",
+        "for _ in string.gmatch(('a'):rep(40), ('a-'):rep(20) .. 'b') do end",
+        "string.gsub(('a'):rep(40), ('a-'):rep(20) .. 'b', '')",
+        "local s = ('a'):rep(40) s:find(('a-'):rep(20) .. 'b')",
+    };
+    for (runaways) |code| {
+        budget.deadline_ns = os.monotonicNs() + 50 * std.time.ns_per_ms;
+        const start_ns = os.monotonicNs();
+        const message = runCode(L, arena, code) orelse return error.TestUnexpectedResult;
+        try testing.expect(std.mem.find(u8, message, "timed out") != null);
+        try testing.expect(os.monotonicNs() - start_ns < 2 * std.time.ns_per_s);
+    }
+    // With time left they work as before, overlapping moves included.
+    budget.deadline_ns = std.math.maxInt(u64);
+    const checks =
+        \\local t = {} for i = 1, 10000 do t[i] = i end
+        \\table.move(t, 1, 9000, 2)
+        \\assert(t[1] == 1 and t[2] == 1 and t[9001] == 9000 and t[10000] == 10000)
+        \\table.move(t, 2, 9001, 1)
+        \\assert(t[1] == 1 and t[9000] == 9000)
+        \\local u = table.move(t, 1, 5000, 1, {})
+        \\assert(#u == 5000 and u[5000] == 5000)
+        \\assert(("hello world"):find("o w") == 5)
+        \\assert(("key=value"):match("(%w+)=(%w+)") == "key")
+        \\assert(select(2, ("a,b,c"):gsub(",", ";")) == 2)
+        \\local n = 0 for w in ("one two three"):gmatch("%a+") do n = n + 1 end
+        \\assert(n == 3)
+        \\assert(("x"):rep(3):find("x", 1, true) == 1)
+    ;
+    try testing.expect(runCode(L, arena, checks) == null);
 }
 
 test "a runaway loop stops at its deadline" {

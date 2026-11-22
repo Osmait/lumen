@@ -82,6 +82,8 @@ pending_deliveries: ?*Delivery = null,
 /// Bumped by every request; the worker sleeps on it (a futex).
 wake_sequence: std.atomic.Value(u32) = .init(0),
 stop: std.atomic.Value(bool) = .init(false),
+/// Set by the worker as it returns: `shutdown` joins it only then.
+worker_done: std.atomic.Value(bool) = .init(false),
 /// The last request number handed out. Main thread only.
 request_generation_last: RequestGeneration = .none,
 /// Under `lock`.
@@ -244,11 +246,31 @@ pub fn start(
     return host;
 }
 
+/// How long `shutdown` waits for the worker to return. Lua stops at its
+/// deadline, but a call into C that never returns (a library of an
+/// extension's own, a blocking read the sandbox missed) must not keep the
+/// daemon from exiting.
+const shutdown_wait_ms = 3000;
+/// How often `shutdown` looks whether the worker has returned.
+const shutdown_poll_ms = 10;
+
 /// Stops and joins the worker, cancels any queued deliveries on the GTK
-/// main loop, and closes every state. Main thread only.
+/// main loop, and closes every state. Main thread only. A worker still
+/// running after `shutdown_wait_ms` is left behind with everything it may
+/// use: the process is about to exit.
 pub fn shutdown(host: *Host) void {
     host.stop.store(true, .release);
     host.wake();
+    if (!host.waitWorkerDone()) {
+        log.warn("the extension worker is still busy after {d} ms: not waiting", .{
+            shutdown_wait_ms,
+        });
+        host.thread.detach();
+        host.delivery_lock.lockUncancelable(host.io);
+        defer host.delivery_lock.unlock(host.io);
+        host.cancelDeliveries();
+        return;
+    }
     host.thread.join();
     host.cancelDeliveries();
     if (host.pending.submit) |request| request.destroy(host.gpa);
@@ -258,6 +280,16 @@ pub fn shutdown(host: *Host) void {
     host.gpa.free(host.config_dir);
     host.gpa.free(host.data_dir);
     host.gpa.destroy(host);
+}
+
+/// Whether the worker returned within `shutdown_wait_ms`.
+fn waitWorkerDone(host: *const Host) bool {
+    var waited_ms: u64 = 0;
+    while (!host.worker_done.load(.acquire)) : (waited_ms += shutdown_poll_ms) {
+        if (waited_ms >= shutdown_wait_ms) return false;
+        os.sleepUs(shutdown_poll_ms * std.time.us_per_ms);
+    }
+    return true;
 }
 
 fn cancelDeliveries(host: *Host) void {
@@ -418,6 +450,7 @@ fn wake(host: *Host) void {
 /// refused; then an action and a submit, so that the lists asked for with
 /// them show what they changed; then the lists.
 fn run(host: *Host) void {
+    defer host.worker_done.store(true, .release);
     var wake_sequence_seen: u32 = 0;
     while (host.waitForWork(wake_sequence_seen)) |wake_sequence| {
         wake_sequence_seen = wake_sequence;

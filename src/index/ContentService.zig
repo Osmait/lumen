@@ -102,6 +102,11 @@ pub const Counters = struct {
 const Worker = struct {
     /// The service thread, set by `run` before its first check.
     thread_id: ?std.Thread.Id = null,
+    /// Mount points below the root that can hang a call (NFS, sshfs, FUSE),
+    /// read at the start of each check (`refresh`), in its arena: documents
+    /// there are neither listed nor stat'ed, so they leave the index and
+    /// are never read or extracted.
+    slow_mounts: []const []const u8 = &.{},
     /// `names.nameChanges()` when files were last listed.
     listed_name_changes: ?u64 = null,
     listed_at_ns: u64 = 0,
@@ -655,6 +660,7 @@ fn listAll(
     const docs = content_list.list(arena, service.gpa, service.io, service.root, .{
         .documents = true,
         .stop = &service.stop,
+        .not_under = service.worker.slow_mounts,
     }) catch |err| {
         if (err != error.Canceled) log.warn("listing files: {t}", .{err});
         return null;
@@ -689,6 +695,11 @@ fn indexedChanges(
         const id: u32 = @intCast(doc_index);
         if (index.removed(id)) continue;
         const doc = index.docIn(id);
+        // On a mount that can hang: out of the index, without a stat.
+        if (content_list.underAny(doc.path, service.worker.slow_mounts)) {
+            try gone.append(arena, id);
+            continue;
+        }
         const path = std.mem.printSentinel(&path_buffer, "{s}", .{doc.path}, 0) catch continue;
         const stat_now = content_list.stat(path, switch (doc.source) {
             .extracted => .document,
@@ -709,6 +720,7 @@ fn indexedChanges(
     }
     // Not in the index (`extractMissing` left them out): as they are now.
     for (service.worker.retry) |doc| {
+        if (content_list.underAny(doc.path, service.worker.slow_mounts)) continue;
         const path = std.mem.printSentinel(&path_buffer, "{s}", .{doc.path}, 0) catch continue;
         const stat = content_list.stat(path, .document) orelse continue;
         try added.append(arena, .{
@@ -727,6 +739,19 @@ fn assertWorkerThread(service: *const ContentService) void {
     assert(service.worker.thread_id.? == std.Thread.getCurrentId());
 }
 
+/// Mount points strictly below `root` that can hang a call, in `arena`;
+/// none when they cannot be read. A root that is such a mount itself (a
+/// home on NFS) is still indexed: leaving it out would leave nothing.
+fn slowMountsBelow(arena: std.mem.Allocator, root: []const u8) []const []const u8 {
+    const mounts = sys.slowMounts(arena, root) catch return &.{};
+    var below: std.ArrayList([]const u8) = .empty;
+    for (mounts) |mount| {
+        if (std.mem.eql(u8, std.mem.trimEnd(u8, mount, "/"), std.mem.trimEnd(u8, root, "/"))) continue;
+        below.append(arena, mount) catch return below.items;
+    }
+    return below.items;
+}
+
 fn refresh(service: *ContentService) void {
     service.assertWorkerThread();
     service.counters.check_ns_last.store(sys.monotonicNs(), .release);
@@ -735,6 +760,8 @@ fn refresh(service: *ContentService) void {
     var arena_state: std.heap.ArenaAllocator = .init(service.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    service.worker.slow_mounts = slowMountsBelow(arena, service.root);
+    defer service.worker.slow_mounts = &.{};
     const name_changes = if (service.options.names) |names| names.nameChanges() else null;
     var docs: ?[]content.DocIn = null;
     var listed: ?ListingStamp = null;

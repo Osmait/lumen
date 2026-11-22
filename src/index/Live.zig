@@ -54,6 +54,8 @@ prune_watches: bool = false,
 /// Mounts under the root that can hang a stat (`sys.slowMounts`): no
 /// recency for what is in them. Read on start and on every rescan.
 slow_mounts: [][]u8 = &.{},
+/// Directories watched by `addScans`, to list again (`Recheck`).
+rechecks: Rechecks = .empty,
 watcher: *Watcher,
 config: *const scan.Config,
 /// Small scans (a new directory) and rescans run here.
@@ -174,6 +176,22 @@ pub const Scan = struct {
 
 pub const Scans = std.ArrayList(Scan);
 
+/// A directory `addScans` watched after `readScans` had read it: what was
+/// created in it in between came with no event and is not in the read.
+/// `readRechecks` lists it again once it is watched (anything later comes
+/// as an event), and `applyRechecks` adds what is missing.
+pub const Recheck = struct {
+    /// Raw `EntryId` of the directory's entry (in the delta).
+    directory: u32,
+    path: [:0]u8,
+    /// What `readRechecks` found in it.
+    found: []const Found = &.{},
+
+    pub const Found = struct { name: []const u8, is_dir: bool };
+};
+
+pub const Rechecks = std.ArrayList(Recheck);
+
 /// What `adopt` hands back: the index and the watcher it replaced.
 pub const Replaced = struct { base: Store, watcher: *Watcher };
 
@@ -209,6 +227,7 @@ pub fn deinit(live: *Live) void {
     live.base.deinit(live.gpa);
     live.delta.deinit(live.gpa);
     freeScans(live.gpa, &live.scans);
+    freeRechecks(live.gpa, &live.rechecks);
     sys.freeList(live.gpa, live.slow_mounts);
     live.watcher.destroy(live.gpa);
     live.engine_base.deinit(live.gpa);
@@ -502,6 +521,86 @@ fn add(live: *Live, parent: EntryId, name: []const u8, is_dir: bool) !bool {
     return true;
 }
 
+/// Queues directory `id` at `path` for `readRechecks`. Out of memory, the
+/// index may miss what it gets before it is watched: a rescan instead.
+fn recheckLater(live: *Live, id: EntryId, path: []const u8) void {
+    const path_owned = live.gpa.dupeSentinel(u8, path, 0) catch {
+        live.pending_resync = true;
+        return;
+    };
+    live.rechecks.append(live.gpa, .{ .directory = id.raw(), .path = path_owned }) catch {
+        live.gpa.free(path_owned);
+        live.pending_resync = true;
+    };
+}
+
+/// The directories `addScans` watched, to list again (`readRechecks`).
+pub fn takeRechecks(live: *Live) Rechecks {
+    const rechecks = live.rechecks;
+    live.rechecks = .empty;
+    return rechecks;
+}
+
+pub fn freeRechecks(gpa: std.mem.Allocator, rechecks: *Rechecks) void {
+    for (rechecks.items) |recheck| gpa.free(recheck.path);
+    rechecks.deinit(gpa);
+}
+
+/// Lists each directory of `rechecks` again, names into `arena`. False
+/// when they hold more than `entries_max` entries in all or memory ran
+/// out: the caller rescans instead. Touches nothing of the index: runs
+/// without the lock.
+pub fn readRechecks(arena: std.mem.Allocator, rechecks: []Recheck, entries_max: usize) bool {
+    var entries_count: usize = 0;
+    for (rechecks) |*recheck| {
+        // Gone or replaced since: its events say so.
+        const fd = sys.openDirNoFollow(recheck.path) catch continue;
+        defer sys.close(fd);
+        var found: std.ArrayList(Recheck.Found) = .empty;
+        var entries: sys.DirIter = .{ .fd = fd };
+        while (entries.next() catch null) |entry| {
+            entries_count += 1;
+            if (entries_count > entries_max) return false;
+            var kind = entry.kind;
+            if (kind == sys.Kind.unknown) {
+                var full_path_buffer: paths.Buffer = undefined;
+                const full_path = std.mem.printSentinel(
+                    &full_path_buffer,
+                    "{s}/{s}",
+                    .{ recheck.path, entry.name },
+                    0,
+                ) catch continue;
+                kind = sys.kindOf(full_path);
+            }
+            const name = arena.dupe(u8, entry.name) catch return false;
+            const is_dir = kind == sys.Kind.directory;
+            found.append(arena, .{ .name = name, .is_dir = is_dir }) catch return false;
+        }
+        recheck.found = found.items;
+    }
+    return true;
+}
+
+/// Adds what `readRechecks` found that the index does not have yet. Only
+/// what is missing: a directory already known is not replaced, as `add`
+/// does for a directory renamed over another.
+pub fn applyRechecks(live: *Live, rechecks: []const Recheck) std.mem.Allocator.Error!bool {
+    var added = false;
+    for (rechecks) |recheck| {
+        const parent: EntryId = .fromRaw(recheck.directory);
+        if (!live.alive(parent)) continue;
+        for (recheck.found) |found| {
+            if (live.childOf(parent, found.name) != null) continue;
+            if (try live.add(parent, found.name, found.is_dir)) added = true;
+        }
+    }
+    if (added) {
+        live.dirty = true;
+        try live.delta.rebuild(live.gpa);
+    }
+    return added;
+}
+
 /// The directories `apply` left to read. Between this and `addScans`
 /// nothing else may change the index: the service's thread does both,
 /// with only `readScans` (and searches) in between.
@@ -580,6 +679,7 @@ pub fn addScans(live: *Live, scans: *Scans) std.mem.Allocator.Error!void {
             const path = pathZ(sub, id, &path_buffer) orelse continue;
             const delta_id: EntryId = .ofDelta(map[sub_index]);
             try live.watcher.watchBestEffort(live.gpa, path, delta_id.raw(), .below_root);
+            live.recheckLater(delta_id, std.mem.span(path));
         }
         live.stats.added += sub.len() - 1;
         added = true;
@@ -594,9 +694,25 @@ pub fn addScans(live: *Live, scans: *Scans) std.mem.Allocator.Error!void {
 /// `takeScans`, `readScans` and `addScans` with the lock held throughout,
 /// for callers that hold it anyway (tests).
 pub fn finishScans(live: *Live) std.mem.Allocator.Error!void {
-    var scans = live.takeScans();
-    readScans(live.gpa, live.scan_pool, live.config, scans.items, live.limits.delta_entries_max);
-    try live.addScans(&scans);
+    while (true) {
+        if (live.scans.items.len > 0) {
+            var scans = live.takeScans();
+            const entries_max = live.limits.delta_entries_max;
+            readScans(live.gpa, live.scan_pool, live.config, scans.items, entries_max);
+            try live.addScans(&scans);
+        }
+        var rechecks = live.takeRechecks();
+        defer freeRechecks(live.gpa, &rechecks);
+        if (rechecks.items.len == 0) return;
+        var arena_state: std.heap.ArenaAllocator = .init(live.gpa);
+        defer arena_state.deinit();
+        const entries_max = live.limits.delta_entries_max;
+        if (!readRechecks(arena_state.allocator(), rechecks.items, entries_max)) {
+            live.pending_resync = true;
+            return;
+        }
+        _ = try live.applyRechecks(rechecks.items);
+    }
 }
 
 /// Drops the watches of directories that left the index (moved out of the
@@ -1058,6 +1174,32 @@ test "live: a MOVE_SELF read after the move was applied keeps the destination" {
     _ = try tree.live.apply(&.{.{ .dir_gone = destination.? }});
     try testing.expect(try tree.found("hoja", "renombrado/interno/hoja.rs"));
     try testing.expect(try tree.found("renombrado", "renombrado"));
+}
+
+test "live: what a new directory gets between its read and its watch is kept" {
+    const tree = try Tree.create(&sample_tree);
+    defer tree.destroy();
+    tree.make("fresco/primero.rs");
+    var changes: std.ArrayList(Watcher.Change) = .empty;
+    try tree.live.watcher.drain(tree.arena.allocator(), &changes);
+    _ = try tree.live.apply(changes.items);
+    var scans = tree.live.takeScans();
+    try testing.expect(scans.items.len > 0);
+    const entries_max = tree.live.limits.delta_entries_max;
+    readScans(tree.live.gpa, tree.live.scan_pool, tree.live.config, scans.items, entries_max);
+    // Read, not watched yet: no event will tell of these.
+    tree.make("fresco/tardio.rs");
+    tree.make("fresco/sub/hondo.rs");
+    try tree.live.addScans(&scans);
+    try tree.live.finishScans();
+    _ = try tree.sync();
+    try testing.expect(try tree.found("primero", "fresco/primero.rs"));
+    try testing.expect(try tree.found("tardio", "fresco/tardio.rs"));
+    try testing.expect(try tree.found("hondo", "fresco/sub/hondo.rs"));
+    // And what comes after the watch arrives once, not twice.
+    tree.make("fresco/sub/despues.rs");
+    _ = try tree.sync();
+    try testing.expectEqual(1, try tree.under("despues", "root"));
 }
 
 test "live: what was added after the scan can be deleted" {
