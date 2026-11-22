@@ -185,8 +185,8 @@ Measured on a 12-thread desktop, `$HOME` with 1.6 M entries:
 | `cargo` / `cargo.toml` | 2.3 / 1.4 ms |
 | recall vs exhaustive | 100% |
 
-`zig build -Doptimize=ReleaseFast && zig-out/bin/lumen-find bench` measures
-your machine.
+`zig build -Doptimize=ReleaseSafe && zig-out/bin/lumen-find bench` measures
+your machine, built as a release is.
 
 ## Content index
 
@@ -348,8 +348,12 @@ with a test:
 zig build test      # unit and integration tests (index on real temp trees,
                     # inotify, extraction with real zip/pdftotext, SQLite)
 zig build perf      # performance regressions on synthetic data (1M names,
-                    # 3k documents): latency limits, exact recall, peak RSS;
-                    # PERF_SCALE=2 relaxes the limits on slower machines
+                    # 3k documents, a 26k-entry tree to scan, 50k launcher
+                    # lines, Lua patterns), built as a release is: latency
+                    # limits, exact recall, peak RSS; PERF_SCALE=2 relaxes
+                    # the limits on slower machines
+tools/perf-compare.sh [BASE]  # the same checks on BASE (origin/main) and the
+                    # working tree, alternating: fails on one >25% slower
 zig build e2e       # end-to-end: an isolated instance (own app id, fake $HOME,
                     # own caches) driven with --dump and --key; needs Wayland
 ```
