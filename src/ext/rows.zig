@@ -348,7 +348,7 @@ fn actionText(
         lua.raise(L, "{s}.text is missing", .{where});
 }
 
-/// `lumen.action.exec`'s argv: 1 to `api.argv_max` strings.
+/// `lumen.action.exec`'s argv: 1 to `api.action_argv_max` strings.
 fn actionArgv(
     L: *lua.State,
     arena: std.mem.Allocator,
@@ -362,8 +362,8 @@ fn actionArgv(
     }
     const words = lua.absIndex(L, -1);
     const words_count = lua.c.lua_rawlen(L, words);
-    if (words_count == 0 or words_count > api.argv_max) {
-        lua.raise(L, "{s}.argv: 1 to {d} strings expected", .{ where, api.argv_max });
+    if (words_count == 0 or words_count > api.action_argv_max) {
+        lua.raise(L, "{s}.argv: 1 to {d} strings expected", .{ where, api.action_argv_max });
     }
     const argv = arena.alloc([:0]const u8, words_count) catch lua.oom(L);
     for (argv, 1..) |*word, word_number| {
@@ -412,13 +412,18 @@ fn keywordsJoined(
     var joined: std.ArrayList(u8) = .empty;
     const keywords_count = lua.c.lua_rawlen(L, keyword_list);
     for (1..keywords_count + 1) |keyword_number| {
+        if (keyword_number % 1024 == 0 and lua.pastDeadline(L)) {
+            lua.raise(L, "timed out", .{});
+        }
         const mark: lua.StackMark = .init(L);
         defer mark.restore(L);
         _ = lua.c.lua_rawgeti(L, keyword_list, @intCast(keyword_number));
         const keyword = lua.toSlice(L, -1) orelse
             lua.raise(L, "{s}.keywords[{d}]: string expected", .{ where, keyword_number });
-        if (joined.items.len + 1 + keyword.len > keywords_bytes_max) break;
-        if (joined.items.len > 0) joined.append(arena, ' ') catch lua.oom(L);
+        if (keyword.len == 0) continue;
+        const space: usize = if (joined.items.len > 0) 1 else 0;
+        if (joined.items.len + space + keyword.len > keywords_bytes_max) break;
+        if (space > 0) joined.append(arena, ' ') catch lua.oom(L);
         joined.appendSlice(arena, keyword) catch lua.oom(L);
     }
     assert(joined.items.len <= keywords_bytes_max);

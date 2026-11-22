@@ -28,6 +28,12 @@ const PreferenceChoice = registry_mod.PreferenceChoice;
 /// A grid command's cells to a line.
 const grid_columns_min = 2;
 const grid_columns_max = 10;
+/// Per-extension and field limits to bound registry memory.
+const preferences_per_ext_max = 64;
+const choices_max = 128;
+const commands_per_ext_max = 128;
+const spec_text_bytes_max = 4096;
+const spec_description_bytes_max = 8192;
 
 comptime {
     assert(grid_columns_min <= grid_columns_max);
@@ -44,7 +50,8 @@ pub fn parseExtension(L: *lua.State, context: *LoadContext, spec: c_int) void {
     // `Host.worker_arena`, which is reset on the next reload while GTK still
     // reads the previous registry.
     const extension_id = arena.dupeSentinel(u8, context.extension.id, 0) catch lua.oom(L);
-    const title = lua.fieldString(L, arena, spec, "title", "extension") orelse extension_id;
+    const title = lua.fieldStringMax(L, arena, spec, "title", "extension", spec_text_bytes_max) orelse
+        extension_id;
     context.title = title;
     const icon_default = rows_mod.fieldIcon(L, arena, spec, "extension.icon") orelse addon_icon;
     parsePreferences(L, context, spec, extension_id, title);
@@ -68,7 +75,13 @@ fn parsePreferences(
     defer mark.restore(L);
     const preferences = lua.fieldList(L, spec, "preferences", "extension") orelse return;
     const preferences_count = lua.c.lua_rawlen(L, preferences);
+    if (preferences_count > preferences_per_ext_max) {
+        lua.raise(L, "extension.preferences: at most {d} preferences", .{preferences_per_ext_max});
+    }
     for (1..preferences_count + 1) |preference_number| {
+        if (context.load.preferences.items.len >= std.math.maxInt(u16)) {
+            lua.raise(L, "too many preferences", .{});
+        }
         const preference_mark: lua.StackMark = .init(L);
         defer preference_mark.restore(L);
         var where_buffer: [32]u8 = undefined;
@@ -107,6 +120,9 @@ fn parseCommands(
     }
     const commands = lua.absIndex(L, -1);
     const commands_count = lua.c.lua_rawlen(L, commands);
+    if (commands_count > commands_per_ext_max) {
+        lua.raise(L, "extension.commands: at most {d} commands", .{commands_per_ext_max});
+    }
     for (1..commands_count + 1) |command_number| {
         const command_mark: lua.StackMark = .init(L);
         defer command_mark.restore(L);
@@ -146,18 +162,23 @@ fn prefChoices(
         lua.raise(L, "{s}.choices: a list expected for a choice", .{where});
     const choices_count = lua.c.lua_rawlen(L, choice_list);
     if (choices_count == 0) lua.raise(L, "{s}.choices is empty", .{where});
+    if (choices_count > choices_max) {
+        lua.raise(L, "{s}.choices: at most {d} choices", .{ where, choices_max });
+    }
     const choices = arena.alloc(PreferenceChoice, choices_count) catch lua.oom(L);
     for (choices, 1..) |*choice, choice_number| {
         const choice_mark: lua.StackMark = .init(L);
         defer choice_mark.restore(L);
         _ = lua.c.lua_rawgeti(L, choice_list, @intCast(choice_number));
         if (lua.toSlice(L, -1)) |text| {
-            const value = arena.dupeSentinel(u8, text, 0) catch lua.oom(L);
+            const value = arena.dupeSentinel(u8, lua.cut(text, spec_text_bytes_max), 0) catch
+                lua.oom(L);
             choice.* = .{ .value = value, .label = value };
         } else if (lua.c.lua_type(L, -1) == lua.c.LUA_TTABLE) {
-            const value = lua.fieldString(L, arena, -1, "value", where) orelse
+            const value = lua.fieldStringMax(L, arena, -1, "value", where, spec_text_bytes_max) orelse
                 lua.raise(L, "{s}.choices[{d}].value is missing", .{ where, choice_number });
-            const label = lua.fieldString(L, arena, -1, "title", where) orelse value;
+            const label = lua.fieldStringMax(L, arena, -1, "title", where, spec_text_bytes_max) orelse
+                value;
             choice.* = .{ .value = value, .label = label };
         } else {
             lua.raise(L, "{s}.choices[{d}]: string or table expected", .{ where, choice_number });
@@ -190,8 +211,16 @@ fn parseField(
         .extension_title = extension_title,
         .file = file,
         .name = name,
-        .title = lua.fieldString(L, arena, field_table, "title", where) orelse name,
-        .description = lua.fieldString(L, arena, field_table, "description", where) orelse "",
+        .title = lua.fieldStringMax(L, arena, field_table, "title", where, spec_text_bytes_max) orelse
+            name,
+        .description = lua.fieldStringMax(
+            L,
+            arena,
+            field_table,
+            "description",
+            where,
+            spec_description_bytes_max,
+        ) orelse "",
         .kind = kind,
         .default = "",
         .required = lua.fieldBool(L, field_table, "required", false, where),
@@ -199,9 +228,22 @@ fn parseField(
     if (kind == .choice) preference.choices = prefChoices(L, arena, field_table, where);
     preference.default = switch (kind) {
         .toggle => registry_mod.toggleText(lua.fieldBool(L, field_table, "default", false, where)),
-        .choice => lua.fieldString(L, arena, field_table, "default", where) orelse
-            preference.choices[0].value,
-        .text, .password => lua.fieldString(L, arena, field_table, "default", where) orelse "",
+        .choice => lua.fieldStringMax(
+            L,
+            arena,
+            field_table,
+            "default",
+            where,
+            spec_text_bytes_max,
+        ) orelse preference.choices[0].value,
+        .text, .password => lua.fieldStringMax(
+            L,
+            arena,
+            field_table,
+            "default",
+            where,
+            spec_text_bytes_max,
+        ) orelse "",
     };
     return preference;
 }
@@ -339,7 +381,7 @@ fn parseCommand(
 ) void {
     const arena = context.load.arena;
     const id = commandId(L, context, command_table, where);
-    const title = lua.fieldString(L, arena, command_table, "title", where) orelse
+    const title = lua.fieldStringMax(L, arena, command_table, "title", where, spec_text_bytes_max) orelse
         lua.raise(L, "{s}.title is missing", .{where});
     const answers_root_search = commandAnswersRootSearch(L, command_table, where);
     const mode_given = commandMode(L, command_table, where);
@@ -355,17 +397,36 @@ fn parseCommand(
     const command: Command = .{
         .id = id,
         .title = title,
-        .subtitle = lua.fieldString(L, arena, command_table, "subtitle", where) orelse
-            extension_title,
+        .subtitle = lua.fieldStringMax(
+            L,
+            arena,
+            command_table,
+            "subtitle",
+            where,
+            spec_text_bytes_max,
+        ) orelse extension_title,
         .icon = rows_mod.fieldIcon(L, arena, command_table, where) orelse icon_default,
         .keywords = rows_mod.keywords(L, arena, command_table, where),
-        .placeholder = lua.fieldString(L, arena, command_table, "placeholder", where) orelse "",
+        .placeholder = lua.fieldStringMax(
+            L,
+            arena,
+            command_table,
+            "placeholder",
+            where,
+            spec_text_bytes_max,
+        ) orelse "",
         .mode = mode,
         .detail = lua.fieldBool(L, command_table, "detail", false, where),
         .answers_root_search = answers_root_search,
         .fields = formFields(L, context, command_table, mode == .form, where, extension_id, extension_title),
-        .submit_title = lua.fieldString(L, arena, command_table, "submit_title", where) orelse
-            "Submit",
+        .submit_title = lua.fieldStringMax(
+            L,
+            arena,
+            command_table,
+            "submit_title",
+            where,
+            spec_text_bytes_max,
+        ) orelse "Submit",
         .grid = lua.fieldBool(L, command_table, "grid", false, where),
         .columns = @intFromFloat(columns),
     };

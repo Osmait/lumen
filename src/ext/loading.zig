@@ -28,6 +28,10 @@ const style_extension_id = registry_mod.style_extension_id;
 /// How long a file may run as it loads before the instruction hook stops
 /// it.
 const load_budget_ns = 5 * std.time.ns_per_s;
+/// Total registry arena cap across all loaded extensions, and per-file cap so
+/// one runaway extension cannot starve the rest.
+const load_bytes_max = 16 << 20;
+const extension_load_bytes_max = 4 << 20;
 
 /// Closes every state and forgets the commands of the registry they made.
 pub fn closeAll(host: *Host) void {
@@ -46,8 +50,9 @@ pub fn reloadExecute(host: *Host) void {
         .generation = host.registry_generation,
         .arena = .init(host.gpa),
     }) orelse return;
-    var load: Load = .{ .arena = registry.arena.allocator() };
-    loadAll(host, &load);
+    var capped: lua.Capped = .{ .child = registry.arena.allocator(), .bytes_max = load_bytes_max };
+    var load: Load = .{ .arena = capped.allocator() };
+    loadAll(host, &load, &capped);
     registryFill(host, registry, &load);
     for (registry.problems) |file_problem| {
         log.warn("{s}: {s}", .{ file_problem.extension, file_problem.message });
@@ -57,7 +62,7 @@ pub fn reloadExecute(host: *Host) void {
 
 /// The style first (init.lua may adjust it), then init.lua, then each
 /// extension.
-fn loadAll(host: *Host, load: *Load) void {
+fn loadAll(host: *Host, load: *Load, cap: *lua.Capped) void {
     const worker_arena = host.worker_arena.allocator();
     const style = blk: {
         host.lock.lockUncancelable(host.io);
@@ -67,21 +72,21 @@ fn loadAll(host: *Host, load: *Load) void {
             break :blk "";
         };
     };
-    if (style.len > 0) loadStyle(host, load, style);
+    if (style.len > 0) loadStyle(host, load, cap, style);
 
     if (worker_arena.printSentinel("{s}/init.lua", .{host.config_dir}, 0)) |path| {
-        if (os.info(path) != null) {
-            loadSource(host, load, config_extension_id, host.config_dir, .{ .file = path });
+        if (os.isRegular(path)) {
+            loadSource(host, load, cap, config_extension_id, host.config_dir, .{ .file = path });
         }
     } else |_| {
         load.problem(config_extension_id, "out of memory");
     }
 
-    for (extensionDirs(host, worker_arena)) |id| loadExtension(host, load, id);
+    for (extensionDirs(host, worker_arena)) |id| loadExtension(host, load, cap, id);
 }
 
 /// The extension in extensions/<id>, when its folder name is one.
-fn loadExtension(host: *Host, load: *Load, id: [:0]const u8) void {
+fn loadExtension(host: *Host, load: *Load, cap: *lua.Capped, id: [:0]const u8) void {
     const worker_arena = host.worker_arena.allocator();
     if (!Host.validId(id)) {
         load.problem(id, "extension folder names may use only a-z, 0-9, - and _");
@@ -102,11 +107,11 @@ fn loadExtension(host: *Host, load: *Load, id: [:0]const u8) void {
         load.problem(id, "out of memory");
         return;
     };
-    if (os.info(path) == null) {
+    if (!os.isRegular(path)) {
         load.problem(id, "no init.lua in the extension's folder");
         return;
     }
-    loadSource(host, load, id, folder, .{ .file = path });
+    loadSource(host, load, cap, id, folder, .{ .file = path });
 }
 
 /// Names of the folders under extensions/, sorted, in `arena`.
@@ -121,18 +126,24 @@ fn anyName(_: []const u8) bool {
 
 /// A style: <config>/styles/<name>/init.lua, else the built-in one. Its
 /// file runs as the extension "style".
-fn loadStyle(host: *Host, load: *Load, name: []const u8) void {
+fn loadStyle(host: *Host, load: *Load, cap: *lua.Capped, name: []const u8) void {
+    if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..") or
+        std.mem.findScalar(u8, name, '/') != null)
+    {
+        load.problem(style_extension_id, "no such style");
+        return;
+    }
     const worker_arena = host.worker_arena.allocator();
     const folder = worker_arena.printSentinel("{s}/styles/{s}", .{ host.config_dir, name }, 0) catch
         return;
     const path = worker_arena.printSentinel("{s}/init.lua", .{folder}, 0) catch return;
-    if (os.info(path) != null) {
-        loadSource(host, load, style_extension_id, folder, .{ .file = path });
+    if (os.isRegular(path)) {
+        loadSource(host, load, cap, style_extension_id, folder, .{ .file = path });
     } else if (os.info(folder) != null) {
         // A style folder may hold only a style.css.
     } else if (styles.find(name)) |built_in| {
         const code: Code = .{ .built_in = .{ .name = "=style", .lua = built_in.lua } };
-        loadSource(host, load, style_extension_id, host.config_dir, code);
+        loadSource(host, load, cap, style_extension_id, host.config_dir, code);
     } else {
         load.problem(style_extension_id, "no such style");
     }
@@ -148,12 +159,26 @@ const Code = union(enum) {
 
 /// Runs `code` as extension `id`, in a new state, and keeps the state if
 /// it ran; reports a problem and leaves nothing behind if it failed.
-fn loadSource(host: *Host, load: *Load, id: []const u8, folder: []const u8, code: Code) void {
+fn loadSource(
+    host: *Host,
+    load: *Load,
+    cap: *lua.Capped,
+    id: []const u8,
+    folder: []const u8,
+    code: Code,
+) void {
+    if (host.extensions.items.len >= std.math.maxInt(u16)) {
+        load.problem(id, "too many extensions");
+        return;
+    }
     const extension = Extension.create(host, id, folder) orelse {
         load.problem(id, "out of memory");
         return;
     };
     const before = load.mark();
+    const saved_bytes_max = cap.bytes_max;
+    cap.bytes_max = @min(saved_bytes_max, cap.used_bytes +| extension_load_bytes_max);
+    defer cap.bytes_max = saved_bytes_max;
     extension.load = load;
     var context: LoadContext = .{
         .extension = extension,
@@ -169,6 +194,7 @@ fn loadSource(host: *Host, load: *Load, id: []const u8, folder: []const u8, code
         LoadContext.run,
     );
     extension.load = null;
+    cap.bytes_max = saved_bytes_max;
     if (failure == null) {
         if (host.extensions.append(host.gpa, extension)) {
             // init.lua and the style are not extensions to list.

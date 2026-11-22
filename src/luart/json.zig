@@ -28,7 +28,8 @@ pub fn decode(L: *lua.State, gpa: std.mem.Allocator, text: []const u8) lua.Error
                 else => @errorName(err),
             }});
         defer parsed.deinit();
-        break :blk lua.tryCall(L, std.json.Value, &parsed.value, pushRoot, 0, 1);
+        var decoder: Decoder = .{ .root = parsed.value };
+        break :blk lua.tryCall(L, Decoder, &decoder, Decoder.run, 0, 1);
     };
     return switch (status) {
         .ok => {},
@@ -37,45 +38,56 @@ pub fn decode(L: *lua.State, gpa: std.mem.Allocator, text: []const u8) lua.Error
     };
 }
 
-fn pushRoot(L: *lua.State, value: *std.json.Value) void {
-    push(L, value.*, 0);
-}
+const Decoder = struct {
+    root: std.json.Value,
+    values_count: u32 = 0,
 
-fn push(L: *lua.State, value: std.json.Value, depth: usize) void {
-    if (depth > depth_max) lua.raise(L, "json.decode: nested too deeply", .{});
-    if (c.lua_checkstack(L, 3) == 0) lua.raise(L, "json.decode: nested too deeply", .{});
-    const mark: lua.StackMark = .init(L);
-    defer mark.expectPushed(L, 1);
-    switch (value) {
-        .null => c.lua_pushnil(L),
-        .bool => |boolean| c.lua_pushboolean(L, @intFromBool(boolean)),
-        .integer => |integer| c.lua_pushinteger(L, integer),
-        .float => |float| c.lua_pushnumber(L, float),
-        // Integers too big for i64.
-        .number_string => |digits| {
-            c.lua_pushnumber(L, std.fmt.parseFloat(f64, digits) catch 0);
-        },
-        .string => |string| lua.pushString(L, string),
-        .array => |array| {
-            const items_count = @min(array.items.len, std.math.maxInt(c_int));
-            c.lua_createtable(L, @intCast(items_count), 0);
-            for (array.items, 1..) |item, item_number| {
-                push(L, item, depth + 1);
-                c.lua_rawseti(L, -2, @intCast(item_number));
-            }
-        },
-        .object => |object| {
-            const fields_count = @min(object.count(), std.math.maxInt(c_int));
-            c.lua_createtable(L, 0, @intCast(fields_count));
-            var iterator = object.iterator();
-            while (iterator.next()) |entry| {
-                lua.pushString(L, entry.key_ptr.*);
-                push(L, entry.value_ptr.*, depth + 1);
-                c.lua_rawset(L, -3);
-            }
-        },
+    const values_per_deadline_check = 4096;
+
+    fn run(L: *lua.State, decoder: *Decoder) void {
+        decoder.push(L, decoder.root, 0);
     }
-}
+
+    fn push(decoder: *Decoder, L: *lua.State, value: std.json.Value, depth: usize) void {
+        if (depth > depth_max) lua.raise(L, "json.decode: nested too deeply", .{});
+        if (c.lua_checkstack(L, 3) == 0) lua.raise(L, "json.decode: nested too deeply", .{});
+        decoder.values_count +%= 1;
+        if (decoder.values_count % values_per_deadline_check == 0 and lua.pastDeadline(L)) {
+            lua.raise(L, "timed out", .{});
+        }
+        const mark: lua.StackMark = .init(L);
+        defer mark.expectPushed(L, 1);
+        switch (value) {
+            .null => c.lua_pushnil(L),
+            .bool => |boolean| c.lua_pushboolean(L, @intFromBool(boolean)),
+            .integer => |integer| c.lua_pushinteger(L, integer),
+            .float => |float| c.lua_pushnumber(L, float),
+            // Integers too big for i64.
+            .number_string => |digits| {
+                c.lua_pushnumber(L, std.fmt.parseFloat(f64, digits) catch 0);
+            },
+            .string => |string| lua.pushString(L, string),
+            .array => |array| {
+                const items_count = @min(array.items.len, std.math.maxInt(c_int));
+                c.lua_createtable(L, @intCast(items_count), 0);
+                for (array.items, 1..) |item, item_number| {
+                    decoder.push(L, item, depth + 1);
+                    c.lua_rawseti(L, -2, @intCast(item_number));
+                }
+            },
+            .object => |object| {
+                const fields_count = @min(object.count(), std.math.maxInt(c_int));
+                c.lua_createtable(L, 0, @intCast(fields_count));
+                var iterator = object.iterator();
+                while (iterator.next()) |entry| {
+                    lua.pushString(L, entry.key_ptr.*);
+                    decoder.push(L, entry.value_ptr.*, depth + 1);
+                    c.lua_rawset(L, -3);
+                }
+            },
+        }
+    }
+};
 
 /// `lumen.json.encode(value)`: encodes the value at `index` and pushes the
 /// text. The walk runs under `tryCall`; the buffer is freed either way.

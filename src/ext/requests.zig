@@ -265,12 +265,13 @@ const ListContext = struct {
             lua.c.LUA_TTABLE => {},
             else => lua.raise(L, "items: a list expected, got {s}", .{lua.typeName(L, rows)}),
         }
-        keep(L, &context.worker_command.list_kept, rows, context.request.request_generation);
         context.result.items = rows_mod.parseItems(L, context.rows_arena, rows, .{
             .list_generation = context.request.request_generation,
             .command = context.request.command,
             .extension_id = context.extension.id,
         }, Host.items_max);
+        // Only replace the previously kept list once `parseItems` succeeded.
+        keep(L, &context.worker_command.list_kept, rows, context.request.request_generation);
     }
 };
 
@@ -326,6 +327,11 @@ fn rootSearchCommand(
     request: *const RootSearchRequest,
 ) []Item {
     const extension = extensionOf(host, worker_command);
+    // Cap each provider individually so one runaway provider cannot consume
+    // the entire shared 16 MB budget and starve healthy providers after it.
+    const saved_bytes_max = rows.bytes_max;
+    rows.bytes_max = @min(saved_bytes_max, rows.used_bytes +| rows_bytes_max / 4);
+    defer rows.bytes_max = saved_bytes_max;
     var context: RootSearchContext = .{
         .extension = extension,
         .worker_command = worker_command,

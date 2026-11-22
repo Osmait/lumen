@@ -35,6 +35,9 @@ data: [:0]const u8,
 /// to it. Null at any other time, which those functions report as an
 /// error.
 load: ?*Load = null,
+/// Per-extension rate limit for `lumen.notify`.
+notify_window_start_ns: u64 = 0,
+notify_window_count: u8 = 0,
 
 /// A new state for the file of extension `id` in `folder`; null when out of
 /// memory. Its names live in the host's worker arena, so until the next

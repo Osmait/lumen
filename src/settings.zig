@@ -221,11 +221,13 @@ pub const Settings = struct {
     }
 
     /// Whether `value` may be written as `text`: a token. An empty style is
-    /// also valid, and means Lumen's own look.
+    /// also valid, and means Lumen's own look. "." and ".." are rejected for
+    /// style names because they are joined into `<config>/styles/<style>`.
     fn textValid(text: Text, value: []const u8) bool {
         return switch (text) {
             .theme => isToken(value),
-            .style => value.len == 0 or isToken(value),
+            .style => value.len == 0 or
+                (isToken(value) and !std.mem.eql(u8, value, ".") and !std.mem.eql(u8, value, "..")),
         };
     }
 
@@ -754,6 +756,8 @@ test "check tells unknown keys from bad values" {
     try testing.expectEqual(Settings.Check.ok, Settings.check("suggestions", "off"));
     try testing.expectEqual(Settings.Check.ok, Settings.check("opacity", "90"));
     try testing.expectEqual(Settings.Check.ok, Settings.check("theme", "midnight"));
+    try testing.expectEqual(Settings.Check.bad_value, Settings.check("style", ".."));
+    try testing.expectEqual(Settings.Check.bad_value, Settings.check("style", "."));
     try testing.expectEqual(Settings.Check.bad_value, Settings.check("width", "huge"));
     try testing.expectEqual(Settings.Check.bad_value, Settings.check("opacity", "10"));
     try testing.expectEqual(Settings.Check.bad_value, Settings.check("clipboard", "maybe"));

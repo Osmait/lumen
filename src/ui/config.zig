@@ -199,6 +199,8 @@ fn appendStyleCss(ui: *Ui, writer: *std.Io.Writer) std.Io.Writer.Error!void {
     ui.appearance.style_css_stamp = .none;
     const name = ui.settings.style;
     if (name.len == 0) return;
+    if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..") or
+        std.mem.findScalar(u8, name, '/') != null) return;
     var folder_bytes: [4096]u8 = undefined;
     const folder = std.mem.printSentinel(
         &folder_bytes,

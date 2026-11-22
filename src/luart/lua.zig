@@ -32,6 +32,9 @@ pub const Budget = struct {
     bytes_max: usize,
     /// Monotonic ns; code still running then is stopped with an error.
     deadline_ns: u64 = std.math.maxInt(u64),
+    /// Set once the deadline expires so `pcall`/`xpcall`/coroutines cannot
+    /// swallow the timeout and keep spinning.
+    timed_out: bool = false,
 };
 
 /// The budget a state was made with (its allocator's user data).
@@ -41,6 +44,9 @@ pub fn budgetOf(L: *State) *Budget {
     return @ptrCast(@alignCast(user_data.?));
 }
 
+/// Instructions between deadline checks under normal execution.
+const hook_instruction_count = 10_000;
+
 /// A new state with the standard libraries minus what could take the
 /// daemon down, or null when out of memory. `budget` must outlive it.
 /// Main use is through `protect`; close it with `c.lua_close`.
@@ -48,31 +54,34 @@ pub fn newState(budget: *Budget) ?*State {
     const L = c.lua_newstate(&alloc, budget) orelse return null;
     _ = c.lua_atpanic(L, &panic);
     // Every 10k instructions: a few µs apart, cheap next to the work.
-    c.lua_sethook(L, &hook, c.LUA_MASKCOUNT, 10_000);
+    c.lua_sethook(L, &hook, c.LUA_MASKCOUNT, hook_instruction_count);
     return L;
 }
 
 /// Opens the libraries, then removes what an extension must not reach:
 /// exiting the process, blocking shell calls without a timeout (`lumen.exec`
-/// has one), native modules, and `debug` (it could unset the time limit).
+/// has one), native modules, binary bytecode chunks (Lua 5.4 does not verify
+/// them), and `debug` (it could unset the time limit).
 /// What the time limit cannot stop goes too: `__gc` metamethods (Lua runs
 /// finalizers with hooks off, so a loop in one would never end; it marks an
 /// object for finalization only when its metatable has `__gc` as
 /// `setmetatable` runs, and the files' metatable is hidden so its `__gc`
-/// cannot be replaced), the daemon's standard input, and opening a FIFO, a
-/// socket or a device that a read or write could wait on forever.
+/// cannot be replaced), catching timeouts with `pcall`/`xpcall`/coroutines,
+/// the daemon's standard input, and opening a FIFO, a socket or a device
+/// that a read or write could wait on forever (including through `require`).
 /// Extensions are still trusted code: they run as the user.
 /// Call inside `protect`.
 pub fn openLibs(L: *State) void {
     c.luaL_openlibs(L);
     const sandbox =
-        \\local refuse = ...
+        \\local refuse, timed_out, arm_hook = ...
         \\debug = nil; package.loaded.debug = nil
         \\os.exit, os.execute, os.setlocale = nil, nil, nil
         \\io.popen = nil
         \\package.loadlib = nil; package.cpath = ""
         \\package.searchers[4] = nil; package.searchers[3] = nil
-        \\local setmt, rawget, type, error = setmetatable, rawget, type, error
+        \\local setmt, rawget, type, error, tostring, select =
+        \\  setmetatable, rawget, type, error, tostring, select
         \\function setmetatable(t, mt)
         \\  if type(mt) == "table" and rawget(mt, "__gc") ~= nil then
         \\    error("setmetatable: __gc is not available (finalizers run past the time limit)", 2)
@@ -82,30 +91,165 @@ pub fn openLibs(L: *State) void {
         \\getmetatable(io.stdout).__metatable = false
         \\pcall(io.input, "/dev/null")
         \\io.stdin = nil
+        \\local function check_path(path)
+        \\  if type(path) == "number" then path = tostring(path) end
+        \\  return path, refuse(path)
+        \\end
         \\local open = io.open
         \\function io.open(path, ...)
-        \\  local why = refuse(path)
+        \\  local checked, why = check_path(path)
         \\  if why then return nil, why end
-        \\  return open(path, ...)
+        \\  return open(checked, ...)
         \\end
-        \\local by_name = {
-        \\  { io, "lines" }, { io, "input" }, { io, "output" }, { _G, "loadfile" }, { _G, "dofile" },
-        \\}
-        \\for _, lib in ipairs(by_name) do
-        \\  local t, name = lib[1], lib[2]
-        \\  local f = t[name]
-        \\  t[name] = function(path, ...)
-        \\    -- Without a file name, loadfile and dofile read standard input.
-        \\    if path == nil and t == _G then error(name .. ": a file name expected", 2) end
-        \\    local why = refuse(path)
+        \\for _, name in ipairs({ "lines", "input", "output" }) do
+        \\  local f = io[name]
+        \\  io[name] = function(path, ...)
+        \\    local checked, why = check_path(path)
         \\    if why then error(why, 2) end
-        \\    return f(path, ...)
+        \\    return f(checked, ...)
+        \\  end
+        \\end
+        \\local raw_load = load
+        \\function load(chunk, chunkname, mode, ...)
+        \\  if mode ~= nil and mode ~= "t" then
+        \\    return nil, "load: binary chunks are not allowed"
+        \\  end
+        \\  if select("#", ...) > 0 then
+        \\    return raw_load(chunk, chunkname, "t", ...)
+        \\  end
+        \\  return raw_load(chunk, chunkname, "t")
+        \\end
+        \\local raw_loadfile = loadfile
+        \\function loadfile(path, mode, ...)
+        \\  if path == nil then error("loadfile: a file name expected", 2) end
+        \\  local checked, why = check_path(path)
+        \\  if why then error(why, 2) end
+        \\  if mode ~= nil and mode ~= "t" then
+        \\    return nil, "loadfile: binary chunks are not allowed"
+        \\  end
+        \\  if select("#", ...) > 0 then
+        \\    return raw_loadfile(checked, "t", ...)
+        \\  end
+        \\  return raw_loadfile(checked, "t")
+        \\end
+        \\function dofile(path)
+        \\  if path == nil then error("dofile: a file name expected", 2) end
+        \\  local chunk, err = loadfile(path, "t")
+        \\  if not chunk then error(err, 2) end
+        \\  return chunk()
+        \\end
+        \\local concat = table.concat
+        \\function package.searchpath(name, path, sep, rep)
+        \\  if type(name) ~= "string" then error("bad argument #1 to 'searchpath' (string expected)", 2) end
+        \\  if type(path) ~= "string" then error("bad argument #2 to 'searchpath' (string expected)", 2) end
+        \\  sep = sep or "."
+        \\  rep = rep or "/"
+        \\  if sep ~= "" then
+        \\    local esc = sep:gsub("([%^%$%(%)%%%.%[%]%*%+%-%?])", "%%%1")
+        \\    local rep_esc = rep:gsub("%%", "%%%%")
+        \\    name = name:gsub(esc, rep_esc)
+        \\  end
+        \\  local repl = name:gsub("%%", "%%%%")
+        \\  local msg = {}
+        \\  for template in (path .. ";"):gmatch("([^;]*);") do
+        \\    if template ~= "" then
+        \\      local filename = template:gsub("%?", repl)
+        \\      local checked, why = check_path(filename)
+        \\      if why then
+        \\        msg[#msg + 1] = "\n\t" .. why
+        \\      else
+        \\        local f = open(checked, "r")
+        \\        if f then
+        \\          f:close()
+        \\          return checked
+        \\        end
+        \\        msg[#msg + 1] = "\n\tno file '" .. checked .. "'"
+        \\      end
+        \\    end
+        \\  end
+        \\  return nil, concat(msg)
+        \\end
+        \\local searchpath = package.searchpath
+        \\package.searchers[2] = function(name)
+        \\  local filename, err = searchpath(name, package.path)
+        \\  if not filename then return err end
+        \\  local checked, why = check_path(filename)
+        \\  if why then error(why, 2) end
+        \\  local chunk, lerr = raw_loadfile(checked, "t")
+        \\  if not chunk then
+        \\    error("error loading module '" .. tostring(name) .. "' from file '" .. checked .. "':\n\t" .. tostring(lerr), 2)
+        \\  end
+        \\  return chunk, checked
+        \\end
+        \\local function rethrow_if_timed_out(ok, ...)
+        \\  if not ok and timed_out() then error("timed out", 0) end
+        \\  return ok, ...
+        \\end
+        \\local raw_pcall, raw_xpcall = pcall, xpcall
+        \\function pcall(...)
+        \\  if timed_out() then error("timed out", 0) end
+        \\  return rethrow_if_timed_out(raw_pcall(...))
+        \\end
+        \\function xpcall(...)
+        \\  if timed_out() then error("timed out", 0) end
+        \\  return rethrow_if_timed_out(raw_xpcall(...))
+        \\end
+        \\if type(coroutine) == "table" then
+        \\  local raw_create, raw_resume, raw_close = coroutine.create, coroutine.resume, coroutine.close
+        \\  function coroutine.create(f)
+        \\    local co = raw_create(f)
+        \\    arm_hook(co)
+        \\    return co
+        \\  end
+        \\  function coroutine.wrap(f)
+        \\    local co = raw_create(f)
+        \\    arm_hook(co)
+        \\    local function unwrap(ok, ...)
+        \\      if not ok then
+        \\        if timed_out() then error("timed out", 0) end
+        \\        error((...), 2)
+        \\      end
+        \\      return ...
+        \\    end
+        \\    return function(...)
+        \\      if timed_out() then error("timed out", 0) end
+        \\      arm_hook(co)
+        \\      return unwrap(raw_resume(co, ...))
+        \\    end
+        \\  end
+        \\  function coroutine.resume(co, ...)
+        \\    if timed_out() then error("timed out", 0) end
+        \\    arm_hook(co)
+        \\    return rethrow_if_timed_out(raw_resume(co, ...))
+        \\  end
+        \\  if raw_close then
+        \\    function coroutine.close(...)
+        \\      if timed_out() then error("timed out", 0) end
+        \\      return rethrow_if_timed_out(raw_close(...))
+        \\    end
         \\  end
         \\end
     ;
-    if (c.luaL_loadstring(L, sandbox) != c.LUA_OK) _ = c.lua_error(L);
+    if (c.luaL_loadbufferx(L, sandbox.ptr, sandbox.len, "=sandbox", "t") != c.LUA_OK) {
+        _ = c.lua_error(L);
+    }
     c.lua_pushcclosure(L, wrap(refuseOpen), 0);
-    c.lua_callk(L, 1, 0, 0, null);
+    c.lua_pushcclosure(L, wrap(isTimedOut), 0);
+    c.lua_pushcclosure(L, wrap(armThreadHook), 0);
+    c.lua_callk(L, 3, 0, 0, null);
+}
+
+fn isTimedOut(L: *State) Error!c_int {
+    c.lua_pushboolean(L, @intFromBool(budgetOf(L).timed_out));
+    return 1;
+}
+
+fn armThreadHook(L: *State) Error!c_int {
+    if (c.lua_tothread(L, 1)) |co| {
+        const count: c_int = if (budgetOf(L).timed_out) 1 else hook_instruction_count;
+        c.lua_sethook(co, &hook, c.LUA_MASKCOUNT, count);
+    }
+    return 0;
 }
 
 /// For the sandbox's io.open and the others that open a file by name: a
@@ -158,7 +302,8 @@ fn alloc(
         budget.used_bytes -= old_bytes;
         return null;
     }
-    const used_bytes_after = budget.used_bytes - old_bytes + nsize;
+    const base = budget.used_bytes - old_bytes;
+    const used_bytes_after = std.math.add(usize, base, nsize) catch return null;
     if (nsize > old_bytes and used_bytes_after > budget.bytes_max) return null;
     const block = std.c.realloc(ptr, nsize) orelse return null;
     budget.used_bytes = used_bytes_after;
@@ -166,13 +311,25 @@ fn alloc(
 }
 
 fn hook(L: ?*State, _: ?*c.lua_Debug) callconv(.c) void {
-    if (pastDeadline(L.?)) _ = c.luaL_error(L, "timed out");
+    const state = L.?;
+    const budget = budgetOf(state);
+    if (budget.timed_out or os.monotonicNs() > budget.deadline_ns) {
+        budget.timed_out = true;
+        c.lua_sethook(state, &hook, c.LUA_MASKCOUNT, 1);
+        _ = c.luaL_error(state, "timed out");
+    }
 }
 
 /// Whether the code running in `L` is past its deadline: for long work in
 /// Zig, where the instruction hook does not run.
 pub fn pastDeadline(L: *State) bool {
-    return os.monotonicNs() > budgetOf(L).deadline_ns;
+    const budget = budgetOf(L);
+    if (budget.timed_out) return true;
+    if (os.monotonicNs() > budget.deadline_ns) {
+        budget.timed_out = true;
+        return true;
+    }
+    return false;
 }
 
 /// An allocator over `child` that holds at most `bytes_max` bytes at once:
@@ -205,7 +362,12 @@ pub const Capped = struct {
     fn fits(self: *Capped, old_bytes: usize, new_bytes: usize) bool {
         assert(self.used_bytes >= old_bytes);
         if (new_bytes <= old_bytes) return true;
-        if (self.used_bytes - old_bytes + new_bytes <= self.bytes_max) return true;
+        const base = self.used_bytes - old_bytes;
+        const after = std.math.add(usize, base, new_bytes) catch {
+            self.refused = true;
+            return false;
+        };
+        if (after <= self.bytes_max) return true;
         self.refused = true;
         return false;
     }
@@ -285,6 +447,13 @@ pub fn protect(
     context: *Context,
     comptime handler: fn (*State, *Context) void,
 ) ?[:0]const u8 {
+    const budget = budgetOf(L);
+    budget.timed_out = false;
+    c.lua_sethook(L, &hook, c.LUA_MASKCOUNT, hook_instruction_count);
+    defer {
+        budget.timed_out = false;
+        c.lua_sethook(L, &hook, c.LUA_MASKCOUNT, hook_instruction_count);
+    }
     const top = c.lua_gettop(L);
     defer c.lua_settop(L, top);
     if (c.lua_checkstack(L, 3) == 0) return "Lua stack overflow";
@@ -758,6 +927,27 @@ test "a runaway loop stops at its deadline" {
     const message = runCode(L, arena_state.allocator(), "while true do end").?;
     try testing.expect(std.mem.find(u8, message, "timed out") != null);
     try testing.expect(os.monotonicNs() - start_ns < 2 * std.time.ns_per_s);
+
+    // `pcall`, `xpcall`, and coroutines cannot swallow a timeout.
+    budget.deadline_ns = os.monotonicNs() + 50 * std.time.ns_per_ms;
+    const pcall_msg = runCode(
+        L,
+        arena_state.allocator(),
+        "repeat local ok = pcall(function() while true do end end) until ok",
+    ).?;
+    try testing.expect(std.mem.find(u8, pcall_msg, "timed out") != null);
+
+    budget.deadline_ns = os.monotonicNs() + 50 * std.time.ns_per_ms;
+    const co_msg = runCode(
+        L,
+        arena_state.allocator(),
+        "local co = coroutine.create(function() while true do end end) repeat local ok = coroutine.resume(co) until ok",
+    ).?;
+    try testing.expect(std.mem.find(u8, co_msg, "timed out") != null);
+
+    // State remains usable once deadline is restored.
+    budget.deadline_ns = std.math.maxInt(u64);
+    try testing.expect(runCode(L, arena_state.allocator(), "assert(pcall(function() return 1 end))") == null);
 }
 
 test "memory is capped per state" {
@@ -827,6 +1017,21 @@ test "what the time limit cannot stop is out of reach" {
         \\local w = assert(io.open(fifo .. ".txt", "w")) w:write("hi") w:close()
         \\assert(io.open(fifo .. ".txt"):read("a") == "hi")
         \\assert(io.open("/dev/null"):read("a") == "")
+        \\-- Binary bytecode is refused by load, loadfile, dofile and require.
+        \\local bin = string.dump(function() return 1 end)
+        \\assert(load(bin) == nil)
+        \\assert(load(bin, "x", "b") == nil)
+        \\assert(load(bin, "x", "bt") == nil)
+        \\local bf = assert(io.open(fifo .. ".luac", "wb")) bf:write(bin) bf:close()
+        \\assert(loadfile(fifo .. ".luac") == nil)
+        \\assert(loadfile(fifo .. ".luac", "bt") == nil)
+        \\assert(not pcall(dofile, fifo .. ".luac"))
+        \\package.path = fifo .. ".?"
+        \\assert(not pcall(require, "luac"))
+        \\-- require also refuses FIFOs.
+        \\package.path = fifo
+        \\local rok, rerr = pcall(require, "anything")
+        \\assert(not rok and tostring(rerr):find("not a regular file"), tostring(rerr))
     , .{fifo}, 0);
     if (runCode(L, arena, code)) |message| {
         std.debug.print("{s}\n", .{message});
