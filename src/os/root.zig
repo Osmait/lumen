@@ -16,6 +16,7 @@
 //! - `child.zig`: programs run to a deadline, fed stdin, output collected.
 //! - `test_dir.zig`: temporary folders for tests.
 
+const std = @import("std");
 const syscall = @import("syscall.zig");
 const stat = @import("stat.zig");
 const folder = @import("folder.zig");
@@ -88,8 +89,48 @@ pub const TestDir = test_dir.TestDir;
 pub const tmpDirAbs = test_dir.tmpDirAbs;
 pub const tmpDirPath = test_dir.tmpDirPath;
 
+var main_thread_set: std.atomic.Value(bool) = .init(false);
+var main_thread_id: std.Thread.Id = undefined;
+
+/// Records the calling thread as the process main thread for `assertMainThread`.
+pub fn setMainThread() void {
+    main_thread_id = std.Thread.getCurrentId();
+    main_thread_set.store(true, .release);
+}
+
+/// Resets the recorded main thread (for unit tests).
+pub fn clearMainThreadForTest() void {
+    main_thread_set.store(false, .release);
+}
+
+/// True when on the main thread (or before `setMainThread` has been called).
+pub fn isMainThread() bool {
+    if (!main_thread_set.load(.acquire)) return true;
+    return main_thread_id == std.Thread.getCurrentId();
+}
+
+/// Asserts that main-thread-only singletons are not touched from worker threads.
+pub fn assertMainThread() void {
+    std.debug.assert(isMainThread());
+}
+
+test "main-thread guard rejects calls from worker threads" {
+    setMainThread();
+    defer clearMainThreadForTest();
+    try std.testing.expect(isMainThread());
+
+    var worker_is_main = std.atomic.Value(bool).init(true);
+    const Worker = struct {
+        fn run(flag: *std.atomic.Value(bool)) void {
+            flag.store(isMainThread(), .release);
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker_is_main});
+    thread.join();
+    try std.testing.expect(!worker_is_main.load(.acquire));
+}
+
 test {
-    const std = @import("std");
     std.testing.refAllDecls(@This());
     // Each topic file, so that its tests run too.
     std.testing.refAllDecls(syscall);

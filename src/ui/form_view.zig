@@ -133,6 +133,7 @@ const form_fields_max = Host.form_fields_max;
 
 /// The Submit row: required fields first, then the extension's submit.
 pub fn submit(ui: *Ui) void {
+    if (ui.ext_act_generation != .none) return ui.showFailure("An action is already running");
     const form = command(ui) orelse return;
     const host = ui.ext_host orelse return;
     const registry = ui.ext_registry orelse return;
@@ -155,6 +156,8 @@ pub fn submit(ui: *Ui) void {
         };
     }
     const form_values = values[0..form.fields.len];
-    ui.ext_act_generation = host.submit(registry.generation, ui.form_command, form_values);
+    const generation = host.submit(registry.generation, ui.form_command, form_values);
+    if (generation == .none) return ui.showFailure("Too many actions queued");
+    ui.ext_act_generation = generation;
     ui.showRunning();
 }

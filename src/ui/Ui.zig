@@ -46,6 +46,7 @@ const keyboard = @import("keyboard.zig");
 pub const ext_view = @import("ext_view.zig");
 pub const dmenu = @import("dmenu.zig");
 pub const installer = @import("installer.zig");
+const pictures = @import("pictures.zig");
 const prefs_view = @import("prefs_view.zig");
 const form_view = @import("form_view.zig");
 const config = @import("config.zig");
@@ -179,6 +180,8 @@ appearance: config.Appearance = .{},
 style_defaults_pending: bool = false,
 /// ~/.config/lumen/icons as last read (row_look.renamed points into it).
 icon_arena: ?std.heap.ArenaAllocator = null,
+icon_dir_stamp: os.Stamp = .none,
+icon_dir_scanned: bool = false,
 
 // ---------------------------------------------------------- extensions
 
@@ -198,6 +201,10 @@ ext_list: Inflight(ExtHost.ListResult, ext_query_bytes_max) = .{},
 ext_root_search: Inflight(ExtHost.RootResult, ext_query_bytes_max) = .{},
 /// The Lua action running (0: none); its answer decides what happens.
 ext_act_generation: ExtHost.RequestGeneration = .none,
+/// Deferred `--command` invocations waiting for initial extension load.
+pending_commands: std.ArrayList(ext_view.PendingCommand) = .empty,
+/// Suppresses key-repeat Backspace navigating back immediately after clearing input.
+backspace_blocked: bool = false,
 /// The extension whose preferences the prefs view lists.
 prefs_ext: core.FixedStr(extension_id_bytes_max) = .{},
 /// What the input view edits: a preference (index in the registry) or a
@@ -477,6 +484,7 @@ pub fn hide(self: *Ui) void {
     self.panel.close();
     self.confirm_key = "";
     self.ext_act_generation = .none;
+    self.backspace_blocked = false;
     gtk.setVisible(self.window, false);
     backdrop.hideBackdrops(self);
 }
@@ -523,6 +531,7 @@ pub fn setView(self: *Ui, view: View) void {
     self.panel.close();
     self.confirm_key = "";
     self.ext_act_generation = .none;
+    self.backspace_blocked = false;
     _ = self.data_arena.reset(arena_keep);
     if (view == .ext) ext_view.enter(self);
     // A password preference hides what is typed.
@@ -530,18 +539,7 @@ pub fn setView(self: *Ui, view: View) void {
         !(view == .input and prefs_view.isPassword(self)),
     ));
     self.base = search.loadBase(self, self.data_arena.allocator());
-
-    window_layout.layoutFor(self, view);
-    var placeholder_bytes: [128]u8 = undefined;
-    c.gtk_text_set_placeholder_text(
-        self.search_bar.entry,
-        self.placeholderFor(view, &placeholder_bytes),
-    );
-    c.gtk_label_set_text(self.search_bar.scope, self.viewTitle());
-    c.gtk_widget_set_visible(gtk.widget(self.search_bar.scope), @intFromBool(
-        view != .root and self.layout.show.scope and self.layout.searchbar.has(.scope),
-    ));
-    c.gtk_label_set_text(self.footer.title, self.viewTitle());
+    self.updateViewChrome();
 
     // Clearing the text emits `changed`, which refreshes; an entry that is
     // already empty emits nothing, so it is refreshed here.
@@ -553,6 +551,23 @@ pub fn setView(self: *Ui, view: View) void {
     }
     // The rows are this base's now: nothing points into replaced app lists.
     self.apps.dropStale();
+}
+
+/// Applies layout, placeholder, scope chip, and footer title for `self.view`
+/// without clearing the search query.
+pub fn updateViewChrome(self: *Ui) void {
+    const view = self.view;
+    window_layout.layoutFor(self, view);
+    var placeholder_bytes: [128]u8 = undefined;
+    c.gtk_text_set_placeholder_text(
+        self.search_bar.entry,
+        self.placeholderFor(view, &placeholder_bytes),
+    );
+    c.gtk_label_set_text(self.search_bar.scope, self.viewTitle());
+    c.gtk_widget_set_visible(gtk.widget(self.search_bar.scope), @intFromBool(
+        view != .root and self.layout.show.scope and self.layout.searchbar.has(.scope),
+    ));
+    c.gtk_label_set_text(self.footer.title, self.viewTitle());
 }
 
 /// The view's name: the search bar's scope chip and the footer's title.
@@ -773,10 +788,19 @@ pub fn perform(self: *Ui, operation: item_mod.Operation) void {
 /// At shutdown: the timers and idle callbacks the window keeps pending,
 /// so none runs against a window being torn down.
 pub fn removeSources(self: *Ui) void {
+    os.assertMainThread();
     if (self.apps_reload_timer != 0) _ = c.g_source_remove(self.apps_reload_timer);
     self.apps_reload_timer = 0;
     if (self.pending_idle != 0) _ = c.g_source_remove(self.pending_idle);
     self.pending_idle = 0;
+    if (self.scroll.tick != 0) {
+        c.gtk_widget_remove_tick_callback(gtk.widget(self.scroller), self.scroll.tick);
+        self.scroll.tick = 0;
+    }
+    dmenu.finish(self, null);
+    pictures.shutdown();
+    installer.shutdown();
+    ext_view.cancelPendingCommands(self);
 }
 
 /// An install or update changes many .desktop files: one reload (~5 ms of

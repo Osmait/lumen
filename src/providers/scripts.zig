@@ -9,6 +9,8 @@ const Item = @import("../item.zig").Item;
 /// How much of a script is read for its metadata: script_meta reads at most
 /// 40 lines of header comments, which fit in it.
 const script_header_bytes_max = 4096;
+/// Bound entries inspected/loaded per scripts directory scan.
+const scripts_entries_max = 512;
 
 /// ~/.config/lumen/scripts, in `arena`; null only when out of memory.
 pub fn folderPath(arena: std.mem.Allocator) ?[:0]const u8 {
@@ -33,6 +35,7 @@ const log = std.log.scoped(.scripts);
 /// The scripts, in `arena`: scanned again only when a file in the folder
 /// was added, removed, renamed or written since the last time.
 pub fn load(arena: std.mem.Allocator) []Item {
+    os.assertMainThread();
     const path = folderPath(arena) orelse return &.{};
     const folder_stamp = stamp(path);
     const cached = if (cache.stamp) |last| std.meta.eql(last, folder_stamp) else false;
@@ -83,8 +86,11 @@ fn stamp(path: [:0]const u8) FolderStamp {
     // Each file hashed on its own, the hashes summed: readdir gives them in
     // the file system's order, which can differ for the same files.
     var files_sum: u64 = 0;
+    var entries_seen: usize = 0;
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     while (c.g_dir_read_name(dir_handle)) |name_terminated| {
+        if (entries_seen >= scripts_entries_max) break;
+        entries_seen += 1;
         const name = std.mem.span(name_terminated);
         var hasher: std.hash.Wyhash = .init(0);
         hasher.update(name);
@@ -94,9 +100,11 @@ fn stamp(path: [:0]const u8) FolderStamp {
             .{ path, name },
             0,
         ) catch continue;
-        if (os.info(file_path)) |file_info| {
-            hasher.update(std.mem.asBytes(&.{ file_info.mtime, file_info.size }));
-        }
+        const file_stamp = os.Stamp.of(file_path.ptr);
+        hasher.update(std.mem.asBytes(&file_stamp.mtime_s));
+        hasher.update(std.mem.asBytes(&file_stamp.mtime_subsecond_ns));
+        hasher.update(std.mem.asBytes(&file_stamp.size));
+        hasher.update(std.mem.asBytes(&file_stamp.inode));
         files_sum +%= hasher.final();
     }
     return .{ .hashed = files_sum };
@@ -109,8 +117,11 @@ fn scan(arena: std.mem.Allocator, path: [:0]const u8) []Item {
 
     var items: std.ArrayList(Item) = .empty;
     var dropped: usize = 0;
+    var entries_seen: usize = 0;
     defer if (dropped > 0) log.warn("{d} scripts left out: out of memory", .{dropped});
     while (c.g_dir_read_name(dir_handle)) |name_terminated| {
+        if (entries_seen >= scripts_entries_max) break;
+        entries_seen += 1;
         const name = std.mem.span(name_terminated);
         if (name.len == 0 or name[0] == '.') continue;
         const item = (itemOf(arena, path, name) catch {
@@ -215,6 +226,11 @@ test "a missing folder and an empty one stamp differently, and edits show" {
     try std.testing.expect(one_file == .hashed);
     try std.testing.expect(!std.meta.eql(empty, one_file));
     try std.testing.expect(std.meta.eql(one_file, stamp(missing)));
+
+    // Atomic replacement of same size within the same second alters inode / nsec stamp.
+    const script_path = try test_dir.path(&path_buffer, "scripts/hello.sh");
+    try os.writeFileAtomic(script_path, "#!/bin/ba\n");
+    try std.testing.expect(!std.meta.eql(one_file, stamp(missing)));
 }
 
 test "emoji icons, joined ones included, and names that are not" {

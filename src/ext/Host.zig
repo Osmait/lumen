@@ -82,6 +82,8 @@ pending_deliveries: ?*Delivery = null,
 /// Bumped by every request; the worker sleeps on it (a futex).
 wake_sequence: std.atomic.Value(u32) = .init(0),
 stop: std.atomic.Value(bool) = .init(false),
+/// Set once the worker completes at least one reloadExecute pass.
+initial_registry_ready: std.atomic.Value(bool) = .init(false),
 /// Set by the worker as it returns: `shutdown` joins it only then.
 worker_done: std.atomic.Value(bool) = .init(false),
 /// The last request number handed out. Main thread only.
@@ -282,7 +284,7 @@ pub fn shutdown(host: *Host) void {
     }
     host.thread.join();
     host.cancelDeliveries();
-    if (host.pending.submit) |request| request.destroy(host.gpa);
+    host.pending.destroyOperations(host.gpa);
     loading.closeAll(host);
     host.extensions.deinit(host.gpa);
     host.worker_arena.deinit();
@@ -373,10 +375,13 @@ pub fn submit(
         values,
     ) catch {
         log.warn("submit: out of memory, not sent", .{});
-        return request_generation;
+        return .none;
     };
-    // The request it replaces never ran, and nothing else frees it.
-    if (host.post(.submit, request)) |replaced| replaced.destroy(host.gpa);
+    if (!host.postOperation(.{ .submit = request })) {
+        log.warn("submit: operation queue full, dropped", .{});
+        request.destroy(host.gpa);
+        return .none;
+    }
     return request_generation;
 }
 
@@ -410,12 +415,15 @@ pub fn act(
     target: ActTarget,
 ) RequestGeneration {
     const request_generation = host.requestGenerationNext();
-    _ = host.post(.act, .{
+    if (!host.postOperation(.{ .act = .{
         .registry_generation = registry_generation,
         .command = command,
         .request_generation = request_generation,
         .target = target,
-    });
+    } })) {
+        log.warn("act: operation queue full, dropped", .{});
+        return .none;
+    }
     return request_generation;
 }
 
@@ -424,6 +432,16 @@ pub fn act(
 fn requestGenerationNext(host: *Host) RequestGeneration {
     host.request_generation_last = host.request_generation_last.next();
     return host.request_generation_last;
+}
+
+fn postOperation(host: *Host, op: requests.Operation) bool {
+    const pushed = blk: {
+        host.lock.lockUncancelable(host.io);
+        defer host.lock.unlock(host.io);
+        break :blk host.pending.pushOperation(op);
+    };
+    if (pushed) host.wake();
+    return pushed;
 }
 
 /// Hands `request` to the worker as the pending request of its kind, and
@@ -443,6 +461,36 @@ fn post(
     };
     host.wake();
     return replaced;
+}
+
+/// Waits up to `timeout_ms` for the initial registry load during startup and
+/// takes the newest pending `.registry` delivery directly (removing its idle source).
+pub fn takePendingRegistry(host: *Host, timeout_ms: u64) ?*Registry {
+    const deadline_ns = os.monotonicNs() +| timeout_ms * std.time.ns_per_ms;
+    while (!host.initial_registry_ready.load(.acquire)) {
+        if (host.stop.load(.acquire)) return null;
+        if (os.monotonicNs() >= deadline_ns) return null;
+        os.sleepUs(5 * std.time.ns_per_ms);
+    }
+    host.delivery_lock.lockUncancelable(host.io);
+    defer host.delivery_lock.unlock(host.io);
+    var cursor = host.pending_deliveries;
+    var found: ?*Registry = null;
+    while (cursor) |delivery| {
+        const next = delivery.next;
+        if (delivery.answer == .registry) {
+            host.unlinkDelivery(delivery);
+            if (delivery.source_id != 0) _ = c.g_source_remove(delivery.source_id);
+            if (found == null) {
+                found = delivery.answer.registry;
+            } else {
+                delivery.answer.registry.destroy(host.gpa);
+            }
+            host.gpa.destroy(delivery);
+        }
+        cursor = next;
+    }
+    return found;
 }
 
 /// Wakes the worker: bumps the sequence it sleeps on.
@@ -465,8 +513,10 @@ fn run(host: *Host) void {
         wake_sequence_seen = wake_sequence;
         const pending = host.pendingTake();
         if (pending.reload) loading.reloadExecute(host);
-        if (pending.act) |request| requests.actExecute(host, request);
-        if (pending.submit) |request| requests.submitExecute(host, request);
+        for (pending.operations[0..pending.operations_len]) |op| switch (op) {
+            .act => |request| requests.actExecute(host, request),
+            .submit => |request| requests.submitExecute(host, request),
+        };
         if (pending.list) |request| requests.listExecute(host, &request);
         if (pending.root_search) |request| requests.rootSearchExecute(host, &request);
     }
@@ -607,6 +657,8 @@ const Probe = struct {
     registry: ?*Registry = null,
     list: ?*ListResult = null,
     act: ?*ActResult = null,
+    acts_seen: usize = 0,
+    act_had_error: bool = false,
     root: ?*RootResult = null,
 
     fn registryCallback(answer: *Registry, context: ?*anyopaque) void {
@@ -621,6 +673,8 @@ const Probe = struct {
     }
     fn actCallback(answer: *ActResult, context: ?*anyopaque) void {
         const probe: *Probe = @ptrCast(@alignCast(context.?));
+        probe.acts_seen += 1;
+        if (answer.error_message != null) probe.act_had_error = true;
         if (probe.act) |old| old.destroy(testing.allocator);
         probe.act = answer;
     }
@@ -1329,4 +1383,86 @@ test "lumen.set deduplicates repeated keys instead of overflowing kept_keys_max"
     try testing.expectEqualStrings("wide", registry.settings[0].value);
     try testing.expectEqualStrings("density", registry.settings[1].key);
     try testing.expectEqualStrings("compact", registry.settings[1].value);
+}
+
+test "multiple act and submit operations queue FIFO without dropping earlier ones" {
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const folder = try os.tmpDirPath(&test_dir, &path_buffer);
+
+    try writeTestFile(folder, "extensions/q/init.lua",
+        \\local log = {}
+        \\return lumen.extension { commands = {
+        \\  { name = "run1", title = "R1", run = function()
+        \\      local until_t = os.clock() + 0.05
+        \\      while os.clock() < until_t do end
+        \\      log[#log + 1] = "r1"
+        \\      return "stay"
+        \\  end },
+        \\  { name = "run2", title = "R2", run = function()
+        \\      log[#log + 1] = "r2"
+        \\      return "stay"
+        \\  end },
+        \\  { name = "form", title = "F", fields = { { name = "v", title = "V", default = "" } },
+        \\    submit = function(vals)
+        \\      log[#log + 1] = "f:" .. vals.v
+        \\      return "stay"
+        \\  end },
+        \\  { name = "items", title = "Items", items = function()
+        \\      return { table.concat(log, ",") }
+        \\  end },
+        \\} }
+    );
+
+    var probe: Probe = .{};
+    defer probe.deinit();
+    const host = try testHost(&probe, folder);
+    defer host.shutdown();
+    host.reload();
+    try probe.wait("registry");
+    const registry = probe.registry.?;
+
+    // Fire an action that keeps worker busy briefly, then queue act + two submits.
+    const g1 = host.act(registry.generation, .from(0), .command_run);
+    os.sleepUs(5_000);
+    const g2 = host.act(registry.generation, .from(1), .command_run);
+    const g3 = host.submit(registry.generation, .from(2), &.{.{ .name = "v", .value = "a", .toggle = false }});
+    const g4 = host.submit(registry.generation, .from(2), &.{.{ .name = "v", .value = "b", .toggle = false }});
+    try testing.expect(g1 != .none and g2 != .none and g3 != .none and g4 != .none);
+
+    const until_ns = os.monotonicNs() + 10 * std.time.ns_per_s;
+    while (probe.acts_seen < 4) {
+        if (os.monotonicNs() > until_ns) return error.Timeout;
+        if (c.g_main_context_iteration(null, 0) == 0) {
+            _ = std.os.linux.poll(&[0]std.os.linux.pollfd{}, 0, 1);
+        }
+    }
+    try testing.expect(!probe.act_had_error);
+    _ = host.list(registry.generation, .from(3), "");
+    const listed = try probe.take("list");
+    defer listed.destroy(testing.allocator);
+    try testing.expectEqualStrings("r1,r2,f:a,f:b", listed.items[0].title);
+}
+
+test "takePendingRegistry waits for initial load even with load problems" {
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const folder = try os.tmpDirPath(&test_dir, &path_buffer);
+
+    try writeTestFile(folder, "extensions/hello/init.lua",
+        \\return lumen.extension { commands = { { name = "greetings", title = "Hi", items = { "ok" } } } }
+    );
+    try writeTestFile(folder, "extensions/broken/init.lua", "syntax error @@@");
+
+    var probe: Probe = .{};
+    defer probe.deinit();
+    const host = try testHost(&probe, folder);
+    defer host.shutdown();
+    host.reload();
+    const registry = host.takePendingRegistry(5000) orelse return error.TestUnexpectedResult;
+    defer registry.destroy(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), registry.commands.len);
+    try testing.expectEqual(@as(usize, 1), registry.problems.len);
 }

@@ -115,14 +115,15 @@ pub fn openLibs(L: *State) void {
     c.lua_pushcclosure(L, wrap(refuseOpen), 0);
     c.lua_pushcclosure(L, wrap(isTimedOut), 0);
     c.lua_pushcclosure(L, wrap(armThreadHook), 0);
-    c.lua_callk(L, 3, 0, 0, null);
+    c.lua_pushcclosure(L, wrap(checkDeadline), 0);
+    c.lua_callk(L, 4, 0, 0, null);
 }
 
 /// Run by `openLibs` once the libraries are open, with `refuseOpen`,
-/// `isTimedOut` and `armThreadHook` as its arguments: what it replaces and
-/// why is said there.
+/// `isTimedOut`, `armThreadHook` and `checkDeadline` as its arguments: what
+/// it replaces and why is said there.
 const sandbox_prelude =
-    \\local refuse, timed_out, arm_hook = ...
+    \\local refuse, timed_out, arm_hook, check_deadline = ...
     \\debug = nil; package.loaded.debug = nil
     \\os.exit, os.execute, os.setlocale = nil, nil, nil
     \\io.popen = nil
@@ -186,6 +187,7 @@ const sandbox_prelude =
     \\  if ti > ei or ti <= fi or a1 ~= a2 then
     \\    local from = fi
     \\    while from <= ei do
+    \\      check_deadline()
     \\      local last = from + move_chunk - 1
     \\      if last > ei then last = ei end
     \\      raw_move(a1, from, last, ti + (from - fi), a2)
@@ -194,6 +196,7 @@ const sandbox_prelude =
     \\  else
     \\    local last = ei
     \\    while last >= fi do
+    \\      check_deadline()
     \\      local from = last - move_chunk + 1
     \\      if from < fi then from = fi end
     \\      raw_move(a1, from, last, ti + (from - fi), a2)
@@ -322,11 +325,37 @@ const sandbox_prelude =
     \\    end
     \\  end
     \\end
+    \\local function guarded(fn)
+    \\  if type(fn) ~= "function" then return fn end
+    \\  return function(...)
+    \\    check_deadline()
+    \\    return fn(...)
+    \\  end
+    \\end
+    \\table.sort = guarded(table.sort)
+    \\table.insert = guarded(table.insert)
+    \\table.remove = guarded(table.remove)
+    \\table.concat = guarded(table.concat)
+    \\table.unpack = guarded(table.unpack)
+    \\string.rep = guarded(string.rep)
+    \\string.dump = guarded(string.dump)
+    \\collectgarbage = guarded(collectgarbage)
 ;
 
 fn isTimedOut(L: *State) Error!c_int {
     c.lua_pushboolean(L, @intFromBool(budgetOf(L).timed_out));
     return 1;
+}
+
+fn checkDeadline(L: *State) Error!c_int {
+    const budget = budgetOf(L);
+    if (budget.expired()) {
+        budget.timed_out = true;
+        c.lua_sethook(L, &hook, c.LUA_MASKCOUNT, 1);
+        pushString(L, "timed out");
+        return error.Raise;
+    }
+    return 0;
 }
 
 fn armThreadHook(L: *State) Error!c_int {
@@ -1427,4 +1456,38 @@ test "pushFmt never reads uninitialized tail bytes and keeps UTF-8 valid" {
     try testing.expectEqualStrings(&prefix2, pushed2[0..508]);
     for (pushed2[508..]) |ch| try testing.expect(std.ascii.isDigit(ch));
     pop(L, 1);
+}
+
+test "deadline stops loops of expensive C functions (table.sort, string.rep)" {
+    var budget: Budget = .{
+        .bytes_max = 16 << 20,
+        .deadline_ns = os.monotonicNs() + 100 * std.time.ns_per_ms,
+    };
+    const L = try testState(&budget);
+    defer c.lua_close(L);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const start_ns = os.monotonicNs();
+    const sort_err = runCode(
+        L,
+        arena_state.allocator(),
+        "local t = {} for i = 1, 50000 do t[i] = 50000 - i end while true do table.sort(t) end",
+    ).?;
+    try testing.expect(std.mem.find(u8, sort_err, "timed out") != null);
+    try testing.expect(os.monotonicNs() - start_ns < std.time.ns_per_s);
+
+    var rep_budget: Budget = .{
+        .bytes_max = 16 << 20,
+        .deadline_ns = os.monotonicNs() + 100 * std.time.ns_per_ms,
+    };
+    const L2 = try testState(&rep_budget);
+    defer c.lua_close(L2);
+    const rep_start_ns = os.monotonicNs();
+    const rep_err = runCode(
+        L2,
+        arena_state.allocator(),
+        "while true do local _ = string.rep('x', 1 << 20) end",
+    ).?;
+    try testing.expect(std.mem.find(u8, rep_err, "timed out") != null);
+    try testing.expect(os.monotonicNs() - rep_start_ns < std.time.ns_per_s);
 }

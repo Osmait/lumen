@@ -172,6 +172,7 @@ pub fn build(ui: *Ui) void {
     const keys = c.gtk_event_controller_key_new();
     c.gtk_event_controller_set_propagation_phase(keys, c.GTK_PHASE_CAPTURE);
     widgets.connect(keys, "key-pressed", &onKey, ui);
+    widgets.connect(keys, "key-released", &onKeyReleased, ui);
     c.gtk_widget_add_controller(gtk.widget(ui.window), keys);
 
     // A click on the clear part of the surface hides the window, like one on
@@ -556,7 +557,18 @@ fn onKey(
 ) callconv(.c) c.gboolean {
     const ui: *Ui = @ptrCast(@alignCast(data));
     if (!keyboard.isModifierKey(keyval)) ui.key_ns = stats.now();
-    return keyboard.handleKey(ui, keyval, state);
+    return keyboard.handleKeyEvent(ui, keyval, state, true);
+}
+
+fn onKeyReleased(
+    _: *c.GtkEventControllerKey,
+    keyval: c_uint,
+    _: c_uint,
+    _: c.GdkModifierType,
+    data: ?*anyopaque,
+) callconv(.c) void {
+    const ui: *Ui = @ptrCast(@alignCast(data));
+    if (keyval == c.GDK_KEY_BackSpace) ui.backspace_blocked = false;
 }
 
 test "style.css has the sizes the window computes with" {

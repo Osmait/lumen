@@ -62,6 +62,11 @@ pub fn output(argv: []const [:0]const u8) ?[:0]u8 {
     return outputWithin(argv, output_timeout_ms, output_bytes_max);
 }
 
+/// Like `output`, with an explicit timeout in milliseconds.
+pub fn outputTimeout(argv: []const [:0]const u8, timeout_ms: u64) ?[:0]u8 {
+    return outputWithin(argv, timeout_ms, output_bytes_max);
+}
+
 fn outputWithin(argv: []const [:0]const u8, timeout_ms: u64, bytes_max: usize) ?[:0]u8 {
     var argv_buffer: Argv = undefined;
     const argv_z = argv_buffer.of(argv) orelse return null;

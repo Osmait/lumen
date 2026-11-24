@@ -141,6 +141,7 @@ fn manageRows(ui: *Ui, arena: std.mem.Allocator, out: *std.ArrayList(Item)) void
             .title = "Update",
             .subtitle = "git pull",
             .icon = .{ .tile = .{ .name = "view-refresh-symbolic", .color = .green } },
+            .confirm = true,
             .action = .{ .setting = .{ .ext_update = id } },
         }) catch return;
     }
