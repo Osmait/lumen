@@ -629,10 +629,21 @@ fn set(L: *lua.State) lua.Error!c_int {
                 return lua.fail(L, "lumen.set: \"{s}\" is not a value for {s}", .{ value, key });
             },
         }
-        settings.append(arena, .{
-            .key = arena.dupeSentinel(u8, key, 0) catch return lua.failOom(L),
-            .value = arena.dupeSentinel(u8, value, 0) catch return lua.failOom(L),
-        }) catch return lua.failOom(L);
+        const duped_value = arena.dupeSentinel(u8, value, 0) catch return lua.failOom(L);
+        var updated = false;
+        for (settings.items) |*entry| {
+            if (std.mem.eql(u8, entry.key, key)) {
+                entry.value = duped_value;
+                updated = true;
+                break;
+            }
+        }
+        if (!updated) {
+            settings.append(arena, .{
+                .key = arena.dupeSentinel(u8, key, 0) catch return lua.failOom(L),
+                .value = duped_value,
+            }) catch return lua.failOom(L);
+        }
         // Pops the value; `lua_next` takes the key off next.
         lua.pop(L, 1);
     }

@@ -67,6 +67,13 @@ pub fn Inflight(comptime Result: type, comptime asked_bytes_max: usize) type {
             self.pending = false;
         }
 
+        /// Keeps `latest` as the active answer and invalidates any in-flight
+        /// request for another query so its late answer is dropped.
+        pub fn keepLatest(self: *Self) void {
+            self.pending = false;
+            if (self.latest) |latest| self.generation = latest.generation;
+        }
+
         /// Forgets the requests in flight (their answers will not be
         /// current) and returns the latest answer for the caller to destroy.
         pub fn forget(self: *Self) ?*Result {
@@ -107,4 +114,20 @@ test "inflight: stale answers are not current, taking hands back the old one" {
     try std.testing.expect(!inflight.showingLatest());
     try std.testing.expectEqual(&third, inflight.forget().?);
     try std.testing.expect(!inflight.current(&third));
+}
+
+test "inflight: keepLatest drops an overtaken in-flight query when returning to latest" {
+    const Answer = struct { generation: u32 };
+    var inflight: Inflight(Answer, 16) = .{};
+    var ab: Answer = .{ .generation = 1 };
+    var abc: Answer = .{ .generation = 2 };
+
+    inflight.sent(1, "ab");
+    try std.testing.expectEqual(@as(?*Answer, null), inflight.take(&ab));
+    inflight.sent(2, "abc");
+    // User deleted back to "ab" while "abc" was still running.
+    inflight.keepLatest();
+    try std.testing.expect(!inflight.pending);
+    try std.testing.expect(!inflight.current(&abc));
+    try std.testing.expect(inflight.current(&ab));
 }

@@ -115,6 +115,7 @@ pub fn child(delta: *const Delta, directory: u32, child_name: []const u8) ?u32 {
 }
 
 /// Adds an entry under delta entry `parent`, and to its parent's `kids`.
+/// Atomic on OOM: if updating `kids` fails, `delta.builder` is untouched.
 pub fn push(
     delta: *Delta,
     gpa: std.mem.Allocator,
@@ -123,14 +124,16 @@ pub fn push(
     entry_flags: u8,
     depth: u16,
 ) std.mem.Allocator.Error!u32 {
-    const id = try delta.builder.push(gpa, name, parent, entry_flags, depth);
     const kids = try delta.kids.getOrPut(gpa, parent);
     if (!kids.found_existing) kids.value_ptr.* = .empty;
-    try kids.value_ptr.append(gpa, id);
+    try kids.value_ptr.ensureUnusedCapacity(gpa, 1);
+    const id = try delta.builder.push(gpa, name, parent, entry_flags, depth);
+    kids.value_ptr.appendAssumeCapacity(id);
     return id;
 }
 
 /// The scaffolding root for base directory `dir_path`, made on first use.
+/// Atomic on OOM: if updating `roots` fails, `delta.builder` is untouched.
 pub fn root(
     delta: *Delta,
     gpa: std.mem.Allocator,
@@ -138,6 +141,9 @@ pub fn root(
     depth: u16,
 ) std.mem.Allocator.Error!u32 {
     if (delta.roots.get(dir_path)) |id| return id;
+    try delta.roots.ensureUnusedCapacity(gpa, 1);
+    const key = try gpa.dupe(u8, dir_path);
+    errdefer gpa.free(key);
     const id = try delta.builder.pushStructural(
         gpa,
         dir_path,
@@ -145,9 +151,7 @@ pub fn root(
         store_mod.flag_dir,
         depth,
     );
-    const key = try gpa.dupe(u8, dir_path);
-    errdefer gpa.free(key);
-    try delta.roots.put(gpa, key, id);
+    delta.roots.putAssumeCapacity(key, id);
     return id;
 }
 
@@ -242,4 +246,32 @@ pub fn tombstoneUnder(delta: *Delta, gpa: std.mem.Allocator, dir_path: []const u
         gpa.free(root_path);
     }
     return tombstoned;
+}
+
+test "Delta.push and Delta.root leave delta.builder untouched on OOM" {
+    const testing = std.testing;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const gpa = failing.allocator();
+    var delta = try Delta.init(testing.allocator);
+    defer delta.deinit(testing.allocator);
+
+    // Every OOM point during root() leaves builder length unchanged.
+    for (0..4) |fail_step| {
+        failing.fail_index = failing.alloc_index + fail_step;
+        _ = delta.root(gpa, "/tmp/root_a", 0) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expectEqual(@as(usize, 0), delta.builder.len());
+            continue;
+        };
+        break;
+    }
+    failing.fail_index = std.math.maxInt(usize);
+    const root_id = try delta.root(testing.allocator, "/tmp/root_b", 0);
+    const len_before_push = delta.builder.len();
+
+    // Fail on the kids allocation inside push(): builder must not keep a ghost entry.
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, delta.push(gpa, "ghost.txt", root_id, 0, 1));
+    try testing.expectEqual(len_before_push, delta.builder.len());
+    try testing.expectEqual(@as(?u32, null), delta.child(root_id, "ghost.txt"));
 }

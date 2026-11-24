@@ -146,7 +146,7 @@ fn scoreWith(
     total -= before_first * weight.before_first_per_byte;
     total -= @as(i32, @intCast(name.len / weight.name_bytes_per_point));
     const stem_length = std.mem.findScalarLast(u8, name, '.') orelse name.len;
-    const stem_is_query = stem_length > 0 and stem_length == query.len;
+    const stem_is_query = stem_length > 0 and stem_length == query.len and hit_previous < stem_length;
     if (name.len == query.len or stem_is_query) total += weight.whole_name;
     return total;
 }
@@ -190,4 +190,15 @@ test "an ASCII name scores the same down both paths" {
         "ab",
         store_mod.charMask("ab-eñe"),
     ));
+}
+
+test "whole_name bonus requires matching the stem content, not just its length" {
+    // "taco.do" has stem_length 4 == "todo".len, but "todo" crosses the dot.
+    try testing.expect(score("todo.md", "todo").? > score("taco.do", "todo").?);
+    try testing.expect(score("mail.min", "main").? < score("main.min", "main").?);
+    try testing.expectEqual(
+        score("abcd.txt", "bdtx").?,
+        score("abcde.txt", "bdtx").?,
+    );
+    try testing.expect(score("Cargo.toml", "cargo").? - score("CargoX.toml", "cargo").? >= weight.whole_name);
 }

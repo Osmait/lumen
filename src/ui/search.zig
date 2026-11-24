@@ -243,7 +243,7 @@ fn fillContents(ui: *Ui, arena: std.mem.Allocator, query_text: []const u8, start
     else
         false;
     if (fresh) {
-        ui.content_query.answered();
+        ui.content_query.keepLatest();
     } else {
         ui.content_query.sent(content_search.submit(query_text, start_ns), query_text);
     }

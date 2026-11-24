@@ -209,7 +209,7 @@ pub fn shutdown(service: *ContentService) void {
 /// search reading it. The last one let go frees it.
 const Shared = struct {
     index: content.Index,
-    version: u64,
+    version: std.atomic.Value(u64),
     gpa: std.mem.Allocator,
     refs: std.atomic.Value(u32) = .init(1),
 
@@ -224,7 +224,7 @@ const Shared = struct {
             dropped.deinit(gpa);
             return err;
         };
-        shared.* = .{ .index = index, .version = version, .gpa = gpa };
+        shared.* = .{ .index = index, .version = .init(version), .gpa = gpa };
         return shared;
     }
 
@@ -369,7 +369,7 @@ pub fn searchUntil(
         .size = index.sizes[match.doc],
         .extracted = index.sources[match.doc] == @backingInt(content.Source.extracted),
     });
-    return shared.version;
+    return shared.version.load(.acquire);
 }
 
 /// The file holding a document's text, for verification (see PathFn).
@@ -644,8 +644,13 @@ fn logOutOfMemory(what: []const u8) void {
 }
 
 /// How the listed documents differ from the index: ids whose document
-/// changed or is gone, and the documents to index (changed or new).
-const Diff = struct { gone: []u32, added: []content.DocIn };
+/// changed or is gone, documents to index (changed or new), and indexed
+/// documents whose cached extracted text vanished and needs re-extraction.
+const Diff = struct {
+    gone: []u32,
+    added: []content.DocIn,
+    reextract: []content.DocIn = &.{},
+};
 
 /// Called on the service thread, the only one that replaces the index, so
 /// it can read it without the lock.
@@ -667,10 +672,16 @@ fn diff(
     @memset(seen, false);
     var gone: std.ArrayList(u32) = .empty;
     var added: std.ArrayList(content.DocIn) = .empty;
+    var reextract: std.ArrayList(content.DocIn) = .empty;
     for (docs) |doc| {
         if (ids.get(doc.path)) |id| {
             seen[id] = true;
-            if (unchanged(index, id, doc)) continue;
+            if (unchanged(index, id, doc)) {
+                if (doc.source == .extracted and !service.textCached(doc)) {
+                    try reextract.append(arena, doc);
+                }
+                continue;
+            }
             try gone.append(arena, id);
         }
         try added.append(arena, doc);
@@ -681,7 +692,7 @@ fn diff(
         if (seen[id]) continue;
         try gone.append(arena, id);
     }
-    return .{ .gone = gone.items, .added = added.items };
+    return .{ .gone = gone.items, .added = added.items, .reextract = reextract.items };
 }
 
 /// Whether `doc` is the version of document `id` that the index holds.
@@ -741,6 +752,7 @@ fn indexedChanges(
     const index = service.current().?;
     var gone: std.ArrayList(u32) = .empty;
     var added: std.ArrayList(content.DocIn) = .empty;
+    var reextract: std.ArrayList(content.DocIn) = .empty;
     var path_buffer: paths.Buffer = undefined;
     for (0..index.docs_count) |doc_index| {
         const id: u32 = @intCast(doc_index);
@@ -759,9 +771,18 @@ fn indexedChanges(
         if (stat_now) |stat| {
             const same = stat.mtime == doc.mtime and stat.size == doc.size;
             // Its extracted text gone from the cache (a cleaner emptied it):
-            // indexed but never found, until the document changed. As if it
-            // had: extracted again.
-            if (same and (doc.source == .plain or service.textCached(doc))) continue;
+            // re-extract into the cache without rebuilding the index.
+            if (same) {
+                if (doc.source == .extracted and !service.textCached(doc)) {
+                    try reextract.append(arena, .{
+                        .path = try arena.dupe(u8, doc.path),
+                        .mtime = doc.mtime,
+                        .size = doc.size,
+                        .source = doc.source,
+                    });
+                }
+                continue;
+            }
         }
         try gone.append(arena, id);
         // Gone, or out of bounds now: only removed.
@@ -785,7 +806,7 @@ fn indexedChanges(
             .source = .extracted,
         });
     }
-    return .{ .gone = gone.items, .added = added.items };
+    return .{ .gone = gone.items, .added = added.items, .reextract = reextract.items };
 }
 
 /// Whether the extracted text of `doc` is in the text cache.
@@ -833,7 +854,11 @@ fn refresh(service: *ContentService) void {
     var listed: ?ListingStamp = null;
     var changed = service.changes(arena, name_changes, &docs, &listed) orelse return;
     if (service.stop.load(.acquire)) return;
-    if (service.index != null and changed.gone.len == 0 and changed.added.len == 0) {
+    if (service.index != null and
+        changed.gone.len == 0 and
+        changed.added.len == 0 and
+        changed.reextract.len == 0)
+    {
         service.commitListing(listed);
         if (service.worker.unsaved) service.retrySave();
         return;
@@ -842,6 +867,25 @@ fn refresh(service: *ContentService) void {
     service.counters.building.store(true, .release);
     defer service.counters.building.store(false, .release);
     defer @import("root.zig").trimHeap();
+    // Only missing cached texts for unchanged indexed documents: extract them
+    // back into TextCache without rebuilding or deleting them via dropStale.
+    if (service.index != null and changed.gone.len == 0 and changed.added.len == 0) {
+        const extract_start_ns = sys.monotonicNs();
+        const reextracted = service.extractMissing(arena, changed.reextract) orelse return;
+        service.counters.extract_ns_last.store(sys.monotonicNs() - extract_start_ns, .monotonic);
+        if (service.stop.load(.acquire)) return;
+        service.commitListing(listed);
+        service.commitRetry(reextracted.retry);
+        if (reextracted.docs.len > 0) {
+            const next_version = service.version.load(.monotonic) + 1;
+            service.lock.lockUncancelable(service.io);
+            service.index.?.version.store(next_version, .release);
+            service.version.store(next_version, .release);
+            service.lock.unlock(service.io);
+            if (service.options.on_published) |hook| hook.callback(hook.context);
+        }
+        return;
+    }
     const whole = service.wantsWhole(changed);
     // A whole build indexes every file: they must be listed.
     if (whole and docs == null) {
@@ -854,6 +898,9 @@ fn refresh(service: *ContentService) void {
     else
         service.extractMissing(arena, changed.added) orelse return;
     if (whole) docs = extracted.docs else changed.added = extracted.docs;
+    if (!whole and changed.reextract.len > 0) {
+        _ = service.extractMissing(arena, changed.reextract);
+    }
     service.counters.extract_ns_last.store(sys.monotonicNs() - start_ns, .monotonic);
     if (service.stop.load(.acquire)) return;
     // Only documents to retry, which failed again.
@@ -888,7 +935,7 @@ fn refresh(service: *ContentService) void {
     if (old) |old_shared| {
         // The service's reference: a search still reading it keeps it
         // until it is done.
-        service.text_cache.dropStale(&old_shared.index, changed.gone);
+        service.text_cache.dropStale(&old_shared.index, changed.gone, changed.added);
         old_shared.release();
     }
     if (whole) service.sweepText();
@@ -1771,4 +1818,61 @@ test "content service: indexVersion advances on publish and searchUntil reports 
     const v2 = try service.searchUntil(fixture.arena_state.allocator(), "ephemeral", 10, null, &hits);
     try testing.expectEqual(@as(u64, 2), v2);
     try testing.expectEqual(@as(usize, 0), hits.items.len);
+}
+
+test "content service: missing cached text is re-extracted and kept instead of dropped as stale" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    if (!haveTool("zip") or !haveTool("unzip")) return error.SkipZigTest;
+
+    var stage = try TestTree.init();
+    defer stage.deinit();
+    try stage.write("[Content_Types].xml", "<?xml version=\"1.0\"?><Types/>");
+    try stage.write(
+        "word/document.xml",
+        \\<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Minutes about the okapi project</w:t></w:r></w:p></w:body></w:document>
+        ,
+    );
+
+    var path_buffer: paths.Buffer = undefined;
+    const report = try fixture.root.path(&path_buffer, "report.docx");
+    const zip_res = try std.process.run(testing.allocator, testing.io, .{
+        .argv = &.{ "zip", "-q", "-X", "-r", report, "." },
+        .cwd = .{ .path = stage.absolute },
+    });
+    testing.allocator.free(zip_res.stdout);
+    testing.allocator.free(zip_res.stderr);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, zip_res.term);
+    try setMtime(report, sys.nowSeconds() - 200);
+
+    const service = try fixture.start();
+    defer service.shutdown();
+    try waitChecks(service, 1);
+    try testing.expectEqual(@as(u32, 1), service.status().extractions);
+    try testing.expectEqual(@as(u32, 1), service.status().builds);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "okapi")).len);
+
+    // Simulate a cache cleaner deleting the cached .txt file while report.docx is unchanged.
+    const stat = content_list.stat(report, .document).?;
+    var cache_path_buf: paths.Buffer = undefined;
+    const cached_txt = service.text_cache.path(&cache_path_buf, .{
+        .path = report,
+        .mtime = stat.mtime,
+        .size = stat.size,
+        .source = .extracted,
+    }).?;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.unlink(cached_txt)));
+    try testing.expect(!sys.exists(cached_txt));
+
+    // Poke: must re-extract without rebuilding the index, and must NOT delete cached_txt!
+    try pokeAndWait(service);
+    try testing.expectEqual(@as(u32, 2), service.status().extractions);
+    try testing.expectEqual(@as(u32, 1), service.status().builds);
+    try testing.expect(sys.exists(cached_txt));
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "okapi")).len);
+
+    // Next poke: cached text is back, so nothing is extracted again.
+    try pokeAndWait(service);
+    try testing.expectEqual(@as(u32, 2), service.status().extractions);
 }

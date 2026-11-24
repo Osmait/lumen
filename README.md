@@ -142,6 +142,7 @@ works right away and fills in within seconds.
 | `Esc` | clear, go back, hide |
 | `Backspace` on an empty search | go back |
 | `Ctrl+X` | delete a clipboard entry |
+| `Ctrl+Shift+X` | delete all clipboard entries (press again to confirm) |
 
 Clicking outside the window closes it.
 

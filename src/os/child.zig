@@ -434,3 +434,24 @@ test "a missing program is an error, not a crash" {
         .{ .deadline_ns = deadline(1000) },
     ));
 }
+
+test "children spawned after ignoreSigpipe do not inherit SIG_IGN on SIGPIPE" {
+    os.unix.ignoreSigpipe();
+    const start_ns = os.monotonicNs();
+    var result = try run(testing.allocator, testing.io, &.{
+        "sh",
+        "-c",
+        "grep '^SigIgn:' /proc/self/status; while :; do echo x; done | head -n 1",
+    }, .{ .deadline_ns = deadline(3000) });
+    defer result.deinit(testing.allocator);
+    try testing.expect(!result.timed_out);
+    try testing.expectEqual(@as(?u8, 0), result.code);
+    try testing.expect(os.monotonicNs() - start_ns < 2 * std.time.ns_per_s);
+    const sigign_line_end = std.mem.findScalar(u8, result.stdout, '\n') orelse result.stdout.len;
+    const prefix = "SigIgn:\t";
+    try testing.expect(std.mem.startsWith(u8, result.stdout[0..sigign_line_end], prefix));
+    const mask_hex = std.mem.trim(u8, result.stdout[prefix.len..sigign_line_end], " \t\r");
+    const sigign = try std.fmt.parseInt(u64, mask_hex, 16);
+    // SIGPIPE is signal 13 -> bit 12 (0x1000).
+    try testing.expectEqual(@as(u64, 0), sigign & (@as(u64, 1) << 12));
+}
