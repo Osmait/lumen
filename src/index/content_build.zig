@@ -17,6 +17,7 @@ const assert = std.debug.assert;
 const paths = @import("paths.zig");
 const Pool = @import("Pool.zig");
 const sys = @import("os");
+const fold = @import("core").fold;
 const content_format = @import("content_format.zig");
 const header_size = content_format.header_size;
 const Header = content_format.Header;
@@ -652,11 +653,24 @@ fn extractTaskOrFail(round: *ExtractRound, task: usize) std.mem.Allocator.Error!
         if (!try round.text.read(round.text.context, round.docs[doc], text, gpa)) continue;
         if (seen.bit_length == 0) seen.* = try .initEmpty(gpa, trigrams_count);
         keys.clearRetainingCapacity();
-        var trigrams: Trigrams = .{ .text = text.items };
-        while (trigrams.next()) |key| {
-            if (seen.isSet(key)) continue;
-            seen.set(key);
-            try keys.append(gpa, key);
+        if (fold.isAscii(text.items)) {
+            if (text.items.len >= content_format.trigram_chars) {
+                var window: u32 = (@as(u32, std.ascii.toLower(text.items[0])) << 8) |
+                    std.ascii.toLower(text.items[1]);
+                for (text.items[2..]) |byte| {
+                    window = ((window << 8) | std.ascii.toLower(byte)) & content_format.trigram_mask;
+                    if (seen.isSet(window)) continue;
+                    seen.set(window);
+                    try keys.append(gpa, window);
+                }
+            }
+        } else {
+            var trigrams: Trigrams = .{ .text = text.items };
+            while (trigrams.next()) |key| {
+                if (seen.isSet(key)) continue;
+                seen.set(key);
+                try keys.append(gpa, key);
+            }
         }
         for (keys.items) |key| seen.unset(key);
         try out.ensureUnusedCapacity(gpa, keys.items.len);

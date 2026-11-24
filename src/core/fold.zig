@@ -158,6 +158,26 @@ pub inline fn next(text: []const u8, index: *usize) Char {
     return .{ .byte = byte, .upper = false };
 }
 
+/// Handles a non-ASCII byte at `text[index.*]` without lookahead on ASCII bytes:
+/// folds 2-byte Latin letters, skips NFD combining diacritics attached to a
+/// prior `'a'..'z'` folded letter (returning `null`), or passes raw bytes through.
+pub inline fn stepNonAscii(text: []const u8, index: *usize, prev_folded: u8) ?u8 {
+    const byte = text[index.*];
+    std.debug.assert(byte >= 0x80);
+    if (isFoldableLead(byte)) {
+        if (letterAt(text, index.*)) |letter_index| {
+            index.* += 2;
+            return letters[letter_index];
+        }
+    }
+    if (prev_folded >= 'a' and prev_folded <= 'z' and isCombiningDiacritic(text, index.*)) {
+        index.* += 2;
+        return null;
+    }
+    index.* += 1;
+    return byte;
+}
+
 /// True when `text[index]` is inside a multi-byte foldable character: the
 /// second byte of a 2-byte foldable letter, or part of an NFD combining
 /// diacritic attached to an earlier foldable letter.
@@ -181,8 +201,21 @@ pub fn insideLetter(text: []const u8, index: usize) bool {
 pub fn foldInto(folded: []u8, text: []const u8) []u8 {
     var text_index: usize = 0;
     var folded_len: usize = 0;
-    while (text_index < text.len and folded_len < folded.len) : (folded_len += 1) {
-        folded[folded_len] = step(text, &text_index);
+    var prev_folded: u8 = 0;
+    while (text_index < text.len and folded_len < folded.len) {
+        const byte = text[text_index];
+        if (byte < 0x80) {
+            text_index += 1;
+            const out_byte = std.ascii.toLower(byte);
+            folded[folded_len] = out_byte;
+            folded_len += 1;
+            prev_folded = out_byte;
+            continue;
+        }
+        const out_byte = stepNonAscii(text, &text_index, prev_folded) orelse continue;
+        folded[folded_len] = out_byte;
+        folded_len += 1;
+        prev_folded = out_byte;
     }
     // A folded character is never longer than the original one.
     std.debug.assert(folded_len <= text.len);
@@ -195,10 +228,38 @@ pub fn foldCase(folded: []u8, upper: []bool, text: []const u8) usize {
     std.debug.assert(upper.len >= folded.len);
     var text_index: usize = 0;
     var folded_len: usize = 0;
-    while (text_index < text.len and folded_len < folded.len) : (folded_len += 1) {
-        const char = next(text, &text_index);
-        folded[folded_len] = char.byte;
-        upper[folded_len] = char.upper;
+    var prev_folded: u8 = 0;
+    while (text_index < text.len and folded_len < folded.len) {
+        const byte = text[text_index];
+        if (byte < 0x80) {
+            text_index += 1;
+            const out_byte = std.ascii.toLower(byte);
+            folded[folded_len] = out_byte;
+            upper[folded_len] = std.ascii.isUpper(byte);
+            folded_len += 1;
+            prev_folded = out_byte;
+            continue;
+        }
+        if (isFoldableLead(byte)) {
+            if (letterAt(text, text_index)) |letter_index| {
+                text_index += 2;
+                const out_byte = letters[letter_index];
+                folded[folded_len] = out_byte;
+                upper[folded_len] = uppers[letter_index];
+                folded_len += 1;
+                prev_folded = out_byte;
+                continue;
+            }
+        }
+        if (prev_folded >= 'a' and prev_folded <= 'z' and isCombiningDiacritic(text, text_index)) {
+            text_index += 2;
+            continue;
+        }
+        text_index += 1;
+        folded[folded_len] = byte;
+        upper[folded_len] = false;
+        folded_len += 1;
+        prev_folded = byte;
     }
     std.debug.assert(folded_len <= text.len);
     return folded_len;
@@ -215,7 +276,18 @@ pub fn foldAlloc(gpa: std.mem.Allocator, text: []const u8) std.mem.Allocator.Err
 pub fn foldedLen(text: []const u8) usize {
     var text_index: usize = 0;
     var folded_len: usize = 0;
-    while (text_index < text.len) : (folded_len += 1) _ = step(text, &text_index);
+    var prev_folded: u8 = 0;
+    while (text_index < text.len) {
+        const byte = text[text_index];
+        if (byte < 0x80) {
+            text_index += 1;
+            prev_folded = std.ascii.toLower(byte);
+            folded_len += 1;
+            continue;
+        }
+        prev_folded = stepNonAscii(text, &text_index, prev_folded) orelse continue;
+        folded_len += 1;
+    }
     return folded_len;
 }
 
@@ -410,4 +482,43 @@ test "NFD decomposed accents fold identically to NFC" {
     try testing.expect(!insideLetter(nfd, 0));
     try testing.expect(insideLetter(nfd, 1));
     try testing.expect(insideLetter(nfd, 2));
+
+    // Verify fast foldInto / foldCase / foldedLen match byte-by-byte step / next.
+    const samples = [_][]const u8{
+        "accio\u{0301}n",
+        "N\u{0303}andu\u{0301}",
+        "a\u{0301}\u{0323}",
+        "é\u{0323}",
+        "\u{0301}x",
+        "1\u{0301}",
+        "×\u{0301}",
+        "mixedAscii_And_Áá\u{0308}Z\u{0301}",
+    };
+    for (samples) |sample| {
+        var step_buf: [128]u8 = undefined;
+        var next_buf: [128]u8 = undefined;
+        var next_upper: [128]bool = undefined;
+        var fast_buf: [128]u8 = undefined;
+        var fast_case_buf: [128]u8 = undefined;
+        var fast_upper: [128]bool = undefined;
+
+        var i: usize = 0;
+        var step_len: usize = 0;
+        while (i < sample.len) : (step_len += 1) step_buf[step_len] = step(sample, &i);
+
+        i = 0;
+        var next_len: usize = 0;
+        while (i < sample.len) : (next_len += 1) {
+            const c = next(sample, &i);
+            next_buf[next_len] = c.byte;
+            next_upper[next_len] = c.upper;
+        }
+
+        const fast_folded = foldInto(&fast_buf, sample);
+        const fast_case_len = foldCase(&fast_case_buf, &fast_upper, sample);
+        try testing.expectEqualStrings(step_buf[0..step_len], fast_folded);
+        try testing.expectEqualStrings(next_buf[0..next_len], fast_case_buf[0..fast_case_len]);
+        try testing.expectEqualSlices(bool, next_upper[0..next_len], fast_upper[0..fast_case_len]);
+        try testing.expectEqual(step_len, foldedLen(sample));
+    }
 }
