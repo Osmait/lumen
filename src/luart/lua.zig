@@ -1207,6 +1207,20 @@ test "extensions open files close-on-exec, and only so many at once" {
     _ = c.lua_gc(L, c.LUA_GCCOLLECT, @as(c_int, 0));
     // Closed, collected, or read to their end: every slot came back.
     try testing.expectEqual(@as(u32, 0), budget.open_files);
+
+    // io.tmpfile opens atomically close-on-exec, is usable for R/W, and is counted.
+    const tmp_check =
+        \\local f = assert(io.tmpfile())
+        \\assert(f:write("tmp-ok"))
+        \\assert(f:seek("set", 0))
+        \\assert(f:read("*a") == "tmp-ok")
+        \\tmp_held = f
+    ;
+    try testing.expect(runCode(L, arena, tmp_check) == null);
+    try testing.expectEqual(@as(u32, 1), budget.open_files);
+    try testing.expectEqual(inheritable_before, inheritableFds());
+    try testing.expect(runCode(L, arena, "tmp_held:close(); tmp_held = nil") == null);
+    try testing.expectEqual(@as(u32, 0), budget.open_files);
 }
 
 test "a cancelled state stops at once, and long errors are cut" {

@@ -51,7 +51,7 @@ jobs:
           version=${GITHUB_REF_NAME#v}
           name=lumen-$version-x86_64-linux
           mkdir -p "pkg/$name"
-          cp dist/bin/lumen dist/bin/lumen-gtk LICENSE README.md CHANGELOG.md "pkg/$name/"
+          cp dist/bin/lumen dist/bin/lumen-gtk LICENSE THIRD_PARTY_LICENSES README.md CHANGELOG.md "pkg/$name/"
           cp -r examples "pkg/$name/"
           tar -C pkg -czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > SHA256SUMS

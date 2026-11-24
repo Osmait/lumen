@@ -212,13 +212,14 @@ pub const Stat = struct { mtime: i64, size: u64 };
 pub const Kind = enum { text, document };
 
 /// A listed file's mtime and size, or null if it is not one to index (any
-/// more): not a regular file, or a size out of bounds for its `kind`.
+/// more): not a regular file (symlinks are not followed, avoiding slow mounts
+/// and matching `scan.zig`/`Watcher.zig`), or a size out of bounds for its `kind`.
 pub fn stat(path: [*:0]const u8, kind: Kind) ?Stat {
     var statx: linux.Statx = undefined;
     const result = linux.statx(
         linux.AT.FDCWD,
         path,
-        0,
+        linux.AT.SYMLINK_NOFOLLOW,
         .{ .TYPE = true, .SIZE = true, .MTIME = true },
         &statx,
     );
@@ -535,4 +536,24 @@ test "slow mounts below the root become anchored, escaped ripgrep excludes" {
     try std.testing.expectEqualStrings("!/we\\[i\\]rd", argv.items[3]);
     try std.testing.expect(underAny("/home/u/nas/a.txt", &mounts));
     try std.testing.expect(!underAny("/home/u2/a.txt", mounts[0..2]));
+}
+
+test "stat does not follow symlinks" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    try tree.write("real.txt", "hello world");
+    var path_buffer: paths.Buffer = undefined;
+    var link_buffer: paths.Buffer = undefined;
+    const real_path = try tree.path(&path_buffer, "real.txt");
+    const link_path = try tree.path(&link_buffer, "link.txt");
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.symlink(real_path, link_path)));
+
+    try testing.expect(stat(real_path, .text) != null);
+    try testing.expect(stat(link_path, .text) == null);
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const got = try listTree(arena_state.allocator(), &tree, true);
+    try testing.expectEqual(@as(usize, 1), got.len);
+    try testing.expectEqualStrings(real_path, got[0].path);
 }

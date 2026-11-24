@@ -746,8 +746,13 @@ pub fn perform(self: *Ui, operation: item_mod.Operation) void {
         else => false,
     };
     if (item.action == .clip and uses_text) {
-        const content = self.db.clipContent(clip_arena.allocator(), item.action.clip) catch null;
-        whole.detail = content orelse return self.showFailure("Could not read the entry");
+        const content = self.db.clipContent(clip_arena.allocator(), item.action.clip) catch {
+            return self.showFailure("Could not read the entry");
+        };
+        whole.detail = content orelse {
+            self.setView(self.view);
+            return;
+        };
     }
     const outcome = run.perform(self.actionContext(), &whole, operation);
     switch (outcome) {

@@ -125,11 +125,17 @@ pub fn run(
         },
         .stdout = .pipe,
         .stderr = if (options.stderr == .collect) .pipe else .ignore,
+        // Run in its own process group so timeouts kill grandchildren too.
+        .pgid = 0,
     });
     if (options.limits) |limits| applyLimits(child.id.?, limits);
     // `kill` sends SIGTERM and waits: after a SIGKILL it only reaps. The
     // child is not reaped yet, so the SIGKILL cannot miss it.
     defer if (child.id) |pid| {
+        // Negative pid signals the child's entire process group so
+        // grandchildren (e.g. spawned by `sh -c`) cannot outlive a timeout,
+        // cancel or output cap.
+        _ = linux.kill(-pid, .KILL);
         _ = linux.kill(pid, .KILL);
         child.kill(io);
     };
@@ -454,4 +460,23 @@ test "children spawned after ignoreSigpipe do not inherit SIG_IGN on SIGPIPE" {
     const sigign = try std.fmt.parseInt(u64, mask_hex, 16);
     // SIGPIPE is signal 13 -> bit 12 (0x1000).
     try testing.expectEqual(@as(u64, 0), sigign & (@as(u64, 1) << 12));
+}
+
+test "timing out kills grandchildren in the child's process group" {
+    const argv = &.{ "sh", "-c", "sleep 30 & echo $!; wait" };
+    var result = try run(testing.allocator, testing.io, argv, .{ .deadline_ns = deadline(150) });
+    defer result.deinit(testing.allocator);
+    try testing.expect(result.timed_out);
+    const pid_text = std.mem.trim(u8, result.stdout, " \t\r\n");
+    try testing.expect(pid_text.len > 0);
+    _ = try std.fmt.parseInt(linux.pid_t, pid_text, 10);
+
+    var proc_buffer: [64]u8 = undefined;
+    const proc_path = try std.mem.printSentinel(&proc_buffer, "/proc/{s}", .{pid_text}, 0);
+    // Wait briefly for the kernel to reap the killed grandchild.
+    const wait_deadline = os.monotonicNs() + 500 * std.time.ns_per_ms;
+    while (os.exists(proc_path) and os.monotonicNs() < wait_deadline) {
+        os.sleepUs(10_000);
+    }
+    try testing.expect(!os.exists(proc_path));
 }

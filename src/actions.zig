@@ -139,7 +139,7 @@ fn copyClip(context: Context, item: *const Item) void {
 
 fn deleteClip(context: Context, item: *const Item) Outcome {
     assert(item.action == .clip);
-    context.db.deleteClip(item.action.clip) catch {
+    _ = context.db.deleteClip(item.action.clip) catch {
         return .{ .failed = "Could not delete the entry" };
     };
     return .refresh_view;

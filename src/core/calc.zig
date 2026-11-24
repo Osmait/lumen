@@ -72,7 +72,11 @@ fn splitConversion(text: []const u8) ?Result {
         if (parser.offset != expression.len) continue;
 
         const base = amount * source.factor + source.offset;
-        const converted = (base - target.offset) / target.factor;
+        const shifted = Parser.cleanNearZero(
+            base - target.offset,
+            @max(@abs(base), @abs(target.offset)),
+        );
+        const converted = shifted / target.factor;
         // "1e308 km to mm" overflows; "(-1)^0.5 m to ft" is nan.
         if (!std.math.isFinite(converted)) return null;
         return .{ .value = converted, .unit = target.names[0], .from_unit = source.names[0] };
@@ -141,17 +145,25 @@ fn fixed4(text_buffer: []u8, value: f64) []const u8 {
     return text[0..end];
 }
 
-/// Formats for copying: no separators, no trailing zeros: "1234.5".
+/// Largest integer every consecutive integer up to it is exact in f64 (2^53).
+const exact_int_max: f64 = 9007199254740992.0;
+
+/// Formats for copying: no separators, no trailing zeros: "1234.5", with full
+/// round-trip precision for scientific notation and exact integers up to 2^53.
 pub fn formatPlain(plain_buffer: []u8, value: f64) []const u8 {
-    // Below 1e-12 is a zero the arithmetic did not reach exactly.
-    const rounded = if (@abs(value) < 1e-12) 0 else value;
-    if (rounded == @trunc(rounded) and @abs(rounded) < 1e15) {
-        return std.mem.print(plain_buffer, "{d}", .{@as(i64, @intFromFloat(rounded))}) catch "?";
+    if (!std.math.isFinite(value)) {
+        return std.mem.print(plain_buffer, "{d}", .{value}) catch "?";
     }
-    if (@abs(rounded) >= 1e15 or @abs(rounded) < 1e-6) {
-        return std.mem.print(plain_buffer, "{e:.6}", .{rounded}) catch "?";
+    if (value == 0) {
+        return std.mem.print(plain_buffer, "0", .{}) catch "?";
     }
-    const text = std.mem.print(plain_buffer, "{d:.10}", .{rounded}) catch return "?";
+    if (value == @trunc(value) and @abs(value) <= exact_int_max) {
+        return std.mem.print(plain_buffer, "{d}", .{@as(i64, @intFromFloat(value))}) catch "?";
+    }
+    if (@abs(value) >= 1e15 or @abs(value) < 1e-6) {
+        return std.mem.print(plain_buffer, "{e}", .{value}) catch "?";
+    }
+    const text = std.mem.print(plain_buffer, "{d:.10}", .{value}) catch return "?";
     var end = text.len;
     while (end > 0 and text[end - 1] == '0') end -= 1;
     if (end > 0 and text[end - 1] == '.') end -= 1;
@@ -257,7 +269,7 @@ test "hostile input: deep nesting, overflowing conversions, huge values" {
 
     var text_buffer: [32]u8 = undefined;
     // Large values used to round through v * 1e4, which overflowed to inf.
-    try std.testing.expectEqualStrings("1.000000e305", formatDisplay(&text_buffer, 1e305));
+    try std.testing.expectEqualStrings("1e305", formatDisplay(&text_buffer, 1e305));
     try std.testing.expectEqualStrings("inf", formatDisplay(&text_buffer, std.math.inf(f64)));
     try std.testing.expectEqualStrings("-inf", formatDisplay(&text_buffer, -std.math.inf(f64)));
     try std.testing.expectEqualStrings("nan", formatDisplay(&text_buffer, std.math.nan(f64)));
@@ -364,10 +376,58 @@ fn fuzzFormat(_: void, smith: *std.testing.Smith) anyerror!void {
     // What is copied reads back as the value.
     if (std.math.isFinite(value)) {
         const back = try std.fmt.parseFloat(f64, plain);
-        try std.testing.expect(@abs(back - value) <= @max(@abs(value) * 1e-6, 1e-10));
+        if (@abs(value) >= 1e15 or @abs(value) < 1e-6 or
+            (value == @trunc(value) and @abs(value) <= exact_int_max))
+        {
+            try std.testing.expectEqual(value, back);
+        } else {
+            try std.testing.expect(@abs(back - value) <= @max(@abs(value) * 1e-9, 1e-10));
+        }
     }
 }
 
 test "fuzz: formatting any f64 fits its buffer" {
     try std.testing.fuzz({}, fuzzFormat, .{});
+}
+
+test "small values, exact integers up to 2^53, and cancellation dust" {
+    var display_buf: [32]u8 = undefined;
+    var plain_buf: [64]u8 = undefined;
+
+    const small_planck = evaluate("6.626e-34 * 2").?;
+    try std.testing.expectEqualStrings("1.3252e-33", formatPlain(&plain_buf, small_planck.value));
+    try std.testing.expectEqualStrings("1.3252e-33", formatDisplay(&display_buf, small_planck.value));
+
+    const small_sub = evaluate("1e-13 * 2").?;
+    try std.testing.expectEqualStrings("2e-13", formatPlain(&plain_buf, small_sub.value));
+    try std.testing.expectEqualStrings("2e-13", formatDisplay(&display_buf, small_sub.value));
+
+    const sum_small = evaluate("1e-13 + 1e-13").?;
+    try std.testing.expectEqualStrings("2e-13", formatPlain(&plain_buf, sum_small.value));
+
+    const pow53 = evaluate("2^53").?;
+    try std.testing.expectEqualStrings("9007199254740992", formatPlain(&plain_buf, pow53.value));
+    try std.testing.expectEqualStrings(
+        "9,007,199,254,740,992",
+        formatDisplay(&display_buf, pow53.value),
+    );
+
+    const exact_mul = evaluate("1234567890123456 * 1").?;
+    try std.testing.expectEqualStrings("1234567890123456", formatPlain(&plain_buf, exact_mul.value));
+
+    const pow15_plus_1 = evaluate("1e15 + 1").?;
+    try std.testing.expectEqualStrings("1000000000000001", formatPlain(&plain_buf, pow15_plus_1.value));
+
+    // Rounding dust from cancellation still displays and copies as 0.
+    for ([_][]const u8{
+        "sqrt(2)^2 - 2",
+        "0.1 + 0.2 - 0.3",
+        "sin(1*pi)",
+        "cos(pi/2)",
+        "32 f to c",
+    }) |expr| {
+        const res = evaluate(expr).?;
+        try std.testing.expectEqualStrings("0", formatPlain(&plain_buf, res.value));
+        try std.testing.expectEqualStrings("0", formatDisplay(&display_buf, res.value));
+    }
 }

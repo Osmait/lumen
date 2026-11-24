@@ -49,7 +49,7 @@ const opacity_percent_default = 97;
 const opacity_percent_max = 100;
 const clipboard_keep_min = 10;
 const clipboard_keep_default = 1000;
-const clipboard_keep_max = 100_000;
+pub const clipboard_keep_max: u32 = 5000;
 /// A value written back into the file: a word, not a paragraph.
 const token_bytes_max = 200;
 /// The heading of the file's second part: which app opens each kind.
@@ -676,6 +676,9 @@ test "bad values keep the default, bad lines are ignored" {
     try testing.expectEqual(TextSize.default, settings.text_size);
     try testing.expectEqual(@as(u8, 97), settings.opacity);
     try testing.expectEqual(@as(u32, 1000), settings.clipboard_keep);
+    try testing.expect(!settings.setChoice(.clipboard_keep, "5001"));
+    try testing.expect(settings.setChoice(.clipboard_keep, "5000"));
+    try testing.expectEqual(@as(u32, 5000), settings.clipboard_keep);
     try testing.expect(settings.files_in_root);
     try testing.expectEqualStrings("", settings.terminal);
     try testing.expectEqualStrings(theme_default, settings.theme);

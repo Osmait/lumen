@@ -62,8 +62,10 @@ Search ignores case and accents everywhere: `accion` finds *acción*.
 | Fedora | `sudo dnf install gtk4 gtk4-layer-shell wl-clipboard wtype ripgrep poppler-utils unzip wireplumber playerctl` |
 | Debian / Ubuntu | `sudo apt install libgtk-4-1 libgtk4-layer-shell0 wl-clipboard wtype ripgrep poppler-utils unzip wireplumber playerctl` |
 
-gtk4-layer-shell is packaged in recent releases (Debian 13, Ubuntu 24.04,
-Fedora 40 and later).
+gtk4-layer-shell is packaged in recent releases (Debian 13, Ubuntu 24.10 /
+26.04 LTS, Fedora 40 and later). On Ubuntu 24.04 LTS and earlier, install
+`libgtk-4-1` via apt and build
+[gtk4-layer-shell](https://github.com/wmww/gtk4-layer-shell) from source.
 
 ## Install
 
@@ -319,5 +321,6 @@ measured to make it fast, is in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## License
 
-MIT, see [LICENSE](LICENSE). The language logos in `src/ui/icons/devicon/`
-come from [Devicon](https://devicon.dev) (MIT, see the license there).
+MIT, see [LICENSE](LICENSE). Third-party notices for bundled Lua, Devicon
+(`src/ui/icons/devicon/`) and SQLite are in
+[THIRD_PARTY_LICENSES](THIRD_PARTY_LICENSES).

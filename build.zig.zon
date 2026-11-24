@@ -13,5 +13,5 @@
             .hash = "N-V-__8AAETTsABEodUZZFAyfdAm9hEyqBXuLw9pRSO0vFh9",
         },
     },
-    .paths = .{ "build.zig", "build.zig.zon", "src", "examples/styles", "LICENSE", "README.md" },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "examples/styles", "LICENSE", "THIRD_PARTY_LICENSES", "README.md" },
 }

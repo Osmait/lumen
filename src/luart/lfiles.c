@@ -7,11 +7,12 @@
 ** method works on them, and closing or collecting one gives its slot back.
 */
 
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -116,15 +117,44 @@ static int luart_io_open (lua_State *L) {
   return 1;
 }
 
+/* Opens an unlinked temporary descriptor atomically with O_CLOEXEC. Prefers
+** O_TMPFILE so no directory entry ever exists; falls back to mkostemp on
+** file systems without O_TMPFILE support. */
+static int open_tmp_fd (void) {
+  const char *dir = getenv("TMPDIR");
+  if (dir == NULL || *dir == '\0') dir = "/tmp";
+#ifdef O_TMPFILE
+  int fd = open(dir, O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
+  if (fd >= 0) return fd;
+#endif
+  char path[4096];
+  int len = snprintf(path, sizeof(path), "%s/lumen-tmp-XXXXXX", dir);
+  if (len < 0 || (size_t)len >= sizeof(path)) {
+    snprintf(path, sizeof(path), "/tmp/lumen-tmp-XXXXXX");
+  }
+  int mkfd = mkostemp(path, O_CLOEXEC);
+  if (mkfd >= 0) unlink(path);
+  return mkfd;
+}
+
 static int luart_io_tmpfile (lua_State *L) {
   luaL_Stream *p = new_stream(L);
   if (!luart_file_opened(L)) return too_many(L, "tmpfile");
-  p->f = tmpfile();
-  if (p->f == NULL) {
+  int fd = open_tmp_fd();
+  if (fd < 0) {
+    int saved_errno = errno;
     luart_file_closed(L);
+    errno = saved_errno;
     return luaL_fileresult(L, 0, NULL);
   }
-  fcntl(fileno(p->f), F_SETFD, FD_CLOEXEC);
+  p->f = fdopen(fd, "w+b");
+  if (p->f == NULL) {
+    int saved_errno = errno;
+    close(fd);
+    luart_file_closed(L);
+    errno = saved_errno;
+    return luaL_fileresult(L, 0, NULL);
+  }
   p->closef = &counted_close;
   return 1;
 }
