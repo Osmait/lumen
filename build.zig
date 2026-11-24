@@ -183,7 +183,7 @@ fn cLibraries(b: *std.Build, options: struct {
         lua.linkSystemLibrary(lua_package, .{});
     }
     const libraries: CLibraries = .{ .sqlite = sqlite.createModule(), .lua = lua.createModule() };
-    const luart_c = luartCLibrary(b, target, hot);
+    const luart_c = luartCLibrary(b, target, optimize, hot);
     libraries.lua.linkLibrary(luart_c);
     if (system_libraries) {
         luart_c.root_module.linkSystemLibrary(lua_package, .{});
@@ -219,12 +219,12 @@ fn cLibraries(b: *std.Build, options: struct {
 /// extensions' string.find/match/gmatch/gsub, lstrmatch.c) and io.open /
 /// io.tmpfile close-on-exec and counted per state (lfiles.c). Public API
 /// only, so it builds against the system's Lua as well as the bundled one;
-/// and built like Lua itself (`hot`, no UBSan): in the module, in a
-/// ReleaseSafe build, UBSan made patterns 23-39% slower than Lua's own
-/// (MYP-186).
+/// compiled with UBSan in Debug/tests and without UBSan in optimized builds
+/// (`hot`), where UBSan made patterns 23-39% slower than Lua's own (MYP-186).
 fn luartCLibrary(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
     hot: std.builtin.OptimizeMode,
 ) *std.Build.Step.Compile {
     return cLibrary(b, .{
@@ -234,6 +234,7 @@ fn luartCLibrary(
         .root = b.path("src/luart"),
         .files = &.{ "lstrmatch.c", "lfiles.c" },
         .flags = &.{"-DLUA_COMPAT_5_3"},
+        .sanitize_c = if (optimize == .debug) .full else .off,
     });
 }
 
@@ -452,9 +453,9 @@ const lua_sources = [_][]const u8{
     "lutf8lib.c", "linit.c",
 };
 
-/// A static library of C sources from a dependency. Their own code: built
-/// optimized (Debug becomes ReleaseSafe) and without Zig's C sanitizer, as
-/// their makefiles do.
+/// A static library of C sources. Third-party dependencies keep UBSan off and
+/// compile optimized (Debug becomes ReleaseSafe), while Lumen's own C sources
+/// can opt into `sanitize_c = .full` in Debug/tests.
 fn cLibrary(b: *std.Build, options: struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
@@ -462,15 +463,19 @@ fn cLibrary(b: *std.Build, options: struct {
     root: std.Build.LazyPath,
     files: []const []const u8,
     flags: []const []const u8,
+    sanitize_c: std.zig.SanitizeC = .off,
 }) *std.Build.Step.Compile {
     const library = b.addLibrary(.{
         .name = options.name,
         .linkage = .static,
         .root_module = b.createModule(.{
             .target = options.target,
-            .optimize = if (options.optimize == .debug) .safe else options.optimize,
+            .optimize = if (options.optimize == .debug and options.sanitize_c == .off)
+                .safe
+            else
+                options.optimize,
             .link_libc = true,
-            .sanitize_c = .off,
+            .sanitize_c = options.sanitize_c,
         }),
     });
     library.root_module.addCSourceFiles(.{

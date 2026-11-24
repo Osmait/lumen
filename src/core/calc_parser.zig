@@ -47,6 +47,18 @@ pub const Parser = struct {
         return true;
     }
 
+    /// Zeroes out rounding dust left by subtracting nearly equal values
+    /// (e.g. `sqrt(2)^2 - 2`, `0.1 + 0.2 - 0.3`), without affecting small
+    /// nonzero results from products or quotients.
+    pub fn cleanNearZero(result: f64, scale: f64) f64 {
+        if (std.math.isFinite(result) and std.math.isFinite(scale) and
+            scale > 0 and @abs(result) <= scale * 1e-12)
+        {
+            return 0;
+        }
+        return result;
+    }
+
     /// Parses `expression := term (('+' | '-') term)*`.
     pub fn parseExpression(parser: *Parser) Error!f64 {
         var value = try parser.parseTerm();
@@ -55,12 +67,14 @@ pub const Parser = struct {
                 '+' => {
                     parser.offset += 1;
                     parser.saw_operator = true;
-                    value += try parser.parseTerm();
+                    const rhs = try parser.parseTerm();
+                    value = cleanNearZero(value + rhs, @max(@abs(value), @abs(rhs)));
                 },
                 '-' => {
                     parser.offset += 1;
                     parser.saw_operator = true;
-                    value -= try parser.parseTerm();
+                    const rhs = try parser.parseTerm();
+                    value = cleanNearZero(value - rhs, @max(@abs(value), @abs(rhs)));
                 },
                 else => return value,
             }
@@ -325,13 +339,16 @@ fn fnLog2(x: f64) Error!f64 {
     return @log2(x);
 }
 fn fnSin(x: f64) Error!f64 {
-    return @sin(x);
+    const y = @sin(x);
+    return if (@abs(x) >= 1e-3 and @abs(y) < 1e-12) 0 else y;
 }
 fn fnCos(x: f64) Error!f64 {
-    return @cos(x);
+    const y = @cos(x);
+    return if (@abs(y) < 1e-12) 0 else y;
 }
 fn fnTan(x: f64) Error!f64 {
-    return @tan(x);
+    const y = @tan(x);
+    return if (@abs(x) >= 1e-3 and @abs(y) < 1e-12) 0 else y;
 }
 fn fnRound(x: f64) Error!f64 {
     return @round(x);

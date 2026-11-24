@@ -48,20 +48,110 @@ pub fn open(path: [:0]const u8) Error!Db {
         \\PRAGMA synchronous = NORMAL;
         \\CREATE TABLE IF NOT EXISTS frecency (
         \\  key TEXT PRIMARY KEY,
-        \\  count INTEGER NOT NULL,
+        \\  score REAL NOT NULL,
         \\  last_used INTEGER NOT NULL
         \\);
         \\CREATE TABLE IF NOT EXISTS clipboard (
-        \\  id INTEGER PRIMARY KEY,
+        \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
         \\  hash INTEGER NOT NULL UNIQUE,
         \\  content TEXT NOT NULL,
         \\  created_at INTEGER NOT NULL,
-        \\  last_copied INTEGER NOT NULL
+        \\  last_copied INTEGER NOT NULL,
+        \\  seq INTEGER NOT NULL DEFAULT 0
         \\);
+    );
+    try db.migrateFrecency();
+    try db.migrateClipboard();
+    try db.exec(
         \\DROP INDEX IF EXISTS clipboard_recent;
-        \\CREATE INDEX IF NOT EXISTS clipboard_by_time ON clipboard(last_copied);
+        \\DROP INDEX IF EXISTS clipboard_by_time;
+        \\CREATE INDEX IF NOT EXISTS clipboard_by_recency ON clipboard(last_copied DESC, seq DESC);
     );
     return db;
+}
+
+fn hasColumn(db: *Db, table: [:0]const u8, column: []const u8) Error!bool {
+    var sql_buf: [128]u8 = undefined;
+    const sql = std.mem.printSentinel(&sql_buf, "PRAGMA table_info({s})", .{table}, 0) catch
+        unreachable;
+    const stmt = try db.prepare(sql);
+    defer _ = c.sqlite3_finalize(stmt);
+    while (try db.nextRow(stmt)) {
+        if (std.mem.eql(u8, columnText(stmt, 1), column)) return true;
+    }
+    return false;
+}
+
+fn clipboardHasAutoincrement(db: *Db) Error!bool {
+    const stmt = try db.prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'clipboard'",
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    if (!try db.nextRow(stmt)) return false;
+    return std.ascii.findIgnoreCase(columnText(stmt, 0), "autoincrement") != null;
+}
+
+/// Migrates legacy `frecency(key, count, last_used)` to `score REAL`.
+fn migrateFrecency(db: *Db) Error!void {
+    if (try db.hasColumn("frecency", "score")) return;
+    try db.exec("BEGIN IMMEDIATE");
+    errdefer _ = c.sqlite3_exec(db.handle, "ROLLBACK", null, null, null);
+    if (!try db.hasColumn("frecency", "score")) {
+        try db.exec(
+            \\CREATE TABLE frecency_new (
+            \\  key TEXT PRIMARY KEY,
+            \\  score REAL NOT NULL,
+            \\  last_used INTEGER NOT NULL
+            \\);
+            \\INSERT INTO frecency_new (key, score, last_used)
+            \\  SELECT key, CAST(MAX(count, 0) AS REAL), last_used FROM frecency;
+            \\DROP TABLE frecency;
+            \\ALTER TABLE frecency_new RENAME TO frecency;
+        );
+    }
+    try db.exec("COMMIT");
+}
+
+/// Migrates legacy `clipboard` tables without `AUTOINCREMENT` or `seq`,
+/// preserving existing ids, contents, and recency order.
+fn migrateClipboard(db: *Db) Error!void {
+    const has_auto = try db.clipboardHasAutoincrement();
+    const has_seq = try db.hasColumn("clipboard", "seq");
+    if (has_auto and has_seq) return;
+    try db.exec("BEGIN IMMEDIATE");
+    errdefer _ = c.sqlite3_exec(db.handle, "ROLLBACK", null, null, null);
+    const now_auto = try db.clipboardHasAutoincrement();
+    const now_seq = try db.hasColumn("clipboard", "seq");
+    if (!now_auto or !now_seq) {
+        try db.exec(
+            \\CREATE TABLE clipboard_new (
+            \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\  hash INTEGER NOT NULL UNIQUE,
+            \\  content TEXT NOT NULL,
+            \\  created_at INTEGER NOT NULL,
+            \\  last_copied INTEGER NOT NULL,
+            \\  seq INTEGER NOT NULL DEFAULT 0
+            \\);
+        );
+        if (now_seq) {
+            try db.exec(
+                \\INSERT INTO clipboard_new (id, hash, content, created_at, last_copied, seq)
+                \\  SELECT id, hash, content, created_at, last_copied, seq FROM clipboard;
+            );
+        } else {
+            try db.exec(
+                \\INSERT INTO clipboard_new (id, hash, content, created_at, last_copied, seq)
+                \\  SELECT id, hash, content, created_at, last_copied,
+                \\    ROW_NUMBER() OVER (ORDER BY last_copied ASC, id ASC)
+                \\  FROM clipboard;
+            );
+        }
+        try db.exec(
+            \\DROP TABLE clipboard;
+            \\ALTER TABLE clipboard_new RENAME TO clipboard;
+        );
+    }
+    try db.exec("COMMIT");
 }
 
 /// The history holds whatever was copied, passwords too, and SQLite creates
@@ -161,6 +251,7 @@ fn bind(db: *Db, stmt: *c.sqlite3_stmt, args: anytype) Error!void {
         const parameter: c_int = arg_index + 1;
         const bind_result = switch (@typeInfo(@TypeOf(arg))) {
             .int, .comptime_int => c.sqlite3_bind_int64(stmt, parameter, arg),
+            .float, .comptime_float => c.sqlite3_bind_double(stmt, parameter, arg),
             else => bindText(stmt, parameter, arg),
         };
         if (bind_result != c.SQLITE_OK) {
@@ -219,10 +310,32 @@ fn stepFailed(db: *Db, step_result: c_int) Error {
 pub fn recordUse(db: *Db, key: []const u8, now: i64) Error!void {
     // An item without a key has no ranking; Ui.perform skips those.
     assert(key.len > 0);
-    try db.execArgs(
-        \\INSERT INTO frecency (key, count, last_used) VALUES (?1, 1, ?2)
-        \\ON CONFLICT(key) DO UPDATE SET count = count + 1, last_used = ?2
-    , .{ key, now });
+    try db.exec("BEGIN IMMEDIATE");
+    errdefer _ = c.sqlite3_exec(db.handle, "ROLLBACK", null, null, null);
+
+    const select_stmt = try db.prepare(
+        "SELECT score, last_used FROM frecency WHERE key = ?1",
+    );
+    defer _ = c.sqlite3_finalize(select_stmt);
+    try db.bind(select_stmt, .{key});
+    if (try db.nextRow(select_stmt)) {
+        const prev_score = columnScore(select_stmt, 0);
+        const prev_last = c.sqlite3_column_int64(select_stmt, 1);
+        const next_score = frecency.addUse(prev_score, prev_last, now);
+        const next_last = @max(now, prev_last);
+        _ = c.sqlite3_reset(select_stmt);
+        try db.execArgs(
+            "UPDATE frecency SET score = ?2, last_used = ?3 WHERE key = ?1",
+            .{ key, next_score, next_last },
+        );
+    } else {
+        _ = c.sqlite3_reset(select_stmt);
+        try db.execArgs(
+            "INSERT INTO frecency (key, score, last_used) VALUES (?1, 1.0, ?2)",
+            .{ key, now },
+        );
+    }
+    try db.exec("COMMIT");
 }
 
 pub fn forget(db: *Db, key: []const u8) Error!void {
@@ -235,7 +348,7 @@ const frecency_negligible = 0.01;
 /// Forgets what decayed below any effect on the ranking: every file opened
 /// adds a key, and the table is read on every show.
 pub fn pruneFrecency(db: *Db, now: i64) Error!void {
-    const select_stmt = try db.prepare("SELECT key, count, last_used FROM frecency");
+    const select_stmt = try db.prepare("SELECT key, score, last_used FROM frecency");
     defer _ = c.sqlite3_finalize(select_stmt);
     const delete_stmt = try db.prepare("DELETE FROM frecency WHERE key = ?1");
     defer _ = c.sqlite3_finalize(delete_stmt);
@@ -244,9 +357,9 @@ pub fn pruneFrecency(db: *Db, now: i64) Error!void {
     const arena = arena_state.allocator();
     var stale: std.ArrayList([]u8) = .empty;
     while (try db.nextRow(select_stmt)) {
-        const count = columnCount(select_stmt, 1);
+        const score = columnScore(select_stmt, 1);
         const last_used = c.sqlite3_column_int64(select_stmt, 2);
-        if (frecency.value(count, last_used, now) >= frecency_negligible) continue;
+        if (frecency.value(score, last_used, now) >= frecency_negligible) continue;
         // Out of memory, a key is kept until the next prune: harmless.
         const key = arena.dupe(u8, columnText(select_stmt, 0)) catch continue;
         stale.append(arena, key) catch continue;
@@ -264,12 +377,11 @@ pub fn pruneFrecency(db: *Db, now: i64) Error!void {
     try db.exec("COMMIT");
 }
 
-/// A use count read from the database. Negative counts become 0 and counts
-/// beyond u32 saturate (a foreign or damaged file).
-fn columnCount(stmt: *c.sqlite3_stmt, column: c_int) u32 {
-    const count = c.sqlite3_column_int64(stmt, column);
-    if (count <= 0) return 0;
-    return std.math.cast(u32, count) orelse std.math.maxInt(u32);
+/// A score read from the database. Negative or non-finite values become 0.
+fn columnScore(stmt: *c.sqlite3_stmt, column: c_int) f64 {
+    const score = c.sqlite3_column_double(stmt, column);
+    if (!(score > 0) or !std.math.isFinite(score)) return 0;
+    return score;
 }
 
 /// All usage, as key -> frecency value. Keys and the map live in `arena`.
@@ -279,13 +391,13 @@ pub fn loadFrecency(
     now: i64,
 ) (Error || std.mem.Allocator.Error)!std.StringHashMapUnmanaged(f64) {
     var map: std.StringHashMapUnmanaged(f64) = .empty;
-    const stmt = try db.prepare("SELECT key, count, last_used FROM frecency");
+    const stmt = try db.prepare("SELECT key, score, last_used FROM frecency");
     defer _ = c.sqlite3_finalize(stmt);
     while (try db.nextRow(stmt)) {
         const key = try arena.dupe(u8, columnText(stmt, 0));
-        const count = columnCount(stmt, 1);
+        const score = columnScore(stmt, 1);
         const last_used = c.sqlite3_column_int64(stmt, 2);
-        try map.put(arena, key, frecency.value(count, last_used, now));
+        try map.put(arena, key, frecency.value(score, last_used, now));
     }
     return map;
 }
@@ -293,9 +405,16 @@ pub fn loadFrecency(
 // --------------------------------------------------------------- clipboard
 
 /// The most entries the history can be set to keep.
-pub const clip_entries_max = 1000;
+pub const clip_entries_max = 5000;
 /// A copy larger than this is not kept.
 pub const clip_bytes_max = 1 << 20;
+
+fn nextClipSeq(db: *Db) Error!i64 {
+    const stmt = try db.prepare("SELECT COALESCE(MAX(seq), 0) + 1 FROM clipboard");
+    defer _ = c.sqlite3_finalize(stmt);
+    assert(try db.nextRow(stmt));
+    return c.sqlite3_column_int64(stmt, 0);
+}
 
 /// Stores a copy and trims the history to the newest `keep` entries (the
 /// Settings value). Empty, blank and oversized copies are ignored.
@@ -306,15 +425,17 @@ pub fn addClip(db: *Db, content: []const u8, now: i64, keep: u32) Error!void {
     const hash: i64 = @bitCast(std.hash.Wyhash.hash(0, content));
     try db.exec("BEGIN IMMEDIATE");
     errdefer _ = c.sqlite3_exec(db.handle, "ROLLBACK", null, null, null);
+    const seq = try db.nextClipSeq();
     try db.execArgs(
-        \\INSERT INTO clipboard (hash, content, created_at, last_copied) VALUES (?1, ?2, ?3, ?3)
-        \\ON CONFLICT(hash) DO UPDATE SET content = ?2, last_copied = ?3
-    , .{ hash, content, now });
-    // What is past the newest `keep`, found through the index (scanned
-    // backwards: newest first, ties by id); NOT IN read the whole table.
+        \\INSERT INTO clipboard (hash, content, created_at, last_copied, seq)
+        \\VALUES (?1, ?2, ?3, ?3, ?4)
+        \\ON CONFLICT(hash) DO UPDATE SET content = ?2, last_copied = ?3, seq = ?4
+    , .{ hash, content, now, seq });
+    // What is past the newest `keep`, found through the recency index
+    // (last_copied DESC, seq DESC).
     try db.execArgs(
         \\DELETE FROM clipboard WHERE id IN
-        \\  (SELECT id FROM clipboard ORDER BY last_copied DESC, id DESC LIMIT -1 OFFSET ?1)
+        \\  (SELECT id FROM clipboard ORDER BY last_copied DESC, seq DESC LIMIT -1 OFFSET ?1)
     , .{@max(keep, 1)});
     try db.exec("COMMIT");
 }
@@ -353,11 +474,10 @@ pub fn recentClips(
     limit: u32,
 ) (Error || std.mem.Allocator.Error)![]Clip {
     var list: std.ArrayList(Clip) = .empty;
-    // Times have one-second resolution; the id breaks ties in copy order
-    // (two copies within a second came back oldest first).
+    // Times have one-second resolution; `seq` breaks ties in copy/recopy order.
     const stmt = try db.prepare(
         \\SELECT id, substr(content, 1, ?2), created_at, last_copied FROM clipboard
-        \\ORDER BY last_copied DESC, id DESC LIMIT ?1
+        \\ORDER BY last_copied DESC, seq DESC LIMIT ?1
     );
     defer _ = c.sqlite3_finalize(stmt);
     try db.bind(stmt, .{ limit, head_chars });
@@ -388,14 +508,21 @@ pub fn clipContent(
 }
 
 pub fn touchClip(db: *Db, id: ClipId, now_s: i64) Error!void {
+    try db.exec("BEGIN IMMEDIATE");
+    errdefer _ = c.sqlite3_exec(db.handle, "ROLLBACK", null, null, null);
+    const seq = try db.nextClipSeq();
     try db.execArgs(
-        "UPDATE clipboard SET last_copied = ?2 WHERE id = ?1",
-        .{ id.rowid(), now_s },
+        "UPDATE clipboard SET last_copied = ?2, seq = ?3 WHERE id = ?1",
+        .{ id.rowid(), now_s, seq },
     );
+    try db.exec("COMMIT");
 }
 
-pub fn deleteClip(db: *Db, id: ClipId) Error!void {
+/// Deletes entry `id`; returns false if it was already removed (e.g. by
+/// another process).
+pub fn deleteClip(db: *Db, id: ClipId) Error!bool {
     try db.execArgs("DELETE FROM clipboard WHERE id = ?1", .{id.rowid()});
+    return c.sqlite3_changes(db.handle) > 0;
 }
 
 pub fn clearClips(db: *Db) Error!void {
@@ -459,8 +586,9 @@ test "the list loads each entry's head, the entry is read whole by id" {
     try std.testing.expectEqual(2 * head_chars, clips[0].head.len);
     try std.testing.expect(std.unicode.utf8ValidateSlice(clips[0].head));
     try std.testing.expectEqualStrings(long, (try db.clipContent(allocator, clips[0].id)).?);
-    try db.deleteClip(clips[0].id);
+    try std.testing.expect(try db.deleteClip(clips[0].id));
     try std.testing.expect(try db.clipContent(allocator, clips[0].id) == null);
+    try std.testing.expect(!(try db.deleteClip(clips[0].id)));
 }
 
 test "the database and its -wal and -shm are owner-only" {
@@ -533,12 +661,12 @@ test "a failed write is an error, not silence" {
     try std.testing.expectEqualStrings("secret", clips[0].head);
 }
 
-test "damaged rows (negative count, non-positive clip id) and symlinks are handled safely" {
+test "damaged rows (negative score, non-positive clip id) and symlinks are handled safely" {
     const linux = std.os.linux;
     var db = try Db.open(Db.in_memory);
     defer db.close();
-    try db.exec("INSERT INTO frecency (key, count, last_used) VALUES ('neg', -5, 100);");
-    try db.exec("INSERT INTO clipboard (id, hash, content, created_at, last_copied) VALUES (-1, 1, 'bad', 1, 1);");
+    try db.exec("INSERT INTO frecency (key, score, last_used) VALUES ('neg', -5.0, 100);");
+    try db.exec("INSERT INTO clipboard (id, hash, content, created_at, last_copied, seq) VALUES (-1, 1, 'bad', 1, 1, 0);");
     try db.addClip("good", 2, Db.clip_entries_max);
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
@@ -552,7 +680,7 @@ test "damaged rows (negative count, non-positive clip id) and symlinks are handl
         "bad",
         (try db.clipContent(arena.allocator(), clips[1].id)).?,
     );
-    try db.deleteClip(clips[1].id);
+    _ = try db.deleteClip(clips[1].id);
 
     var test_dir: @import("os").TestDir = try .init();
     defer test_dir.deinit();
@@ -570,4 +698,145 @@ test "damaged rows (negative count, non-positive clip id) and symlinks are handl
         linux.errno(linux.statx(linux.AT.FDCWD, target, 0, .{ .MODE = true }, &stx)),
     );
     try std.testing.expectEqual(@as(u16, 0o644), stx.mode & 0o777);
+}
+
+test "frecency decays per use so one new use does not resurrect old history" {
+    var db = try Db.open(Db.in_memory);
+    defer db.close();
+    const day = 86_400;
+    const now: i64 = 1000 * day;
+    for (0..200) |_| try db.recordUse("app:abandoned", now - 365 * day);
+    try db.recordUse("app:abandoned", now);
+    for (0..20) |_| try db.recordUse("app:daily", now - 2 * day);
+
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const map = try db.loadFrecency(arena.allocator(), now);
+    try std.testing.expect(map.get("app:abandoned").? < 1.001);
+    try std.testing.expect(map.get("app:daily").? > 15.0);
+    try std.testing.expect(map.get("app:daily").? > map.get("app:abandoned").?);
+}
+
+test "same-second recopy ordering and retention keep the recopied entry" {
+    var db = try Db.open(Db.in_memory);
+    defer db.close();
+    // A -> B -> A within the same second puts A first.
+    try db.addClip("A", 50, 10);
+    try db.addClip("B", 50, 10);
+    try db.addClip("A", 50, 10);
+
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var clips = try db.recentClips(arena.allocator(), 10);
+    try std.testing.expectEqualStrings("A", clips[0].head);
+    try std.testing.expectEqualStrings("B", clips[1].head);
+
+    // Touch promotes within the same second.
+    try db.touchClip(clips[1].id, 50);
+    clips = try db.recentClips(arena.allocator(), 10);
+    try std.testing.expectEqualStrings("B", clips[0].head);
+
+    // Retention with 10 entries in the same second: recopying oldest ("e0")
+    // then inserting "e10" must evict "e1", not "e0".
+    try db.clearClips();
+    for (0..10) |i| {
+        var buf: [16]u8 = undefined;
+        try db.addClip(try std.mem.print(&buf, "e{d}", .{i}), 100, 10);
+    }
+    try db.addClip("e0", 100, 10);
+    try db.addClip("e10", 100, 10);
+    clips = try db.recentClips(arena.allocator(), 20);
+    try std.testing.expectEqual(@as(usize, 10), clips.len);
+    try std.testing.expectEqualStrings("e10", clips[0].head);
+    try std.testing.expectEqualStrings("e0", clips[1].head);
+    for (clips) |clip| try std.testing.expect(!std.mem.eql(u8, "e1", clip.head));
+}
+
+test "clipboard IDs are never reused after delete or clear across connections" {
+    var test_dir: @import("os").TestDir = try .init();
+    defer test_dir.deinit();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try test_dir.path(&path_buf, "shared.db");
+
+    var db_a = try Db.open(path);
+    defer db_a.close();
+    var db_b = try Db.open(path);
+    defer db_b.close();
+
+    try db_a.addClip("alpha", 10, Db.clip_entries_max);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const clips_a = try db_a.recentClips(arena.allocator(), 10);
+    try std.testing.expectEqual(@as(usize, 1), clips_a.len);
+    const alpha_id = clips_a[0].id;
+
+    // Another connection clears the history and adds "bravo".
+    try db_b.clearClips();
+    try db_b.addClip("bravo", 11, Db.clip_entries_max);
+
+    // Stale UI handle from A cannot read or delete "bravo".
+    try std.testing.expect(try db_a.clipContent(arena.allocator(), alpha_id) == null);
+    try std.testing.expect(!(try db_a.deleteClip(alpha_id)));
+    const clips_b = try db_b.recentClips(arena.allocator(), 10);
+    try std.testing.expectEqual(@as(usize, 1), clips_b.len);
+    try std.testing.expectEqualStrings("bravo", clips_b[0].head);
+    try std.testing.expect(clips_b[0].id != alpha_id);
+}
+
+test "legacy database migrates frecency score and clipboard autoincrement+seq" {
+    var test_dir: @import("os").TestDir = try .init();
+    defer test_dir.deinit();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try test_dir.path(&path_buf, "legacy.db");
+
+    // Create a file database using the old schema before migrating.
+    {
+        var raw_handle: ?*c.sqlite3 = null;
+        try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_open(path.ptr, &raw_handle));
+        var legacy: Db = .{ .handle = raw_handle.? };
+        defer legacy.close();
+        try legacy.exec(
+            \\CREATE TABLE frecency (
+            \\  key TEXT PRIMARY KEY,
+            \\  count INTEGER NOT NULL,
+            \\  last_used INTEGER NOT NULL
+            \\);
+            \\CREATE TABLE clipboard (
+            \\  id INTEGER PRIMARY KEY,
+            \\  hash INTEGER NOT NULL UNIQUE,
+            \\  content TEXT NOT NULL,
+            \\  created_at INTEGER NOT NULL,
+            \\  last_copied INTEGER NOT NULL
+            \\);
+            \\INSERT INTO frecency VALUES ('app:old', 5, 100), ('app:bad', -2, 100);
+            \\INSERT INTO clipboard (id, hash, content, created_at, last_copied)
+            \\  VALUES (1, 11, 'first', 50, 50), (2, 22, 'second', 50, 50);
+        );
+    }
+
+    var db = try Db.open(path);
+    defer db.close();
+
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const map = try db.loadFrecency(arena.allocator(), 100);
+    try std.testing.expectApproxEqAbs(@as(f64, 5.0), map.get("app:old").?, 1e-9);
+    try std.testing.expectEqual(@as(f64, 0), map.get("app:bad").?);
+
+    var clips = try db.recentClips(arena.allocator(), 10);
+    try std.testing.expectEqual(@as(usize, 2), clips.len);
+    try std.testing.expectEqualStrings("second", clips[0].head);
+    try std.testing.expectEqualStrings("first", clips[1].head);
+
+    // Same-second recopy of 'first' now promotes it past 'second'.
+    try db.addClip("first", 50, 10);
+    clips = try db.recentClips(arena.allocator(), 10);
+    try std.testing.expectEqualStrings("first", clips[0].head);
+
+    // Clearing and inserting assigns a fresh id strictly greater than 2.
+    try db.clearClips();
+    try db.addClip("third", 51, 10);
+    clips = try db.recentClips(arena.allocator(), 10);
+    try std.testing.expectEqual(@as(usize, 1), clips.len);
+    try std.testing.expect(clips[0].id.rowid() > 2);
 }

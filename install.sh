@@ -112,15 +112,42 @@ for prog in lumen lumen-gtk; do
 done
 say "Installed Lumen $version in $dir."
 
+# Returns 0 when `os_id` is ubuntu with VERSION_ID older than 24.10 (the first
+# Ubuntu release that packaged libgtk4-layer-shell0).
+ubuntu_lacks_layer_shell() {
+    [ "$1" = "ubuntu" ] || return 1
+    case "$2" in
+        [0-9]*.[0-9]*) ;;
+        *) return 1 ;;
+    esac
+    major=${2%%.*}
+    rest=${2#*.}
+    minor=${rest%%.*}
+    case "$major$minor" in
+        *[!0-9]*) return 1 ;;
+    esac
+    [ "$major" -lt 24 ] || { [ "$major" -eq 24 ] && [ "$minor" -lt 10 ]; }
+}
+
 # lumen-gtk does not start when a library it links is missing.
 if ! "$dir/lumen-gtk" --version >/dev/null 2>&1; then
     say ""
     say "Lumen needs GTK 4 (4.12 or newer) and gtk4-layer-shell, which are not installed:"
-    id=$( (. /etc/os-release 2>/dev/null && printf '%s %s' "${ID:-}" "${ID_LIKE:-}") || true)
-    case " $id " in
+    os_id=$( (. /etc/os-release 2>/dev/null && printf '%s' "${ID:-}") || true)
+    os_like=$( (. /etc/os-release 2>/dev/null && printf '%s' "${ID_LIKE:-}") || true)
+    os_version_id=$( (. /etc/os-release 2>/dev/null && printf '%s' "${VERSION_ID:-}") || true)
+    case " $os_id $os_like " in
         *" arch "*) say "  sudo pacman -S gtk4 gtk4-layer-shell" ;;
         *" fedora "*) say "  sudo dnf install gtk4 gtk4-layer-shell" ;;
-        *" debian "* | *" ubuntu "*) say "  sudo apt install libgtk-4-1 libgtk4-layer-shell0" ;;
+        *" debian "* | *" ubuntu "*)
+            if ubuntu_lacks_layer_shell "$os_id" "$os_version_id"; then
+                say "  sudo apt install libgtk-4-1"
+                say "  gtk4-layer-shell is not packaged in Ubuntu 24.04 and earlier (added in 24.10 / 26.04 LTS);"
+                say "  build it from source: https://github.com/wmww/gtk4-layer-shell"
+            else
+                say "  sudo apt install libgtk-4-1 libgtk4-layer-shell0"
+            fi
+            ;;
         *) say "  install your distribution's gtk4 and gtk4-layer-shell packages" ;;
     esac
     restart=no

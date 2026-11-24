@@ -11,15 +11,21 @@ const boost_per_doubling = 120;
 /// ...up to this, so a clearly better text match still wins.
 const boost_max = 600;
 
-/// `count` uses, the last one at `last_used` (unix seconds), seen at `now`.
-pub fn value(count: u32, last_used: i64, now: i64) f64 {
-    if (count == 0) return 0;
+/// `score` accumulated up to `last_used` (unix seconds), decayed to `now`.
+pub fn value(score: f64, last_used: i64, now: i64) f64 {
+    if (!(score > 0) or !std.math.isFinite(score)) return 0;
     // Saturating: `last_used` comes from the database file.
     const age_s: f64 = @floatFromInt(@max(now -| last_used, 0));
     const decay = std.math.pow(f64, 0.5, age_s / half_life_s);
-    const result = @as(f64, @floatFromInt(count)) * decay;
+    const result = score * decay;
     assert(result >= 0);
     return result;
+}
+
+/// Decays `score` from `last_used` to `now`, then adds one use. Each prior
+/// use keeps its own age rather than being resurrected by a newer one.
+pub fn addUse(score: f64, last_used: i64, now: i64) f64 {
+    return value(score, last_used, now) + 1.0;
 }
 
 /// Ranking bonus added to a fuzzy score: grows with use but saturates so a
@@ -48,4 +54,16 @@ test "a NaN frecency gets no boost, not the most" {
     try std.testing.expectEqual(@as(i32, 0), boost(std.math.nan(f64)));
     try std.testing.expectEqual(@as(i32, 0), boost(-1));
     try std.testing.expect(boost(10) > 0);
+}
+
+test "one new use does not resurrect old uses" {
+    const day = 86_400;
+    const now: i64 = 1_000_000_000;
+    // 200 uses a year ago, then one use today: the old history decayed to ~0.
+    const old_then_one = addUse(200.0, now - 365 * day, now);
+    try std.testing.expect(old_then_one < 1.0001);
+    try std.testing.expect(old_then_one >= 1.0);
+    // 20 uses a couple of days ago easily outrank it.
+    const recent = value(20.0, now - 2 * day, now);
+    try std.testing.expect(boost(recent) > boost(old_then_one));
 }

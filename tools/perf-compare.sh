@@ -45,10 +45,17 @@ done
 
 for side in base head; do
     for round in $(seq "$rounds"); do checks "$work/$side.$round"; done >"$work/$side.tsv"
+    if [[ ! -s "$work/$side.tsv" ]]; then
+        echo "error: perf checks produced no measurements for $side" >&2
+        if [[ -s "$work/$side.1" ]]; then
+            cat "$work/$side.1" >&2
+        fi
+        exit 1
+    fi
 done
 
 awk -F'\t' -v threshold="$threshold" -v floor="$floor" -v base_ref="$base_ref" '
-    FNR == NR {
+    FILENAME == ARGV[1] {
         if (!($1 in base) || $2 < base[$1]) base[$1] = $2
         next
     }
@@ -58,6 +65,10 @@ awk -F'\t' -v threshold="$threshold" -v floor="$floor" -v base_ref="$base_ref" '
         unit[$1] = $3
     }
     END {
+        if (count == 0) {
+            printf "error: no checks found in head output\n" > "/dev/stderr"
+            exit 1
+        }
         printf "%-46s %10s %10s %7s\n", "check (fastest of each)", base_ref, "this", "ratio"
         failed = 0
         for (i = 1; i <= count; i++) {

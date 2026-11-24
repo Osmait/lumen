@@ -18,6 +18,7 @@ const hypr = @import("../sys/hypr.zig");
 const commands = @import("../providers/commands.zig");
 const scripts = @import("../providers/scripts.zig");
 const stats = @import("../stats.zig");
+const settings_mod = @import("../settings.zig");
 const dmenu = @import("dmenu.zig");
 const ext_view = @import("ext_view.zig");
 const file_results = @import("file_results.zig");
@@ -41,8 +42,9 @@ const content_results_max = 50;
 /// Clipboard and window searches: the lists are short already.
 const filtered_results_max = 200;
 
-/// Clipboard entries the clipboard view loads, newest first.
-const clipboard_rows_max = 500;
+/// Clipboard entries the clipboard view loads, newest first: matches the
+/// largest `clipboard_keep` value so kept entries are always searchable.
+const clipboard_rows_max = settings_mod.clipboard_keep_max;
 
 /// Files in the root search, after this many of the best other results.
 const root_files_max = 5;
@@ -77,6 +79,7 @@ comptime {
     assert(root_files_max <= file_results_max);
     assert(suggestions_max <= root_results_max);
     assert(content_query_bytes_min <= ContentSearch.query_bytes_max);
+    assert(clipboard_rows_max >= settings_mod.clipboard_keep_max);
 }
 
 /// The view's candidates before filtering, in `arena` (the view's).
@@ -468,4 +471,21 @@ test "content results become stale when the content index version advances" {
     try testing.expect(isContentResultFresh(&result, "alpha", 1));
     try testing.expect(!isContentResultFresh(&result, "alpha", 2));
     try testing.expect(!isContentResultFresh(&result, "beta", 1));
+}
+
+test "clipboard view loads entries beyond 500 up to clipboard_keep_max" {
+    const Db = @import("../sys/Db.zig");
+    var db = try Db.open(Db.in_memory);
+    defer db.close();
+    for (0..600) |i| {
+        var buf: [24]u8 = undefined;
+        const text = try std.mem.print(&buf, "entry {d}", .{i});
+        try db.addClip(text, @intCast(i + 1), 1000);
+    }
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const clips = try db.recentClips(arena.allocator(), clipboard_rows_max);
+    try std.testing.expectEqual(@as(usize, 600), clips.len);
+    try std.testing.expectEqualStrings("entry 599", clips[0].head);
+    try std.testing.expectEqualStrings("entry 0", clips[599].head);
 }
