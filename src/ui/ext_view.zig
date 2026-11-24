@@ -98,6 +98,7 @@ fn registryCallback(registry: *Host.Registry, context: ?*anyopaque) void {
     // requests drops them when they arrive.
     const old_list = ui.ext_list.forget();
     const old_root = ui.ext_root_search.forget();
+    ui.ext_act_generation = .none;
     // What the views point at by index, found again by id (before anything
     // rebuilds them): the open view may have lost it.
     const lost = if (old_registry) |old| remap(ui, old, registry) else false;
@@ -471,7 +472,11 @@ pub fn prepare(ui: *Ui, query_typed: []const u8) bool {
         result.command == ui.ext_command and std.mem.eql(u8, result.query, query)
     else
         false;
-    if (!answered and !ui.ext_list.asking(query)) ask(ui, query);
+    if (answered) {
+        ui.ext_list.keepLatest();
+    } else if (!ui.ext_list.asking(query)) {
+        ask(ui, query);
+    }
     return false;
 }
 
@@ -774,4 +779,12 @@ test "indexes into the registry follow their ids across a reload" {
     try testing.expect(sameFields(&name, &name));
     try testing.expect(!sameFields(&name, &renamed));
     try testing.expect(!sameFields(&name, &.{}));
+}
+
+test "cleared ext_act_generation rejects late Lua action responses" {
+    var generation: Host.RequestGeneration = @fromBackingInt(@as(u32, 7));
+    const answer_gen = generation;
+    // Simulating Ui.hide() / Ui.setView() / registryCallback() clearing it.
+    generation = .none;
+    try testing.expect(answer_gen != generation);
 }

@@ -380,13 +380,14 @@ const RootSearchContext = struct {
             lua.c.LUA_TTABLE => {},
             else => lua.raise(L, "root: a list expected, got {s}", .{lua.typeName(L, rows)}),
         }
-        keep(L, &context.worker_command.root_search_kept, rows, context.request.request_generation);
         context.items = rows_mod.parseItems(L, context.rows_arena, rows, .{
             .list_generation = context.request.request_generation,
             .command = context.command,
             .from_root_search = true,
             .extension_id = context.extension.id,
         }, Host.root_search_items_max);
+        // Only replace the previously kept list once `parseItems` succeeded.
+        keep(L, &context.worker_command.root_search_kept, rows, context.request.request_generation);
     }
 };
 

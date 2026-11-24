@@ -143,6 +143,17 @@ fn unlinkHop(content_search: *ContentSearch, hop: *Hop) void {
     hop.next = null;
 }
 
+/// Bumps `counter` with wraparound, skipping 0 (which `Inflight.forget()`
+/// reserves as its cleared sentinel).
+fn nextGeneration(counter: *std.atomic.Value(u32)) u32 {
+    while (true) {
+        const current = counter.load(.monotonic);
+        var next = current +% 1;
+        if (next == 0) next = 1;
+        if (counter.cmpxchgWeak(current, next, .release, .monotonic) == null) return next;
+    }
+}
+
 /// Asks for `clip(query)`; returns its generation. Results of older
 /// generations still in flight should be dropped by the receiver.
 /// Thread-safe.
@@ -154,7 +165,7 @@ pub fn submit(content_search: *ContentSearch, query: []const u8, start_ns: u64) 
         content_search.query.set(query_clipped);
         content_search.query_start_ns = start_ns;
         content_search.newer.store(true, .release);
-        break :blk content_search.generation.fetchAdd(1, .release) + 1;
+        break :blk nextGeneration(&content_search.generation);
     };
     content_search.io.futexWake(u32, &content_search.generation.raw, 1);
     return generation;
@@ -273,4 +284,11 @@ fn deliver(data: ?*anyopaque) callconv(.c) c.gboolean {
     }
     content_search.on_result(hop.result, content_search.context);
     return 0;
+}
+
+test "nextGeneration wraps u32 without overflowing or hitting sentinel 0" {
+    var counter: std.atomic.Value(u32) = .init(std.math.maxInt(u32) - 1);
+    try std.testing.expectEqual(std.math.maxInt(u32), nextGeneration(&counter));
+    try std.testing.expectEqual(@as(u32, 1), nextGeneration(&counter));
+    try std.testing.expectEqual(@as(u32, 2), nextGeneration(&counter));
 }

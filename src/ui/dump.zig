@@ -11,6 +11,7 @@ const c = @import("c");
 const gtk = @import("gtk.zig");
 const row_list = @import("row_list.zig");
 const search = @import("search.zig");
+const prefs_view = @import("prefs_view.zig");
 const window_layout = @import("window_layout.zig");
 const Ui = @import("Ui.zig");
 
@@ -41,12 +42,20 @@ pub fn dump(
     return out.toOwnedSliceSentinel(0);
 }
 
+/// Redacts non-empty password input values so diagnostic dumps never export
+/// secrets in plaintext.
+pub fn dumpQueryText(query: []const u8, redacted: bool) []const u8 {
+    if (redacted and query.len > 0) return "(redacted)";
+    return query;
+}
+
 /// The dump's first lines: the view, the query, the layout and the footer.
 fn dumpWindow(ui: *Ui, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    const query_text = dumpQueryText(ui.query(), ui.view == .input and prefs_view.isPassword(ui));
     try writer.print("view: {t}\nvisible: {}\nquery: {s}\n", .{
         ui.view,
         gtk.isVisible(ui.window),
-        ui.query(),
+        query_text,
     });
     try writer.print("title: {s}\nprimary: {s}\n", .{ ui.viewTitle(), ui.primary });
     const layout = ui.layout;
@@ -140,4 +149,12 @@ fn dumpDetail(ui: *Ui, writer: *std.Io.Writer) std.Io.Writer.Error!void {
             });
         }
     }
+}
+
+test "dumpQueryText redacts non-empty password input without hiding normal queries" {
+    const testing = std.testing;
+    try testing.expectEqualStrings("hello", dumpQueryText("hello", false));
+    try testing.expectEqualStrings("", dumpQueryText("", false));
+    try testing.expectEqualStrings("", dumpQueryText("", true));
+    try testing.expectEqualStrings("(redacted)", dumpQueryText("super-secret-token", true));
 }

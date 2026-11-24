@@ -476,6 +476,7 @@ pub fn hide(self: *Ui) void {
     if (self.view == .themes) config.applyAppearance(self, null);
     self.panel.close();
     self.confirm_key = "";
+    self.ext_act_generation = .none;
     gtk.setVisible(self.window, false);
     backdrop.hideBackdrops(self);
 }
@@ -521,6 +522,7 @@ pub fn setView(self: *Ui, view: View) void {
     if (leaving_themes) config.applyAppearance(self, null);
     self.panel.close();
     self.confirm_key = "";
+    self.ext_act_generation = .none;
     _ = self.data_arena.reset(arena_keep);
     if (view == .ext) ext_view.enter(self);
     // A password preference hides what is typed.
@@ -670,16 +672,33 @@ pub fn performEntry(self: *Ui, entry: item_mod.Entry) void {
     self.perform(entry.operation);
 }
 
+const clip_clear_confirm_key = "clip:clear";
+
+/// Updates `confirm_key` for `target`: returns true when waiting for a
+/// second confirmation press, false once confirmed.
+fn confirmStep(confirm_key: *[]const u8, target: []const u8) bool {
+    if (std.mem.eql(u8, confirm_key.*, target)) return false;
+    confirm_key.* = target;
+    return true;
+}
+
 /// Destructive commands need a second Enter: true while waiting for it
 /// (the row says so).
 pub fn needsConfirm(self: *Ui, item: *const Item) bool {
-    if (std.mem.eql(u8, self.confirm_key, item.key)) return false;
-    self.confirm_key = item.key;
+    if (!confirmStep(&self.confirm_key, item.key)) return false;
     self.primary = self.query_arena.allocator().printSentinel(
         "Press ↵ again to {s}",
         .{item.title},
         0,
     ) catch return true;
+    row_list.setHint(self, self.primary, .warning);
+    return true;
+}
+
+/// Clearing the entire clipboard history requires a second confirmation press.
+fn needsConfirmClearClips(self: *Ui) bool {
+    if (!confirmStep(&self.confirm_key, clip_clear_confirm_key)) return false;
+    self.primary = "Press again to delete all clipboard entries";
     row_list.setHint(self, self.primary, .warning);
     return true;
 }
@@ -702,6 +721,7 @@ pub fn perform(self: *Ui, operation: item_mod.Operation) void {
     const item = self.selectedItem() orelse return;
     const primary = operation == .run or operation == .open;
     if (item.confirm and primary and self.needsConfirm(item)) return;
+    if (operation == .clip_clear and self.needsConfirmClearClips()) return;
     self.panel.close();
     // Ranking only, and Db logs its own failures: the action goes ahead
     // whether or not the use was recorded.
@@ -818,4 +838,14 @@ test "Navigation forgets the oldest view when it is full" {
         );
     }
     try std.testing.expectEqual(views.len - Navigation.capacity, expected);
+}
+
+test "confirmStep requires a second matching press before confirming" {
+    var key: []const u8 = "";
+    try std.testing.expect(confirmStep(&key, clip_clear_confirm_key));
+    try std.testing.expectEqualStrings(clip_clear_confirm_key, key);
+    try std.testing.expect(!confirmStep(&key, clip_clear_confirm_key));
+    // Switching target requires confirmation for the new target.
+    try std.testing.expect(confirmStep(&key, "cmd:restart"));
+    try std.testing.expectEqualStrings("cmd:restart", key);
 }

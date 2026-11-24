@@ -95,7 +95,15 @@ pub fn saveSettings(ui: *Ui) void {
     var kept_count: usize = 0;
     if (ui.ext_registry) |registry| {
         for (registry.settings) |override| {
-            if (kept_count == kept.len) break;
+            var seen = false;
+            for (kept[0..kept_count]) |existing| {
+                if (std.mem.eql(u8, existing, override.key)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+            assert(kept_count < kept.len);
             kept[kept_count] = override.key;
             kept_count += 1;
         }

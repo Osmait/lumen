@@ -78,14 +78,17 @@ fn connectFinished(fd: linux.fd_t) bool {
     return failed(result) == null and socket_error == 0;
 }
 
+fn noopSigpipe(_: linux.SIG) callconv(.c) void {}
+
 /// Ignores SIGPIPE process-wide so writing to a closed pipe or socket
 /// returns EPIPE instead of killing the process (Zig's start code no longer
-/// ignores it).
+/// ignores it). Uses an empty handler rather than SIG_IGN so execve resets
+/// SIGPIPE to SIG_DFL in child processes spawned by os.child.run.
 pub fn ignoreSigpipe() void {
     const action: linux.Sigaction = .{
-        .handler = .{ .handler = linux.SIG.IGN },
+        .handler = .{ .handler = &noopSigpipe },
         .mask = linux.sigemptyset(),
-        .flags = 0,
+        .flags = linux.SA.RESTART,
     };
     _ = linux.sigaction(.PIPE, &action, null);
 }

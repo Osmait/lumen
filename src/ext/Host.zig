@@ -1245,3 +1245,88 @@ test "lumen.storage writes 0600 atomically without clobbering .tmp symlinks and 
     var head_buffer: [16]u8 = undefined;
     try testing.expectEqualStrings("untouched", os.readHead(victim, &head_buffer));
 }
+
+test "root search keeps earlier kept rows if a later parseItems fails" {
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const folder = try os.tmpDirPath(&test_dir, &path_buffer);
+
+    try writeTestFile(folder, "extensions/rootkeep/init.lua",
+        \\local ran = false
+        \\return lumen.extension { commands = { {
+        \\  name = "p", title = "Provider",
+        \\  root = function(q)
+        \\    if q == "bad" then return { 123 } end
+        \\    return { {
+        \\      title = "Row",
+        \\      actions = { { title = "Act", run = function() ran = true end } },
+        \\    } }
+        \\  end,
+        \\  items = function() return { tostring(ran) } end,
+        \\} } }
+    );
+
+    var probe: Probe = .{};
+    defer probe.deinit();
+    const host = try testHost(&probe, folder);
+    defer host.shutdown();
+    host.reload();
+    try probe.wait("registry");
+    const registry = probe.registry.?;
+
+    const gen1 = host.root(registry.generation, "good");
+    const r1 = try probe.take("root");
+    defer r1.destroy(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), r1.sections.len);
+
+    // Query 2 fails in parseItems (row 1 is a number, not a table/string).
+    _ = host.root(registry.generation, "bad");
+    const r2 = try probe.take("root");
+    defer r2.destroy(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), r2.sections.len);
+
+    // Row from query 1 must still keep its Lua action alive!
+    _ = host.act(registry.generation, .from(0), .{ .row_action = .{
+        .from_root_search = true,
+        .list_generation = gen1,
+        .row_index = 0,
+        .action_index = 0,
+    } });
+    const acted = try probe.take("act");
+    defer acted.destroy(testing.allocator);
+    try testing.expect(acted.error_message == null);
+
+    _ = host.list(registry.generation, .from(0), "");
+    const listed = try probe.take("list");
+    defer listed.destroy(testing.allocator);
+    try testing.expectEqualStrings("true", listed.items[0].title);
+}
+
+test "lumen.set deduplicates repeated keys instead of overflowing kept_keys_max" {
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const folder = try os.tmpDirPath(&test_dir, &path_buffer);
+
+    try writeTestFile(folder, "init.lua",
+        \\for i = 1, 40 do
+        \\  lumen.set { width = i % 2 == 0 and "wide" or "narrow" }
+        \\end
+        \\lumen.set { density = "compact" }
+    );
+
+    var probe: Probe = .{};
+    defer probe.deinit();
+    const host = try testHost(&probe, folder);
+    defer host.shutdown();
+    host.reload();
+    try probe.wait("registry");
+    const registry = probe.registry.?;
+
+    try testing.expectEqual(@as(usize, 2), registry.settings.len);
+    try testing.expectEqualStrings("width", registry.settings[0].key);
+    try testing.expectEqualStrings("wide", registry.settings[0].value);
+    try testing.expectEqualStrings("density", registry.settings[1].key);
+    try testing.expectEqualStrings("compact", registry.settings[1].value);
+}

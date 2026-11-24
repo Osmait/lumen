@@ -25,7 +25,7 @@ pub fn decode(L: *lua.State, gpa: std.mem.Allocator, text: []const u8) lua.Error
             std.json.Value,
             capped.allocator(),
             text,
-            .{},
+            .{ .duplicate_field_behavior = .use_last },
         ) catch |err|
             return lua.fail(L, "json.decode: {s}", .{switch (err) {
                 error.OutOfMemory => "out of memory",
@@ -221,6 +221,9 @@ const Encoder = struct {
                 const type_name = lua.typeName(L, -2);
                 lua.raise(L, "json.encode: object keys must be strings, got {s}", .{type_name});
             };
+            if (!std.unicode.utf8ValidateSlice(key)) {
+                lua.raise(L, "json.encode: object keys must be valid UTF-8", .{});
+            }
             if (!first) try encoder.writer.writeByte(',');
             first = false;
             try writeString(encoder.writer, key);
@@ -357,14 +360,19 @@ test "json reports bad input instead of crashing" {
     );
 }
 
-test "json encodes any bytes as text that decodes again" {
+test "json encodes string values as valid UTF-8, rejects non-UTF-8 keys, and decodes duplicate keys" {
     try expectOk(
         \\local s = "ok \xff\xfe é \xc3 \xed\xa0\x80 \0 end"
-        \\local text = json.encode({ [s] = s, list = { s } })
+        \\local text = json.encode({ val = s, list = { s } })
         \\local back = json.decode(text)
         \\local want = "ok \u{FFFD}\u{FFFD} é \u{FFFD} \u{FFFD}\u{FFFD}\u{FFFD} \0 end"
-        \\assert(back.list[1] == want and back[want] == want, text)
+        \\assert(back.list[1] == want and back.val == want, text)
         \\assert(json.encode("é\xff") == '"é\u{FFFD}"')
+        \\assert(json.decode('{"a":1,"a":2}').a == 2)
+    );
+    try expectError(
+        "json.encode({ ['caf\\xe9'] = 1, ['caf\\xe8'] = 2 })",
+        "keys must be valid UTF-8",
     );
 }
 

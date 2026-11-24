@@ -108,12 +108,31 @@ pub fn size(cache: TextCache, doc: DocIn) u64 {
 
 /// Deletes the cached text of document versions that are gone (edited or
 /// deleted): it is keyed by mtime, so each edit otherwise left the old
-/// text in the cache for good.
-pub fn dropStale(cache: TextCache, old: *const Index, gone: []const u32) void {
+/// text in the cache for good. Versions in `kept` share the same key (e.g.
+/// a re-extracted document) and are never removed.
+pub fn dropStale(
+    cache: TextCache,
+    old: *const Index,
+    gone: []const u32,
+    kept: []const DocIn,
+) void {
     var path_buffer: paths.Buffer = undefined;
     for (gone) |id| {
         if (old.sources[id] != @backingInt(content.Source.extracted)) continue;
-        const text_path = cache.path(&path_buffer, old.docIn(id)) orelse continue;
+        const stale = old.docIn(id);
+        var is_kept = false;
+        for (kept) |doc| {
+            if (doc.source == .extracted and
+                doc.mtime == stale.mtime and
+                doc.size == stale.size and
+                std.mem.eql(u8, doc.path, stale.path))
+            {
+                is_kept = true;
+                break;
+            }
+        }
+        if (is_kept) continue;
+        const text_path = cache.path(&path_buffer, stale) orelse continue;
         // Left behind, it is deleted by the next whole build's sweep.
         const result = linux.unlink(text_path);
         switch (linux.errno(result)) {
