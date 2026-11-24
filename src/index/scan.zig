@@ -106,6 +106,7 @@ const Batch = struct {
     ends: std.ArrayList(u32) = .empty,
     flags: std.ArrayList(u8) = .empty,
     errors: u64 = 0,
+    access_denied: bool = false,
     /// Memory ran out while reading or sorting it: part of the folder is
     /// missing, so the whole scan fails (`scan` returns OutOfMemory) rather
     /// than index it as if that were all.
@@ -185,6 +186,44 @@ pub fn scan(
     watcher: ?*Watcher,
     stats: ?*Stats,
 ) std.mem.Allocator.Error!Store {
+    return scanImpl(gpa, pool, config, watcher, stats, null);
+}
+
+/// Like `scan`, also appending copies of directories skipped due to `EACCES`
+/// (either during `readDir` or `inotify_add_watch`) to `unreadable`.
+pub fn scanCollectingUnreadable(
+    gpa: std.mem.Allocator,
+    pool: *Pool,
+    config: *const Config,
+    watcher: ?*Watcher,
+    stats: ?*Stats,
+    unreadable: *std.ArrayList([]u8),
+) std.mem.Allocator.Error!Store {
+    return scanImpl(gpa, pool, config, watcher, stats, unreadable);
+}
+
+fn recordUnreadable(
+    gpa: std.mem.Allocator,
+    unreadable: ?*std.ArrayList([]u8),
+    path: []const u8,
+) std.mem.Allocator.Error!void {
+    const list = unreadable orelse return;
+    for (list.items) |existing| {
+        if (std.mem.eql(u8, existing, path)) return;
+    }
+    const copy = try gpa.dupe(u8, path);
+    errdefer gpa.free(copy);
+    try list.append(gpa, copy);
+}
+
+fn scanImpl(
+    gpa: std.mem.Allocator,
+    pool: *Pool,
+    config: *const Config,
+    watcher: ?*Watcher,
+    stats: ?*Stats,
+    unreadable: ?*std.ArrayList([]u8),
+) std.mem.Allocator.Error!Store {
     const start_ns = sys.monotonicNs();
     var totals: Stats = .{};
     var builder: Builder = .empty;
@@ -202,14 +241,21 @@ pub fn scan(
         if (watcher) |inotify| {
             const placement: Watcher.Placement = if (follow) .root else .below_root;
             for (frontier.items) |folder| {
-                try inotify.watchBestEffort(gpa, folder.path, folder.id, placement);
+                const watched = try inotify.watchTrackingAccess(
+                    gpa,
+                    folder.path,
+                    folder.id,
+                    placement,
+                );
+                if (!watched) try recordUnreadable(gpa, unreadable, folder.path);
             }
         }
         const batches = try readLevel(gpa, pool, config, frontier.items, follow, &roots);
         defer freeBatches(gpa, batches);
-        for (batches) |batch| {
+        for (frontier.items, batches) |folder, batch| {
             // A folder read in part must not pass for the whole of it.
             if (batch.out_of_memory) return error.OutOfMemory;
+            if (batch.access_denied) try recordUnreadable(gpa, unreadable, folder.path);
             if (batch.over_cap) totals.truncated = true;
         }
 
@@ -291,13 +337,15 @@ fn readLevelCallback(context: *LevelContext, i: usize) void {
     const batch = &context.batches[i];
     const follow = context.follow;
     const folder = context.frontier[i];
-    const fd = openFolder(context.roots, folder, follow) catch {
+    const fd = openFolder(context.roots, folder, follow) catch |err| {
         batch.errors += 1;
+        if (err == error.Access) batch.access_denied = true;
         return;
     };
     defer sys.close(fd);
     readDir(context.gpa, fd, folder.path, context.config, batch) catch |err| {
         batch.errors += 1;
+        if (err == error.Access) batch.access_denied = true;
         if (err == error.OutOfMemory) {
             batch.out_of_memory = true;
             return;
@@ -389,14 +437,9 @@ fn readDir(
         }
         var kind = entry.kind;
         if (kind == sys.Kind.unknown) {
-            var full_path_buffer: paths.Buffer = undefined;
-            const full_path = std.mem.printSentinel(
-                &full_path_buffer,
-                "{s}/{s}",
-                .{ path, entry.name },
-                0,
-            ) catch continue;
-            kind = sys.kindOf(full_path);
+            var name_buffer: [std.os.linux.NAME_MAX + 1]u8 = undefined;
+            const name_z = std.mem.printSentinel(&name_buffer, "{s}", .{entry.name}, 0) catch continue;
+            kind = sys.kindAt(fd, name_z);
         }
         var flags: u8 = 0;
         // Dot-dirs and caches are noise: searchable, ranked low, and the
@@ -405,7 +448,7 @@ fn readDir(
         if (hiddenByName(entry.name)) flags |= store_mod.flag_hidden;
         if (kind == sys.Kind.symlink) flags |= store_mod.flag_symlink;
         // A skipped directory is still indexed (searchable), just not opened.
-        const descend = kind == sys.Kind.directory and shouldDescend(path, entry.name, config);
+        const descend = kind == sys.Kind.directory and shouldDescendAt(fd, path, entry.name, config);
         if (descend) flags |= store_mod.flag_dir;
         // A link to a folder is not looked through: the stat could hang.
         if (kind == sys.Kind.directory) flags |= store_mod.flag_folder;
@@ -444,6 +487,15 @@ fn endsWithComponents(path: []const u8, tail: []const u8) bool {
 /// `skip` rules, and caches marked by a CACHEDIR.TAG. The scan decides by
 /// it, and so does `Live` for a directory created after the scan.
 pub fn shouldDescend(parent: []const u8, name: []const u8, config: *const Config) bool {
+    return shouldDescendAt(null, parent, name, config);
+}
+
+fn shouldDescendAt(
+    parent_fd: ?i32,
+    parent: []const u8,
+    name: []const u8,
+    config: *const Config,
+) bool {
     if (config.not_opened.len > 0) {
         var full_path_buffer: paths.Buffer = undefined;
         const full_path = std.mem.print(&full_path_buffer, "{s}{s}{s}", .{
@@ -468,15 +520,33 @@ pub fn shouldDescend(parent: []const u8, name: []const u8, config: *const Config
     }
     for (config.cachedir_probe) |probe| {
         if (!std.mem.eql(u8, probe, name)) continue;
-        // One stat, only for the handful of suspicious names.
-        var tag_path_buffer: paths.Buffer = undefined;
-        const tag = std.mem.printSentinel(
-            &tag_path_buffer,
-            "{s}/{s}/CACHEDIR.TAG",
-            .{ parent, name },
-            0,
-        ) catch return true;
-        if (sys.exists(tag)) return false;
+        // One fd-relative NOFOLLOW stat inside the opened directory, so
+        // symlinks cannot escape to a slow mount.
+        const child_fd: i32 = if (parent_fd) |pfd| blk: {
+            const linux = std.os.linux;
+            var name_buf: [linux.NAME_MAX + 1]u8 = undefined;
+            const name_z = std.mem.printSentinel(&name_buf, "{s}", .{name}, 0) catch return true;
+            const res = linux.openat(pfd, name_z, .{
+                .ACCMODE = .RDONLY,
+                .DIRECTORY = true,
+                .NOFOLLOW = true,
+                .CLOEXEC = true,
+                .NONBLOCK = true,
+            }, 0);
+            if (linux.errno(res) != .SUCCESS) return true;
+            break :blk @intCast(res);
+        } else blk: {
+            var dir_buf: paths.Buffer = undefined;
+            const dir_z = std.mem.printSentinel(
+                &dir_buf,
+                "{s}{s}{s}",
+                .{ parent, paths.separatorAfter(parent), name },
+                0,
+            ) catch return true;
+            break :blk sys.openDirNoFollow(dir_z) catch return true;
+        };
+        defer sys.close(child_fd);
+        if (sys.existsAtNoFollow(child_fd, "CACHEDIR.TAG")) return false;
     }
     return true;
 }
@@ -686,4 +756,34 @@ test "sortBatch preserves errors, out_of_memory, and over_cap" {
     try std.testing.expectEqual(@as(usize, 2), batch.ends.items.len);
     try std.testing.expectEqualStrings("alpha", batch.names.items[0..batch.ends.items[0]]);
     try std.testing.expectEqualStrings("zeta", batch.names.items[batch.ends.items[0]..batch.ends.items[1]]);
+}
+
+test "scan: fd-relative kindAt and CACHEDIR.TAG check do not follow symlinks" {
+    var tree = try ScanTree.init();
+    defer tree.temporary.cleanup();
+    tree.file("r/cache/CACHEDIR.TAG");
+    tree.file("r/cache/skipped.txt");
+    tree.file("r/build/CACHEDIR.TAG");
+    // Replace r/build/CACHEDIR.TAG with a symlink to test NOFOLLOW behavior:
+    // the tag symlink itself exists at entry level and must still mark cache,
+    // without following the target.
+    var tag_buf: paths.Buffer = undefined;
+    const tag_path = tree.path(&tag_buf, "r/build/CACHEDIR.TAG");
+    const linux = std.os.linux;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.unlink(tag_path)));
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.symlink("/nonexistent/target", tag_path)));
+    tree.file("r/build/inside.txt");
+
+    var root_buf: paths.Buffer = undefined;
+    const root_fd = try sys.openDirNoFollow(tree.path(&root_buf, "r"));
+    defer sys.close(root_fd);
+    try testing.expectEqual(sys.Kind.directory, sys.kindAt(root_fd, "cache"));
+    const build_fd = try sys.openDirNoFollow(tree.path(&root_buf, "r/build"));
+    defer sys.close(build_fd);
+    try testing.expectEqual(sys.Kind.symlink, sys.kindAt(build_fd, "CACHEDIR.TAG"));
+
+    var store = try tree.scanOf("r", .{ .roots = &.{} }, null);
+    defer store.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), ScanTree.named(&store, "skipped.txt"));
+    try testing.expectEqual(@as(usize, 0), ScanTree.named(&store, "inside.txt"));
 }

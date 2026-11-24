@@ -62,6 +62,12 @@ pub const SearchOptions = struct {
     /// newer query waits): verification stops at the next candidate, and
     /// the matches so far are returned.
     stop: ?*const std.atomic.Value(bool) = null,
+    /// Work budget on verified candidates (stops past this when advancing
+    /// through false positives and sets `truncated`).
+    max_verified: usize = candidates_budget_max,
+    /// Set to true if verification hit `max_verified` while candidates were
+    /// still capable of filling or improving the result set.
+    truncated: ?*bool = null,
 };
 
 /// For plain documents only (benchmarks, tests).
@@ -110,22 +116,29 @@ pub fn search(
         .index = index,
         .words = words,
         .phrase = phrase,
-        .candidates = ordered[0..@min(ordered.len, candidates_verified_max)],
+        .candidates = ordered,
         .text_path = text_path,
         .text_context = text_context,
         .stop = options.stop,
+        .max_verified = options.max_verified,
         .now_s = now_s,
         .top = top,
         .arena = arena,
     };
     pool.run(@min(tasks, context.candidates.len), &context, verifyTask);
+    if (options.truncated) |truncated_out| {
+        truncated_out.* = context.truncated.load(.acquire);
+    }
     if (context.out_of_memory.load(.acquire)) return error.OutOfMemory;
     try out.appendSlice(arena, top[0..context.top_count]);
     sortMatches(out.items);
 }
 
-/// The most candidates a query reads: past them, it gives what it found.
+/// Legacy constant kept for compatibility; normal candidate cutoff is governed by
+/// the score bound + `candidates_budget_max` so false positives do not hide hits.
 pub const candidates_verified_max = 4000;
+/// Maximum candidates read from disk per query when advancing past false positives.
+pub const candidates_budget_max = 20_000;
 
 /// A candidate in verification order: by `bound`, the most its score can
 /// be once its text is read.
@@ -236,10 +249,13 @@ const VerifyContext = struct {
     text_path: PathFn,
     text_context: *anyopaque,
     stop: ?*const std.atomic.Value(bool),
+    max_verified: usize,
     now_s: i64,
     next: std.atomic.Value(usize) = .init(0),
     /// The worst score among the best `top.len`, once there are that many.
     floor: std.atomic.Value(i32) = .init(std.math.minInt(i32)),
+    top_filled: std.atomic.Value(bool) = .init(false),
+    truncated: std.atomic.Value(bool) = .init(false),
     /// Under `lock`: the best matches so far, snippets in `arena`.
     lock: std.Io.Mutex = .init,
     top: []Match,
@@ -267,6 +283,7 @@ const VerifyContext = struct {
         if (context.top_count < context.top.len) context.top_count += 1;
         if (context.top_count == context.top.len) {
             context.floor.store(context.top[worst(context.top)].score, .release);
+            context.top_filled.store(true, .release);
         }
     }
 };
@@ -284,6 +301,15 @@ fn verifyTask(context: *VerifyContext, _: usize) void {
         const candidate = context.candidates[candidate_index];
         // Candidates come by bound: none after this one can enter either.
         if (candidate.bound < context.floor.load(.acquire)) {
+            context.next.store(context.candidates.len, .monotonic);
+            return;
+        }
+        if (candidate_index >= context.max_verified) {
+            if (!context.top_filled.load(.acquire) or
+                candidate.bound >= context.floor.load(.acquire))
+            {
+                context.truncated.store(true, .release);
+            }
             context.next.store(context.candidates.len, .monotonic);
             return;
         }
@@ -681,4 +707,121 @@ test "fuzz: verify on arbitrary text and queries" {
     try testing.fuzz({}, fuzzVerify, .{ .corpus = &.{
         "\x0d\x00\x00\x00ab\nxx ab ab b" ++ "\x05\x00\x00\x00ab  b",
     } });
+}
+
+test "search finds hits past 4000 false-positive candidates and reports budget exhaustion" {
+    const gpa = testing.allocator;
+    var test_dir = try sys.TestDir.init();
+    defer test_dir.deinit();
+    var fp_buf: paths.Buffer = undefined;
+    var match_buf: paths.Buffer = undefined;
+    const fp_path = try test_dir.path(&fp_buf, "fp.txt");
+    const match_path = try test_dir.path(&match_buf, "match.txt");
+    try sys.writeFile(fp_path, "alp lph pha\n");
+    try sys.writeFile(match_path, "the real alpha line\n");
+
+    const now = sys.nowSeconds();
+    const docs_count = candidates_verified_max + 1;
+    var docs = try gpa.alloc(DocIn, docs_count);
+    defer gpa.free(docs);
+    for (0..candidates_verified_max) |i| {
+        docs[i] = .{ .path = fp_path, .mtime = now, .size = 12 };
+    }
+    docs[candidates_verified_max] = .{ .path = match_path, .mtime = now - 10 * std.time.s_per_day, .size = 20 };
+
+    const SharedPaths = struct {
+        fp: []const u8,
+        match: []const u8,
+        fn read(
+            ctx: *anyopaque,
+            doc: DocIn,
+            text: *std.ArrayList(u8),
+            alloc: std.mem.Allocator,
+        ) std.mem.Allocator.Error!bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            text.clearRetainingCapacity();
+            try text.appendSlice(alloc, if (std.mem.eql(u8, doc.path, self.match))
+                "the real alpha line\n"
+            else
+                "alp lph pha\n");
+            return true;
+        }
+        fn textPath(ctx: *anyopaque, doc: DocIn, buffer: []u8) ?[:0]const u8 {
+            _ = ctx;
+            return std.mem.printSentinel(buffer, "{s}", .{doc.path}, 0) catch null;
+        }
+    };
+    var shared_ctx: SharedPaths = .{ .fp = fp_path, .match = match_path };
+    const pool = try Pool.create(gpa, testing.io, 2);
+    defer pool.destroy();
+    var index = try build(gpa, pool, docs, .{ .read = SharedPaths.read, .context = &shared_ctx }, null);
+    defer index.deinit(gpa);
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var out: std.ArrayList(Match) = .empty;
+    var truncated = false;
+    try search(&index, gpa, arena.allocator(), pool, "alpha", .{
+        .limit = 10,
+        .text_path = SharedPaths.textPath,
+        .text_context = &shared_ctx,
+        .truncated = &truncated,
+    }, &out);
+    try testing.expect(!truncated);
+    try testing.expectEqual(@as(usize, 1), out.items.len);
+    try testing.expectEqual(@as(u32, candidates_verified_max), out.items[0].doc);
+
+    // Exhausting a smaller verification budget marks the search truncated.
+    var truncated_budget = false;
+    try search(&index, gpa, arena.allocator(), pool, "alpha", .{
+        .limit = 10,
+        .max_verified = 10,
+        .text_path = SharedPaths.textPath,
+        .text_context = &shared_ctx,
+        .truncated = &truncated_budget,
+    }, &out);
+    try testing.expect(truncated_budget);
+    try testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "search finds NFD decomposed accented words while preserving snippet text" {
+    const gpa = testing.allocator;
+    var test_dir = try sys.TestDir.init();
+    defer test_dir.deinit();
+    var p_nfc: paths.Buffer = undefined;
+    var p_nfd: paths.Buffer = undefined;
+    const nfc_path = try test_dir.path(&p_nfc, "nfc.txt");
+    const nfd_path = try test_dir.path(&p_nfd, "nfd.txt");
+    const nfc_text = "Primera acción NFC\n";
+    const nfd_text = "Segunda accio\u{0301}n NFD\n";
+    try sys.writeFile(nfc_path, nfc_text);
+    try sys.writeFile(nfd_path, nfd_text);
+
+    var docs = [_]DocIn{
+        .{ .path = nfc_path, .mtime = 10, .size = nfc_text.len },
+        .{ .path = nfd_path, .mtime = 10, .size = nfd_text.len },
+    };
+    const pool = try Pool.create(gpa, testing.io, 1);
+    defer pool.destroy();
+    var dummy: u8 = 0;
+    var index = try build(gpa, pool, &docs, .{ .read = FileDocs.readText, .context = &dummy }, null);
+    defer index.deinit(gpa);
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var out: std.ArrayList(Match) = .empty;
+    try search(&index, gpa, arena.allocator(), pool, "accion", .{
+        .limit = 10,
+        .text_path = plainPath,
+        .text_context = &dummy,
+    }, &out);
+    try testing.expectEqual(@as(usize, 2), out.items.len);
+    var saw_nfc = false;
+    var saw_nfd = false;
+    for (out.items) |hit| {
+        if (std.mem.eql(u8, hit.snippet, "Primera acción NFC")) saw_nfc = true;
+        if (std.mem.eql(u8, hit.snippet, "Segunda accio\u{0301}n NFD")) saw_nfd = true;
+    }
+    try testing.expect(saw_nfc);
+    try testing.expect(saw_nfd);
 }

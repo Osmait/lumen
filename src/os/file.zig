@@ -128,14 +128,71 @@ pub fn rename(old_path: [*:0]const u8, new_path: [*:0]const u8) Error!void {
     _ = try check(linux.rename(old_path, new_path));
 }
 
-/// Writes `path` whole through `<path>.tmp`, fsync and rename: a crash or a
-/// full disk never leaves a truncated `path` behind, and a failed write
-/// leaves no `.tmp`. Owner-only.
+/// Writes `path` whole through `<path>.<pid>.<seq>.tmp`, fsync and rename: a
+/// crash or a full disk never leaves a truncated `path` behind, and a failed
+/// write leaves no `.tmp`. Owner-only.
 pub fn writeFileAtomic(path: []const u8, data: []const u8) Error!void {
     var file = try AtomicFile.create(path);
     errdefer file.abort();
     try file.write(data);
     try file.commit();
+}
+
+/// Writes `path` atomically and returns a private writable mapping of the exact
+/// inode written, before any external writer can replace `path`.
+pub fn writeFileAtomicMapped(path: []const u8, data: []const u8) Error!MappedBytes {
+    if (data.len == 0) return error.NotFound;
+    const print = std.mem.printSentinel;
+    var final_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var temp_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const final_path = print(&final_buf, "{s}", .{path}, 0) catch return error.NameTooLong;
+    const pid = linux.getpid();
+    const flags: linux.O = .{
+        .ACCMODE = .RDWR,
+        .CREAT = true,
+        .EXCL = true,
+        .NOFOLLOW = true,
+        .CLOEXEC = true,
+    };
+    var fd: i32 = -1;
+    var temp_path: [:0]const u8 = "";
+    var last_result: usize = 0;
+    for (0..AtomicFile.create_attempts_max) |_| {
+        const seq = temp_sequence.fetchAdd(1, .monotonic);
+        const candidate = print(&temp_buf, "{s}.{d}.{d}.tmp", .{ path, pid, seq }, 0) catch
+            return error.NameTooLong;
+        const result = linux.open(candidate, flags, 0o600);
+        if (linux.errno(result) == .EXIST) {
+            last_result = result;
+            continue;
+        }
+        fd = @intCast(try check(result));
+        temp_path = candidate;
+        break;
+    }
+    if (fd < 0) {
+        _ = try check(last_result);
+        unreachable;
+    }
+    defer close(fd);
+    var committed = false;
+    errdefer if (!committed) {
+        _ = linux.unlink(temp_path);
+    };
+    try writeAll(fd, data);
+    _ = try check(linux.fsync(fd));
+    try rename(temp_path, final_path);
+    committed = true;
+    const mapping_address = try check(linux.mmap(
+        null,
+        data.len,
+        .{ .READ = true, .WRITE = true },
+        .{ .TYPE = .PRIVATE },
+        fd,
+        0,
+    ));
+    const mapping: [*]align(mapping_alignment_bytes) u8 = @ptrFromInt(mapping_address);
+    return mapping[0..data.len];
 }
 
 /// Per-process sequence for unique temporary file names in `AtomicFile`.

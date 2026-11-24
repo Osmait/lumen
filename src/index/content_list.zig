@@ -243,6 +243,24 @@ pub fn documentKind(path: []const u8) bool {
     return extract.kindOf(path) != null;
 }
 
+/// True if `path` under `root` passes content-index filtering and size/type limits right now.
+pub fn eligible(root: []const u8, path: []const u8, not_under: []const []const u8) bool {
+    if (underAny(path, not_under)) return false;
+    const relative = if (sys.isAtOrBelow(path, root))
+        std.mem.trimStart(u8, path[root.len..], "/")
+    else
+        path;
+    var base_parts = std.mem.tokenizeScalar(u8, relative, '/');
+    while (base_parts.next()) |part| {
+        if (part.len > 0 and part[0] == '.') return false;
+    }
+    const kind: Kind = if (documentKind(path)) .document else .text;
+    if (kind == .text and binaryByName(path)) return false;
+    var path_buffer: paths.Buffer = undefined;
+    const path_z = std.mem.printSentinel(&path_buffer, "{s}", .{path}, 0) catch return false;
+    return stat(path_z, kind) != null;
+}
+
 /// Obviously binary by extension: skips opening them at all.
 fn binaryByName(path: []const u8) bool {
     const extensions = [_][]const u8{

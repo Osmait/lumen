@@ -32,6 +32,8 @@ const arm_batch_watches = 2_000;
 /// Pause between arming batches: without it the thread re-takes the lock at
 /// once and a reader can starve for the whole arming (149 ms measured).
 const arm_yield_us = 300;
+/// Cap on distinct modified file paths queued between content refreshes.
+const modified_paths_max = 64;
 /// A rescan asked for soon after the last one waits, twice as long as the
 /// previous wait, from 1 s up to a minute. Under heavy churn every rescan
 /// overflowed the queue while it ran and asked for the next one at once: a
@@ -71,6 +73,10 @@ cache_path: [:0]u8,
 /// lists files again only when this moved. Idle, a home sees name changes
 /// all the time, but in .cache and .config (120 in 90 s, none elsewhere).
 name_changes: std.atomic.Value(u64) = .init(0),
+/// Bounded paths of files whose contents were modified in-place (`CLOSE_WRITE`),
+/// drained by `ContentService` to notice files whose size crossed indexability bounds.
+modified_paths: std.ArrayList([]u8) = .empty,
+modified_overflow: bool = false,
 /// For `lumen --stats`, read from other threads.
 rescans: std.atomic.Value(u32) = .init(0),
 rescan_ns_last: std.atomic.Value(u64) = .init(0),
@@ -78,6 +84,9 @@ rescan_ns_last: std.atomic.Value(u64) = .init(0),
 /// last one asked for soon after it waited (see `backoff_min_ns`).
 last_rescan_end_ns: ?u64 = null,
 backoff_ns: u64 = 0,
+/// Exponential backoff for retrying permission-denied folders (`retry_dirs`).
+retry_backoff_ns: u64 = 0,
+next_retry_ns: u64 = 0,
 
 pub const StartError = std.mem.Allocator.Error || std.Thread.SpawnError ||
     Watcher.CreateError;
@@ -166,6 +175,8 @@ fn deinit(service: *Service) void {
         .content_build = service.content_build_pool,
     };
     pools.destroy();
+    for (service.modified_paths.items) |path| service.gpa.free(path);
+    service.modified_paths.deinit(service.gpa);
     sys.freeList(service.gpa, service.slow_mounts);
     service.gpa.free(service.roots[0]);
     service.gpa.free(service.cache_path);
@@ -328,11 +339,69 @@ pub fn nameChanges(service: *Service) ?u64 {
     return service.name_changes.load(.acquire);
 }
 
+pub const Modified = struct {
+    paths: [][]u8,
+    overflow: bool,
+};
+
+/// Returns modified non-hidden file paths accumulated since the last call
+/// (strings allocated in `arena`) and clears the queue. Thread-safe.
+pub fn takeModified(service: *Service, arena: std.mem.Allocator) std.mem.Allocator.Error!Modified {
+    service.lock.lockUncancelable(service.io);
+    defer service.lock.unlock(service.io);
+    const overflow = service.modified_overflow;
+    const items = service.modified_paths.items;
+    var out = try arena.alloc([]u8, items.len);
+    var count: usize = 0;
+    errdefer {
+        // Keep undrained items untouched on OOM.
+    }
+    for (items) |p| {
+        out[count] = try arena.dupe(u8, p);
+        count += 1;
+    }
+    for (items) |p| service.gpa.free(p);
+    service.modified_paths.clearRetainingCapacity();
+    service.modified_overflow = false;
+    return .{ .paths = out[0..count], .overflow = overflow };
+}
+
+fn recordModifiedLocked(service: *Service, parent: u32, name: []const u8) void {
+    if (service.modified_overflow) return;
+    var dir_buf: paths.Buffer = undefined;
+    const directory = service.live.pathOf(.fromRaw(parent), &dir_buf) orelse {
+        service.modified_overflow = true;
+        return;
+    };
+    const sep = paths.separatorAfter(directory);
+    var full_buf: paths.Buffer = undefined;
+    const full = std.mem.print(&full_buf, "{s}{s}{s}", .{ directory, sep, name }) catch {
+        service.modified_overflow = true;
+        return;
+    };
+    for (service.modified_paths.items) |existing| {
+        if (std.mem.eql(u8, existing, full)) return;
+    }
+    if (service.modified_paths.items.len >= modified_paths_max) {
+        service.modified_overflow = true;
+        return;
+    }
+    const copy = service.gpa.dupe(u8, full) catch {
+        service.modified_overflow = true;
+        return;
+    };
+    service.modified_paths.append(service.gpa, copy) catch {
+        service.gpa.free(copy);
+        service.modified_overflow = true;
+    };
+}
+
 /// Whether a change may concern the content index (see `name_changes`).
 /// Under the lock, before the change is applied (its parent id resolves).
 fn concernsContent(service: *Service, change: Watcher.Change) bool {
     const parent: u32, const name: []const u8 = switch (change) {
         .created => |created| .{ created.parent, created.name },
+        .modified => |modified| .{ modified.parent, modified.name },
         .removed => |removed| .{ removed.parent, removed.name },
         else => return true,
     };
@@ -432,10 +501,17 @@ fn applyEvents(service: *Service, arena: std.mem.Allocator) bool {
             log.warn("reading file events: {t}", .{err});
             service.live.pending_resync = true;
         };
+        var bumped_names = false;
         for (changes.items) |change| {
             if (!service.concernsContent(change)) continue;
-            _ = service.name_changes.fetchAdd(1, .release);
-            break;
+            if (change == .modified) {
+                service.recordModifiedLocked(change.modified.parent, change.modified.name);
+                continue;
+            }
+            if (!bumped_names) {
+                _ = service.name_changes.fetchAdd(1, .release);
+                bumped_names = true;
+            }
         }
         _ = service.live.apply(changes.items) catch |err| {
             log.warn("applying file events: {t}", .{err});
@@ -513,6 +589,83 @@ fn rescanDue(service: *const Service) bool {
     return service.live.needsCompaction();
 }
 
+fn retryWaitMs(service: *Service) i32 {
+    service.lock.lockSharedUncancelable(service.io);
+    defer service.lock.unlockShared(service.io);
+    if (service.live.retry_dirs.len == 0) {
+        service.retry_backoff_ns = 0;
+        service.next_retry_ns = 0;
+        return -1;
+    }
+    const min_ns = service.live.limits.retry_dir_min_ns;
+    const now_ns = sys.monotonicNs();
+    if (service.retry_backoff_ns == 0) {
+        service.retry_backoff_ns = min_ns;
+        service.next_retry_ns = now_ns +| service.retry_backoff_ns;
+    }
+    const left_ns = service.next_retry_ns -| now_ns;
+    const left_ms = (left_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms;
+    return @intCast(@min(left_ms, @as(u64, std.math.maxInt(i32))));
+}
+
+/// Probes permission-denied folders outside the lock. Returns true if any
+/// recovered readability and requires a rescan.
+fn probeRetryDirs(service: *Service) bool {
+    var copy_list: std.ArrayList([]u8) = .empty;
+    defer {
+        for (copy_list.items) |dir| service.gpa.free(dir);
+        copy_list.deinit(service.gpa);
+    }
+    {
+        service.lock.lockSharedUncancelable(service.io);
+        defer service.lock.unlockShared(service.io);
+        for (service.live.retry_dirs) |dir| {
+            const copy = service.gpa.dupe(u8, dir) catch continue;
+            copy_list.append(service.gpa, copy) catch {
+                service.gpa.free(copy);
+                continue;
+            };
+        }
+    }
+    if (copy_list.items.len == 0) return false;
+    var path_buf: paths.Buffer = undefined;
+    var still_locked: std.ArrayList([]u8) = .empty;
+    defer still_locked.deinit(service.gpa);
+    for (copy_list.items) |dir| {
+        const dir_z = std.mem.printSentinel(&path_buf, "{s}", .{dir}, 0) catch continue;
+        if (sys.openDirNoFollow(dir_z)) |fd| {
+            sys.close(fd);
+            return true;
+        } else |err| switch (err) {
+            error.NotFound, error.IsLink => {},
+            else => still_locked.append(service.gpa, dir) catch {},
+        }
+    }
+    // Keep only folders that are still present and denied, and advance backoff.
+    service.lock.lockUncancelable(service.io);
+    defer service.lock.unlock(service.io);
+    var kept = service.gpa.alloc([]u8, still_locked.items.len) catch null;
+    if (kept) |*k| {
+        var filled: usize = 0;
+        for (still_locked.items) |dir| {
+            k.*[filled] = service.gpa.dupe(u8, dir) catch break;
+            filled += 1;
+        }
+        sys.freeList(service.gpa, service.live.retry_dirs);
+        service.live.retry_dirs = k.*[0..filled];
+    }
+    if (service.live.retry_dirs.len == 0) {
+        service.retry_backoff_ns = 0;
+        service.next_retry_ns = 0;
+    } else {
+        const min_ns = service.live.limits.retry_dir_min_ns;
+        const max_ns = service.live.limits.retry_dir_max_ns;
+        service.retry_backoff_ns = std.math.clamp(service.retry_backoff_ns *| 2, min_ns, max_ns);
+        service.next_retry_ns = sys.monotonicNs() +| service.retry_backoff_ns;
+    }
+    return false;
+}
+
 fn run(service: *Service) void {
     var arena_state: std.heap.ArenaAllocator = .init(service.gpa);
     defer arena_state.deinit();
@@ -540,8 +693,19 @@ fn run(service: *Service) void {
         service.lock.lockSharedUncancelable(service.io);
         const fd = service.live.watcher.fd;
         service.lock.unlockShared(service.io);
-        // A negative descriptor is one `poll` ignores.
-        if (!sys.waitEvents(fd, service.wake_fd)) continue;
+        const retry_ms = service.retryWaitMs();
+        if (!sys.waitEventsTimeout(fd, service.wake_fd, retry_ms)) {
+            if (retry_ms >= 0 and !service.stop.load(.acquire) and
+                sys.monotonicNs() >= service.next_retry_ns)
+            {
+                if (service.probeRetryDirs()) {
+                    service.last_rescan_end_ns = null;
+                    service.backoff_ns = 0;
+                    service.rescan();
+                }
+            }
+            continue;
+        }
 
         _ = arena_state.reset(.retain_capacity);
         if (service.applyEvents(arena_state.allocator())) service.rescan();
@@ -941,5 +1105,64 @@ test "service: rescans asked for in a row wait longer each time" {
     for ([_]u64{ 1, 2, 4, 8, 16, 32, 60, 60 }) |want| {
         wait = backoffFor(wait, 0);
         try testing.expectEqual(want * second, wait);
+    }
+}
+
+test "service: unreadable folders are retried and watched once accessible" {
+    const gpa = testing.allocator;
+    const linux = std.os.linux;
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory_buffer: paths.Buffer = undefined;
+    const directory = try temporaryPath(&temporary, &directory_buffer);
+    try makeDirectory(directory, "root");
+    var root_buffer: paths.Buffer = undefined;
+    const root = try std.mem.print(&root_buffer, "{s}/root", .{directory});
+    try makeDirectory(root, "locked");
+    var locked_buffer: paths.Buffer = undefined;
+    const locked = try std.mem.printSentinel(&locked_buffer, "{s}/locked", .{root}, 0);
+    try touch(locked, "existing_secret.txt");
+
+    var index_path_buffer: paths.Buffer = undefined;
+    const index_path = try std.mem.printSentinel(&index_path_buffer, "{s}/files.idx", .{directory}, 0);
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    if (linux.geteuid() != 0) {
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(locked, 0o000)));
+        defer _ = linux.chmod(locked, 0o755);
+
+        const service = try Service.start(gpa, testing.io, root, index_path);
+        defer service.shutdown();
+        service.lock.lockUncancelable(service.io);
+        service.live.limits.retry_dir_min_ns = 25 * std.time.ns_per_ms;
+        service.live.limits.retry_dir_max_ns = 100 * std.time.ns_per_ms;
+        service.lock.unlock(service.io);
+
+        try settle(service);
+        try testing.expect(!(try has(service, arena, "existing_secret", "existing_secret.txt")));
+        service.lock.lockSharedUncancelable(service.io);
+        const retry_count = service.live.retry_dirs.len;
+        service.lock.unlockShared(service.io);
+        try testing.expectEqual(@as(usize, 1), retry_count);
+
+        // Restore permissions and wait for automatic discovery without restarting Service.
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(locked, 0o755)));
+        try testing.expect(try waitHas(service, arena, "existing_secret", "/locked/existing_secret.txt"));
+        // Watch must also be armed on `locked` so subsequent writes show up live.
+        try touch(locked, "after_recover.txt");
+        try testing.expect(try waitHas(service, arena, "after_recover", "/locked/after_recover.txt"));
+    } else {
+        // Under UID 0, chmod 0000 is still readable; verify probeRetryDirs drops a deleted
+        // path cleanly and triggers recovery when an injected path exists.
+        const service = try Service.start(gpa, testing.io, root, index_path);
+        defer service.shutdown();
+        try settle(service);
+        service.lock.lockUncancelable(service.io);
+        try service.live.addRetryDir(locked);
+        service.lock.unlock(service.io);
+        try testing.expect(service.probeRetryDirs());
     }
 }

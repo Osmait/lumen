@@ -251,7 +251,8 @@ fn fillContents(ui: *Ui, arena: std.mem.Allocator, query_text: []const u8, start
         ui.content_query.sent(content_search.submit(query_text, start_ns), query_text);
     }
     if (ui.content_query.latest) |latest| {
-        row_list.addSection(ui, "Matches");
+        const heading = if (latest.truncated) "Matches (partial — refine query)" else "Matches";
+        row_list.addSection(ui, heading);
         for (file_results.itemsFromHits(ui, arena, latest.hits)) |item| row_list.addItem(ui, item);
         ui.content_query.shown = latest;
     }
@@ -439,6 +440,13 @@ pub fn emptyText(ui: *Ui, arena: std.mem.Allocator) [:0]const u8 {
             .{content_error.?},
             0,
         ) catch "Content search failed";
+    }
+    if (ui.view == .contents) {
+        if (ui.content_query.latest) |latest| {
+            if (latest.truncated and latest.hits.len == 0) {
+                return "No matches in checked files — try a more specific query";
+            }
+        }
     }
     const clipboard_off = ui.view == .clipboard and !ui.settings.clipboard;
     if (clipboard_off and query_text.len == 0) {

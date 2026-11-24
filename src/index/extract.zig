@@ -78,7 +78,7 @@ pub fn extractText(
     const members: []const []const u8 = switch (kind) {
         .pdf => unreachable, // Handled above.
         .docx => &.{ "word/document.xml", "word/footnotes.xml", "word/endnotes.xml" },
-        .xlsx => &.{"xl/sharedStrings.xml"},
+        .xlsx => &.{ "xl/sharedStrings.xml", "xl/worksheets/sheet*.xml" },
         .pptx => &.{"ppt/slides/slide*.xml"},
         .odt, .ods, .odp => &.{"content.xml"},
     };
@@ -101,7 +101,11 @@ pub fn extractText(
         cancel,
     );
     defer gpa.free(xml);
-    return shrink(gpa, try xmlToText(gpa, xml, bytes_max), bytes_max);
+    const extracted = if (kind == .xlsx)
+        try xlsxXmlToText(gpa, xml, bytes_max)
+    else
+        try xmlToText(gpa, xml, bytes_max);
+    return shrink(gpa, extracted, bytes_max);
 }
 
 pub const Error = sys.Error || error{
@@ -203,8 +207,8 @@ const Gap = enum(u2) { none, space, newline };
 
 fn gapOf(local: []const u8) Gap {
     const newline = [_][]const u8{
-        // Paragraphs (w:, a:, text:), headings, breaks, rows, xlsx strings.
-        "p",         "h",          "br",   "cr",        "tr", "si",
+        // Paragraphs (w:, a:, text:), headings, breaks, rows, xlsx shared/inline strings.
+        "p",         "h",          "br",   "cr",        "tr", "si", "is",
         "table-row", "line-break", "page", "list-item",
     };
     const space = [_][]const u8{ "tab", "tc", "table-cell", "s", "c" };
@@ -251,6 +255,55 @@ fn xmlToText(gpa: std.mem.Allocator, xml: []const u8, bytes_max: usize) ![]u8 {
         if (!tag.closing and !tag.self_closing and skipped(tag.local)) {
             skip = .{ .name = tag.name, .depth = 1 };
             continue;
+        }
+        text_out.widenGap(gapOf(tag.local));
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// Text of concatenated XLSX XML members (`sharedStrings.xml` and
+/// `sheet*.xml`): keeps all text outside worksheets (`sharedStrings.xml`), and
+/// inside worksheets keeps only `<is>` inline-string elements while skipping
+/// numeric cell `<v>` values and `<f>` formulas.
+fn xlsxXmlToText(gpa: std.mem.Allocator, xml: []const u8, bytes_max: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    const initial_cap = @min(xml.len / xml_per_text_guess + 16, bytes_max +| 16);
+    try out.ensureTotalCapacity(gpa, initial_cap);
+    var text_out: TextOut = .{ .out = &out, .gpa = gpa, .bytes_max = bytes_max };
+    var skip: Skip = .{};
+    var worksheet_depth: usize = 0;
+    var inline_str_depth: usize = 0;
+    var i: usize = 0;
+    while (i < xml.len and !text_out.full()) {
+        const skipping = skip.name != null or (worksheet_depth > 0 and inline_str_depth == 0);
+        if (xml[i] != '<') {
+            i = try text_out.charData(xml, i, skipping);
+            continue;
+        }
+        if (try text_out.markup(xml, i, skipping)) |next| {
+            i = next;
+            continue;
+        }
+        const tag = Tag.parse(xml, i) orelse break; // Truncated.
+        i = tag.end + 1;
+        if (skip.swallow(tag)) continue;
+        if (!tag.closing and !tag.self_closing and skipped(tag.local)) {
+            skip = .{ .name = tag.name, .depth = 1 };
+            continue;
+        }
+        if (std.mem.eql(u8, tag.local, "worksheet")) {
+            if (tag.closing) {
+                worksheet_depth -|= 1;
+            } else if (!tag.self_closing) {
+                worksheet_depth += 1;
+            }
+        } else if (worksheet_depth > 0 and std.mem.eql(u8, tag.local, "is")) {
+            if (tag.closing) {
+                inline_str_depth -|= 1;
+            } else if (!tag.self_closing) {
+                inline_str_depth += 1;
+            }
         }
         text_out.widenGap(gapOf(tag.local));
     }
@@ -661,6 +714,25 @@ test "extract docx, xlsx, pptx (OOXML)" {
     try zipInto(&test_dir, "y", "nums.xlsx");
     try expectExtract(&test_dir, "nums.xlsx", "");
 
+    // Inline strings in worksheets without sharedStrings.xml, skipping numbers/formulas.
+    try test_dir.write("in/xl/workbook.xml", "<workbook/>");
+    try test_dir.write("in/xl/worksheets/sheet1.xml",
+        \\<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>InlineOnly</t></is></c><c r="B1"><f>SUM(A1:A2)</f><v>42</v></c></row></sheetData></worksheet>
+    );
+    try zipInto(&test_dir, "in", "inline.xlsx");
+    try expectExtract(&test_dir, "inline.xlsx", "InlineOnly");
+
+    // Both sharedStrings.xml and inlineStr cells in worksheets.
+    try test_dir.write(
+        "both/xl/sharedStrings.xml",
+        "<?xml version=\"1.0\"?><sst><si><t>SharedCell</t></si></sst>",
+    );
+    try test_dir.write("both/xl/worksheets/sheet1.xml",
+        \\<?xml version="1.0"?><worksheet><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="inlineStr"><is><r><t>Rich</t></r><r><t>Inline</t></r><rPh><t>phonetic</t></rPh></is></c></row></sheetData></worksheet>
+    );
+    try zipInto(&test_dir, "both", "combined.xlsx");
+    try expectExtract(&test_dir, "combined.xlsx", "SharedCell\nRichInline");
+
     try test_dir.write(
         "p/ppt/slides/slide1.xml",
         "<?xml version=\"1.0\"?><p:sld><a:p><a:r><a:t>First slide</a:t></a:r></a:p></p:sld>",
@@ -822,6 +894,7 @@ test "extract: a password-protected document fails at once, asking nobody" {
     try test_dir.write("e/word/document.xml", "<w:p><w:t>secret</w:t></w:p>");
     try zipWith(&test_dir, "e", "locked.docx", "-P hunter2");
     try test_dir.write("x/xl/sharedStrings.xml", "<sst><si><t>secret</t></si></sst>");
+    try test_dir.write("x/xl/worksheets/sheet1.xml", "<worksheet/>");
     try zipWith(&test_dir, "x", "locked.xlsx", "-P hunter2");
     // unzip asked for the password on /dev/tty (the terminal the daemon was
     // started from, or this test) and waited out the timeout.

@@ -89,39 +89,91 @@ inline fn letterAt(text: []const u8, index: usize) ?usize {
     return if (letters[letter_index] != 0) letter_index else null;
 }
 
+/// True when `text[index..]` begins with a UTF-8 Combining Diacritical Mark
+/// (U+0300..U+036F: lead byte 0xCC [80..BF], or lead byte 0xCD [80..AF]).
+pub inline fn isCombiningDiacritic(text: []const u8, index: usize) bool {
+    if (index + 1 >= text.len) return false;
+    const lead = text[index];
+    const cont = text[index + 1];
+    if (lead == 0xCC) return (cont & 0xC0) == 0x80;
+    if (lead == 0xCD) return cont >= 0x80 and cont <= 0xAF;
+    return false;
+}
+
+/// Skips any combining diacritical marks following a folded base letter.
+pub inline fn skipCombining(text: []const u8, index: *usize) void {
+    while (isCombiningDiacritic(text, index.*)) index.* += 2;
+}
+
 /// Folded character at `text[index.*]`; advances `index` past it (by 1 or
-/// 2 bytes). `index.*` must be < `text.len`.
+/// 2 bytes, plus any following NFD combining marks). `index.*` must be < `text.len`.
 pub inline fn step(text: []const u8, index: *usize) u8 {
     const byte = text[index.*];
+    if (byte < 0x80) {
+        index.* += 1;
+        if ((byte & 0xDF) >= 'A' and (byte & 0xDF) <= 'Z') {
+            if (index.* < text.len and (text[index.*] & 0xFE) == 0xCC) {
+                skipCombining(text, index);
+            }
+            return byte | 0x20;
+        }
+        return byte;
+    }
     if (isFoldableLead(byte)) {
         if (letterAt(text, index.*)) |letter_index| {
             index.* += 2;
+            if (index.* < text.len and (text[index.*] & 0xFE) == 0xCC) {
+                skipCombining(text, index);
+            }
             return letters[letter_index];
         }
     }
     index.* += 1;
-    return std.ascii.toLower(byte);
+    return byte;
 }
 
 /// Like `step`, also telling whether the original was uppercase.
 pub inline fn next(text: []const u8, index: *usize) Char {
     const byte = text[index.*];
+    if (byte < 0x80) {
+        index.* += 1;
+        if ((byte & 0xDF) >= 'A' and (byte & 0xDF) <= 'Z') {
+            if (index.* < text.len and (text[index.*] & 0xFE) == 0xCC) {
+                skipCombining(text, index);
+            }
+            return .{ .byte = byte | 0x20, .upper = byte <= 'Z' };
+        }
+        return .{ .byte = byte, .upper = false };
+    }
     if (isFoldableLead(byte)) {
         if (letterAt(text, index.*)) |letter_index| {
             index.* += 2;
+            if (index.* < text.len and (text[index.*] & 0xFE) == 0xCC) {
+                skipCombining(text, index);
+            }
             return .{ .byte = letters[letter_index], .upper = uppers[letter_index] };
         }
     }
     index.* += 1;
-    return .{ .byte = std.ascii.toLower(byte), .upper = std.ascii.isUpper(byte) };
+    return .{ .byte = byte, .upper = false };
 }
 
-/// True when the second byte of a two-byte foldable letter is at
-/// `text[index]`: not the start of a folded character.
+/// True when `text[index]` is inside a multi-byte foldable character: the
+/// second byte of a 2-byte foldable letter, or part of an NFD combining
+/// diacritic attached to an earlier foldable letter.
 pub fn insideLetter(text: []const u8, index: usize) bool {
-    if (index == 0) return false;
-    if (text[index] & 0xC0 != 0x80) return false;
-    return letterAt(text, index - 1) != null;
+    if (index == 0 or index >= text.len) return false;
+    if ((text[index] & 0xC0) == 0x80 and letterAt(text, index - 1) != null) return true;
+    var cursor: usize = if (isCombiningDiacritic(text, index))
+        index
+    else if (isCombiningDiacritic(text, index - 1))
+        index - 1
+    else
+        return false;
+    while (cursor >= 2 and isCombiningDiacritic(text, cursor - 2)) cursor -= 2;
+    if (cursor == 0) return false;
+    if (std.ascii.isAlphabetic(text[cursor - 1])) return true;
+    return cursor >= 2 and letterAt(text, cursor - 2) != null;
 }
 
 /// Writes the folded `text` into `folded`; returns the written part.
@@ -298,7 +350,8 @@ test "folding is idempotent and never lengthens" {
         "Ñ",
         "×",
         "\xC3", "\xA1",
-        "\xC5",
+        "\xC5", "\xCC",
+        "\xCD", "\x81",
         "ŉ",
         " ",
         "日",
@@ -343,4 +396,18 @@ test "foldAlloc and a truncating buffer" {
     try testing.expectEqualStrings("nandu y accion", folded);
     var small: [3]u8 = undefined;
     try testing.expectEqualStrings("acc", foldInto(&small, "Acción"));
+}
+
+test "NFD decomposed accents fold identically to NFC" {
+    try expectFold("accion", "accio\u{0301}n");
+    try expectFold("nandu", "N\u{0303}andu\u{0301}");
+    try expectFold("a", "a\u{0301}\u{0323}");
+    // Precomposed letter followed by extra combining mark folds cleanly.
+    try expectFold("e", "é\u{0323}");
+    // Standalone combining mark not preceded by a foldable letter stays unchanged.
+    try expectFold("\u{0301}x", "\u{0301}x");
+    const nfd = "o\u{0301}";
+    try testing.expect(!insideLetter(nfd, 0));
+    try testing.expect(insideLetter(nfd, 1));
+    try testing.expect(insideLetter(nfd, 2));
 }

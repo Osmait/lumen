@@ -58,6 +58,7 @@ pub const Result = struct {
     search_ns: u64,
     query: []const u8,
     hits: []index.ContentService.Hit,
+    truncated: bool = false,
     /// Why the search stopped short (then `hits` may be empty or partial).
     err: ?std.mem.Allocator.Error = null,
     arena: std.heap.ArenaAllocator,
@@ -201,11 +202,12 @@ fn run(content_search: *ContentSearch) void {
         const now_ns = os.monotonicNs();
         var hits: std.ArrayList(index.ContentService.Hit) = .empty;
         if (result.err == null) {
-            result.index_version = content_search.service.searchUntil(
+            result.index_version = content_search.service.searchUntilWith(
                 arena,
                 result.query,
                 content_search.hits_max,
                 &content_search.newer,
+                &result.truncated,
                 &hits,
             ) catch |err| blk: {
                 result.err = err;

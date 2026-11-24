@@ -33,7 +33,8 @@ pub const flag_folder: u8 = 1 << 3;
 /// 02: masks are built from folded names (accents and case, `core.fold`).
 /// 03: each directory's children are sorted by name (`findChild`).
 /// 04: `flag_folder` marks every directory, not only those opened.
-const magic = "LUMIDX04";
+/// 05: masks fold NFD combining diacritics onto their base letter (`core.fold`).
+const magic = "LUMIDX05";
 
 /// The first bytes of the file. The arrays after it are read in place, in
 /// the host's byte order, and so is this: the format is little-endian, and
@@ -342,6 +343,14 @@ pub const Store = struct {
     /// then rename: a crash midway never leaves a corrupt index in place).
     pub fn save(store: *const Store, path_z: [:0]const u8) sys.Error!void {
         try sys.writeFileAtomic(path_z, store.bytes);
+    }
+
+    /// Writes atomically and maps the exact inode written so concurrent
+    /// writers replacing `path_z` cannot swap the backing store after save.
+    pub fn saveAndMap(store: *const Store, path_z: [:0]const u8) (sys.Error || error{BadIndex})!Store {
+        const bytes = try sys.writeFileAtomicMapped(path_z, store.bytes);
+        errdefer sys.unmap(bytes);
+        return parse(bytes, .mapped);
     }
 
     /// Maps an index file. PROT_WRITE with MAP_PRIVATE is copy-on-write, so

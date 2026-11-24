@@ -72,6 +72,10 @@ pub const Options = struct {
     /// Called on the worker thread right after a new index is published, so
     /// the UI can re-run a visible query against the newer version.
     on_published: ?OnPublished = null,
+    /// Minimum backoff between extraction retries for transient failures (doubles per try).
+    extract_retry_backoff_ns: u64 = 5 * 60 * std.time.ns_per_s,
+    /// Backoff before retrying extractions after ENOSPC/EACCES writing the text cache.
+    cache_write_backoff_ns: u64 = 10 * 60 * std.time.ns_per_s,
 };
 
 pub const OnPublished = struct {
@@ -106,6 +110,16 @@ pub const Counters = struct {
     extract_ns_last: std.atomic.Value(u64) = .init(0),
 };
 
+/// Maximum extraction attempts for deterministic per-document Timeout / ToolKilled
+/// before caching an empty marker until the document changes.
+const extract_retries_max: u8 = 3;
+
+const RetryEntry = struct {
+    doc: content.DocIn,
+    attempts: u8,
+    next_retry_ns: u64,
+};
+
 /// State only the service thread reads or writes, so it needs no lock and no
 /// atomics. Every function that touches it asserts the thread
 /// (`assertWorkerThread`).
@@ -124,11 +138,12 @@ const Worker = struct {
     /// if nothing changed.
     unsaved: bool = false,
     /// Documents whose extraction failed in passing (a timeout, a missing
-    /// tool, memory): kept out of the index, which would remember them as
-    /// textless for as long as they do not change, and tried again by the
-    /// next check. In `retry_arena`.
-    retry: []const content.DocIn = &.{},
+    /// tool, memory): kept out of the index with attempt counts and exponential
+    /// backoff so a pathological file does not thrash forever. In `retry_arena`.
+    retry: []RetryEntry = &.{},
     retry_arena: std.heap.ArenaAllocator,
+    /// Monotonic deadline until which cache writes reported ENOSPC/EACCES.
+    cache_unwritable_until_ns: u64 = 0,
 };
 
 /// The thread pools it borrows: they must outlive the service.
@@ -339,6 +354,21 @@ pub fn searchUntil(
     stop: ?*const std.atomic.Value(bool),
     out: *std.ArrayList(Hit),
 ) std.mem.Allocator.Error!u64 {
+    return service.searchUntilWith(arena, query, limit, stop, null, out);
+}
+
+/// Like `searchUntil`, also reporting whether `candidates_budget_max` stopped
+/// verification while matching or higher-scoring candidates may still remain.
+pub fn searchUntilWith(
+    service: *ContentService,
+    arena: std.mem.Allocator,
+    query: []const u8,
+    limit: usize,
+    stop: ?*const std.atomic.Value(bool),
+    truncated_out: ?*bool,
+    out: *std.ArrayList(Hit),
+) std.mem.Allocator.Error!u64 {
+    if (truncated_out) |flag| flag.* = false;
     out.clearRetainingCapacity();
     // A reference, not the lock, keeps the index while files are read.
     const shared = blk: {
@@ -357,7 +387,13 @@ pub fn searchUntil(
         arena,
         service.search_pool,
         query,
-        .{ .limit = limit, .text_path = pathOf, .text_context = service, .stop = stop },
+        .{
+            .limit = limit,
+            .text_path = pathOf,
+            .text_context = service,
+            .stop = stop,
+            .truncated = truncated_out,
+        },
         &matches,
     );
     for (matches.items) |match| try out.append(arena, .{
@@ -457,64 +493,121 @@ fn cachedTextBytes(context: *anyopaque, doc: content.DocIn) u64 {
 /// again at the next check.
 const ExtractOutcome = struct {
     docs: []content.DocIn,
-    retry: []content.DocIn,
+    retry: []RetryEntry,
 };
+
+fn priorRetry(service: *const ContentService, doc: content.DocIn) ?RetryEntry {
+    for (service.worker.retry) |entry| {
+        if (entry.doc.mtime == doc.mtime and
+            entry.doc.size == doc.size and
+            std.mem.eql(u8, entry.doc.path, doc.path))
+        {
+            return entry;
+        }
+    }
+    return null;
+}
 
 /// Extracts what is missing from the text cache, on the background pool
 /// (a PDF takes 10-40 ms, a whole book up to ~0.7 s). Documents that cannot
-/// be extracted (a corrupt file, a tool error) get an empty file, so they
-/// are not retried every refresh. Passing failures (out of memory, a
-/// timeout, a missing tool, a tool killed, a cache write error) leave
-/// nothing: those documents are taken out of `docs` (what is left is
-/// returned) and into `retry`, so that the index does not remember them as
-/// textless and the next check tries again; `refresh` commits `retry` only
-/// once the build finishes. Null when out of memory: nothing is to be
-/// indexed then.
+/// be extracted (a corrupt file, or repeatedly hitting Timeout/ToolKilled)
+/// get an empty cache file so they do not thrash every refresh. Unwritable
+/// caches (ENOSPC/EACCES) pause extraction for `cache_write_backoff_ns`.
 fn extractMissing(
     service: *ContentService,
     arena: std.mem.Allocator,
     docs: []content.DocIn,
 ) ?ExtractOutcome {
+    const now_ns = sys.monotonicNs();
+    const cache_blocked = now_ns < service.worker.cache_unwritable_until_ns;
     var missing: std.ArrayList(usize) = .empty;
+    var prev_attempts: std.ArrayList(u8) = .empty;
+    var deferred: std.ArrayList(RetryEntry) = .empty;
+    var deferred_indices: std.ArrayList(usize) = .empty;
     var path_buffer: paths.Buffer = undefined;
     for (docs, 0..) |doc, doc_index| {
         if (doc.source != .extracted) continue;
         const text_path = service.text_cache.path(&path_buffer, doc) orelse continue;
         if (sys.exists(text_path)) continue;
+        const prior = service.priorRetry(doc);
+        const attempts: u8 = if (prior) |p| p.attempts else 0;
+        const waiting_backoff = prior != null and now_ns < prior.?.next_retry_ns;
+        if (cache_blocked or waiting_backoff) {
+            const wait_until = if (waiting_backoff)
+                prior.?.next_retry_ns
+            else
+                service.worker.cache_unwritable_until_ns;
+            deferred.append(arena, .{
+                .doc = doc,
+                .attempts = attempts,
+                .next_retry_ns = wait_until,
+            }) catch {
+                log.warn("extracting documents: out of memory", .{});
+                return null;
+            };
+            deferred_indices.append(arena, doc_index) catch {
+                log.warn("extracting documents: out of memory", .{});
+                return null;
+            };
+            continue;
+        }
         missing.append(arena, doc_index) catch {
             log.warn("extracting documents: out of memory", .{});
             return null;
         };
+        prev_attempts.append(arena, attempts) catch {
+            log.warn("extracting documents: out of memory", .{});
+            return null;
+        };
     }
-    // Nothing to extract: nothing to retry either.
-    if (missing.items.len == 0) return .{ .docs = docs, .retry = &.{} };
-    const failed = arena.alloc(?anyerror, missing.items.len) catch {
+    if (missing.items.len == 0 and deferred.items.len == 0) {
+        return .{ .docs = docs, .retry = &.{} };
+    }
+    const failed = arena.alloc(?ExtractContext.Failure, missing.items.len) catch {
         log.warn("extracting documents: out of memory", .{});
         return null;
     };
     @memset(failed, null);
-    var context: ExtractContext = .{
-        .service = service,
-        .docs = docs,
-        .missing = missing.items,
-        .failed = failed,
-    };
-    service.build_pool.run(missing.items.len, &context, ExtractContext.extractOne);
-    return service.leaveOut(arena, docs, missing.items, failed);
+    if (missing.items.len > 0) {
+        var context: ExtractContext = .{
+            .service = service,
+            .docs = docs,
+            .missing = missing.items,
+            .failed = failed,
+        };
+        service.build_pool.run(missing.items.len, &context, ExtractContext.extractOne);
+    }
+    return service.leaveOut(
+        arena,
+        docs,
+        missing.items,
+        prev_attempts.items,
+        failed,
+        deferred.items,
+        deferred_indices.items,
+        now_ns,
+    );
 }
 
 /// What the build pool's workers share while `extractMissing` runs.
 const ExtractContext = struct {
+    const Failure = struct { err: anyerror, cache_write: bool = false };
+
     service: *ContentService,
     docs: []const content.DocIn,
     /// Positions in `docs` of the documents to extract.
     missing: []const usize,
-    /// One per `missing`: set when extracting it failed in passing.
-    failed: []?anyerror,
+    /// One per `missing`: set when extracting or caching failed.
+    failed: []?Failure,
+    cache_unwritable: std.atomic.Value(bool) = .init(false),
 
     fn extractOne(context: *ExtractContext, missing_index: usize) void {
         const service = context.service;
         if (service.stop.load(.acquire)) return;
+        if (context.cache_unwritable.load(.acquire)) {
+            context.failed[missing_index] = .{ .err = error.NoSpace, .cache_write = true };
+            return;
+        }
         const doc = context.docs[context.missing[missing_index]];
         var text_path_buffer: paths.Buffer = undefined;
         var source_path_buffer: paths.Buffer = undefined;
@@ -535,70 +628,126 @@ const ExtractContext = struct {
             &service.stop,
         ) catch |err| switch (err) {
             // For good: an empty text, so that it is not tried again until
-            // the document changes. Not a tool killed by a signal, nor a
-            // document unreadable for now (a chmod changes neither its
-            // mtime nor its size, the cache's key): those are retried.
+            // the document changes.
             error.ToolFailed, error.NotRegular, error.NotFound => "",
             else => {
-                context.failed[missing_index] = err;
+                context.failed[missing_index] = .{ .err = err };
                 return;
             },
         };
         defer if (text.len > 0) service.gpa.free(text);
         sys.writeFileAtomic(text_path, text) catch |err| {
             log.warn("caching text of {s}: {t}", .{ doc.path, err });
-            context.failed[missing_index] = err;
+            if (err == error.NoSpace or err == error.Access) {
+                context.cache_unwritable.store(true, .release);
+            }
+            context.failed[missing_index] = .{ .err = err, .cache_write = true };
             return;
         };
         _ = service.counters.extractions.fetchAdd(1, .release);
     }
 };
 
-/// `docs` without those whose extraction `failed` (`missing` says which),
-/// and the documents to retry (committed to `worker.retry` by `commitRetry`
-/// only after the refresh succeeds). Logged when that count changes.
+/// Drops failed/deferred documents from `docs` (unless permanently marked
+/// empty after `extract_retries_max`) and produces updated `RetryEntry` rows.
 fn leaveOut(
     service: *ContentService,
     arena: std.mem.Allocator,
     docs: []content.DocIn,
     missing: []const usize,
-    failed: []const ?anyerror,
+    prev_attempts: []const u8,
+    failed: []const ?ExtractContext.Failure,
+    deferred: []const RetryEntry,
+    deferred_indices: []const usize,
+    now_ns: u64,
 ) ?ExtractOutcome {
     service.assertWorkerThread();
     assert(missing.len == failed.len);
-    var failed_count: usize = 0;
-    var failed_first: ?usize = null;
-    for (failed, 0..) |failure, missing_index| {
-        if (failure == null) continue;
-        failed_count += 1;
-        if (failed_first == null) failed_first = missing_index;
-    }
-    if (failed_count == 0) return .{ .docs = docs, .retry = &.{} };
-
-    const first = failed_first.?;
-    if (failed_count != service.worker.retry.len) {
-        log.warn(
-            "extracting {d} documents failed for now ({s}: {t}), will retry",
-            .{ failed_count, docs[missing[first]].path, failed[first].? },
-        );
-    }
-    const retry = arena.alloc(content.DocIn, failed_count) catch {
-        logOutOfMemory("setting documents aside to retry");
-        return null;
-    };
+    assert(missing.len == prev_attempts.len);
+    assert(deferred.len == deferred_indices.len);
     const dropped = arena.alloc(bool, docs.len) catch {
         logOutOfMemory("setting documents aside to retry");
         return null;
     };
     @memset(dropped, false);
-    var retry_index: usize = 0;
-    for (failed, missing) |failure, doc_index| {
-        if (failure == null) continue;
+
+    var retry: std.ArrayList(RetryEntry) = .empty;
+    var failed_first: ?usize = null;
+    var failed_new_count: usize = 0;
+    var cache_path_buffer: paths.Buffer = undefined;
+
+    for (failed, missing, prev_attempts, 0..) |maybe_failure, doc_index, prev, missing_index| {
+        const failure = maybe_failure orelse continue;
+        const doc = docs[doc_index];
+        if (failure.cache_write) {
+            if (failure.err == error.NoSpace or failure.err == error.Access) {
+                service.worker.cache_unwritable_until_ns =
+                    now_ns +| service.options.cache_write_backoff_ns;
+            }
+            dropped[doc_index] = true;
+            failed_new_count += 1;
+            if (failed_first == null) failed_first = missing_index;
+            retry.append(arena, .{
+                .doc = doc,
+                .attempts = prev,
+                .next_retry_ns = now_ns +| service.options.cache_write_backoff_ns,
+            }) catch {
+                logOutOfMemory("setting documents aside to retry");
+                return null;
+            };
+            continue;
+        }
+        const next_attempts: u8 = prev +| 1;
+        const permanent_tool_fail =
+            (failure.err == error.Timeout or failure.err == error.ToolKilled) and
+            next_attempts >= extract_retries_max;
+        if (permanent_tool_fail) {
+            if (service.text_cache.path(&cache_path_buffer, doc)) |text_path| {
+                if (sys.writeFileAtomic(text_path, "")) |_| {
+                    log.warn(
+                        "extraction of {s} failed {d} times ({t}); caching empty until modified",
+                        .{ doc.path, next_attempts, failure.err },
+                    );
+                    continue;
+                } else |write_err| {
+                    if (write_err == error.NoSpace or write_err == error.Access) {
+                        service.worker.cache_unwritable_until_ns =
+                            now_ns +| service.options.cache_write_backoff_ns;
+                    }
+                }
+            }
+        }
         dropped[doc_index] = true;
-        retry[retry_index] = docs[doc_index];
-        retry_index += 1;
+        failed_new_count += 1;
+        if (failed_first == null) failed_first = missing_index;
+        const shift: u3 = @intCast(@min(next_attempts - 1, 4));
+        const delay = service.options.extract_retry_backoff_ns <<| shift;
+        retry.append(arena, .{
+            .doc = doc,
+            .attempts = next_attempts,
+            .next_retry_ns = now_ns +| delay,
+        }) catch {
+            logOutOfMemory("setting documents aside to retry");
+            return null;
+        };
     }
-    assert(retry_index == failed_count);
+
+    if (failed_first) |first| {
+        if (failed_new_count + deferred.len != service.worker.retry.len) {
+            log.warn(
+                "extracting {d} documents failed for now ({s}: {t}), will retry",
+                .{ failed_new_count, docs[missing[first]].path, failed[first].?.err },
+            );
+        }
+    }
+
+    for (deferred, deferred_indices) |entry, doc_index| {
+        dropped[doc_index] = true;
+        retry.append(arena, entry) catch {
+            logOutOfMemory("setting documents aside to retry");
+            return null;
+        };
+    }
 
     var kept_count: usize = 0;
     for (docs, dropped) |doc, doc_dropped| {
@@ -606,18 +755,15 @@ fn leaveOut(
         docs[kept_count] = doc;
         kept_count += 1;
     }
-    assert(kept_count + failed_count == docs.len);
-    return .{ .docs = docs[0..kept_count], .retry = retry };
+    return .{ .docs = docs[0..kept_count], .retry = retry.items };
 }
 
 /// Persists `retry` in `worker.retry_arena` once a refresh finishes. Copied
-/// into a new arena first: out of memory, the list before stays (reset
-/// first, a failure emptied it, and those documents waited for the next
-/// full listing).
-fn commitRetry(service: *ContentService, retry: []const content.DocIn) void {
+/// into a new arena first: out of memory, the list before stays.
+fn commitRetry(service: *ContentService, retry: []const RetryEntry) void {
     service.assertWorkerThread();
     var fresh_arena: std.heap.ArenaAllocator = .init(service.gpa);
-    const copy = copyDocs(fresh_arena.allocator(), retry) catch {
+    const copy = copyRetries(fresh_arena.allocator(), retry) catch {
         fresh_arena.deinit();
         logOutOfMemory("keeping the documents to retry");
         return;
@@ -627,14 +773,14 @@ fn commitRetry(service: *ContentService, retry: []const content.DocIn) void {
     service.worker.retry = copy;
 }
 
-fn copyDocs(
+fn copyRetries(
     arena: std.mem.Allocator,
-    docs: []const content.DocIn,
-) std.mem.Allocator.Error![]content.DocIn {
-    const copy = try arena.alloc(content.DocIn, docs.len);
-    for (docs, copy) |doc, *dst| {
-        dst.* = doc;
-        dst.path = try arena.dupe(u8, doc.path);
+    entries: []const RetryEntry,
+) std.mem.Allocator.Error![]RetryEntry {
+    const copy = try arena.alloc(RetryEntry, entries.len);
+    for (entries, copy) |entry, *dst| {
+        dst.* = entry;
+        dst.doc.path = try arena.dupe(u8, entry.doc.path);
     }
     return copy;
 }
@@ -794,11 +940,20 @@ fn indexedChanges(
             .source = doc.source,
         });
     }
-    // Not in the index (`extractMissing` left them out): as they are now.
-    for (service.worker.retry) |doc| {
+    // Not in the index (`extractMissing` left them out): as they are now,
+    // respecting retry backoff unless the file changed on disk.
+    const now_ns = sys.monotonicNs();
+    for (service.worker.retry) |entry| {
+        const doc = entry.doc;
         if (content_list.underAny(doc.path, service.worker.slow_mounts)) continue;
         const path = std.mem.printSentinel(&path_buffer, "{s}", .{doc.path}, 0) catch continue;
         const stat = content_list.stat(path, .document) orelse continue;
+        const same_version = stat.mtime == doc.mtime and stat.size == doc.size;
+        if (same_version and (now_ns < entry.next_retry_ns or
+            now_ns < service.worker.cache_unwritable_until_ns))
+        {
+            continue;
+        }
         try added.append(arena, .{
             .path = try arena.dupe(u8, doc.path),
             .mtime = stat.mtime,
@@ -942,8 +1097,9 @@ fn refresh(service: *ContentService) void {
 }
 
 /// What changed since the index was built: every file listed again (no
-/// index yet, names created or removed, or the listing is old), or only
-/// the indexed ones checked. A listing is left in `docs`.
+/// index yet, names created or removed, modified unindexed file became
+/// eligible, or the listing is old), or only the indexed ones checked. A
+/// listing is left in `docs`.
 fn changes(
     service: *ContentService,
     arena: std.mem.Allocator,
@@ -953,11 +1109,22 @@ fn changes(
 ) ?Diff {
     const start_ns = sys.monotonicNs();
     if (service.listingReason(name_changes, start_ns) != null) {
+        if (service.options.names) |names| _ = names.takeModified(arena) catch {};
         docs.* = service.listAll(arena, name_changes, listed) orelse return null;
         return service.diff(arena, docs.*.?) catch {
             logOutOfMemory("comparing the listing");
             return null;
         };
+    }
+    if (service.options.names) |names| {
+        const modified = names.takeModified(arena) catch null;
+        if (modified != null and service.shouldRelistForModified(modified.?)) {
+            docs.* = service.listAll(arena, name_changes, listed) orelse return null;
+            return service.diff(arena, docs.*.?) catch {
+                logOutOfMemory("comparing the listing");
+                return null;
+            };
+        }
     }
     const changed = service.indexedChanges(arena) catch {
         logOutOfMemory("checking the indexed files");
@@ -965,6 +1132,29 @@ fn changes(
     };
     service.counters.stat_ns_last.store(sys.monotonicNs() - start_ns, .monotonic);
     return changed;
+}
+
+/// True if an in-place modification queue overflowed or includes a file not
+/// currently live in the index that is now eligible (e.g. a >1 MiB log file
+/// truncated into indexable bounds).
+fn shouldRelistForModified(service: *const ContentService, modified: Service.Modified) bool {
+    if (modified.overflow) return true;
+    const index = service.current() orelse return true;
+    for (modified.paths) |mod_path| {
+        if (service.isLivePath(index, mod_path)) continue;
+        if (content_list.eligible(service.root, mod_path, service.worker.slow_mounts)) return true;
+    }
+    return false;
+}
+
+fn isLivePath(service: *const ContentService, index: *const content.Index, target: []const u8) bool {
+    _ = service;
+    for (0..index.docs_count) |doc_index| {
+        const id: u32 = @intCast(doc_index);
+        if (index.removed(id)) continue;
+        if (std.mem.eql(u8, index.path(id), target)) return true;
+    }
+    return false;
 }
 
 /// Why every file must be listed again rather than only the indexed ones
@@ -1653,9 +1843,11 @@ test "content service: Office documents are extracted once per version" {
     try testing.expectEqual(@as(usize, 1), service.status().docs);
 }
 
-test "content service: a document whose extraction failed in passing is left out, and retried" {
+test "content service: a document whose extraction failed in passing is left out, and retried with cap and backoff" {
     var tree = try TestTree.init();
     defer tree.deinit();
+    var cache_dir = try TestTree.init();
+    defer cache_dir.deinit();
     try tree.write("a.pdf", "not really a pdf");
     try tree.write("b.txt", "plain words here");
     var path_buffer: paths.Buffer = undefined;
@@ -1665,21 +1857,21 @@ test "content service: a document whose extraction failed in passing is left out
     const arena = arena_state.allocator();
     const pool = try Pool.create(testing.allocator, testing.io, 0);
     defer pool.destroy();
-    // Only what retrying touches: no thread, no cache.
     var service: ContentService = .{
         .gpa = testing.allocator,
         .io = testing.io,
         .root = tree.absolute,
         .cache_path = undefined,
-        .text_cache = undefined,
+        .text_cache = try TextCache.init(testing.allocator, cache_dir.absolute),
         .search_pool = pool,
         .build_pool = pool,
-        .options = .{},
+        .options = .{ .extract_retry_backoff_ns = 0, .cache_write_backoff_ns = 60 * std.time.ns_per_s },
         .worker = .{
             .thread_id = std.Thread.getCurrentId(),
             .retry_arena = .init(testing.allocator),
         },
     };
+    defer service.text_cache.deinit(testing.allocator);
     defer service.worker.retry_arena.deinit();
     const docs = content_list.list(arena, testing.allocator, testing.io, tree.absolute, .{
         .documents = true,
@@ -1691,14 +1883,25 @@ test "content service: a document whose extraction failed in passing is left out
     try testing.expectEqual(@as(usize, 2), docs.len);
     try testing.expectEqualStrings(pdf, docs[0].path);
 
-    // Timed out: left out (indexed, it stayed textless until it changed).
-    const first = service.leaveOut(arena, docs, &.{0}, &[_]?anyerror{error.Timeout}).?;
+    // Timed out attempt 1: left out and queued for retry.
+    const now = sys.monotonicNs();
+    const first = service.leaveOut(
+        arena,
+        docs,
+        &.{0},
+        &.{0},
+        &[_]?ExtractContext.Failure{.{ .err = error.Timeout }},
+        &.{},
+        &.{},
+        now,
+    ).?;
     service.commitRetry(first.retry);
     const kept = first.docs;
     try testing.expectEqual(@as(usize, 1), kept.len);
     try testing.expect(std.mem.endsWith(u8, kept[0].path, "/b.txt"));
     try testing.expectEqual(@as(usize, 1), service.worker.retry.len);
-    try testing.expectEqualStrings(pdf, service.worker.retry[0].path);
+    try testing.expectEqual(@as(u8, 1), service.worker.retry[0].attempts);
+    try testing.expectEqualStrings(pdf, service.worker.retry[0].doc.path);
     const reader: content.TextReader = .{ .read = textOf, .context = &service };
     service.index = try Shared.create(
         testing.allocator,
@@ -1707,17 +1910,62 @@ test "content service: a document whose extraction failed in passing is left out
     );
     defer service.index.?.release();
 
-    // The next check, though it lists nothing, tries it again.
+    // With future backoff, indexedChanges defers instead of looping every refresh.
+    service.worker.retry[0].next_retry_ns = sys.monotonicNs() + 60 * std.time.ns_per_s;
+    const deferred_changes = try service.indexedChanges(arena);
+    try testing.expectEqual(@as(usize, 0), deferred_changes.added.len);
+
+    // Once backoff expires, indexedChanges schedules retry again.
+    service.worker.retry[0].next_retry_ns = 0;
     const changes_found = try service.indexedChanges(arena);
     try testing.expectEqual(@as(usize, 0), changes_found.gone.len);
     try testing.expectEqual(@as(usize, 1), changes_found.added.len);
     try testing.expectEqualStrings(pdf, changes_found.added[0].path);
     try testing.expectEqual(content.Source.extracted, changes_found.added[0].source);
-    // Extracted this time: indexed, nothing left to retry.
-    const second = service.leaveOut(arena, changes_found.added, &.{0}, &[_]?anyerror{null}).?;
-    service.commitRetry(second.retry);
-    try testing.expectEqual(@as(usize, 1), second.docs.len);
+
+    // Repeated deterministic timeouts up to extract_retries_max cache an empty file and stop retrying.
+    const second = service.leaveOut(
+        arena,
+        changes_found.added,
+        &.{0},
+        &.{1},
+        &[_]?ExtractContext.Failure{.{ .err = error.Timeout }},
+        &.{},
+        &.{},
+        now,
+    ).?;
+    try testing.expectEqual(@as(usize, 1), second.retry.len);
+    try testing.expectEqual(@as(u8, 2), second.retry[0].attempts);
+
+    const third = service.leaveOut(
+        arena,
+        changes_found.added,
+        &.{0},
+        &.{2},
+        &[_]?ExtractContext.Failure{.{ .err = error.Timeout }},
+        &.{},
+        &.{},
+        now,
+    ).?;
+    service.commitRetry(third.retry);
     try testing.expectEqual(@as(usize, 0), service.worker.retry.len);
+    try testing.expectEqual(@as(usize, 1), third.docs.len);
+    try testing.expect(service.textCached(changes_found.added[0]));
+
+    // Cache write failures (ENOSPC) arm cache_unwritable_until_ns without burning attempts.
+    const enospc = service.leaveOut(
+        arena,
+        changes_found.added,
+        &.{0},
+        &.{0},
+        &[_]?ExtractContext.Failure{.{ .err = error.NoSpace, .cache_write = true }},
+        &.{},
+        &.{},
+        now,
+    ).?;
+    try testing.expect(service.worker.cache_unwritable_until_ns > now);
+    try testing.expectEqual(@as(usize, 1), enospc.retry.len);
+    try testing.expectEqual(@as(u8, 0), enospc.retry[0].attempts);
 }
 
 test "a shared index outlives the service's reference while a search holds one" {
@@ -1875,4 +2123,53 @@ test "content service: missing cached text is re-extracted and kept instead of d
     // Next poke: cached text is back, so nothing is extracted again.
     try pokeAndWait(service);
     try testing.expectEqual(@as(u32, 2), service.status().extractions);
+}
+
+test "content service: file truncated below text_bytes_max is indexed promptly via CLOSE_WRITE" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+
+    // Create a >1 MiB file so the initial build excludes it.
+    var log_buf: paths.Buffer = undefined;
+    const log_path = try fixture.root.path(&log_buf, "huge.log");
+    try fixture.root.write("huge.log", "initially too big\n");
+    {
+        const fd_res = linux.open(log_path, .{ .ACCMODE = .WRONLY, .CLOEXEC = true }, 0);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(fd_res));
+        const fd: i32 = @intCast(fd_res);
+        defer sys.close(fd);
+        try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.ftruncate(fd, content.text_bytes_max + 100)));
+    }
+
+    var names_path_buffer: paths.Buffer = undefined;
+    const names_path = try fixture.cache.path(&names_path_buffer, "files.idx");
+    const names = try Service.start(testing.allocator, testing.io, fixture.root.absolute, names_path);
+    defer names.shutdown();
+    _ = try Service.waitNames(names, null);
+
+    const service = try fixture.startWith(.{
+        .refresh_interval_ns = std.math.maxInt(u64),
+        .poke_interval_ns_min = 0,
+        .list_interval_ns = 30 * 60 * std.time.ns_per_s,
+        .removed_percent_max = 100,
+        .names = names,
+    });
+    defer service.shutdown();
+    try waitChecks(service, 1);
+    try testing.expectEqual(@as(usize, 0), service.status().docs);
+
+    // Edit in-place (same inode) shrinking below text_bytes_max -> IN_CLOSE_WRITE triggers indexing.
+    try fixture.root.write("huge.log", "truncated capybara log line\n");
+    // Give inotify thread a moment to drain IN_CLOSE_WRITE.
+    var indexed = false;
+    for (0..100) |_| {
+        try pokeAndWait(service);
+        if ((try fixture.find(service, "capybara")).len == 1) {
+            indexed = true;
+            break;
+        }
+        sys.sleepUs(10_000);
+    }
+    try testing.expect(indexed);
 }
