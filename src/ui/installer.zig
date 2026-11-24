@@ -296,6 +296,24 @@ pub fn install(
     start(ui, caller, .install, name, folder, installing, &argv);
 }
 
+/// Single-extension update script: refuses to walk up into a parent git
+/// repository when the extension folder itself is not a git worktree root.
+const update_one_script =
+    \\top=$(git -C "$1" rev-parse --show-toplevel 2>/dev/null) || { printf '%s is not a git repository\n' "$2"; exit 1; }
+    \\dir=$(cd "$1" && pwd -P) || exit 1
+    \\if [ "$top" != "$dir" ]; then
+    \\  printf '%s is not a git repository\n' "$2"
+    \\  exit 1
+    \\fi
+    \\exec git -C "$1" pull --ff-only
+;
+
+fn hasGitMarker(folder: []const u8) bool {
+    var marker_buffer: [path_bytes_max + "/.git".len]u8 = undefined;
+    const marker = std.mem.printSentinel(&marker_buffer, "{s}/.git", .{folder}, 0) catch return false;
+    return os.info(marker) != null;
+}
+
 pub fn update(ui: *Ui, caller: ?*c.GApplicationCommandLine, name: ?[]const u8) void {
     var folder_bytes: [path_bytes_max]u8 = undefined;
     if (name) |extension_name| {
@@ -308,7 +326,21 @@ pub fn update(ui: *Ui, caller: ?*c.GApplicationCommandLine, name: ?[]const u8) v
         if (os.info(folder) == null) {
             return fail(ui, caller, "no extension named \"{s}\"", .{extension_name});
         }
-        var argv = [_:null]?[*:0]const u8{ "git", "-C", folder.ptr, "pull", "--ff-only" };
+        if (!hasGitMarker(folder)) {
+            return fail(ui, caller, "{s} is not a git repository", .{extension_name});
+        }
+        var name_buffer: [extension_name_bytes_max + 1]u8 = undefined;
+        const name_z = std.mem.printSentinel(&name_buffer, "{s}", .{extension_name}, 0) catch {
+            return fail(ui, caller, "no extension named \"{s}\"", .{extension_name});
+        };
+        var argv = [_:null]?[*:0]const u8{
+            "sh",
+            "-c",
+            update_one_script,
+            "lumen-update",
+            folder.ptr,
+            name_z.ptr,
+        };
         return start(ui, caller, .update, extension_name, folder, folder, &argv);
     }
     // Every extension that is a git checkout.
@@ -323,7 +355,8 @@ pub fn update(ui: *Ui, caller: ?*c.GApplicationCommandLine, name: ?[]const u8) v
         \\cd "$1" || exit 1
         \\status=0
         \\for d in */; do
-        \\  [ -d "$d.git" ] || continue
+        \\  [ -e "$d.git" ] || continue
+        \\  [ "$(git -C "$d" rev-parse --show-toplevel 2>/dev/null)" = "$(cd "$d" && pwd -P)" ] || continue
         \\  printf '%s: ' "${d%/}"
         \\  before=$(git -C "$d" rev-parse HEAD 2>/dev/null)
         \\  if git -C "$d" pull --ff-only --quiet; then
@@ -729,4 +762,99 @@ test "busy folders: one job per folder, and the update of all against any" {
     try std.testing.expect(!busyWith("/c/extensions/clock"));
     unmarkBusy("/c/extensions/weather");
     try std.testing.expect(!busyWith("/c/extensions"));
+}
+
+test "updating a manual folder inside a parent git repo leaves the parent intact; worktrees update" {
+    const testing = std.testing;
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const deadline_ns = os.monotonicNs() + 10 * std.time.ns_per_s;
+
+    const runGit = struct {
+        fn call(alloc: std.mem.Allocator, io_ctx: std.Io, deadline: u64, argv: []const []const u8) ![]u8 {
+            const res = try os.child.run(alloc, io_ctx, argv, .{ .deadline_ns = deadline });
+            defer alloc.free(res.stderr);
+            if (res.code != 0) {
+                std.debug.print("git failed: {s}\n", .{res.stderr});
+                alloc.free(res.stdout);
+                return error.GitFailed;
+            }
+            return res.stdout;
+        }
+    }.call;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [path_bytes_max]u8 = undefined;
+    const root = try os.tmpDirAbs(&tmp, &root_buf);
+
+    var remote_buf: [path_bytes_max]u8 = undefined;
+    const remote = try std.fmt.bufPrint(&remote_buf, "{s}/remote.git", .{root});
+    var seed_buf: [path_bytes_max]u8 = undefined;
+    const seed = try std.fmt.bufPrint(&seed_buf, "{s}/seed", .{root});
+    var parent_buf: [path_bytes_max]u8 = undefined;
+    const parent = try std.fmt.bufPrint(&parent_buf, "{s}/parent", .{root});
+    var manual_buf: [path_bytes_max]u8 = undefined;
+    const manual = try std.fmt.bufPrint(&manual_buf, "{s}/parent/extensions/manual", .{root});
+    var wt_buf: [path_bytes_max]u8 = undefined;
+    const wt = try std.fmt.bufPrint(&wt_buf, "{s}/worktree", .{root});
+
+    // Bare remote + initial commit via seed.
+    gpa.free(try runGit(gpa, io, deadline_ns, &.{ "git", "init", "--bare", remote }));
+    gpa.free(try runGit(gpa, io, deadline_ns, &.{ "git", "clone", remote, seed }));
+    gpa.free(try runGit(gpa, io, deadline_ns, &.{
+        "git", "-C", seed, "-c", "user.name=T", "-c", "user.email=t@e", "commit", "--allow-empty", "-m", "c1",
+    }));
+    const branch_out = try runGit(gpa, io, deadline_ns, &.{ "git", "-C", seed, "branch", "--show-current" });
+    defer gpa.free(branch_out);
+    const branch = std.mem.trimEnd(u8, branch_out, "\r\n ");
+    gpa.free(try runGit(gpa, io, deadline_ns, &.{ "git", "-C", seed, "push", "-u", "origin", branch }));
+
+    // Clone parent repo at c1, add a manual extension folder (no .git of its own).
+    gpa.free(try runGit(gpa, io, deadline_ns, &.{ "git", "clone", remote, parent }));
+    try os.mkdirP(manual);
+    try testing.expect(!hasGitMarker(manual));
+
+    // Create a linked git worktree at c1 on a tracking branch.
+    gpa.free(try runGit(gpa, io, deadline_ns, &.{
+        "git", "-C", seed, "worktree", "add", "-b", "wt-branch", wt, branch,
+    }));
+    var wt_upstream_buf: [128]u8 = undefined;
+    const wt_upstream = try std.fmt.bufPrint(&wt_upstream_buf, "origin/{s}", .{branch});
+    gpa.free(try runGit(gpa, io, deadline_ns, &.{
+        "git", "-C", wt, "branch", "--set-upstream-to", wt_upstream,
+    }));
+    try testing.expect(hasGitMarker(wt));
+
+    // Advance remote to c2.
+    gpa.free(try runGit(gpa, io, deadline_ns, &.{
+        "git", "-C", seed, "-c", "user.name=T", "-c", "user.email=t@e", "commit", "--allow-empty", "-m", "c2",
+    }));
+    gpa.free(try runGit(gpa, io, deadline_ns, &.{ "git", "-C", seed, "push", "origin", branch }));
+
+    const parent_head_before = try runGit(gpa, io, deadline_ns, &.{ "git", "-C", parent, "rev-parse", "HEAD" });
+    defer gpa.free(parent_head_before);
+    const seed_head = try runGit(gpa, io, deadline_ns, &.{ "git", "-C", seed, "rev-parse", "HEAD" });
+    defer gpa.free(seed_head);
+
+    // 1. Updating the manual folder via update_one_script must fail and NOT pull parent!
+    var manual_res = try os.child.run(gpa, io, &.{
+        "sh", "-c", update_one_script, "lumen-update", manual, "manual",
+    }, .{ .deadline_ns = deadline_ns });
+    defer manual_res.deinit(gpa);
+    try testing.expect(manual_res.code != 0);
+    try testing.expect(std.mem.find(u8, manual_res.stdout, "is not a git repository") != null);
+    const parent_head_after = try runGit(gpa, io, deadline_ns, &.{ "git", "-C", parent, "rev-parse", "HEAD" });
+    defer gpa.free(parent_head_after);
+    try testing.expectEqualStrings(parent_head_before, parent_head_after);
+
+    // 2. Updating a valid git worktree must succeed and fast-forward to c2!
+    var wt_res = try os.child.run(gpa, io, &.{
+        "sh", "-c", update_one_script, "lumen-update", wt, "worktree",
+    }, .{ .deadline_ns = deadline_ns });
+    defer wt_res.deinit(gpa);
+    try testing.expectEqual(@as(?u8, 0), wt_res.code);
+    const wt_head_after = try runGit(gpa, io, deadline_ns, &.{ "git", "-C", wt, "rev-parse", "HEAD" });
+    defer gpa.free(wt_head_after);
+    try testing.expectEqualStrings(seed_head, wt_head_after);
 }

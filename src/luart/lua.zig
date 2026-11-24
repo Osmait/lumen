@@ -144,16 +144,9 @@ const sandbox_prelude =
     \\  return path, refuse(path)
     \\end
     \\local open = io.open
-    \\function io.open(path, ...)
-    \\  local checked, why = check_path(path)
-    \\  if why then return nil, why end
-    \\  return open(checked, ...)
-    \\end
     \\local raw_input, raw_output, raw_lines = io.input, io.output, io.lines
     \\local function opened(path, mode)
-    \\  local checked, why = check_path(path)
-    \\  if why then error(why, 3) end
-    \\  local f, err = open(checked, mode)
+    \\  local f, err = open(path, mode)
     \\  if not f then error(err, 3) end
     \\  return f
     \\end
@@ -358,18 +351,46 @@ fn refuseOpen(L: *State) Error!c_int {
     return 1;
 }
 
-/// Whether `path`, whose status is `status`, is a process's memory under
-/// /proc (`/proc/self/mem` and the like): a regular file to stat, but
-/// writing it patches the daemon, its time limits included. Extensions run
-/// as the user anyway; this keeps one from switching its own limits off.
-fn isProcessMemory(path: [*:0]const u8, status: *const std.os.linux.Statx) bool {
+/// Whether an already-opened descriptor `fd` is safe for an extension to
+/// hold: a regular file or folder, or one of the non-blocking memory
+/// devices (`MemoryDevice`), and never a procfs process memory file or a
+/// writable procfs file (even through a symlink, since `/proc/self/fd/<fd>`
+/// resolves the open target).
+fn fdAllowed(fd: i32) bool {
     const linux = std.os.linux;
-    const name = std.fs.path.basename(std.mem.span(path));
-    if (!std.mem.eql(u8, name, "mem")) return false;
+    var status: linux.Statx = undefined;
+    const result = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &status);
+    if (linux.errno(result) != .SUCCESS) return false;
     var proc_status: linux.Statx = undefined;
     const proc_result = linux.statx(linux.AT.FDCWD, "/proc", 0, .{ .TYPE = true }, &proc_status);
     if (linux.errno(proc_result) != .SUCCESS) return false;
-    return status.dev_major == proc_status.dev_major and status.dev_minor == proc_status.dev_minor;
+    if (status.dev_major == proc_status.dev_major and status.dev_minor == proc_status.dev_minor) {
+        const flags = linux.fcntl(fd, linux.F.GETFL, 0);
+        if (linux.errno(flags) != .SUCCESS) return false;
+        const o_flags: linux.O = @bitCast(@as(u32, @truncate(flags)));
+        if (o_flags.ACCMODE != .RDONLY) return false;
+        var fd_path_buf: [32]u8 = undefined;
+        const fd_path = std.mem.printSentinel(&fd_path_buf, "/proc/self/fd/{d}", .{fd}, 0) catch {
+            return false;
+        };
+        var target_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const len = linux.readlink(fd_path.ptr, &target_buf, target_buf.len);
+        if (linux.errno(len) != .SUCCESS or len == 0) return false;
+        const base = std.fs.path.basename(target_buf[0..len]);
+        if (std.mem.eql(u8, base, "mem") or std.mem.startsWith(u8, base, "mem ")) return false;
+    }
+    return switch (status.mode & linux.S.IFMT) {
+        linux.S.IFREG, linux.S.IFDIR => true,
+        // The memory devices: null, zero, full, random and urandom.
+        linux.S.IFCHR => status.rdev_major == memory_device_major and
+            std.enums.fromInt(MemoryDevice, status.rdev_minor) != null,
+        else => false,
+    };
+}
+
+/// For io.open (lfiles.c): nonzero when `fd` may be wrapped in a Lua stream.
+export fn luart_fd_allowed(fd: c_int) c_int {
+    return @intFromBool(fdAllowed(fd));
 }
 
 /// Linux's memory devices (major 1) that Lua's file functions may open,
@@ -379,18 +400,21 @@ const MemoryDevice = enum(u32) { null = 3, zero = 5, full = 7, random = 8, urand
 
 fn opensSafely(path: [*:0]const u8) bool {
     const linux = std.os.linux;
-    var status: linux.Statx = undefined;
-    const result = linux.statx(linux.AT.FDCWD, path, 0, .{ .TYPE = true }, &status);
-    // Missing, or out of reach: the open fails on its own.
-    if (linux.errno(result) != .SUCCESS) return true;
-    if (isProcessMemory(path, &status)) return false;
-    return switch (status.mode & linux.S.IFMT) {
-        linux.S.IFREG, linux.S.IFDIR => true,
-        // The memory devices: null, zero, full, random and urandom.
-        linux.S.IFCHR => status.rdev_major == memory_device_major and
-            std.enums.fromInt(MemoryDevice, status.rdev_minor) != null,
-        else => false,
-    };
+    const result = linux.open(
+        path,
+        .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true, .NOCTTY = true },
+        0,
+    );
+    switch (linux.errno(result)) {
+        .SUCCESS => {
+            const fd: i32 = @intCast(result);
+            defer os.close(fd);
+            return fdAllowed(fd);
+        },
+        .NXIO => return false,
+        // Missing, out of reach, or ELOOP/ENAMETOOLONG: the caller reports it.
+        else => return true,
+    }
 }
 
 /// Lua's allocator (`lua_Alloc`; `osize` and `nsize` are its manual's
@@ -1069,6 +1093,10 @@ test "loops in C stop at the deadline too: table.move and patterns" {
         "for _ in string.gmatch(('a'):rep(40), ('a-'):rep(20) .. 'b') do end",
         "string.gsub(('a'):rep(40), ('a-'):rep(20) .. 'b', '')",
         "local s = ('a'):rep(40) s:find(('a-'):rep(20) .. 'b')",
+        "('a'):rep(1e6):find(('a'):rep(1e5) .. 'b', 1, true)",
+        "('a'):rep(1e6):find(('a'):rep(1e5) .. 'b')",
+        "('('):rep(1e6):find('%b()')",
+        "('a'):rep(1e6):find('a*b')",
     };
     for (runaways) |code| {
         budget.deadline_ns = os.monotonicNs() + 50 * std.time.ns_per_ms;
@@ -1110,18 +1138,40 @@ fn inheritableFds() usize {
     return count;
 }
 
-test "a process's memory under /proc is not opened" {
+test "a process's memory under /proc is not opened, even through a symlink" {
     var budget: Budget = .{ .bytes_max = 8 << 20 };
     const L = try testState(&budget);
     defer c.lua_close(L);
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
-    const code =
-        \\local f, why = io.open("/proc/self/mem", "r+")
-        \\assert(f == nil and why:find("not a regular file"), why)
-        \\assert(io.open("/proc/self/status")):close()
-    ;
-    try testing.expect(runCode(L, arena_state.allocator(), code) == null);
+    const arena = arena_state.allocator();
+
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [512]u8 = undefined;
+    const dir_path = try os.tmpDirPath(&test_dir, &path_buffer);
+    const link = try std.fmt.allocPrintSentinel(arena, "{s}/x", .{dir_path}, 0);
+    const linux = std.os.linux;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.symlink("/proc/self/mem", link)));
+
+    const code = try std.fmt.allocPrintSentinel(arena,
+        \\local link = "{s}"
+        \\for _, path in ipairs({{ "/proc/self/mem", link }}) do
+        \\  for _, mode in ipairs({{ "r+", "r", "w" }}) do
+        \\    local f, why = io.open(path, mode)
+        \\    assert(f == nil and why:find("not a regular file"), tostring(why))
+        \\  end
+        \\  local lok, lwhy = pcall(loadfile, path)
+        \\  assert(not lok and tostring(lwhy):find("not a regular file"), tostring(lwhy))
+        \\  local ok, derr = pcall(dofile, path)
+        \\  assert(not ok and tostring(derr):find("not a regular file"), tostring(derr))
+        \\end
+        \\assert(io.open("/proc/self/status", "r")):close()
+    , .{link}, 0);
+    if (runCode(L, arena, code)) |message| {
+        std.debug.print("{s}\n", .{message});
+        return error.TestUnexpectedResult;
+    }
 }
 
 test "extensions open files close-on-exec, and only so many at once" {
@@ -1281,8 +1331,11 @@ test "what the time limit cannot stop is out of reach" {
         \\local fifo = "{s}"
         \\local f, err = io.open(fifo)
         \\assert(f == nil and err:find("not a regular file"), err)
+        \\local fw, werr = io.open(fifo, "w")
+        \\assert(fw == nil and werr:find("not a regular file"), werr)
         \\assert(not pcall(io.lines, fifo) and not pcall(io.output, fifo) and not pcall(dofile, fifo))
-        \\assert(io.open(fifo .. ".missing") == nil)
+        \\local mf, merr, mcode = io.open(fifo .. ".missing")
+        \\assert(mf == nil and mcode == 2)
         \\local w = assert(io.open(fifo .. ".txt", "w")) w:write("hi") w:close()
         \\assert(io.open(fifo .. ".txt"):read("a") == "hi")
         \\assert(io.open("/dev/null"):read("a") == "")

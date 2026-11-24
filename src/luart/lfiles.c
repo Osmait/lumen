@@ -7,17 +7,23 @@
 ** method works on them, and closing or collecting one gives its slot back.
 */
 
+#define _POSIX_C_SOURCE 200809L
+
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "lua.h"
 #include "lauxlib.h"
 #include "lualib.h"
 
-/* In src/luart/lua.zig: take a slot (0 when none is left) and give it back. */
+/* In src/luart/lua.zig: take a slot (0 when none is left), give it back,
+** and verify the opened descriptor is not a FIFO, device or procfs mem. */
 int luart_file_opened (lua_State *L);
 void luart_file_closed (lua_State *L);
+int luart_fd_allowed (int fd);
 
 /* What liolib's 'l_checkmode' accepts: [rwa]%+?b* */
 static int valid_mode (const char *mode) {
@@ -25,6 +31,32 @@ static int valid_mode (const char *mode) {
   mode++;
   if (*mode == '+') mode++;
   return strspn(mode, "b") == strlen(mode);
+}
+
+static int open_flags (const char *mode) {
+  int rw = (mode[1] == '+');
+  int flags = O_CLOEXEC | O_NONBLOCK | O_NOCTTY;
+  switch (mode[0]) {
+    case 'r':
+      flags |= rw ? O_RDWR : O_RDONLY;
+      break;
+    case 'w':
+      flags |= (rw ? O_RDWR : O_WRONLY) | O_CREAT | O_TRUNC;
+      break;
+    case 'a':
+      flags |= (rw ? O_RDWR : O_WRONLY) | O_CREAT | O_APPEND;
+      break;
+  }
+  return flags;
+}
+
+static int refuse_file (lua_State *L, const char *filename) {
+  luaL_pushfail(L);
+  lua_pushfstring(
+      L,
+      "%s: not a regular file (Lumen does not open FIFOs, sockets, devices or a process's memory)",
+      filename);
+  return 2;
 }
 
 /* Called by liolib (close, io.close, the finalizer) with the file at 1. */
@@ -54,16 +86,30 @@ static int too_many (lua_State *L, const char *what) {
 static int luart_io_open (lua_State *L) {
   const char *filename = luaL_checkstring(L, 1);
   const char *mode = luaL_optstring(L, 2, "r");
-  char mode_cloexec[8];
-  luaL_argcheck(L, valid_mode(mode) && strlen(mode) + 2 <= sizeof(mode_cloexec),
-                2, "invalid mode");
+  luaL_argcheck(L, valid_mode(mode), 2, "invalid mode");
   luaL_Stream *p = new_stream(L);
   if (!luart_file_opened(L)) return too_many(L, filename);
-  /* 'e': O_CLOEXEC (glibc). */
-  snprintf(mode_cloexec, sizeof(mode_cloexec), "%se", mode);
-  p->f = fopen(filename, mode_cloexec);
-  if (p->f == NULL) {
+  int fd = open(filename, open_flags(mode), 0666);
+  if (fd < 0) {
+    int saved_errno = errno;
     luart_file_closed(L);
+    if (saved_errno == ENXIO) return refuse_file(L, filename);
+    errno = saved_errno;
+    return luaL_fileresult(L, 0, filename);
+  }
+  if (!luart_fd_allowed(fd)) {
+    close(fd);
+    luart_file_closed(L);
+    return refuse_file(L, filename);
+  }
+  int fl = fcntl(fd, F_GETFL);
+  if (fl != -1) fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+  p->f = fdopen(fd, mode);
+  if (p->f == NULL) {
+    int saved_errno = errno;
+    close(fd);
+    luart_file_closed(L);
+    errno = saved_errno;
     return luaL_fileresult(L, 0, filename);
   }
   p->closef = &counted_close;

@@ -37,6 +37,9 @@ jobs:
       - name: Unit and integration tests
         run: zig build test --summary all
 
+      - name: Debug build
+        run: zig build
+
       # As a release is built (SQLite and Lua bundled: not installed above).
       - name: Release build
         run: |

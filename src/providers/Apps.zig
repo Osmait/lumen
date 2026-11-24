@@ -42,16 +42,16 @@ pub fn dropStale(self: *Apps) void {
 }
 
 /// Reads the installed apps again. Earlier `items` and the GAppInfo
-/// pointers in them stay valid until `dropStale`.
+/// pointers in them stay valid until `dropStale`. On OOM while saving the
+/// previous generation, aborts the reload and keeps existing `list`/`items`
+/// intact so active views never hold dangling pointers.
 pub fn reload(self: *Apps) void {
     if (self.list != null or self.items.len > 0) {
-        if (self.stale.append(self.gpa, .{ .arena = self.arena, .list = self.list })) {
-            self.arena = .init(self.gpa);
-        } else |_| {
-            // No room to keep them: free now, as before (rare and racy).
-            if (self.list) |list| c.g_list_free_full(list, &c.g_object_unref);
-            _ = self.arena.reset(.retain_capacity);
-        }
+        self.stale.append(self.gpa, .{ .arena = self.arena, .list = self.list }) catch |err| {
+            log.warn("reloading apps skipped: {t}", .{err});
+            return;
+        };
+        self.arena = .init(self.gpa);
     }
     self.list = c.g_app_info_get_all();
     const arena = self.arena.allocator();
@@ -162,4 +162,28 @@ fn keywords(
         try joined.appendSlice(arena, base);
     }
     return joined.items;
+}
+
+test "reload keeps previous items intact when stale.append fails with OOM" {
+    const testing = std.testing;
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const gpa = failing.allocator();
+    var apps = Apps.init(gpa);
+    defer apps.deinit();
+
+    const key = try apps.arena.allocator().dupe(u8, "app:example.desktop");
+    const items = try apps.arena.allocator().alloc(Item, 1);
+    items[0] = .{
+        .key = key,
+        .title = "Example",
+        .action = .calc,
+    };
+    apps.items = items;
+
+    // Force the very next allocation (stale.append) to fail with OutOfMemory.
+    failing.fail_index = failing.alloc_index;
+    apps.reload();
+
+    try testing.expectEqual(@as(usize, 1), apps.items.len);
+    try testing.expectEqualStrings("app:example.desktop", apps.items[0].key);
 }

@@ -851,6 +851,8 @@ pub fn adopt(live: *Live, fresh: Replaced) std.mem.Allocator.Error!Replaced {
     live.delta = delta;
     freeScans(live.gpa, &live.scans);
     live.scans = .empty;
+    freeRechecks(live.gpa, &live.rechecks);
+    live.rechecks = .empty;
     live.prune_watches = false;
     live.pending_resync = false;
     live.dirty = false;
@@ -1696,4 +1698,31 @@ test "live: paths too long to open are left out, not shown empty" {
     var hits: std.ArrayList(Hit) = .empty;
     try live.search(arena.allocator(), pool, "profundo", .{ .limit = 10, .recency = false }, &hits);
     try testing.expectEqual(0, hits.items.len);
+}
+
+test "live: adopt frees pending rechecks from the replaced delta" {
+    const gpa = testing.allocator;
+    const pool = try Pool.create(gpa, testing.io, 1);
+    defer pool.destroy();
+    const roots = [_][]const u8{"/r"};
+    const config: scan.Config = .{ .roots = &roots };
+
+    var b1: Builder = .empty;
+    _ = try b1.push(gpa, "/r", store_mod.no_parent, store_mod.flag_dir, 0);
+    const base1 = try b1.finish(gpa);
+    var live = try Live.initUnarmed(gpa, base1, &config, pool);
+    defer live.deinit();
+
+    const stale_path = try gpa.dupeSentinel(u8, "/r/new_dir", 0);
+    const delta_id = EntryId{ .in_delta = true, .index = 0 };
+    try live.rechecks.append(gpa, .{ .directory = delta_id.raw(), .path = stale_path });
+
+    var b2: Builder = .empty;
+    _ = try b2.push(gpa, "/r", store_mod.no_parent, store_mod.flag_dir, 0);
+    const base2 = try b2.finish(gpa);
+    const watcher2 = try Watcher.create(gpa);
+    const old = try live.adopt(.{ .base = base2, .watcher = watcher2 });
+    old.deinit(gpa);
+
+    try testing.expectEqual(@as(usize, 0), live.rechecks.items.len);
 }

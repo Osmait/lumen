@@ -555,7 +555,7 @@ fn onKey(
     data: ?*anyopaque,
 ) callconv(.c) c.gboolean {
     const ui: *Ui = @ptrCast(@alignCast(data));
-    ui.key_ns = stats.now();
+    if (!keyboard.isModifierKey(keyval)) ui.key_ns = stats.now();
     return keyboard.handleKey(ui, keyval, state);
 }
 

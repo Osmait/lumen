@@ -1190,3 +1190,58 @@ test "shutdown cancels queued deliveries without leaking or calling back" {
     while (c.g_main_context_iteration(null, 0) != 0) {}
     try testing.expect(probe.registry == null);
 }
+
+test "lumen.storage writes 0600 atomically without clobbering .tmp symlinks and makes data dir 0700" {
+    const linux = std.os.linux;
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const folder = try os.tmpDirPath(&test_dir, &path_buffer);
+
+    try writeTestFile(folder, "extensions/secret/init.lua",
+        \\return lumen.extension { commands = { { name = "save", title = "Save", run = function()
+        \\  lumen.storage.set("token", "hunter2")
+        \\end } } }
+    );
+    // Simulate a pre-existing 0755 extension data folder and a victim + planted .tmp symlink.
+    const data_dir = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/data/extensions/secret", .{folder}, 0);
+    defer testing.allocator.free(data_dir);
+    try os.mkdirP(data_dir);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(data_dir, 0o755)));
+
+    const victim = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/victim", .{folder}, 0);
+    defer testing.allocator.free(victim);
+    try os.writeFile(victim, "untouched");
+    const tmp_link = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/storage.json.tmp", .{data_dir}, 0);
+    defer testing.allocator.free(tmp_link);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.symlink(victim, tmp_link)));
+
+    var probe: Probe = .{};
+    defer probe.deinit();
+    const host = try testHost(&probe, folder);
+    defer host.shutdown();
+    host.reload();
+    try probe.wait("registry");
+    const registry = probe.registry.?;
+
+    _ = host.act(registry.generation, .from(0), .command_run);
+    const acted = try probe.take("act");
+    defer acted.destroy(testing.allocator);
+    try testing.expect(acted.error_message == null);
+
+    var stx: linux.Statx = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(
+        linux.statx(linux.AT.FDCWD, data_dir, 0, .{ .MODE = true }, &stx),
+    ));
+    try testing.expectEqual(@as(u16, 0o700), stx.mode & 0o777);
+
+    const storage_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/storage.json", .{data_dir}, 0);
+    defer testing.allocator.free(storage_path);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(
+        linux.statx(linux.AT.FDCWD, storage_path, 0, .{ .MODE = true }, &stx),
+    ));
+    try testing.expectEqual(@as(u16, 0o600), stx.mode & 0o777);
+
+    var head_buffer: [16]u8 = undefined;
+    try testing.expectEqualStrings("untouched", os.readHead(victim, &head_buffer));
+}

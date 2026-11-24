@@ -49,6 +49,7 @@ const Daemon = struct {
     ui: ?Ui = null,
     shutting_down: bool = false,
     clipboard_watcher: ClipboardWatcher = .{},
+    content_index_idle_queued: std.atomic.Value(bool) = .init(false),
 };
 
 var daemon: Daemon = .{};
@@ -560,7 +561,10 @@ fn startFileIndex(ui: *Ui) void {
         home,
         cache_dir,
         file_service.contentPools(),
-        .{ .names = file_service },
+        .{
+            .names = file_service,
+            .on_published = .{ .callback = &onContentIndexPublished },
+        },
     ) catch |err| {
         log.warn("content index: {t}", .{err});
         return;
@@ -578,6 +582,24 @@ fn startFileIndex(ui: *Ui) void {
         log.warn("content search worker: {t}", .{err});
         break :blk null;
     };
+}
+
+fn onContentIndexPublished(_: ?*anyopaque) void {
+    if (daemon.shutting_down) return;
+    if (daemon.content_index_idle_queued.swap(true, .acq_rel)) return;
+    if (c.g_idle_add(&contentIndexPublishedIdle, null) == 0) {
+        daemon.content_index_idle_queued.store(false, .release);
+    }
+}
+
+fn contentIndexPublishedIdle(_: ?*anyopaque) callconv(.c) c.gboolean {
+    daemon.content_index_idle_queued.store(false, .release);
+    if (daemon.shutting_down) return 0;
+    const ui = readyUi() orelse return 0;
+    if (ui.view == .contents and c.gtk_widget_get_visible(@ptrCast(ui.window)) != 0) {
+        ui.refresh();
+    }
+    return 0;
 }
 
 fn dbPath() ?[*:0]u8 {
@@ -792,6 +814,8 @@ test {
 
 test {
     _ = @import("ui/logos.zig");
+    _ = @import("ui/image_size.zig");
+    _ = @import("providers/Apps.zig");
     _ = @import("cli.zig");
     _ = @import("ext/api.zig");
     _ = @import("ext/Host.zig");

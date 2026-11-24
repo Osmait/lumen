@@ -198,7 +198,7 @@ fn jpegSize(data: []const u8) ?Size {
                 if (isJpegFrame(marker)) return jpegFrameSize(data, at);
                 const length = int(u16, data, at + jpeg.marker_bytes, .big) orelse return null;
                 if (length < jpeg.length_bytes) return null;
-                at += jpeg.marker_bytes + length;
+                at += jpeg.marker_bytes + @as(usize, length);
             },
         }
     }
@@ -500,4 +500,45 @@ test "image sizes are read from headers" {
     try testing.expect(read("hello") == null);
     try testing.expect(read(png_file[0..20]) == null);
     try testing.expect(read("GIF89a\x00\x00\x00\x00\x00\x00\x00") == null);
+}
+
+test "jpegSize handles maximum-length segments without overflowing u16" {
+    const testing = std.testing;
+    // Truncated APP2 segment declaring 0xFFFF bytes used to overflow u16.
+    try testing.expect(read("\xff\xd8\xff\xe2\xff\xff") == null);
+
+    // Complete APP2 segments of 0xFFFE and 0xFFFF bytes followed by SOF0 (4000x3000).
+    for ([_]u16{ 0xfffe, 0xffff }) |seg_len| {
+        const sof0 = "\xff\xc0\x00\x11\x08\x0b\xb8\x0f\xa0\x03";
+        const total = 2 + 2 + @as(usize, seg_len) + sof0.len;
+        const buf = try testing.allocator.alloc(u8, total);
+        defer testing.allocator.free(buf);
+        @memset(buf, 0);
+        buf[0] = 0xff;
+        buf[1] = 0xd8;
+        buf[2] = 0xff;
+        buf[3] = 0xe2;
+        std.mem.writeInt(u16, buf[4..6], seg_len, .big);
+        @memcpy(buf[4 + @as(usize, seg_len) ..], sof0);
+        try testing.expectEqual(Size{ .width_px = 4000, .height_px = 3000 }, read(buf).?);
+    }
+}
+
+fn fuzzImageSize(_: void, smith: *std.testing.Smith) anyerror!void {
+    var buffer: [4096]u8 = undefined;
+    const bytes = buffer[0..smith.slice(&buffer)];
+    _ = read(bytes);
+}
+
+test "fuzz: image_size.read never panics on arbitrary headers" {
+    const corpus = [_][]const u8{
+        "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x4e\x20\x00\x00\x4e\x20\x08\x02",
+        "\xff\xd8\xff\xe2\xff\xff",
+        "\xff\xd8\xff\xe1\x00\x04ab\xff\xc0\x00\x11\x08\x0b\xb8\x0f\xa0\x03",
+        "GIF89a\x01\x00\x01\x00\x00\x00\x00\x2c\x0a\x00\x05\x00\x2c\x01\xc8\x00\x00\x02\x01\x00\x00\x3b",
+        "RIFF\x00\x00\x00\x00WEBPVP8L\x00\x00\x00\x00\x2f\x63\x00\x19\x00",
+        "II*\x00\x08\x00\x00\x00\x02\x00\x00\x01\x03\x00\x01\x00\x00\x00\x40\x1f\x00\x00",
+        "\x00\x00\x00\x10ftypheic\x00\x00\x00\x00\x00\x00\x00\x30meta\x00\x00\x00\x00",
+    };
+    try std.testing.fuzz({}, fuzzImageSize, .{ .corpus = &corpus });
 }
