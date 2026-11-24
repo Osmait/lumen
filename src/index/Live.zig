@@ -56,6 +56,8 @@ prune_watches: bool = false,
 slow_mounts: [][]u8 = &.{},
 /// Directories watched by `addScans`, to list again (`Recheck`).
 rechecks: Rechecks = .empty,
+/// Directories skipped due to EACCES during scan/watch, retried by `Service`.
+retry_dirs: [][]u8 = &.{},
 watcher: *Watcher,
 config: *const scan.Config,
 /// Small scans (a new directory) and rescans run here.
@@ -140,6 +142,8 @@ pub const Limits = struct {
     /// Tombstones must also exceed 1/graves_divisor of the base (5%).
     graves_divisor: usize = 20,
     interval_ns: u64 = compact_interval_ns,
+    retry_dir_min_ns: u64 = 1 * std.time.ns_per_s,
+    retry_dir_max_ns: u64 = 60 * std.time.ns_per_s,
 };
 
 /// A directory that appeared after the scan. Its entry is in the delta at
@@ -154,6 +158,7 @@ pub const Scan = struct {
     depth: u16,
     hidden: u8,
     outcome: Outcome = .unread,
+    unreadable: [][]u8 = &.{},
 
     /// What `readScans` found in the directory.
     pub const Outcome = union(enum) {
@@ -170,6 +175,7 @@ pub const Scan = struct {
 
     fn deinit(scan_job: *Scan, gpa: std.mem.Allocator) void {
         gpa.free(scan_job.path);
+        sys.freeList(gpa, scan_job.unreadable);
         if (scan_job.outcome == .read) scan_job.outcome.read.deinit(gpa);
     }
 };
@@ -179,14 +185,16 @@ pub const Scans = std.ArrayList(Scan);
 /// A directory `addScans` watched after `readScans` had read it: what was
 /// created in it in between came with no event and is not in the read.
 /// `readRechecks` lists it again once it is watched (anything later comes
-/// as an event), and `applyRechecks` adds what is missing.
+/// as an event), and `applyRechecks` adds what is missing and drops ghosts.
 pub const Recheck = struct {
     /// Raw `EntryId` of the directory's entry (in the delta).
     directory: u32,
     path: [:0]u8,
+    status: Status = .unread,
     /// What `readRechecks` found in it.
     found: []const Found = &.{},
 
+    pub const Status = enum { unread, read, gone, unreadable };
     pub const Found = struct { name: []const u8, is_dir: bool };
 };
 
@@ -203,12 +211,14 @@ pub const Replaced = struct {
     /// list, freed with it.
     graves: usize = 0,
     slow_mounts: ?[][]u8 = null,
+    retry_dirs: ?[][]u8 = null,
 
     pub fn deinit(replaced: Replaced, gpa: std.mem.Allocator) void {
         var base = replaced.base;
         base.deinit(gpa);
         replaced.watcher.destroy(gpa);
         if (replaced.slow_mounts) |mounts| sys.freeList(gpa, mounts);
+        if (replaced.retry_dirs) |dirs| sys.freeList(gpa, dirs);
     }
 };
 
@@ -245,6 +255,7 @@ pub fn deinit(live: *Live) void {
     live.delta.deinit(live.gpa);
     freeScans(live.gpa, &live.scans);
     freeRechecks(live.gpa, &live.rechecks);
+    sys.freeList(live.gpa, live.retry_dirs);
     sys.freeList(live.gpa, live.slow_mounts);
     live.watcher.destroy(live.gpa);
     live.engine_base.deinit(live.gpa);
@@ -331,6 +342,7 @@ pub fn apply(live: *Live, changes: []const Watcher.Change) std.mem.Allocator.Err
             const added = try live.add(parent, created.name, created.is_dir);
             applied_count += @intFromBool(added);
         },
+        .modified => {},
         .removed => |removed| {
             applied_count += @intFromBool(live.remove(.fromRaw(removed.parent), removed.name));
         },
@@ -572,8 +584,13 @@ pub fn freeRechecks(gpa: std.mem.Allocator, rechecks: *Rechecks) void {
 pub fn readRechecks(arena: std.mem.Allocator, rechecks: []Recheck, entries_max: usize) bool {
     var entries_count: usize = 0;
     for (rechecks) |*recheck| {
-        // Gone or replaced since: its events say so.
-        const fd = sys.openDirNoFollow(recheck.path) catch continue;
+        const fd = sys.openDirNoFollow(recheck.path) catch |err| {
+            recheck.status = switch (err) {
+                error.NotFound, error.IsLink => .gone,
+                else => .unreadable,
+            };
+            continue;
+        };
         defer sys.close(fd);
         var found: std.ArrayList(Recheck.Found) = .empty;
         var entries: sys.DirIter = .{ .fd = fd };
@@ -582,42 +599,81 @@ pub fn readRechecks(arena: std.mem.Allocator, rechecks: []Recheck, entries_max: 
             if (entries_count > entries_max) return false;
             var kind = entry.kind;
             if (kind == sys.Kind.unknown) {
-                var full_path_buffer: paths.Buffer = undefined;
-                const full_path = std.mem.printSentinel(
-                    &full_path_buffer,
-                    "{s}/{s}",
-                    .{ recheck.path, entry.name },
-                    0,
-                ) catch continue;
-                kind = sys.kindOf(full_path);
+                var name_buffer: [std.os.linux.NAME_MAX + 1]u8 = undefined;
+                if (std.mem.printSentinel(&name_buffer, "{s}", .{entry.name}, 0)) |name_z| {
+                    kind = sys.kindAt(fd, name_z);
+                } else |_| {}
             }
             const name = arena.dupe(u8, entry.name) catch return false;
             const is_dir = kind == sys.Kind.directory;
             found.append(arena, .{ .name = name, .is_dir = is_dir }) catch return false;
         }
         recheck.found = found.items;
+        recheck.status = .read;
     }
     return true;
 }
 
-/// Adds what `readRechecks` found that the index does not have yet. Only
-/// what is missing: a directory already known is not replaced, as `add`
-/// does for a directory renamed over another.
+/// Synchronizes `rechecks` directories: adds entries that appeared before
+/// the watch existed, and removes ghost entries deleted or renamed away in
+/// that same window.
 pub fn applyRechecks(live: *Live, rechecks: []const Recheck) std.mem.Allocator.Error!bool {
-    var added = false;
+    var changed = false;
+    var present: std.StringHashMapUnmanaged(void) = .empty;
+    defer present.deinit(live.gpa);
+    var ghosts: std.ArrayList(u32) = .empty;
+    defer ghosts.deinit(live.gpa);
+
     for (rechecks) |recheck| {
         const parent: EntryId = .fromRaw(recheck.directory);
         if (!live.alive(parent)) continue;
+        switch (recheck.status) {
+            .gone => {
+                live.stats.removed += live.tombstoneTree(parent);
+                changed = true;
+                continue;
+            },
+            .unread, .unreadable => continue,
+            .read => {},
+        }
         for (recheck.found) |found| {
             if (live.childOf(parent, found.name) != null) continue;
-            if (try live.add(parent, found.name, found.is_dir)) added = true;
+            if (try live.add(parent, found.name, found.is_dir)) changed = true;
+        }
+        if (parent.in_delta) {
+            present.clearRetainingCapacity();
+            ghosts.clearRetainingCapacity();
+            present.ensureUnusedCapacity(live.gpa, @intCast(recheck.found.len)) catch {
+                live.pending_resync = true;
+                continue;
+            };
+            for (recheck.found) |found| present.putAssumeCapacity(found.name, {});
+            if (live.delta.kids.get(parent.index)) |kids| {
+                const builder = &live.delta.builder;
+                for (kids.items) |kid| {
+                    if (builder.masks.items[kid] == 0) continue;
+                    const offset = builder.name_offsets.items[kid];
+                    const kid_name = builder.names.items[offset..][0..builder.name_sizes.items[kid]];
+                    if (!present.contains(kid_name)) {
+                        ghosts.append(live.gpa, kid) catch {
+                            live.pending_resync = true;
+                            break;
+                        };
+                    }
+                }
+            }
+            for (ghosts.items) |kid| {
+                live.stats.removed += live.tombstoneTree(.ofDelta(kid));
+                changed = true;
+            }
         }
     }
-    if (added) {
+    if (changed) {
         live.dirty = true;
         try live.delta.rebuild(live.gpa);
+        live.pruneWatches();
     }
-    return added;
+    return changed;
 }
 
 /// The directories `apply` left to read. Between this and `addScans`
@@ -658,18 +714,37 @@ pub fn readScans(
         sub_config.follow_roots = false;
         sub_config.entries_max = entries_left;
         var scan_stats: scan.Stats = .{};
-        var sub = scan.scan(gpa, pool, &sub_config, null, &scan_stats) catch {
+        var unreadable: std.ArrayList([]u8) = .empty;
+        errdefer sys.freeList(gpa, unreadable.items);
+        var sub = scan.scanCollectingUnreadable(gpa, pool, &sub_config, null, &scan_stats, &unreadable) catch {
+            sys.freeList(gpa, unreadable.items);
             scan_job.outcome = .failed;
             continue;
         };
         if (scan_stats.truncated) {
             sub.deinit(gpa);
+            sys.freeList(gpa, unreadable.items);
             scan_job.outcome = .too_big;
             continue;
         }
+        scan_job.unreadable = unreadable.toOwnedSlice(gpa) catch blk: {
+            sys.freeList(gpa, unreadable.items);
+            break :blk &.{};
+        };
         entries_left -|= sub.len();
         scan_job.outcome = .{ .read = sub };
     }
+}
+
+pub fn addRetryDir(live: *Live, dir: []const u8) std.mem.Allocator.Error!void {
+    for (live.retry_dirs) |existing| {
+        if (std.mem.eql(u8, existing, dir)) return;
+    }
+    const copy = try live.gpa.dupe(u8, dir);
+    errdefer live.gpa.free(copy);
+    const grown = try live.gpa.realloc(live.retry_dirs, live.retry_dirs.len + 1);
+    grown[grown.len - 1] = copy;
+    live.retry_dirs = grown;
 }
 
 /// Adds what `readScans` found under each directory's entry and watches
@@ -679,6 +754,7 @@ pub fn addScans(live: *Live, scans: *Scans) std.mem.Allocator.Error!void {
     defer freeScans(live.gpa, scans);
     var added = false;
     for (scans.items) |*scan_job| {
+        for (scan_job.unreadable) |dir| live.addRetryDir(dir) catch {};
         // Removed again before it was read (later in the same batch).
         if (!live.delta.alive(scan_job.directory)) continue;
         const sub = switch (scan_job.outcome) {
@@ -864,6 +940,10 @@ pub fn adopt(live: *Live, fresh: Replaced) std.mem.Allocator.Error!Replaced {
         old.slow_mounts = live.slow_mounts;
         live.slow_mounts = mounts;
     }
+    if (fresh.retry_dirs) |dirs| {
+        old.retry_dirs = live.retry_dirs;
+        live.retry_dirs = dirs;
+    }
     return old;
 }
 
@@ -909,18 +989,25 @@ pub fn prepareCompaction(
 ) (std.mem.Allocator.Error || Watcher.CreateError)!Replaced {
     const watcher = try Watcher.create(gpa);
     errdefer watcher.destroy(gpa);
-    const base = try scanSaved(gpa, pool, config, watcher, cache_path);
+    var unreadable: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (unreadable.items) |dir| gpa.free(dir);
+        unreadable.deinit(gpa);
+    }
+    const base = try scanSavedCollecting(gpa, pool, config, watcher, cache_path, &unreadable);
     return .{
         .base = base,
         .watcher = watcher,
         .graves = base.len() - base.liveCount(),
         // Out of memory: unknown, the list before stays.
         .slow_mounts = slowMountsOf(gpa, config) catch null,
+        .retry_dirs = try unreadable.toOwnedSlice(gpa),
     };
 }
 
-/// A fresh scan, saved to `cache_path` when there is one and returned
-/// mapped from it if the save worked. With no `watcher`, nothing is
+/// A fresh scan, saved to `cache_path` when there is one and mapped
+/// directly from our own written descriptor so concurrent writers cannot
+/// swap the backing index behind the watcher. With no `watcher`, nothing is
 /// watched: what a shutdown saves is never served (arming ~72 k inotify
 /// watches only to drop them took seconds).
 pub fn scanSaved(
@@ -930,25 +1017,35 @@ pub fn scanSaved(
     watcher: ?*Watcher,
     cache_path: ?[:0]const u8,
 ) std.mem.Allocator.Error!Store {
-    var base = try scan.scan(gpa, pool, config, watcher, null);
+    return scanSavedCollecting(gpa, pool, config, watcher, cache_path, null);
+}
+
+fn scanSavedCollecting(
+    gpa: std.mem.Allocator,
+    pool: *Pool,
+    config: *const scan.Config,
+    watcher: ?*Watcher,
+    cache_path: ?[:0]const u8,
+    unreadable: ?*std.ArrayList([]u8),
+) std.mem.Allocator.Error!Store {
+    var base = if (unreadable) |list|
+        try scan.scanCollectingUnreadable(gpa, pool, config, watcher, null, list)
+    else
+        try scan.scan(gpa, pool, config, watcher, null);
     errdefer base.deinit(gpa);
     if (cache_path) |path| {
         if (std.mem.findScalarLast(u8, path, '/')) |slash| {
             // The save below fails and says so.
             sys.mkdirP(path[0..slash]) catch |err| log.warn("{s}: {t}", .{ path[0..slash], err });
         }
-        base.save(path) catch |err| {
-            // Served from memory; the next rescan saves again.
-            log.warn("saving the file index: {t}", .{err});
-            return base;
-        };
-        // Swap the heap copy for a mapping of what was just written: same
-        // bytes, but clean page cache the kernel can reclaim instead of
-        // ~80 MB of anonymous memory.
-        if (Store.open(path)) |mapped| {
+        // Save and map via the open descriptor before closing so concurrent
+        // writers replacing `path` cannot mismatch `base` and `watcher`.
+        if (base.saveAndMap(path)) |mapped| {
             base.deinit(gpa);
             base = mapped;
-        } else |_| {}
+        } else |err| {
+            log.warn("saving the file index: {t}", .{err});
+        }
     }
     return base;
 }
@@ -1725,4 +1822,73 @@ test "live: adopt frees pending rechecks from the replaced delta" {
     old.deinit(gpa);
 
     try testing.expectEqual(@as(usize, 0), live.rechecks.items.len);
+}
+
+test "live: rechecks remove files renamed or deleted between readScans and watching" {
+    const tree = try Tree.create(&sample_tree);
+    defer tree.destroy();
+
+    tree.make("fresh/temporal.part");
+    tree.make("fresh/gone_dir/inside.txt");
+    // Simulate directory creation reported by inotify, then run readScans.
+    _ = try tree.live.apply(&.{
+        .{ .created = .{ .parent = 0, .name = "fresh", .is_dir = true } },
+    });
+    var scans = tree.live.takeScans();
+    readScans(testing.allocator, tree.pool, &tree.config, scans.items, 1000);
+
+    // Mutate inside `fresh` before addScans watches and rechecks it.
+    tree.move("root/fresh/temporal.part", "root/fresh/final.pdf");
+    tree.remove("fresh/gone_dir/inside.txt");
+    tree.remove("fresh/gone_dir/");
+
+    try tree.live.addScans(&scans);
+    try tree.live.finishScans();
+    _ = try tree.sync();
+
+    try testing.expect(!tree.live.pending_resync);
+    try testing.expect(try tree.found("final", "fresh/final.pdf"));
+    try testing.expectEqual(@as(usize, 0), try tree.under("temporal", ""));
+    try testing.expectEqual(@as(usize, 0), try tree.under("gone_dir", ""));
+    try testing.expectEqual(@as(usize, 0), try tree.under("inside", ""));
+}
+
+test "live: saveAndMap maps our own inode even when shared path is replaced by another writer" {
+    const gpa = testing.allocator;
+    var tmp = try sys.TestDir.init();
+    defer tmp.deinit();
+    var cache_buf: paths.Buffer = undefined;
+    const shared_cache = try tmp.path(&cache_buf, "files.idx");
+
+    try tmp.write("left/left_only.txt", "x");
+    try tmp.write("right/right_only.txt", "y");
+    var left_buf: paths.Buffer = undefined;
+    var right_buf: paths.Buffer = undefined;
+    const left_root = try tmp.path(&left_buf, "left");
+    const right_root = try tmp.path(&right_buf, "right");
+
+    const pool = try Pool.create(gpa, testing.io, 1);
+    defer pool.destroy();
+    const left_cfg: scan.Config = .{ .roots = &.{left_root} };
+    const right_cfg: scan.Config = .{ .roots = &.{right_root} };
+
+    // Left builds, saves atomically & maps its own fd via saveAndMap.
+    var left_store = try scanSaved(gpa, pool, &left_cfg, null, shared_cache);
+    defer left_store.deinit(gpa);
+    // Right immediately overwrites shared_cache.
+    var right_built = try scan.scan(gpa, pool, &right_cfg, null, null);
+    defer right_built.deinit(gpa);
+    try right_built.save(shared_cache);
+    var right_store = try Store.open(shared_cache);
+    defer right_store.deinit(gpa);
+
+    var pbuf: paths.Buffer = undefined;
+    // Left's mapped store must still contain `left_only.txt`, never right's contents.
+    var saw_left = false;
+    for (0..left_store.len()) |i| {
+        const p = left_store.path(@intCast(i), &pbuf) orelse continue;
+        if (std.mem.endsWith(u8, p, "/left_only.txt")) saw_left = true;
+        try testing.expect(!std.mem.endsWith(u8, p, "/right_only.txt"));
+    }
+    try testing.expect(saw_left);
 }

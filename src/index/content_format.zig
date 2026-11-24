@@ -21,7 +21,8 @@ const fold = @import("core").fold;
 /// 03: a flags column (documents removed by an incremental update).
 /// 04: path offsets are positions in the file, so an appended doc table
 /// refers to the paths already there instead of writing them all again.
-pub const magic = "LUMCTX04";
+/// 05: trigrams fold NFD combining diacritics onto their base letter (`core.fold`).
+pub const magic = "LUMCTX05";
 pub const header_size = 64;
 
 /// The first bytes of the file. The doc table's columns and the segments'
@@ -121,7 +122,14 @@ pub const Trigrams = struct {
 
     pub fn next(trigrams: *Trigrams) ?u32 {
         while (trigrams.position < trigrams.text.len) {
-            const folded = fold.step(trigrams.text, &trigrams.position);
+            const byte = trigrams.text[trigrams.position];
+            const folded = if (byte < 0x80) blk: {
+                trigrams.position += 1;
+                break :blk std.ascii.toLower(byte);
+            } else blk: {
+                const prev: u8 = if (trigrams.seen > 0) @truncate(trigrams.window) else 0;
+                break :blk fold.stepNonAscii(trigrams.text, &trigrams.position, prev) orelse continue;
+            };
             trigrams.window = (trigrams.window << @bitSizeOf(u8) | folded) & trigram_mask;
             if (trigrams.seen == trigram_chars - 1) return trigrams.window;
             trigrams.seen += 1;
@@ -388,4 +396,28 @@ test "content: the header struct lays out the bytes LUMCTX04 always had" {
     std.mem.writeInt(u64, expected[48..56], 6, .little);
     try testing.expectEqualSlices(u8, &expected, &header.encode());
     try testing.expectEqual(header, Header.decode(&expected));
+}
+
+test "content: Trigrams folds NFC and NFD identically without skipping standalone marks" {
+    const collect = struct {
+        fn run(allocator: std.mem.Allocator, text: []const u8) ![]u32 {
+            var list: std.ArrayList(u32) = .empty;
+            var it: Trigrams = .{ .text = text };
+            while (it.next()) |key| try list.append(allocator, key);
+            return list.toOwnedSlice(allocator);
+        }
+    }.run;
+    const gpa = testing.allocator;
+    const nfc = try collect(gpa, "Acción");
+    defer gpa.free(nfc);
+    const nfd = try collect(gpa, "Accio\u{0301}n");
+    defer gpa.free(nfd);
+    const ascii = try collect(gpa, "accion");
+    defer gpa.free(ascii);
+    try testing.expectEqualSlices(u32, ascii, nfc);
+    try testing.expectEqualSlices(u32, ascii, nfd);
+
+    const standalone = try collect(gpa, "\u{0301}abc");
+    defer gpa.free(standalone);
+    try testing.expectEqual(@as(usize, 3), standalone.len);
 }

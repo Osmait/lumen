@@ -33,18 +33,20 @@ events_buffer: [64 * 1024]u8 align(@alignOf(linux.inotify_event)) = undefined,
 /// tree re-pointed that folder's watch to the link's entry, and its events
 /// went to an entry that was not there.
 const mask: u32 = linux.IN.CREATE | linux.IN.DELETE | linux.IN.MOVED_FROM | linux.IN.MOVED_TO |
-    linux.IN.DELETE_SELF | linux.IN.MOVE_SELF | linux.IN.EXCL_UNLINK | linux.IN.ONLYDIR |
-    linux.IN.DONT_FOLLOW;
+    linux.IN.DELETE_SELF | linux.IN.MOVE_SELF | linux.IN.CLOSE_WRITE | linux.IN.EXCL_UNLINK |
+    linux.IN.ONLYDIR | linux.IN.DONT_FOLLOW;
 
 pub const Change = union(enum) {
     /// Something appeared in directory `parent`; a directory must be
     /// scanned whole (it may have filled before we watched it).
     created: struct { parent: u32, name: []const u8, is_dir: bool },
+    /// A non-directory file in `parent` finished being written.
+    modified: struct { parent: u32, name: []const u8 },
     /// Something left `parent` (deleted or moved away).
     removed: struct { parent: u32, name: []const u8 },
     /// The watched directory itself went away.
     dir_gone: u32,
-    /// Kernel queue overflow: changes were missed. Rescan.
+    /// Kernel queue overflow or unmounted filesystem: changes may be missed. Rescan.
     overflow,
 };
 
@@ -72,7 +74,7 @@ pub fn count(watcher: *const Watcher) usize {
     return watcher.watch_ids.count();
 }
 
-pub const WatchError = error{ WatchLimit, Watch, OutOfMemory };
+pub const WatchError = error{ WatchLimit, Access, Watch, OutOfMemory };
 
 /// Watches directory `path` (never a link to one), attributing its events to
 /// index entry `id`. The kernel keys watches by inode: watching the same
@@ -114,14 +116,27 @@ pub fn watchBestEffort(
     id: u32,
     placement: Placement,
 ) std.mem.Allocator.Error!void {
+    _ = try watcher.watchTrackingAccess(gpa, path, id, placement);
+}
+
+/// Like `watchBestEffort`, returning false if watching failed with permission denied.
+pub fn watchTrackingAccess(
+    watcher: *Watcher,
+    gpa: std.mem.Allocator,
+    path: [*:0]const u8,
+    id: u32,
+    placement: Placement,
+) std.mem.Allocator.Error!bool {
     const result = switch (placement) {
         .root => watcher.watchRoot(gpa, path, id),
         .below_root => watcher.watch(gpa, path, id),
     };
     result catch |err| switch (err) {
+        error.Access => return false,
         error.WatchLimit, error.Watch => {},
         error.OutOfMemory => return error.OutOfMemory,
     };
+    return true;
 }
 
 fn add(
@@ -137,6 +152,7 @@ fn add(
     const result = linux.inotify_add_watch(watcher.fd, path, events);
     switch (linux.errno(result)) {
         .SUCCESS => {},
+        .ACCES, .PERM => return error.Access,
         .NOSPC => {
             if (watcher.unwatched == 0) {
                 log.warn(
@@ -225,7 +241,7 @@ fn parse(
         if (name_start + event.len > bytes_read) break;
         defer offset = name_start + event.len;
 
-        if (event.mask & linux.IN.Q_OVERFLOW != 0) {
+        if (event.mask & (linux.IN.Q_OVERFLOW | linux.IN.UNMOUNT) != 0) {
             try out.append(arena, .overflow);
             continue;
         }
@@ -252,6 +268,8 @@ fn parse(
                 .name = owned,
                 .is_dir = event.mask & linux.IN.ISDIR != 0,
             } });
+        } else if (event.mask & linux.IN.CLOSE_WRITE != 0 and event.mask & linux.IN.ISDIR == 0) {
+            try out.append(arena, .{ .modified = .{ .parent = id, .name = owned } });
         } else if (event.mask & (linux.IN.DELETE | linux.IN.MOVED_FROM) != 0) {
             try out.append(arena, .{ .removed = .{ .parent = id, .name = owned } });
         }
@@ -296,22 +314,25 @@ test "watcher: events become changes attributed to the watched entry" {
 
     var changes: std.ArrayList(Change) = .empty;
     try watcher.drain(arena, &changes);
-    try testing.expectEqual(5, changes.items.len);
+    try testing.expectEqual(6, changes.items.len);
     const seen = changes.items;
     try testing.expect(seen[0] == .created);
     try testing.expectEqual(7, seen[0].created.parent);
     try testing.expect(!seen[0].created.is_dir);
     try testing.expectEqualStrings("f", seen[0].created.name);
-    try testing.expect(seen[1] == .created);
-    try testing.expect(seen[1].created.is_dir);
-    try testing.expectEqualStrings("d", seen[1].created.name);
-    try testing.expect(seen[2] == .removed);
-    try testing.expectEqual(7, seen[2].removed.parent);
-    try testing.expectEqualStrings("f", seen[2].removed.name);
-    try testing.expect(seen[3] == .created);
-    try testing.expectEqualStrings("g", seen[3].created.name);
-    try testing.expect(seen[4] == .removed);
-    try testing.expectEqualStrings("g", seen[4].removed.name);
+    try testing.expect(seen[1] == .modified);
+    try testing.expectEqual(7, seen[1].modified.parent);
+    try testing.expectEqualStrings("f", seen[1].modified.name);
+    try testing.expect(seen[2] == .created);
+    try testing.expect(seen[2].created.is_dir);
+    try testing.expectEqualStrings("d", seen[2].created.name);
+    try testing.expect(seen[3] == .removed);
+    try testing.expectEqual(7, seen[3].removed.parent);
+    try testing.expectEqualStrings("f", seen[3].removed.name);
+    try testing.expect(seen[4] == .created);
+    try testing.expectEqualStrings("g", seen[4].created.name);
+    try testing.expect(seen[5] == .removed);
+    try testing.expectEqualStrings("g", seen[5].removed.name);
 
     // The directory itself going away, and its watch with it.
     const sub_path = try std.mem.printSentinel(&other_path_buffer, "{s}/d", .{directory}, 0);
@@ -332,8 +353,10 @@ test "watcher: events become changes attributed to the watched entry" {
     try sys.writeFile(try std.mem.printSentinel(&path_buffer, "{s}/h", .{directory}, 0), "x");
     changes.clearRetainingCapacity();
     try watcher.drain(arena, &changes);
-    try testing.expectEqual(1, changes.items.len);
+    try testing.expectEqual(2, changes.items.len);
     try testing.expectEqual(9, changes.items[0].created.parent);
+    try testing.expect(changes.items[1] == .modified);
+    try testing.expectEqual(9, changes.items[1].modified.parent);
 }
 
 test "watcher: links are never followed below a root, and prune drops watches" {
@@ -451,4 +474,25 @@ test "watcher: a flooded queue reports the overflow in one drain" {
     try watcher.drain(arena_state.allocator(), &changes);
     try testing.expect(changes.items.len >= queued_max - 1);
     try testing.expect(changes.items[changes.items.len - 1] == .overflow);
+}
+
+test "watcher: IN_UNMOUNT triggers overflow rescan" {
+    const gpa = testing.allocator;
+    const watcher = try create(gpa);
+    defer watcher.destroy(gpa);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+
+    const event_size = @sizeOf(linux.inotify_event);
+    const ev: linux.inotify_event = .{
+        .wd = 99,
+        .mask = linux.IN.UNMOUNT,
+        .cookie = 0,
+        .len = 0,
+    };
+    @memcpy(watcher.events_buffer[0..event_size], std.mem.asBytes(&ev));
+    var changes: std.ArrayList(Change) = .empty;
+    try watcher.parse(arena_state.allocator(), event_size, &changes);
+    try testing.expectEqual(@as(usize, 1), changes.items.len);
+    try testing.expect(changes.items[0] == .overflow);
 }

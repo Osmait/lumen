@@ -154,6 +154,11 @@ inline fn matchAt(
                 if (std.ascii.isAscii(byte)) {
                     if (std.ascii.toLower(byte) != needle[j]) return null;
                     i += 1;
+                    if ((byte & 0xDF) >= 'A' and (byte & 0xDF) <= 'Z' and
+                        i < hay.len and (hay[i] & 0xFE) == 0xCC)
+                    {
+                        fold.skipCombining(hay, &i);
+                    }
                 } else if (fold.step(hay, &i) != needle[j]) return null;
                 j += 1;
             },
@@ -164,7 +169,7 @@ inline fn matchAt(
             .raw => if (fold.step(hay, &i) != fold.step(needle, &j)) return null,
         }
     }
-    if (start > from and fold.insideLetter(hay, start)) return null;
+    if (start > from and fold.insideLetter(hay[from..], start - from)) return null;
     return i;
 }
 
@@ -305,10 +310,21 @@ test "folded search: accents and case, both ways, positions in the original" {
         @as(?Span, .{ .start = 50, .end = 201 }),
         findFold(long_hay, long_needle, 0),
     );
-    try testing.expectEqual(
-        @as(?Span, .{ .start = 201, .end = long_hay.len }),
-        findFold(long_hay, long_needle, 51),
-    );
+    try testing.expectEqual(@as(?Span, .{ .start = 201, .end = long_hay.len }), findFold(long_hay, long_needle, 51));
+}
+
+test "findFold matches NFD decomposed accents in both hay and needle" {
+    const nfd_text = "Una accio\u{0301}n y un n\u{0303}andu\u{0301}";
+    const s1 = findFold(nfd_text, "accion", 0).?;
+    try testing.expectEqualStrings("accio\u{0301}n", nfd_text[s1.start..s1.end]);
+    const s2 = findFold(nfd_text, "ACCION", 0).?;
+    try testing.expectEqualStrings("accio\u{0301}n", nfd_text[s2.start..s2.end]);
+    const s3 = findFold("Una accion", "accio\u{0301}n", 0).?;
+    try testing.expectEqualStrings("accion", "Una accion"[s3.start..s3.end]);
+    const s4 = findFold(nfd_text, "nandu", 0).?;
+    try testing.expectEqualStrings("n\u{0303}andu\u{0301}", nfd_text[s4.start..s4.end]);
+    // Must not start a match inside a combining diacritic attached to an earlier letter.
+    try testing.expectEqual(@as(?Span, null), findFold("a\u{0301}b", "\u{0301}b", 0));
 }
 
 fn fuzzFindFold(_: void, smith: *testing.Smith) anyerror!void {
@@ -326,6 +342,8 @@ fn fuzzFindFold(_: void, smith: *testing.Smith) anyerror!void {
         .value(u8, 0x81, 4),
         .value(u8, 0x97, 2),
         .value(u8, 0xC5, 2),
+        .value(u8, 0xCC, 6),
+        .value(u8, 0xCD, 2),
         .rangeAtMost(u8, 0, 255, 1),
     };
     var hay: [300]u8 = undefined;

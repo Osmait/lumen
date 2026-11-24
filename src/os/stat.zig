@@ -47,10 +47,15 @@ pub const Kind = struct {
 
 /// d_type is UNKNOWN on some filesystems: then a statx tells.
 pub fn kindOf(path: [*:0]const u8) u8 {
+    return kindAt(linux.AT.FDCWD, path);
+}
+
+/// Like `kindOf`, relative to an already-open directory descriptor.
+pub fn kindAt(dir_fd: i32, name: [*:0]const u8) u8 {
     var stx: linux.Statx = undefined;
     const result = linux.statx(
-        linux.AT.FDCWD,
-        path,
+        dir_fd,
+        name,
         linux.AT.SYMLINK_NOFOLLOW,
         .{ .TYPE = true },
         &stx,
@@ -61,6 +66,14 @@ pub fn kindOf(path: [*:0]const u8) u8 {
         linux.S.IFLNK => Kind.symlink,
         else => linux.DT.REG,
     };
+}
+
+/// True if `relative_path` under `dir_fd` exists (as any entry, including
+/// dangling symlinks), without following symlinks on the final component.
+pub fn existsAtNoFollow(dir_fd: i32, relative_path: [*:0]const u8) bool {
+    var stx: linux.Statx = undefined;
+    const result = linux.statx(dir_fd, relative_path, linux.AT.SYMLINK_NOFOLLOW, .{}, &stx);
+    return linux.errno(result) == .SUCCESS;
 }
 
 /// True for a regular file (not a FIFO, device, socket or directory).

@@ -35,6 +35,10 @@ const strictlyAscending = content_format.strictlyAscending;
 
 const ContentIndex = @This();
 
+/// Max segments cached inline in the struct so `list` never re-reads the
+/// segment directory from a `MAP_PRIVATE` mapping. Matches `segments_max`.
+const segments_inline_max = 64;
+
 bytes: Bytes,
 backing: format.Backing,
 docs_count: usize,
@@ -47,8 +51,10 @@ sources: []const u8,
 flags: []const u8,
 /// The file up to `Header.size_total`: paths are found at their offsets
 /// in it.
-file: []const u8,
+file: BytesConst,
 segments: []const SegmentEntry,
+segments_inline: [segments_inline_max]SegmentEntry = undefined,
+segments_copied: usize = 0,
 /// Documents flagged removed: their ids stay, queries skip them.
 docs_removed_count: usize,
 /// Live documents whose text was extracted (`extractedLive`).
@@ -129,7 +135,10 @@ pub fn deinit(index: *ContentIndex, gpa: std.mem.Allocator) void {
 
 pub fn path(index: *const ContentIndex, doc: u32) []const u8 {
     assert(doc < index.docs_count);
-    return index.file[index.path_offsets[doc]..][0..index.path_sizes[doc]];
+    const offset = index.path_offsets[doc];
+    const size = index.path_sizes[doc];
+    if (@as(u64, offset) + size > index.file.len) return "";
+    return index.file[offset..][0..size];
 }
 
 pub fn removed(index: *const ContentIndex, doc: u32) bool {
@@ -163,7 +172,7 @@ pub fn docIn(index: *const ContentIndex, doc: u32) DocIn {
         .path = index.path(doc),
         .mtime = index.mtimes[doc],
         .size = index.sizes[doc],
-        .source = @fromBackingInt(@intCast(index.sources[doc])),
+        .source = std.enums.fromInt(Source, index.sources[doc]) orelse .plain,
     };
 }
 
@@ -228,7 +237,7 @@ pub fn parse(whole: Bytes, backing: format.Backing) error{BadIndex}!ContentIndex
     if (bytes_live > file.len) return error.BadIndex;
     bytes_live = try addSegments(file, segments, bytes_live);
 
-    return .{
+    var out: ContentIndex = .{
         .bytes = whole,
         .backing = backing,
         .docs_count = docs_count,
@@ -241,10 +250,13 @@ pub fn parse(whole: Bytes, backing: format.Backing) error{BadIndex}!ContentIndex
         .flags = columns.flags,
         .file = file,
         .segments = segments,
+        .segments_copied = @min(segments_count, segments_inline_max),
         .docs_removed_count = columns.docs_removed_count,
         .extracted_live_count = columns.extracted_live_count,
         .bytes_live = bytes_live,
     };
+    @memcpy(out.segments_inline[0..out.segments_copied], segments[0..out.segments_copied]);
+    return out;
 }
 
 /// Writes the index to `path_z` atomically (`sys.writeFileAtomic`): its
@@ -261,15 +273,27 @@ pub fn open(path_z: [:0]const u8) (sys.Error || error{BadIndex})!ContentIndex {
 }
 
 /// Posting list bytes of `key` in segment `segment_index` (empty if
-/// absent).
+/// absent or if bounds are violated by an external write to the mapping).
 fn list(index: *const ContentIndex, segment_index: usize, key: u32) []const u8 {
-    const segment = index.segments[segment_index];
-    // u64 in the file; checked to fit inside it by `checkSegment`.
-    const keys_offset: usize = @intCast(segment.keys_offset);
+    if (segment_index >= index.segments_count) return &.{};
+    const segment = if (segment_index < index.segments_copied)
+        index.segments_inline[segment_index]
+    else
+        index.segments[segment_index];
+    const keys_offset = region(index.file.len, segment.keys_offset, segment.keys_count, 4, 4) catch
+        return &.{};
     const keys_count: usize = @intCast(segment.keys_count);
-    const offsets_offset: usize = @intCast(segment.offsets_offset);
-    const postings_offset: usize = @intCast(segment.postings_offset);
-    const keys = sliceAtConst(u32, index.bytes, keys_offset, keys_count);
+    const offsets_count = std.math.add(u64, segment.keys_count, 1) catch return &.{};
+    const offsets_offset = region(index.file.len, segment.offsets_offset, offsets_count, 4, 4) catch
+        return &.{};
+    const postings_offset = region(
+        index.file.len,
+        segment.postings_offset,
+        segment.postings_size,
+        1,
+        1,
+    ) catch return &.{};
+    const keys = sliceAtConst(u32, index.file, keys_offset, keys_count);
     var low: usize = 0;
     var high: usize = keys.len;
     while (low < high) {
@@ -278,8 +302,12 @@ fn list(index: *const ContentIndex, segment_index: usize, key: u32) []const u8 {
     }
     if (low == keys.len) return &.{};
     if (keys[low] != key) return &.{};
-    const offsets = sliceAtConst(u32, index.bytes, offsets_offset, keys_count + 1);
-    return index.bytes[postings_offset + offsets[low] .. postings_offset + offsets[low + 1]];
+    const offsets = sliceAtConst(u32, index.file, offsets_offset, keys_count + 1);
+    const start = offsets[low];
+    const end = offsets[low + 1];
+    if (start > end or end > segment.postings_size) return &.{};
+    if (@as(u64, postings_offset) + end > index.file.len) return &.{};
+    return index.file[postings_offset + start .. postings_offset + end];
 }
 
 /// Documents containing every trigram of every word, folded (words of 3+
@@ -624,4 +652,35 @@ test "fuzz: parsing arbitrary bytes as a content index never crashes" {
     const seed = try corpusEntry(gpa, index.bytes);
     defer gpa.free(seed);
     try testing.fuzz({}, fuzzParseBytes, .{ .corpus = &.{seed} });
+}
+
+test "post-parse mutations to mmap buffer are rejected safely" {
+    const gpa = testing.allocator;
+    var index = try smallIndex(gpa);
+    defer index.deinit(gpa);
+
+    // Mutate path_offset, path_size, source enum, and posting end offset after parse().
+    const bad = try gpa.alignedAlloc(u8, .@"8", index.bytes.len);
+    defer gpa.free(bad);
+    @memcpy(bad, index.bytes);
+
+    var mutated = try ContentIndex.parse(bad, .heap);
+    // Do not call mutated.deinit(gpa) since bad is freed above; replace backing fields cleanly.
+    const docs_offset = std.mem.readInt(u64, bad[32..40], .little);
+    const docs_count = mutated.docs_count;
+    // Corrupt doc 0 path offset past EOF and doc 1 source to invalid enum 99.
+    std.mem.writeInt(u32, bad[docs_offset + docs_count * 16 ..][0..4], 0xffff_ff00, .little);
+    bad[docs_offset + docs_count * 22 + 1] = 99;
+    // Corrupt posting offset end in segment 0 backwards (start > end).
+    const segment = mutated.segments_inline[0];
+    if (segment.keys_count > 0) {
+        std.mem.writeInt(u32, bad[@intCast(segment.offsets_offset + 4)..][0..4], 0, .little);
+    }
+
+    try testing.expectEqualStrings("", mutated.path(0));
+    try testing.expectEqual(Source.plain, mutated.docIn(1).source);
+    var got: std.ArrayList(u32) = .empty;
+    defer got.deinit(gpa);
+    try mutated.candidates(gpa, &.{"arena"}, &got);
+    mutated.bytes = &.{};
 }

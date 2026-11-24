@@ -89,7 +89,7 @@ pub fn exerciseIndex(index: *const Index, gpa: std.mem.Allocator) !void {
         try testing.expect(strictlyAscending(u32, got.items));
         for (got.items) |doc| {
             try testing.expect(doc < index.docs_count);
-            const source: Source = @fromBackingInt(@intCast(index.sources[doc]));
+            const source = index.docIn(doc).source;
             sum +%= index.path(doc).len +% @as(
                 usize,
                 @bitCast(index.mtimes[doc]),
