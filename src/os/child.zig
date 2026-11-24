@@ -462,6 +462,19 @@ test "children spawned after ignoreSigpipe do not inherit SIG_IGN on SIGPIPE" {
     try testing.expectEqual(@as(u64, 0), sigign & (@as(u64, 1) << 12));
 }
 
+fn procAlive(status_path: [:0]const u8) bool {
+    const fd = os.openRegular(status_path) catch return false;
+    defer os.close(fd);
+    var buf: [512]u8 = undefined;
+    const n = linux.read(fd, &buf, buf.len);
+    if (linux.errno(n) != .SUCCESS or n == 0) return false;
+    const text = buf[0..n];
+    // Killed orphans stay as zombies in containers whose PID 1 does not reap.
+    if (std.mem.find(u8, text, "State:\tZ") != null) return false;
+    if (std.mem.find(u8, text, "State:\tX") != null) return false;
+    return true;
+}
+
 test "timing out kills grandchildren in the child's process group" {
     const argv = &.{ "sh", "-c", "sleep 30 & echo $!; wait" };
     var result = try run(testing.allocator, testing.io, argv, .{ .deadline_ns = deadline(150) });
@@ -472,11 +485,11 @@ test "timing out kills grandchildren in the child's process group" {
     _ = try std.fmt.parseInt(linux.pid_t, pid_text, 10);
 
     var proc_buffer: [64]u8 = undefined;
-    const proc_path = try std.mem.printSentinel(&proc_buffer, "/proc/{s}", .{pid_text}, 0);
-    // Wait briefly for the kernel to reap the killed grandchild.
+    const status_path = try std.mem.printSentinel(&proc_buffer, "/proc/{s}/status", .{pid_text}, 0);
+    // Wait briefly for the kernel to transition the killed grandchild out of live state.
     const wait_deadline = os.monotonicNs() + 500 * std.time.ns_per_ms;
-    while (os.exists(proc_path) and os.monotonicNs() < wait_deadline) {
+    while (procAlive(status_path) and os.monotonicNs() < wait_deadline) {
         os.sleepUs(10_000);
     }
-    try testing.expect(!os.exists(proc_path));
+    try testing.expect(!procAlive(status_path));
 }
