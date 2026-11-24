@@ -50,7 +50,7 @@ pub fn build(b: *std.Build) void {
         .luart = luart,
         .build_options = build_options,
     });
-    const executable = daemonExecutable(b, target, daemon);
+    const executable = daemonExecutable(b, target, optimize, daemon);
     const client = clientModule(b, target, optimize, build_options);
     toolSteps(b, .{
         .target = target,
@@ -284,15 +284,18 @@ fn daemonModule(b: *std.Build, options: struct {
 fn daemonExecutable(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
     daemon: *std.Build.Module,
 ) *std.Build.Step.Compile {
-    // LLD links only the libraries used (--as-needed): Zig's own linker
-    // also records every one pkg-config lists for GTK (vulkan, harfbuzz,
-    // graphene...), which a binary meant for other systems must not ask for.
+    // LLD links only the libraries used (--as-needed) in release builds: Zig's
+    // own linker also records every one pkg-config lists for GTK (vulkan,
+    // harfbuzz, graphene...), which a binary meant for other systems must not
+    // ask for. Zig 0.17's self-hosted Debug backend does not support LLD, so
+    // Debug uses Zig's default linker.
     const executable = b.addExecutable(.{
         .name = "lumen-gtk",
         .root_module = daemon,
-        .use_lld = true,
+        .use_lld = if (optimize != .debug) true else null,
     });
     // Built for an older glibc (a release, -Dtarget=x86_64-linux-gnu.2.36),
     // it links against this machine's GTK, built for a newer one; where it

@@ -56,6 +56,8 @@ pub fn create(host: *Host, id: []const u8, folder: []const u8) ?*Extension {
     extension.budget.cancel = &host.stop;
     // Without it, the extension runs; lumen.storage fails and says so.
     os.mkdirP(extension.data) catch |err| log.warn("{s}: {t}", .{ extension.data, err });
+    // Older versions made it 0755: tighten existing folders too.
+    os.makePrivate(extension.data);
     extension.L = lua.newState(&extension.budget) orelse {
         host.gpa.destroy(extension);
         return null;

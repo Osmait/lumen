@@ -298,8 +298,12 @@ fn readLevelCallback(context: *LevelContext, i: usize) void {
     defer sys.close(fd);
     readDir(context.gpa, fd, folder.path, context.config, batch) catch |err| {
         batch.errors += 1;
-        if (err == error.OutOfMemory) batch.out_of_memory = true;
+        if (err == error.OutOfMemory) {
+            batch.out_of_memory = true;
+            return;
+        }
     };
+    if (batch.out_of_memory) return;
     sortBatch(context.gpa, batch) catch {
         // Unsorted, `Store.findChild` would miss names: nothing at all.
         batch.deinit(context.gpa);
@@ -333,7 +337,11 @@ fn sortBatch(gpa: std.mem.Allocator, batch: *Batch) std.mem.Allocator.Error!void
     defer gpa.free(permutation);
     for (permutation, 0..) |*position, i| position.* = @intCast(i);
     std.mem.sort(u32, permutation, order, Order.lessThan);
-    var sorted: Batch = .{ .errors = batch.errors };
+    var sorted: Batch = .{
+        .errors = batch.errors,
+        .out_of_memory = batch.out_of_memory,
+        .over_cap = batch.over_cap,
+    };
     errdefer sorted.deinit(gpa);
     try sorted.names.ensureTotalCapacity(gpa, batch.names.items.len);
     try sorted.ends.ensureTotalCapacity(gpa, names_count);
@@ -652,4 +660,30 @@ test "scan: one folder over entries_max stops being read at the cap" {
     try testing.expect(stats.truncated);
     // Not the 40 files: the folder stopped at the cap.
     try testing.expect(store.len() <= 1 + 1 + 10);
+}
+
+test "sortBatch preserves errors, out_of_memory, and over_cap" {
+    const gpa = std.testing.allocator;
+    var batch: Batch = .{
+        .errors = 2,
+        .out_of_memory = true,
+        .over_cap = true,
+    };
+    defer batch.deinit(gpa);
+    // Unsorted entries so sortBatch takes the reordering path.
+    try batch.names.appendSlice(gpa, "zeta");
+    try batch.ends.append(gpa, @intCast(batch.names.items.len));
+    try batch.flags.append(gpa, 0);
+    try batch.names.appendSlice(gpa, "alpha");
+    try batch.ends.append(gpa, @intCast(batch.names.items.len));
+    try batch.flags.append(gpa, store_mod.flag_dir);
+
+    try sortBatch(gpa, &batch);
+
+    try std.testing.expectEqual(@as(u64, 2), batch.errors);
+    try std.testing.expect(batch.out_of_memory);
+    try std.testing.expect(batch.over_cap);
+    try std.testing.expectEqual(@as(usize, 2), batch.ends.items.len);
+    try std.testing.expectEqualStrings("alpha", batch.names.items[0..batch.ends.items[0]]);
+    try std.testing.expectEqualStrings("zeta", batch.names.items[batch.ends.items[0]..batch.ends.items[1]]);
 }

@@ -51,6 +51,8 @@
 /* Calls to 'match' between deadline checks (a power of two): each is a few
 ** ns, and a check reads the clock. */
 #define LUART_MATCH_CHECK_STEPS	1024
+/* Bytes scanned in plain search / balance / capture checks between deadline checks. */
+#define LUART_FIND_CHECK_BYTES	65536
 
 /* In src/luart/lua.zig: nonzero once the state's deadline has passed. */
 int luart_match_timed_out (lua_State *L);
@@ -215,7 +217,11 @@ static const char *matchbalance (MatchState *ms, const char *s,
     int b = *p;
     int e = *(p+1);
     int cont = 1;
+    size_t scanned = 0;
     while (++s < ms->src_end) {
+      if (l_unlikely((++scanned & (LUART_MATCH_CHECK_STEPS - 1)) == 0) &&
+          luart_match_timed_out(ms->L))
+        luaL_error(ms->L, "timed out");
       if (*s == e) {
         if (--cont == 0) return s+1;
       }
@@ -229,8 +235,12 @@ static const char *matchbalance (MatchState *ms, const char *s,
 static const char *max_expand (MatchState *ms, const char *s,
                                  const char *p, const char *ep) {
   ptrdiff_t i = 0;  /* counts maximum expand for item */
-  while (singlematch(ms, s + i, p, ep))
+  while (singlematch(ms, s + i, p, ep)) {
     i++;
+    if (l_unlikely(((size_t)i & (LUART_MATCH_CHECK_STEPS - 1)) == 0) &&
+        luart_match_timed_out(ms->L))
+      luaL_error(ms->L, "timed out");
+  }
   /* keeps trying to match with the maximum repetitions */
   while (i>=0) {
     const char *res = match(ms, (s+i), ep+1);
@@ -283,6 +293,8 @@ static const char *match_capture (MatchState *ms, const char *s, int l) {
   size_t len;
   l = check_capture(ms, l);
   len = ms->capture[l].len;
+  if (l_unlikely(len >= LUART_FIND_CHECK_BYTES) && luart_match_timed_out(ms->L))
+    luaL_error(ms->L, "timed out");
   if ((size_t)(ms->src_end-s) >= len &&
       memcmp(ms->capture[l].init, s, len) == 0)
     return s+len;
@@ -398,12 +410,13 @@ static const char *match (MatchState *ms, const char *s, const char *p) {
 
 
 
-static const char *lmemfind (const char *s1, size_t l1,
+static const char *lmemfind (lua_State *L, const char *s1, size_t l1,
                                const char *s2, size_t l2) {
   if (l2 == 0) return s1;  /* empty strings are everywhere */
   else if (l2 > l1) return NULL;  /* avoids a negative 'l1' */
   else {
     const char *init;  /* to search for a '*s2' inside 's1' */
+    size_t work = 0;
     l2--;  /* 1st char will be checked by 'memchr' */
     l1 = l1-l2;  /* 's2' cannot be found after that */
     while (l1 > 0 && (init = (const char *)memchr(s1, *s2, l1)) != NULL) {
@@ -411,8 +424,15 @@ static const char *lmemfind (const char *s1, size_t l1,
       if (memcmp(init, s2+1, l2) == 0)
         return init-1;
       else {  /* correct 'l1' and 's1' to try again */
-        l1 -= init-s1;
+        size_t step = (size_t)(init - s1);
+        l1 -= step;
         s1 = init;
+        work += step + l2;
+        if (l_unlikely(work >= LUART_FIND_CHECK_BYTES)) {
+          work = 0;
+          if (luart_match_timed_out(L))
+            luaL_error(L, "timed out");
+        }
       }
     }
     return NULL;  /* not found */
@@ -510,7 +530,7 @@ static int str_find_aux (lua_State *L, int find) {
   /* explicit request or no special characters? */
   if (find && (lua_toboolean(L, 4) || nospecials(p, lp))) {
     /* do a plain search */
-    const char *s2 = lmemfind(s + init, ls - init, p, lp);
+    const char *s2 = lmemfind(L, s + init, ls - init, p, lp);
     if (s2) {
       lua_pushinteger(L, (s2 - s) + 1);
       lua_pushinteger(L, (s2 - s) + lp);

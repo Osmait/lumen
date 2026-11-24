@@ -50,6 +50,9 @@ pub const Result = struct {
     /// generations: it is the worker's futex word as well (`submit` bumps
     /// it and wakes the worker on it).
     generation: u32,
+    /// `ContentService.indexVersion()` when this result was searched (0 when
+    /// no index was ready yet).
+    index_version: u64 = 0,
     /// When the keystroke that asked for it happened (latency stats).
     start_ns: u64,
     search_ns: u64,
@@ -187,14 +190,15 @@ fn run(content_search: *ContentSearch) void {
         const now_ns = os.monotonicNs();
         var hits: std.ArrayList(index.ContentService.Hit) = .empty;
         if (result.err == null) {
-            content_search.service.searchUntil(
+            result.index_version = content_search.service.searchUntil(
                 arena,
                 result.query,
                 content_search.hits_max,
                 &content_search.newer,
                 &hits,
-            ) catch |err| {
+            ) catch |err| blk: {
                 result.err = err;
+                break :blk 0;
             };
         }
         result.search_ns = os.monotonicNs() - now_ns;

@@ -241,3 +241,44 @@ fn itemShortcut(ui: *Ui, key: KeyPress) bool {
     }
     return false;
 }
+
+/// True when `keyval` is a modifier or lock key alone (Shift, Ctrl, Alt,
+/// Super, Hyper, ISO level/group shifts, Mode_switch, Num_Lock): pressing
+/// the hotkey's modifier to close Lumen must not count as recent typing.
+pub fn isModifierKey(keyval: c_uint) bool {
+    return switch (keyval) {
+        c.GDK_KEY_Shift_L...c.GDK_KEY_Hyper_R,
+        c.GDK_KEY_ISO_Lock...c.GDK_KEY_ISO_Group_Lock,
+        c.GDK_KEY_ISO_Level5_Shift...c.GDK_KEY_ISO_Level5_Lock,
+        c.GDK_KEY_Mode_switch,
+        c.GDK_KEY_Num_Lock,
+        => true,
+        else => false,
+    };
+}
+
+test "modifier keys are excluded from recent typing while normal keys count" {
+    const modifiers = [_]c_uint{
+        c.GDK_KEY_Shift_L,
+        c.GDK_KEY_Control_L,
+        c.GDK_KEY_Alt_L,
+        c.GDK_KEY_Alt_R,
+        c.GDK_KEY_Super_L,
+        c.GDK_KEY_Hyper_R,
+        c.GDK_KEY_ISO_Level3_Shift,
+        c.GDK_KEY_ISO_Level5_Shift,
+        c.GDK_KEY_Mode_switch,
+        c.GDK_KEY_Num_Lock,
+    };
+    for (modifiers) |keyval| try std.testing.expect(isModifierKey(keyval));
+
+    const keys = [_]c_uint{
+        'a',
+        ' ',
+        c.GDK_KEY_Return,
+        c.GDK_KEY_Escape,
+        c.GDK_KEY_BackSpace,
+        c.GDK_KEY_Down,
+    };
+    for (keys) |keyval| try std.testing.expect(!isModifierKey(keyval));
+}

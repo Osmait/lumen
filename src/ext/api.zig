@@ -150,12 +150,33 @@ fn setStringField(L: *lua.State, table: c_int, name: [:0]const u8, value: [:0]co
     lua.c.lua_setfield(L, table, name.ptr);
 }
 
-/// Runs `prelude` with the `lumen` table as its argument.
+/// Runs `prelude` with the `lumen` table and the native `writeStorage` helper.
 fn runPrelude(L: *lua.State) void {
     const loaded = lua.c.luaL_loadbufferx(L, prelude.ptr, prelude.len, "=lumen", "t");
     if (loaded != lua.c.LUA_OK) _ = lua.c.lua_error(L);
     _ = lua.c.lua_getglobal(L, "lumen");
-    lua.c.lua_callk(L, 1, 0, 0, null);
+    lua.c.lua_pushcclosure(L, lua.wrap(writeStorage), 0);
+    lua.c.lua_callk(L, 2, 0, 0, null);
+}
+
+/// Writes `storage.json` atomically (`0600`, `O_EXCL|O_NOFOLLOW`, `fsync` +
+/// `rename`) into `extension.data`. Returns `(true)` or `(false, err)`.
+fn writeStorage(L: *lua.State) lua.Error!c_int {
+    const text = try lua.argString(L, 1, "lumen.storage");
+    const extension = extensionOf(L);
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = std.mem.printSentinel(&path_buffer, "{s}/storage.json", .{extension.data}, 0) catch {
+        lua.c.lua_pushboolean(L, 0);
+        _ = lua.c.lua_pushstring(L, "storage path too long");
+        return 2;
+    };
+    os.writeFileAtomic(path, text) catch |err| {
+        lua.c.lua_pushboolean(L, 0);
+        lua.pushFmt(L, "{t}", .{err});
+        return 2;
+    };
+    lua.c.lua_pushboolean(L, 1);
+    return 1;
 }
 
 /// lumen.extension (it notes the preferences' defaults), lumen.preferences
@@ -164,7 +185,7 @@ fn runPrelude(L: *lua.State) void {
 /// written by Settings. A file that is there but does not read as a JSON
 /// object is never written over: that would lose every value in it.
 const prelude =
-    \\local lumen = ...
+    \\local lumen, write_storage = ...
     \\-- The object in the file: {} when there is none yet, nil and why when
     \\-- it cannot be read as one.
     \\local function read_json(path)
@@ -179,14 +200,6 @@ const prelude =
     \\  local ok, value = pcall(lumen.json.decode, text or "")
     \\  if ok and type(value) == "table" and #value == 0 then return value end
     \\  return nil, path .. " is not a JSON object"
-    \\end
-    \\local function write_file(path, text)
-    \\  local f, err = io.open(path .. ".tmp", "w")
-    \\  if not f then return nil, err end
-    \\  local wrote, werr = f:write(text)
-    \\  local closed, cerr = f:close()
-    \\  if not wrote or not closed then return nil, werr or cerr end
-    \\  return os.rename(path .. ".tmp", path)
     \\end
     \\
     \\local defaults = {}
@@ -239,7 +252,7 @@ const prelude =
     \\  d[key] = value
     \\  local encoded, text = pcall(lumen.json.encode, d)
     \\  local done, err = false, text
-    \\  if encoded then done, err = write_file(lumen.data_dir .. "/storage.json", text) end
+    \\  if encoded then done, err = write_storage(text) end
     \\  if not done then
     \\    d[key] = old
     \\    error("lumen.storage: " .. tostring(err), 3)

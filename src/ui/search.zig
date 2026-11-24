@@ -174,9 +174,25 @@ pub fn answerPending(ui: *Ui, start_ns: u64) bool {
     if (query_text.len < content_query_bytes_min) return false;
     if (!ui.content_query.showingLatest()) return false;
     const latest = ui.content_query.latest.?;
-    if (std.mem.eql(u8, latest.query, ContentSearch.clip(query_text))) return false;
+    if (isContentResultFresh(latest, query_text, contentIndexVersion(ui))) return false;
     ui.content_query.sent(content_search.submit(query_text, start_ns), query_text);
     return true;
+}
+
+/// True when `latest` answers `query_text` against `index_version`: a newer
+/// content index invalidates an earlier answer for the same text (whether it
+/// was empty before the first build or held hits that have since changed).
+pub fn isContentResultFresh(
+    latest: *const ContentSearch.Result,
+    query_text: []const u8,
+    index_version: u64,
+) bool {
+    return latest.index_version == index_version and
+        std.mem.eql(u8, latest.query, ContentSearch.clip(query_text));
+}
+
+fn contentIndexVersion(ui: *const Ui) u64 {
+    return if (ui.contents) |service| service.indexVersion() else 0;
 }
 
 /// Builds the current view's rows for `query_text`.
@@ -218,12 +234,12 @@ fn fillContents(ui: *Ui, arena: std.mem.Allocator, query_text: []const u8, start
         }
         return;
     };
-    // Ask the worker unless the result for this exact query is already
-    // here; meanwhile keep showing the last result. The worker searches the
-    // clipped query: compare with that, or a query longer than the clip
-    // never counts as answered.
+    // Ask the worker unless the result for this exact query and index version
+    // is already here; meanwhile keep showing the last result. The worker
+    // searches the clipped query: compare with that, or a query longer than
+    // the clip never counts as answered.
     const fresh = if (ui.content_query.latest) |latest|
-        std.mem.eql(u8, latest.query, ContentSearch.clip(query_text))
+        isContentResultFresh(latest, query_text, contentIndexVersion(ui))
     else
         false;
     if (fresh) {
@@ -428,4 +444,28 @@ pub fn emptyText(ui: *Ui, arena: std.mem.Allocator) [:0]const u8 {
     if (ui.view == .ext) return ext_view.emptyText(ui, arena, query_text);
     if (ui.view == .dmenu) return dmenu.emptyText(ui);
     return "No Results";
+}
+
+test "content results become stale when the content index version advances" {
+    const testing = std.testing;
+    var result: ContentSearch.Result = .{
+        .generation = 1,
+        .index_version = 0,
+        .start_ns = 0,
+        .search_ns = 0,
+        .query = "alpha",
+        .hits = &.{},
+        .arena = .init(testing.allocator),
+    };
+    defer result.arena.deinit();
+
+    // Empty result searched while index was absent (v0) matches v0, not v1.
+    try testing.expect(isContentResultFresh(&result, "alpha", 0));
+    try testing.expect(!isContentResultFresh(&result, "alpha", 1));
+
+    // Result searched against v1 matches v1, not v2 after an edit/rebuild.
+    result.index_version = 1;
+    try testing.expect(isContentResultFresh(&result, "alpha", 1));
+    try testing.expect(!isContentResultFresh(&result, "alpha", 2));
+    try testing.expect(!isContentResultFresh(&result, "beta", 1));
 }
