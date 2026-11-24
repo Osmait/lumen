@@ -49,6 +49,7 @@ pub fn closeAll(host: *Host) void {
 
 /// Loads every file again into new states, and delivers the new registry.
 pub fn reloadExecute(host: *Host) void {
+    defer host.initial_registry_ready.store(true, .release);
     closeAll(host);
     host.registry_generation = host.registry_generation.next();
     const registry = host.answerCreate(Registry, "reload", .{

@@ -591,6 +591,7 @@ pub fn copy(text: []const u8) void {
 /// `paste_focus_wait_ms`) and wl-copy owns the selection (it exits then).
 /// Sent on the focus alone, a busy machine pasted the previous clipboard.
 pub fn pasteText(text: []const u8) void {
+    os.assertMainThread();
     paste_wait = .{ .generation = paste_wait.generation +% 1 };
     proc.pipeToThen(&.{"wl-copy"}, text, .{
         .callback = &pasteCopied,
@@ -610,6 +611,7 @@ const PasteWait = struct {
 var paste_wait: PasteWait = .{};
 
 fn pasteCopied(generation: usize, ok: bool) void {
+    os.assertMainThread();
     if (generation != paste_wait.generation) return;
     // Not copied: Ctrl+V would paste something else.
     if (!ok) {
@@ -622,6 +624,7 @@ fn pasteCopied(generation: usize, ok: bool) void {
 }
 
 fn pasteFocused() void {
+    os.assertMainThread();
     paste_wait.focused = true;
     if (paste_wait.copied) pasteNow();
 }
@@ -636,6 +639,7 @@ const paste_focus_wait_ms = 120;
 const active_window_answer_bytes_max = 64 * 1024;
 
 fn pasteNow() void {
+    os.assertMainThread();
     paste_wait.copied = false;
     paste_wait.focused = false;
     sendPaste();

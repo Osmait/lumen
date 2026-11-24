@@ -557,8 +557,103 @@ fn badgeIcon(badge: @FieldType(item_mod.Icon, "badge")) *c.GtkWidget {
 
 // -------------------------------------------------------------- helpers
 
-pub fn connect(instance: anytype, signal: [*:0]const u8, handler: anytype, data: ?*anyopaque) void {
-    _ = c.g_signal_connect_data(@ptrCast(instance), signal, @ptrCast(handler), data, null, 0);
+pub fn connect(
+    instance: anytype,
+    comptime signal: [:0]const u8,
+    handler: anytype,
+    data: ?*anyopaque,
+) void {
+    comptime assertSignalHandler(signal, @TypeOf(handler));
+    _ = c.g_signal_connect_data(@ptrCast(instance), signal.ptr, @ptrCast(handler), data, null, 0);
+}
+
+fn assertSignalHandler(comptime signal: [:0]const u8, comptime Handler: type) void {
+    const ptr = @typeInfo(Handler);
+    if (ptr != .pointer or ptr.pointer.size != .one) {
+        @compileError("connect handler must be a function pointer");
+    }
+    const child = @typeInfo(ptr.pointer.child);
+    if (child != .@"fn") @compileError("connect handler must point to a function");
+    const fn_info = child.@"fn";
+    if (!std.meta.eql(fn_info.attrs.@"callconv", std.builtin.CallingConvention.c)) {
+        @compileError("connect handler for signal '" ++ signal ++ "' must use callconv(.c)");
+    }
+    const params = fn_info.param_types;
+    if (params.len < 2) @compileError("connect handler must accept instance and user_data");
+    if (@typeInfo(params[0].?) != .pointer) {
+        @compileError("connect handler first parameter must be a pointer");
+    }
+    if (params[params.len - 1].? != ?*anyopaque) {
+        @compileError("connect handler last parameter must be ?*anyopaque");
+    }
+    const ret = fn_info.return_type.?;
+    if (std.mem.eql(u8, signal, "startup") or
+        std.mem.eql(u8, signal, "shutdown") or
+        std.mem.eql(u8, signal, "changed") or
+        std.mem.eql(u8, signal, "after-paint"))
+    {
+        if (params.len != 2 or ret != void) {
+            @compileError("signal '" ++ signal ++ "' requires fn(instance, ?*anyopaque) void");
+        }
+    } else if (std.mem.eql(u8, signal, "command-line")) {
+        if (params.len != 3 or params[1].? != *c.GApplicationCommandLine or ret != c_int) {
+            @compileError("signal 'command-line' requires fn(instance, *GApplicationCommandLine, ?*anyopaque) c_int");
+        }
+    } else if (std.mem.eql(u8, signal, "row-activated")) {
+        if (params.len != 3 or params[1].? != *c.GtkListBoxRow or ret != void) {
+            @compileError("signal 'row-activated' requires fn(instance, *GtkListBoxRow, ?*anyopaque) void");
+        }
+    } else if (std.mem.eql(u8, signal, "child-activated")) {
+        if (params.len != 3 or params[1].? != *c.GtkFlowBoxChild or ret != void) {
+            @compileError("signal 'child-activated' requires fn(instance, *GtkFlowBoxChild, ?*anyopaque) void");
+        }
+    } else if (std.mem.eql(u8, signal, "pressed") or std.mem.eql(u8, signal, "released")) {
+        if (params.len != 5 or
+            params[1].? != c_int or
+            params[2].? != f64 or
+            params[3].? != f64 or
+            ret != void)
+        {
+            @compileError("signal '" ++ signal ++ "' requires fn(instance, c_int, f64, f64, ?*anyopaque) void");
+        }
+    } else if (std.mem.eql(u8, signal, "key-pressed")) {
+        if (params.len != 5 or
+            params[1].? != c_uint or
+            params[2].? != c_uint or
+            params[3].? != c.GdkModifierType or
+            ret != c.gboolean)
+        {
+            @compileError("signal 'key-pressed' requires fn(instance, c_uint, c_uint, GdkModifierType, ?*anyopaque) gboolean");
+        }
+    } else if (std.mem.eql(u8, signal, "key-released")) {
+        if (params.len != 5 or
+            params[1].? != c_uint or
+            params[2].? != c_uint or
+            params[3].? != c.GdkModifierType or
+            ret != void)
+        {
+            @compileError("signal 'key-released' requires fn(instance, c_uint, c_uint, GdkModifierType, ?*anyopaque) void");
+        }
+    } else if (std.mem.startsWith(u8, signal, "changed::")) {
+        if (params.len != 3 or params[1].? != [*:0]const u8 or ret != void) {
+            @compileError("signal 'changed::*' requires fn(instance, [*:0]const u8, ?*anyopaque) void");
+        }
+    }
+}
+
+test "connect validates handler signatures at comptime" {
+    const dummy_startup = struct {
+        fn cb(_: *c.GtkApplication, _: ?*anyopaque) callconv(.c) void {}
+    }.cb;
+    const dummy_key = struct {
+        fn cb(_: *c.GtkEventControllerKey, _: c_uint, _: c_uint, _: c.GdkModifierType, _: ?*anyopaque) callconv(.c) c.gboolean {
+            return 0;
+        }
+    }.cb;
+    comptime {
+        assertSignalHandler("startup", @TypeOf(&dummy_startup));
+        assertSignalHandler("key-pressed", @TypeOf(&dummy_key));
+    }
 }
 
 pub const hbox = gtk.hbox;

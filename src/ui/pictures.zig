@@ -174,6 +174,7 @@ pub fn requestPicture(
     done: Done,
     context: ?*anyopaque,
 ) void {
+    os.assertMainThread();
     // A size of 0 would make the decoder scale to nothing.
     assert(width_px > 0);
     assert(height_px > 0);
@@ -201,6 +202,7 @@ pub fn requestPicture(
 }
 
 fn startNext() void {
+    os.assertMainThread();
     while (!decoding and waiting.items.len > 0) {
         const request = waiting.orderedRemove(0);
         if (request.generation != request.lane.current()) {
@@ -240,12 +242,28 @@ fn unrefObject(pointer: ?*anyopaque) callconv(.c) void {
 }
 
 fn onDecoded(_: ?*c.GObject, result: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) void {
+    os.assertMainThread();
     const request: *Request = @ptrCast(@alignCast(data.?));
     decoding = false;
     const pixbuf: ?*c.GdkPixbuf = @ptrCast(c.g_task_propagate_pointer(@ptrCast(result), null));
     defer unrefObject(pixbuf);
     finishRequest(request, pixbuf, request.generation == request.lane.current());
     startNext();
+}
+
+/// Drops pending requests and forgets all picture lanes at shutdown so in-flight
+/// worker results are ignored once the UI tears down. Main thread.
+pub fn shutdown() void {
+    os.assertMainThread();
+    preview_lane.forget();
+    grid_lane.forget();
+    icon_lane.forget();
+    while (waiting.items.len > 0) {
+        const request = waiting.orderedRemove(0);
+        finishRequest(request, null, false);
+    }
+    waiting.deinit(std.heap.c_allocator);
+    waiting = .empty;
 }
 
 fn finishRequest(request: *Request, pixbuf: ?*c.GdkPixbuf, current: bool) void {
@@ -310,4 +328,35 @@ test "a picture over the limits is never decoded" {
 
 test {
     _ = image_size;
+}
+
+test "pictures shutdown forgets lanes and drains queued requests" {
+    const Counter = struct {
+        called: usize = 0,
+        last_current: bool = true,
+        fn cb(context: ?*anyopaque, _: ?*c.GdkPixbuf, is_current: bool) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.called += 1;
+            self.last_current = is_current;
+        }
+    };
+    const gpa = std.heap.c_allocator;
+    var counter: Counter = .{};
+    const req = try gpa.create(Request);
+    req.* = .{
+        .path = try gpa.dupeSentinel(u8, "/tmp/nonexistent.png", 0),
+        .width_px = 32,
+        .height_px = 32,
+        .lane = &preview_lane,
+        .generation = preview_lane.current(),
+        .done = &Counter.cb,
+        .context = &counter,
+    };
+    const gen_before = preview_lane.current();
+    try waiting.append(gpa, req);
+    shutdown();
+    try std.testing.expect(preview_lane.current() != gen_before);
+    try std.testing.expectEqual(@as(usize, 0), waiting.items.len);
+    try std.testing.expectEqual(@as(usize, 1), counter.called);
+    try std.testing.expect(!counter.last_current);
 }

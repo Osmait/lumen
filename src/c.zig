@@ -35,7 +35,7 @@ pub const graphene_rect_t = extern struct {
 // copied wrong.
 comptime {
     const std = @import("std");
-    std.debug.assert(@sizeOf(GError) == 16);
+    std.debug.assert(@sizeOf(GError) == 8 + @sizeOf(usize));
     std.debug.assert(@sizeOf(GList) == 3 * @sizeOf(usize));
     std.debug.assert(@sizeOf(GdkRectangle) == 16);
     std.debug.assert(@sizeOf(graphene_rect_t) == 16);
@@ -411,7 +411,7 @@ pub extern fn g_subprocess_newv(
     flags: c_int,
     err: ?*?*GError,
 ) ?*GSubprocess;
-pub extern fn g_subprocess_get_stdin_pipe(subprocess: *GSubprocess) *GOutputStream;
+pub extern fn g_subprocess_get_stdin_pipe(subprocess: *GSubprocess) ?*GOutputStream;
 pub extern fn g_subprocess_communicate_utf8_async(
     subprocess: *GSubprocess,
     stdin: ?[*:0]const u8,
@@ -427,7 +427,7 @@ pub extern fn g_subprocess_communicate_utf8_finish(
     err: ?*?*GError,
 ) gboolean;
 pub extern fn g_subprocess_get_successful(subprocess: *GSubprocess) gboolean;
-pub extern fn g_subprocess_get_stdout_pipe(subprocess: *GSubprocess) *GInputStream;
+pub extern fn g_subprocess_get_stdout_pipe(subprocess: *GSubprocess) ?*GInputStream;
 pub extern fn g_subprocess_force_exit(subprocess: *GSubprocess) void;
 pub const GSubprocessLauncher = opaque {};
 pub extern fn g_subprocess_launcher_new(flags: c_int) *GSubprocessLauncher;
@@ -637,8 +637,9 @@ pub extern fn gtk_widget_add_tick_callback(
     widget: *GtkWidget,
     callback: GtkTickCallback,
     data: ?*anyopaque,
-    notify: ?*const anyopaque,
+    notify: ?GDestroyNotify,
 ) c_uint;
+pub extern fn gtk_widget_remove_tick_callback(widget: *GtkWidget, id: c_uint) void;
 
 pub extern fn gtk_box_new(orientation: c_int, spacing: c_int) *GtkWidget;
 pub extern fn gtk_box_append(box: *GtkBox, child: *GtkWidget) void;
@@ -827,7 +828,7 @@ pub extern fn g_idle_add_full(
     priority: c_int,
     function: GSourceFunc,
     data: ?*anyopaque,
-    notify: ?*const anyopaque,
+    notify: ?GDestroyNotify,
 ) c_uint;
 pub const GTask = opaque {};
 pub const GTaskThreadFunc = *const fn (
@@ -845,13 +846,13 @@ pub extern fn g_task_new(
 pub extern fn g_task_set_task_data(
     task: *GTask,
     data: ?*anyopaque,
-    destroy: ?*const fn (?*anyopaque) callconv(.c) void,
+    destroy: ?GDestroyNotify,
 ) void;
 pub extern fn g_task_run_in_thread(task: *GTask, function: GTaskThreadFunc) void;
 pub extern fn g_task_return_pointer(
     task: *GTask,
     result: ?*anyopaque,
-    destroy: ?*const fn (?*anyopaque) callconv(.c) void,
+    destroy: ?GDestroyNotify,
 ) void;
 pub extern fn g_task_propagate_pointer(task: *GTask, err: ?*?*GError) ?*anyopaque;
 pub extern fn gdk_texture_new_from_filename(path: [*:0]const u8, err: ?*?*GError) ?*GdkTexture;
@@ -862,7 +863,7 @@ pub extern fn gtk_picture_set_paintable(picture: *GtkPicture, paintable: ?*anyop
 pub extern fn g_memory_input_stream_new_from_data(
     data: ?*const anyopaque,
     length: isize,
-    destroy: ?*const fn (?*anyopaque) callconv(.c) void,
+    destroy: ?GDestroyNotify,
 ) *GInputStream;
 pub extern fn gdk_pixbuf_new_from_stream_at_scale(
     stream: *GInputStream,

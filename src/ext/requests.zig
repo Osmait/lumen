@@ -79,15 +79,38 @@ pub const Kept = struct {
     list_generation: RequestGeneration,
 };
 
-/// Requests the worker has not taken yet. A newer request of a kind
-/// replaces one not started.
+/// Bounded FIFO capacity for explicit user-initiated Lua actions / form submits.
+pub const operations_queue_max = 16;
+
+pub const Operation = union(enum) {
+    act: ActRequest,
+    /// Owned: freed once it ran, or when destroyed on shutdown.
+    submit: *SubmitRequest,
+};
+
+/// Requests the worker has not taken yet. A newer search/reload replaces an
+/// unstarted one, while explicit actions and form submits queue FIFO.
 pub const Pending = struct {
     reload: bool = false,
     list: ?ListRequest = null,
     root_search: ?RootSearchRequest = null,
-    act: ?ActRequest = null,
-    /// Owned: freed once it ran, or by the submit that replaces it.
-    submit: ?*SubmitRequest = null,
+    operations: [operations_queue_max]Operation = undefined,
+    operations_len: usize = 0,
+
+    pub fn pushOperation(pending: *Pending, operation: Operation) bool {
+        if (pending.operations_len >= operations_queue_max) return false;
+        pending.operations[pending.operations_len] = operation;
+        pending.operations_len += 1;
+        return true;
+    }
+
+    pub fn destroyOperations(pending: *Pending, gpa: std.mem.Allocator) void {
+        for (pending.operations[0..pending.operations_len]) |op| switch (op) {
+            .act => {},
+            .submit => |request| request.destroy(gpa),
+        };
+        pending.operations_len = 0;
+    }
 };
 
 pub const ListRequest = struct {

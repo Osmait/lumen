@@ -21,11 +21,19 @@ pub const Error = error{ DbOpen, DbExec, DbPrepare, DbBind, DbStep };
 /// before it fails with SQLITE_BUSY.
 const busy_timeout_ms = 2000;
 
+pub const OpenOptions = struct {
+    busy_timeout_ms: c_int = busy_timeout_ms,
+};
+
 /// SQLite's name for a database that lives in memory only (the tests').
 /// It has no file to make private.
 pub const in_memory = ":memory:";
 
 pub fn open(path: [:0]const u8) Error!Db {
+    return openWith(path, .{});
+}
+
+pub fn openWith(path: [:0]const u8, options: OpenOptions) Error!Db {
     if (!std.mem.eql(u8, path, in_memory)) try makePrivate(path);
     var handle: ?*c.sqlite3 = null;
     if (c.sqlite3_open(path.ptr, &handle) != c.SQLITE_OK) {
@@ -39,7 +47,7 @@ pub fn open(path: [:0]const u8) Error!Db {
     }
     var db: Db = .{ .handle = handle.? };
     errdefer db.close();
-    if (c.sqlite3_busy_timeout(db.handle, busy_timeout_ms) != c.SQLITE_OK) {
+    if (c.sqlite3_busy_timeout(db.handle, options.busy_timeout_ms) != c.SQLITE_OK) {
         log.warn("busy timeout: {s}", .{c.sqlite3_errmsg(db.handle)});
         return error.DbOpen;
     }
@@ -839,4 +847,9 @@ test "legacy database migrates frecency score and clipboard autoincrement+seq" {
     clips = try db.recentClips(arena.allocator(), 10);
     try std.testing.expectEqual(@as(usize, 1), clips.len);
     try std.testing.expect(clips[0].id.rowid() > 2);
+}
+
+test "openWith supports shorter UI busy timeout" {
+    var db = try Db.openWith(in_memory, .{ .busy_timeout_ms = 50 });
+    db.close();
 }

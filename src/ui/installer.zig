@@ -117,6 +117,58 @@ const job_timeout_s = 600;
 /// Main thread only. Two installs of one name at once had the second's
 /// failure delete the first's clone.
 var busy: std.ArrayList([]u8) = .empty;
+var active_jobs: std.ArrayList(*Job) = .empty;
+var active_removals: std.ArrayList(*Removal) = .empty;
+var shutting_down = false;
+
+/// Stops all active installer subprocesses, timers, and removals on shutdown
+/// and frees installer tracking state. Main thread.
+pub fn shutdown() void {
+    os.assertMainThread();
+    shutting_down = true;
+    for (active_jobs.items) |job| {
+        if (job.timer != 0) {
+            _ = c.g_source_remove(job.timer);
+            job.timer = 0;
+        }
+        c.g_cancellable_cancel(job.cancellable);
+        c.g_subprocess_force_exit(job.subprocess);
+        if (job.caller) |command_line| {
+            c.g_application_command_line_set_exit_status(command_line, 1);
+            c.g_object_unref(command_line);
+            job.caller = null;
+        }
+    }
+    for (active_removals.items) |removal| {
+        c.g_cancellable_cancel(removal.cancellable);
+        if (removal.subprocess) |sub| c.g_subprocess_force_exit(sub);
+    }
+    for (busy.items) |held| std.heap.c_allocator.free(held);
+    busy.deinit(std.heap.c_allocator);
+    busy = .empty;
+    active_jobs.deinit(std.heap.c_allocator);
+    active_jobs = .empty;
+    active_removals.deinit(std.heap.c_allocator);
+    active_removals = .empty;
+}
+
+fn untrackJob(job: *Job) void {
+    for (active_jobs.items, 0..) |tracked, i| {
+        if (tracked == job) {
+            _ = active_jobs.swapRemove(i);
+            return;
+        }
+    }
+}
+
+fn untrackRemoval(removal: *Removal) void {
+    for (active_removals.items, 0..) |tracked, i| {
+        if (tracked == removal) {
+            _ = active_removals.swapRemove(i);
+            return;
+        }
+    }
+}
 
 /// Whether a job works on `folder`, on a folder in it, or on one it is in
 /// (the update of every extension against any other job).
@@ -289,11 +341,51 @@ pub fn install(
         const left = "{s} is left from an install that stopped: remove it, then install again";
         return fail(ui, caller, left, .{installing});
     }
-    // "--": a URL starting with "-" is not an option.
-    var argv = [_:null]?[*:0]const u8{
-        "git", "clone", "--depth", "1", "--", url_z.ptr, installing.ptr,
+    var clone_buf: [20]?[*:0]const u8 = undefined;
+    const argv = gitCloneArgv(&clone_buf, url_z.ptr, installing.ptr, Ui.testMode());
+    start(ui, caller, .install, name, folder, installing, argv);
+}
+
+fn gitCloneArgv(
+    out: *[20]?[*:0]const u8,
+    url: [*:0]const u8,
+    dest: [*:0]const u8,
+    allow_file: bool,
+) [*:null]?[*:0]const u8 {
+    var i: usize = 0;
+    const base = [_][*:0]const u8{
+        "git",
+        "-c",
+        "protocol.allow=never",
+        "-c",
+        "protocol.https.allow=always",
+        "-c",
+        "protocol.ssh.allow=always",
     };
-    start(ui, caller, .install, name, folder, installing, &argv);
+    for (base) |arg| {
+        out[i] = arg;
+        i += 1;
+    }
+    if (allow_file) {
+        out[i] = "-c";
+        out[i + 1] = "protocol.file.allow=always";
+        i += 2;
+    }
+    const tail_args = [_][*:0]const u8{
+        "clone",
+        "--depth",
+        "1",
+        "--no-recurse-submodules",
+        "--",
+        url,
+        dest,
+    };
+    for (tail_args) |arg| {
+        out[i] = arg;
+        i += 1;
+    }
+    out[i] = null;
+    return @ptrCast(out.ptr);
 }
 
 /// Single-extension update script: refuses to walk up into a parent git
@@ -305,7 +397,13 @@ const update_one_script =
     \\  printf '%s is not a git repository\n' "$2"
     \\  exit 1
     \\fi
-    \\exec git -C "$1" pull --ff-only
+    \\file_allow=${3:-never}
+    \\before=$(git -C "$1" rev-parse HEAD 2>/dev/null || true)
+    \\git -C "$1" -c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always -c "protocol.file.allow=$file_allow" -c submodule.recurse=false pull --ff-only || exit 1
+    \\after=$(git -C "$1" rev-parse HEAD 2>/dev/null || true)
+    \\if [ -n "$before" ] && [ -n "$after" ] && [ "$before" != "$after" ]; then
+    \\  git -C "$1" log --oneline --no-decorate -n 20 "$before..$after" 2>/dev/null || true
+    \\fi
 ;
 
 fn hasGitMarker(folder: []const u8) bool {
@@ -314,8 +412,161 @@ fn hasGitMarker(folder: []const u8) bool {
     return os.info(marker) != null;
 }
 
+/// Reads the commit SHA pointed to by HEAD in git repository/worktree `folder`.
+fn gitHeadSha(folder: []const u8, out: *[64]u8) ?[]const u8 {
+    var path_buf: [path_bytes_max + 64]u8 = undefined;
+    var dotgit_buf: [path_bytes_max + 16]u8 = undefined;
+    var gitdir_buf: [path_bytes_max]u8 = undefined;
+    var common_buf: [path_bytes_max]u8 = undefined;
+    const dotgit_path = std.mem.printSentinel(&dotgit_buf, "{s}/.git", .{folder}, 0) catch return null;
+    var gitdir: []const u8 = dotgit_path;
+    if (os.isRegular(dotgit_path)) {
+        var buf: [path_bytes_max]u8 = undefined;
+        const text = os.readHead(dotgit_path, &buf);
+        const trimmed = std.mem.trim(u8, text, "\r\n \t");
+        if (!std.mem.startsWith(u8, trimmed, "gitdir:")) return null;
+        const target = std.mem.trim(u8, trimmed["gitdir:".len..], " \t");
+        gitdir = if (std.mem.startsWith(u8, target, "/"))
+            std.mem.print(&gitdir_buf, "{s}", .{target}) catch return null
+        else
+            std.mem.print(&gitdir_buf, "{s}/{s}", .{ folder, target }) catch return null;
+    }
+    var commondir: []const u8 = gitdir;
+    const commondir_file = std.mem.printSentinel(&path_buf, "{s}/commondir", .{gitdir}, 0) catch return null;
+    if (os.isRegular(commondir_file)) {
+        var cbuf: [path_bytes_max]u8 = undefined;
+        const rel = std.mem.trim(u8, os.readHead(commondir_file, &cbuf), "\r\n \t");
+        if (rel.len > 0) {
+            commondir = if (std.mem.startsWith(u8, rel, "/"))
+                std.mem.print(&common_buf, "{s}", .{rel}) catch return null
+            else
+                std.mem.print(&common_buf, "{s}/{s}", .{ gitdir, rel }) catch return null;
+        }
+    }
+    const head_path = std.mem.printSentinel(&path_buf, "{s}/HEAD", .{gitdir}, 0) catch return null;
+    var head_buf: [512]u8 = undefined;
+    const head = std.mem.trim(u8, os.readHead(head_path, &head_buf), "\r\n \t");
+    if (head.len == 0) return null;
+    if (std.mem.startsWith(u8, head, "ref:")) {
+        const ref = std.mem.trim(u8, head["ref:".len..], " \t");
+        for ([_][]const u8{ gitdir, commondir }) |base| {
+            const ref_path = std.mem.printSentinel(&path_buf, "{s}/{s}", .{ base, ref }, 0) catch continue;
+            var sha_buf: [128]u8 = undefined;
+            const direct = std.mem.trim(u8, os.readHead(ref_path, &sha_buf), "\r\n \t");
+            if (direct.len >= 40 and direct.len <= out.len) {
+                @memcpy(out[0..direct.len], direct);
+                return out[0..direct.len];
+            }
+            const packed_path = std.mem.printSentinel(&path_buf, "{s}/packed-refs", .{base}, 0) catch continue;
+            if (os.openRegular(packed_path)) |fd| {
+                defer os.close(fd);
+                var contents: std.ArrayList(u8) = .empty;
+                defer contents.deinit(std.heap.c_allocator);
+                os.readUpTo(std.heap.c_allocator, fd, &contents, 1 << 20) catch continue;
+                var lines = std.mem.splitScalar(u8, contents.items, '\n');
+                while (lines.next()) |line| {
+                    const clean = std.mem.trim(u8, line, "\r \t");
+                    if (clean.len == 0 or clean[0] == '#' or clean[0] == '^') continue;
+                    const sp = std.mem.findScalar(u8, clean, ' ') orelse continue;
+                    if (std.mem.eql(u8, clean[sp + 1 ..], ref) and sp >= 40 and sp <= out.len) {
+                        @memcpy(out[0..sp], clean[0..sp]);
+                        return out[0..sp];
+                    }
+                }
+            } else |_| {}
+        }
+        return null;
+    }
+    if (head.len < 40 or head.len > out.len) return null;
+    @memcpy(out[0..head.len], head);
+    return out[0..head.len];
+}
+
+fn lockPath(config_dir: []const u8, buf: *[path_bytes_max]u8) ?[:0]const u8 {
+    return std.mem.printSentinel(buf, "{s}/extensions/lumen.lock", .{config_dir}, 0) catch null;
+}
+
+fn updateLockFile(
+    gpa: std.mem.Allocator,
+    config_dir: []const u8,
+    ext_name: []const u8,
+    sha: ?[]const u8,
+) void {
+    var path_buf: [path_bytes_max]u8 = undefined;
+    const path = lockPath(config_dir, &path_buf) orelse return;
+    var existing: std.ArrayList(u8) = .empty;
+    defer existing.deinit(gpa);
+    if (os.openRegular(path)) |fd| {
+        defer os.close(fd);
+        os.readUpTo(gpa, fd, &existing, 1 << 20) catch {};
+    } else |_| {}
+
+    const Entry = struct { name: []const u8, sha: []const u8 };
+    var entries: std.ArrayList(Entry) = .empty;
+    defer entries.deinit(gpa);
+    var replaced = false;
+    var lines = std.mem.splitScalar(u8, existing.items, '\n');
+    while (lines.next()) |line| {
+        const clean = std.mem.trim(u8, line, "\r \t");
+        if (clean.len == 0) continue;
+        const sp = std.mem.findScalar(u8, clean, ' ') orelse continue;
+        const k = clean[0..sp];
+        const v = std.mem.trim(u8, clean[sp + 1 ..], " \t");
+        if (std.mem.eql(u8, k, ext_name)) {
+            replaced = true;
+            if (sha) |new_sha| entries.append(gpa, .{ .name = ext_name, .sha = new_sha }) catch {};
+        } else {
+            entries.append(gpa, .{ .name = k, .sha = v }) catch {};
+        }
+    }
+    if (!replaced) {
+        if (sha) |new_sha| entries.append(gpa, .{ .name = ext_name, .sha = new_sha }) catch {};
+    }
+    std.mem.sort(Entry, entries.items, {}, struct {
+        fn lessThan(_: void, a: Entry, b: Entry) bool {
+            return std.mem.lessThan(u8, a.name, b.name);
+        }
+    }.lessThan);
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    for (entries.items) |entry| {
+        out.appendSlice(gpa, entry.name) catch return;
+        out.append(gpa, ' ') catch return;
+        out.appendSlice(gpa, entry.sha) catch return;
+        out.append(gpa, '\n') catch return;
+    }
+    os.writeFileAtomic(path, out.items) catch |err| {
+        log.warn("writing {s}: {t}", .{ path, err });
+    };
+}
+
+fn recordAllLocks(gpa: std.mem.Allocator, config_dir: []const u8) void {
+    var ext_dir_buf: [path_bytes_max]u8 = undefined;
+    const ext_dir = std.mem.printSentinel(
+        &ext_dir_buf,
+        "{s}/extensions",
+        .{config_dir},
+        0,
+    ) catch return;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    for (os.subdirs(arena.allocator(), ext_dir, Host.validId)) |name| {
+        var folder_buf: [path_bytes_max]u8 = undefined;
+        const folder = std.mem.printSentinel(
+            &folder_buf,
+            "{s}/{s}",
+            .{ ext_dir, name },
+            0,
+        ) catch continue;
+        if (!hasGitMarker(folder)) continue;
+        var sha_buf: [64]u8 = undefined;
+        if (gitHeadSha(folder, &sha_buf)) |sha| updateLockFile(gpa, config_dir, name, sha);
+    }
+}
+
 pub fn update(ui: *Ui, caller: ?*c.GApplicationCommandLine, name: ?[]const u8) void {
     var folder_bytes: [path_bytes_max]u8 = undefined;
+    const file_allow: [*:0]const u8 = if (Ui.testMode()) "always" else "never";
     if (name) |extension_name| {
         if (!Host.validId(extension_name)) {
             return fail(ui, caller, "no extension named \"{s}\"", .{extension_name});
@@ -340,6 +591,7 @@ pub fn update(ui: *Ui, caller: ?*c.GApplicationCommandLine, name: ?[]const u8) v
             "lumen-update",
             folder.ptr,
             name_z.ptr,
+            file_allow,
         };
         return start(ui, caller, .update, extension_name, folder, folder, &argv);
     }
@@ -353,17 +605,19 @@ pub fn update(ui: *Ui, caller: ?*c.GApplicationCommandLine, name: ?[]const u8) v
     var argv = [_:null]?[*:0]const u8{
         "sh",           "-c",
         \\cd "$1" || exit 1
+        \\file_allow=${2:-never}
         \\status=0
         \\for d in */; do
         \\  [ -e "$d.git" ] || continue
         \\  [ "$(git -C "$d" rev-parse --show-toplevel 2>/dev/null)" = "$(cd "$d" && pwd -P)" ] || continue
         \\  printf '%s: ' "${d%/}"
         \\  before=$(git -C "$d" rev-parse HEAD 2>/dev/null)
-        \\  if git -C "$d" pull --ff-only --quiet; then
-        \\    if [ "$(git -C "$d" rev-parse HEAD 2>/dev/null)" = "$before" ]; then
+        \\  if git -C "$d" -c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always -c "protocol.file.allow=$file_allow" -c submodule.recurse=false pull --ff-only --quiet; then
+        \\    after=$(git -C "$d" rev-parse HEAD 2>/dev/null)
+        \\    if [ "$after" = "$before" ]; then
         \\      echo up to date
         \\    else
-        \\      echo updated
+        \\      echo "updated (${before%"${before#???????}"}..${after%"${after#???????}"})"
         \\    fi
         \\  else
         \\    status=1
@@ -372,6 +626,7 @@ pub fn update(ui: *Ui, caller: ?*c.GApplicationCommandLine, name: ?[]const u8) v
         \\exit $status
         ,
         "lumen-update", folder.ptr,
+        file_allow,
     };
     start(ui, caller, .update, "", folder, folder, &argv);
 }
@@ -436,6 +691,7 @@ fn start(
     std.debug.assert(work.len <= @TypeOf(job.work).capacity);
     job.folder.set(folder);
     job.work.set(work);
+    active_jobs.append(std.heap.c_allocator, job) catch {};
     job.timer = c.g_timeout_add_seconds(job_timeout_s, &onTimeout, job);
     // Read as bytes, chunk by chunk, keeping only the end: git prints file
     // names and messages in any encoding, and how much it prints has no
@@ -444,7 +700,10 @@ fn start(
 }
 
 fn readOutput(job: *Job) void {
-    const stdout = c.g_subprocess_get_stdout_pipe(job.subprocess);
+    const stdout = c.g_subprocess_get_stdout_pipe(job.subprocess) orelse {
+        c.g_subprocess_wait_async(job.subprocess, job.cancellable, &onDone, job);
+        return;
+    };
     c.g_input_stream_read_async(
         stdout,
         &job.chunk,
@@ -461,6 +720,7 @@ fn readOutput(job: *Job) void {
 fn onTimeout(data: ?*anyopaque) callconv(.c) c.gboolean {
     const job: *Job = @ptrCast(@alignCast(data.?));
     job.timer = 0;
+    if (shutting_down) return 0;
     job.timed_out = true;
     c.g_subprocess_force_exit(job.subprocess);
     c.g_cancellable_cancel(job.cancellable);
@@ -470,18 +730,27 @@ fn onTimeout(data: ?*anyopaque) callconv(.c) c.gboolean {
 fn onOutput(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) void {
     const job: *Job = @ptrCast(@alignCast(data.?));
     var err: ?*c.GError = null;
-    const stdout = c.g_subprocess_get_stdout_pipe(job.subprocess);
-    const bytes_read = c.g_input_stream_read_finish(stdout, async_result, &err);
-    if (bytes_read > 0) {
-        job.keepOutput(job.chunk[0..@intCast(bytes_read)]);
-        return readOutput(job);
+    if (c.g_subprocess_get_stdout_pipe(job.subprocess)) |stdout| {
+        const bytes_read = c.g_input_stream_read_finish(stdout, async_result, &err);
+        if (bytes_read > 0 and !shutting_down) {
+            job.keepOutput(job.chunk[0..@intCast(bytes_read)]);
+            return readOutput(job);
+        }
+        // The end of the output, or a read that failed: the exit decides. A
+        // failed read closes the pipe, or a program still writing would block
+        // on it and never exit.
+        if (err != null or shutting_down) _ = c.g_input_stream_close(stdout, null, null);
+        proc.warnError(.install, err, "reading {s}'s output", .{@tagName(job.kind)});
     }
-    // The end of the output, or a read that failed: the exit decides. A
-    // failed read closes the pipe, or a program still writing would block
-    // on it and never exit.
-    if (err != null) _ = c.g_input_stream_close(stdout, null, null);
-    proc.warnError(.install, err, "reading {s}'s output", .{@tagName(job.kind)});
-    c.g_subprocess_wait_async(job.subprocess, null, &onDone, job);
+    if (shutting_down) {
+        if (job.timer != 0) _ = c.g_source_remove(job.timer);
+        c.g_object_unref(job.cancellable);
+        c.g_object_unref(job.subprocess);
+        if (job.caller) |command_line| c.g_object_unref(command_line);
+        job.ui.gpa.destroy(job);
+        return;
+    }
+    c.g_subprocess_wait_async(job.subprocess, job.cancellable, &onDone, job);
 }
 
 /// What the job printed, as UTF-8 (U+FFFD for what is not, NUL included):
@@ -500,9 +769,10 @@ fn onDone(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
     // Unless the removal of a failed clone has it now (`removeTreeThenReload`).
     var busy_handed_over = false;
     defer {
+        if (!shutting_down) untrackJob(job);
         if (job.timer != 0) _ = c.g_source_remove(job.timer);
         c.g_object_unref(job.cancellable);
-        if (!busy_handed_over) unmarkBusy(job.folderPath());
+        if (!shutting_down and !busy_handed_over) unmarkBusy(job.folderPath());
         c.g_object_unref(job.subprocess);
         // The caller's `lumen --install` returns once this is released.
         if (caller) |command_line| c.g_object_unref(command_line);
@@ -511,6 +781,7 @@ fn onDone(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
     var err: ?*c.GError = null;
     const ran = c.g_subprocess_wait_finish(job.subprocess, async_result, &err) != 0;
     defer if (err) |gerror| c.g_error_free(gerror);
+    if (shutting_down) return;
     const output = outputText(job);
     defer c.g_free(output.ptr);
     const succeeded = !job.timed_out and ran and err == null and
@@ -547,16 +818,16 @@ fn reportSuccess(job: *Job, output: [:0]const u8) bool {
     const caller = job.caller;
     switch (job.kind) {
         .install => {
-            var init_path_bytes: [path_bytes_max + init_lua.len]u8 = undefined;
+            var init_path_bytes: [path_bytes_max + init_lua.len + 1]u8 = undefined;
             const init_path = std.mem.printSentinel(
                 &init_path_bytes,
                 "{s}" ++ init_lua,
                 .{job.workPath()},
                 0,
             ) catch {
-                // Not known to be missing: the clone stays where it is.
+                removeTreeThenReload(ui, job.workPath(), job.folderPath());
                 fail(ui, caller, "{s}: path too long to check its init.lua", .{job.workPath()});
-                return false;
+                return true;
             };
             if (os.info(init_path) == null) {
                 removeTreeThenReload(ui, job.workPath(), job.folderPath());
@@ -574,6 +845,10 @@ fn reportSuccess(job: *Job, output: [:0]const u8) bool {
                 );
                 return true;
             };
+            var sha_buf: [64]u8 = undefined;
+            if (gitHeadSha(job.folderPath(), &sha_buf)) |sha| {
+                updateLockFile(ui.gpa, ui.config_dir, job.nameSlice(), sha);
+            }
             print(
                 ui,
                 caller,
@@ -581,20 +856,33 @@ fn reportSuccess(job: *Job, output: [:0]const u8) bool {
                 .{ job.nameSlice(), job.folderPath() },
             );
         },
-        .update => if (caller != null) {
-            const end = tail(if (output.len > 0) output else "Up to date\n", print_bytes_max - 8);
-            print(ui, caller, "{s}{s}", .{ end[0], end[1] });
-        } else {
-            // git's own lines are too long for a row: a summary shows instead.
-            note(
-                ui,
-                if (anyUpdated(
-                    job.nameSlice().len == 0,
-                    output,
-                )) "Updated" else "Already up to date",
-            );
+        .update => {
+            if (job.nameSlice().len > 0) {
+                var sha_buf: [64]u8 = undefined;
+                if (gitHeadSha(job.folderPath(), &sha_buf)) |sha| {
+                    updateLockFile(ui.gpa, ui.config_dir, job.nameSlice(), sha);
+                }
+            } else {
+                recordAllLocks(ui.gpa, ui.config_dir);
+            }
+            if (caller != null) {
+                const end = tail(if (output.len > 0) output else "Up to date\n", print_bytes_max - 8);
+                print(ui, caller, "{s}{s}", .{ end[0], end[1] });
+            } else {
+                // git's own lines are too long for a row: a summary shows instead.
+                note(
+                    ui,
+                    if (anyUpdated(
+                        job.nameSlice().len == 0,
+                        output,
+                    )) "Updated" else "Already up to date",
+                );
+            }
         },
-        .uninstall => print(ui, caller, "Removed {s}\n", .{job.nameSlice()}),
+        .uninstall => {
+            updateLockFile(ui.gpa, ui.config_dir, job.nameSlice(), null);
+            print(ui, caller, "Removed {s}\n", .{job.nameSlice()});
+        },
     }
     ext_view.reload(ui);
     if (caller) |command_line| c.g_application_command_line_set_exit_status(command_line, 0);
@@ -612,7 +900,7 @@ fn reportSuccess(job: *Job, output: [:0]const u8) bool {
 /// Whether an update changed anything: a line "NAME: updated" from the
 /// update of every extension (`all`), or git's own output for one.
 fn anyUpdated(all: bool, output: []const u8) bool {
-    if (all) return std.mem.find(u8, output, ": updated\n") != null;
+    if (all) return std.mem.find(u8, output, ": updated") != null;
     return output.len > 0 and std.mem.find(u8, output, "Already up to date") == null;
 }
 
@@ -643,7 +931,7 @@ fn removeTreeThenReload(ui: *Ui, folder: [:0]const u8, busy_folder: []const u8) 
         unmarkBusy(busy_folder);
         return ext_view.reload(ui);
     };
-    removal.* = .{ .ui = ui };
+    removal.* = .{ .ui = ui, .cancellable = c.g_cancellable_new() };
     removal.busy_folder.set(busy_folder);
     var argv = [_:null]?[*:0]const u8{ "rm", "-rf", "--", folder.ptr };
     var err: ?*c.GError = null;
@@ -655,16 +943,24 @@ fn removeTreeThenReload(ui: *Ui, folder: [:0]const u8, busy_folder: []const u8) 
         proc.warnError(.install, err, "rm {s}", .{folder});
         return removal.finish();
     };
-    c.g_subprocess_wait_check_async(subprocess, null, &onRemoved, removal);
+    removal.subprocess = subprocess;
+    active_removals.append(std.heap.c_allocator, removal) catch {};
+    c.g_subprocess_wait_check_async(subprocess, removal.cancellable, &onRemoved, removal);
 }
 
 const Removal = struct {
     ui: *Ui,
+    cancellable: *c.GCancellable,
+    subprocess: ?*c.GSubprocess = null,
     busy_folder: core.FixedStr(std.Io.Dir.max_path_bytes) = .{},
 
     fn finish(removal: *Removal) void {
-        unmarkBusy(removal.busy_folder.slice());
-        ext_view.reload(removal.ui);
+        if (!shutting_down) {
+            untrackRemoval(removal);
+            unmarkBusy(removal.busy_folder.slice());
+            ext_view.reload(removal.ui);
+        }
+        c.g_object_unref(removal.cancellable);
         std.heap.c_allocator.destroy(removal);
     }
 };
@@ -679,7 +975,7 @@ fn onRemoved(
     defer c.g_object_unref(subprocess);
     var err: ?*c.GError = null;
     if (c.g_subprocess_wait_check_finish(subprocess, async_result, &err) == 0) {
-        proc.warnError(.install, err, "rm", .{});
+        if (!shutting_down) proc.warnError(.install, err, "rm", .{}) else if (err) |e| c.g_error_free(e);
     }
     removal.finish();
 }
@@ -848,13 +1144,70 @@ test "updating a manual folder inside a parent git repo leaves the parent intact
     defer gpa.free(parent_head_after);
     try testing.expectEqualStrings(parent_head_before, parent_head_after);
 
-    // 2. Updating a valid git worktree must succeed and fast-forward to c2!
+    // 2. Updating a valid git worktree must succeed when file:// is allowed in test mode.
     var wt_res = try os.child.run(gpa, io, &.{
-        "sh", "-c", update_one_script, "lumen-update", wt, "worktree",
+        "sh", "-c", update_one_script, "lumen-update", wt, "worktree", "always",
     }, .{ .deadline_ns = deadline_ns });
     defer wt_res.deinit(gpa);
     try testing.expectEqual(@as(?u8, 0), wt_res.code);
     const wt_head_after = try runGit(gpa, io, deadline_ns, &.{ "git", "-C", wt, "rev-parse", "HEAD" });
     defer gpa.free(wt_head_after);
     try testing.expectEqualStrings(seed_head, wt_head_after);
+
+    // 3. Updating via file:// must fail when file:// protocol is restricted.
+    var blocked_res = try os.child.run(gpa, io, &.{
+        "sh", "-c", update_one_script, "lumen-update", wt, "worktree", "never",
+    }, .{ .deadline_ns = deadline_ns });
+    defer blocked_res.deinit(gpa);
+    try testing.expect(blocked_res.code != 0);
+
+    // 4. gitHeadSha + lockfile record/remove work on both normal repos and worktrees.
+    var sha_buf: [64]u8 = undefined;
+    const wt_sha = gitHeadSha(wt, &sha_buf).?;
+    const expected_sha = std.mem.trim(u8, seed_head, "\r\n ");
+    try testing.expectEqualStrings(expected_sha, wt_sha);
+    const parent_sha = gitHeadSha(parent, &sha_buf).?;
+    try testing.expectEqualStrings(std.mem.trim(u8, parent_head_before, "\r\n "), parent_sha);
+
+    try os.mkdirP(manual);
+    updateLockFile(gpa, parent, "alpha", wt_sha);
+    updateLockFile(gpa, parent, "beta", parent_sha);
+    var lock_buf: [path_bytes_max]u8 = undefined;
+    const lp = lockPath(parent, &lock_buf).?;
+    const lfd = try os.openRegular(lp);
+    defer os.close(lfd);
+    var content_buf: [512]u8 = undefined;
+    const ltext = os.readHead(lp, &content_buf);
+    try testing.expect(std.mem.find(u8, ltext, "alpha ") != null);
+    try testing.expect(std.mem.find(u8, ltext, "beta ") != null);
+    updateLockFile(gpa, parent, "alpha", null);
+    const ltext2 = os.readHead(lp, &content_buf);
+    try testing.expect(std.mem.find(u8, ltext2, "alpha ") == null);
+    try testing.expect(std.mem.find(u8, ltext2, "beta ") != null);
+}
+
+test "gitCloneArgv restricts git protocols and disables submodules" {
+    var buf: [20]?[*:0]const u8 = undefined;
+    const prod = gitCloneArgv(&buf, "https://example.com/ext.git", "/tmp/dest", false);
+    var saw_never = false;
+    var saw_https = false;
+    var saw_file = false;
+    var saw_no_sub = false;
+    var i: usize = 0;
+    while (prod[i]) |arg| : (i += 1) {
+        const s = std.mem.span(arg);
+        if (std.mem.eql(u8, s, "protocol.allow=never")) saw_never = true;
+        if (std.mem.eql(u8, s, "protocol.https.allow=always")) saw_https = true;
+        if (std.mem.eql(u8, s, "protocol.file.allow=always")) saw_file = true;
+        if (std.mem.eql(u8, s, "--no-recurse-submodules")) saw_no_sub = true;
+    }
+    try std.testing.expect(saw_never and saw_https and !saw_file and saw_no_sub);
+
+    const test_only = gitCloneArgv(&buf, "/tmp/repo", "/tmp/dest", true);
+    var saw_test_file = false;
+    i = 0;
+    while (test_only[i]) |arg| : (i += 1) {
+        if (std.mem.eql(u8, std.mem.span(arg), "protocol.file.allow=always")) saw_test_file = true;
+    }
+    try std.testing.expect(saw_test_file);
 }

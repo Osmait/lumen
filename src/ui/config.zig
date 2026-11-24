@@ -76,6 +76,7 @@ pub fn loadCss(ui: *Ui) void {
 
 /// Reads the settings file again and applies it, init.lua's settings over it.
 pub fn reloadSettings(ui: *Ui) void {
+    os.assertMainThread();
     const fresh = Settings.load(ui.gpa, ui.settings_path.ptr);
     ui.settings.deinit();
     ui.settings = fresh;
@@ -184,6 +185,7 @@ fn currentTheme(ui: *Ui) *const themes.Theme {
 /// they changed. `preview` paints a theme without choosing it (moving
 /// through Change Theme).
 pub fn applyAppearance(ui: *Ui, preview: ?*const themes.Theme) void {
+    os.assertMainThread();
     const theme = preview orelse currentTheme(ui);
     var out: std.Io.Writer.Allocating = .init(ui.gpa);
     defer out.deinit();
@@ -247,6 +249,7 @@ const CssFile = struct {
     /// file (a FIFO would block the window), `css_bytes_max` at most. Null
     /// when it cannot be read or is larger.
     fn read(file: *CssFile, path: [:0]const u8, stamp: settings_mod.Stamp) ?[]const u8 {
+        os.assertMainThread();
         const path_hash = std.hash.Wyhash.hash(0, path);
         const known = file.path_hash == path_hash and file.stamp.eql(stamp);
         if (known and !stamp.eql(.none)) return file.text.items;
@@ -330,6 +333,7 @@ pub fn preferDark(ui: *Ui) bool {
 }
 
 pub fn watchColorScheme(ui: *Ui) void {
+    os.assertMainThread();
     const source = c.g_settings_schema_source_get_default() orelse return;
     // Looking the schema up first: g_settings_new aborts on a missing one.
     const recursive = 1;
@@ -351,9 +355,24 @@ fn onColorScheme(_: *c.GSettings, _: [*:0]const u8, data: ?*anyopaque) callconv(
     if (ui.view == .settings or ui.view == .themes) ui.rebuild();
 }
 
+const icons_dir_entries_max = 1024;
+
 /// ~/.config/lumen/icons/<name>.svg|png replaces the icon <name> everywhere
-/// (row_look.renamed). Read when the window opens: a handful of files.
+/// (row_look.renamed). Read when the window opens only when the folder's stamp
+/// changed (capped at `icons_dir_entries_max` entries).
 pub fn scanIconDir(ui: *Ui) void {
+    os.assertMainThread();
+    var icons_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const icons_path = std.mem.printSentinel(
+        &icons_path_buf,
+        "{s}/icons",
+        .{ui.config_dir},
+        0,
+    ) catch return;
+    const dir_stamp = os.Stamp.of(icons_path.ptr);
+    if (ui.icon_dir_scanned and dir_stamp.eql(ui.icon_dir_stamp)) return;
+    ui.icon_dir_stamp = dir_stamp;
+    ui.icon_dir_scanned = true;
     ui.row_look.renamed = .empty;
     if (ui.icon_arena) |*icon_arena| {
         _ = icon_arena.reset(.retain_capacity);
@@ -361,10 +380,12 @@ pub fn scanIconDir(ui: *Ui) void {
         ui.icon_arena = .init(ui.gpa);
     }
     const arena = ui.icon_arena.?.allocator();
-    const icons_path = arena.printSentinel("{s}/icons", .{ui.config_dir}, 0) catch return;
     const icons_folder = c.g_dir_open(icons_path.ptr, 0, null) orelse return;
     defer c.g_dir_close(icons_folder);
+    var entries_seen: usize = 0;
     while (c.g_dir_read_name(icons_folder)) |name_z| {
+        if (entries_seen >= icons_dir_entries_max) break;
+        entries_seen += 1;
         const name = std.mem.span(name_z);
         const dot = std.mem.findScalarLast(u8, name, '.') orelse continue;
         const extension = name[dot + 1 ..];

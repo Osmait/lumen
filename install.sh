@@ -89,7 +89,15 @@ fi
 
 name=lumen-$version-$arch-linux
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+cleanup() {
+    rm -rf "$tmp"
+    rm -f \
+        "$dir/.lumen.new.$$" \
+        "$dir/.lumen-gtk.new.$$" \
+        "$dir/.lumen.bak.$$" \
+        "$dir/.lumen-gtk.bak.$$"
+}
+trap cleanup EXIT
 
 say "Downloading Lumen $version..."
 curl -fsSL -o "$tmp/$name.tar.gz" "$repo_url/download/v$version/$name.tar.gz" ||
@@ -101,15 +109,46 @@ want=$(grep " $name.tar.gz\$" "$tmp/SHA256SUMS" | cut -d' ' -f1)
 [ "$(sha256 "$tmp/$name.tar.gz")" = "$want" ] || die "the download is damaged (checksum mismatch)"
 tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
 
+for prog in lumen lumen-gtk; do
+    [ -f "$tmp/$name/$prog" ] && [ -s "$tmp/$name/$prog" ] ||
+        die "incomplete release archive: missing $prog"
+done
+
+mkdir -p "$dir"
+# Stage both binaries inside $dir before touching the running installation.
+for prog in lumen lumen-gtk; do
+    cp "$tmp/$name/$prog" "$dir/.$prog.new.$$"
+    chmod 755 "$dir/.$prog.new.$$"
+done
+
 restart=no
 if stop_daemon; then restart=yes; fi
-mkdir -p "$dir"
-# Replaced, not written over: a running program keeps its old file.
-for prog in lumen lumen-gtk; do
-    cp "$tmp/$name/$prog" "$dir/.$prog.new"
-    chmod 755 "$dir/.$prog.new"
-    mv -f "$dir/.$prog.new" "$dir/$prog"
-done
+
+had_lumen=no
+had_gtk=no
+if [ -e "$dir/lumen" ]; then
+    had_lumen=yes
+    ln "$dir/lumen" "$dir/.lumen.bak.$$" 2>/dev/null || cp -p "$dir/lumen" "$dir/.lumen.bak.$$"
+fi
+if [ -e "$dir/lumen-gtk" ]; then
+    had_gtk=yes
+    ln "$dir/lumen-gtk" "$dir/.lumen-gtk.bak.$$" 2>/dev/null || cp -p "$dir/lumen-gtk" "$dir/.lumen-gtk.bak.$$"
+fi
+
+if ! mv -f "$dir/.lumen.new.$$" "$dir/lumen" || ! mv -f "$dir/.lumen-gtk.new.$$" "$dir/lumen-gtk"; then
+    if [ "$had_lumen" = yes ] && [ -e "$dir/.lumen.bak.$$" ]; then
+        mv -f "$dir/.lumen.bak.$$" "$dir/lumen" 2>/dev/null || true
+    elif [ "$had_lumen" = no ]; then
+        rm -f "$dir/lumen"
+    fi
+    if [ "$had_gtk" = yes ] && [ -e "$dir/.lumen-gtk.bak.$$" ]; then
+        mv -f "$dir/.lumen-gtk.bak.$$" "$dir/lumen-gtk" 2>/dev/null || true
+    elif [ "$had_gtk" = no ]; then
+        rm -f "$dir/lumen-gtk"
+    fi
+    die "failed to replace lumen and lumen-gtk; restored previous installation"
+fi
+rm -f "$dir/.lumen.bak.$$" "$dir/.lumen-gtk.bak.$$"
 say "Installed Lumen $version in $dir."
 
 # Returns 0 when `os_id` is ubuntu with VERSION_ID older than 24.10 (the first

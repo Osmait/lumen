@@ -82,6 +82,7 @@ pub const ListenError = error{
 /// `lumen` still works, through lumen-gtk, only slower: a failure is
 /// logged here, and the daemon runs on.
 pub fn start(allocator: std.mem.Allocator, app_id: []const u8, handler: Handler) void {
+    os.assertMainThread();
     const runtime_dir_z = c.g_getenv(ipc.env.runtime_dir);
     const runtime_dir = if (runtime_dir_z) |value| std.mem.span(value) else "";
     listenIn(allocator, runtime_dir, app_id, handler) catch |err| {
@@ -97,6 +98,7 @@ fn listenIn(
     app_id: []const u8,
     handler: Handler,
 ) ListenError!void {
+    os.assertMainThread();
     assert(!server.listening());
     if (runtime_dir.len == 0) return error.NoRuntimeDir;
     var dir_buffer: [256]u8 = undefined;
@@ -163,6 +165,7 @@ fn listenAt(socket_path: [:0]const u8) ListenError!linux.fd_t {
 /// Stops listening (`stop`) and ends the connections still open: an answer
 /// not sent yet gets one last try, without waiting. Main thread only.
 pub fn shutdown() void {
+    os.assertMainThread();
     stop();
     for (server.connections) |slot| {
         const connection = slot orelse continue;
@@ -175,6 +178,7 @@ pub fn shutdown() void {
 /// Closes the socket and removes its file; the connections still open end
 /// on their own. Safe to call when not listening.
 pub fn stop() void {
+    os.assertMainThread();
     if (!server.listening()) return;
     switch (server.accepting) {
         .paused => {},

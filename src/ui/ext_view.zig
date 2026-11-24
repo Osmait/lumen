@@ -30,6 +30,123 @@ const form_view = @import("form_view.zig");
 
 const log = std.log.scoped(.ext);
 
+pub const PendingCommand = struct {
+    caller: *c.GApplicationCommandLine,
+    target: [:0]u8,
+    query: ?[:0]u8,
+};
+
+fn refreshExtView(ui: *Ui) void {
+    ui.keepSelection();
+    ui.updateViewChrome();
+    enter(ui);
+    ui.rebuild();
+}
+
+/// Formats an informative error message for a failed `--command <target>`,
+/// surfacing the extension's load error if that extension failed to load.
+pub fn commandFailureMessage(
+    registry: ?*const Host.Registry,
+    target: []const u8,
+    buffer: *[256]u8,
+) [:0]const u8 {
+    if (registry) |loaded| {
+        if (std.mem.findScalar(u8, target, '.')) |dot| {
+            const ext_id = target[0..dot];
+            for (loaded.problems) |problem| {
+                if (!std.mem.eql(u8, problem.extension, ext_id)) continue;
+                var line_buf: [160]u8 = undefined;
+                const end = std.mem.findScalar(u8, problem.message, '\n') orelse problem.message.len;
+                const raw = core.utf8.validPrefix(problem.message[0..@min(end, line_buf.len)]);
+                @memcpy(line_buf[0..raw.len], raw);
+                return std.mem.printSentinel(
+                    buffer,
+                    "lumen: extension \"{s}\" failed to load: {s}\n",
+                    .{ ext_id, line_buf[0..raw.len] },
+                    0,
+                ) catch "lumen: extension failed to load\n";
+            }
+        }
+    }
+    const id_shown = target[0..@min(target.len, 200)];
+    return std.mem.printSentinel(
+        buffer,
+        "lumen: no command \"{s}\"\n",
+        .{id_shown},
+        0,
+    ) catch "lumen: no such command\n";
+}
+
+/// Queues a `--command` invocation while the initial extension registry is still loading.
+pub fn deferCommand(
+    ui: *Ui,
+    caller: *c.GApplicationCommandLine,
+    target: []const u8,
+    query: ?[*:0]const u8,
+) bool {
+    const target_copy = ui.gpa.dupeSentinel(u8, target, 0) catch return false;
+    errdefer ui.gpa.free(target_copy);
+    const query_copy: ?[:0]u8 = if (query) |q|
+        ui.gpa.dupeSentinel(u8, std.mem.span(q), 0) catch return false
+    else
+        null;
+    errdefer if (query_copy) |q| ui.gpa.free(q);
+    ui.pending_commands.append(ui.gpa, .{
+        .caller = @ptrCast(c.g_object_ref(caller)),
+        .target = target_copy,
+        .query = query_copy,
+    }) catch return false;
+    return true;
+}
+
+fn freePendingCommand(ui: *Ui, entry: PendingCommand) void {
+    c.g_object_unref(entry.caller);
+    ui.gpa.free(entry.target);
+    if (entry.query) |q| ui.gpa.free(q);
+}
+
+fn resolvePendingCommands(ui: *Ui) void {
+    var i: usize = 0;
+    while (i < ui.pending_commands.items.len) : (i += 1) {
+        const entry = ui.pending_commands.items[i];
+        defer freePendingCommand(ui, entry);
+        const query_ptr: ?[*:0]const u8 = if (entry.query) |q| q.ptr else null;
+        if (openTarget(ui, entry.target, query_ptr)) {
+            c.g_application_command_line_set_exit_status(entry.caller, 0);
+        } else {
+            var buf: [256]u8 = undefined;
+            const msg = commandFailureMessage(ui.ext_registry, entry.target, &buf);
+            c.g_application_command_line_printerr(entry.caller, "%s", msg.ptr);
+            c.g_application_command_line_set_exit_status(entry.caller, 1);
+        }
+    }
+    ui.pending_commands.clearRetainingCapacity();
+}
+
+/// Cancels any deferred `--command` callers at daemon shutdown.
+pub fn cancelPendingCommands(ui: *Ui) void {
+    for (ui.pending_commands.items) |entry| {
+        c.g_application_command_line_printerr(
+            entry.caller,
+            "lumen: daemon stopped before extensions loaded\n",
+        );
+        c.g_application_command_line_set_exit_status(entry.caller, 1);
+        freePendingCommand(ui, entry);
+    }
+    ui.pending_commands.deinit(ui.gpa);
+    ui.pending_commands = .empty;
+}
+
+/// For synchronous socket `--command` during startup: waits briefly for the
+/// initial registry reload and applies it immediately if not yet delivered.
+pub fn ensureInitialRegistry(ui: *Ui) void {
+    if (ui.ext_registry != null) return;
+    const host = ui.ext_host orelse return;
+    if (host.takePendingRegistry(5000)) |registry| {
+        registryCallback(registry, ui);
+    }
+}
+
 /// Starts the extension thread and loads the files. Main thread, once the
 /// window exists.
 pub fn start(ui: *Ui) void {
@@ -112,7 +229,7 @@ fn registryCallback(registry: *Host.Registry, context: ?*anyopaque) void {
     if (lost or (ui.view == .ext and command(ui) == null)) {
         ui.setView(.root);
     } else if (ui.view == .ext) {
-        ui.setView(.ext);
+        refreshExtView(ui);
     } else {
         // Same row as before the reload (an update from Settings, say).
         ui.keepSelection();
@@ -126,6 +243,7 @@ fn registryCallback(registry: *Host.Registry, context: ?*anyopaque) void {
         ui.after_reload_pending = false;
         ui.showFailure(ui.after_reload.slice());
     }
+    resolvePendingCommands(ui);
 }
 
 /// A style just chosen: its lumen.set become the settings' new values,
@@ -270,8 +388,9 @@ fn actCallback(answer: *Host.ActResult, context: ?*anyopaque) void {
         .close => ui.hide(),
         .stay => row_list.select(ui, ui.selected),
         .refresh => if (ui.view == .ext) {
-            ui.keepSelection();
-            ui.setView(.ext);
+            const old_list = ui.ext_list.forget();
+            refreshExtView(ui);
+            if (old_list) |result| result.destroy(ui.gpa);
         } else if (ui.view == .form) {
             // A form "refreshes" by starting over, ready for the next one.
             form_view.reset(ui);
@@ -525,8 +644,13 @@ pub fn activate(ui: *Ui, command_index: Host.CommandIndex) void {
     const activated = registry.command(command_index) orelse return;
     switch (activated.mode) {
         .run => {
+            if (ui.ext_act_generation != .none) {
+                return ui.showFailure("An action is already running");
+            }
             const host = ui.ext_host orelse return;
-            ui.ext_act_generation = host.act(registry.generation, command_index, .command_run);
+            const generation = host.act(registry.generation, command_index, .command_run);
+            if (generation == .none) return ui.showFailure("Too many actions queued");
+            ui.ext_act_generation = generation;
             ui.showRunning();
         },
         .form => form_view.open(ui, command_index),
@@ -548,14 +672,19 @@ pub fn perform(ui: *Ui, action_index: u8) void {
     ui.panel.close();
     switch (row.actions[action_index]) {
         .lua => {
+            if (ui.ext_act_generation != .none) {
+                return ui.showFailure("An action is already running");
+            }
             const host = ui.ext_host orelse return;
             const registry = ui.ext_registry orelse return;
-            ui.ext_act_generation = host.act(registry.generation, row.command, .{ .row_action = .{
+            const generation = host.act(registry.generation, row.command, .{ .row_action = .{
                 .from_root_search = row.from_root_search,
                 .list_generation = row.list_generation,
                 .row_index = row.row_index,
                 .action_index = action_index,
             } });
+            if (generation == .none) return ui.showFailure("Too many actions queued");
+            ui.ext_act_generation = generation;
             ui.showRunning();
             return;
         },
@@ -787,4 +916,25 @@ test "cleared ext_act_generation rejects late Lua action responses" {
     // Simulating Ui.hide() / Ui.setView() / registryCallback() clearing it.
     generation = .none;
     try testing.expect(answer_gen != generation);
+}
+
+test "commandFailureMessage surfaces extension load errors when available" {
+    const problems = [_]Host.Problem{.{
+        .extension = "broken",
+        .message = "syntax error\nstack traceback",
+    }};
+    const reg: Host.Registry = .{
+        .generation = @fromBackingInt(@as(u32, 1)),
+        .problems = &problems,
+        .arena = undefined,
+    };
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings(
+        "lumen: extension \"broken\" failed to load: syntax error\n",
+        commandFailureMessage(&reg, "broken.cmd", &buf),
+    );
+    try testing.expectEqualStrings(
+        "lumen: no command \"missing.cmd\"\n",
+        commandFailureMessage(&reg, "missing.cmd", &buf),
+    );
 }

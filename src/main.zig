@@ -58,6 +58,7 @@ var daemon: Daemon = .{};
 /// or when the database could not be opened. Commands that need it fail
 /// then.
 fn readyUi() ?*Ui {
+    os.assertMainThread();
     return if (daemon.ui) |*ui| ui else null;
 }
 
@@ -98,6 +99,7 @@ const malloc_arenas_max = 4;
 const stdin_buffer_bytes = 16 << 10;
 
 pub fn main(init: std.process.Init) !void {
+    os.setMainThread();
     os.unix.ignoreSigpipe();
     stats.started_ns = stats.now();
     // glibc raises its mmap threshold every time a large mmap'd block is
@@ -188,6 +190,7 @@ const test_instance_lifetime_s = 300;
 
 /// Runs once, in the primary instance.
 fn startupCallback(gtk_app: *c.GtkApplication, data: ?*anyopaque) callconv(.c) void {
+    os.assertMainThread();
     const start: *const Start = @ptrCast(@alignCast(data.?));
     assert(daemon.ui == null);
     const path = dbPath() orelse {
@@ -195,7 +198,7 @@ fn startupCallback(gtk_app: *c.GtkApplication, data: ?*anyopaque) callconv(.c) v
         return;
     };
     defer c.g_free(path);
-    var db = Db.open(std.mem.span(path)) catch |err| {
+    var db = Db.openWith(std.mem.span(path), .{ .busy_timeout_ms = 50 }) catch |err| {
         log.err("cannot open {s}: {t}", .{ path, err });
         return;
     };
@@ -264,6 +267,7 @@ fn commandLineCallback(
     command_line: *c.GApplicationCommandLine,
     _: ?*anyopaque,
 ) callconv(.c) c_int {
+    os.assertMainThread();
     var argc: c_int = 0;
     const argv = c.g_application_command_line_get_arguments(command_line, &argc);
     defer c.g_strfreev(argv);
@@ -289,6 +293,7 @@ fn socketCallback(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
 ) u8 {
+    os.assertMainThread();
     const status = run(arguments, &.{ .stdout = stdout, .stderr = stderr, .payload = payload });
     return std.math.cast(u8, status) orelse 1;
 }
@@ -481,14 +486,22 @@ fn runWindow(window: Request.Window, reply: *const Reply) c_int {
     }
     if (window.command) |command_id| {
         if (Ui.ext_view.openTarget(ui, command_id, window.query)) return status_ok;
+        if (ui.ext_registry == null and ui.ext_host != null) {
+            if (reply.command_line) |command_line| {
+                if (Ui.ext_view.deferCommand(ui, command_line, command_id, window.query)) {
+                    return status_answered_later;
+                }
+            } else {
+                Ui.ext_view.ensureInitialRegistry(ui);
+                if (Ui.ext_view.openTarget(ui, command_id, window.query)) return status_ok;
+            }
+        }
         var message_buffer: [256]u8 = undefined;
-        const id_shown = command_id[0..@min(command_id.len, 200)];
-        const message = std.mem.printSentinel(
+        const message = Ui.ext_view.commandFailureMessage(
+            ui.ext_registry,
+            command_id,
             &message_buffer,
-            "lumen: no command \"{s}\"\n",
-            .{id_shown},
-            0,
-        ) catch "lumen: no such command\n";
+        );
         reply.printErr(message);
         return status_failed;
     }
@@ -509,6 +522,7 @@ fn usage(reply: *const Reply) c_int {
 }
 
 fn shutdownCallback(_: *c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
+    os.assertMainThread();
     daemon.shutting_down = true;
     // The socket, and the clients still connected to it.
     ipc_server.shutdown();
@@ -593,6 +607,7 @@ fn onContentIndexPublished(_: ?*anyopaque) void {
 }
 
 fn contentIndexPublishedIdle(_: ?*anyopaque) callconv(.c) c.gboolean {
+    os.assertMainThread();
     daemon.content_index_idle_queued.store(false, .release);
     if (daemon.shutting_down) return 0;
     const ui = readyUi() orelse return 0;
@@ -618,6 +633,7 @@ fn dbPath() ?[*:0]u8 {
 /// DO_NOT_REAP_CHILD matters: without it GLib double-forks, the watcher's
 /// parent is a helper that exits at once, and the death signal fires.
 fn startClipboardWatcher() void {
+    os.assertMainThread();
     const watcher = &daemon.clipboard_watcher;
     assert(!watcher.running());
     const self_exe = c.g_file_read_link("/proc/self/exe", null) orelse return;

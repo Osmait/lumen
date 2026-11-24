@@ -72,7 +72,7 @@ pub fn parse(comptime T: type, arena: std.mem.Allocator, json: []const u8) ?T {
 
 fn query(arena: std.mem.Allocator, comptime T: type, what: [:0]const u8) ?T {
     const json = request(arena, what) orelse blk: {
-        const output = proc.output(&.{ "hyprctl", "-j", what }) orelse return null;
+        const output = proc.outputTimeout(&.{ "hyprctl", "-j", what }, 300) orelse return null;
         defer proc.free(output);
         break :blk arena.dupe(u8, output) catch return null;
     };
@@ -186,14 +186,11 @@ fn connect(socket: Socket, options: os.unix.ConnectOptions) ?linux.fd_t {
 }
 
 /// A compositor that does not answer must not freeze the window.
-const answer_timeout_ns = std.time.ns_per_s;
+const answer_timeout_ns = 150 * std.time.ns_per_ms;
 /// Nor one that never stops: `j/clients` with 200 windows is ~300 KB.
 const answer_bytes_max = 16 << 20;
 /// How much more room the answer gets each time it fills up.
 const answer_chunk_bytes = 16 << 10;
-/// The answer to dispatches is only read to its end, never kept: "ok" per
-/// dispatch.
-const ok_answer_bytes_max = 256;
 
 comptime {
     assert(answer_chunk_bytes < answer_bytes_max);
@@ -221,10 +218,10 @@ fn talk(arena: std.mem.Allocator, message: []const u8) ?[]const u8 {
     return if (answer.items.len > 0) answer.items else null;
 }
 
-/// Sends dispatches and waits until Hyprland has run them. False only when
-/// nothing was sent (no socket), so hyprctl may try instead: once sent, a
-/// dispatch must never go twice (a toggle would undo itself). What Hyprland
-/// answers ("ok" per dispatch) does not matter.
+/// Sends dispatches without blocking the UI waiting for Hyprland's "ok"
+/// reply. False only when nothing was sent (no socket), so hyprctl may try
+/// instead: once sent, a dispatch must never go twice (a toggle would undo
+/// itself).
 fn dispatchOver(message: []const u8) bool {
     const fd = connect(.requests, .{}) orelse return false;
     defer _ = linux.close(fd);
@@ -241,11 +238,6 @@ fn dispatchOver(message: []const u8) bool {
     if (written < message.len and !os.unix.sendAll(fd, message[written..])) {
         log.warn("dispatch partly sent: {d} of {d} bytes", .{ written, message.len });
     }
-    const deadline_ns = os.monotonicNs() + answer_timeout_ns;
-    var answer: [ok_answer_bytes_max]u8 = undefined;
-    while (os.unix.readSome(fd, &answer, deadline_ns)) |answer_len| {
-        if (answer_len == 0) break;
-    } else |_| {}
     return true;
 }
 
@@ -253,6 +245,7 @@ fn dispatchOver(message: []const u8) bool {
 
 /// `batch` of one command.
 pub fn dispatch(gpa: std.mem.Allocator, command: []const u8) void {
+    os.assertMainThread();
     batch(gpa, &.{command});
 }
 
@@ -260,6 +253,7 @@ pub fn dispatch(gpa: std.mem.Allocator, command: []const u8) void {
 /// idle, or once the window has hidden and the focus is back
 /// (`sendAfterHide`).
 pub fn batch(gpa: std.mem.Allocator, commands: []const []const u8) void {
+    os.assertMainThread();
     if (!dispatch_queue.append(commands)) {
         // Too long to queue: run hyprctl now (slower, but never dropped).
         const batch_z = batchString(gpa, commands) catch return;
@@ -342,6 +336,7 @@ const focus_fallback_ms = 60;
 /// the focus back (or after `focus_fallback_ms`). Listening starts now, so
 /// the event that the hide causes is not missed.
 pub fn sendAfterHide() void {
+    os.assertMainThread();
     if (dispatch_queue.len == 0) return;
     dispatch_queue.cancelIdle();
     afterFocusChange(&sendQueued, focus_fallback_ms);
@@ -351,12 +346,14 @@ pub fn sendAfterHide() void {
 /// At shutdown: dispatches still queued go now (they were asked for), and
 /// the GLib sources and the event socket this file holds are let go.
 pub fn shutdown() void {
+    os.assertMainThread();
     dispatch_queue.cancelIdle();
     sendQueued();
     focus_waiter.stop();
 }
 
 pub fn sendQueued() void {
+    os.assertMainThread();
     if (dispatch_queue.len == 0) return;
     const queued = dispatch_queue.buffer[0..dispatch_queue.len];
     dispatch_queue.len = 0;
@@ -437,6 +434,7 @@ var focus_waiter: FocusWaiter = .{};
 /// `fallback_ms`: a paste right after Lumen hides waited a fixed 120 ms,
 /// and the focus is back in ~2.
 pub fn afterFocusChange(callback: *const fn () void, fallback_ms: c_uint) void {
+    os.assertMainThread();
     const waiter = &focus_waiter;
     for (waiter.callbacks[0..waiter.callbacks_count]) |waiting_callback| {
         if (waiting_callback == callback) return;

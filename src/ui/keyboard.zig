@@ -9,8 +9,19 @@ const item_mod = @import("../item.zig");
 const row_list = @import("row_list.zig");
 const Ui = @import("Ui.zig");
 
-/// A key press, real or from `lumen --key`; true (1) when Lumen handled it.
+/// Synthetic / test key handling (`lumen --key`).
 pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
+    return handleKeyEvent(ui, keyval, state, false);
+}
+
+/// Real or synthetic key press; `from_keyboard` enables repeat-guarding Backspace
+/// so holding Backspace to clear a query never exits a view or aborts `--dmenu`.
+pub fn handleKeyEvent(
+    ui: *Ui,
+    keyval: c_uint,
+    state: c.GdkModifierType,
+    from_keyboard: bool,
+) c.gboolean {
     const key: KeyPress = .decode(keyval, state, .{ .panel_open = ui.panel.isOpen() });
 
     if (ui.panel.isOpen()) {
@@ -44,7 +55,9 @@ pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
         return 1;
     }
     if (itemShortcut(ui, key)) return 1;
-    if (key.keyval == c.GDK_KEY_BackSpace and ui.query().len == 0 and ui.view != .root) {
+    if (key.keyval == c.GDK_KEY_BackSpace and
+        backspaceGoesBack(ui.view, ui.query().len == 0, &ui.backspace_blocked, from_keyboard))
+    {
         ui.goBack();
         return 1;
     }
@@ -52,6 +65,25 @@ pub fn handleKey(ui: *Ui, keyval: c_uint, state: c.GdkModifierType) c.gboolean {
     if (Ui.ext_view.keymap(ui, keyval, state)) return 1;
     if (typeAltChord(ui, keyval, state)) return 1;
     return 0;
+}
+
+/// True when a Backspace press should navigate back. Never leaves `.root` or
+/// `.dmenu`, and from a physical keyboard (`from_keyboard = true`) ignores held
+/// repeats until Backspace is released and pressed again on an empty bar.
+pub fn backspaceGoesBack(
+    view: Ui.View,
+    query_empty: bool,
+    blocked: *bool,
+    from_keyboard: bool,
+) bool {
+    if (view == .root or view == .dmenu) return false;
+    if (!query_empty) {
+        if (from_keyboard) blocked.* = true;
+        return false;
+    }
+    if (from_keyboard and blocked.*) return false;
+    if (from_keyboard) blocked.* = true;
+    return true;
 }
 
 /// A printable key with Alt alone (no Ctrl or Super) types its character,
@@ -281,4 +313,24 @@ test "modifier keys are excluded from recent typing while normal keys count" {
         c.GDK_KEY_Down,
     };
     for (keys) |keyval| try std.testing.expect(!isModifierKey(keyval));
+}
+
+test "held backspace never exits a view or aborts dmenu" {
+    var blocked = false;
+    // Holding Backspace while deleting text sets `blocked`, then hitting empty still refuses exit.
+    try std.testing.expect(!backspaceGoesBack(.settings, false, &blocked, true));
+    try std.testing.expect(blocked);
+    try std.testing.expect(!backspaceGoesBack(.settings, true, &blocked, true));
+    // Releasing Backspace clears `blocked`; pressing again on empty navigates back once.
+    blocked = false;
+    try std.testing.expect(backspaceGoesBack(.settings, true, &blocked, true));
+    try std.testing.expect(blocked);
+    try std.testing.expect(!backspaceGoesBack(.settings, true, &blocked, true));
+    // dmenu and root never navigate back on Backspace.
+    blocked = false;
+    try std.testing.expect(!backspaceGoesBack(.dmenu, true, &blocked, true));
+    try std.testing.expect(!backspaceGoesBack(.dmenu, true, &blocked, false));
+    try std.testing.expect(!backspaceGoesBack(.root, true, &blocked, false));
+    // Synthetic `--key backspace` continues to navigate back on non-dmenu subviews.
+    try std.testing.expect(backspaceGoesBack(.settings, true, &blocked, false));
 }
