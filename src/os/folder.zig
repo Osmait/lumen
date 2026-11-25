@@ -198,6 +198,30 @@ pub fn makePrivate(path: []const u8) void {
     }
 }
 
+/// Whether `dir` is a real directory owned by the current user (not a symlink)
+/// and owner-only (`0700`); if owned by us with broader permissions, tightens to `0700`.
+pub fn ensurePrivateDir(dir: [*:0]const u8) bool {
+    const open_result = linux.open(
+        dir,
+        .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true },
+        0,
+    );
+    if (linux.errno(open_result) != .SUCCESS) return false;
+    const fd: i32 = @intCast(open_result);
+    defer close(fd);
+    var stx: linux.Statx = undefined;
+    const statx_result = linux.statx(
+        fd,
+        "",
+        linux.AT.EMPTY_PATH,
+        .{ .TYPE = true, .MODE = true, .UID = true },
+        &stx,
+    );
+    if (linux.errno(statx_result) != .SUCCESS) return false;
+    if (stx.uid != linux.getuid() or stx.mode & linux.S.IFMT != linux.S.IFDIR) return false;
+    return stx.mode & 0o777 == 0o700 or linux.errno(linux.fchmod(fd, 0o700)) == .SUCCESS;
+}
+
 const expectSuccess = @import("test_dir.zig").expectSuccess;
 
 test "subdirs: folders and links to them, sorted, filtered" {
@@ -331,4 +355,29 @@ test "openDirBeneath goes through no link and never above its base" {
         close(fd);
         return error.TestUnexpectedResult;
     } else |_| {}
+}
+
+test "ensurePrivateDir tightens open dirs and rejects links and regular files" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var dir_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try os.tmpDirPath(&tmp_dir, &dir_buffer);
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+
+    const open_dir = try std.mem.printSentinel(&path_buffer, "{s}/open", .{root}, 0);
+    try expectSuccess(linux.mkdir(open_dir, 0o755));
+    try expectSuccess(linux.chmod(open_dir, 0o755));
+    try std.testing.expect(ensurePrivateDir(open_dir));
+    var stx: linux.Statx = undefined;
+    try expectSuccess(linux.statx(linux.AT.FDCWD, open_dir, 0, .{ .MODE = true }, &stx));
+    try std.testing.expectEqual(@as(u16, 0o700), stx.mode & 0o777);
+
+    var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const link = try std.mem.printSentinel(&link_buffer, "{s}/link", .{root}, 0);
+    try expectSuccess(linux.symlink("open", link));
+    try std.testing.expect(!ensurePrivateDir(link));
+
+    const file = try std.mem.printSentinel(&path_buffer, "{s}/file", .{root}, 0);
+    try os.writeFile(file, "x");
+    try std.testing.expect(!ensurePrivateDir(file));
 }

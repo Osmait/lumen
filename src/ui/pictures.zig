@@ -44,12 +44,12 @@ const header_probe_bytes = 64 << 10;
 /// regular file: decoding by path opened the file again, and a FIFO swapped
 /// in meanwhile blocked forever.
 pub fn decodeImage(
+    gpa: std.mem.Allocator,
     path: [*:0]const u8,
     width_px: c_int,
     height_px: c_int,
     limits: Limits,
 ) ?*c.GdkPixbuf {
-    const gpa = std.heap.c_allocator;
     var data: std.ArrayList(u8) = .empty;
     defer data.deinit(gpa);
     {
@@ -143,6 +143,7 @@ pub var icon_lane: Lane = .{};
 pub const Done = *const fn (context: ?*anyopaque, pixbuf: ?*c.GdkPixbuf, current: bool) void;
 
 const Request = struct {
+    gpa: std.mem.Allocator,
     path: [:0]u8,
     width_px: c_int,
     height_px: c_int,
@@ -152,11 +153,58 @@ const Request = struct {
     context: ?*anyopaque,
 };
 
+/// O(1) FIFO/LIFO-front ring buffer for pending picture decode requests.
+const RequestQueue = struct {
+    items: []*Request = &.{},
+    head: usize = 0,
+    len: usize = 0,
+
+    fn ensureRoom(queue: *RequestQueue, gpa: std.mem.Allocator) std.mem.Allocator.Error!void {
+        if (queue.len < queue.items.len) return;
+        const new_cap = @max(queue.items.len * 2, 16);
+        const new_items = try gpa.alloc(*Request, new_cap);
+        for (0..queue.len) |i| {
+            new_items[i] = queue.items[(queue.head + i) % queue.items.len];
+        }
+        gpa.free(queue.items);
+        queue.items = new_items;
+        queue.head = 0;
+    }
+
+    fn pushBack(queue: *RequestQueue, gpa: std.mem.Allocator, req: *Request) std.mem.Allocator.Error!void {
+        try queue.ensureRoom(gpa);
+        const slot = (queue.head + queue.len) % queue.items.len;
+        queue.items[slot] = req;
+        queue.len += 1;
+    }
+
+    fn pushFront(queue: *RequestQueue, gpa: std.mem.Allocator, req: *Request) std.mem.Allocator.Error!void {
+        try queue.ensureRoom(gpa);
+        queue.head = if (queue.head == 0) queue.items.len - 1 else queue.head - 1;
+        queue.items[queue.head] = req;
+        queue.len += 1;
+    }
+
+    fn popFront(queue: *RequestQueue) ?*Request {
+        if (queue.len == 0) return null;
+        const req = queue.items[queue.head];
+        queue.head = (queue.head + 1) % queue.items.len;
+        queue.len -= 1;
+        return req;
+    }
+
+    fn deinit(queue: *RequestQueue, gpa: std.mem.Allocator) void {
+        gpa.free(queue.items);
+        queue.* = .{};
+    }
+};
+
 /// Requests not started yet, and whether one is decoding (main thread).
 /// One at a time: each can take `picture_limits` × 4 bytes while it
 /// decodes, and GLib's pool ran one per selection change at once (an
 /// arrow key held over a folder of photos).
-var waiting: std.ArrayList(*Request) = .empty;
+var waiting: RequestQueue = .{};
+var waiting_gpa: ?std.mem.Allocator = null;
 var decoding = false;
 
 /// Where a request joins the queue: a preview goes ahead of what waits
@@ -166,6 +214,7 @@ pub const QueuePlace = enum { front, back };
 /// Decodes `path` to fit `width_px`×`height_px` on a worker thread, within
 /// `picture_limits`, and calls `done`. Main thread.
 pub fn requestPicture(
+    gpa: std.mem.Allocator,
     path: []const u8,
     width_px: c_int,
     height_px: c_int,
@@ -178,10 +227,12 @@ pub fn requestPicture(
     // A size of 0 would make the decoder scale to nothing.
     assert(width_px > 0);
     assert(height_px > 0);
-    const gpa = std.heap.c_allocator;
+    if (waiting_gpa == null) waiting_gpa = gpa;
+    const queue_gpa = waiting_gpa.?;
     // Out of memory: as good as dropped (nothing is learnt about the file).
     const request = gpa.create(Request) catch return done(context, null, false);
     request.* = .{
+        .gpa = gpa,
         .path = gpa.dupeSentinel(u8, path, 0) catch {
             gpa.destroy(request);
             return done(context, null, false);
@@ -194,8 +245,8 @@ pub fn requestPicture(
         .context = context,
     };
     const queued = switch (place) {
-        .front => waiting.insert(gpa, 0, request),
-        .back => waiting.append(gpa, request),
+        .front => waiting.pushFront(queue_gpa, request),
+        .back => waiting.pushBack(queue_gpa, request),
     };
     queued catch return finishRequest(request, null, false);
     startNext();
@@ -203,8 +254,8 @@ pub fn requestPicture(
 
 fn startNext() void {
     os.assertMainThread();
-    while (!decoding and waiting.items.len > 0) {
-        const request = waiting.orderedRemove(0);
+    while (!decoding) {
+        const request = waiting.popFront() orelse break;
         if (request.generation != request.lane.current()) {
             finishRequest(request, null, false);
             continue;
@@ -229,6 +280,7 @@ fn decodeRequest(
         return c.g_task_return_pointer(task, null, null);
     }
     const pixbuf = decodeImage(
+        request.gpa,
         request.path.ptr,
         request.width_px,
         request.height_px,
@@ -258,16 +310,15 @@ pub fn shutdown() void {
     preview_lane.forget();
     grid_lane.forget();
     icon_lane.forget();
-    while (waiting.items.len > 0) {
-        const request = waiting.orderedRemove(0);
+    while (waiting.popFront()) |request| {
         finishRequest(request, null, false);
     }
-    waiting.deinit(std.heap.c_allocator);
-    waiting = .empty;
+    if (waiting_gpa) |queue_gpa| waiting.deinit(queue_gpa);
+    waiting_gpa = null;
 }
 
 fn finishRequest(request: *Request, pixbuf: ?*c.GdkPixbuf, current: bool) void {
-    const gpa = std.heap.c_allocator;
+    const gpa = request.gpa;
     defer {
         gpa.free(request.path);
         gpa.destroy(request);
@@ -303,7 +354,7 @@ test "a picture over the limits is never decoded" {
     // Refused from its header: gdk-pixbuf is never called.
     try test_dir.write("bomb.png", bomb);
     const bomb_path = try test_dir.path(&path_bytes, "bomb.png");
-    try testing.expect(decodeImage(bomb_path, 64, 64, limits) == null);
+    try testing.expect(decodeImage(testing.allocator, bomb_path, 64, 64, limits) == null);
     // A file larger than `bytes` is not decoded either.
     const big = try testing.allocator.alloc(u8, limits.bytes + 1);
     defer testing.allocator.free(big);
@@ -311,7 +362,7 @@ test "a picture over the limits is never decoded" {
     @memcpy(big[0..small.len], small);
     try test_dir.write("big.png", big);
     const big_path = try test_dir.path(&path_bytes, "big.png");
-    try testing.expect(decodeImage(big_path, 64, 64, limits) == null);
+    try testing.expect(decodeImage(testing.allocator, big_path, 64, 64, limits) == null);
     // Larger than the header probe: refused from its first bytes alone.
     const padded = try testing.allocator.alloc(u8, header_probe_bytes * 2);
     defer testing.allocator.free(padded);
@@ -319,11 +370,11 @@ test "a picture over the limits is never decoded" {
     @memcpy(padded[0..bomb.len], bomb);
     try test_dir.write("padded.png", padded);
     const padded_path = try test_dir.path(&path_bytes, "padded.png");
-    try testing.expect(decodeImage(padded_path, 64, 64, limits) == null);
+    try testing.expect(decodeImage(testing.allocator, padded_path, 64, 64, limits) == null);
     // A FIFO named like a picture: refused at once, not waited on.
     const fifo = try test_dir.path(&path_bytes, "fifo.png");
     try testing.expect(std.os.linux.mknod(fifo, std.os.linux.S.IFIFO | 0o600, 0) == 0);
-    try testing.expect(decodeImage(fifo, 64, 64, limits) == null);
+    try testing.expect(decodeImage(testing.allocator, fifo, 64, 64, limits) == null);
 }
 
 test {
@@ -340,10 +391,12 @@ test "pictures shutdown forgets lanes and drains queued requests" {
             self.last_current = is_current;
         }
     };
-    const gpa = std.heap.c_allocator;
+    const gpa = std.testing.allocator;
+    waiting_gpa = gpa;
     var counter: Counter = .{};
     const req = try gpa.create(Request);
     req.* = .{
+        .gpa = gpa,
         .path = try gpa.dupeSentinel(u8, "/tmp/nonexistent.png", 0),
         .width_px = 32,
         .height_px = 32,
@@ -353,10 +406,32 @@ test "pictures shutdown forgets lanes and drains queued requests" {
         .context = &counter,
     };
     const gen_before = preview_lane.current();
-    try waiting.append(gpa, req);
+    try waiting.pushBack(gpa, req);
     shutdown();
     try std.testing.expect(preview_lane.current() != gen_before);
-    try std.testing.expectEqual(@as(usize, 0), waiting.items.len);
+    try std.testing.expectEqual(@as(usize, 0), waiting.len);
     try std.testing.expectEqual(@as(usize, 1), counter.called);
     try std.testing.expect(!counter.last_current);
+}
+
+test "RequestQueue ring buffer preserves front/back ordering across wrap-around and growth" {
+    const gpa = std.testing.allocator;
+    var q: RequestQueue = .{};
+    defer q.deinit(gpa);
+
+    var dummy: [20]Request = undefined;
+    for (0..20) |i| {
+        if (i % 2 == 0) {
+            try q.pushBack(gpa, &dummy[i]);
+        } else {
+            try q.pushFront(gpa, &dummy[i]);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 20), q.len);
+    // Pop front half, then push more to wrap around.
+    for (0..10) |_| try std.testing.expect(q.popFront() != null);
+    for (0..10) |i| try q.pushBack(gpa, &dummy[i]);
+    try std.testing.expectEqual(@as(usize, 20), q.len);
+    for (0..20) |_| try std.testing.expect(q.popFront() != null);
+    try std.testing.expectEqual(@as(?*Request, null), q.popFront());
 }

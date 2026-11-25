@@ -314,14 +314,11 @@ fn parseAction(
     action_table: c_int,
     where: []const u8,
 ) ParsedAction {
-    const title = lua.fieldString(L, arena, action_table, "title", where);
+    const title = line(L, arena, action_table, "title", where);
     if (actionHasRun(L, action_table, where)) {
         return .{ .action = .lua, .label = title orelse "Run" };
     }
-    const kind_name = lua.fieldString(L, arena, action_table, "kind", where) orelse
-        lua.raise(L, "{s}: give it a run function, or make it with lumen.action.*", .{where});
-    const kind = std.meta.stringToEnum(ActionKind, kind_name) orelse
-        lua.raise(L, "{s}.kind: unknown \"{s}\"", .{ where, kind_name });
+    const kind = actionKind(L, action_table, where);
     switch (kind) {
         .open => {
             const target = lua.fieldString(L, arena, action_table, "target", where) orelse
@@ -341,6 +338,23 @@ fn parseAction(
             return .{ .action = .{ .exec = argv }, .label = title orelse "Run" };
         },
     }
+}
+
+fn actionKind(L: *lua.State, action_table: c_int, where: []const u8) ActionKind {
+    const mark: lua.StackMark = .init(L);
+    defer mark.restore(L);
+    switch (lua.getField(L, action_table, "kind")) {
+        lua.c.LUA_TNIL => {
+            lua.raise(L, "{s}: give it a run function, or make it with lumen.action.*", .{where});
+        },
+        lua.c.LUA_TSTRING, lua.c.LUA_TNUMBER => {},
+        else => lua.raise(L, "{s}.kind: string expected, got {s}", .{ where, lua.typeName(L, -1) }),
+    }
+    var length: usize = 0;
+    const bytes = lua.c.lua_tolstring(L, -1, &length);
+    const kind_name = bytes[0..length];
+    return std.meta.stringToEnum(ActionKind, kind_name) orelse
+        lua.raise(L, "{s}.kind: unknown \"{s}\"", .{ where, kind_name });
 }
 
 /// Whether the action is a Lua function (`run`).
@@ -479,25 +493,26 @@ pub fn parseIcon(
             // "~/icons/x.svg": a file in the home folder.
             const home_prefix = "~/";
             const in_home = std.mem.startsWith(u8, text, home_prefix);
+            const is_path = in_home or std.mem.startsWith(u8, text, "/");
+            const capped = lua.cut(text, if (is_path) path_bytes_max else line_bytes_max);
             const home = std.mem.span(c.g_get_home_dir());
             const copy = if (in_home)
-                arena.printSentinel("{s}/{s}", .{ home, text[home_prefix.len..] }, 0)
+                arena.printSentinel(
+                    "{s}/{s}",
+                    .{ home, lua.cut(text[home_prefix.len..], path_bytes_max) },
+                    0,
+                )
             else
-                arena.dupeSentinel(u8, text, 0);
+                arena.dupeSentinel(u8, capped, 0);
             const name = copy catch lua.oom(L);
             const is_emoji = text.len > 0 and text.len <= emoji_bytes_max and text[0] >= 0x80;
             if (is_emoji) return .{ .emoji = name };
             return .byName(name);
         },
         lua.c.LUA_TTABLE => {
-            const name = lua.fieldString(L, arena, icon, "name", where) orelse
+            const name = line(L, arena, icon, "name", where) orelse
                 lua.raise(L, "{s}.icon.name is missing", .{where});
-            const color_name = lua.fieldString(L, arena, icon, "color", where) orelse "gray";
-            const color = std.meta.stringToEnum(item_mod.Color, color_name) orelse lua.raise(
-                L,
-                "{s}.icon.color: one of red, orange, yellow, green, blue, purple, pink, gray (got \"{s}\")",
-                .{ where, color_name },
-            );
+            const color = iconColor(L, icon, where);
             return .{ .tile = .{ .name = name, .color = color } };
         },
         else => {
@@ -505,6 +520,26 @@ pub fn parseIcon(
             lua.raise(L, "{s}.icon: string or table expected, got {s}", .{ where, type_name });
         },
     }
+}
+
+fn iconColor(L: *lua.State, icon: c_int, where: []const u8) item_mod.Color {
+    const color_mark: lua.StackMark = .init(L);
+    defer color_mark.restore(L);
+    switch (lua.getField(L, icon, "color")) {
+        lua.c.LUA_TNIL => return .gray,
+        lua.c.LUA_TSTRING, lua.c.LUA_TNUMBER => {},
+        else => {
+            lua.raise(L, "{s}.icon.color: string expected, got {s}", .{ where, lua.typeName(L, -1) });
+        },
+    }
+    var length: usize = 0;
+    const bytes = lua.c.lua_tolstring(L, -1, &length);
+    const color_name = bytes[0..length];
+    return std.meta.stringToEnum(item_mod.Color, color_name) orelse lua.raise(
+        L,
+        "{s}.icon.color: one of red, orange, yellow, green, blue, purple, pink, gray (got \"{s}\")",
+        .{ where, color_name },
+    );
 }
 
 test "long markdown is cut at a line's end, short markdown is whole" {

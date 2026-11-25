@@ -21,7 +21,7 @@ pub fn folderPath(arena: std.mem.Allocator) ?[:0]const u8 {
 /// The last scan's scripts, and what the folder looked like then: the root
 /// view is built on every show, and each scan read every script.
 const Cache = struct {
-    arena: std.heap.ArenaAllocator = .init(std.heap.c_allocator),
+    arena: ?std.heap.ArenaAllocator = null,
     items: []Item = &.{},
     /// Null until the first scan.
     stamp: ?FolderStamp = null,
@@ -32,16 +32,25 @@ var cache: Cache = .{};
 
 const log = std.log.scoped(.scripts);
 
+/// Frees the cached scripts arena on shutdown. Main thread only.
+pub fn shutdown() void {
+    os.assertMainThread();
+    if (cache.arena) |*arena| arena.deinit();
+    cache = .{};
+}
+
 /// The scripts, in `arena`: scanned again only when a file in the folder
 /// was added, removed, renamed or written since the last time.
-pub fn load(arena: std.mem.Allocator) []Item {
+pub fn load(gpa: std.mem.Allocator, arena: std.mem.Allocator) []Item {
     os.assertMainThread();
+    if (cache.arena == null) cache.arena = .init(gpa);
     const path = folderPath(arena) orelse return &.{};
     const folder_stamp = stamp(path);
     const cached = if (cache.stamp) |last| std.meta.eql(last, folder_stamp) else false;
     if (!cached) {
-        _ = cache.arena.reset(.retain_capacity);
-        cache.items = scan(cache.arena.allocator(), path);
+        const cache_arena = &cache.arena.?;
+        _ = cache_arena.reset(.retain_capacity);
+        cache.items = scan(cache_arena.allocator(), path);
         cache.stamp = folder_stamp;
     }
     const items = arena.alloc(Item, cache.items.len) catch return &.{};

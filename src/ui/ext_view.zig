@@ -413,7 +413,11 @@ fn find(registry: *const Host.Registry, id: []const u8) ?Host.CommandIndex {
 /// True when the open view lost what it shows. Call with `new` in place.
 fn remap(ui: *Ui, old: *const Host.Registry, new: *const Host.Registry) bool {
     ui.ext_command = sameCommand(old, new, ui.ext_command) orelse .gone;
-    const form = sameCommand(old, new, ui.form_command);
+    const candidate_form = sameCommand(old, new, ui.form_command);
+    const form = if (candidate_form) |form_index|
+        if (new.command(form_index).?.mode == .form) form_index else null
+    else
+        null;
     // A form whose fields changed starts over: values are kept by position.
     const same_form = if (form) |form_index|
         sameFields(old.command(ui.form_command).?.fields, new.command(form_index).?.fields)
@@ -690,7 +694,7 @@ pub fn perform(ui: *Ui, action_index: u8) void {
         },
         .open => |target| open(ui, target),
         .copy => |text| run.copy(text),
-        .paste => |text| run.pasteText(text),
+        .paste => |text| run.pasteText(ui.gpa, text),
         .exec => |argv| proc.spawn(argv),
     }
     ui.hide();
@@ -908,6 +912,26 @@ test "indexes into the registry follow their ids across a reload" {
     try testing.expect(sameFields(&name, &name));
     try testing.expect(!sameFields(&name, &renamed));
     try testing.expect(!sameFields(&name, &.{}));
+
+    // A form command whose mode changes on reload is treated as lost.
+    var old_form = testCommand("ext.act", &name);
+    old_form.mode = .form;
+    var new_list = testCommand("ext.act", &.{});
+    new_list.mode = .list;
+    const old_regs = [_]Host.Command{old_form};
+    const new_regs = [_]Host.Command{new_list};
+    const reg_old: Host.Registry = .{
+        .generation = @fromBackingInt(@as(u32, 3)),
+        .commands = &old_regs,
+        .arena = undefined,
+    };
+    const reg_new: Host.Registry = .{
+        .generation = @fromBackingInt(@as(u32, 4)),
+        .commands = &new_regs,
+        .arena = undefined,
+    };
+    try testing.expectEqual(@as(?Command, .from(0)), sameCommand(&reg_old, &reg_new, .from(0)));
+    try testing.expect(reg_new.command(.from(0)).?.mode != .form);
 }
 
 test "cleared ext_act_generation rejects late Lua action responses" {

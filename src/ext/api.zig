@@ -261,17 +261,25 @@ const prelude =
     \\local function check(key)
     \\  if type(key) ~= "string" then error("lumen.storage: keys are strings, not " .. type(key), 3) end
     \\end
-    \\local function clone(v)
+    \\local clone_depth_max = 32
+    \\local clone_nodes_max = 10000
+    \\local function clone(v, seen, depth, budget)
     \\  if type(v) ~= "table" then return v end
+    \\  if seen[v] then error("lumen.storage: cyclic table", 0) end
+    \\  if depth >= clone_depth_max then error("lumen.storage: table nested too deep", 0) end
+    \\  budget.n = budget.n + 1
+    \\  if budget.n > clone_nodes_max then error("lumen.storage: table too large", 0) end
+    \\  seen[v] = true
     \\  local out = {}
-    \\  for k, item in pairs(v) do out[k] = clone(item) end
+    \\  for k, item in pairs(v) do out[k] = clone(item, seen, depth + 1, budget) end
+    \\  seen[v] = nil
     \\  return out
     \\end
-    \\function storage.get(key) check(key) return clone(load()[key]) end
-    \\function storage.set(key, value) check(key) save(key, clone(value)) end
+    \\function storage.get(key) check(key) return clone(load()[key], {}, 0, { n = 0 }) end
+    \\function storage.set(key, value) check(key) save(key, clone(value, {}, 0, { n = 0 })) end
     \\function storage.remove(key) check(key) save(key, nil) end
     \\function storage.all()
-    \\  return clone(load())
+    \\  return clone(load(), {}, 0, { n = 0 })
     \\end
     \\lumen.storage = storage
 ;
@@ -464,17 +472,17 @@ fn theme(L: *lua.State) lua.Error!c_int {
     }
     const name = lua.fieldStringMax(L, arena, 1, "name", "theme", api_text_bytes_max) orelse
         return lua.fail(L, "theme.name is missing", .{});
-    const background = try color(L, arena, "bg", null);
-    const foreground = try color(L, arena, "fg", null);
+    const background = try color(L, "bg", null);
+    const foreground = try color(L, "fg", null);
     const new_theme: themes.Theme = .{
         .id = id,
         .name = name,
         .dark = lua.fieldBool(L, 1, "dark", true, "theme"),
         .background = background,
-        .surface = try color(L, arena, "surface", background),
+        .surface = try color(L, "surface", background),
         .foreground = foreground,
-        .ink = try color(L, arena, "ink", foreground),
-        .accent = try color(L, arena, "accent", null),
+        .ink = try color(L, "ink", foreground),
+        .accent = try color(L, "accent", null),
         .from_style = std.mem.eql(u8, extension.id, Host.style_extension_id),
     };
     load.themes.append(arena, new_theme) catch return lua.failOom(L);
@@ -484,14 +492,23 @@ fn theme(L: *lua.State) lua.Error!c_int {
 /// The theme's colour `field` (argument 1), or `default` when it has none.
 fn color(
     L: *lua.State,
-    arena: std.mem.Allocator,
     field: [:0]const u8,
     default: ?u24,
 ) lua.Error!u24 {
-    const text = lua.fieldString(L, arena, 1, field, "theme") orelse {
-        if (default) |default_color| return default_color;
-        return lua.fail(L, "theme.{s} is missing", .{field});
-    };
+    const mark: lua.StackMark = .init(L);
+    defer mark.restore(L);
+    switch (lua.getField(L, 1, field)) {
+        lua.c.LUA_TNIL => {
+            if (default) |default_color| return default_color;
+            return lua.fail(L, "theme.{s} is missing", .{field});
+        },
+        lua.c.LUA_TSTRING => {},
+        else => {
+            const type_name = lua.typeName(L, -1);
+            return lua.fail(L, "theme.{s}: string expected, got {s}", .{ field, type_name });
+        },
+    }
+    const text = lua.toSlice(L, -1).?;
     return parseHex(text) orelse
         lua.fail(L, "theme.{s}: \"#rrggbb\" expected (got \"{s}\")", .{ field, text });
 }

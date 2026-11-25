@@ -694,17 +694,25 @@ fn run(service: *Service) void {
         const fd = service.live.watcher.fd;
         service.lock.unlockShared(service.io);
         const retry_ms = service.retryWaitMs();
-        if (!sys.waitEventsTimeout(fd, service.wake_fd, retry_ms)) {
-            if (retry_ms >= 0 and !service.stop.load(.acquire) and
-                sys.monotonicNs() >= service.next_retry_ns)
-            {
-                if (service.probeRetryDirs()) {
-                    service.last_rescan_end_ns = null;
-                    service.backoff_ns = 0;
-                    service.rescan();
+        switch (sys.waitEventsTimeout(fd, service.wake_fd, retry_ms)) {
+            .ready => {},
+            .woken, .timed_out => {
+                if (retry_ms >= 0 and !service.stop.load(.acquire) and
+                    sys.monotonicNs() >= service.next_retry_ns)
+                {
+                    if (service.probeRetryDirs()) {
+                        service.last_rescan_end_ns = null;
+                        service.backoff_ns = 0;
+                        service.rescan();
+                    }
                 }
-            }
-            continue;
+                continue;
+            },
+            .failed => {
+                // Avoid busy-spinning if poll fails permanently (e.g. closed watcher fd).
+                if (!service.stop.load(.acquire)) sys.sleepUs(100 * std.time.us_per_ms);
+                continue;
+            },
         }
 
         _ = arena_state.reset(.retain_capacity);

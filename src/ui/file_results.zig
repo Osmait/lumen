@@ -87,11 +87,11 @@ pub fn itemsFromHits(
     return out.items;
 }
 
-/// What the content search asks for while the query is too short to look
-/// up, from the same minimum the search uses.
+/// What the content search asks for while no query word can narrow the
+/// trigram index, from the same minimum the search uses.
 const type_more_hint = std.fmt.comptimePrint(
-    "Type at least {d} characters",
-    .{search.content_query_bytes_min},
+    "Type a word of at least {d} characters",
+    .{index.content.trigram_chars},
 );
 
 /// The contents view's empty row, by how much is typed (`typed_bytes`).

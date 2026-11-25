@@ -226,7 +226,7 @@ fn appendStyleCss(ui: *Ui, writer: *std.Io.Writer) std.Io.Writer.Error!void {
     var path_bytes: [4096]u8 = undefined;
     const path = std.mem.printSentinel(&path_bytes, "{s}/style.css", .{folder}, 0) catch return;
     ui.appearance.style_css_stamp = settings_mod.Stamp.of(path.ptr);
-    const contents = style_css_file.read(path, ui.appearance.style_css_stamp) orelse return;
+    const contents = style_css_file.read(ui.gpa, path, ui.appearance.style_css_stamp) orelse return;
     try writer.print("\n/* {s} */\n", .{path});
     try writer.writeAll(contents);
     try writer.writeByte('\n');
@@ -248,12 +248,16 @@ const CssFile = struct {
     /// the one read last, else from a descriptor checked to be a regular
     /// file (a FIFO would block the window), `css_bytes_max` at most. Null
     /// when it cannot be read or is larger.
-    fn read(file: *CssFile, path: [:0]const u8, stamp: settings_mod.Stamp) ?[]const u8 {
+    fn read(
+        file: *CssFile,
+        gpa: std.mem.Allocator,
+        path: [:0]const u8,
+        stamp: settings_mod.Stamp,
+    ) ?[]const u8 {
         os.assertMainThread();
         const path_hash = std.hash.Wyhash.hash(0, path);
         const known = file.path_hash == path_hash and file.stamp.eql(stamp);
         if (known and !stamp.eql(.none)) return file.text.items;
-        const gpa = std.heap.c_allocator;
         file.text.clearRetainingCapacity();
         file.path_hash = 0;
         file.stamp = .none;
@@ -274,6 +278,14 @@ const CssFile = struct {
 var style_css_file: CssFile = .{};
 var user_css_file: CssFile = .{};
 
+pub fn shutdown(gpa: std.mem.Allocator) void {
+    os.assertMainThread();
+    style_css_file.text.deinit(gpa);
+    style_css_file = .{};
+    user_css_file.text.deinit(gpa);
+    user_css_file = .{};
+}
+
 /// $XDG_CONFIG_HOME/lumen/style.css, after Lumen's rules so it wins. The
 /// classes it can use are listed in EXTENSIONS.md.
 fn appendUserCss(ui: *Ui, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -285,7 +297,7 @@ fn appendUserCss(ui: *Ui, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         0,
     ) catch return;
     ui.appearance.user_css_stamp = settings_mod.Stamp.of(path.ptr);
-    const contents = user_css_file.read(path, ui.appearance.user_css_stamp) orelse return;
+    const contents = user_css_file.read(ui.gpa, path, ui.appearance.user_css_stamp) orelse return;
     try writer.writeAll("\n/* ~/.config/lumen/style.css */\n");
     try writer.writeAll(contents);
     try writer.writeByte('\n');

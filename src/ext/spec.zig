@@ -155,12 +155,20 @@ fn fieldName(
     table: c_int,
     where: []const u8,
 ) [:0]const u8 {
-    const name = lua.fieldString(L, arena, table, "name", where) orelse
-        lua.raise(L, "{s}.name is missing", .{where});
-    if (!Host.validId(name)) {
-        lua.raise(L, "{s}.name: use only a-z, 0-9, - and _ (got \"{s}\")", .{ where, name });
+    const mark: lua.StackMark = .init(L);
+    defer mark.restore(L);
+    switch (lua.getField(L, table, "name")) {
+        lua.c.LUA_TNIL => lua.raise(L, "{s}.name is missing", .{where}),
+        lua.c.LUA_TSTRING, lua.c.LUA_TNUMBER => {},
+        else => lua.raise(L, "{s}.name: string expected, got {s}", .{ where, lua.typeName(L, -1) }),
     }
-    return name;
+    var length: usize = 0;
+    const bytes = lua.c.lua_tolstring(L, -1, &length);
+    const raw = bytes[0..length];
+    if (!Host.validId(raw)) {
+        lua.raise(L, "{s}.name: use only a-z, 0-9, - and _ (got \"{s}\")", .{ where, raw });
+    }
+    return arena.dupeSentinel(u8, raw, 0) catch lua.oom(L);
 }
 
 /// A choice's `choices`: strings, or tables with a value and a title.
@@ -226,12 +234,7 @@ fn parseField(
 ) Preference {
     const arena = context.load.arena;
     const name = fieldName(L, arena, field_table, where);
-    const kind_name = lua.fieldString(L, arena, field_table, "type", where) orelse "text";
-    const kind = std.meta.stringToEnum(PreferenceKind, kind_name) orelse lua.raise(
-        L,
-        "{s}.type: toggle, choice, text or password (got \"{s}\")",
-        .{ where, kind_name },
-    );
+    const kind = fieldPreferenceKind(L, field_table, where);
     const file = arena.printSentinel("{s}/preferences.json", .{context.extension.data}, 0) catch
         lua.oom(L);
     var preference: Preference = .{
@@ -280,7 +283,40 @@ fn parseField(
             spec_text_bytes_max,
         ) orelse "",
     };
+    if (kind == .choice and preference.default.len > 0) {
+        var matched = false;
+        for (preference.choices) |choice| {
+            if (std.mem.eql(u8, choice.value, preference.default)) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            lua.raise(L, "{s}.default: \"{s}\" is not one of the choices", .{
+                where,
+                preference.default,
+            });
+        }
+    }
     return preference;
+}
+
+fn fieldPreferenceKind(L: *lua.State, field_table: c_int, where: []const u8) PreferenceKind {
+    const mark: lua.StackMark = .init(L);
+    defer mark.restore(L);
+    switch (lua.getField(L, field_table, "type")) {
+        lua.c.LUA_TNIL => return .text,
+        lua.c.LUA_TSTRING, lua.c.LUA_TNUMBER => {},
+        else => lua.raise(L, "{s}.type: string expected, got {s}", .{ where, lua.typeName(L, -1) }),
+    }
+    var length: usize = 0;
+    const bytes = lua.c.lua_tolstring(L, -1, &length);
+    const raw = bytes[0..length];
+    return std.meta.stringToEnum(PreferenceKind, raw) orelse lua.raise(
+        L,
+        "{s}.type: toggle, choice, text or password (got \"{s}\")",
+        .{ where, raw },
+    );
 }
 
 /// The field of a command that sets its mode.

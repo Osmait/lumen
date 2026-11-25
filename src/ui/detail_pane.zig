@@ -175,7 +175,7 @@ const preview_px = 2048;
 /// each); now on a worker (`pictures.requestPicture`: within
 /// `picture_limits`, one at a time, a request the selection has left
 /// behind dropped before it is decoded), and not again for the same file.
-fn showImage(detail: *DetailPane, path: [:0]const u8, mtime: i64) void {
+fn showImage(gpa: std.mem.Allocator, detail: *DetailPane, path: [:0]const u8, mtime: i64) void {
     const shown_path = detail.image_path[0..detail.image_path_length];
     const same_image = detail.image_mtime == mtime and std.mem.eql(u8, shown_path, path);
     if (same_image) return;
@@ -185,6 +185,7 @@ fn showImage(detail: *DetailPane, path: [:0]const u8, mtime: i64) void {
     detail.image_path_length = path.len;
     detail.image_mtime = mtime;
     pictures.requestPicture(
+        gpa,
         path,
         preview_px,
         preview_px,
@@ -236,7 +237,7 @@ pub fn showFileDetail(ui: *Ui, item: *const Item) void {
     const info = if (slow) null else os.info(file.path);
     gtk.setVisible(ui.detail.picture, image);
     if (image) {
-        showImage(&ui.detail, file.path, if (info) |file_info| file_info.mtime else 0);
+        showImage(ui.gpa, &ui.detail, file.path, if (info) |file_info| file_info.mtime else 0);
     } else {
         forgetImage(&ui.detail);
     }

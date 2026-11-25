@@ -389,7 +389,20 @@ fn contentLive(
         .build = build_pool,
     });
     defer service.shutdown();
-    while (!service.status().ready) sys.sleepUs(10_000);
+    const wait_deadline_ns = sys.monotonicNs() + 60 * std.time.ns_per_s;
+    while (true) {
+        const s = service.status();
+        if (s.ready) break;
+        if (!s.building and s.checks > 0 and s.list_failed) {
+            std.debug.print("lumen-find content-live: failed to index {s}\n", .{home});
+            return error.IndexFailed;
+        }
+        if (sys.monotonicNs() >= wait_deadline_ns) {
+            std.debug.print("lumen-find content-live: timed out waiting for index of {s}\n", .{home});
+            return error.Timeout;
+        }
+        sys.sleepUs(10_000);
+    }
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     var hits: std.ArrayList(index.ContentService.Hit) = .empty;

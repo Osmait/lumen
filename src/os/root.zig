@@ -50,8 +50,10 @@ pub const DirIter = folder.DirIter;
 pub const subdirs = folder.subdirs;
 pub const mkdirP = folder.mkdirP;
 pub const makePrivate = folder.makePrivate;
+pub const ensurePrivateDir = folder.ensurePrivateDir;
 
 pub const openRegular = file.openRegular;
+pub const ensurePrivateFile = file.ensurePrivateFile;
 pub const readHead = file.readHead;
 pub const ReadUpToError = file.ReadUpToError;
 pub const readUpTo = file.readUpTo;
@@ -78,6 +80,7 @@ pub const sleepUs = time.sleepUs;
 
 pub const waitExit = wait.waitExit;
 pub const waitExitCancelable = wait.waitExitCancelable;
+pub const EventWait = wait.EventWait;
 pub const waitEvents = wait.waitEvents;
 pub const waitEventsTimeout = wait.waitEventsTimeout;
 pub const waitReadable = wait.waitReadable;

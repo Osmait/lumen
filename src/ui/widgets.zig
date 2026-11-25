@@ -190,6 +190,7 @@ fn fileKey(path: [*:0]const u8, width_px: c_int, height_px: c_int) ?u64 {
 /// keeps one (applyLayout, applyStructure, scanIconDir fill it) and hands
 /// it to the row builders.
 pub const RowLook = struct {
+    gpa: std.mem.Allocator = std.heap.c_allocator,
     /// Icon size, from the Density setting.
     icon_px: c_int = themes.densitySizes(.default).icon_px,
     /// Icons replaced by name: ~/.config/lumen/icons/<name>.svg (or .png)
@@ -213,7 +214,13 @@ const RowIcons = struct {
 
     /// A row's icon waiting for its picture; its widgets are referenced
     /// until then.
-    const Wait = struct { key: u64, size_px: c_int, holder: *c.GtkBox, placeholder: *c.GtkWidget };
+    const Wait = struct {
+        gpa: std.mem.Allocator,
+        key: u64,
+        size_px: c_int,
+        holder: *c.GtkBox,
+        placeholder: *c.GtkWidget,
+    };
 
     /// The icon for the image at `path`: from the ring, or a placeholder in
     /// a box that the picture replaces once decoded.
@@ -232,13 +239,19 @@ const RowIcons = struct {
         gtk.setValign(holder, c.GTK_ALIGN_CENTER);
         const placeholder = iconWidget(look, .none, size_px);
         gtk.append(holder, placeholder);
-        const wait = std.heap.c_allocator.create(Wait) catch return gtk.widget(holder);
+        const wait = look.gpa.create(Wait) catch return gtk.widget(holder);
         // Not in a row yet: its reference is still floating (see GridPictures).
         _ = c.g_object_ref_sink(holder);
         _ = c.g_object_ref(placeholder);
-        wait.* = .{ .key = key, .size_px = size_px, .holder = holder, .placeholder = placeholder };
+        wait.* = .{
+            .gpa = look.gpa,
+            .key = key,
+            .size_px = size_px,
+            .holder = holder,
+            .placeholder = placeholder,
+        };
         const lane = &pictures.icon_lane;
-        pictures.requestPicture(path, decode_px, decode_px, lane, .back, &requestCallback, wait);
+        pictures.requestPicture(look.gpa, path, decode_px, decode_px, lane, .back, &requestCallback, wait);
         return gtk.widget(holder);
     }
 
@@ -255,7 +268,7 @@ const RowIcons = struct {
         defer {
             c.g_object_unref(wait.holder);
             c.g_object_unref(wait.placeholder);
-            std.heap.c_allocator.destroy(wait);
+            wait.gpa.destroy(wait);
         }
         // Dropped for a newer build before it was decoded: nothing learnt.
         if (decoded == null and !current) return;
@@ -359,7 +372,9 @@ pub fn gridCell(look: *const RowLook, item: Item, width_px: c_int) *c.GtkWidget 
     gtk.setHexpand(title, true);
     gtk.append(box, title);
     gtk.setSizeRequest(box, width_px, -1);
-    if (decode) GridPictures.request(item.image, width_px, picture_height_px, key.?, box, shown);
+    if (decode) {
+        GridPictures.request(look.gpa, item.image, width_px, picture_height_px, key.?, box, shown);
+    }
     return gtk.widget(box);
 }
 
@@ -382,9 +397,16 @@ const GridPictures = struct {
     var ring: TextureRing(grid_picture_cache_entries, u64) = .{};
 
     /// A cell waiting for its picture; its widgets are referenced until then.
-    const Wait = struct { key: u64, height_px: c_int, box: *c.GtkBox, icon: *c.GtkWidget };
+    const Wait = struct {
+        gpa: std.mem.Allocator,
+        key: u64,
+        height_px: c_int,
+        box: *c.GtkBox,
+        icon: *c.GtkWidget,
+    };
 
     fn request(
+        gpa: std.mem.Allocator,
         path: []const u8,
         width_px: c_int,
         height_px: c_int,
@@ -392,15 +414,21 @@ const GridPictures = struct {
         box: *c.GtkBox,
         icon: *c.GtkWidget,
     ) void {
-        const wait = std.heap.c_allocator.create(Wait) catch return;
+        const wait = gpa.create(Wait) catch return;
         // The cell is not in the grid yet: its reference is still floating.
         // A plain ref left it floating, so the grid's ref_sink took that one
         // and a cell never added leaked; sunk here, the grid adds its own.
         _ = c.g_object_ref_sink(box);
         _ = c.g_object_ref(icon);
-        wait.* = .{ .key = key, .height_px = height_px, .box = box, .icon = icon };
+        wait.* = .{
+            .gpa = gpa,
+            .key = key,
+            .height_px = height_px,
+            .box = box,
+            .icon = icon,
+        };
         const lane = &pictures.grid_lane;
-        pictures.requestPicture(path, width_px, height_px, lane, .back, &requestCallback, wait);
+        pictures.requestPicture(gpa, path, width_px, height_px, lane, .back, &requestCallback, wait);
     }
 
     fn requestCallback(context: ?*anyopaque, decoded: ?*c.GdkPixbuf, current: bool) void {
@@ -408,7 +436,7 @@ const GridPictures = struct {
         defer {
             c.g_object_unref(wait.box);
             c.g_object_unref(wait.icon);
-            std.heap.c_allocator.destroy(wait);
+            wait.gpa.destroy(wait);
         }
         // Dropped for a newer build before it was decoded: nothing learnt.
         if (decoded == null and !current) return;

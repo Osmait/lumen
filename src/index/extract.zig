@@ -75,29 +75,44 @@ pub fn extractText(
         return shrink(gpa, raw, bytes_max);
     }
 
-    const members: []const []const u8 = switch (kind) {
+    var extra_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer extra_arena.deinit();
+    var extra_members: []const []const u8 = &.{};
+    if (kind == .docx) {
+        const rels_xml = try runUnzipMembers(
+            gpa,
+            io,
+            fd,
+            &.{"word/_rels/document.xml.rels"},
+            docx_rels_bytes_max,
+            cancel,
+        );
+        defer gpa.free(rels_xml);
+        // The first unzip read `fd` to EOF; rewind before reading the document parts.
+        _ = linux.lseek(fd, 0, linux.SEEK.SET);
+        extra_members = try parseDocxRelsMembers(extra_arena.allocator(), rels_xml);
+    }
+
+    const base_members: []const []const u8 = switch (kind) {
         .pdf => unreachable, // Handled above.
-        .docx => &.{ "word/document.xml", "word/footnotes.xml", "word/endnotes.xml" },
+        .docx => &docx_base_members,
         .xlsx => &.{ "xl/sharedStrings.xml", "xl/worksheets/sheet*.xml" },
         .pptx => &.{"ppt/slides/slide*.xml"},
         .odt, .ods, .odp => &.{"content.xml"},
     };
-    var argv: [8][]const u8 = undefined;
-    // An encrypted member fails (exit 82) instead of prompting.
-    const argv_head = [_][]const u8{ "unzip", "-P", "", "-p", "/dev/stdin" };
-    @memcpy(argv[0..argv_head.len], &argv_head);
-    @memcpy(argv[argv_head.len..][0..members.len], members);
+    var members_buf: [docx_base_members.len + docx_extra_members_max][]const u8 = undefined;
+    const members_len = base_members.len + extra_members.len;
+    @memcpy(members_buf[0..base_members.len], base_members);
+    @memcpy(members_buf[base_members.len..members_len], extra_members);
 
     // Markup outweighs text several times over; the cap only guards memory.
     const xml_bytes_read_max = @max(bytes_max, @min(bytes_max *| xml_per_text_max, xml_bytes_max));
-    const xml = try runTool(
+    const xml = try runUnzipMembers(
         gpa,
         io,
-        argv[0 .. argv_head.len + members.len],
         fd,
+        members_buf[0..members_len],
         xml_bytes_read_max,
-        &.{ unzip_exit.ok, unzip_exit.member_missing },
-        timeout_ms,
         cancel,
     );
     defer gpa.free(xml);
@@ -106,6 +121,156 @@ pub fn extractText(
     else
         try xmlToText(gpa, xml, bytes_max);
     return shrink(gpa, extracted, bytes_max);
+}
+
+const docx_rels_bytes_max = 256 << 10;
+const docx_extra_members_max = 16;
+const docx_base_members = [_][]const u8{
+    "word/document.xml",
+    "word/footnotes.xml",
+    "word/endnotes.xml",
+};
+
+fn runUnzipMembers(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    fd: i32,
+    members: []const []const u8,
+    output_bytes_max: usize,
+    cancel: ?*const std.atomic.Value(bool),
+) ExtractError![]u8 {
+    // An encrypted member fails (exit 82) instead of prompting.
+    const argv_head = [_][]const u8{ "unzip", "-P", "", "-p", "/dev/stdin" };
+    var argv: [argv_head.len + docx_base_members.len + docx_extra_members_max][]const u8 = undefined;
+    @memcpy(argv[0..argv_head.len], &argv_head);
+    @memcpy(argv[argv_head.len..][0..members.len], members);
+    return runTool(
+        gpa,
+        io,
+        argv[0 .. argv_head.len + members.len],
+        fd,
+        output_bytes_max,
+        &.{ unzip_exit.ok, unzip_exit.member_missing },
+        timeout_ms,
+        cancel,
+    );
+}
+
+/// Parses `word/_rels/document.xml.rels` for linked internal header/footer XML
+/// members, normalized relative to the archive root and deduplicated.
+fn parseDocxRelsMembers(
+    arena: std.mem.Allocator,
+    xml: []const u8,
+) std.mem.Allocator.Error![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var i: usize = 0;
+    while (i < xml.len and out.items.len < docx_extra_members_max) {
+        const lt = std.mem.findScalarPos(u8, xml, i, '<') orelse break;
+        if (nonTagMarkupEnd(xml, lt)) |next| {
+            i = next;
+            continue;
+        }
+        const tag = Tag.parse(xml, lt) orelse break;
+        i = tag.end + 1;
+        if (tag.closing or !std.mem.eql(u8, tag.local, "Relationship")) continue;
+        const rel_type = tagAttribute(xml, lt, tag.end, "Type") orelse continue;
+        const target = tagAttribute(xml, lt, tag.end, "Target") orelse continue;
+        const target_mode = tagAttribute(xml, lt, tag.end, "TargetMode") orelse "";
+        if (std.ascii.eqlIgnoreCase(target_mode, "External")) continue;
+        if (!std.mem.endsWith(u8, rel_type, "/header") and
+            !std.mem.endsWith(u8, rel_type, "/footer")) continue;
+        const normalized = try normalizeDocxTarget(arena, target) orelse continue;
+        if (containsMember(&docx_base_members, normalized) or containsMember(out.items, normalized)) {
+            continue;
+        }
+        try out.append(arena, normalized);
+    }
+    return out.items;
+}
+
+fn containsMember(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |member| {
+        if (std.mem.eql(u8, member, needle)) return true;
+    }
+    return false;
+}
+
+fn nonTagMarkupEnd(xml: []const u8, i: usize) ?usize {
+    const rest = xml[i..];
+    if (std.mem.startsWith(u8, rest, "<!--")) {
+        const end = std.mem.findPos(u8, xml, i + "<!--".len, "-->") orelse return xml.len;
+        return end + "-->".len;
+    }
+    if (std.mem.startsWith(u8, rest, "<![CDATA[")) {
+        const end = std.mem.findPos(u8, xml, i + "<![CDATA[".len, "]]>") orelse return xml.len;
+        return end + "]]>".len;
+    }
+    if (std.mem.startsWith(u8, rest, "<?")) {
+        const end = std.mem.findPos(u8, xml, i + "<?".len, "?>") orelse return xml.len;
+        return end + "?>".len;
+    }
+    if (std.mem.startsWith(u8, rest, "<!")) {
+        const end = std.mem.findScalarPos(u8, xml, i + "<!".len, '>') orelse return xml.len;
+        return end + 1;
+    }
+    return null;
+}
+
+fn tagAttribute(xml: []const u8, tag_start: usize, tag_end: usize, attr_name: []const u8) ?[]const u8 {
+    var pos = tag_start + 1;
+    while (pos < tag_end and !isSpace(xml[pos])) pos += 1;
+    while (pos < tag_end) {
+        while (pos < tag_end and (isSpace(xml[pos]) or xml[pos] == '/')) pos += 1;
+        if (pos >= tag_end) break;
+        const name_start = pos;
+        while (pos < tag_end and !isSpace(xml[pos]) and xml[pos] != '=' and xml[pos] != '/') pos += 1;
+        const name = xml[name_start..pos];
+        while (pos < tag_end and isSpace(xml[pos])) pos += 1;
+        if (pos >= tag_end or xml[pos] != '=') continue;
+        pos += 1;
+        while (pos < tag_end and isSpace(xml[pos])) pos += 1;
+        if (pos >= tag_end) break;
+        const quote = xml[pos];
+        if (quote != '"' and quote != '\'') continue;
+        pos += 1;
+        const val_start = pos;
+        while (pos < tag_end and xml[pos] != quote) pos += 1;
+        if (pos >= tag_end) break;
+        const val = xml[val_start..pos];
+        pos += 1;
+        if (std.mem.eql(u8, name, attr_name)) return val;
+    }
+    return null;
+}
+
+fn normalizeDocxTarget(arena: std.mem.Allocator, raw_target: []const u8) std.mem.Allocator.Error!?[]const u8 {
+    if (raw_target.len == 0) return null;
+    for (raw_target) |ch| {
+        if (ch < 0x20 or ch == '\\' or ch == '*' or ch == '?' or ch == '[' or ch == ']') return null;
+    }
+    var parts: [16][]const u8 = undefined;
+    var count: usize = 0;
+    const is_abs = raw_target[0] == '/';
+    if (!is_abs) {
+        parts[0] = "word";
+        count = 1;
+    }
+    var it = std.mem.tokenizeScalar(u8, std.mem.trimStart(u8, raw_target, "/"), '/');
+    while (it.next()) |component| {
+        if (std.mem.eql(u8, component, ".")) continue;
+        if (std.mem.eql(u8, component, "..")) {
+            if (count == 0) return null;
+            count -= 1;
+            continue;
+        }
+        if (count >= parts.len) return null;
+        parts[count] = component;
+        count += 1;
+    }
+    if (count == 0) return null;
+    const joined = try std.mem.join(arena, "/", parts[0..count]);
+    if (joined[0] == '-') return null;
+    return joined;
 }
 
 pub const Error = sys.Error || error{
@@ -700,6 +865,32 @@ test "extract docx, xlsx, pptx (OOXML)" {
     );
     try zipInto(&test_dir, "d", "doc.docx");
     try expectExtract(&test_dir, "doc.docx", "Quarterly report\nIngresos & gastos — año\nA footnote");
+
+    try test_dir.write("dh/[Content_Types].xml", "<?xml version=\"1.0\"?><Types/>");
+    try test_dir.write(
+        "dh/word/document.xml",
+        "<w:document><w:body><w:p><w:r><w:t>ArenaAllocator</w:t></w:r></w:p></w:body></w:document>",
+    );
+    try test_dir.write(
+        "dh/word/header1.xml",
+        "<w:hdr><w:p><w:r><w:t>HeaderUseState</w:t></w:r></w:p></w:hdr>",
+    );
+    try test_dir.write(
+        "dh/word/footer1.xml",
+        "<w:ftr><w:p><w:r><w:t>FooterUniqueToken</w:t></w:r></w:p></w:ftr>",
+    );
+    try test_dir.write("dh/word/_rels/document.xml.rels",
+        \\<?xml version="1.0" encoding="UTF-8"?>
+        \\<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+        \\  <!-- <Relationship Type=".../header" Target="ignored.xml"/> -->
+        \\  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/>
+        \\  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="/word/footer1.xml"/>
+        \\  <Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="https://example.com/h" TargetMode="External"/>
+        \\  <Relationship Id="rId4" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="../../etc/passwd"/>
+        \\</Relationships>
+    );
+    try zipInto(&test_dir, "dh", "headers.docx");
+    try expectExtract(&test_dir, "headers.docx", "ArenaAllocator\nFooterUniqueToken\nHeaderUseState");
 
     try test_dir.write(
         "x/xl/sharedStrings.xml",

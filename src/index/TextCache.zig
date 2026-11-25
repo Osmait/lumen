@@ -70,9 +70,12 @@ pub fn path(cache: TextCache, path_buffer: []u8, doc: DocIn) ?[:0]const u8 {
 
 fn nameOf(name_buffer: *[name_bytes_max]u8, doc: DocIn) []const u8 {
     var hash_hex: [32]u8 = undefined;
-    // Bump xlsx cache key suffix (-v2) so stale sharedStrings-only caches get re-extracted
-    // with inlineStr worksheet text support.
-    const suffix = if (extract.kindOf(doc.path) == .xlsx) "-v2" else "";
+    // Bump xlsx and docx cache key suffix (-v2) so stale entries re-extract
+    // with inlineStr worksheet text and docx header/footer support.
+    const suffix = switch (extract.kindOf(doc.path) orelse .pdf) {
+        .xlsx, .docx => "-v2",
+        else => "",
+    };
     return std.mem.print(
         name_buffer,
         "{s}-{d}-{d}{s}.txt",
@@ -208,8 +211,9 @@ fn namesKept(
         var name_buffer: [name_bytes_max]u8 = undefined;
         const name = try arena.dupe(u8, nameOf(&name_buffer, doc));
         try keep.put(arena, name, name);
-        // Legacy xlsx entries missed inlineStr text; let sweep drop them so they re-extract.
-        if (extract.kindOf(doc.path) == .xlsx) continue;
+        // Legacy xlsx and docx entries missed inlineStr / headers & footers; let sweep drop them.
+        const doc_kind = extract.kindOf(doc.path);
+        if (doc_kind == .xlsx or doc_kind == .docx) continue;
         const legacy_hash = std.hash.Wyhash.hash(0, doc.path);
         const legacy_with_size = try arena.print("{x:0>16}-{d}-{d}.txt", .{
             legacy_hash,
@@ -226,12 +230,15 @@ fn namesKept(
     return keep;
 }
 
-test "xlsx uses versioned cache keys while other docs keep legacy rename compatibility" {
+test "xlsx and docx use versioned cache keys while other docs keep legacy rename compatibility" {
     const testing = std.testing;
     var buf: [name_bytes_max]u8 = undefined;
     const xlsx_name = nameOf(&buf, .{ .path = "/tmp/book.xlsx", .mtime = 10, .size = 20, .source = .extracted });
     try testing.expect(std.mem.endsWith(u8, xlsx_name, "-10-20-v2.txt"));
     var docx_buf: [name_bytes_max]u8 = undefined;
     const docx_name = nameOf(&docx_buf, .{ .path = "/tmp/doc.docx", .mtime = 10, .size = 20, .source = .extracted });
-    try testing.expect(std.mem.endsWith(u8, docx_name, "-10-20.txt"));
+    try testing.expect(std.mem.endsWith(u8, docx_name, "-10-20-v2.txt"));
+    var odt_buf: [name_bytes_max]u8 = undefined;
+    const odt_name = nameOf(&odt_buf, .{ .path = "/tmp/doc.odt", .mtime = 10, .size = 20, .source = .extracted });
+    try testing.expect(std.mem.endsWith(u8, odt_name, "-10-20.txt"));
 }

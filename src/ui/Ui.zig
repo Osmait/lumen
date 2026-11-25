@@ -332,6 +332,7 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, app: *c.GtkApplication, db: Db) 
         .data_arena = .init(gpa),
         .query_arena = .init(gpa),
         .frecency_arena = .init(gpa),
+        .row_look = .{ .gpa = gpa },
     };
 }
 
@@ -349,11 +350,14 @@ pub fn build(self: *Ui) void {
         .{std.mem.span(c.g_get_user_config_dir())},
         0,
     ) catch "";
-    self.settings_path = self.gpa.printSentinel(
-        "{s}/settings.conf",
-        .{self.config_dir},
-        0,
-    ) catch "";
+    self.settings_path = if (self.config_dir.len > 0)
+        self.gpa.printSentinel(
+            "{s}/settings.conf",
+            .{self.config_dir},
+            0,
+        ) catch ""
+    else
+        "";
     config.watchColorScheme(self);
     config.reloadSettings(self);
 
@@ -798,7 +802,10 @@ pub fn removeSources(self: *Ui) void {
         self.scroll.tick = 0;
     }
     dmenu.finish(self, null);
+    choose_view.setChoosing(self, .none);
     pictures.shutdown();
+    config.shutdown(self.gpa);
+    @import("../providers/scripts.zig").shutdown();
     installer.shutdown();
     ext_view.cancelPendingCommands(self);
 }

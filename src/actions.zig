@@ -58,7 +58,7 @@ pub fn perform(context: Context, item: *const Item, operation: item_mod.Operatio
         .clip_delete => deleteClip(context, item),
         .clip_clear => clearClips(context),
         .calc_copy, .copy_detail => hideAfter(copy(item.detail)),
-        .calc_paste => hideAfter(pasteText(item.detail)),
+        .calc_paste => hideAfter(pasteText(context.gpa, item.detail)),
         // The UI runs extension actions (ext_view.zig) and dmenu answers.
         .ext, .pick_typed => .stay,
     };
@@ -120,6 +120,7 @@ fn resetRanking(context: Context, item: *const Item) Outcome {
 fn closeWindow(context: Context, item: *const Item) Outcome {
     assert(item.action == .focus_window);
     const address = item.action.focus_window;
+    if (!hypr.validAddress(address)) return .stay;
     var command_buffer: [64]u8 = undefined;
     const command = std.mem.print(&command_buffer, "closewindow address:{s}", .{address}) catch
         return .stay;
@@ -129,7 +130,7 @@ fn closeWindow(context: Context, item: *const Item) Outcome {
 
 fn pasteClip(context: Context, item: *const Item) void {
     touchClip(context, item);
-    pasteText(item.detail);
+    pasteText(context.gpa, item.detail);
 }
 
 fn copyClip(context: Context, item: *const Item) void {
@@ -495,6 +496,7 @@ fn launch(app_info: *c.GAppInfo) void {
 
 fn focusWindow(context: Context, item: *const Item) void {
     assert(item.action == .focus_window);
+    if (!hypr.validAddress(item.action.focus_window)) return;
     var command_buffer: [64]u8 = undefined;
     const command = std.mem.print(
         &command_buffer,
@@ -590,14 +592,15 @@ pub fn copy(text: []const u8) void {
 /// once both the focus is back (Hyprland says so, ~2 ms, else after
 /// `paste_focus_wait_ms`) and wl-copy owns the selection (it exits then).
 /// Sent on the focus alone, a busy machine pasted the previous clipboard.
-pub fn pasteText(text: []const u8) void {
+pub fn pasteText(gpa: std.mem.Allocator, text: []const u8) void {
     os.assertMainThread();
     paste_wait = .{ .generation = paste_wait.generation +% 1 };
-    proc.pipeToThen(&.{"wl-copy"}, text, .{
+    const generation = paste_wait.generation;
+    proc.pipeToThen(gpa, &.{"wl-copy"}, text, .{
         .callback = &pasteCopied,
-        .context = paste_wait.generation,
+        .context = generation,
     });
-    hypr.afterFocusChange(&pasteFocused, paste_focus_wait_ms);
+    hypr.afterFocusChange(&pasteFocused, generation, paste_focus_wait_ms);
 }
 
 /// The paste in progress: what it still waits for. Main thread only.
@@ -623,8 +626,9 @@ fn pasteCopied(generation: usize, ok: bool) void {
     if (paste_wait.focused) pasteNow();
 }
 
-fn pasteFocused() void {
+fn pasteFocused(generation: usize) void {
     os.assertMainThread();
+    if (generation != paste_wait.generation) return;
     paste_wait.focused = true;
     if (paste_wait.copied) pasteNow();
 }
@@ -748,4 +752,13 @@ test "terminals get Ctrl+Shift+V, everything else Ctrl+V" {
     try std.testing.expectEqual(Chord.ctrl_v, pasteChord("discord"));
     try std.testing.expectEqual(Chord.ctrl_v, pasteChord("brave-browser"));
     try std.testing.expectEqual(Chord.ctrl_v, pasteChord(""));
+}
+
+test "pasteFocused ignores stale focus callback generation" {
+    paste_wait = .{ .generation = 7, .copied = false, .focused = false };
+    defer paste_wait = .{};
+    pasteFocused(6);
+    try std.testing.expect(!paste_wait.focused);
+    pasteFocused(7);
+    try std.testing.expect(paste_wait.focused);
 }

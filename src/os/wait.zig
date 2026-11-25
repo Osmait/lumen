@@ -52,26 +52,56 @@ pub fn waitExitCancelable(
     }
 }
 
-/// Waits until `fd` is readable (true) or `wake` is written (false). Without
-/// `wake`, it gives up every 100 ms so the caller can look around.
-pub fn waitEvents(fd: i32, wake: ?i32) bool {
+pub const EventWait = enum { ready, woken, timed_out, failed };
+
+/// Waits until `fd` is readable (`.ready`) or `wake` is written (`.woken`).
+/// Without `wake`, gives up every 100 ms so the caller can look around.
+pub fn waitEvents(fd: i32, wake: ?i32) EventWait {
     return waitEventsTimeout(fd, wake, -1);
 }
 
 /// Like `waitEvents`, but waits at most `timeout_ms` ms when `timeout_ms >= 0`.
-pub fn waitEventsTimeout(fd: i32, wake: ?i32, timeout_ms: i32) bool {
-    var poll_fds = [2]linux.pollfd{
-        .{ .fd = fd, .events = linux.POLL.IN, .revents = 0 },
-        .{ .fd = wake orelse -1, .events = linux.POLL.IN, .revents = 0 },
-    };
-    const poll_fds_count: usize = if (wake == null) 1 else 2;
+pub fn waitEventsTimeout(fd: i32, wake: ?i32, timeout_ms: i32) EventWait {
+    if (fd < 0) return .failed;
     const effective_timeout_ms: i32 = if (wake == null)
         (if (timeout_ms >= 0 and timeout_ms < 100) timeout_ms else 100)
     else
         timeout_ms;
-    const ready_count = linux.poll(&poll_fds, poll_fds_count, effective_timeout_ms);
-    if (linux.errno(ready_count) != .SUCCESS) return false;
-    return ready_count > 0 and poll_fds[0].revents & linux.POLL.IN != 0;
+    const deadline_ns: ?u64 = if (effective_timeout_ms >= 0)
+        os.monotonicNs() + @as(u64, @intCast(effective_timeout_ms)) * std.time.ns_per_ms
+    else
+        null;
+    const poll_fds_count: usize = if (wake == null) 1 else 2;
+    while (true) {
+        const remaining_ms: i32 = if (deadline_ns) |limit| blk: {
+            if (effective_timeout_ms == 0) break :blk 0;
+            const now_ns = os.monotonicNs();
+            if (now_ns >= limit) return .timed_out;
+            const left_ms = (limit - now_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms;
+            break :blk @intCast(@min(left_ms, std.math.maxInt(i32)));
+        } else -1;
+        var poll_fds = [2]linux.pollfd{
+            .{ .fd = fd, .events = linux.POLL.IN, .revents = 0 },
+            .{ .fd = wake orelse -1, .events = linux.POLL.IN, .revents = 0 },
+        };
+        const ready_count = linux.poll(&poll_fds, poll_fds_count, remaining_ms);
+        switch (linux.errno(ready_count)) {
+            .SUCCESS => {},
+            .INTR => continue,
+            else => return .failed,
+        }
+        if (ready_count == 0) return .timed_out;
+        if (poll_fds[0].revents & linux.POLL.NVAL != 0) return .failed;
+        if (poll_fds_count > 1 and poll_fds[1].revents & linux.POLL.NVAL != 0) return .failed;
+        if (poll_fds_count > 1 and poll_fds[1].revents & linux.POLL.IN != 0) return .woken;
+        if (poll_fds[0].revents & (linux.POLL.ERR | linux.POLL.HUP) != 0 and
+            poll_fds[0].revents & linux.POLL.IN == 0)
+        {
+            return .failed;
+        }
+        if (poll_fds[0].revents & linux.POLL.IN != 0) return .ready;
+        return .failed;
+    }
 }
 
 /// No deadline: `pollUntil` waits as long as it takes.
@@ -131,4 +161,34 @@ test "waitExitCancelable returns immediately when pidfd_open fails" {
     const ok = waitExitCancelable(-1, start_ns + 5 * std.time.ns_per_s, &cancel, 50);
     try std.testing.expect(!ok);
     try std.testing.expect(os.monotonicNs() - start_ns < std.time.ns_per_s);
+}
+
+test "waitEventsTimeout distinguishes ready, woken, timed_out and POLLNVAL" {
+    try std.testing.expectEqual(EventWait.failed, waitEventsTimeout(-1, null, 0));
+
+    var event_pipe: [2]i32 = undefined;
+    var wake_pipe: [2]i32 = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&event_pipe, .{ .CLOEXEC = true })));
+    defer for (event_pipe) |p| os.close(p);
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&wake_pipe, .{ .CLOEXEC = true })));
+    defer for (wake_pipe) |p| os.close(p);
+
+    try std.testing.expectEqual(EventWait.timed_out, waitEventsTimeout(event_pipe[0], wake_pipe[0], 0));
+
+    var one: [1]u8 = .{'w'};
+    _ = linux.write(wake_pipe[1], &one, 1);
+    try std.testing.expectEqual(EventWait.woken, waitEventsTimeout(event_pipe[0], wake_pipe[0], 100));
+
+    var drain: [1]u8 = undefined;
+    _ = linux.read(wake_pipe[0], &drain, 1);
+    _ = linux.write(event_pipe[1], &one, 1);
+    try std.testing.expectEqual(EventWait.ready, waitEventsTimeout(event_pipe[0], wake_pipe[0], 100));
+
+    // A closed positive fd yields POLLNVAL -> .failed.
+    var bad_pipe: [2]i32 = undefined;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.pipe2(&bad_pipe, .{ .CLOEXEC = true })));
+    const closed_fd = bad_pipe[0];
+    os.close(closed_fd);
+    os.close(bad_pipe[1]);
+    try std.testing.expectEqual(EventWait.failed, waitEventsTimeout(closed_fd, null, 0));
 }
