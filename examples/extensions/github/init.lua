@@ -4,9 +4,9 @@ local lumen = require("lumen")
 -- Runs gh and decodes its JSON; errors show in Lumen's list.
 local function gh(args)
   table.insert(args, 1, "gh")
-  local out, code, err = lumen.exec(args, { timeout = 20 })
+  local out, code, err = lumen.exec(args, { timeout = 9 })
   if not out then error(code, 0) end -- could not run: `code` is the message
-  if code ~= 0 then error(err ~= "" and err or "gh exited with " .. code, 0) end
+  if code ~= 0 then error(err ~= "" and err or "gh exited with " .. tostring(code), 0) end
   return lumen.json.decode(out)
 end
 

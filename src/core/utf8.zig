@@ -33,6 +33,98 @@ pub fn validWindow(text: []const u8) []const u8 {
     return validPrefix(text[skip..]);
 }
 
+/// Strips up to `continuation_bytes_max` leading continuation bytes (when a
+/// slice started mid-character) and any trailing truncated multi-byte UTF-8
+/// sequence at the end, without stopping at interior invalid bytes.
+pub fn trimIncompleteEdges(text: []const u8) []const u8 {
+    var start: usize = 0;
+    while (start < text.len and start < continuation_bytes_max and isContinuation(text[start])) {
+        start += 1;
+    }
+    const body = text[start..];
+    var end = body.len;
+    // Check if the last <= 3 bytes begin a multi-byte sequence truncated at `end`.
+    var back: usize = 1;
+    while (back <= continuation_bytes_max and back <= body.len) : (back += 1) {
+        const idx = body.len - back;
+        if (!isContinuation(body[idx])) {
+            const seq_len = std.unicode.utf8ByteSequenceLength(body[idx]) catch 1;
+            if (idx + seq_len > body.len) end = idx;
+            break;
+        }
+    }
+    return body[0..end];
+}
+
+pub const replacement = "\u{FFFD}";
+
+/// Writes `raw` to `out`, replacing invalid UTF-8 sequences and NUL bytes with U+FFFD.
+/// `out.len` should be at least `raw.len * 3` in the worst case (all single invalid bytes).
+pub fn sanitizeInto(out: []u8, raw: []const u8) []const u8 {
+    var written: usize = 0;
+    var at: usize = 0;
+    while (at < raw.len) {
+        const b = raw[at];
+        if (b == 0) {
+            if (written + replacement.len > out.len) break;
+            @memcpy(out[written..][0..replacement.len], replacement);
+            written += replacement.len;
+            at += 1;
+            continue;
+        }
+        const seq_len = std.unicode.utf8ByteSequenceLength(b) catch 0;
+        const seq_end = at + seq_len;
+        const valid = seq_len > 0 and seq_end <= raw.len and
+            std.unicode.utf8ValidateSlice(raw[at..seq_end]);
+        if (!valid) {
+            if (written + replacement.len > out.len) break;
+            @memcpy(out[written..][0..replacement.len], replacement);
+            written += replacement.len;
+            at += 1;
+            continue;
+        }
+        if (written + seq_len > out.len) break;
+        @memcpy(out[written..][0..seq_len], raw[at..seq_end]);
+        written += seq_len;
+        at = seq_end;
+    }
+    return out[0..written];
+}
+
+/// Allocates a NUL-terminated valid UTF-8 copy of `raw` in `arena`, replacing
+/// invalid UTF-8 sequences and NUL bytes with U+FFFD while preserving tabs/newlines.
+pub fn sanitizeAlloc(
+    arena: std.mem.Allocator,
+    raw: []const u8,
+) std.mem.Allocator.Error![:0]const u8 {
+    if (std.mem.findScalar(u8, raw, 0) == null and std.unicode.utf8ValidateSlice(raw)) {
+        return arena.dupeSentinel(u8, raw, 0);
+    }
+    var out: std.ArrayList(u8) = .empty;
+    try out.ensureTotalCapacity(arena, raw.len + 1);
+    var at: usize = 0;
+    while (at < raw.len) {
+        const b = raw[at];
+        if (b == 0) {
+            try out.appendSlice(arena, replacement);
+            at += 1;
+            continue;
+        }
+        const seq_len = std.unicode.utf8ByteSequenceLength(b) catch 0;
+        const seq_end = at + seq_len;
+        const valid = seq_len > 0 and seq_end <= raw.len and
+            std.unicode.utf8ValidateSlice(raw[at..seq_end]);
+        if (!valid) {
+            try out.appendSlice(arena, replacement);
+            at += 1;
+            continue;
+        }
+        try out.appendSlice(arena, raw[at..seq_end]);
+        at = seq_end;
+    }
+    return out.toOwnedSliceSentinel(arena, 0);
+}
+
 /// The longest length up to `len_max` that ends `text` between characters.
 pub fn floorBoundary(text: []const u8, len_max: usize) usize {
     if (len_max >= text.len) return text.len;

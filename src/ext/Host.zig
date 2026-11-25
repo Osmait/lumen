@@ -1446,3 +1446,40 @@ test "takePendingRegistry waits for initial load even with load problems" {
     try testing.expectEqual(@as(usize, 1), registry.commands.len);
     try testing.expectEqual(@as(usize, 1), registry.problems.len);
 }
+
+test "plain-table extensions keep numeric preference defaults coerced to string" {
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const folder = try os.tmpDirPath(&test_dir, &path_buffer);
+    try writeTestFile(folder, "extensions/plain/init.lua",
+        \\return {
+        \\  id = "plain",
+        \\  preferences = {
+        \\    { name = "count", title = "Count", type = "text", default = 5 },
+        \\  },
+        \\  commands = {
+        \\    { name = "show", title = "Show", items = function()
+        \\        return { lumen.preferences.count, type(lumen.preferences.count) }
+        \\    end },
+        \\  },
+        \\}
+    );
+
+    var probe: Probe = .{};
+    defer probe.deinit();
+    const host = try testHost(&probe, folder);
+    defer host.shutdown();
+    host.reload();
+    try probe.wait("registry");
+    const registry = probe.registry.?;
+    try testing.expectEqual(@as(usize, 1), registry.preferences.len);
+    try testing.expectEqualStrings("5", registry.preferences[0].default);
+
+    _ = host.list(registry.generation, .from(0), "");
+    const listed = try probe.take("list");
+    defer listed.destroy(testing.allocator);
+    try testing.expect(listed.error_message == null);
+    try testing.expectEqualStrings("5", listed.items[0].title);
+    try testing.expectEqualStrings("string", listed.items[1].title);
+}

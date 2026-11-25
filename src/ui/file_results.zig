@@ -79,9 +79,10 @@ pub fn itemsFromHits(
                 .line = hit.line,
                 .extracted = hit.extracted,
                 .size = hit.size,
+                .mtime_ns = hit.mtime,
             } },
             .detail = hit.snippet,
-            .time_s = hit.mtime,
+            .time_s = @divFloor(hit.mtime, std.time.ns_per_s),
         }) catch break;
     }
     return out.items;

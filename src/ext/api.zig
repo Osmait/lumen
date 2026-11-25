@@ -150,13 +150,36 @@ fn setStringField(L: *lua.State, table: c_int, name: [:0]const u8, value: [:0]co
     lua.c.lua_setfield(L, table, name.ptr);
 }
 
+const pref_defaults_registry_key = "lumen_pref_defaults";
+
 /// Runs `prelude` with the `lumen` table and the native `writeStorage` helper.
 fn runPrelude(L: *lua.State) void {
     const loaded = lua.c.luaL_loadbufferx(L, prelude.ptr, prelude.len, "=lumen", "t");
     if (loaded != lua.c.LUA_OK) _ = lua.c.lua_error(L);
     _ = lua.c.lua_getglobal(L, "lumen");
     lua.c.lua_pushcclosure(L, lua.wrap(writeStorage), 0);
-    lua.c.lua_callk(L, 2, 0, 0, null);
+    lua.c.lua_callk(L, 2, 1, 0, null);
+    lua.c.lua_setfield(L, lua.c.LUA_REGISTRYINDEX, pref_defaults_registry_key);
+}
+
+/// Syncs parsed preference defaults from Zig into `lumen.preferences` so
+/// extensions returning plain tables (without calling `lumen.extension`) also
+/// observe typed default values in command callbacks.
+pub fn setPreferenceDefaults(L: *lua.State, preferences: []const registry_mod.Preference) void {
+    const mark: lua.StackMark = .init(L);
+    defer mark.restore(L);
+    if (lua.c.lua_getfield(L, lua.c.LUA_REGISTRYINDEX, pref_defaults_registry_key) != lua.c.LUA_TTABLE) {
+        return;
+    }
+    const defaults_table = lua.absIndex(L, -1);
+    for (preferences) |pref| {
+        if (pref.kind == .toggle) {
+            lua.c.lua_pushboolean(L, @intFromBool(std.mem.eql(u8, pref.default, "true")));
+        } else {
+            _ = lua.c.lua_pushlstring(L, pref.default.ptr, pref.default.len);
+        }
+        lua.c.lua_setfield(L, defaults_table, pref.name.ptr);
+    }
 }
 
 /// Writes `storage.json` atomically (`0600`, `O_EXCL|O_NOFOLLOW`, `fsync` +
@@ -203,19 +226,26 @@ const prelude =
     \\end
     \\
     \\local defaults = {}
+    \\local function set_default(p)
+    \\  if type(p) ~= "table" or type(p.name) ~= "string" then return end
+    \\  local d = p.default
+    \\  if p.type == "toggle" then
+    \\    d = d == true
+    \\  elseif d == nil then
+    \\    if p.type == "choice" and type(p.choices) == "table" then
+    \\      local first = p.choices[1]
+    \\      d = type(first) == "table" and first.value or first
+    \\    end
+    \\    d = d ~= nil and tostring(d) or ""
+    \\  else
+    \\    d = tostring(d)
+    \\  end
+    \\  defaults[p.name] = d
+    \\end
     \\function lumen.extension(spec)
     \\  if type(spec) ~= "table" then error("lumen.extension: a table expected", 2) end
     \\  for _, p in ipairs(type(spec.preferences) == "table" and spec.preferences or {}) do
-    \\    if type(p) == "table" and type(p.name) == "string" then
-    \\      local d = p.default
-    \\      if d == nil and p.type == "toggle" then d = false end
-    \\      if d == nil and p.type == "choice" and type(p.choices) == "table" then
-    \\        local first = p.choices[1]
-    \\        d = type(first) == "table" and first.value or first
-    \\      end
-    \\      if d == nil then d = "" end
-    \\      defaults[p.name] = d
-    \\    end
+    \\    set_default(p)
     \\  end
     \\  return spec
     \\end
@@ -282,6 +312,7 @@ const prelude =
     \\  return clone(load(), {}, 0, { n = 0 })
     \\end
     \\lumen.storage = storage
+    \\return defaults
 ;
 
 /// lumen.exec's arguments, checked.
@@ -515,6 +546,7 @@ fn color(
 
 pub fn parseHex(text: []const u8) ?u24 {
     if (text.len != color_hex_example.len or text[0] != '#') return null;
+    for (text[1..]) |ch| if (!std.ascii.isHex(ch)) return null;
     return std.fmt.parseInt(u24, text[1..], 16) catch null;
 }
 
@@ -924,4 +956,7 @@ test "theme colours parse as #rrggbb" {
     try std.testing.expectEqual(@as(?u24, null), parseHex("1e1e2e"));
     try std.testing.expectEqual(@as(?u24, null), parseHex("#12345"));
     try std.testing.expectEqual(@as(?u24, null), parseHex("#zzzzzz"));
+    try std.testing.expectEqual(@as(?u24, null), parseHex("#+12345"));
+    try std.testing.expectEqual(@as(?u24, null), parseHex("#-00000"));
+    try std.testing.expectEqual(@as(?u24, null), parseHex("#ff_ff0"));
 }

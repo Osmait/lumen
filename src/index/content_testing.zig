@@ -20,12 +20,12 @@ pub const TestDocs = struct {
         doc: DocIn,
         text: *std.ArrayList(u8),
         gpa: std.mem.Allocator,
-    ) std.mem.Allocator.Error!bool {
+    ) std.mem.Allocator.Error!content.ReadOutcome {
         const test_docs: *TestDocs = @ptrCast(@alignCast(context));
-        const text_index = std.fmt.parseInt(usize, doc.path, 10) catch return false;
+        const text_index = std.fmt.parseInt(usize, doc.path, 10) catch return .none;
         text.clearRetainingCapacity();
         try text.appendSlice(gpa, test_docs.texts[text_index]);
-        return true;
+        return .text;
     }
 };
 

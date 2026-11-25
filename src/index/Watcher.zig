@@ -39,7 +39,8 @@ const mask: u32 = linux.IN.CREATE | linux.IN.DELETE | linux.IN.MOVED_FROM | linu
 pub const Change = union(enum) {
     /// Something appeared in directory `parent`; a directory must be
     /// scanned whole (it may have filled before we watched it).
-    created: struct { parent: u32, name: []const u8, is_dir: bool },
+    /// `moved_to` is true only for `IN_MOVED_TO` (replacing a directory via `mv -T`).
+    created: struct { parent: u32, name: []const u8, is_dir: bool, moved_to: bool = false },
     /// A non-directory file in `parent` finished being written.
     modified: struct { parent: u32, name: []const u8 },
     /// Something left `parent` (deleted or moved away).
@@ -267,6 +268,7 @@ fn parse(
                 .parent = id,
                 .name = owned,
                 .is_dir = event.mask & linux.IN.ISDIR != 0,
+                .moved_to = event.mask & linux.IN.MOVED_TO != 0,
             } });
         } else if (event.mask & linux.IN.CLOSE_WRITE != 0 and event.mask & linux.IN.ISDIR == 0) {
             try out.append(arena, .{ .modified = .{ .parent = id, .name = owned } });

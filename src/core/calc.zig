@@ -430,4 +430,11 @@ test "small values, exact integers up to 2^53, and cancellation dust" {
         try std.testing.expectEqualStrings("0", formatPlain(&plain_buf, res.value));
         try std.testing.expectEqualStrings("0", formatDisplay(&display_buf, res.value));
     }
+
+    const knots = evaluate("1000 kn to kmh").?;
+    try std.testing.expectEqualStrings("1852", formatPlain(&plain_buf, knots.value));
+    const short_ton = evaluate("1 ton to lb").?;
+    try std.testing.expectEqualStrings("2000", formatPlain(&plain_buf, short_ton.value));
+    const metric_tonne = evaluate("1 tonne to kg").?;
+    try std.testing.expectEqualStrings("1000", formatPlain(&plain_buf, metric_tonne.value));
 }

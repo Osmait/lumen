@@ -233,7 +233,12 @@ pub fn stat(path: [*:0]const u8, kind: Kind) ?Stat {
         },
         .document => if (statx.size > document_bytes_max) return null,
     }
-    return .{ .mtime = statx.mtime.sec, .size = statx.size };
+    const mtime_ns = std.math.add(
+        i64,
+        std.math.mul(i64, statx.mtime.sec, std.time.ns_per_s) catch std.math.maxInt(i64),
+        @as(i64, statx.mtime.nsec),
+    ) catch std.math.maxInt(i64);
+    return .{ .mtime = mtime_ns, .size = statx.size };
 }
 
 pub fn documentKind(path: []const u8) bool {
@@ -429,11 +434,12 @@ test "list: what is indexed and what is excluded" {
     const now = sys.nowSeconds();
     for (got) |doc| {
         try testing.expectEqual(documentKind(doc.path), doc.source == .extracted);
-        try testing.expect(doc.mtime > now - 3600);
-        try testing.expect(doc.mtime <= now + 1);
+        const mtime_s = @divFloor(doc.mtime, std.time.ns_per_s);
+        try testing.expect(mtime_s > now - 3600);
+        try testing.expect(mtime_s <= now + 1);
         const info = sys.info(try std.mem.printSentinel(&path_buffer, "{s}", .{doc.path}, 0)).?;
         try testing.expectEqual(info.size, doc.size);
-        try testing.expectEqual(info.mtime, doc.mtime);
+        try testing.expectEqual(info.mtime, mtime_s);
     }
     for (got) |doc| {
         if (!std.mem.endsWith(u8, doc.path, "/exactly_max.log")) continue;

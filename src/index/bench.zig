@@ -262,8 +262,8 @@ fn plainText(
     document: index.content.DocIn,
     text: *std.ArrayList(u8),
     gpa: std.mem.Allocator,
-) std.mem.Allocator.Error!bool {
-    if (document.source != .plain) return false;
+) std.mem.Allocator.Error!index.content.ReadOutcome {
+    if (document.source != .plain) return .none;
     return index.content.readPlain(gpa, document.path, text);
 }
 

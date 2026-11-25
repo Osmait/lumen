@@ -247,7 +247,8 @@ fn staticScore(doc: DocIn, words: []const []const u8, now_s: i64) i32 {
         if (findFolded(name, word, 0) != null) score += name_word_score;
     }
     // Saturating: mtimes come from the index file, which may be damaged.
-    score += recency.bonus(now_s -| doc.mtime);
+    const mtime_s = @divFloor(doc.mtime, std.time.ns_per_s);
+    score += recency.bonus(now_s -| mtime_s);
     score -= @intCast(paths.depth(doc.path) * depth_penalty);
     return score;
 }
@@ -308,6 +309,7 @@ fn verifyTask(context: *VerifyContext, _: usize) void {
     var path_buffer: paths.Buffer = undefined;
     var plain_text: std.ArrayList(u8) = .empty;
     defer plain_text.deinit(context.gpa);
+    var snippet_buf: [snippet_sanitized_bytes_max]u8 = undefined;
     while (true) {
         if (context.stop) |stop| {
             if (stop.load(.acquire)) return;
@@ -341,8 +343,8 @@ fn verifyTask(context: *VerifyContext, _: usize) void {
         const text: []const u8 = switch (doc.source) {
             .plain => blk: {
                 // Out of memory: this candidate is left out of the results.
-                const has_text = readPlain(context.gpa, text_path, &plain_text) catch false;
-                if (!has_text) continue;
+                const outcome = readPlain(context.gpa, text_path, &plain_text) catch .unavailable;
+                if (outcome != .text) continue;
                 break :blk plain_text.items;
             },
             .extracted => blk: {
@@ -351,8 +353,13 @@ fn verifyTask(context: *VerifyContext, _: usize) void {
             },
         };
         const maybe_phrase = candidate.maybe_phrase;
-        const verified = verify(text, context.words, context.phrase, maybe_phrase) orelse
-            continue;
+        const verified = verify(
+            text,
+            context.words,
+            context.phrase,
+            maybe_phrase,
+            &snippet_buf,
+        ) orelse continue;
         const phrase_bonus: i32 = if (verified.phrase) phrase_max else 0;
         context.offer(.{
             .doc = candidate.doc,
@@ -400,6 +407,8 @@ pub const Verified = struct { count: u32, line: u32, snippet: []const u8, phrase
 const snippet_lead_bytes_max = 60;
 const snippet_lead_bytes = 40;
 const snippet_bytes_max = 200;
+/// Worst-case sanitized UTF-8 buffer for a raw snippet (every byte -> 3-byte U+FFFD).
+pub const snippet_sanitized_bytes_max = snippet_bytes_max * utf8.replacement.len;
 
 comptime {
     assert(snippet_lead_bytes <= snippet_lead_bytes_max);
@@ -415,6 +424,7 @@ pub fn verify(
     words: []const []const u8,
     phrase: []const u8,
     maybe_phrase: bool,
+    snippet_buf: *[snippet_sanitized_bytes_max]u8,
 ) ?Verified {
     if (words.len == 0) return null;
     // The phrase holds every word: found, they need no looking for. Not
@@ -447,11 +457,16 @@ pub fn verify(
     const snippet_start = if (hit_far_into_line) hit_start - snippet_lead_bytes else line_start;
     const snippet_end = @min(line_end, snippet_start + snippet_bytes_max);
     const snippet = std.mem.trim(u8, text[snippet_start..snippet_end], " \t\r");
+    const edged = utf8.trimIncompleteEdges(snippet);
+    const clean = if (std.mem.findScalar(u8, edged, 0) == null and
+        std.unicode.utf8ValidateSlice(edged))
+        edged
+    else
+        utf8.sanitizeInto(snippet_buf, edged);
     return .{
         .count = count,
         .line = line_number,
-        // Into `text`: copied once, by whoever keeps it.
-        .snippet = utf8.validWindow(snippet),
+        .snippet = clean,
         .phrase = phrase_hit != null,
     };
 }
@@ -466,13 +481,14 @@ const TextReader = content_build.TextReader;
 test "verify finds the line and counts hits" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
+    var snippet_buf: [snippet_sanitized_bytes_max]u8 = undefined;
     const text = "first line\n  const a = ArenaAllocator.init(gpa);\nArenaAllocator again\n";
-    const verified = verify(text, &.{"arenaallocator"}, "arenaallocator", true).?;
+    const verified = verify(text, &.{"arenaallocator"}, "arenaallocator", true, &snippet_buf).?;
     try testing.expectEqual(@as(u32, 2), verified.line);
     try testing.expectEqual(@as(u32, 2), verified.count);
     try testing.expectEqualStrings("const a = ArenaAllocator.init(gpa);", verified.snippet);
     try testing.expect(
-        verify(text, &.{ "arena", "missing" }, "arena missing", true) == null,
+        verify(text, &.{ "arena", "missing" }, "arena missing", true, &snippet_buf) == null,
     );
     // The phrase wins over the first word's first occurrence.
     const phrase_verified = verify(
@@ -480,9 +496,14 @@ test "verify finds the line and counts hits" {
         &.{ "arenaallocator", "again" },
         "arenaallocator again",
         true,
+        &snippet_buf,
     ).?;
     try testing.expectEqual(@as(u32, 2), phrase_verified.line);
     try testing.expect(phrase_verified.phrase);
+
+    // Invalid UTF-8 bytes before a match become U+FFFD instead of truncating the snippet.
+    const latin1 = verify("Caf\xe9 society: the meeting is at noon\n", &.{"meeting"}, "meeting", true, &snippet_buf).?;
+    try testing.expectEqualStrings("Caf\u{FFFD} society: the meeting is at noon", latin1.snippet);
 }
 
 test "verify: folded matches, line and snippet from the original text" {
@@ -490,9 +511,10 @@ test "verify: folded matches, line and snippet from the original text" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+    var snippet_buf: [snippet_sanitized_bytes_max]u8 = undefined;
     for ([_][]const u8{ "accion", "ACCIÓN", "acción" }) |query| {
         const words = try splitWords(arena, query);
-        const verified = verify(text, words, words[0], true).?;
+        const verified = verify(text, words, words[0], true, &snippet_buf).?;
         try testing.expectEqual(@as(u32, 2), verified.line);
         try testing.expectEqualStrings("Una ACCIÓN rápida", verified.snippet);
     }
@@ -501,13 +523,14 @@ test "verify: folded matches, line and snippet from the original text" {
         try splitWords(arena, "nandu corre"),
         try fold.foldAlloc(arena, "nandu corre"),
         true,
+        &snippet_buf,
     ).?;
     try testing.expectEqual(@as(u32, 3), verified.line);
     try testing.expect(verified.phrase);
     // Two hits of different lengths, counted without overlap.
     try testing.expectEqual(
         @as(u32, 3),
-        verify("acción accion ACCIÓN", &.{"accion"}, "accion", true).?.count,
+        verify("acción accion ACCIÓN", &.{"accion"}, "accion", true, &snippet_buf).?.count,
     );
 }
 
@@ -517,7 +540,7 @@ const FileDocs = struct {
         doc: DocIn,
         text: *std.ArrayList(u8),
         gpa: std.mem.Allocator,
-    ) std.mem.Allocator.Error!bool {
+    ) std.mem.Allocator.Error!@import("content_build.zig").ReadOutcome {
         return readPlain(gpa, doc.path, text);
     }
 };
@@ -558,7 +581,7 @@ test "search: the top matches equal reading every document and ranking them all"
         try sys.writeFile(try std.mem.printSentinel(&path_buffer, "{s}", .{path}, 0), text.items);
         const ages_days = [_]i64{ 0, 3, 20, 100, 300, 900 };
         const age_s = ages_days[i % ages_days.len] * std.time.s_per_day;
-        doc.* = .{ .path = path, .mtime = now - age_s, .size = text.items.len };
+        doc.* = .{ .path = path, .mtime = (now - age_s) * std.time.ns_per_s, .size = text.items.len };
     }
     const pool = try Pool.create(gpa, testing.io, 3);
     defer pool.destroy();
@@ -591,8 +614,9 @@ test "search: the top matches equal reading every document and ranking them all"
         const words = try splitWords(arena, query);
         const phrase = try fold.foldAlloc(arena, std.mem.trim(u8, query, " \t"));
         for (docs, 0..) |doc, i| {
-            if (!try readPlain(gpa, doc.path, &doc_text)) continue;
-            const verified = verify(doc_text.items, words, phrase, true) orelse continue;
+            if (try readPlain(gpa, doc.path, &doc_text) != .text) continue;
+            var snippet_buf: [snippet_sanitized_bytes_max]u8 = undefined;
+            const verified = verify(doc_text.items, words, phrase, true, &snippet_buf) orelse continue;
             const bonus: i32 = if (verified.phrase) phrase_max else 0;
             try want.append(arena, .{
                 .doc = @intCast(i),
@@ -711,7 +735,8 @@ fn fuzzVerify(_: void, smith: *testing.Smith) anyerror!void {
     const query_used = query[0..smith.sliceWeightedBytes(&query, weights)];
     const words = try splitWords(arena, query_used);
     const phrase = try fold.foldAlloc(arena, std.mem.trim(u8, query_used, " \t"));
-    if (verify(text_used, words, phrase, true)) |verified| {
+    var snippet_buf: [snippet_sanitized_bytes_max]u8 = undefined;
+    if (verify(text_used, words, phrase, true, &snippet_buf)) |verified| {
         try testing.expect(std.unicode.utf8ValidateSlice(verified.snippet));
         try testing.expect(verified.count >= 1);
         try testing.expect(verified.count <= count_cap);
@@ -741,9 +766,9 @@ test "search finds hits past 4000 false-positive candidates and reports budget e
     var docs = try gpa.alloc(DocIn, docs_count);
     defer gpa.free(docs);
     for (0..candidates_verified_max) |i| {
-        docs[i] = .{ .path = fp_path, .mtime = now, .size = 12 };
+        docs[i] = .{ .path = fp_path, .mtime = now * std.time.ns_per_s, .size = 12 };
     }
-    docs[candidates_verified_max] = .{ .path = match_path, .mtime = now - 10 * std.time.s_per_day, .size = 20 };
+    docs[candidates_verified_max] = .{ .path = match_path, .mtime = (now - 10 * std.time.s_per_day) * std.time.ns_per_s, .size = 20 };
 
     const SharedPaths = struct {
         fp: []const u8,
@@ -753,14 +778,14 @@ test "search finds hits past 4000 false-positive candidates and reports budget e
             doc: DocIn,
             text: *std.ArrayList(u8),
             alloc: std.mem.Allocator,
-        ) std.mem.Allocator.Error!bool {
+        ) std.mem.Allocator.Error!@import("content_build.zig").ReadOutcome {
             const self: *@This() = @ptrCast(@alignCast(ctx));
             text.clearRetainingCapacity();
             try text.appendSlice(alloc, if (std.mem.eql(u8, doc.path, self.match))
                 "the real alpha line\n"
             else
                 "alp lph pha\n");
-            return true;
+            return .text;
         }
         fn textPath(ctx: *anyopaque, doc: DocIn, buffer: []u8) ?[:0]const u8 {
             _ = ctx;

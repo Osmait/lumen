@@ -117,6 +117,7 @@ pub fn openLibs(L: *State) void {
     c.lua_pushcclosure(L, wrap(armThreadHook), 0);
     c.lua_pushcclosure(L, wrap(checkDeadline), 0);
     c.lua_callk(L, 4, 0, 0, null);
+    luart_cloexec_io_input(L);
 }
 
 /// Run by `openLibs` once the libraries are open, with `refuseOpen`,
@@ -473,6 +474,7 @@ fn alloc(
 
 extern fn luart_open_patterns(L: *State) c_int;
 extern fn luart_open_files(L: *State) c_int;
+extern fn luart_cloexec_io_input(L: *State) void;
 
 /// For io.open (lfiles.c): takes one of the state's `open_files_max`
 /// slots; 0 when none is left.
@@ -528,6 +530,9 @@ pub const Capped = struct {
     child: std.mem.Allocator,
     bytes_max: usize,
     used_bytes: usize = 0,
+    /// When set, allocations are also charged live against this Lua state budget
+    /// so peak temporary Zig + Lua allocations cannot exceed `budget.bytes_max`.
+    budget: ?*Budget = null,
     /// An allocation was refused for going over `bytes_max`.
     refused: bool = false,
 
@@ -536,6 +541,12 @@ pub const Capped = struct {
     pub fn leftIn(L: *State, child: std.mem.Allocator) Capped {
         const budget = budgetOf(L);
         return .{ .child = child, .bytes_max = budget.bytes_max -| budget.used_bytes };
+    }
+
+    /// Charges allocations directly against `L`'s live `Budget` while alive.
+    pub fn chargedTo(L: *State, child: std.mem.Allocator) Capped {
+        const budget = budgetOf(L);
+        return .{ .child = child, .bytes_max = budget.bytes_max, .budget = budget };
     }
 
     pub fn allocator(self: *Capped) std.mem.Allocator {
@@ -551,14 +562,40 @@ pub const Capped = struct {
     fn fits(self: *Capped, old_bytes: usize, new_bytes: usize) bool {
         assert(self.used_bytes >= old_bytes);
         if (new_bytes <= old_bytes) return true;
+        const delta = new_bytes - old_bytes;
         const base = self.used_bytes - old_bytes;
         const after = std.math.add(usize, base, new_bytes) catch {
             self.refused = true;
             return false;
         };
-        if (after <= self.bytes_max) return true;
-        self.refused = true;
-        return false;
+        if (after > self.bytes_max) {
+            self.refused = true;
+            return false;
+        }
+        if (self.budget) |budget| {
+            const budget_after = std.math.add(usize, budget.used_bytes, delta) catch {
+                self.refused = true;
+                return false;
+            };
+            if (budget_after > budget.bytes_max) {
+                self.refused = true;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    fn recordDelta(self: *Capped, old_bytes: usize, new_bytes: usize) void {
+        self.used_bytes = self.used_bytes - old_bytes + new_bytes;
+        if (self.budget) |budget| {
+            if (new_bytes >= old_bytes) {
+                budget.used_bytes += new_bytes - old_bytes;
+            } else {
+                const shrink = old_bytes - new_bytes;
+                assert(budget.used_bytes >= shrink);
+                budget.used_bytes -= shrink;
+            }
+        }
     }
 
     fn cappedAlloc(
@@ -570,7 +607,7 @@ pub const Capped = struct {
         const self: *Capped = @ptrCast(@alignCast(context));
         if (!self.fits(0, bytes)) return null;
         const block = self.child.rawAlloc(bytes, alignment, return_address) orelse return null;
-        self.used_bytes += bytes;
+        self.recordDelta(0, bytes);
         return block;
     }
 
@@ -584,7 +621,7 @@ pub const Capped = struct {
         const self: *Capped = @ptrCast(@alignCast(context));
         if (!self.fits(memory.len, new_bytes)) return false;
         if (!self.child.rawResize(memory, alignment, new_bytes, return_address)) return false;
-        self.used_bytes = self.used_bytes - memory.len + new_bytes;
+        self.recordDelta(memory.len, new_bytes);
         return true;
     }
 
@@ -599,7 +636,7 @@ pub const Capped = struct {
         if (!self.fits(memory.len, new_bytes)) return null;
         const remapped = self.child.rawRemap(memory, alignment, new_bytes, return_address);
         const block = remapped orelse return null;
-        self.used_bytes = self.used_bytes - memory.len + new_bytes;
+        self.recordDelta(memory.len, new_bytes);
         return block;
     }
 
@@ -612,7 +649,7 @@ pub const Capped = struct {
         const self: *Capped = @ptrCast(@alignCast(context));
         assert(self.used_bytes >= memory.len);
         self.child.rawFree(memory, alignment, return_address);
-        self.used_bytes -= memory.len;
+        self.recordDelta(memory.len, 0);
     }
 };
 
@@ -1204,13 +1241,14 @@ test "a process's memory under /proc is not opened, even through a symlink" {
 }
 
 test "extensions open files close-on-exec, and only so many at once" {
+    const inheritable_before = inheritableFds();
     var budget: Budget = .{ .bytes_max = 8 << 20 };
     const L = try testState(&budget);
     defer c.lua_close(L);
+    try testing.expectEqual(inheritable_before, inheritableFds());
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const inheritable_before = inheritableFds();
     const fill =
         \\files = {}
         \\for i = 1, 64 do files[i] = assert(io.open("/dev/null")) end

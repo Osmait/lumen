@@ -20,7 +20,7 @@ const depth_max = 200;
 /// from `gpa`, freed before returning; the push runs under `tryCall`.
 pub fn decode(L: *lua.State, gpa: std.mem.Allocator, text: []const u8) lua.Error!void {
     const status = blk: {
-        var capped: lua.Capped = .leftIn(L, gpa);
+        var capped: lua.Capped = .chargedTo(L, gpa);
         var parsed = std.json.parseFromSlice(
             std.json.Value,
             capped.allocator(),
@@ -396,4 +396,22 @@ test "json stops at the memory left and at the deadline" {
     defer testing.allocator.free(message);
     try testing.expect(std.mem.find(u8, message, "timed out") != null);
     try testing.expect(os.monotonicNs() - start_ns < 5 * std.time.ns_per_s);
+}
+
+test "json.decode shares Lua Budget across parse tree and pushed Lua values" {
+    var budget: lua.Budget = .{ .bytes_max = 256 << 10 };
+    // Even ~110 KB of strings already held plus an encoded JSON array (~60 KB parse tree
+    // + ~60 KB Lua values) stays well within 256 KB individually, yet exceeds 256 KB
+    // combined while both `parsed` and the pushed Lua table coexist.
+    const message = (try runIn(&budget,
+        \\local hold = string.rep("x", 110000)
+        \\local arr = '[' .. string.rep('"abcdef",', 2000) .. '"abcdef"]'
+        \\json.decode(arr)
+        \\assert(hold)
+    )).?;
+    defer testing.allocator.free(message);
+    try testing.expect(
+        std.mem.find(u8, message, "out of memory") != null or
+            std.mem.find(u8, message, "not enough memory") != null,
+    );
 }

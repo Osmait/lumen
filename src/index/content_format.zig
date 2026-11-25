@@ -23,7 +23,8 @@ const fold = @import("core").fold;
 /// refers to the paths already there instead of writing them all again.
 /// 05: trigrams fold NFD combining diacritics onto their base letter (`core.fold`).
 /// 06: DOCX extraction includes linked headers and footers.
-pub const magic = "LUMCTX06";
+/// 07: doc table stores nanosecond mtimes.
+pub const magic = "LUMCTX07";
 pub const header_size = 64;
 
 /// The first bytes of the file. The doc table's columns and the segments'

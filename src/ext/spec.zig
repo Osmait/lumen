@@ -14,6 +14,7 @@ const Host = @import("Host.zig");
 const Load = @import("Load.zig");
 const LoadContext = @import("loading.zig").LoadContext;
 const rows_mod = @import("rows.zig");
+const api = @import("api.zig");
 const registry_mod = @import("registry.zig");
 const item_mod = @import("../item.zig");
 
@@ -85,6 +86,7 @@ fn parsePreferences(
     if (preferences_count > preferences_per_ext_max) {
         lua.raise(L, "extension.preferences: at most {d} preferences", .{preferences_per_ext_max});
     }
+    const prefs_start = context.load.preferences.items.len;
     for (1..preferences_count + 1) |preference_number| {
         if (context.load.preferences.items.len >= std.math.maxInt(u16)) {
             lua.raise(L, "too many preferences", .{});
@@ -108,6 +110,7 @@ fn parsePreferences(
         }
         context.load.preferences.append(context.load.arena, preference) catch lua.oom(L);
     }
+    api.setPreferenceDefaults(L, context.load.preferences.items[prefs_start..]);
 }
 
 fn preferenceDeclared(load: *const Load, extension_id: []const u8, name: []const u8) bool {

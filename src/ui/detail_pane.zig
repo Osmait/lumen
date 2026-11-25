@@ -134,14 +134,21 @@ pub fn showContentDetail(ui: *Ui, item: *const Item) void {
     const service = ui.contents orelse return;
     // The document as the search found it: no stat on the UI thread. On a
     // network or FUSE mount, not even a read: the snippet shows instead.
-    const text = if (onSlowMount(ui, file.path)) item.detail else service.readText(
+    var using_snippet = false;
+    const text = if (onSlowMount(ui, file.path)) blk: {
+        using_snippet = true;
+        break :blk item.detail;
+    } else service.readText(
         arena,
         file.path,
-        item.time_s,
+        file.mtime_ns,
         file.size,
         if (file.extracted) .extracted else .plain,
         line +| labels.context_lines_after,
-    ) orelse item.detail;
+    ) orelse blk: {
+        using_snippet = true;
+        break :blk item.detail;
+    };
     const words = index.content.splitWords(arena, ui.query()) catch return;
     // The theme's accent behind matches, its text colour on top.
     const highlight_open = arena.print(
@@ -151,9 +158,10 @@ pub fn showContentDetail(ui: *Ui, item: *const Item) void {
             std.mem.sliceTo(&ui.appearance.highlight_foreground, 0),
         },
     ) catch return;
+    const first_line = if (using_snippet) line else 1;
     c.gtk_label_set_markup(
         ui.detail.text,
-        labels.contextMarkup(arena, text, line, words, highlight_open).ptr,
+        labels.contextMarkupFrom(arena, text, first_line, line, words, highlight_open).ptr,
     );
 
     const guessed_type = c.g_content_type_guess(file.path, null, 0, null);
@@ -311,11 +319,9 @@ fn showExtDetail(ui: *Ui, item: ?*const Item) void {
         gtk.addClass(ui.detail.text, markdown_class);
     } else {
         const detail = if (item) |shown| shown.detail else "";
-        const text = detail[0..@min(detail.len, detail_text_bytes_max)];
-        c.gtk_label_set_text(
-            label,
-            (arena.dupeSentinel(u8, core.utf8.validPrefix(text), 0) catch return).ptr,
-        );
+        const cut = core.utf8.floorBoundary(detail, detail_text_bytes_max);
+        const clean = core.utf8.sanitizeAlloc(arena, detail[0..cut]) catch return;
+        c.gtk_label_set_text(label, clean.ptr);
         gtk.setClass(ui.detail.text, markdown_class, false);
     }
     const meta = if (item) |shown| shown.meta else &.{};
@@ -365,11 +371,9 @@ pub fn showDetail(ui: *Ui, item: ?*const Item) void {
         (ui.db.clipContent(arena, shown.action.clip) catch null) orelse shown.detail
     else
         shown.detail;
-    const text = content[0..@min(content.len, detail_text_bytes_max)];
-    c.gtk_label_set_text(
-        ui.detail.text,
-        (arena.dupeSentinel(u8, core.utf8.validPrefix(text), 0) catch return).ptr,
-    );
+    const cut = core.utf8.floorBoundary(content, detail_text_bytes_max);
+    const clean = core.utf8.sanitizeAlloc(arena, content[0..cut]) catch return;
+    c.gtk_label_set_text(ui.detail.text, clean.ptr);
     const character_count = std.unicode.utf8CountCodepoints(content) catch content.len;
     var word_count: usize = 0;
     var words = std.mem.tokenizeAny(u8, content, " \t\r\n");
