@@ -419,6 +419,7 @@ pub fn applyLayout(ui: *Ui) void {
     // Before the early return: the detail pane's side can change while the
     // window's size does not.
     sizeList(ui, gtk.isVisible(ui.detail.box));
+    if (gtk.isVisible(ui.window)) placeOnFocusedMonitor(ui);
     var width_current_px: c_int = 0;
     var height_current_px: c_int = 0;
     c.gtk_widget_get_size_request(gtk.widget(ui.column), &width_current_px, &height_current_px);
@@ -432,6 +433,7 @@ pub fn applyLayout(ui: *Ui) void {
     if (gtk.isVisible(ui.window)) {
         gtk.setVisible(ui.window, false);
         gtk.setVisible(ui.window, true);
+        placeOnFocusedMonitor(ui);
         _ = c.gtk_widget_grab_focus(gtk.widget(ui.search_bar.entry));
     }
 }
@@ -480,55 +482,76 @@ pub fn layoutFor(ui: *Ui, view: View) void {
     detail_pane.prepareFor(&ui.detail, view);
 }
 
-/// Puts the window on the monitor Hyprland has focused, a bit above centre.
+/// Puts the window on Hyprland's focused monitor (else the surface's or first
+/// GDK monitor), at the configured vertical position and offset.
 pub fn placeOnFocusedMonitor(ui: *Ui) void {
     if (Ui.testMode()) return;
+    const display = c.gdk_display_get_default() orelse return;
+    const monitor = chooseMonitor(ui, display) orelse return;
+    defer c.g_object_unref(monitor);
+    c.gtk_layer_set_monitor(ui.window, monitor);
+    var geometry: c.GdkRectangle = undefined;
+    c.gdk_monitor_get_geometry(monitor, &geometry);
+    applyPosition(ui, geometry.height);
+}
+
+/// Returns a referenced `GdkMonitor`: Hyprland's focused monitor when present,
+/// otherwise the window surface's monitor or the first monitor in `display`.
+fn chooseMonitor(ui: *Ui, display: *c.GdkDisplay) ?*c.GdkMonitor {
     var arena: std.heap.ArenaAllocator = .init(ui.gpa);
     defer arena.deinit();
-    const name = hypr.focusedMonitorName(arena.allocator()) orelse return;
-    const monitors = c.gdk_display_get_monitors(c.gdk_display_get_default() orelse return);
-    const monitor_count = c.g_list_model_get_n_items(monitors);
-    var i: c_uint = 0;
-    while (i < monitor_count) : (i += 1) {
-        const monitor_object = c.g_list_model_get_item(monitors, i) orelse continue;
-        defer c.g_object_unref(monitor_object);
-        // The display's monitor list holds GdkMonitors only.
-        const monitor: *c.GdkMonitor = @ptrCast(monitor_object);
-        const connector = c.gdk_monitor_get_connector(monitor) orelse continue;
-        if (!std.mem.eql(u8, std.mem.span(connector), name)) continue;
-        c.gtk_layer_set_monitor(ui.window, monitor);
-        var geometry: c.GdkRectangle = undefined;
-        c.gdk_monitor_get_geometry(monitor, &geometry);
-        const window: *c.GtkWindow = ui.window;
-        const chosen: layout_mod.Position = switch (ui.settings.position) {
-            .upper_third => .upper_third,
-            .center => .center,
-        };
-        const position = ui.layout.position orelse chosen;
-        const offset_px: c_int = ui.layout.offset;
-        // The pieces sit `style_css.shell_margin_px` inside the surface, room
-        // for their shadows, so the margin is the pieces' place minus that.
-        const at_bottom = position == .bottom;
-        c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_TOP, @intFromBool(!at_bottom));
-        c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_BOTTOM, @intFromBool(at_bottom));
-        const room_px = geometry.height - panelHeight(ui);
-        const room_above_tenths: c_int = switch (position) {
-            .center => position_center_tenths,
-            .upper_third => position_upper_third_tenths,
-            .top, .bottom => 0,
-        };
-        const room_above_px = @divTrunc(room_px * room_above_tenths, 10);
-        const margin_px: c_int = switch (position) {
-            .top, .bottom => offset_px - style_css.shell_margin_px,
-            .upper_third, .center => @max(room_above_px - style_css.shell_margin_px, 0) + offset_px,
-        };
-        c.gtk_layer_set_margin(
-            window,
-            if (at_bottom) c.GTK_LAYER_SHELL_EDGE_BOTTOM else c.GTK_LAYER_SHELL_EDGE_TOP,
-            margin_px,
-        );
-        return;
+    const monitors = c.gdk_display_get_monitors(display);
+    if (hypr.focusedMonitorName(arena.allocator())) |name| {
+        const monitor_count = c.g_list_model_get_n_items(monitors);
+        var i: c_uint = 0;
+        while (i < monitor_count) : (i += 1) {
+            const monitor_object = c.g_list_model_get_item(monitors, i) orelse continue;
+            const monitor: *c.GdkMonitor = @ptrCast(monitor_object);
+            const connector = c.gdk_monitor_get_connector(monitor);
+            if (connector != null and std.mem.eql(u8, std.mem.span(connector.?), name)) {
+                return monitor;
+            }
+            c.g_object_unref(monitor_object);
+        }
     }
+    if (c.gtk_native_get_surface(@ptrCast(ui.window))) |surface| {
+        if (c.gdk_display_get_monitor_at_surface(display, surface)) |monitor| {
+            return @ptrCast(c.g_object_ref(monitor));
+        }
+    }
+    const first = c.g_list_model_get_item(monitors, 0) orelse return null;
+    return @ptrCast(first);
+}
+
+fn applyPosition(ui: *Ui, monitor_height_px: c_int) void {
+    const window: *c.GtkWindow = ui.window;
+    const chosen: layout_mod.Position = switch (ui.settings.position) {
+        .upper_third => .upper_third,
+        .center => .center,
+    };
+    const position = ui.layout.position orelse chosen;
+    const offset_px: c_int = ui.layout.offset;
+    // The pieces sit `style_css.shell_margin_px` inside the surface, room
+    // for their shadows, so the margin is the pieces' place minus that.
+    const at_bottom = position == .bottom;
+    c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_TOP, @intFromBool(!at_bottom));
+    c.gtk_layer_set_anchor(window, c.GTK_LAYER_SHELL_EDGE_BOTTOM, @intFromBool(at_bottom));
+    const room_px = @max(monitor_height_px - panelHeight(ui), 0);
+    const room_above_tenths: c_int = switch (position) {
+        .center => position_center_tenths,
+        .upper_third => position_upper_third_tenths,
+        .top, .bottom => 0,
+    };
+    const room_above_px = @divTrunc(room_px * room_above_tenths, 10);
+    const margin_px: c_int = switch (position) {
+        .top, .bottom => offset_px - style_css.shell_margin_px,
+        .upper_third, .center => @max(room_above_px - style_css.shell_margin_px, 0) + offset_px,
+    };
+    c.gtk_layer_set_margin(
+        window,
+        if (at_bottom) c.GTK_LAYER_SHELL_EDGE_BOTTOM else c.GTK_LAYER_SHELL_EDGE_TOP,
+        margin_px,
+    );
 }
 
 fn onChanged(_: *c.GtkEditable, data: ?*anyopaque) callconv(.c) void {

@@ -440,7 +440,7 @@ fn notify(L: *lua.State) lua.Error!c_int {
     }
     if (extension.notify_window_count >= notify_per_second_max) return 0;
     extension.notify_window_count += 1;
-    proc.spawn(&notifyArgv(title, body));
+    _ = proc.spawn(&notifyArgv(title, body));
     return 0;
 }
 

@@ -1,10 +1,12 @@
 //! Script commands from ~/.config/lumen/scripts.
 
 const std = @import("std");
+const linux = std.os.linux;
 const c = @import("c");
 const script_meta = @import("core").script_meta;
 const os = @import("os");
 const Item = @import("../item.zig").Item;
+const labels = @import("../ui/labels.zig");
 
 /// How much of a script is read for its metadata: script_meta reads at most
 /// 40 lines of header comments, which fit in it.
@@ -153,6 +155,17 @@ fn itemOf(
     name: []const u8,
 ) std.mem.Allocator.Error!?Item {
     const file_path = try arena.printSentinel("{s}/{s}", .{ path, name }, 0);
+    var stx: linux.Statx = undefined;
+    const stat_res = linux.statx(
+        linux.AT.FDCWD,
+        file_path.ptr,
+        0,
+        .{ .TYPE = true, .MODE = true },
+        &stx,
+    );
+    if (linux.errno(stat_res) != .SUCCESS) return null;
+    if ((stx.mode & linux.S.IFMT) != linux.S.IFREG) return null;
+    if ((stx.mode & 0o111) == 0) return null;
     // Only the header is read: script metadata lives in its comments.
     var head_buffer: [script_header_bytes_max]u8 = undefined;
     const head = os.readHead(file_path.ptr, &head_buffer);
@@ -160,8 +173,8 @@ fn itemOf(
     const subtitle = if (metadata.package_name.len > 0) metadata.package_name else "Script Command";
     return .{
         .key = try arena.print("script:{s}", .{name}),
-        .title = try arena.dupeSentinel(u8, metadata.title, 0),
-        .subtitle = try arena.dupeSentinel(u8, subtitle, 0),
+        .title = labels.displayText(arena, metadata.title),
+        .subtitle = labels.displayText(arena, subtitle),
         .accessory = "Script",
         .keywords = try arena.dupe(u8, metadata.description),
         .confirm = metadata.needs_confirmation,
@@ -240,6 +253,30 @@ test "a missing folder and an empty one stamp differently, and edits show" {
     const script_path = try test_dir.path(&path_buffer, "scripts/hello.sh");
     try os.writeFileAtomic(script_path, "#!/bin/ba\n");
     try std.testing.expect(!std.meta.eql(one_file, stamp(missing)));
+}
+
+test "scan skips non-executable files and sanitizes title and subtitle" {
+    var test_dir = try os.TestDir.init();
+    defer test_dir.deinit();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    try test_dir.mkdir("scripts");
+
+    try test_dir.write("scripts/notes.sh",
+        \\#!/bin/sh
+        \\# @raycast.title Non Exec
+    );
+    try test_dir.write("scripts/run.sh", "#!/bin/sh\n# @raycast.title Hello\rWorld\n# @raycast.packageName Dev\tTools\n");
+    const run_path = try test_dir.path(&path_buffer, "scripts/run.sh");
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fchmodat(linux.AT.FDCWD, run_path, 0o755)));
+
+    var dir_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const scripts_dir = try test_dir.path(&dir_buffer, "scripts");
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const items = scan(arena_state.allocator(), scripts_dir);
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    try std.testing.expectEqualStrings("Hello World", items[0].title);
+    try std.testing.expectEqualStrings("Dev Tools", items[0].subtitle);
 }
 
 test "emoji icons, joined ones included, and names that are not" {

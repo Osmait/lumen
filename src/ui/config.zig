@@ -113,7 +113,10 @@ pub fn saveSettings(ui: *Ui) void {
         ui.gpa,
         ui.settings_path,
         kept[0..kept_count],
-    ) catch |err| log.warn("saving settings: {t}", .{err});
+    ) catch |err| {
+        log.warn("saving settings: {t}", .{err});
+        ui.showFailure("Could not save the settings");
+    };
     ui.settings_stamp = settings_mod.Stamp.of(ui.settings_path.ptr);
     applyAppearance(ui, null);
     window_layout.applyLayout(ui);

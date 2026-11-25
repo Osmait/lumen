@@ -295,26 +295,37 @@ pub fn selectAfterRefresh(ui: *Ui) void {
     ui.scroll.suppressed = false;
 }
 
-/// The built row showing the item `key`.
+pub fn isSelectable(item: Item) bool {
+    return switch (item.action) {
+        .pick => |pick| pick.selectable,
+        else => true,
+    };
+}
+
+/// The built row showing the selectable item `key`.
 fn rowOfKey(ui: *const Ui, key: []const u8) ?usize {
     for (ui.rows.items, 0..) |row, i| {
         const item_index = row.item orelse continue;
+        if (!isSelectable(ui.items.items[item_index])) continue;
         if (std.mem.eql(u8, ui.items.items[item_index].key, key)) return i;
     }
     return null;
 }
 
-/// Where the item `key` is among the rows queued (`pending`).
+/// Where the selectable item `key` is among the rows queued (`pending`).
 fn pendingOfKey(ui: *const Ui, key: []const u8) ?usize {
     for (ui.pending.items, 0..) |pending_row, i| switch (pending_row) {
-        .item => |item_index| if (std.mem.eql(u8, ui.items.items[item_index].key, key)) return i,
+        .item => |item_index| {
+            if (!isSelectable(ui.items.items[item_index])) continue;
+            if (std.mem.eql(u8, ui.items.items[item_index].key, key)) return i;
+        },
         .section => {},
     };
     return null;
 }
 
 /// The first row after `from` (or from either end, when null) in
-/// `direction` that shows an item; `from` when there is none.
+/// `direction` that shows a selectable item; `from` when there is none.
 pub fn nextSelectable(ui: *Ui, from: ?usize, direction: i32) ?usize {
     assert(direction == 1 or direction == -1);
     if (from) |start| assert(start < ui.rows.items.len);
@@ -337,7 +348,8 @@ pub fn nextSelectable(ui: *Ui, from: ?usize, direction: i32) ?usize {
     else
         @as(i64, @intCast(row_count)) - 1;
     while (i >= 0 and i < row_count) : (i += direction) {
-        if (ui.rows.items[@intCast(i)].item != null) return @intCast(i);
+        const item_index = ui.rows.items[@intCast(i)].item orelse continue;
+        if (isSelectable(ui.items.items[item_index])) return @intCast(i);
     }
     return from;
 }
@@ -499,9 +511,15 @@ pub fn onRowActivated(
     data: ?*anyopaque,
 ) callconv(.c) void {
     const ui: *Ui = @ptrCast(@alignCast(data));
+    if (ui.suppress_next_activate) {
+        ui.suppress_next_activate = false;
+        return;
+    }
     const row_tag = @intFromPtr(c.g_object_get_data(row, row_index_data_key));
     // 0 is no data at all: a row Lumen did not build (the empty text).
     if (row_tag == 0 or row_tag - 1 >= ui.rows.items.len) return;
+    const item_index = ui.rows.items[row_tag - 1].item orelse return;
+    if (!isSelectable(ui.items.items[item_index])) return;
     select(ui, row_tag - 1);
     const item = ui.selectedItem() orelse return;
     ui.performEntry(item_mod.actionsFor(item)[0]);
@@ -513,6 +531,10 @@ pub fn onGridActivated(
     data: ?*anyopaque,
 ) callconv(.c) void {
     const ui: *Ui = @ptrCast(@alignCast(data));
+    if (ui.suppress_next_activate) {
+        ui.suppress_next_activate = false;
+        return;
+    }
     const cell_index = c.gtk_flow_box_child_get_index(child);
     if (cell_index < 0 or cell_index >= ui.rows.items.len) return;
     select(ui, @intCast(cell_index));

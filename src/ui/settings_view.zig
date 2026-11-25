@@ -494,7 +494,9 @@ pub fn performSetting(ui: *Ui, setting: item_mod.Setting, operation: item_mod.Op
         .open_file => {
             // Write the defaults first: an empty editor helps nobody.
             if (os.info(ui.settings_path.ptr) == null) config.saveSettings(ui);
-            run.openFile(ui.actionContext(), ui.settings_path, .file);
+            if (!run.openFile(ui.actionContext(), ui.settings_path, .file)) {
+                return ui.showFailure("Could not open it");
+            }
             ui.hide();
         },
         .ext_prefs => |id| prefs_view.open(ui, id),
@@ -503,7 +505,9 @@ pub fn performSetting(ui: *Ui, setting: item_mod.Setting, operation: item_mod.Op
         .field => |field_index| form_view.edit(ui, field_index),
         .submit_form => form_view.submit(ui),
         .ext_open => |folder| {
-            run.openFile(ui.actionContext(), folder, .folder);
+            if (!run.openFile(ui.actionContext(), folder, .folder)) {
+                return ui.showFailure("Could not open it");
+            }
             ui.hide();
         },
         .ext_update => |id| {

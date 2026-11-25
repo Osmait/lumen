@@ -272,7 +272,7 @@ pub fn batch(gpa: std.mem.Allocator, commands: []const []const u8) void {
 fn spawnBatch(gpa: std.mem.Allocator, commands: []const []const u8) void {
     const batch_z = batchString(gpa, commands) catch return;
     defer gpa.free(batch_z);
-    proc.spawn(&.{ "hyprctl", "--batch", batch_z });
+    _ = proc.spawn(&.{ "hyprctl", "--batch", batch_z });
 }
 
 fn batchWith(
@@ -403,7 +403,7 @@ pub fn sendQueued() void {
     var batch_buffer: [dispatch_queue_bytes_max]u8 = undefined;
     const commands = queued[batch_prefix.len..];
     const batch_z = std.mem.printSentinel(&batch_buffer, "{s}", .{commands}, 0) catch return;
-    proc.spawn(&.{ "hyprctl", "--batch", batch_z });
+    _ = proc.spawn(&.{ "hyprctl", "--batch", batch_z });
 }
 
 /// The argument of `hyprctl --batch`: "dispatch a ; dispatch b". Caller owns

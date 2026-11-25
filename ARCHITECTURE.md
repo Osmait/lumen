@@ -29,14 +29,17 @@ to `lumen-gtk` through a memfd as its stdin.
 src/main.zig      entry point: GApplication, command line, clipboard watcher
 src/client.zig    `lumen`: arguments to the daemon over a socket, else lumen-gtk
 src/ipc.zig       the socket's path and messages (shared by both)
-src/cli.zig       the command-line flags: what the client passes on, what
-                  needs a daemon, the usage text (shared by both)
+src/ipc/cli.zig   (via src/cli.zig) the command-line flags and usage text
+src/item.zig      row item model, actions, views and operation list
+src/layout.zig    window layout options (`lumen.layout` fields and validation)
+src/stats.zig     daemon latency, index and heap measurements (`lumen --stats`)
 src/core/         pure logic, unit tested: fuzzy matching, accent folding,
-                  calculator and units, frecency, window geometry, script
+                  calculator and units, frecency, window geometry, markdown
+                  to Pango markup, file kinds and badges, fixed strings, script
                   headers, UTF-8 cuts
 src/os/           the Linux calls Lumen makes itself (std only, no libc, so
                   the client uses it too), one file per topic, mapped in
-                  root.zig: stat, folder, file (atomic and append files,
+                  root.zig: stat, folder, file (atomic, append and lock files,
                   mappings), mounts, time, wait, sockets with deadlines
                   (unix.zig), programs run to a deadline (child.zig)
 src/index/        file index (std + os): store, scan, search (cheap and
@@ -45,11 +48,12 @@ src/index/        file index (std + os): store, scan, search (cheap and
                   content_format, content_write, content_build,
                   ContentIndex, content_search, content_find, content_list,
                   extract, TextCache, ContentService
-src/sys/          SQLite store (Db.zig), process spawning (GLib), hyprctl,
+src/sys/          SQLite store (Db.zig), process spawning (proc.zig), Hyprland
+                  IPC sockets (hypr.zig), main-loop queue (MainLoopQueue.zig),
                   the daemon's end of the socket (ipc_server.zig)
 src/providers/    apps (GIO), built-in commands, script commands
 src/luart/        Lua 5.4 as a library: lua.zig (the C API and its rules),
-                  json.zig (both ways)
+                  json.zig (both ways), lfiles.c, lstrmatch.c
 src/ext/          Lua extensions: Host.zig (requests, the worker thread,
                   delivery), requests.zig (list, root, act, submit on the
                   worker), loading.zig and spec.zig (reload, reading
@@ -72,7 +76,7 @@ src/c.zig         hand-written GTK/GLib/gtk4-layer-shell bindings
 ```
 
 `src/c.zig` declares only the C functions Lumen calls: Zig 0.16's
-translate-c could not parse GLib's headers. Zig 0.17's can, so the bindings
+translate-c could not parse GLib's headers. Zig 0.17.1's can, so the bindings
 could be generated now; they were kept by hand, with enum values checked
 against the installed headers. SQLite and Lua go through translate-c
 (`src/sqlite.h`, `src/lua.h`).
@@ -298,7 +302,7 @@ documents indexed):
 | files, key to frame p50 | 73 ms | 23 ms | preview capped at 40 lines, no wrapping |
 | CPU idle | 0 % | 0 % | nothing polls: inotify and futex waits |
 | name index thread, idle | 50 ms CPU, 629 wakeups per minute | ~0 ms, 44 | tombstones counted as they happen instead of 1.1 M masks after each event batch; no 100 ms poll timeout (an eventfd wakes it to stop); the content service sleeps until its next check instead of every 5 s |
-| anonymous memory | 44 MB | 37 MB | glibc's malloc in release builds (Zig 0.17's ReleaseSafe default is a checking allocator mapping every allocation of 6 KB or more, so the tuning above did not apply), no 256 KB signal stack in each of 31 threads' TLS |
+| anonymous memory | 44 MB | 37 MB | glibc's malloc in release builds (Zig 0.17.1's ReleaseSafe default is a checking allocator mapping every allocation of 6 KB or more, so the tuning above did not apply), no 256 KB signal stack in each of 31 threads' TLS |
 | disk writes, idle | ~1 GB/h | — | the name index rescanned every 10 minutes whenever caches changed (always); now only on start |
 | key press to window (p50) | 58.5 ms | 7.8 ms | `lumen` without GTK: 42.8 ms of client became 0.9 ms (Hyprland's `openlayer` event, 15 runs); the focused monitor read from Hyprland's socket instead of starting `hyprctl` (daemon's show 16.3 → 6.8 ms) |
 | files view, key to frame (p50) | 23.5 ms | 12 ms | only the first 14 rows are built with the keystroke's frame (the list shows ~8); the rest after it, a few per idle callback, dropped by the next keystroke. GTK laid out all 61 rows (~430 widgets) per key |
@@ -325,9 +329,9 @@ with a test:
 - a folder replaced by a link, `mv -T` over an empty folder, files added to
   a folder that is then moved away: the index stays right, each with a test
 - images are decoded only if the size their header declares is within
-  limits (8192² for previews and grid pictures, 2048² for icons), at most
-  2048 px wide for a preview; formats whose size cannot be read from the
-  header (JPEG XL, ICO, TGA...) are not previewed
+  `picture_limits` (8192², 64 MB, or 8 MB for SVG — shared by previews, grid
+  pictures and row icons), at most 2048 px wide for a preview; formats whose
+  size cannot be read from the header (JPEG XL, ICO, TGA...) are not previewed
 - rows show at most 512 bytes of a title (dmenu still prints the whole
   line), and Unicode bidi controls are left out of displayed names
 - Clipboard History loads the first 2000 characters of each entry; the
@@ -366,7 +370,7 @@ presses a key, so the UI is tested without screenshots.
 
 Fuzz tests (index files, calculator, Office XML, case-insensitive search) run
 on their seed corpus as part of `zig build test`. Exploring with `--fuzz`
-builds with Zig 0.17.0 but does not run yet: the test runner's input poller
+builds with Zig 0.17.1 but does not run yet: the test runner's input poller
 panics (`start index 1 is larger than end index 0`) in every worker as soon
 as fuzzing starts, in std, not in Lumen's targets. Under 0.16, with a patched
 lib dir and `use_llvm = true`, 3.5M + 4.9M iterations found nothing.

@@ -22,6 +22,7 @@ pub fn handleKeyEvent(
     state: c.GdkModifierType,
     from_keyboard: bool,
 ) c.gboolean {
+    ui.suppress_next_activate = false;
     const key: KeyPress = .decode(keyval, state, .{ .panel_open = ui.panel.isOpen() });
 
     if (ui.panel.isOpen()) {
@@ -162,19 +163,20 @@ const KeyPress = struct {
         state: c.GdkModifierType,
         context: struct { panel_open: bool },
     ) KeyPress {
+        const lower = c.gdk_keyval_to_lower(keyval);
         const ctrl = state & c.GDK_CONTROL_MASK != 0;
-        const down = keyval == c.GDK_KEY_Down or
-            (ctrl and (keyval == c.GDK_KEY_n or keyval == c.GDK_KEY_j));
-        const up = keyval == c.GDK_KEY_Up or
-            (ctrl and (keyval == c.GDK_KEY_p or keyval == c.GDK_KEY_k and context.panel_open));
+        const down = lower == c.GDK_KEY_Down or
+            (ctrl and (lower == c.GDK_KEY_n or lower == c.GDK_KEY_j));
+        const up = lower == c.GDK_KEY_Up or
+            (ctrl and (lower == c.GDK_KEY_p or lower == c.GDK_KEY_k and context.panel_open));
         // No key is both: a chord names one letter.
         assert(!(down and up));
         return .{
-            .keyval = keyval,
+            .keyval = lower,
             .ctrl = ctrl,
             .shift = state & c.GDK_SHIFT_MASK != 0,
             .vertical = if (down) .down else if (up) .up else null,
-            .enter = keyval == c.GDK_KEY_Return or keyval == c.GDK_KEY_KP_Enter,
+            .enter = lower == c.GDK_KEY_Return or lower == c.GDK_KEY_KP_Enter,
         };
     }
 
@@ -333,4 +335,22 @@ test "held backspace never exits a view or aborts dmenu" {
     try std.testing.expect(!backspaceGoesBack(.root, true, &blocked, false));
     // Synthetic `--key backspace` continues to navigate back on non-dmenu subviews.
     try std.testing.expect(backspaceGoesBack(.settings, true, &blocked, false));
+}
+
+test "KeyPress.decode handles uppercase Ctrl letters when Caps Lock is active" {
+    const ctrl_n = KeyPress.decode('N', c.GDK_CONTROL_MASK, .{ .panel_open = false });
+    try std.testing.expectEqual(@as(?KeyPress.Vertical, .down), ctrl_n.vertical);
+
+    const ctrl_j = KeyPress.decode('J', c.GDK_CONTROL_MASK, .{ .panel_open = false });
+    try std.testing.expectEqual(@as(?KeyPress.Vertical, .down), ctrl_j.vertical);
+
+    const ctrl_p = KeyPress.decode('P', c.GDK_CONTROL_MASK, .{ .panel_open = false });
+    try std.testing.expectEqual(@as(?KeyPress.Vertical, .up), ctrl_p.vertical);
+
+    const ctrl_k_closed = KeyPress.decode('K', c.GDK_CONTROL_MASK, .{ .panel_open = false });
+    try std.testing.expectEqual(@as(c_uint, c.GDK_KEY_k), ctrl_k_closed.keyval);
+    try std.testing.expectEqual(@as(?KeyPress.Vertical, null), ctrl_k_closed.vertical);
+
+    const ctrl_k_open = KeyPress.decode('K', c.GDK_CONTROL_MASK, .{ .panel_open = true });
+    try std.testing.expectEqual(@as(?KeyPress.Vertical, .up), ctrl_k_open.vertical);
 }
