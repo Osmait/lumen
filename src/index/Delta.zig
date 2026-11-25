@@ -30,6 +30,53 @@ const search = @import("search.zig");
 
 const Delta = @This();
 
+const NameKey = struct { parent: u32, name: []const u8 };
+
+const NameContext = struct {
+    builder: *const Builder,
+
+    fn nameOf(builder: *const Builder, id: u32) []const u8 {
+        const offset = builder.name_offsets.items[id];
+        return builder.names.items[offset..][0..builder.name_sizes.items[id]];
+    }
+
+    pub fn hash(ctx: NameContext, id: u32) u64 {
+        return hashKey(.{ .parent = ctx.builder.parents.items[id], .name = nameOf(ctx.builder, id) });
+    }
+
+    pub fn eql(ctx: NameContext, a: u32, b: u32) bool {
+        if (ctx.builder.parents.items[a] != ctx.builder.parents.items[b]) return false;
+        return std.mem.eql(u8, nameOf(ctx.builder, a), nameOf(ctx.builder, b));
+    }
+
+    fn hashKey(key: NameKey) u64 {
+        var h: std.hash.Wyhash = .init(0);
+        h.update(std.mem.asBytes(&key.parent));
+        h.update(key.name);
+        return h.final();
+    }
+};
+
+const NameAdapter = struct {
+    builder: *const Builder,
+
+    pub fn hash(_: NameAdapter, key: NameKey) u64 {
+        return NameContext.hashKey(key);
+    }
+
+    pub fn eql(adapter: NameAdapter, key: NameKey, id: u32) bool {
+        if (adapter.builder.parents.items[id] != key.parent) return false;
+        return std.mem.eql(u8, NameContext.nameOf(adapter.builder, id), key.name);
+    }
+};
+
+const NameMap = std.HashMapUnmanaged(
+    u32,
+    void,
+    NameContext,
+    std.hash_map.default_max_load_percentage,
+);
+
 /// Searchable version of `builder`, rebuilt after each batch of changes.
 store: Store,
 builder: Builder = .empty,
@@ -37,9 +84,10 @@ builder: Builder = .empty,
 /// new file of one directory hangs from the same root. Owns the keys.
 roots: std.StringHashMapUnmanaged(u32) = .empty,
 /// Delta entry -> the delta entries under it (scaffolding roots
-/// included), so finding a child or a subtree is not a walk over the
-/// whole delta.
+/// included), so finding a subtree is not a walk over the whole delta.
 kids: std.AutoHashMapUnmanaged(u32, std.ArrayList(u32)) = .empty,
+/// O(1) lookup by `(parent, name)` into `builder` for live delta entries.
+by_name: NameMap = .empty,
 /// Persistent engine over `store` (see `Live.engine_base`).
 engine: search.Engine = .empty,
 
@@ -72,6 +120,7 @@ pub fn deinit(delta: *Delta, gpa: std.mem.Allocator) void {
     var kids_lists = delta.kids.valueIterator();
     while (kids_lists.next()) |list| list.deinit(gpa);
     delta.kids.deinit(gpa);
+    delta.by_name.deinit(gpa);
     delta.engine.deinit(gpa);
     delta.* = undefined;
 }
@@ -96,26 +145,20 @@ pub fn isDir(delta: *const Delta, id: u32) bool {
     return delta.flags(id) & store_mod.flag_dir != 0;
 }
 
-/// Child of delta entry `directory` named `child_name`, looked up in the
-/// builder, not in `store`: that one is only rebuilt after the batch, so a
-/// file created and deleted within one batch (an editor's temp file) was
-/// never found and stayed searchable for good. Among `directory`'s `kids`
-/// only: walking the whole delta made every event cost everything added
-/// since the rescan.
+/// Child of delta entry `directory` named `child_name`, looked up in O(1) via
+/// `by_name` against `builder` (never `store`: that one is only rebuilt after
+/// the batch).
 pub fn child(delta: *const Delta, directory: u32, child_name: []const u8) ?u32 {
-    const builder = &delta.builder;
-    const kids = delta.kids.get(directory) orelse return null;
-    for (kids.items) |kid| {
-        if (builder.masks.items[kid] == 0) continue;
-        const name_offset = builder.name_offsets.items[kid];
-        const kid_name = builder.names.items[name_offset..][0..builder.name_sizes.items[kid]];
-        if (std.mem.eql(u8, kid_name, child_name)) return kid;
-    }
-    return null;
+    const id = delta.by_name.getKeyAdapted(
+        NameKey{ .parent = directory, .name = child_name },
+        NameAdapter{ .builder = &delta.builder },
+    ) orelse return null;
+    assert(delta.builder.masks.items[id] != 0);
+    return id;
 }
 
-/// Adds an entry under delta entry `parent`, and to its parent's `kids`.
-/// Atomic on OOM: if updating `kids` fails, `delta.builder` is untouched.
+/// Adds an entry under delta entry `parent`, and to its parent's `kids` and `by_name`.
+/// Atomic on OOM: if updating `kids` or `by_name` fails, `delta.builder` is untouched.
 pub fn push(
     delta: *Delta,
     gpa: std.mem.Allocator,
@@ -127,8 +170,11 @@ pub fn push(
     const kids = try delta.kids.getOrPut(gpa, parent);
     if (!kids.found_existing) kids.value_ptr.* = .empty;
     try kids.value_ptr.ensureUnusedCapacity(gpa, 1);
+    const map_ctx: NameContext = .{ .builder = &delta.builder };
+    try delta.by_name.ensureUnusedCapacityContext(gpa, 1, map_ctx);
     const id = try delta.builder.push(gpa, name, parent, entry_flags, depth);
     kids.value_ptr.appendAssumeCapacity(id);
+    delta.by_name.putAssumeCapacityContext(id, {}, map_ctx);
     return id;
 }
 
@@ -215,6 +261,11 @@ pub fn tombstoneTree(delta: *Delta, gpa: std.mem.Allocator, root_id: u32) Tombst
                 };
             }
         }
+        const adapter: NameAdapter = .{ .builder = builder };
+        _ = delta.by_name.removeAdapted(
+            NameKey{ .parent = builder.parents.items[id], .name = NameContext.nameOf(builder, id) },
+            adapter,
+        );
         builder.tombstone(id);
         if (id < delta.store.len()) delta.store.tombstone(id);
         tombstoned.count += 1;
@@ -274,4 +325,23 @@ test "Delta.push and Delta.root leave delta.builder untouched on OOM" {
     try testing.expectError(error.OutOfMemory, delta.push(gpa, "ghost.txt", root_id, 0, 1));
     try testing.expectEqual(len_before_push, delta.builder.len());
     try testing.expectEqual(@as(?u32, null), delta.child(root_id, "ghost.txt"));
+}
+
+test "Delta.child remains O(1) across many entries in one folder" {
+    const testing = std.testing;
+    var delta = try Delta.init(testing.allocator);
+    defer delta.deinit(testing.allocator);
+    const dir_id = try delta.root(testing.allocator, "/tmp/many", 0);
+
+    var name_buf: [32]u8 = undefined;
+    var ids: [2000]u32 = undefined;
+    for (0..2000) |i| {
+        const name = try std.mem.print(&name_buf, "file_{d}.txt", .{i});
+        ids[i] = try delta.push(testing.allocator, name, dir_id, 0, 1);
+    }
+    try testing.expectEqual(@as(?u32, ids[0]), delta.child(dir_id, "file_0.txt"));
+    try testing.expectEqual(@as(?u32, ids[1999]), delta.child(dir_id, "file_1999.txt"));
+    _ = delta.tombstoneTree(testing.allocator, ids[0]);
+    try testing.expectEqual(@as(?u32, null), delta.child(dir_id, "file_0.txt"));
+    try testing.expectEqual(@as(?u32, ids[1]), delta.child(dir_id, "file_1.txt"));
 }

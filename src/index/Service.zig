@@ -466,10 +466,7 @@ fn rescan(service: *Service) void {
     }
     const fresh = service.prepareCompaction() catch |err| {
         log.warn("rescan: {t}", .{err});
-        // Clear the request so a failing rescan does not spin the CPU.
-        service.lock.lockUncancelable(service.io);
-        defer service.lock.unlock(service.io);
-        service.live.pending_resync = false;
+        // Keep `pending_resync` set so backoff spaces retries instead of stranding stale state.
         return;
     };
     const old = blk: {

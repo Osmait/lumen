@@ -339,7 +339,7 @@ pub fn apply(live: *Live, changes: []const Watcher.Change) std.mem.Allocator.Err
     for (changes) |change| switch (change) {
         .created => |created| {
             const parent: EntryId = .fromRaw(created.parent);
-            const added = try live.add(parent, created.name, created.is_dir);
+            const added = try live.add(parent, created.name, created.is_dir, created.moved_to);
             applied_count += @intFromBool(added);
         },
         .modified => {},
@@ -497,16 +497,16 @@ fn tombstoneDeltaUnder(live: *Live, directory: u32) usize {
     return live.tombstonedCount(live.delta.tombstoneUnder(live.gpa, dir_path));
 }
 
-fn add(live: *Live, parent: EntryId, name: []const u8, is_dir: bool) !bool {
+fn add(live: *Live, parent: EntryId, name: []const u8, is_dir: bool, moved_to: bool) !bool {
     // A directory moved out of the tree is still watched: what happens in
     // it now must not come back under its old path.
     if (!live.alive(parent)) return false;
     if (live.childOf(parent, name)) |known| {
         // Already indexed: an IN_MOVED_TO of something known, or what a
-        // rescan read before its event came. No duplicate. Except for a
-        // directory renamed over an empty one (`mv -T a b`): same name,
-        // another directory, and what came from `a` was lost, unwatched.
-        if (!is_dir or !live.isDirEntry(known)) return false;
+        // rescan read before its event came (`IN_CREATE`). No duplicate.
+        // Only an `IN_MOVED_TO` directory over an existing one (`mv -T a b`)
+        // replaces unknown contents and needs tombstoning + rescanning.
+        if (!moved_to or !is_dir or !live.isDirEntry(known)) return false;
         live.stats.removed += live.tombstoneTree(known);
     }
     var parent_path_buffer: paths.Buffer = undefined;
@@ -638,7 +638,7 @@ pub fn applyRechecks(live: *Live, rechecks: []const Recheck) std.mem.Allocator.E
         }
         for (recheck.found) |found| {
             if (live.childOf(parent, found.name) != null) continue;
-            if (try live.add(parent, found.name, found.is_dir)) changed = true;
+            if (try live.add(parent, found.name, found.is_dir, false)) changed = true;
         }
         if (parent.in_delta) {
             present.clearRetainingCapacity();
@@ -1891,4 +1891,16 @@ test "live: saveAndMap maps our own inode even when shared path is replaced by a
         try testing.expect(!std.mem.endsWith(u8, p, "/right_only.txt"));
     }
     try testing.expect(saw_left);
+}
+
+test "live: IN_CREATE for an already-indexed directory keeps its subtree without tombstoning" {
+    const tree = try Tree.create(&sample_tree);
+    defer tree.destroy();
+    const graves_before = tree.live.graves;
+    const applied = try tree.live.apply(&.{
+        .{ .created = .{ .parent = 0, .name = "modulo", .is_dir = true, .moved_to = false } },
+    });
+    try testing.expectEqual(@as(usize, 0), applied);
+    try testing.expectEqual(graves_before, tree.live.graves);
+    try testing.expectEqual(@as(usize, 1), try tree.count("hoja", "modulo/interno/hoja.rs"));
 }

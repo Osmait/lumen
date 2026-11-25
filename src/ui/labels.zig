@@ -95,14 +95,34 @@ pub fn contextMarkup(
     words: []const []const u8,
     highlight_open: []const u8,
 ) [:0]const u8 {
-    const first = if (line > context_lines_before) line - context_lines_before else 1;
+    return contextMarkupFrom(arena, text, 1, line, words, highlight_open);
+}
+
+/// Like `contextMarkup`, starting line numbering at `first_line_number`
+/// (pass `line` when displaying a single-line snippet fallback).
+pub fn contextMarkupFrom(
+    arena: std.mem.Allocator,
+    text: []const u8,
+    first_line_number: u32,
+    line: u32,
+    words: []const []const u8,
+    highlight_open: []const u8,
+) [:0]const u8 {
+    const start_at = @max(first_line_number, 1);
+    const first = if (start_at > 1)
+        start_at
+    else if (line > context_lines_before)
+        line - context_lines_before
+    else
+        1;
     var out: std.ArrayList(u8) = .empty;
-    var line_number: u32 = 1;
+    var line_number: u32 = start_at;
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw| : (line_number += 1) {
         if (line_number < first) continue;
         if (line_number > line +| context_lines_after) break;
-        const shown = core.utf8.validPrefix(raw[0..@min(raw.len, context_line_bytes_max)]);
+        const cut_len = core.utf8.floorBoundary(raw, context_line_bytes_max);
+        const shown = core.utf8.sanitizeAlloc(arena, raw[0..cut_len]) catch return "";
         const number = arena.print(
             "<span alpha=\"" ++ line_number_alpha ++ "\">{d: >4}  </span>",
             .{line_number},
@@ -291,8 +311,8 @@ pub fn firstLine(arena: std.mem.Allocator, text: []const u8) [:0]const u8 {
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0) continue;
-        const title = trimmed[0..@min(trimmed.len, clipboard_title_bytes_max)];
-        return displayText(arena, core.utf8.validPrefix(title));
+        const cut = core.utf8.floorBoundary(trimmed, clipboard_title_bytes_max);
+        return displayText(arena, trimmed[0..cut]);
     }
     return "";
 }
@@ -335,6 +355,22 @@ test "bidirectional controls cannot disguise a name" {
     const title = firstLine(arena, "\n  pay \u{202E}fdp.exe\nmore");
     try std.testing.expectEqualStrings("pay fdp.exe", title);
     try std.testing.expectEqualStrings("a b", firstLine(arena, "a\tb"));
+    try std.testing.expectEqualStrings(
+        "Caf\u{FFFD} meeting",
+        firstLine(arena, "Caf\xe9 meeting"),
+    );
+    const markup = contextMarkupFrom(
+        arena,
+        "Caf\xe9 /* funci\xf3n buscar */",
+        50,
+        50,
+        &.{"buscar"},
+        "<span>",
+    );
+    try std.testing.expect(std.mem.find(u8, markup, "50") != null);
+    try std.testing.expect(std.mem.find(u8, markup, "<b>") != null);
+    try std.testing.expect(std.mem.find(u8, markup, "<span>buscar</span>") != null);
+    try std.testing.expect(std.mem.find(u8, markup, "Caf\u{FFFD}") != null);
 }
 
 test "dayBoundsInZone aligns Yesterday with calendar midnight across DST transitions" {

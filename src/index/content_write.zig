@@ -94,9 +94,9 @@ pub const Sink = struct {
     }
 };
 
-/// Where `writeDocs` put the doc table, and how many bytes of paths it
+/// Where `writeDocs` put the doc table, its flags column, and how many bytes of paths it
 /// added after it.
-pub const DocTableWritten = struct { offset: usize, paths_size: usize };
+pub const DocTableWritten = struct { offset: usize, paths_size: usize, flags_offset: usize };
 
 pub const WriteDocsOptions = struct {
     /// Each document's flags; none set when null.
@@ -164,6 +164,7 @@ pub fn writeDocs(
         table[cursor] = @backingInt(doc.source);
         cursor += 1;
     }
+    const flags_offset = cursor;
     if (options.flags) |flags| @memcpy(table[cursor..][0..docs.len], flags);
     cursor += docs.len;
     assert(cursor == table_start + docs.len * doc_size);
@@ -173,7 +174,11 @@ pub fn writeDocs(
         cursor += doc.path.len;
     }
     assert(path_offset == paths_offset + paths_size);
-    return .{ .offset = docs_offset, .paths_size = paths_size };
+    return .{
+        .offset = docs_offset,
+        .paths_size = paths_size,
+        .flags_offset = docs_offset + (flags_offset - table_start),
+    };
 }
 
 /// A segment of another index, as it is.

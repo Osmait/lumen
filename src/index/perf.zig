@@ -358,7 +358,7 @@ fn plainText(
     document: content.DocIn,
     text: *std.ArrayList(u8),
     gpa: std.mem.Allocator,
-) std.mem.Allocator.Error!bool {
+) std.mem.Allocator.Error!content.ReadOutcome {
     return content.readPlain(gpa, document.path, text);
 }
 
@@ -387,7 +387,7 @@ fn contents(gpa: std.mem.Allocator, pool: *index.Pool, directory: []const u8) !v
         text_bytes += text.items.len;
         try documents.append(arena, .{
             .path = document_path,
-            .mtime = 1_700_000_000 + @as(i64, @intCast(i)),
+            .mtime = (1_700_000_000 + @as(i64, @intCast(i))) * std.time.ns_per_s,
             .size = text.items.len,
         });
     }

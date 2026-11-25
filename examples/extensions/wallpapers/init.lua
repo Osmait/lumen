@@ -2,7 +2,10 @@
 -- in Settings > Extensions > Wallpapers (swww by default).
 local lumen = require("lumen")
 
-local function expand(path) return (path:gsub("^~", os.getenv("HOME"))) end
+local function expand(path)
+  local home = os.getenv("HOME") or ""
+  return (path:gsub("^~", function() return home end))
+end
 
 return lumen.extension {
   title = "Wallpapers",
@@ -28,15 +31,18 @@ return lumen.extension {
         for path in (out or ""):gmatch("[^\n]+") do
           local argv = {}
           for word in lumen.preferences.command:gmatch("%S+") do argv[#argv + 1] = word end
-          argv[#argv + 1] = path
+          local actions = {
+            lumen.action.open(path, "Open"),
+            lumen.action.copy(path, "Copy Path"),
+          }
+          if #argv > 0 then
+            argv[#argv + 1] = path
+            table.insert(actions, 1, lumen.action.exec(argv, "Set as Wallpaper"))
+          end
           rows[#rows + 1] = {
             title = path:match("([^/]+)$"),
             image = path,
-            actions = {
-              lumen.action.exec(argv, "Set as Wallpaper"),
-              lumen.action.open(path, "Open"),
-              lumen.action.copy(path, "Copy Path"),
-            },
+            actions = actions,
           }
         end
         table.sort(rows, function(a, b) return a.title < b.title end)

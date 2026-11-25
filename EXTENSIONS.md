@@ -262,7 +262,7 @@ Anywhere an icon is given (commands, rows, `lumen.icons`):
 | | |
 |---|---|
 | `lumen.extension(spec)` | What `init.lua` returns. |
-| `lumen.exec(argv [, opts])` | Runs a program and waits for it. Returns `stdout, code, stderr`, or `nil, message` when it cannot run or times out. `opts.stdin` is written to its input; `opts.timeout` is in seconds. It inherits Lumen's environment and searches `PATH`. |
+| `lumen.exec(argv [, opts])` | Runs a program and waits for it. Returns `stdout, code, stderr` (`code` is `nil` if killed by a signal), or `nil, message` when it cannot run or times out. Output past 16 MB stops the child and fails. `opts.stdin` is written to its input; `opts.timeout` is in seconds. It inherits Lumen's environment and searches `PATH`. |
 | `lumen.json.decode(text)` | JSON to Lua values; null becomes nil. |
 | `lumen.json.encode(value)` | Lua values to JSON. A table with a sequence part is an array, else an object with string keys. Bytes that are not UTF-8 become U+FFFD. |
 | `lumen.notify(title [, body])` | A desktop notification. |

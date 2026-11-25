@@ -54,17 +54,20 @@ const round_docs_max = 1024;
 /// per ~9 bytes, so a round still reads hundreds of files.
 const round_pairs_max = segment_pairs_max;
 
-/// Reads a document's text into `text` for indexing or verifying: false when
-/// it has none to index (gone, binary, too big). `extracted` documents are
-/// read from the text cache by the caller-provided resolver. Running out of
-/// memory is an error, never "no text": the index would keep the document
-/// empty until it changed.
+/// Outcome of reading a document for indexing:
+/// - `text`: usable text is in `text` (indexed and searched)
+/// - `none`: permanently empty/unindexable for this version (missing, non-regular, binary, oversized)
+/// - `unavailable`: transient/permission read error; do not keep as an empty live doc
+pub const ReadOutcome = enum { text, none, unavailable };
+
+/// Reads a document's text into `text` for indexing or verifying. Running out
+/// of memory is an error, never `.none`.
 pub const TextFn = *const fn (
     context: *anyopaque,
     doc: DocIn,
     text: *std.ArrayList(u8),
     gpa: std.mem.Allocator,
-) std.mem.Allocator.Error!bool;
+) std.mem.Allocator.Error!ReadOutcome;
 
 /// A `TextFn` and the context it is called with.
 pub const TextReader = struct {
@@ -99,27 +102,32 @@ pub const TextReader = struct {
 };
 
 /// Plain text of a file: up to `text_bytes_max` bytes, rejected if binary
-/// (a NUL in the first 8 KB, git's rule).
+/// (a NUL in the first 8 KB, git's rule). Transient/permission open or read
+/// errors return `.unavailable` so the caller can retry later instead of
+/// recording the file as empty.
 pub fn readPlain(
     gpa: std.mem.Allocator,
     path: []const u8,
     text: *std.ArrayList(u8),
-) std.mem.Allocator.Error!bool {
+) std.mem.Allocator.Error!ReadOutcome {
     text.clearRetainingCapacity();
     var path_buffer: paths.Buffer = undefined;
-    const path_z = std.mem.printSentinel(&path_buffer, "{s}", .{path}, 0) catch return false;
+    const path_z = std.mem.printSentinel(&path_buffer, "{s}", .{path}, 0) catch return .none;
     // Not a plain open: the path may have become a FIFO since it was indexed.
-    const fd = sys.openRegular(path_z) catch return false;
+    const fd = sys.openRegular(path_z) catch |err| switch (err) {
+        error.NotFound, error.NotRegular, error.NameTooLong => return .none,
+        else => return .unavailable,
+    };
     defer sys.close(fd);
     // One byte past the limit tells a file over it.
     sys.readUpTo(gpa, fd, text, text_bytes_max + 1) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        // Part of the file is not its text: left out, as if unreadable.
-        error.ReadFailed => return false,
+        // Part of the file is unreadable: retry later instead of caching empty.
+        error.ReadFailed => return .unavailable,
     };
-    if (text.items.len > text_bytes_max) return false;
+    if (text.items.len > text_bytes_max) return .none;
     const head = text.items[0..@min(text.items.len, 8000)];
-    return std.mem.findScalar(u8, head, 0) == null;
+    return if (std.mem.findScalar(u8, head, 0) == null) .text else .none;
 }
 
 pub const BuildStats = struct {
@@ -175,6 +183,8 @@ pub fn buildFile(
     path_z: [:0]const u8,
     stats: ?*BuildStats,
 ) FileError!Index {
+    var lock = try sys.LockFile.acquire(path_z);
+    defer lock.release();
     var file = try sys.AtomicFile.create(path_z);
     errdefer file.abort();
     var sink: Sink = .{ .gpa = gpa, .file = &file };
@@ -217,6 +227,8 @@ pub fn updateFile(
     path_z: [:0]const u8,
     stats: ?*BuildStats,
 ) FileError!Index {
+    var lock = try sys.LockFile.acquire(path_z);
+    defer lock.release();
     var file = try sys.AtomicFile.create(path_z);
     errdefer file.abort();
     var sink: Sink = .{ .gpa = gpa, .file = &file };
@@ -244,7 +256,9 @@ pub fn appendFile(
     path_z: [:0]const u8,
     stats: ?*BuildStats,
 ) FileError!?Index {
-    var file = (try sys.AppendFile.open(path_z, old.bytes.len)) orelse return null;
+    var lock = try sys.LockFile.acquire(path_z);
+    defer lock.release();
+    var file = (try sys.AppendFile.open(path_z, old.bytes.len, old.file_id)) orelse return null;
     defer file.deinit();
     var sink: Sink = .{ .gpa = gpa, .append_file = &file, .written_bytes = file.len };
     defer sink.deinit();
@@ -257,7 +271,8 @@ pub fn appendFile(
     var index = try Index.open(path_z);
     errdefer index.deinit(gpa);
     // Another writer could have replaced the path between sync and reopen.
-    if (index.docs_count != header.docs_count or
+    if (index.file_id == null or !index.file_id.?.eql(file.id) or
+        index.docs_count != header.docs_count or
         index.segments_count != header.segments_count or
         index.file.len != header.size_total)
     {
@@ -289,6 +304,23 @@ fn toFile(sink: *Sink, header: Header, path_z: [:0]const u8) FileError!Index {
     return Index.open(path_z);
 }
 
+fn markUnavailable(
+    sink: *Sink,
+    table: content_write.DocTableWritten,
+    unavailable: []const u32,
+) FileError!void {
+    if (unavailable.len == 0) return;
+    if (sink.file != null) try sink.flush();
+    for (unavailable) |doc| {
+        const offset = table.flags_offset + doc;
+        if (sink.file) |file| {
+            try file.writeAt(&.{flag_removed}, offset);
+        } else {
+            sink.bytes.items[offset] |= flag_removed;
+        }
+    }
+}
+
 fn buildInto(
     sink: *Sink,
     pool: *Pool,
@@ -305,8 +337,11 @@ fn buildInto(
         .header = .reserve,
         .path_offsets_reused = &.{},
     });
-    try indexDocs(sink, pool, &directory, docs, 0, text, &build_stats, &.{});
-    build_stats.docs_indexed = docs.len;
+    var unavailable: std.ArrayList(u32) = .empty;
+    defer unavailable.deinit(sink.gpa);
+    try indexDocs(sink, pool, &directory, docs, 0, text, &build_stats, &.{}, &unavailable);
+    try markUnavailable(sink, table, unavailable.items);
+    build_stats.docs_indexed = docs.len - unavailable.items.len;
     const header = try finish(sink, directory.items, docs.len, table);
     build_stats.report(start_ns, stats);
     return header;
@@ -337,8 +372,21 @@ fn updateInto(
         .path_offsets_reused = &.{},
     });
     for (old.segments) |segment| try copySegment(sink, &directory, old.bytes, segment);
-    try indexDocs(sink, pool, &directory, docs, old.docs_count, text, &build_stats, &.{});
-    build_stats.docs_indexed = added.len;
+    var unavailable: std.ArrayList(u32) = .empty;
+    defer unavailable.deinit(gpa);
+    try indexDocs(
+        sink,
+        pool,
+        &directory,
+        docs,
+        old.docs_count,
+        text,
+        &build_stats,
+        &.{},
+        &unavailable,
+    );
+    try markUnavailable(sink, table, unavailable.items);
+    build_stats.docs_indexed = added.len - unavailable.items.len;
     const header = try finish(sink, directory.items, docs.len, table);
     build_stats.report(start_ns, stats);
     return header;
@@ -425,6 +473,8 @@ fn appendInto(
             try closePairs(sink, &directory, &pairs_merged, &merge_scratch, &build_stats);
         }
     }
+    var unavailable: std.ArrayList(u32) = .empty;
+    defer unavailable.deinit(gpa);
     try indexDocs(
         sink,
         pool,
@@ -434,13 +484,15 @@ fn appendInto(
         text,
         &build_stats,
         pairs_merged.items,
+        &unavailable,
     );
+    for (unavailable.items) |doc_id| flags[doc_id] |= flag_removed;
     const table = try writeDocs(sink, docs, .{
         .flags = flags,
         .header = .none,
         .path_offsets_reused = old.path_offsets,
     });
-    build_stats.docs_indexed = added.len;
+    build_stats.docs_indexed = added.len - unavailable.items.len;
     const header = try finish(sink, directory.items, docs.len, table);
     build_stats.report(start_ns, stats);
     return header;
@@ -490,6 +542,7 @@ fn indexDocs(
     text: TextReader,
     build_stats: *BuildStats,
     initial: []const u64,
+    unavailable: *std.ArrayList(u32),
 ) FileError!void {
     const gpa = sink.gpa;
     var pairs: std.ArrayList(u64) = .empty;
@@ -503,6 +556,7 @@ fn indexDocs(
     const task_pairs = buffers.task_pairs;
     const scratches = buffers.scratches;
     const spans = buffers.spans;
+    const outcomes = buffers.outcomes;
 
     var round_start = from;
     while (round_start < docs.len) {
@@ -517,10 +571,14 @@ fn indexDocs(
             .task_pairs = task_pairs,
             .scratches = scratches,
             .spans = spans,
+            .outcomes = outcomes,
             .next = .init(round_start),
         };
         pool.run(@min(tasks, round_end - round_start), &round, extractTask);
         if (round.out_of_memory.load(.acquire)) return error.OutOfMemory;
+        for (outcomes[0 .. round_end - round_start], 0..) |outcome, offset| {
+            if (outcome == .unavailable) try unavailable.append(gpa, @intCast(round_start + offset));
+        }
         // In doc order, which the stable radix sort turns into (key, doc).
         for (spans[0 .. round_end - round_start]) |span| {
             try pairs.appendSlice(gpa, task_pairs[span.task].items[span.start..][0..span.count]);
@@ -569,6 +627,7 @@ const RoundBuffers = struct {
     task_pairs: []std.ArrayList(u64),
     scratches: []TaskScratch,
     spans: []Pairs,
+    outcomes: []ReadOutcome,
 
     fn init(gpa: std.mem.Allocator, tasks: usize) std.mem.Allocator.Error!RoundBuffers {
         const task_pairs = try gpa.alloc(std.ArrayList(u64), tasks);
@@ -578,7 +637,9 @@ const RoundBuffers = struct {
         errdefer gpa.free(scratches);
         for (scratches) |*task_scratch| task_scratch.* = .{};
         const spans = try gpa.alloc(Pairs, round_docs_max);
-        return .{ .task_pairs = task_pairs, .scratches = scratches, .spans = spans };
+        errdefer gpa.free(spans);
+        const outcomes = try gpa.alloc(ReadOutcome, round_docs_max);
+        return .{ .task_pairs = task_pairs, .scratches = scratches, .spans = spans, .outcomes = outcomes };
     }
 
     fn deinit(buffers: RoundBuffers, gpa: std.mem.Allocator) void {
@@ -587,6 +648,7 @@ const RoundBuffers = struct {
         for (buffers.scratches) |*task_scratch| task_scratch.deinit(gpa);
         gpa.free(buffers.scratches);
         gpa.free(buffers.spans);
+        gpa.free(buffers.outcomes);
     }
 };
 
@@ -605,6 +667,7 @@ const ExtractRound = struct {
     scratches: []TaskScratch,
     /// Per document of the round: where its pairs are in `task_pairs`.
     spans: []Pairs,
+    outcomes: []ReadOutcome,
     next: std.atomic.Value(usize),
     /// Set by a task that ran out of memory: the build fails (and is retried
     /// later) instead of indexing its documents as empty.
@@ -650,7 +713,9 @@ fn extractTaskOrFail(round: *ExtractRound, task: usize) std.mem.Allocator.Error!
             .start = start,
             .count = out.items.len - start,
         };
-        if (!try round.text.read(round.text.context, round.docs[doc], text, gpa)) continue;
+        const outcome = try round.text.read(round.text.context, round.docs[doc], text, gpa);
+        round.outcomes[doc - round.start] = outcome;
+        if (outcome != .text) continue;
         if (seen.bit_length == 0) seen.* = try .initEmpty(gpa, trigrams_count);
         keys.clearRetainingCapacity();
         if (fold.isAscii(text.items)) {

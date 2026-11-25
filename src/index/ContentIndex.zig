@@ -41,6 +41,7 @@ const segments_inline_max = 64;
 
 bytes: Bytes,
 backing: format.Backing,
+file_id: ?sys.FileId = null,
 docs_count: usize,
 segments_count: usize,
 mtimes: []const i64,
@@ -267,9 +268,11 @@ pub fn save(index: *const ContentIndex, path_z: [:0]const u8) sys.Error!void {
 }
 
 pub fn open(path_z: [:0]const u8) (sys.Error || error{BadIndex})!ContentIndex {
-    const mapped = try sys.mapPrivate(path_z);
-    errdefer sys.unmap(mapped);
-    return parse(mapped, .mapped);
+    const mapped = try sys.mapPrivateWithId(path_z);
+    errdefer sys.unmap(mapped.bytes);
+    var parsed = try parse(mapped.bytes, .mapped);
+    parsed.file_id = mapped.id;
+    return parsed;
 }
 
 /// Posting list bytes of `key` in segment `segment_index` (empty if

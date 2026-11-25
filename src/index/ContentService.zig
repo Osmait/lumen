@@ -478,11 +478,11 @@ fn textOf(
     doc: content.DocIn,
     text: *std.ArrayList(u8),
     gpa: std.mem.Allocator,
-) std.mem.Allocator.Error!bool {
+) std.mem.Allocator.Error!content.ReadOutcome {
     const service: *ContentService = @ptrCast(@alignCast(context));
     return switch (doc.source) {
         .plain => content.readPlain(gpa, doc.path, text),
-        .extracted => service.text_cache.read(gpa, doc, text),
+        .extracted => if (try service.text_cache.read(gpa, doc, text)) .text else .none,
     };
 }
 
@@ -1486,7 +1486,7 @@ fn pokeAndWait(service: *ContentService) !void {
     try waitChecks(service, checks_before + 1);
 }
 
-/// Moves a file's mtime away from "now": the index compares whole seconds.
+/// Moves a file's mtime away from "now" (`setMtime` sets whole seconds, `nsec = 0`).
 fn setMtime(path: [:0]const u8, mtime_s: i64) !void {
     const time: linux.timespec = .{ .sec = mtime_s, .nsec = 0 };
     const times = [2]linux.timespec{ time, time };
@@ -1558,7 +1558,7 @@ test "content service: finds, follows edits and deletions, rebuilds only on chan
         try testing.expectEqual(@as(u32, 1), service.status().updates);
         hits = try fixture.find(service, "kilimanjaro");
         try testing.expectEqual(@as(usize, 1), hits.len);
-        try testing.expectEqual(edited, hits[0].mtime);
+        try testing.expectEqual(edited * std.time.ns_per_s, hits[0].mtime);
         try testing.expectEqual(@as(usize, 0), (try fixture.find(service, "zanzibar")).len);
 
         // Deleted: out of the index.
@@ -1783,7 +1783,7 @@ test "content service: Office documents are extracted once per version" {
         try testing.expectEqual(@as(u32, 2), status_now.builds);
         try testing.expectEqual(@as(usize, 1), try countText(service, prefix));
         var name_buffer: [64]u8 = undefined;
-        const name = try std.mem.print(&name_buffer, "{s}{d}-", .{ prefix, mtime_second });
+        const name = try std.mem.print(&name_buffer, "{s}{d}-", .{ prefix, mtime_second * std.time.ns_per_s });
         try testing.expectEqual(@as(usize, 1), try countText(service, name));
         try testing.expectEqual(@as(usize, 0), (try fixture.find(service, "wombat")).len);
         hits = try fixture.find(service, "platypus");
@@ -1841,7 +1841,7 @@ test "content service: Office documents are extracted once per version" {
     const now_name = try std.mem.printSentinel(&now_name_buffer, "{s}/text/{s}-{d}-{d}.txt", .{
         fixture.cache.absolute,
         TextCache.pathHashHex(&odt_hash_hex, odt_report),
-        mtime_second,
+        mtime_second * std.time.ns_per_s,
         odt_size,
     }, 0);
     const old_name = try std.mem.printSentinel(&old_name_buffer, "{s}/text/{x:0>16}-{d}.txt", .{
@@ -2007,8 +2007,8 @@ test "a shared index outlives the service's reference while a search holds one" 
             _: content.DocIn,
             _: *std.ArrayList(u8),
             _: std.mem.Allocator,
-        ) std.mem.Allocator.Error!bool {
-            return false;
+        ) std.mem.Allocator.Error!content.ReadOutcome {
+            return .none;
         }
     };
     var unused: u8 = 0;
@@ -2222,4 +2222,51 @@ test "content service: initial listing failure reports list_failed without becom
     const s = service.status();
     try testing.expect(!s.ready);
     try testing.expect(s.list_failed);
+}
+
+test "content service: unreadable plain file stays retryable after chmod and detects sub-second edits" {
+    if (linux.geteuid() == 0) return error.SkipZigTest;
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+
+    var p1_buf: paths.Buffer = undefined;
+    var p2_buf: paths.Buffer = undefined;
+    const secret_path = try fixture.root.path(&p1_buf, "secret.txt");
+    const subsec_path = try fixture.root.path(&p2_buf, "subsec.txt");
+    try fixture.root.write("secret.txt", "confidential aardvark token\n");
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(secret_path, 0o000)));
+    errdefer _ = linux.chmod(secret_path, 0o644);
+    try fixture.root.write("subsec.txt", "cat_word\n");
+    try setMtimeNs(subsec_path, 1_700_000_100, 200_000_000);
+
+    const service = try fixture.start();
+    defer {
+        _ = linux.chmod(secret_path, 0o644);
+        service.shutdown();
+    }
+    try waitChecks(service, 1);
+    // subsec_path is indexed; secret_path was unreadable so it must not be cached empty as live.
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "cat_word")).len);
+    try testing.expectEqual(@as(usize, 0), (try fixture.find(service, "aardvark")).len);
+
+    // Chmod preserves mtime and size, yet listing sees secret_path is not live and reads it.
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(secret_path, 0o644)));
+    // Same second and identical size ("cat_word\n" -> "dog_word\n"), different nsec.
+    try fixture.root.write("subsec.txt", "dog_word\n");
+    try setMtimeNs(subsec_path, 1_700_000_100, 800_000_000);
+    try pokeAndWait(service);
+
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "aardvark")).len);
+    try testing.expectEqual(@as(usize, 0), (try fixture.find(service, "cat_word")).len);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "dog_word")).len);
+}
+
+fn setMtimeNs(path: [*:0]const u8, sec: isize, nsec: isize) !void {
+    const times = [2]linux.timespec{
+        .{ .sec = sec, .nsec = nsec },
+        .{ .sec = sec, .nsec = nsec },
+    };
+    const rc = linux.utimensat(linux.AT.FDCWD, path, &times, 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
 }

@@ -28,7 +28,11 @@ return lumen.extension {
       submit_title = "Create File",
       submit = function(values)
         local path = values.folder .. "/" .. values.name
-        if io.open(path, "r") then error(values.name .. " already exists", 0) end
+        local existing = io.open(path, "r")
+        if existing then
+          existing:close()
+          error(values.name .. " already exists", 0)
+        end
         local f = assert(io.open(path, "w"))
         f:write(values.content ~= "" and values.content .. "\n" or "")
         f:close()

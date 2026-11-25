@@ -171,3 +171,21 @@ int luart_open_files (lua_State *L) {
   lua_pop(L, 1);
   return 0;
 }
+
+/* Sets FD_CLOEXEC on whatever file io.input() currently points at (the
+** sandbox's /dev/null opened via liolib's fopen without "e"). */
+void luart_cloexec_io_input (lua_State *L) {
+  lua_getglobal(L, "io");
+  lua_getfield(L, -1, "input");
+  if (lua_pcall(L, 0, 1, 0) == LUA_OK) {
+    luaL_Stream *p = (luaL_Stream *)luaL_testudata(L, -1, LUA_FILEHANDLE);
+    if (p != NULL && p->f != NULL) {
+      int fd = fileno(p->f);
+      if (fd >= 0) {
+        int flags = fcntl(fd, F_GETFD);
+        if (flags != -1) fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+      }
+    }
+  }
+  lua_pop(L, 2);
+}

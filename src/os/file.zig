@@ -347,14 +347,88 @@ pub const AtomicFile = struct {
 /// flock(2)'s LOCK_EX.
 const lock_exclusive = 2;
 
+/// Device + inode identity of an opened regular file.
+pub const FileId = struct {
+    dev: u64,
+    ino: u64,
+
+    pub fn eql(a: FileId, b: FileId) bool {
+        return a.dev == b.dev and a.ino == b.ino;
+    }
+};
+
+/// Returns the `(dev, ino)` identity of `fd` after verifying it is a regular file.
+pub fn fdIdentity(fd: i32) Error!FileId {
+    var stx: linux.Statx = undefined;
+    const stx_result = linux.statx(
+        fd,
+        "",
+        linux.AT.EMPTY_PATH,
+        .{ .TYPE = true, .INO = true },
+        &stx,
+    );
+    if (linux.errno(stx_result) != .SUCCESS or stx.mode & linux.S.IFMT != linux.S.IFREG) {
+        return error.NotRegular;
+    }
+    return .{
+        .dev = (@as(u64, stx.dev_major) << 32) | stx.dev_minor,
+        .ino = stx.ino,
+    };
+}
+
+/// Advisory exclusive flock on `<target_path>.lock` used to serialize both
+/// whole-file atomic rewrites and in-place appends across processes.
+pub const LockFile = struct {
+    fd: i32,
+
+    pub fn acquire(target_path: []const u8) Error!LockFile {
+        var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const lock_path = std.mem.printSentinel(&buf, "{s}.lock", .{target_path}, 0) catch
+            return error.NameTooLong;
+        const open_result = linux.open(
+            lock_path,
+            .{
+                .ACCMODE = .RDWR,
+                .CREAT = true,
+                .NOFOLLOW = true,
+                .CLOEXEC = true,
+                .NOCTTY = true,
+            },
+            0o600,
+        );
+        switch (linux.errno(open_result)) {
+            .LOOP, .ISDIR => return error.NotRegular,
+            else => {},
+        }
+        const fd: i32 = @intCast(try check(open_result));
+        errdefer close(fd);
+        _ = try fdIdentity(fd);
+        while (true) {
+            const lock_result = linux.flock(fd, lock_exclusive);
+            if (linux.errno(lock_result) != .INTR) {
+                _ = try check(lock_result);
+                break;
+            }
+        }
+        return .{ .fd = fd };
+    }
+
+    pub fn release(lock: *LockFile) void {
+        close(lock.fd);
+        lock.fd = -1;
+    }
+};
+
 pub const AppendFile = struct {
     fd: i32,
     /// Where the next `write` goes.
     len: usize,
+    id: FileId,
 
-    /// Null when the file is not `expect_len` bytes long (someone else wrote
-    /// it): the caller rewrites it whole instead.
-    pub fn open(path: [*:0]const u8, expect_len: usize) Error!?AppendFile {
+    /// Null when the file is not `expect_len` bytes long or its `(dev, ino)`
+    /// differs from `expect_id` (someone else rewrote/replaced it): the caller
+    /// rewrites it whole instead.
+    pub fn open(path: [*:0]const u8, expect_len: usize, expect_id: ?FileId) Error!?AppendFile {
         const open_result = linux.open(
             path,
             .{
@@ -374,15 +448,11 @@ pub const AppendFile = struct {
         }
         const fd: i32 = @intCast(try check(open_result));
         errdefer close(fd);
-        var stx: linux.Statx = undefined;
-        const stx_result = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stx);
-        if (linux.errno(stx_result) != .SUCCESS or stx.mode & linux.S.IFMT != linux.S.IFREG) {
-            return error.NotRegular;
-        }
+        _ = try fdIdentity(fd);
         // Held until `deinit`: a second process appending at once (the
         // daemon and lumen-find on one cache) wrote at the same offset, and
         // the header written last pointed at the other one's bytes. It waits
-        // here, then finds the file longer than it expects (below).
+        // here, then checks `(dev, ino)` and length after locking.
         while (true) {
             const lock_result = linux.flock(fd, lock_exclusive);
             if (linux.errno(lock_result) != .INTR) {
@@ -390,12 +460,19 @@ pub const AppendFile = struct {
                 break;
             }
         }
+        const id = try fdIdentity(fd);
+        if (expect_id) |want| {
+            if (!id.eql(want)) {
+                close(fd);
+                return null;
+            }
+        }
         const size = try check(linux.lseek(fd, 0, linux.SEEK.END));
         if (size != expect_len) {
             close(fd);
             return null;
         }
-        return .{ .fd = fd, .len = size };
+        return .{ .fd = fd, .len = size, .id = id };
     }
 
     pub fn write(file: *AppendFile, data: []const u8) Error!void {
@@ -430,8 +507,14 @@ pub fn unmap(mapping: MappedBytes) void {
 
 /// Private, writable (copy-on-write) mapping of a whole file.
 pub fn mapPrivate(path: [*:0]const u8) Error!MappedBytes {
+    return (try mapPrivateWithId(path)).bytes;
+}
+
+/// Like `mapPrivate`, also returning the opened file's `(dev, ino)` identity.
+pub fn mapPrivateWithId(path: [*:0]const u8) Error!struct { bytes: MappedBytes, id: FileId } {
     const fd = try openRegular(path);
     defer close(fd);
+    const id = try fdIdentity(fd);
     const size = try check(linux.lseek(fd, 0, linux.SEEK.END));
     if (size == 0) return error.NotFound;
     const mapping_address = try check(linux.mmap(
@@ -443,7 +526,7 @@ pub fn mapPrivate(path: [*:0]const u8) Error!MappedBytes {
         0,
     ));
     const mapping: [*]align(mapping_alignment_bytes) u8 = @ptrFromInt(mapping_address);
-    return mapping[0..size];
+    return .{ .bytes = mapping[0..size], .id = id };
 }
 
 const expectSuccess = @import("test_dir.zig").expectSuccess;
@@ -460,11 +543,11 @@ test "special files are refused without blocking" {
     // Each of these used to block forever on a FIFO with no writer.
     try std.testing.expectEqualStrings("", readHead(fifo, &head_buffer));
     try std.testing.expectError(error.NotRegular, mapPrivate(fifo));
-    try std.testing.expectError(error.NotRegular, AppendFile.open(fifo, 0));
+    try std.testing.expectError(error.NotRegular, AppendFile.open(fifo, 0, null));
     var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const link = try std.mem.printSentinel(&link_buffer, "{s}/link", .{dir}, 0);
     try expectSuccess(linux.symlink(fifo, link));
-    try std.testing.expectError(error.NotRegular, AppendFile.open(link, 0));
+    try std.testing.expectError(error.NotRegular, AppendFile.open(link, 0, null));
     try std.testing.expect(!os.isRegular(fifo));
     try std.testing.expectEqualStrings("", readHead("/dev/null", &head_buffer));
     try std.testing.expect(os.isRegular("/proc/self/status"));
@@ -651,10 +734,12 @@ test "a second append waits for the first, then sees the file grew" {
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const path = try std.mem.printSentinel(&path_buffer, "{s}/index", .{dir}, 0);
     try writeFile(path, "0123456789");
-    var first = (try AppendFile.open(path, 10)).?;
+    const mapped = try mapPrivateWithId(path);
+    defer unmap(mapped.bytes);
+    var first = (try AppendFile.open(path, 10, mapped.id)).?;
     const Second = struct {
-        fn run(file_path: [:0]const u8, result: *?bool) void {
-            const opened = AppendFile.open(file_path, 10) catch {
+        fn run(file_path: [:0]const u8, expect_id: FileId, result: *?bool) void {
+            const opened = AppendFile.open(file_path, 10, expect_id) catch {
                 result.* = null;
                 return;
             };
@@ -666,7 +751,7 @@ test "a second append waits for the first, then sees the file grew" {
         }
     };
     var second_opened: ?bool = null;
-    const thread = try std.Thread.spawn(.{}, Second.run, .{ path, &second_opened });
+    const thread = try std.Thread.spawn(.{}, Second.run, .{ path, mapped.id, &second_opened });
     // The second one is blocked on the lock meanwhile.
     os.sleepUs(100 * std.time.us_per_ms);
     try first.write("abc");
@@ -674,6 +759,13 @@ test "a second append waits for the first, then sees the file grew" {
     thread.join();
     // Not 10 bytes any more: it rewrites instead of appending over these.
     try std.testing.expectEqual(@as(?bool, false), second_opened);
+
+    // Replacing atomically with another file of identical length still rejects append via (dev, ino).
+    try writeFileAtomic(path, "abcdefghij");
+    const mapped2 = try mapPrivateWithId(path);
+    defer unmap(mapped2.bytes);
+    try std.testing.expect(!mapped.id.eql(mapped2.id));
+    try std.testing.expectEqual(@as(?AppendFile, null), try AppendFile.open(path, 10, mapped.id));
 }
 
 test "ensurePrivateFile creates, tightens permissions, skips absent, rejects links" {

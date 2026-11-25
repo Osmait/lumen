@@ -49,7 +49,8 @@ const units = [_]Unit{
         .dimension = .mass,
         .factor = 1,
     },
-    .{ .names = &.{ "t", "ton", "tons", "tonne", "tonnes" }, .dimension = .mass, .factor = 1000 },
+    .{ .names = &.{ "t", "tonne", "tonnes" }, .dimension = .mass, .factor = 1000 },
+    .{ .names = &.{ "ton", "tons" }, .dimension = .mass, .factor = 907.18474 },
     .{ .names = &.{ "oz", "ounce", "ounces" }, .dimension = .mass, .factor = 0.028349523125 },
     .{ .names = &.{ "lb", "lbs", "pound", "pounds" }, .dimension = .mass, .factor = 0.45359237 },
     // Times, in seconds.
@@ -110,7 +111,7 @@ const units = [_]Unit{
     .{ .names = &.{ "kmh", "km/h", "kph" }, .dimension = .speed, .factor = 1000.0 / 3600.0 },
     .{ .names = &.{"mph"}, .dimension = .speed, .factor = 0.44704 },
     .{ .names = &.{ "m/s", "mps" }, .dimension = .speed, .factor = 1 },
-    .{ .names = &.{ "kn", "knot", "knots" }, .dimension = .speed, .factor = 0.514444 },
+    .{ .names = &.{ "kn", "knot", "knots" }, .dimension = .speed, .factor = 1852.0 / 3600.0 },
     // Areas, in square metres.
     .{ .names = &.{ "m2", "sqm" }, .dimension = .area, .factor = 1 },
     .{ .names = &.{ "km2", "sqkm" }, .dimension = .area, .factor = 1e6 },

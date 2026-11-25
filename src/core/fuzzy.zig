@@ -88,9 +88,17 @@ pub fn scoreQuery(query_prepared: Query, text_in: []const u8) i32 {
     if (query.len > text.len) return no_match;
 
     // A plain substring is the strongest signal (see
-    // `substring_outranks_fuzzy_chars_max`), and a prefix more so.
-    if (std.mem.find(u8, text, query)) |substring_start| {
-        const result = scoreSubstring(text, upper, query.len, substring_start);
+    // `substring_outranks_fuzzy_chars_max`), and a prefix more so. Score every
+    // occurrence so an earlier mid-word hit cannot hide a word-start hit.
+    if (std.mem.find(u8, text, query)) |first_start| {
+        var result = scoreSubstring(text, upper, query.len, first_start);
+        if (first_start > 0) {
+            var search_from = first_start + 1;
+            while (std.mem.findPos(u8, text, search_from, query)) |substring_start| {
+                result = @max(result, scoreSubstring(text, upper, query.len, substring_start));
+                search_from = substring_start + 1;
+            }
+        }
         assert(result >= Score.substring_floor);
         return result;
     }
@@ -334,6 +342,11 @@ test "accents and case fold both ways" {
     // Symbols are not letters.
     try std.testing.expectEqual(no_match, score("x", "×"));
     try std.testing.expect(score("×", "3×4") > 0);
+}
+
+test "substring scoring picks the strongest occurrence" {
+    try std.testing.expect(score("test", "src/latest/test_main.zig") > score("test", "src/contest.zig"));
+    try std.testing.expect(score("code", "Xcode Code") > score("code", "Xcode mode"));
 }
 
 test "the DP scores as the one that visited every position (MYP-188)" {

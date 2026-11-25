@@ -215,15 +215,16 @@ fn namesKept(
         const doc_kind = extract.kindOf(doc.path);
         if (doc_kind == .xlsx or doc_kind == .docx) continue;
         const legacy_hash = std.hash.Wyhash.hash(0, doc.path);
+        const mtime_s = @divFloor(doc.mtime, std.time.ns_per_s);
         const legacy_with_size = try arena.print("{x:0>16}-{d}-{d}.txt", .{
             legacy_hash,
-            doc.mtime,
+            mtime_s,
             doc.size,
         });
         try keep.put(arena, legacy_with_size, name);
         const old = try arena.print("{x:0>16}-{d}.txt", .{
             legacy_hash,
-            doc.mtime,
+            mtime_s,
         });
         try keep.put(arena, old, name);
     }

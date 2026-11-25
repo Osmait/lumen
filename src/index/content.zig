@@ -51,6 +51,7 @@ pub const trigram_chars = content_format.trigram_chars;
 // Building.
 pub const text_bytes_max = content_build.text_bytes_max;
 pub const extracted_bytes_max = content_build.extracted_bytes_max;
+pub const ReadOutcome = content_build.ReadOutcome;
 pub const TextFn = content_build.TextFn;
 pub const TextReader = content_build.TextReader;
 pub const readPlain = content_build.readPlain;

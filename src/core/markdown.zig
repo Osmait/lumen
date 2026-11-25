@@ -80,7 +80,17 @@ fn heading(line: []const u8) ?Heading {
     // "#" alone, or "#title" with no space, is text.
     if (level == line.len) return null;
     if (line[level] != ' ') return null;
-    return .{ .level = @intCast(@min(level, 3)), .text = std.mem.trim(u8, line[level..], " #") };
+    var text = std.mem.trim(u8, line[level..], " ");
+    // CommonMark strips trailing '#' only when preceded by a space (keep "Learn C#", "F#").
+    const without_hashes = std.mem.trimEnd(u8, text, "#");
+    if (without_hashes.len < text.len) {
+        if (without_hashes.len == 0) {
+            text = "";
+        } else if (without_hashes[without_hashes.len - 1] == ' ') {
+            text = std.mem.trimEnd(u8, without_hashes, " ");
+        }
+    }
+    return .{ .level = @intCast(@min(level, 3)), .text = text };
 }
 
 /// Three or more of one marker, spaces between allowed ("- - -"): a lone
@@ -131,9 +141,15 @@ const span_depth_max = 3;
 fn writeSpans(writer: *std.Io.Writer, line: []const u8, depth: u8) Error!void {
     assert(depth <= span_depth_max);
     // Searches for closing markers, each picking up where the last ended.
+    var triple_star: Finder = .{ .marker = "***", .after_text = true };
     var bold: Finder = .{ .marker = "**", .after_text = true };
-    var star: Finder = .{ .marker = "*", .after_text = true };
-    var underscore: Finder = .{ .marker = "_", .after_text = true };
+    var star: Finder = .{ .marker = "*", .after_text = true, .single_marker_only = true };
+    var underscore: Finder = .{
+        .marker = "_",
+        .after_text = true,
+        .not_before_alnum = true,
+        .single_marker_only = true,
+    };
     var links: Link = .{};
     var index: usize = 0;
     while (index < line.len) {
@@ -147,7 +163,19 @@ fn writeSpans(writer: *std.Io.Writer, line: []const u8, depth: u8) Error!void {
                 index = end + 1;
                 continue;
             }
-        } else if (char == '*' and index + 1 < line.len and line[index + 1] == '*') {
+        } else if (depth + 2 <= span_depth_max and char == '*' and
+            index + 2 < line.len and line[index + 1] == '*' and line[index + 2] == '*')
+        {
+            if (closing(line, index + 3, &triple_star)) |end| {
+                try writer.writeAll("<b><i>");
+                try writeSpans(writer, line[index + 3 .. end], depth + 2);
+                try writer.writeAll("</i></b>");
+                index = end + 3;
+                continue;
+            }
+        } else if (depth < span_depth_max and char == '*' and
+            index + 1 < line.len and line[index + 1] == '*')
+        {
             if (closing(line, index + 2, &bold)) |end| {
                 try writer.writeAll("<b>");
                 try writeSpans(writer, line[index + 2 .. end], depth + 1);
@@ -155,12 +183,14 @@ fn writeSpans(writer: *std.Io.Writer, line: []const u8, depth: u8) Error!void {
                 index = end + 2;
                 continue;
             }
-        } else if (char == '*' or char == '_') {
-            // Not inside a word for "_" (snake_case stays as it is).
+        } else if (depth < span_depth_max and (char == '*' or char == '_')) {
+            // Not inside a word or double underscore for "_" (snake_case and __init__.py stay as is).
             const after_word_char = index > 0 and std.ascii.isAlphanumeric(line[index - 1]);
-            const word_inside = char == '_' and after_word_char;
+            const adjacent_underscore = (index > 0 and line[index - 1] == '_') or
+                (index + 1 < line.len and line[index + 1] == '_');
+            const skip_underscore = char == '_' and (after_word_char or adjacent_underscore);
             const finder = if (char == '*') &star else &underscore;
-            const end_maybe = if (word_inside) null else closing(line, index + 1, finder);
+            const end_maybe = if (skip_underscore) null else closing(line, index + 1, finder);
             if (end_maybe) |end| {
                 try writer.writeAll("<i>");
                 try writeSpans(writer, line[index + 1 .. end], depth + 1);
@@ -203,6 +233,10 @@ const Finder = struct {
     marker: []const u8,
     /// Only matches right after something other than a space.
     after_text: bool = false,
+    /// Closing '_' must not be immediately followed by an alphanumeric char.
+    not_before_alnum: bool = false,
+    /// Closing marker must not be part of a repeated run (`**` or `__`).
+    single_marker_only: bool = false,
     /// The first match at or after `from` (null: none), once searched.
     from: usize = 0,
     found: ?usize = null,
@@ -216,9 +250,23 @@ const Finder = struct {
         }
         var search_from = from;
         finder.found = while (std.mem.findPos(u8, line, search_from, finder.marker)) |match| {
-            if (!finder.after_text) break match;
-            if (match > 0 and line[match - 1] != ' ') break match;
-            search_from = match + 1;
+            const after = match + finder.marker.len;
+            const ok_after_text = !finder.after_text or (match > 0 and line[match - 1] != ' ');
+            const ok_not_alnum = !finder.not_before_alnum or
+                after >= line.len or !std.ascii.isAlphanumeric(line[after]);
+            const ok_single_marker = !finder.single_marker_only or blk: {
+                const m = finder.marker[0];
+                break :blk (match == 0 or line[match - 1] != m) and (after >= line.len or line[after] != m);
+            };
+            if (ok_after_text and ok_not_alnum and ok_single_marker) break match;
+            if (finder.single_marker_only) {
+                const m = finder.marker[0];
+                var skip = after;
+                while (skip < line.len and line[skip] == m) skip += 1;
+                search_from = skip;
+            } else {
+                search_from = match + 1;
+            }
         } else null;
         finder.from = from;
         finder.searched = true;
@@ -239,15 +287,24 @@ const Link = struct {
         const close = link.close.next(line, start + 1) orelse return null;
         if (close + 1 >= line.len) return null;
         if (line[close + 1] != '(') return null;
-        const paren = link.paren.next(line, close + 2) orelse return null;
-        const url = line[close + 2 .. paren];
+        // Any other scheme stays text: check prefix first in O(1).
+        if (!linkAllowed(line[close + 2 ..])) return null;
+        _ = link.paren.next(line, close + 2) orelse return null;
+        var depth: usize = 0;
+        var i = close + 2;
+        const paren_end: usize = while (i < line.len) : (i += 1) {
+            const ch = line[i];
+            if (ch == ' ') return null;
+            if (ch == '(') {
+                depth += 1;
+            } else if (ch == ')') {
+                if (depth == 0) break i;
+                depth -= 1;
+            }
+        } else return null;
+        const url = line[close + 2 .. paren_end];
         if (url.len == 0) return null;
-        if (std.mem.findScalar(u8, url, ' ') != null) return null;
-        // Any other scheme stays text: GTK opens a link with the system's
-        // app for it, and an extension's `file:///...desktop` or a scheme
-        // of some app's own ran that app, past the actions it declares.
-        if (!linkAllowed(url)) return null;
-        return .{ .text = line[start + 1 .. close], .url = url, .end = paren + 1 };
+        return .{ .text = line[start + 1 .. close], .url = url, .end = paren_end + 1 };
     }
 };
 
@@ -334,6 +391,16 @@ test "inline spans" {
     );
     try expectMarkup("**bold _and it_**", "<b>bold <i>and it</i></b>");
     try expectMarkup("`<b>` is & stays", "<tt>&lt;b&gt;</tt> is &amp; stays");
+    try expectMarkup("***bold italic***", "<b><i>bold italic</i></b>");
+    try expectMarkup("*a **b** c*", "<i>a <b>b</b> c</i>");
+    try expectMarkup(
+        "[Zig](https://en.wikipedia.org/wiki/Zig_(programming_language))",
+        "<a href=\"https://en.wikipedia.org/wiki/Zig_(programming_language)\">Zig</a>",
+    );
+    try expectMarkup("## Learn C#\n# F#\n## Title ##", "<span size=\"large\" weight=\"bold\">Learn C#</span>\n<span size=\"x-large\" weight=\"bold\">F#</span>\n<span size=\"large\" weight=\"bold\">Title</span>");
+    try expectMarkup("~/_drafts/my_notes.md", "~/_drafts/my_notes.md");
+    try expectMarkup("Set _LUMEN_DEBUG to 1", "Set _LUMEN_DEBUG to 1");
+    try expectMarkup("__init__.py", "__init__.py");
 }
 
 test "blocks" {
