@@ -218,6 +218,7 @@ pub fn settingsCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
 /// The settings.conf key a Settings row changes, if any.
 fn settingName(setting: item_mod.Setting) ?[]const u8 {
     return switch (setting) {
+        .go => |view| if (view == .themes) "theme" else null,
         .toggle => |toggle| @tagName(toggle),
         .choose => |choice| @tagName(choice),
         else => null,
@@ -522,4 +523,10 @@ fn resetSettings(ui: *Ui) void {
     config.saveSettings(ui);
     ui.setReselect("set:reset", .{});
     ui.rebuild();
+}
+
+test "settingName maps theme go-row to theme override key" {
+    try std.testing.expectEqualStrings("theme", settingName(.{ .go = .themes }).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), settingName(.{ .go = .default_apps }));
+    try std.testing.expectEqualStrings("width", settingName(.{ .choose = .width }).?);
 }

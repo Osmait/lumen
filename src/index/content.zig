@@ -72,6 +72,7 @@ pub const SearchOptions = content_search.SearchOptions;
 pub const PathFn = content_search.PathFn;
 pub const plainPath = content_search.plainPath;
 pub const splitWords = content_search.splitWords;
+pub const querySearchable = content_search.querySearchable;
 pub const search = content_search.search;
 pub const Verified = content_search.Verified;
 pub const verify = content_search.verify;

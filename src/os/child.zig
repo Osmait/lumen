@@ -311,10 +311,12 @@ const Pump = struct {
             return false;
         }
         const output_bytes_max = pump.options.output_bytes_max;
-        const keep = @min(bytes_read, output_bytes_max -| output.items.len);
+        const room = output_bytes_max -| output.items.len;
+        const keep = @min(bytes_read, room);
+        const exceeded = bytes_read > room;
         try output.appendSlice(pump.gpa, chunk[0..keep]);
         assert(output.items.len <= output_bytes_max);
-        return pump.options.at_cap == .kill and output.items.len == output_bytes_max;
+        return pump.options.at_cap == .kill and exceeded;
     }
 };
 
@@ -492,4 +494,27 @@ test "timing out kills grandchildren in the child's process group" {
         os.sleepUs(10_000);
     }
     try testing.expect(!procAlive(status_path));
+}
+
+test "at_cap .kill kills only when output strictly exceeds output_bytes_max" {
+    var exact = try run(testing.allocator, testing.io, &.{ "sh", "-c", "printf '12345'" }, .{
+        .deadline_ns = deadline(5000),
+        .output_bytes_max = 5,
+        .at_cap = .kill,
+    });
+    defer exact.deinit(testing.allocator);
+    try testing.expect(!exact.capped);
+    try testing.expect(!exact.timed_out);
+    try testing.expectEqual(@as(?u8, 0), exact.code);
+    try testing.expectEqualStrings("12345", exact.stdout);
+
+    var over = try run(testing.allocator, testing.io, &.{ "sh", "-c", "printf '123456'" }, .{
+        .deadline_ns = deadline(5000),
+        .output_bytes_max = 5,
+        .at_cap = .kill,
+    });
+    defer over.deinit(testing.allocator);
+    try testing.expect(over.capped);
+    try testing.expectEqual(@as(?u8, null), over.code);
+    try testing.expectEqualStrings("12345", over.stdout);
 }

@@ -99,6 +99,8 @@ pub const Counters = struct {
     /// ones).
     listings: std.atomic.Value(u32) = .init(0),
     checks: std.atomic.Value(u32) = .init(0),
+    /// True when the latest full listing attempt failed.
+    list_failed: std.atomic.Value(bool) = .init(false),
     /// Documents whose text was extracted (a child process each).
     extractions: std.atomic.Value(u32) = .init(0),
     /// When the last check started, for the rate limit of `poke`.
@@ -289,6 +291,7 @@ pub const Status = struct {
     updates: u32 = 0,
     listings: u32 = 0,
     checks: u32 = 0,
+    list_failed: bool = false,
     /// Documents whose text was extracted (a child process each).
     extractions: u32 = 0,
     list_ns_last: u64 = 0,
@@ -312,6 +315,7 @@ pub fn status(service: *ContentService) Status {
         .updates = service.counters.updates.load(.acquire),
         .listings = service.counters.listings.load(.acquire),
         .checks = service.counters.checks.load(.acquire),
+        .list_failed = service.counters.list_failed.load(.acquire),
         .extractions = service.counters.extractions.load(.acquire),
         .list_ns_last = service.counters.list_ns_last.load(.monotonic),
         .stat_ns_last = service.counters.stat_ns_last.load(.monotonic),
@@ -870,9 +874,13 @@ fn listAll(
         .stop = &service.stop,
         .not_under = service.worker.slow_mounts,
     }) catch |err| {
-        if (err != error.Canceled) log.warn("listing files: {t}", .{err});
+        if (err != error.Canceled) {
+            log.warn("listing files: {t}", .{err});
+            service.counters.list_failed.store(true, .release);
+        }
         return null;
     };
+    service.counters.list_failed.store(false, .release);
     service.counters.list_ns_last.store(sys.monotonicNs() - start_ns, .monotonic);
     _ = service.counters.listings.fetchAdd(1, .release);
     listed.* = .{ .name_changes = name_changes, .listed_at_ns = start_ns };
@@ -1723,12 +1731,6 @@ test "content service: Office documents are extracted once per version" {
         "{s}-",
         .{TextCache.pathHashHex(&hash_hex, report)},
     );
-    var legacy_prefix_buffer: [32]u8 = undefined;
-    const legacy_prefix = try std.mem.print(
-        &legacy_prefix_buffer,
-        "{x:0>16}-",
-        .{std.hash.Wyhash.hash(0, report)},
-    );
     const mtime_second = sys.nowSeconds() - 100;
 
     {
@@ -1805,42 +1807,69 @@ test "content service: Office documents are extracted once per version" {
     try fixture.cache.write("text/0123456789abcdef-1700000000-99.txt", "stale");
     try fixture.cache.write("text/0123456789abcdef-1700000000.txt", "old name");
     try fixture.cache.write("text/0123456789abcdef-1-2.txt.tmp", "half");
-    // And the current version's text under the naming before sizes: renamed
-    // on start, not extracted again.
+    // Unversioned document (e.g. .odt) keeps legacy Wyhash rename on start without
+    // re-extracting, while .docx uses -v2 and drops unversioned legacy caches.
+    var odt_stage = try TestTree.init();
+    defer odt_stage.deinit();
+    try odt_stage.write("mimetype", "application/vnd.oasis.opendocument.text");
+    try odt_stage.write(
+        "content.xml",
+        "<?xml version=\"1.0\"?><office:document-content><text:p>quokka notes</text:p></office:document-content>",
+    );
+    var odt_path_buffer: paths.Buffer = undefined;
+    const odt_report = try fixture.root.path(&odt_path_buffer, "docs/notes.odt");
+    {
+        const res = try std.process.run(testing.allocator, testing.io, .{
+            .argv = &.{ "zip", "-q", "-X", "-r", odt_report, "." },
+            .cwd = .{ .path = odt_stage.absolute },
+        });
+        testing.allocator.free(res.stdout);
+        testing.allocator.free(res.stderr);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+    }
+    try setMtime(odt_report, mtime_second);
+    {
+        const s0 = try fixture.start();
+        defer s0.shutdown();
+        try waitChecks(s0, 1);
+    }
+
     var now_name_buffer: paths.Buffer = undefined;
     var old_name_buffer: paths.Buffer = undefined;
-    const size = sys.info(report).?.size;
-    const now_name = try std.mem.printSentinel(&now_name_buffer, "{s}/text/{s}{d}-{d}.txt", .{
+    const odt_size = sys.info(odt_report).?.size;
+    var odt_hash_hex: [32]u8 = undefined;
+    const now_name = try std.mem.printSentinel(&now_name_buffer, "{s}/text/{s}-{d}-{d}.txt", .{
         fixture.cache.absolute,
-        prefix,
+        TextCache.pathHashHex(&odt_hash_hex, odt_report),
         mtime_second,
-        size,
+        odt_size,
     }, 0);
-    const old_name = try std.mem.printSentinel(&old_name_buffer, "{s}/text/{s}{d}.txt", .{
+    const old_name = try std.mem.printSentinel(&old_name_buffer, "{s}/text/{x:0>16}-{d}.txt", .{
         fixture.cache.absolute,
-        legacy_prefix,
+        std.hash.Wyhash.hash(0, odt_report),
         mtime_second,
     }, 0);
     try sys.rename(now_name, old_name);
 
     // Restarted: the extracted text is reused, nothing is extracted again.
-    // (Its text is found once renamed: the start's sweep, then the check.)
+    // (The .odt text is found once renamed: the start's sweep, then the check.)
     const service = try fixture.start();
     defer service.shutdown();
     try waitChecks(service, 1);
     try testing.expectEqual(@as(u32, 0), service.status().extractions);
     try testing.expectEqual(@as(u32, 0), service.status().builds);
     try testing.expectEqual(@as(usize, 0), try countText(service, "0123456789abcdef-"));
-    // Both documents' texts stay (the broken one's is empty).
-    try testing.expectEqual(@as(usize, 2), try countText(service, ""));
+    // All three documents' texts stay (the broken one's is empty).
+    try testing.expectEqual(@as(usize, 3), try countText(service, ""));
     try testing.expect(sys.exists(now_name));
     try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "echidna")).len);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "quokka")).len);
 
     // Deleted: its text goes with it.
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.unlink(report)));
     try pokeAndWait(service);
     try testing.expectEqual(@as(usize, 0), try countText(service, prefix));
-    try testing.expectEqual(@as(usize, 1), service.status().docs);
+    try testing.expectEqual(@as(usize, 2), service.status().docs);
 }
 
 test "content service: a document whose extraction failed in passing is left out, and retried with cap and backoff" {
@@ -2172,4 +2201,25 @@ test "content service: file truncated below text_bytes_max is indexed promptly v
         sys.sleepUs(10_000);
     }
     try testing.expect(indexed);
+}
+
+test "content service: initial listing failure reports list_failed without becoming ready" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+
+    var missing_buf: paths.Buffer = undefined;
+    const missing_root = try fixture.cache.path(&missing_buf, "missing-root");
+    const service = try ContentService.startWith(testing.allocator, testing.io, missing_root, fixture.cache.absolute, .{
+        .search = fixture.search_pool,
+        .build = fixture.build_pool,
+    }, .{
+        .refresh_interval_ns = std.math.maxInt(u64),
+    });
+    defer service.shutdown();
+
+    try waitChecks(service, 1);
+    const s = service.status();
+    try testing.expect(!s.ready);
+    try testing.expect(s.list_failed);
 }

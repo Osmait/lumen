@@ -22,7 +22,8 @@ const fold = @import("core").fold;
 /// 04: path offsets are positions in the file, so an appended doc table
 /// refers to the paths already there instead of writing them all again.
 /// 05: trigrams fold NFD combining diacritics onto their base letter (`core.fold`).
-pub const magic = "LUMCTX05";
+/// 06: DOCX extraction includes linked headers and footers.
+pub const magic = "LUMCTX06";
 pub const header_size = 64;
 
 /// The first bytes of the file. The doc table's columns and the segments'

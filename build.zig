@@ -32,6 +32,11 @@ pub fn build(b: *std.Build) void {
     // The version both binaries print (`lumen --version`).
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", resolveVersion(b));
+    build_options.addOption(
+        bool,
+        "checked_alloc",
+        b.option(bool, "checked-alloc", "Use Zig's checking allocator in release builds") orelse false,
+    );
 
     const base = baseModules(b, target, optimize);
     const c_options = CLibrariesOptions.fromCommandLine(b);

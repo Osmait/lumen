@@ -10,10 +10,10 @@
 //! the search threads and the index for an answer nobody would see.
 
 const std = @import("std");
-const c = @import("c");
 const index = @import("index");
 const core = @import("core");
 const os = @import("os");
+const MainLoopQueue = @import("../sys/MainLoopQueue.zig").MainLoopQueue;
 
 const ContentSearch = @This();
 
@@ -33,8 +33,7 @@ on_result: Callback,
 context: ?*anyopaque,
 thread: std.Thread = undefined,
 lock: std.Io.Mutex = .init,
-delivery_lock: std.Io.Mutex = .init,
-pending_hops: ?*Hop = null,
+deliveries: MainLoopQueue(*Result) = undefined,
 /// Bumped by every `submit`; the worker sleeps on it.
 generation: std.atomic.Value(u32) = .init(0),
 /// Set by `submit` (and `shutdown`), cleared by the worker when it takes
@@ -74,14 +73,6 @@ pub const Callback = *const fn (result: *Result, context: ?*anyopaque) void;
 
 pub const StartError = std.mem.Allocator.Error || std.Thread.SpawnError;
 
-const Hop = struct {
-    content_search: *ContentSearch,
-    result: *Result,
-    source_id: c_uint = 0,
-    prev: ?*Hop = null,
-    next: ?*Hop = null,
-};
-
 /// The part of `query` a search runs: whole UTF-8 characters, at most
 /// `query_bytes_max` bytes.
 pub fn clip(query: []const u8) []const u8 {
@@ -107,6 +98,14 @@ pub fn start(
         .on_result = on_result,
         .context = context,
     };
+    content_search.deliveries = .{
+        .gpa = gpa,
+        .io = io,
+        .stop = &content_search.stop,
+        .context = content_search,
+        .deliver_fn = &deliver,
+        .destroy_fn = &destroyResult,
+    };
     content_search.thread = try std.Thread.spawn(.{}, run, .{content_search});
     // The name only shows in tools like top: a thread without one works.
     content_search.thread.setName(io, "lm-csearch") catch {};
@@ -121,27 +120,8 @@ pub fn shutdown(content_search: *ContentSearch) void {
     _ = content_search.generation.fetchAdd(1, .release);
     content_search.io.futexWake(u32, &content_search.generation.raw, 1);
     content_search.thread.join();
-    var cursor = content_search.pending_hops;
-    content_search.pending_hops = null;
-    while (cursor) |hop| {
-        const next = hop.next;
-        if (hop.source_id != 0) _ = c.g_source_remove(hop.source_id);
-        hop.result.destroy(content_search.gpa);
-        content_search.gpa.destroy(hop);
-        cursor = next;
-    }
+    content_search.deliveries.drain();
     content_search.gpa.destroy(content_search);
-}
-
-fn unlinkHop(content_search: *ContentSearch, hop: *Hop) void {
-    if (hop.prev) |prev| {
-        prev.next = hop.next;
-    } else if (content_search.pending_hops == hop) {
-        content_search.pending_hops = hop.next;
-    }
-    if (hop.next) |next| next.prev = hop.prev;
-    hop.prev = null;
-    hop.next = null;
 }
 
 /// Bumps `counter` with wraparound, skipping 0 (which `Inflight.forget()`
@@ -222,8 +202,17 @@ fn run(content_search: *ContentSearch) void {
             result.destroy(content_search.gpa);
             continue;
         }
-        if (!content_search.handOver(result)) return;
+        if (!content_search.deliveries.post(result) and content_search.stop.load(.acquire)) return;
     }
+}
+
+fn destroyResult(gpa: std.mem.Allocator, result: *Result) void {
+    result.destroy(gpa);
+}
+
+fn deliver(context: *anyopaque, result: *Result) void {
+    const content_search: *ContentSearch = @ptrCast(@alignCast(context));
+    content_search.on_result(result, content_search.context);
 }
 
 /// The query asked for, into `result` (its generation, start, text); the
@@ -242,50 +231,6 @@ fn takeQuery(content_search: *ContentSearch, result: *Result) u32 {
         break :blk "";
     };
     return seen;
-}
-
-/// Hands `result` to the GTK main loop (`deliver`), or drops it. False
-/// once shutdown has begun: the worker is to return.
-fn handOver(content_search: *ContentSearch, result: *Result) bool {
-    const hop = content_search.gpa.create(Hop) catch {
-        result.destroy(content_search.gpa);
-        return true;
-    };
-    hop.* = .{ .content_search = content_search, .result = result };
-    content_search.delivery_lock.lockUncancelable(content_search.io);
-    defer content_search.delivery_lock.unlock(content_search.io);
-    if (content_search.stop.load(.acquire)) {
-        result.destroy(content_search.gpa);
-        content_search.gpa.destroy(hop);
-        return false;
-    }
-    hop.next = content_search.pending_hops;
-    if (content_search.pending_hops) |head| head.prev = hop;
-    content_search.pending_hops = hop;
-    const source_id = c.g_idle_add(&deliver, hop);
-    hop.source_id = source_id;
-    if (source_id == 0) {
-        content_search.unlinkHop(hop);
-        result.destroy(content_search.gpa);
-        content_search.gpa.destroy(hop);
-    }
-    return true;
-}
-
-fn deliver(data: ?*anyopaque) callconv(.c) c.gboolean {
-    const hop: *Hop = @ptrCast(@alignCast(data.?));
-    const content_search = hop.content_search;
-    content_search.delivery_lock.lockUncancelable(content_search.io);
-    content_search.unlinkHop(hop);
-    const stopped = content_search.stop.load(.acquire);
-    content_search.delivery_lock.unlock(content_search.io);
-    defer content_search.gpa.destroy(hop);
-    if (stopped) {
-        hop.result.destroy(content_search.gpa);
-        return 0;
-    }
-    content_search.on_result(hop.result, content_search.context);
-    return 0;
 }
 
 test "nextGeneration wraps u32 without overflowing or hitting sentinel 0" {

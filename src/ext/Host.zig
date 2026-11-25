@@ -36,6 +36,7 @@ const std = @import("std");
 const c = @import("c");
 const os = @import("os");
 const core = @import("core");
+const MainLoopQueue = @import("../sys/MainLoopQueue.zig").MainLoopQueue;
 const rows_mod = @import("rows.zig");
 const registry_mod = @import("registry.zig");
 const generation_mod = @import("generation.zig");
@@ -75,10 +76,7 @@ thread: std.Thread = undefined,
 /// Guards `pending` and `style`, which the main thread writes and the
 /// worker reads.
 lock: std.Io.Mutex = .init,
-/// Guards `pending_deliveries`, which the worker appends to before
-/// `g_idle_add` and the main loop unlinks from in `deliverCallback`.
-delivery_lock: std.Io.Mutex = .init,
-pending_deliveries: ?*Delivery = null,
+deliveries: MainLoopQueue(Answer) = undefined,
 /// Bumped by every request; the worker sleeps on it (a futex).
 wake_sequence: std.atomic.Value(u32) = .init(0),
 stop: std.atomic.Value(bool) = .init(false),
@@ -242,6 +240,14 @@ pub fn start(
         .callbacks = callbacks,
         .worker_arena = .init(gpa),
     };
+    host.deliveries = .{
+        .gpa = gpa,
+        .io = io,
+        .stop = &host.stop,
+        .context = host,
+        .deliver_fn = &deliverCallback,
+        .destroy_fn = &destroyAnswer,
+    };
     host.thread = try std.Thread.spawn(.{}, run, .{host});
     // Cosmetic: the name only shows in tools like top.
     host.thread.setName(io, "lm-ext") catch {};
@@ -277,13 +283,11 @@ pub fn shutdown(host: *Host) void {
             shutdown_wait_ms,
         });
         host.thread.detach();
-        host.delivery_lock.lockUncancelable(host.io);
-        defer host.delivery_lock.unlock(host.io);
-        host.cancelDeliveries();
+        host.deliveries.drain();
         return;
     }
     host.thread.join();
-    host.cancelDeliveries();
+    host.deliveries.drain();
     host.pending.destroyOperations(host.gpa);
     loading.closeAll(host);
     host.extensions.deinit(host.gpa);
@@ -301,18 +305,6 @@ fn waitWorkerDone(host: *const Host) bool {
         os.sleepUs(shutdown_poll_ms * std.time.us_per_ms);
     }
     return true;
-}
-
-fn cancelDeliveries(host: *Host) void {
-    var cursor = host.pending_deliveries;
-    host.pending_deliveries = null;
-    while (cursor) |delivery| {
-        const next = delivery.next;
-        if (delivery.source_id != 0) _ = c.g_source_remove(delivery.source_id);
-        destroyAnswer(host.gpa, delivery.answer);
-        host.gpa.destroy(delivery);
-        cursor = next;
-    }
 }
 
 /// The style loaded before init.lua from the next reload on: a folder in
@@ -472,25 +464,13 @@ pub fn takePendingRegistry(host: *Host, timeout_ms: u64) ?*Registry {
         if (os.monotonicNs() >= deadline_ns) return null;
         os.sleepUs(5 * std.time.ns_per_ms);
     }
-    host.delivery_lock.lockUncancelable(host.io);
-    defer host.delivery_lock.unlock(host.io);
-    var cursor = host.pending_deliveries;
-    var found: ?*Registry = null;
-    while (cursor) |delivery| {
-        const next = delivery.next;
-        if (delivery.answer == .registry) {
-            host.unlinkDelivery(delivery);
-            if (delivery.source_id != 0) _ = c.g_source_remove(delivery.source_id);
-            if (found == null) {
-                found = delivery.answer.registry;
-            } else {
-                delivery.answer.registry.destroy(host.gpa);
-            }
-            host.gpa.destroy(delivery);
+    const isRegistry = struct {
+        fn match(answer: Answer) bool {
+            return answer == .registry;
         }
-        cursor = next;
-    }
-    return found;
+    }.match;
+    const answer = host.deliveries.takeNewest(isRegistry) orelse return null;
+    return answer.registry;
 }
 
 /// Wakes the worker: bumps the sequence it sleeps on.
@@ -572,80 +552,21 @@ fn destroyAnswer(gpa: std.mem.Allocator, answer: Answer) void {
     }
 }
 
-const Delivery = struct {
-    host: *Host,
-    answer: Answer,
-    source_id: c_uint = 0,
-    prev: ?*Delivery = null,
-    next: ?*Delivery = null,
-};
-
-fn unlinkDelivery(host: *Host, delivery: *Delivery) void {
-    if (delivery.prev) |prev| {
-        prev.next = delivery.next;
-    } else if (host.pending_deliveries == delivery) {
-        host.pending_deliveries = delivery.next;
-    }
-    if (delivery.next) |next| next.prev = delivery.prev;
-    delivery.prev = null;
-    delivery.next = null;
-}
-
 /// Hands `answer` to its callback on the GTK main loop. Worker thread only.
 pub fn deliver(host: *Host, answer: Answer) void {
-    if (host.stop.load(.acquire)) {
-        destroyAnswer(host.gpa, answer);
-        return;
-    }
-    const delivery = host.gpa.create(Delivery) catch {
-        log.warn("out of memory: an answer for the window is dropped", .{});
-        destroyAnswer(host.gpa, answer);
-        return;
-    };
-    delivery.* = .{ .host = host, .answer = answer };
-    host.delivery_lock.lockUncancelable(host.io);
-    if (host.stop.load(.acquire)) {
-        host.delivery_lock.unlock(host.io);
-        destroyAnswer(host.gpa, answer);
-        host.gpa.destroy(delivery);
-        return;
-    }
-    delivery.next = host.pending_deliveries;
-    if (host.pending_deliveries) |head| head.prev = delivery;
-    host.pending_deliveries = delivery;
-    const source_id = c.g_idle_add(&deliverCallback, delivery);
-    delivery.source_id = source_id;
-    if (source_id == 0) {
-        host.unlinkDelivery(delivery);
-        host.delivery_lock.unlock(host.io);
-        destroyAnswer(host.gpa, answer);
-        host.gpa.destroy(delivery);
-        return;
-    }
-    host.delivery_lock.unlock(host.io);
+    _ = host.deliveries.post(answer);
 }
 
 /// On the GTK main loop: hands the answer to its callback.
-fn deliverCallback(data: ?*anyopaque) callconv(.c) c.gboolean {
-    const delivery: *Delivery = @ptrCast(@alignCast(data.?));
-    const host = delivery.host;
-    host.delivery_lock.lockUncancelable(host.io);
-    host.unlinkDelivery(delivery);
-    const stopped = host.stop.load(.acquire);
-    host.delivery_lock.unlock(host.io);
-    defer host.gpa.destroy(delivery);
-    if (stopped) {
-        destroyAnswer(host.gpa, delivery.answer);
-        return 0;
-    }
+fn deliverCallback(context: *anyopaque, answer: Answer) void {
+    const host: *Host = @ptrCast(@alignCast(context));
     const callbacks = host.callbacks;
-    switch (delivery.answer) {
+    switch (answer) {
         .registry => |registry| callbacks.registry_callback(registry, callbacks.context),
         .list => |result| callbacks.list_callback(result, callbacks.context),
         .act => |result| callbacks.act_callback(result, callbacks.context),
         .root => |result| callbacks.root_callback(result, callbacks.context),
     }
-    return 0;
 }
 
 // ---------------------------------------------------------------- tests
@@ -1099,6 +1020,65 @@ test "preferences read Settings' file over their defaults; storage persists" {
     try testing.expectEqualStrings("2", after.items[3].title);
 }
 
+test "storage clone stops cycles, deep nesting and exponential DAGs; invalid theme/choice defaults fail" {
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const folder = try os.tmpDirPath(&test_dir, &path_buffer);
+
+    try writeTestFile(folder, "extensions/cycles/init.lua",
+        \\local cyc = {}
+        \\cyc.self = cyc
+        \\local ok_cyc, err_cyc = pcall(lumen.storage.set, "c", cyc)
+        \\local deep = {}
+        \\local cur = deep
+        \\for _ = 1, 40 do cur.next = {} cur = cur.next end
+        \\local ok_deep, err_deep = pcall(lumen.storage.set, "d", deep)
+        \\local dag = { x = 1 }
+        \\for _ = 1, 16 do dag = { a = dag, b = dag } end
+        \\local ok_dag, err_dag = pcall(lumen.storage.set, "dag", dag)
+        \\return lumen.extension { commands = { { name = "res", title = "R", items = {
+        \\  tostring(ok_cyc) .. ":" .. tostring(err_cyc),
+        \\  tostring(ok_deep) .. ":" .. tostring(err_deep),
+        \\  tostring(ok_dag) .. ":" .. tostring(err_dag),
+        \\} } } }
+    );
+    try writeTestFile(folder, "extensions/bad_choice/init.lua",
+        \\return lumen.extension {
+        \\  preferences = {
+        \\    { name = "pick", title = "Pick", type = "choice", choices = { "a", "b" }, default = "missing" }
+        \\  },
+        \\  commands = { { name = "c", title = "C", items = {} } },
+        \\}
+    );
+    try writeTestFile(folder, "init.lua",
+        \\local ok = pcall(lumen.theme, { id = "bad", name = "Bad", bg = string.rep("x", 10000), fg = "#ffffff", accent = "#000000" })
+        \\assert(not ok)
+    );
+
+    var probe: Probe = .{};
+    defer probe.deinit();
+    const host = try testHost(&probe, folder);
+    defer host.shutdown();
+    host.reload();
+    try probe.wait("registry");
+    const registry = probe.registry.?;
+
+    // bad_choice should fail to load, while cycles & config should load cleanly.
+    var saw_bad_choice = false;
+    for (registry.problems) |p| {
+        if (std.mem.eql(u8, p.extension, "bad_choice")) saw_bad_choice = true;
+    }
+    try testing.expect(saw_bad_choice);
+
+    _ = host.list(registry.generation, .from(0), "");
+    const listed = try probe.take("list");
+    defer listed.destroy(testing.allocator);
+    try testing.expect(std.mem.startsWith(u8, listed.items[0].title, "false:"));
+    try testing.expect(std.mem.startsWith(u8, listed.items[1].title, "false:"));
+    try testing.expect(std.mem.startsWith(u8, listed.items[2].title, "false:"));
+}
+
 test "storage never writes over what it cannot read, and reads back what it wrote" {
     var test_dir = testing.tmpDir(.{});
     defer test_dir.cleanup();
@@ -1234,9 +1214,9 @@ test "shutdown cancels queued deliveries without leaking or calling back" {
     // without pumping GLib, so shutdown must cancel and free it.
     const until_ns = os.monotonicNs() + 5 * std.time.ns_per_s;
     while (os.monotonicNs() < until_ns) {
-        host.delivery_lock.lockUncancelable(host.io);
-        const queued = host.pending_deliveries != null;
-        host.delivery_lock.unlock(host.io);
+        host.deliveries.lock.lockUncancelable(host.io);
+        const queued = host.deliveries.head != null;
+        host.deliveries.lock.unlock(host.io);
         if (queued) break;
         os.sleepUs(1000);
     }

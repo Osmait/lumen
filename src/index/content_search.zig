@@ -47,6 +47,22 @@ pub fn splitWords(
     return words.items;
 }
 
+/// True when `query` has at least one token whose folded length is at least
+/// `trigram_chars` bytes, so the trigram index can narrow candidates.
+pub fn querySearchable(query: []const u8) bool {
+    var tokens = std.mem.tokenizeAny(u8, query, " \t");
+    while (tokens.next()) |word| {
+        var folded_len: usize = 0;
+        var i: usize = 0;
+        while (i < word.len) {
+            _ = fold.step(word, &i);
+            folded_len += 1;
+            if (folded_len >= trigram_chars) return true;
+        }
+    }
+    return false;
+}
+
 /// The file that holds a document's text: the document itself, or its
 /// extracted text in a cache. Verification maps it instead of reading it,
 /// so a hit on page 1 of a 4 MB book touches a few pages, not the book.
@@ -824,4 +840,14 @@ test "search finds NFD decomposed accented words while preserving snippet text" 
     }
     try testing.expect(saw_nfc);
     try testing.expect(saw_nfd);
+}
+
+test "querySearchable requires at least one word of trigram_chars folded bytes" {
+    try testing.expect(!querySearchable(""));
+    try testing.expect(!querySearchable("   "));
+    try testing.expect(!querySearchable("go to"));
+    try testing.expect(!querySearchable("éé"));
+    try testing.expect(querySearchable("ééé"));
+    try testing.expect(querySearchable("go to the"));
+    try testing.expect(querySearchable("e\u{0301}e\u{0301}e\u{0301}"));
 }

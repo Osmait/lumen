@@ -33,8 +33,8 @@ const Server = struct {
     accepting: Accepting = .paused,
     path_buffer: [256]u8 = undefined,
     path: [:0]const u8 = "",
-    handler: Handler = undefined,
-    gpa: std.mem.Allocator = undefined,
+    handler: ?Handler = null,
+    gpa: ?std.mem.Allocator = null,
     connections_open: usize = 0,
     /// The inode of the socket this daemon bound: `stop` removes the file
     /// only while it is still that one.
@@ -199,25 +199,7 @@ pub fn stop() void {
 /// folder others can write to, someone else's would let them replace the
 /// socket with theirs.
 fn isPrivateDir(dir: [:0]const u8) bool {
-    const open_result = linux.open(
-        dir.ptr,
-        .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .NOFOLLOW = true, .CLOEXEC = true },
-        0,
-    );
-    if (failed(open_result) != null) return false;
-    const fd: linux.fd_t = @intCast(open_result);
-    defer _ = linux.close(fd);
-    var stx: linux.Statx = undefined;
-    const statx_result = linux.statx(
-        fd,
-        "",
-        linux.AT.EMPTY_PATH,
-        .{ .TYPE = true, .MODE = true, .UID = true },
-        &stx,
-    );
-    if (failed(statx_result) != null) return false;
-    if (stx.uid != linux.getuid() or stx.mode & linux.S.IFMT != linux.S.IFDIR) return false;
-    return stx.mode & 0o777 == 0o700 or failed(linux.fchmod(fd, 0o700)) == null;
+    return os.ensurePrivateDir(dir.ptr);
 }
 
 /// Connections taken per turn of the main loop: the rest wait for the
@@ -304,7 +286,7 @@ const Connection = struct {
             _ = linux.close(fd);
             return;
         }
-        const self = server.gpa.create(Connection) catch {
+        const self = server.gpa.?.create(Connection) catch {
             log.warn("out of memory: a connection refused", .{});
             _ = linux.close(fd);
             return;
@@ -327,11 +309,11 @@ const Connection = struct {
         if (self.watch != 0) _ = c.g_source_remove(self.watch);
         if (self.timer != 0) _ = c.g_source_remove(self.timer);
         _ = linux.close(self.fd);
-        self.bytes.deinit(server.gpa);
+        self.bytes.deinit(server.gpa.?);
         for (&server.connections) |*slot| {
             if (slot.* == self) slot.* = null;
         }
-        server.gpa.destroy(self);
+        server.gpa.?.destroy(self);
         assert(server.connections_open > 0);
         server.connections_open -= 1;
         // Paused at connections_max: there is room again.
@@ -368,9 +350,13 @@ const Connection = struct {
     /// or when the buffer is full (the client sends no more than that).
     fn read(self: *Connection) enum { more, done, failed } {
         while (self.bytes.items.len < ipc.request_bytes_max) {
-            self.bytes.ensureUnusedCapacity(server.gpa, read_chunk_bytes) catch return .failed;
+            const room_left = ipc.request_bytes_max - self.bytes.items.len;
+            self.bytes.ensureUnusedCapacity(
+                server.gpa.?,
+                @min(read_chunk_bytes, room_left),
+            ) catch return .failed;
             const spare = self.bytes.unusedCapacitySlice();
-            const room = @min(spare.len, ipc.request_bytes_max - self.bytes.items.len);
+            const room = @min(spare.len, room_left);
             const bytes_read = linux.read(self.fd, spare.ptr, room);
             if (failed(bytes_read)) |errno| switch (errno) {
                 .AGAIN => return .more,
@@ -398,7 +384,7 @@ const Connection = struct {
             return self.close();
         };
 
-        var arena_state: std.heap.ArenaAllocator = .init(server.gpa);
+        var arena_state: std.heap.ArenaAllocator = .init(server.gpa.?);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
         const arguments_count = request.arguments_count;
@@ -408,7 +394,7 @@ const Connection = struct {
         }
         var stdout: std.Io.Writer.Allocating = .init(arena);
         var stderr: std.Io.Writer.Allocating = .init(arena);
-        const status = server.handler(arguments, request.payload, &stdout.writer, &stderr.writer);
+        const status = server.handler.?(arguments, request.payload, &stdout.writer, &stderr.writer);
 
         // The request is done with: the buffer takes the answer.
         self.bytes.clearRetainingCapacity();
@@ -417,9 +403,9 @@ const Connection = struct {
             return self.close();
         };
         const header = ipc.encodeAnswerHeader(status, stdout_len);
-        self.bytes.appendSlice(server.gpa, &header) catch return self.close();
-        self.bytes.appendSlice(server.gpa, stdout.written()) catch return self.close();
-        self.bytes.appendSlice(server.gpa, stderr.written()) catch return self.close();
+        self.bytes.appendSlice(server.gpa.?, &header) catch return self.close();
+        self.bytes.appendSlice(server.gpa.?, stdout.written()) catch return self.close();
+        self.bytes.appendSlice(server.gpa.?, stderr.written()) catch return self.close();
         self.flush();
     }
 

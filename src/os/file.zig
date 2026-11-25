@@ -35,14 +35,59 @@ pub fn openRegular(path: [*:0]const u8) Error!i32 {
     return fd;
 }
 
-/// The first bytes of a file (previews). Empty for anything not a regular
-/// file.
+/// The first bytes of a file (previews, script headers). Empty for anything
+/// not a regular file or if reading fails before EOF.
 pub fn readHead(path: [*:0]const u8, head_buffer: []u8) []const u8 {
     const fd = openRegular(path) catch return "";
     defer close(fd);
-    const bytes_read = linux.read(fd, head_buffer.ptr, head_buffer.len);
-    if (linux.errno(bytes_read) != .SUCCESS) return "";
-    return head_buffer[0..bytes_read];
+    var total: usize = 0;
+    while (total < head_buffer.len) {
+        const rest = head_buffer[total..];
+        const bytes_read = linux.read(fd, rest.ptr, rest.len);
+        switch (linux.errno(bytes_read)) {
+            .SUCCESS => {
+                if (bytes_read == 0) break;
+                total += bytes_read;
+            },
+            .INTR => continue,
+            else => return "",
+        }
+    }
+    return head_buffer[0..total];
+}
+
+/// Ensures `path` is a regular file (never following symlinks) and owner-only
+/// (0600). When `create` is true, creates it atomically as 0600 if missing;
+/// when `create` is false, a missing file succeeds cleanly.
+pub fn ensurePrivateFile(path: [*:0]const u8, create: bool) Error!void {
+    const open_result = linux.open(
+        path,
+        .{
+            .ACCMODE = .RDONLY,
+            .CREAT = create,
+            .NOFOLLOW = true,
+            .CLOEXEC = true,
+            .NONBLOCK = true,
+            .NOCTTY = true,
+        },
+        0o600,
+    );
+    switch (linux.errno(open_result)) {
+        .SUCCESS => {},
+        .NOENT => if (!create) return else return error.NotFound,
+        else => {
+            _ = try check(open_result);
+            unreachable;
+        },
+    }
+    const fd: i32 = @intCast(open_result);
+    defer close(fd);
+    var stx: linux.Statx = undefined;
+    const stx_result = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stx);
+    if (linux.errno(stx_result) != .SUCCESS or stx.mode & linux.S.IFMT != linux.S.IFREG) {
+        return error.NotRegular;
+    }
+    _ = try check(linux.fchmod(fd, 0o600));
 }
 
 /// Lumen's own files (indexes, extracted text) hold the names and text of
@@ -182,6 +227,7 @@ pub fn writeFileAtomicMapped(path: []const u8, data: []const u8) Error!MappedByt
     try writeAll(fd, data);
     _ = try check(linux.fsync(fd));
     try rename(temp_path, final_path);
+    fsyncParentDir(path);
     committed = true;
     const mapping_address = try check(linux.mmap(
         null,
@@ -193,6 +239,17 @@ pub fn writeFileAtomicMapped(path: []const u8, data: []const u8) Error!MappedByt
     ));
     const mapping: [*]align(mapping_alignment_bytes) u8 = @ptrFromInt(mapping_address);
     return mapping[0..data.len];
+}
+
+/// Best-effort directory sync after `rename` so the new directory entry
+/// persists across power loss on filesystems without implicit ordering.
+fn fsyncParentDir(path: []const u8) void {
+    const dir_slice = std.Io.Dir.path.dirname(path) orelse ".";
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_z = std.mem.printSentinel(&dir_buf, "{s}", .{dir_slice}, 0) catch return;
+    const dir_fd = os.openDir(dir_z) catch return;
+    defer close(dir_fd);
+    _ = linux.fsync(dir_fd);
 }
 
 /// Per-process sequence for unique temporary file names in `AtomicFile`.
@@ -270,6 +327,7 @@ pub const AtomicFile = struct {
             file.temporary_path[0..file.temporary_path_len :0],
             file.final_path[0..file.final_path_len :0],
         );
+        fsyncParentDir(file.final_path[0..file.final_path_len]);
     }
 
     /// Safe to call after a failed `commit` (it already aborted).
@@ -616,4 +674,36 @@ test "a second append waits for the first, then sees the file grew" {
     thread.join();
     // Not 10 bytes any more: it rewrites instead of appending over these.
     try std.testing.expectEqual(@as(?bool, false), second_opened);
+}
+
+test "ensurePrivateFile creates, tightens permissions, skips absent, rejects links" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var dir_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try os.tmpDirPath(&tmp_dir, &dir_buffer);
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+
+    const absent = try std.mem.printSentinel(&path_buffer, "{s}/missing", .{dir}, 0);
+    try ensurePrivateFile(absent, false);
+    try std.testing.expectError(error.NotFound, openRegular(absent));
+
+    const created = try std.mem.printSentinel(&path_buffer, "{s}/created", .{dir}, 0);
+    try ensurePrivateFile(created, true);
+    var stx: linux.Statx = undefined;
+    try expectSuccess(linux.statx(linux.AT.FDCWD, created, 0, .{ .MODE = true }, &stx));
+    try std.testing.expectEqual(@as(u16, 0o600), stx.mode & 0o777);
+
+    try expectSuccess(linux.chmod(created, 0o644));
+    try ensurePrivateFile(created, false);
+    try expectSuccess(linux.statx(linux.AT.FDCWD, created, 0, .{ .MODE = true }, &stx));
+    try std.testing.expectEqual(@as(u16, 0o600), stx.mode & 0o777);
+
+    var link_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const link = try std.mem.printSentinel(&link_buffer, "{s}/link", .{dir}, 0);
+    try expectSuccess(linux.symlink(created, link));
+    try std.testing.expectError(error.IsLink, ensurePrivateFile(link, false));
+
+    var head_buffer: [16]u8 = undefined;
+    try writeFile(created, "abcdef");
+    try std.testing.expectEqualStrings("abcdef", readHead(created, &head_buffer));
 }

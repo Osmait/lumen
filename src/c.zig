@@ -44,6 +44,7 @@ comptime {
 pub const GObject = opaque {};
 pub const GDir = opaque {};
 pub const GDateTime = opaque {};
+pub const GTimeZone = opaque {};
 pub const GIcon = opaque {};
 pub const GAppInfo = opaque {};
 pub const GDesktopAppInfo = opaque {};
@@ -262,6 +263,18 @@ pub extern fn g_spawn_sync(
     err: ?*?*GError,
 ) gboolean;
 
+pub extern fn g_time_zone_new_local() *GTimeZone;
+pub extern fn g_time_zone_new_identifier(identifier: ?[*:0]const u8) ?*GTimeZone;
+pub extern fn g_time_zone_unref(tz: *GTimeZone) void;
+pub extern fn g_date_time_new(
+    tz: *GTimeZone,
+    year: c_int,
+    month: c_int,
+    day: c_int,
+    hour: c_int,
+    minute: c_int,
+    seconds: f64,
+) ?*GDateTime;
 pub extern fn g_date_time_new_now_local() ?*GDateTime;
 pub extern fn g_date_time_new_local(
     year: c_int,
@@ -271,7 +284,10 @@ pub extern fn g_date_time_new_local(
     minute: c_int,
     seconds: f64,
 ) ?*GDateTime;
+pub extern fn g_date_time_new_from_unix_utc(unix_time_s: i64) ?*GDateTime;
 pub extern fn g_date_time_new_from_unix_local(unix_time_s: i64) ?*GDateTime;
+pub extern fn g_date_time_to_timezone(date_time: *GDateTime, tz: *GTimeZone) ?*GDateTime;
+pub extern fn g_date_time_add_days(date_time: *GDateTime, days: c_int) ?*GDateTime;
 pub extern fn g_date_time_unref(date_time: *GDateTime) void;
 pub extern fn g_date_time_get_year(date_time: *GDateTime) c_int;
 pub extern fn g_date_time_get_month(date_time: *GDateTime) c_int;

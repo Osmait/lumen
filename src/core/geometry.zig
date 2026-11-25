@@ -112,8 +112,8 @@ pub fn place(layout: Layout, outer: Rect, current: Size, gap_px: i32) Rect {
         .almost_maximize => shrinkCentered(area, 0.9),
         .center => centered(
             area,
-            @min(current.width, area.width),
-            @min(current.height, area.height),
+            @min(@max(current.width, 0), area.width),
+            @min(@max(current.height, 0), area.height),
         ),
         .first_third => .{ .x = area.x, .y = area.y, .width = third, .height = area.height },
         .center_third => .{
@@ -188,4 +188,7 @@ test "center keeps size" {
     const area: Rect = .{ .x = 0, .y = 0, .width = 1000, .height = 800 };
     const center = place(.center, area, .{ .width = 400, .height = 300 }, 0);
     try std.testing.expectEqual(Rect{ .x = 300, .y = 250, .width = 400, .height = 300 }, center);
+
+    const negative = place(.center, area, .{ .width = -50, .height = -20 }, 0);
+    try std.testing.expectEqual(Rect{ .x = 500, .y = 400, .width = 0, .height = 0 }, negative);
 }

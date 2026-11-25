@@ -71,11 +71,8 @@ pub fn parse(comptime T: type, arena: std.mem.Allocator, json: []const u8) ?T {
 }
 
 fn query(arena: std.mem.Allocator, comptime T: type, what: [:0]const u8) ?T {
-    const json = request(arena, what) orelse blk: {
-        const output = proc.outputTimeout(&.{ "hyprctl", "-j", what }, 300) orelse return null;
-        defer proc.free(output);
-        break :blk arena.dupe(u8, output) catch return null;
-    };
+    const json = request(arena, what) orelse
+        (proc.outputTimeout(arena, &.{ "hyprctl", "-j", what }, 300) orelse return null);
     return parse(T, arena, json) orelse {
         log.warn("hyprctl {s}: unexpected JSON", .{what});
         return null;
@@ -107,10 +104,19 @@ pub fn sortByFocus(all: []Client) void {
     }.lessThan);
 }
 
+/// Whether `address` is a lowercase hexadecimal Hyprland window address (`0x[0-9a-f]+`).
+pub fn validAddress(address: []const u8) bool {
+    if (address.len < 3 or !std.mem.startsWith(u8, address, "0x")) return false;
+    for (address[2..]) |ch| {
+        if (!((ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f'))) return false;
+    }
+    return true;
+}
+
 pub fn activeWindow(arena: std.mem.Allocator) ?Client {
     const window = query(arena, Client, "activewindow") orelse return null;
-    // No window focused: Hyprland answers with an empty one.
-    if (window.address.len == 0) return null;
+    // No window focused (empty address) or malformed address: ignore.
+    if (!validAddress(window.address)) return null;
     return window;
 }
 
@@ -170,7 +176,7 @@ const Socket = enum {
     }
 };
 
-/// Connects to one of Hyprland's sockets; null without Hyprland.
+/// Connects to one of Hyprland's sockets; null without Hyprland or if peer UID differs.
 fn connect(socket: Socket, options: os.unix.ConnectOptions) ?linux.fd_t {
     const signature_z = c.g_getenv("HYPRLAND_INSTANCE_SIGNATURE") orelse return null;
     const runtime_dir_z = c.g_getenv(ipc.env.runtime_dir) orelse return null;
@@ -182,7 +188,13 @@ fn connect(socket: Socket, options: os.unix.ConnectOptions) ?linux.fd_t {
         "{s}/hypr/{s}/{s}",
         .{ runtime_dir, instance_signature, socket.fileName() },
     ) catch return null;
-    return os.unix.connect(path, options);
+    const fd = os.unix.connect(path, options) orelse return null;
+    if (os.unix.peerUid(fd) != linux.getuid()) {
+        log.warn("refused Hyprland socket {s} owned by another user", .{path});
+        _ = linux.close(fd);
+        return null;
+    }
+    return fd;
 }
 
 /// A compositor that does not answer must not freeze the window.
@@ -254,11 +266,35 @@ pub fn dispatch(gpa: std.mem.Allocator, command: []const u8) void {
 /// (`sendAfterHide`).
 pub fn batch(gpa: std.mem.Allocator, commands: []const []const u8) void {
     os.assertMainThread();
+    batchWith(gpa, commands, &sendQueued, &spawnBatch);
+}
+
+fn spawnBatch(gpa: std.mem.Allocator, commands: []const []const u8) void {
+    const batch_z = batchString(gpa, commands) catch return;
+    defer gpa.free(batch_z);
+    proc.spawn(&.{ "hyprctl", "--batch", batch_z });
+}
+
+fn batchWith(
+    gpa: std.mem.Allocator,
+    commands: []const []const u8,
+    flush_queued: *const fn () void,
+    send_direct: *const fn (std.mem.Allocator, []const []const u8) void,
+) void {
     if (!dispatch_queue.append(commands)) {
-        // Too long to queue: run hyprctl now (slower, but never dropped).
-        const batch_z = batchString(gpa, commands) catch return;
-        defer gpa.free(batch_z);
-        proc.spawn(&.{ "hyprctl", "--batch", batch_z });
+        // Flush queued commands first so the oversized batch never overtakes them.
+        if (dispatch_queue.len > 0) {
+            dispatch_queue.cancelIdle();
+            flush_queued();
+            if (dispatch_queue.append(commands)) {
+                if (dispatch_queue.idle_source == 0) {
+                    dispatch_queue.idle_source = c.g_idle_add(&batchIdleCallback, null);
+                }
+                return;
+            }
+        }
+        // Too long to queue even alone: run hyprctl now (slower, but never dropped).
+        send_direct(gpa, commands);
         return;
     }
     // Send on the next idle, in case the action does not hide the window;
@@ -339,7 +375,11 @@ pub fn sendAfterHide() void {
     os.assertMainThread();
     if (dispatch_queue.len == 0) return;
     dispatch_queue.cancelIdle();
-    afterFocusChange(&sendQueued, focus_fallback_ms);
+    afterFocusChange(&sendQueuedCallback, 0, focus_fallback_ms);
+}
+
+fn sendQueuedCallback(_: usize) void {
+    sendQueued();
 }
 
 /// Sends what `batch` queued; hyprctl if the socket cannot be reached.
@@ -388,10 +428,15 @@ pub fn batchString(
 /// is one short line ("activewindow>>class,title").
 const events_buffer_bytes = 4096;
 
+const FocusCallback = struct {
+    callback: *const fn (usize) void,
+    context: usize,
+};
+
 /// Waits for Hyprland to give a window the focus (`activewindow` on its
 /// event socket), then calls back whoever asked. Main thread only.
 const FocusWaiter = struct {
-    callbacks: [4]*const fn () void = undefined,
+    callbacks: [4]FocusCallback = undefined,
     callbacks_count: usize = 0,
     events_fd: linux.fd_t = -1,
     /// The event socket's watch and the fallback timer; 0 when not set.
@@ -422,7 +467,7 @@ const FocusWaiter = struct {
         const callbacks = waiter.callbacks;
         const callbacks_count = waiter.callbacks_count;
         waiter.callbacks_count = 0;
-        for (callbacks[0..callbacks_count]) |callback| callback();
+        for (callbacks[0..callbacks_count]) |entry| entry.callback(entry.context);
     }
 };
 
@@ -430,22 +475,37 @@ const FocusWaiter = struct {
 /// meantime shares. Main thread only.
 var focus_waiter: FocusWaiter = .{};
 
-/// Calls `callback` once Hyprland gives a window the focus, else after
+/// Calls `callback(context)` once Hyprland gives a window the focus, else after
 /// `fallback_ms`: a paste right after Lumen hides waited a fixed 120 ms,
 /// and the focus is back in ~2.
-pub fn afterFocusChange(callback: *const fn () void, fallback_ms: c_uint) void {
+pub fn afterFocusChange(
+    callback: *const fn (usize) void,
+    context: usize,
+    fallback_ms: c_uint,
+) void {
     os.assertMainThread();
     const waiter = &focus_waiter;
-    for (waiter.callbacks[0..waiter.callbacks_count]) |waiting_callback| {
-        if (waiting_callback == callback) return;
+    for (waiter.callbacks[0..waiter.callbacks_count]) |*entry| {
+        if (entry.callback == callback) {
+            entry.context = context;
+            if (waiter.timer_source != 0) {
+                _ = c.g_source_remove(waiter.timer_source);
+                waiter.timer_source = c.g_timeout_add(
+                    fallback_ms,
+                    &afterFocusChangeTimeoutCallback,
+                    null,
+                );
+            }
+            return;
+        }
     }
     if (waiter.callbacks_count == waiter.callbacks.len) {
         log.debug("{d} callbacks already wait for the focus: called now", .{
             waiter.callbacks_count,
         });
-        return callback();
+        return callback(context);
     }
-    waiter.callbacks[waiter.callbacks_count] = callback;
+    waiter.callbacks[waiter.callbacks_count] = .{ .callback = callback, .context = context };
     waiter.callbacks_count += 1;
     // Already waiting: one event serves all.
     if (waiter.waiting()) return;
@@ -613,8 +673,7 @@ pub fn layoutCommands(
     monitor_area: geometry.Monitor,
     layout: geometry.Layout,
 ) std.mem.Allocator.Error![]const []const u8 {
-    // activeWindow returns no window without an address.
-    assert(window.address.len > 0);
+    if (!validAddress(window.address)) return &.{};
     const current_size: geometry.Size = .{ .width = window.size[0], .height = window.size[1] };
     const placed = geometry.place(layout, monitor_area.usable(), current_size, layout_gap_px);
     var commands: std.ArrayList([]const u8) = .empty;
@@ -733,4 +792,97 @@ test "garbage or a changed shape does not crash" {
     try testing.expect(parse([]Client, arena.allocator(), "not json") == null);
     try testing.expect(parse([]Client, arena.allocator(), "{\"address\": 3}") == null);
     try testing.expect(parse([]MonitorJson, arena.allocator(), "[{\"name\":\"x\"}]") == null);
+}
+
+test "validAddress accepts only 0x lowercase hex addresses" {
+    try testing.expect(validAddress("0x5600000000a0"));
+    try testing.expect(!validAddress(""));
+    try testing.expect(!validAddress("0x"));
+    try testing.expect(!validAddress("0X5600"));
+    try testing.expect(!validAddress("0x56;dispatch exec x"));
+    try testing.expect(!validAddress("5600"));
+}
+
+test "batch flushes queued commands before overflowing and afterFocusChange updates context" {
+    dispatch_queue.cancelIdle();
+    dispatch_queue.len = 0;
+    defer {
+        dispatch_queue.cancelIdle();
+        dispatch_queue.len = 0;
+        focus_waiter.stop();
+    }
+
+    const Stub = struct {
+        var seq: usize = 0;
+        var flush_count: usize = 0;
+        var flush_order: usize = 0;
+        var direct_count: usize = 0;
+        var direct_order: usize = 0;
+
+        fn reset() void {
+            seq = 0;
+            flush_count = 0;
+            flush_order = 0;
+            direct_count = 0;
+            direct_order = 0;
+        }
+
+        fn flush() void {
+            seq += 1;
+            flush_count += 1;
+            flush_order = seq;
+            dispatch_queue.len = 0;
+        }
+
+        fn direct(_: std.mem.Allocator, _: []const []const u8) void {
+            seq += 1;
+            direct_count += 1;
+            direct_order = seq;
+        }
+    };
+
+    // 1. Overflow with a command that fits after flushing clears the queue and re-queues.
+    Stub.reset();
+    var fill_buf: [dispatch_queue_bytes_max - 32]u8 = undefined;
+    @memset(&fill_buf, 'x');
+    batchWith(testing.allocator, &.{&fill_buf}, &Stub.flush, &Stub.direct);
+    try testing.expectEqual(@as(usize, 0), Stub.flush_count);
+    try testing.expectEqual(@as(usize, 0), Stub.direct_count);
+    try testing.expect(dispatch_queue.len > 0);
+
+    var small_next: [64]u8 = undefined;
+    @memset(&small_next, 'y');
+    batchWith(testing.allocator, &.{&small_next}, &Stub.flush, &Stub.direct);
+    try testing.expectEqual(@as(usize, 1), Stub.flush_count);
+    try testing.expectEqual(@as(usize, 0), Stub.direct_count);
+    try testing.expect(dispatch_queue.len > 0);
+
+    // 2. Oversized command (> queue capacity) flushes queued commands BEFORE send_direct.
+    Stub.reset();
+    var big_cmd_buf: [dispatch_queue_bytes_max]u8 = undefined;
+    @memset(&big_cmd_buf, 'a');
+    batchWith(testing.allocator, &.{&big_cmd_buf}, &Stub.flush, &Stub.direct);
+    try testing.expectEqual(@as(usize, 1), Stub.flush_count);
+    try testing.expectEqual(@as(usize, 1), Stub.direct_count);
+    try testing.expect(Stub.flush_order < Stub.direct_order);
+    try testing.expectEqual(@as(usize, 0), dispatch_queue.len);
+    dispatch_queue.cancelIdle();
+
+    // 3. afterFocusChange updates context and resets timer on duplicate callback registration.
+    const Seen = struct {
+        var ctx: usize = 0;
+        fn onFocus(value: usize) void {
+            ctx = value;
+        }
+    };
+    afterFocusChange(&Seen.onFocus, 1, 5000);
+    const first_timer = focus_waiter.timer_source;
+    try testing.expect(first_timer != 0);
+    afterFocusChange(&Seen.onFocus, 2, 5000);
+    try testing.expectEqual(@as(usize, 1), focus_waiter.callbacks_count);
+    try testing.expectEqual(@as(usize, 2), focus_waiter.callbacks[0].context);
+    try testing.expect(focus_waiter.timer_source != 0);
+    try testing.expect(focus_waiter.timer_source != first_timer);
+    focus_waiter.fire();
+    try testing.expectEqual(@as(usize, 2), Seen.ctx);
 }

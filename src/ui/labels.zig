@@ -5,6 +5,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const c = @import("c");
 const core = @import("core");
+const os = @import("os");
 const item_mod = @import("../item.zig");
 const index = @import("index");
 const widgets = @import("widgets.zig");
@@ -100,7 +101,7 @@ pub fn contextMarkup(
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw| : (line_number += 1) {
         if (line_number < first) continue;
-        if (line_number > line + context_lines_after) break;
+        if (line_number > line +| context_lines_after) break;
         const shown = core.utf8.validPrefix(raw[0..@min(raw.len, context_line_bytes_max)]);
         const number = arena.print(
             "<span alpha=\"" ++ line_number_alpha ++ "\">{d: >4}  </span>",
@@ -215,21 +216,58 @@ pub fn formatSize(arena: std.mem.Allocator, bytes: u64) [:0]const u8 {
         arena.printSentinel("{d:.1} {s}", .{ amount, units[unit_index] }, 0)) catch "";
 }
 
-/// Today's midnight, local time, in seconds since the Unix epoch.
-pub fn startOfToday() i64 {
-    // Null only for a date GLib cannot represent: then everything is "Earlier".
-    const date_time = c.g_date_time_new_now_local() orelse return std.math.maxInt(i64);
-    defer c.g_date_time_unref(date_time);
-    const midnight = c.g_date_time_new_local(
-        c.g_date_time_get_year(date_time),
-        c.g_date_time_get_month(date_time),
-        c.g_date_time_get_day_of_month(date_time),
+pub const DayBounds = struct {
+    today_start_s: i64,
+    yesterday_start_s: i64,
+
+    pub fn section(bounds: DayBounds, time_s: i64) [:0]const u8 {
+        if (time_s >= bounds.today_start_s) return "Today";
+        if (time_s >= bounds.yesterday_start_s) return "Yesterday";
+        return "Earlier";
+    }
+
+    pub fn dateFormat(bounds: DayBounds, time_s: i64) [*:0]const u8 {
+        if (time_s >= bounds.today_start_s) return "Today at %H:%M";
+        if (time_s >= bounds.yesterday_start_s) return "Yesterday at %H:%M";
+        return "%b %e at %H:%M";
+    }
+};
+
+/// Today's and yesterday's local calendar midnights in `tz` for `now_s`.
+/// Using `GDateTime` + `g_date_time_add_days` instead of subtracting 86400 s
+/// keeps "Yesterday" aligned with calendar midnight across 23 h / 25 h DST days.
+pub fn dayBoundsInZone(now_s: i64, tz: *c.GTimeZone) DayBounds {
+    const fallback: DayBounds = .{
+        .today_start_s = std.math.maxInt(i64),
+        .yesterday_start_s = std.math.maxInt(i64),
+    };
+    const utc_now = c.g_date_time_new_from_unix_utc(now_s) orelse return fallback;
+    defer c.g_date_time_unref(utc_now);
+    const local_now = c.g_date_time_to_timezone(utc_now, tz) orelse return fallback;
+    defer c.g_date_time_unref(local_now);
+    const today_midnight = c.g_date_time_new(
+        tz,
+        c.g_date_time_get_year(local_now),
+        c.g_date_time_get_month(local_now),
+        c.g_date_time_get_day_of_month(local_now),
         0,
         0,
         0,
-    ) orelse return std.math.maxInt(i64);
-    defer c.g_date_time_unref(midnight);
-    return c.g_date_time_to_unix(midnight);
+    ) orelse return fallback;
+    defer c.g_date_time_unref(today_midnight);
+    const yesterday_midnight = c.g_date_time_add_days(today_midnight, -1) orelse return fallback;
+    defer c.g_date_time_unref(yesterday_midnight);
+    return .{
+        .today_start_s = c.g_date_time_to_unix(today_midnight),
+        .yesterday_start_s = c.g_date_time_to_unix(yesterday_midnight),
+    };
+}
+
+/// Today's and yesterday's local calendar midnights in Unix seconds.
+pub fn dayBounds() DayBounds {
+    const tz = c.g_time_zone_new_local();
+    defer c.g_time_zone_unref(tz);
+    return dayBoundsInZone(os.nowSeconds(), tz);
 }
 
 /// "Today at 09:30", "Yesterday at 18:05" or "Mar 3 at 12:00" for a time
@@ -237,13 +275,7 @@ pub fn startOfToday() i64 {
 pub fn formatWhen(arena: std.mem.Allocator, time_s: i64) [:0]const u8 {
     const date_time = c.g_date_time_new_from_unix_local(time_s) orelse return "";
     defer c.g_date_time_unref(date_time);
-    const today_s = startOfToday();
-    const format: [*:0]const u8 = if (time_s >= today_s)
-        "Today at %H:%M"
-    else if (time_s >= today_s - std.time.s_per_day)
-        "Yesterday at %H:%M"
-    else
-        "%b %e at %H:%M";
+    const format = dayBounds().dateFormat(time_s);
     const formatted = c.g_date_time_format(date_time, format) orelse return "";
     defer c.g_free(formatted);
     return arena.dupeSentinel(u8, std.mem.span(formatted), 0) catch "";
@@ -303,4 +335,34 @@ test "bidirectional controls cannot disguise a name" {
     const title = firstLine(arena, "\n  pay \u{202E}fdp.exe\nmore");
     try std.testing.expectEqualStrings("pay fdp.exe", title);
     try std.testing.expectEqualStrings("a b", firstLine(arena, "a\tb"));
+}
+
+test "dayBoundsInZone aligns Yesterday with calendar midnight across DST transitions" {
+    const ny = c.g_time_zone_new_identifier("America/New_York") orelse
+        return error.SkipZigTest;
+    defer c.g_time_zone_unref(ny);
+
+    // US Spring Forward: 2026-03-08 is 23 hours long (EST -05 -> EDT -04).
+    // On 2026-03-09 12:00 EDT:
+    //   2026-03-09 00:00 EDT = 1773028800
+    //   2026-03-08 00:00 EST = 1772946000 (82800 s earlier)
+    const spring_now: i64 = 1773072000;
+    const spring_bounds = dayBoundsInZone(spring_now, ny);
+    try std.testing.expectEqual(@as(i64, 1773028800), spring_bounds.today_start_s);
+    try std.testing.expectEqual(@as(i64, 1772946000), spring_bounds.yesterday_start_s);
+    // 2026-03-07 23:30 EST (1772944200) must be "Earlier", not "Yesterday".
+    try std.testing.expectEqualStrings("Earlier", spring_bounds.section(1772944200));
+    try std.testing.expectEqualStrings("Yesterday", spring_bounds.section(1772946000));
+
+    // US Fall Back: 2026-11-01 is 25 hours long (EDT -04 -> EST -05).
+    // On 2026-11-02 12:00 EST:
+    //   2026-11-02 00:00 EST = 1793595600
+    //   2026-11-01 00:00 EDT = 1793505600 (90000 s earlier)
+    const fall_now: i64 = 1793638800;
+    const fall_bounds = dayBoundsInZone(fall_now, ny);
+    try std.testing.expectEqual(@as(i64, 1793595600), fall_bounds.today_start_s);
+    try std.testing.expectEqual(@as(i64, 1793505600), fall_bounds.yesterday_start_s);
+    // 2026-11-01 00:30 EDT (1793507400) must be "Yesterday", not "Earlier".
+    try std.testing.expectEqualStrings("Yesterday", fall_bounds.section(1793507400));
+    try std.testing.expectEqualStrings("Earlier", fall_bounds.section(1793505599));
 }

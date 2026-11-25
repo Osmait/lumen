@@ -41,7 +41,7 @@ const log = std.log.scoped(.main);
 /// The daemon's state, reached from GLib callbacks that carry no user
 /// data; main thread only. The only global of this file.
 const Daemon = struct {
-    app: *c.GApplication = undefined,
+    app: ?*c.GApplication = null,
     /// LUMEN_APP_ID lets end-to-end tests run a second, isolated instance
     /// (GApplication is single-instance per id; the socket is per id too).
     app_id: [:0]const u8 = ipc.app_id_default,
@@ -116,17 +116,15 @@ pub fn main(init: std.process.Init) !void {
 
     // A process can be started with no argv at all (execve with argc 0).
     const arguments = if (argv.items.len > 1) argv.items[1..] else argv.items[0..0];
-    const first_flag: ?cli.Flag = if (arguments.len > 0)
-        cli.parse(std.mem.span(arguments[0].?))
-    else
-        null;
+    const arg_slices = try init.gpa.alloc([:0]const u8, arguments.len);
+    defer init.gpa.free(arg_slices);
+    for (arguments, arg_slices) |argument, *slice| slice.* = std.mem.span(argument.?);
+    const first_flag: ?cli.Flag = if (arg_slices.len > 0) cli.parse(arg_slices[0]) else null;
     if (first_flag == .clip_store) return clipStore(init);
     // --help never needs a daemon: print the usage here, before
-    // GApplication can start one.
-    for (arguments) |argument| {
-        if (cli.parse(std.mem.span(argument.?)) == .help) return printToStdout(init.io, cli.usage);
-    }
-    if (arguments.len == 1 and first_flag == .version) return printToStdout(init.io, version_line);
+    // GApplication can start one (ignoring literal values like --query --help).
+    if (requestsHelp(arg_slices)) return printToStdout(init.io, cli.usage);
+    if (arg_slices.len == 1 and first_flag == .version) return printToStdout(init.io, version_line);
 
     if (c.g_getenv(ipc.env.app_id)) |app_id| daemon.app_id = std.mem.span(app_id);
     // GLib's rules, not ipc.validAppId's (which only keeps the socket's
@@ -150,11 +148,15 @@ pub fn main(init: std.process.Init) !void {
         std.process.fatal("cannot create the application {s}", .{daemon.app_id});
     };
     defer c.g_object_unref(gtk_app);
-    daemon.app = @ptrCast(gtk_app);
+    const app: *c.GApplication = @ptrCast(gtk_app);
+    daemon.app = app;
     // Zig's default in ReleaseSafe is a checking allocator over mmap (every
     // allocation of 6 KB or more a fresh mapping); glibc's, tuned above, is
-    // what the measurements were made with. Debug builds keep the checks.
-    const gpa = if (builtin.mode == .debug) init.gpa else std.heap.c_allocator;
+    // what the measurements were made with. Debug builds and -Dchecked-alloc keep checks.
+    const gpa = if (builtin.mode == .debug or @import("build_options").checked_alloc)
+        init.gpa
+    else
+        std.heap.c_allocator;
     var start: Start = .{ .gpa = gpa, .io = init.io };
     Ui.connect(gtk_app, "startup", &startupCallback, &start);
     Ui.connect(gtk_app, "command-line", &commandLineCallback, null);
@@ -164,15 +166,41 @@ pub fn main(init: std.process.Init) !void {
     const argc = std.math.cast(c_int, argv.items.len) orelse {
         std.process.fatal("too many arguments", .{});
     };
-    const status = c.g_application_run(daemon.app, argc, @ptrCast(argv.items.ptr));
+    const status = c.g_application_run(app, argc, @ptrCast(argv.items.ptr));
     std.process.exit(std.math.cast(u8, status) orelse 1);
 }
 
 /// Registers with the bus as a launcher: true when another instance (the
 /// daemon) is the primary one.
 fn daemonIsRunning() bool {
-    if (c.g_application_register(daemon.app, null, null) == 0) return false;
-    return c.g_application_get_is_remote(daemon.app) != 0;
+    const app = daemon.app orelse return false;
+    if (c.g_application_register(app, null, null) == 0) return false;
+    return c.g_application_get_is_remote(app) != 0;
+}
+
+/// True when `arguments` asks for `--help` / `-h` in flag position (not as
+/// the value consumed by an option such as `--query --help`).
+fn requestsHelp(arguments: []const [:0]const u8) bool {
+    var argument_index: usize = 0;
+    while (argument_index < arguments.len) : (argument_index += 1) {
+        const flag = cli.parse(arguments[argument_index]) orelse continue;
+        if (flag == .help) return true;
+        switch (cli.specs.get(flag).value) {
+            .none => {},
+            .required => {
+                if (argument_index + 1 == arguments.len) return false;
+                argument_index += 1;
+            },
+            .optional => {
+                if (argument_index + 1 < arguments.len and
+                    !std.mem.startsWith(u8, arguments[argument_index + 1], "-"))
+                {
+                    argument_index += 1;
+                }
+            },
+        }
+    }
+    return false;
 }
 
 /// Nobody is told when stdout is closed (`lumen --help | head -0`): there
@@ -202,7 +230,7 @@ fn startupCallback(gtk_app: *c.GtkApplication, data: ?*anyopaque) callconv(.c) v
         log.err("cannot open {s}: {t}", .{ path, err });
         return;
     };
-    db.pruneFrecency(os.nowSeconds()) catch |err| {
+    db.pruneFrecency(start.gpa, os.nowSeconds()) catch |err| {
         // Only the table grows until the next start; Db logged SQLite's word.
         log.warn("frecency prune: {t}", .{err});
     };
@@ -212,7 +240,7 @@ fn startupCallback(gtk_app: *c.GtkApplication, data: ?*anyopaque) callconv(.c) v
     ui.build();
     ui.on_settings_changed = &settingsChangedCallback;
     Ui.ext_view.start(ui);
-    c.g_application_hold(daemon.app);
+    c.g_application_hold(daemon.app.?);
     if (c.g_getenv(ipc.env.test_mode) == null) {
         if (ui.settings.clipboard) startClipboardWatcher();
     } else {
@@ -230,33 +258,55 @@ fn startupCallback(gtk_app: *c.GtkApplication, data: ?*anyopaque) callconv(.c) v
 
 /// Where a command's answer goes: the GApplication command line that ran
 /// it, or the socket `lumen` asked through.
-const Reply = struct {
-    command_line: ?*c.GApplicationCommandLine = null,
-    stdout: ?*std.Io.Writer = null,
-    stderr: ?*std.Io.Writer = null,
-    /// What followed the arguments on the socket (a copy, --clip-store).
-    payload: ?[]const u8 = null,
+const Reply = union(enum) {
+    command_line: *c.GApplicationCommandLine,
+    socket: struct {
+        stdout: *std.Io.Writer,
+        stderr: *std.Io.Writer,
+        /// What followed the arguments on the socket (a copy, --clip-store).
+        payload: []const u8,
+    },
 
     /// False when the text could not be written (the socket's writer ran
     /// out of memory): the command then fails rather than answer nothing
     /// with success.
     fn print(reply: *const Reply, text: [:0]const u8) bool {
-        if (reply.command_line) |command_line| {
-            c.g_application_command_line_print(command_line, "%s", text.ptr);
-            return true;
+        switch (reply.*) {
+            .command_line => |command_line| {
+                c.g_application_command_line_print(command_line, "%s", text.ptr);
+                return true;
+            },
+            .socket => |socket| {
+                socket.stdout.writeAll(text) catch return false;
+                return true;
+            },
         }
-        const writer = reply.stdout orelse return true;
-        writer.writeAll(text) catch return false;
-        return true;
     }
 
     fn printErr(reply: *const Reply, text: [:0]const u8) void {
-        if (reply.command_line) |command_line| {
-            c.g_application_command_line_printerr(command_line, "%s", text.ptr);
-            return;
+        switch (reply.*) {
+            .command_line => |command_line| {
+                c.g_application_command_line_printerr(command_line, "%s", text.ptr);
+            },
+            .socket => |socket| {
+                socket.stderr.writeAll(text) catch
+                    log.warn("an error message for the client was lost", .{});
+            },
         }
-        const writer = reply.stderr orelse return;
-        writer.writeAll(text) catch log.warn("an error message for the client was lost", .{});
+    }
+
+    fn commandLine(reply: *const Reply) ?*c.GApplicationCommandLine {
+        return switch (reply.*) {
+            .command_line => |command_line| command_line,
+            .socket => null,
+        };
+    }
+
+    fn payloadBytes(reply: *const Reply) ?[]const u8 {
+        return switch (reply.*) {
+            .command_line => null,
+            .socket => |socket| socket.payload,
+        };
     }
 };
 
@@ -294,7 +344,10 @@ fn socketCallback(
     stderr: *std.Io.Writer,
 ) u8 {
     os.assertMainThread();
-    const status = run(arguments, &.{ .stdout = stdout, .stderr = stderr, .payload = payload });
+    const status = run(
+        arguments,
+        &.{ .socket = .{ .stdout = stdout, .stderr = stderr, .payload = payload } },
+    );
     return std.math.cast(u8, status) orelse 1;
 }
 
@@ -421,11 +474,11 @@ fn runNow(now: Request.Now, reply: *const Reply) c_int {
         .help => return printed(reply.print(cli.usage)),
         .version => return printed(reply.print(version_line)),
         .quit => {
-            c.g_application_quit(daemon.app);
+            if (daemon.app) |app| c.g_application_quit(app);
             return status_ok;
         },
         .clip_store => {
-            storeClip(reply.payload orelse return usage(reply));
+            storeClip(reply.payloadBytes() orelse return usage(reply));
             return status_ok;
         },
         else => {},
@@ -465,7 +518,7 @@ fn printed(ok: bool) c_int {
 fn runWindow(window: Request.Window, reply: *const Reply) c_int {
     const ui = readyUi() orelse return status_failed;
     if (window.extension_job != null or window.dmenu) {
-        const command_line = reply.command_line orelse {
+        const command_line = reply.commandLine() orelse {
             reply.printErr("lumen: --dmenu and installs go through lumen-gtk\n");
             return status_failed;
         };
@@ -487,7 +540,7 @@ fn runWindow(window: Request.Window, reply: *const Reply) c_int {
     if (window.command) |command_id| {
         if (Ui.ext_view.openTarget(ui, command_id, window.query)) return status_ok;
         if (ui.ext_registry == null and ui.ext_host != null) {
-            if (reply.command_line) |command_line| {
+            if (reply.commandLine()) |command_line| {
                 if (Ui.ext_view.deferCommand(ui, command_line, command_id, window.query)) {
                     return status_answered_later;
                 }
@@ -734,7 +787,7 @@ fn prewarmCallback(_: ?*anyopaque) callconv(.c) c.gboolean {
 
 fn testWatchdogCallback(_: ?*anyopaque) callconv(.c) c.gboolean {
     log.warn("test instance alive for {d} s: quitting", .{test_instance_lifetime_s});
-    c.g_application_quit(daemon.app);
+    if (daemon.app) |app| c.g_application_quit(app);
     return 0;
 }
 
@@ -806,6 +859,15 @@ test "requests: flags in order, values, and what is refused" {
     try std.testing.expect(parseRequest(&.{ "--view", "ext" }) == null);
     try std.testing.expect(parseRequest(&.{ "--view", "nope", "--dump" }) == null);
     try std.testing.expect(parseRequest(&.{}).?.window.mode == .toggle);
+}
+
+test "requestsHelp distinguishes help flag from option values" {
+    try std.testing.expect(requestsHelp(&.{"--help"}));
+    try std.testing.expect(requestsHelp(&.{ "--show", "--help" }));
+    try std.testing.expect(requestsHelp(&.{ "--update", "--help" }));
+    try std.testing.expect(requestsHelp(&.{ "--query", "--help", "--help" }));
+    try std.testing.expect(!requestsHelp(&.{ "--show", "--query", "--help" }));
+    try std.testing.expect(!requestsHelp(&.{ "--dmenu", "--prompt", "--help" }));
 }
 
 test {

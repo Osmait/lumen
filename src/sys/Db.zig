@@ -4,9 +4,11 @@
 //! thread (the UI uses it from the GTK main loop only).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = std.debug.assert;
 const c = @import("sqlite");
 const frecency = @import("core").frecency;
+const os = @import("os");
 
 const Db = @This();
 
@@ -61,11 +63,12 @@ pub fn openWith(path: [:0]const u8, options: OpenOptions) Error!Db {
         \\);
         \\CREATE TABLE IF NOT EXISTS clipboard (
         \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
-        \\  hash INTEGER NOT NULL UNIQUE,
+        \\  hash INTEGER NOT NULL,
         \\  content TEXT NOT NULL,
         \\  created_at INTEGER NOT NULL,
         \\  last_copied INTEGER NOT NULL,
-        \\  seq INTEGER NOT NULL DEFAULT 0
+        \\  seq INTEGER NOT NULL DEFAULT 0,
+        \\  UNIQUE(hash, content)
         \\);
     );
     try db.migrateFrecency();
@@ -90,13 +93,21 @@ fn hasColumn(db: *Db, table: [:0]const u8, column: []const u8) Error!bool {
     return false;
 }
 
-fn clipboardHasAutoincrement(db: *Db) Error!bool {
+fn clipboardSchemaSql(db: *Db, arena: std.mem.Allocator) Error!?[]const u8 {
     const stmt = try db.prepare(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'clipboard'",
     );
     defer _ = c.sqlite3_finalize(stmt);
-    if (!try db.nextRow(stmt)) return false;
-    return std.ascii.findIgnoreCase(columnText(stmt, 0), "autoincrement") != null;
+    if (!try db.nextRow(stmt)) return null;
+    return arena.dupe(u8, columnText(stmt, 0)) catch return null;
+}
+
+fn clipboardHasModernSchema(db: *Db) Error!bool {
+    var buf: [2048]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    const sql = try db.clipboardSchemaSql(fba.allocator()) orelse return false;
+    return std.ascii.findIgnoreCase(sql, "autoincrement") != null and
+        std.ascii.findIgnoreCase(sql, "unique(hash, content)") != null;
 }
 
 /// Migrates legacy `frecency(key, count, last_used)` to `score REAL`.
@@ -120,25 +131,26 @@ fn migrateFrecency(db: *Db) Error!void {
     try db.exec("COMMIT");
 }
 
-/// Migrates legacy `clipboard` tables without `AUTOINCREMENT` or `seq`,
-/// preserving existing ids, contents, and recency order.
+/// Migrates legacy `clipboard` tables without `AUTOINCREMENT`, `seq`, or
+/// `UNIQUE(hash, content)`, preserving existing ids, contents, and order.
 fn migrateClipboard(db: *Db) Error!void {
-    const has_auto = try db.clipboardHasAutoincrement();
+    const has_modern = try db.clipboardHasModernSchema();
     const has_seq = try db.hasColumn("clipboard", "seq");
-    if (has_auto and has_seq) return;
+    if (has_modern and has_seq) return;
     try db.exec("BEGIN IMMEDIATE");
     errdefer _ = c.sqlite3_exec(db.handle, "ROLLBACK", null, null, null);
-    const now_auto = try db.clipboardHasAutoincrement();
+    const now_modern = try db.clipboardHasModernSchema();
     const now_seq = try db.hasColumn("clipboard", "seq");
-    if (!now_auto or !now_seq) {
+    if (!now_modern or !now_seq) {
         try db.exec(
             \\CREATE TABLE clipboard_new (
             \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
-            \\  hash INTEGER NOT NULL UNIQUE,
+            \\  hash INTEGER NOT NULL,
             \\  content TEXT NOT NULL,
             \\  created_at INTEGER NOT NULL,
             \\  last_copied INTEGER NOT NULL,
-            \\  seq INTEGER NOT NULL DEFAULT 0
+            \\  seq INTEGER NOT NULL DEFAULT 0,
+            \\  UNIQUE(hash, content)
             \\);
         );
         if (now_seq) {
@@ -177,58 +189,27 @@ fn makePrivate(path: [:0]const u8) Error!void {
             "{s}{s}",
             .{ path, suffix },
             0,
-        ) catch continue;
+        ) catch {
+            log.warn("{s}{s}: path exceeds PATH_MAX", .{ path, suffix });
+            return error.DbOpen;
+        };
         try makeRegularFilePrivate(side_path, false);
     }
 }
 
 fn makeRegularFilePrivate(path: [:0]const u8, create: bool) Error!void {
-    const linux = std.os.linux;
-    const open_result = linux.open(
-        path,
-        .{
-            .ACCMODE = .RDONLY,
-            .CREAT = create,
-            .NOFOLLOW = true,
-            .CLOEXEC = true,
-            .NONBLOCK = true,
-            .NOCTTY = true,
-        },
-        0o600,
-    );
-    switch (linux.errno(open_result)) {
-        .SUCCESS => {},
-        // SQLite has not made -wal/-shm yet: it will, with the database's mode.
-        .NOENT => if (!create) return else {
-            log.warn("open {s}: NOENT", .{path});
-            return error.DbOpen;
-        },
-        else => |errno| {
-            log.warn("open {s}: {t}", .{ path, errno });
-            return error.DbOpen;
-        },
-    }
-    const fd: i32 = @intCast(open_result);
-    defer _ = linux.close(fd);
-    var stx: linux.Statx = undefined;
-    const stx_result = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &stx);
-    if (linux.errno(stx_result) != .SUCCESS or stx.mode & linux.S.IFMT != linux.S.IFREG) {
-        log.warn("{s}: not a regular file", .{path});
+    os.ensurePrivateFile(path, create) catch |err| {
+        log.warn("makePrivate {s}: {t}", .{ path, err });
         return error.DbOpen;
-    }
-    switch (linux.errno(linux.fchmod(fd, 0o600))) {
-        .SUCCESS => {},
-        else => |errno| {
-            log.warn("could not make {s} owner-only: {t}", .{ path, errno });
-            return error.DbOpen;
-        },
-    }
+    };
 }
 
 pub fn close(db: *Db) void {
-    // SQLITE_BUSY here means a statement was left unfinalized: a bug, not
-    // an operating error.
-    assert(c.sqlite3_close(db.handle) == c.SQLITE_OK);
+    const rc = c.sqlite3_close_v2(db.handle);
+    if (rc != c.SQLITE_OK) {
+        log.warn("close: {s}", .{c.sqlite3_errmsg(db.handle)});
+        if (builtin.is_test) assert(false);
+    }
     db.* = undefined;
 }
 
@@ -355,12 +336,12 @@ const frecency_negligible = 0.01;
 
 /// Forgets what decayed below any effect on the ranking: every file opened
 /// adds a key, and the table is read on every show.
-pub fn pruneFrecency(db: *Db, now: i64) Error!void {
+pub fn pruneFrecency(db: *Db, gpa: std.mem.Allocator, now: i64) Error!void {
     const select_stmt = try db.prepare("SELECT key, score, last_used FROM frecency");
     defer _ = c.sqlite3_finalize(select_stmt);
     const delete_stmt = try db.prepare("DELETE FROM frecency WHERE key = ?1");
     defer _ = c.sqlite3_finalize(delete_stmt);
-    var arena_state: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     var stale: std.ArrayList([]u8) = .empty;
@@ -437,7 +418,7 @@ pub fn addClip(db: *Db, content: []const u8, now: i64, keep: u32) Error!void {
     try db.execArgs(
         \\INSERT INTO clipboard (hash, content, created_at, last_copied, seq)
         \\VALUES (?1, ?2, ?3, ?3, ?4)
-        \\ON CONFLICT(hash) DO UPDATE SET content = ?2, last_copied = ?3, seq = ?4
+        \\ON CONFLICT(hash, content) DO UPDATE SET last_copied = ?3, seq = ?4
     , .{ hash, content, now, seq });
     // What is past the newest `keep`, found through the recency index
     // (last_copied DESC, seq DESC).
@@ -641,7 +622,7 @@ test "frecency forgets what decayed to nothing, keeps the rest" {
     try db.recordUse("file:/old", now - 100 * day);
     try db.recordUse("app:recent", now - 2 * day);
     for (0..50) |_| try db.recordUse("app:much-used", now - 40 * day);
-    try db.pruneFrecency(now);
+    try db.pruneFrecency(std.testing.allocator, now);
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const map = try db.loadFrecency(arena.allocator(), now);
@@ -852,4 +833,35 @@ test "legacy database migrates frecency score and clipboard autoincrement+seq" {
 test "openWith supports shorter UI busy timeout" {
     var db = try Db.openWith(in_memory, .{ .busy_timeout_ms = 50 });
     db.close();
+}
+
+test "clipboard hash collision preserves distinct entries and long sidecar path fails open" {
+    var db = try Db.open(Db.in_memory);
+    defer db.close();
+    // Same hash with distinct content creates two distinct rows instead of overwriting.
+    try db.exec(
+        \\INSERT INTO clipboard (hash, content, created_at, last_copied, seq)
+        \\VALUES (12345, 'colliding-a', 10, 10, 1)
+    );
+    try db.exec(
+        \\INSERT INTO clipboard (hash, content, created_at, last_copied, seq)
+        \\VALUES (12345, 'colliding-b', 11, 11, 2)
+        \\ON CONFLICT(hash, content) DO UPDATE SET last_copied = 11, seq = 2
+    );
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const clips = try db.recentClips(arena.allocator(), 10);
+    try std.testing.expectEqual(@as(usize, 2), clips.len);
+
+    // A path that exceeds max_path_bytes for "-wal" fails open instead of ignoring permissions.
+    var test_dir: os.TestDir = try .init();
+    defer test_dir.deinit();
+    var long_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    @memset(&long_buf, 'x');
+    const prefix = test_dir.absolute;
+    @memcpy(long_buf[0..prefix.len], prefix);
+    long_buf[prefix.len] = '/';
+    long_buf[std.Io.Dir.max_path_bytes - 2] = 0;
+    const long_path = long_buf[0 .. std.Io.Dir.max_path_bytes - 2 :0];
+    try std.testing.expectError(error.DbOpen, makePrivate(long_path));
 }

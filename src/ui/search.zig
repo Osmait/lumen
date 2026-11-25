@@ -12,6 +12,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const core = @import("core");
+const index = @import("index");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
 const hypr = @import("../sys/hypr.zig");
@@ -57,10 +58,6 @@ const suggestions_max = 6;
 /// match half the disk.
 const root_files_query_bytes_min = 3;
 
-/// A content query needs a whole trigram: the content index looks up
-/// three-character pieces.
-pub const content_query_bytes_min = 3;
-
 /// How much of a clipboard entry's text the filter scores. Each keystroke
 /// scores every entry on the main thread.
 const filtered_detail_bytes_max = 2000;
@@ -78,7 +75,7 @@ comptime {
     assert(root_results_before_files_max <= root_results_max);
     assert(root_files_max <= file_results_max);
     assert(suggestions_max <= root_results_max);
-    assert(content_query_bytes_min <= ContentSearch.query_bytes_max);
+    assert(index.content.trigram_chars <= ContentSearch.query_bytes_max);
     assert(clipboard_rows_max >= settings_mod.clipboard_keep_max);
 }
 
@@ -107,7 +104,7 @@ fn rootCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
     const sources = [_][]const Item{
         ui.apps.items,
         &commands.all,
-        scripts.load(arena),
+        scripts.load(ui.gpa, arena),
         ext_view.rootItems(ui, arena),
     };
     var item_count: usize = 0;
@@ -145,7 +142,7 @@ fn clipCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
 fn windowCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
     var out: std.ArrayList(Item) = .empty;
     for (hypr.clients(arena)) |client| {
-        if (!client.mapped or client.address.len == 0) continue;
+        if (!client.mapped or !hypr.validAddress(client.address)) continue;
         const icon: item_mod.Icon = if (ui.apps.iconForClass(client.class)) |gicon|
             .{ .gicon = gicon }
         else
@@ -174,7 +171,7 @@ pub fn answerPending(ui: *Ui, start_ns: u64) bool {
     // In the contents view, the rows on screen are the last result's.
     if (ui.view != .contents) return false;
     const content_search = ui.content_search orelse return false;
-    if (query_text.len < content_query_bytes_min) return false;
+    if (!index.content.querySearchable(query_text)) return false;
     if (!ui.content_query.showingLatest()) return false;
     const latest = ui.content_query.latest.?;
     if (isContentResultFresh(latest, query_text, contentIndexVersion(ui))) return false;
@@ -210,7 +207,7 @@ pub fn fill(ui: *Ui, arena: std.mem.Allocator, query_text: []const u8, start_ns:
                 row_list.addItem(ui, item);
             }
         },
-        .contents => if (query_text.len >= content_query_bytes_min) {
+        .contents => if (index.content.querySearchable(query_text)) {
             fillContents(ui, arena, query_text, start_ns);
         },
         .settings, .themes, .default_apps, .choose => fillSectioned(ui, arena, query_text),
@@ -373,15 +370,10 @@ fn fillFiltered(
 ) void {
     if (query_text.len == 0) {
         if (grouping == .by_day) {
-            const today_s = labels.startOfToday();
+            const bounds = labels.dayBounds();
             var last: ?[:0]const u8 = null;
             for (ui.base) |item| {
-                const section: [:0]const u8 = if (item.time_s >= today_s)
-                    "Today"
-                else if (item.time_s >= today_s - std.time.s_per_day)
-                    "Yesterday"
-                else
-                    "Earlier";
+                const section = bounds.section(item.time_s);
                 if (last == null or !std.mem.eql(u8, last.?, section)) {
                     row_list.addSection(ui, section);
                     last = section;
@@ -429,7 +421,7 @@ fn sortByScore(items: []Item) void {
 pub fn emptyText(ui: *Ui, arena: std.mem.Allocator) [:0]const u8 {
     const query_text = std.mem.trim(u8, ui.query(), " ");
     if (ui.view == .files and query_text.len == 0) return file_results.filesHint(ui, arena);
-    if (ui.view == .contents and query_text.len < content_query_bytes_min) {
+    if (ui.view == .contents and !index.content.querySearchable(query_text)) {
         return file_results.contentsHint(ui, arena, query_text.len);
     }
     if (ui.view == .contents and ui.content_query.pending) return "Searching...";

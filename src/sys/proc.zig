@@ -51,23 +51,25 @@ const output_chunk_bytes = 16 << 10;
 /// (`hyprctl -j clients` with 200 windows is ~300 KB).
 const output_bytes_max = 16 << 20;
 
-/// What `output` allocates with.
-const gpa = std.heap.c_allocator;
-
 /// Runs to completion and returns stdout, or null when it could not run,
 /// was still writing after `output_timeout_ms` or wrote more than
 /// `output_bytes_max` (then it is killed). Caller owns the
 /// result and frees it with `free`.
-pub fn output(argv: []const [:0]const u8) ?[:0]u8 {
-    return outputWithin(argv, output_timeout_ms, output_bytes_max);
+pub fn output(gpa: std.mem.Allocator, argv: []const [:0]const u8) ?[:0]u8 {
+    return outputWithin(gpa, argv, output_timeout_ms, output_bytes_max);
 }
 
 /// Like `output`, with an explicit timeout in milliseconds.
-pub fn outputTimeout(argv: []const [:0]const u8, timeout_ms: u64) ?[:0]u8 {
-    return outputWithin(argv, timeout_ms, output_bytes_max);
+pub fn outputTimeout(gpa: std.mem.Allocator, argv: []const [:0]const u8, timeout_ms: u64) ?[:0]u8 {
+    return outputWithin(gpa, argv, timeout_ms, output_bytes_max);
 }
 
-fn outputWithin(argv: []const [:0]const u8, timeout_ms: u64, bytes_max: usize) ?[:0]u8 {
+fn outputWithin(
+    gpa: std.mem.Allocator,
+    argv: []const [:0]const u8,
+    timeout_ms: u64,
+    bytes_max: usize,
+) ?[:0]u8 {
     var argv_buffer: Argv = undefined;
     const argv_z = argv_buffer.of(argv) orelse return null;
     var pid: c.GPid = 0;
@@ -126,7 +128,7 @@ fn outputWithin(argv: []const [:0]const u8, timeout_ms: u64, bytes_max: usize) ?
     return stdout.toOwnedSliceSentinel(gpa, 0) catch null;
 }
 
-pub fn free(text: [:0]u8) void {
+pub fn free(gpa: std.mem.Allocator, text: [:0]u8) void {
     gpa.free(text);
 }
 
@@ -135,7 +137,17 @@ pub fn free(text: [:0]u8) void {
 /// written from the main loop as the program reads it, so one that does not
 /// read cannot hold the window.
 pub fn pipeTo(argv: []const [:0]const u8, input: []const u8) void {
-    pipeToThen(argv, input, null);
+    var argv_buffer: Argv = undefined;
+    const argv_z = argv_buffer.of(argv) orelse return;
+    var err: ?*c.GError = null;
+    const flags = c.G_SUBPROCESS_FLAGS_STDIN_PIPE;
+    const subprocess = c.g_subprocess_newv(argv_z, flags, &err) orelse {
+        logError("pipe", argv[0], err);
+        return;
+    };
+    const bytes = c.g_bytes_new(input.ptr, input.len);
+    defer c.g_bytes_unref(bytes);
+    c.g_subprocess_communicate_async(subprocess, bytes, null, &pipeToCallback, null);
 }
 
 /// Called once a `pipeToThen` program has taken all its input and exited
@@ -145,26 +157,47 @@ pub const Then = struct {
     context: usize,
 };
 
+const ThenOwned = struct {
+    gpa: std.mem.Allocator,
+    then: Then,
+};
+
 /// `pipeTo`, then `then` once the program is done: wl-copy exits once it
 /// owns the selection, so a paste sent after it pastes this text.
-pub fn pipeToThen(argv: []const [:0]const u8, input: []const u8, then: ?Then) void {
+pub fn pipeToThen(
+    gpa: std.mem.Allocator,
+    argv: []const [:0]const u8,
+    input: []const u8,
+    then: ?Then,
+) void {
     var argv_buffer: Argv = undefined;
-    const argv_z = argv_buffer.of(argv) orelse return;
-    var err: ?*c.GError = null;
-    const flags = c.G_SUBPROCESS_FLAGS_STDIN_PIPE;
-    const subprocess = c.g_subprocess_newv(argv_z, flags, &err) orelse {
-        logError("pipe", argv[0], err);
+    const argv_z = argv_buffer.of(argv) orelse {
         if (then) |done| done.callback(done.context, false);
         return;
     };
-    const then_owned: ?*Then = if (then) |done| blk: {
-        const owned = gpa.create(Then) catch {
+    // Reserve the completion box before spawning so OOM notifies without
+    // launching a child whose outcome would otherwise be dropped or misreported.
+    const then_owned: ?*ThenOwned = if (then) |done| blk: {
+        const owned = gpa.create(ThenOwned) catch {
             done.callback(done.context, false);
-            break :blk null;
+            return;
         };
-        owned.* = done;
+        owned.* = .{ .gpa = gpa, .then = done };
         break :blk owned;
     } else null;
+    var err: ?*c.GError = null;
+    const flags = c.G_SUBPROCESS_FLAGS_STDIN_PIPE;
+    const subprocess = c.g_subprocess_newv(argv_z, flags, &err) orelse {
+        if (then_owned) |owned| {
+            const done = owned.then;
+            owned.gpa.destroy(owned);
+            logError("pipe", argv[0], err);
+            done.callback(done.context, false);
+            return;
+        }
+        logError("pipe", argv[0], err);
+        return;
+    };
     // A copy: `input` is the caller's only until this returns.
     const bytes = c.g_bytes_new(input.ptr, input.len);
     defer c.g_bytes_unref(bytes);
@@ -182,8 +215,9 @@ fn pipeToCallback(
     var err: ?*c.GError = null;
     const finished = c.g_subprocess_communicate_finish(subprocess, result, null, null, &err) != 0;
     if (!finished) warnError(.proc, err, "write to a program", .{});
-    const then: *Then = @ptrCast(@alignCast(data orelse return));
-    defer gpa.destroy(then);
+    const owned: *ThenOwned = @ptrCast(@alignCast(data orelse return));
+    const then = owned.then;
+    owned.gpa.destroy(owned);
     const ok = finished and c.g_subprocess_get_successful(subprocess) != 0;
     then.callback(then.context, ok);
 }
@@ -245,13 +279,14 @@ test "argv longer than the buffer is refused, not overflowed" {
 }
 
 test "output: what a program prints, or nothing once it takes too long" {
-    const printed = output(&.{ "sh", "-c", "echo hi" }) orelse return error.TestUnexpectedResult;
-    defer free(printed);
+    const printed = output(std.testing.allocator, &.{ "sh", "-c", "echo hi" }) orelse
+        return error.TestUnexpectedResult;
+    defer free(std.testing.allocator, printed);
     try std.testing.expectEqualStrings("hi\n", printed);
 
     const start_ns = os.monotonicNs();
     const argv = &.{ "sh", "-c", "echo partial; exec sleep 30" };
-    try std.testing.expect(outputWithin(argv, 100, output_bytes_max) == null);
+    try std.testing.expect(outputWithin(std.testing.allocator, argv, 100, output_bytes_max) == null);
     try std.testing.expect(os.monotonicNs() - start_ns < std.time.ns_per_s);
 }
 
@@ -259,7 +294,7 @@ test "output: a program that writes past the cap is stopped and dropped" {
     const start_ns = os.monotonicNs();
     // Would write forever: only the cap (or the kill after it) ends it.
     const argv = &.{ "sh", "-c", "exec yes" };
-    try std.testing.expect(outputWithin(argv, 5000, 64 << 10) == null);
+    try std.testing.expect(outputWithin(std.testing.allocator, argv, 5000, 64 << 10) == null);
     try std.testing.expect(os.monotonicNs() - start_ns < 5 * std.time.ns_per_s);
 }
 
@@ -279,7 +314,7 @@ test "pipeToThen calls back once the program has its input and exited" {
         .{ .argv = &.{ "sh", "-c", "cat >/dev/null; exit 3" }, .ok = false },
     };
     for (cases, 1..) |case, calls_expected| {
-        pipeToThen(case.argv, "hello", then);
+        pipeToThen(std.testing.allocator, case.argv, "hello", then);
         const deadline_ns = os.monotonicNs() + 5 * std.time.ns_per_s;
         while (Seen.calls < calls_expected and os.monotonicNs() < deadline_ns) {
             _ = c.g_main_context_iteration(null, 1);
@@ -287,4 +322,28 @@ test "pipeToThen calls back once the program has its input and exited" {
         try std.testing.expectEqual(calls_expected, Seen.calls);
         try std.testing.expectEqual(case.ok, Seen.ok_last);
     }
+}
+
+test "pipeToThen calls back with ok = false on invalid argv or OOM without leaking" {
+    const Seen = struct {
+        var calls: usize = 0;
+        var ok_last = true;
+        fn done(context: usize, ok: bool) void {
+            std.debug.assert(context == 99);
+            calls += 1;
+            ok_last = ok;
+        }
+    };
+    const then: Then = .{ .callback = &Seen.done, .context = 99 };
+
+    // Empty argv is refused synchronously with ok = false.
+    pipeToThen(std.testing.allocator, &.{}, "hello", then);
+    try std.testing.expectEqual(@as(usize, 1), Seen.calls);
+    try std.testing.expect(!Seen.ok_last);
+
+    // OOM allocating ThenOwned triggers callback synchronously without spawning.
+    Seen.ok_last = true;
+    pipeToThen(std.testing.failing_allocator, &.{"true"}, "hello", then);
+    try std.testing.expectEqual(@as(usize, 2), Seen.calls);
+    try std.testing.expect(!Seen.ok_last);
 }
