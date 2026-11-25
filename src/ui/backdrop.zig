@@ -90,7 +90,7 @@ pub fn isOn(ui: *Ui, piece: anytype, x: f64, y: f64) bool {
 }
 
 pub fn onWindowPressed(
-    _: *c.GtkEventController,
+    gesture: *c.GtkEventController,
     _: c_int,
     x: f64,
     y: f64,
@@ -103,7 +103,12 @@ pub fn onWindowPressed(
     if (self.panel.isOpen()) {
         if (isOn(self, gtk.widget(self.panel.box), x, y)) return;
         // Outside the action panel but on Lumen: only the panel closes.
-        if (on_pieces) return self.panel.close();
+        if (on_pieces) {
+            self.suppress_next_activate = true;
+            self.panel.close();
+            _ = c.gtk_gesture_set_state(gesture, c.GTK_EVENT_SEQUENCE_CLAIMED);
+            return;
+        }
     }
     if (!on_pieces) self.hide();
 }

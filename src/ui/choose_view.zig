@@ -518,7 +518,7 @@ pub fn openWith(ui: *Ui, id: [:0]const u8, choice: OpenWithChoice) void {
             }
         }
     }
-    if (!run.openWith(file.path, id)) return;
+    if (!run.openWith(file.path, id)) return ui.showFailure("Could not open it");
     ui.hide();
 }
 

@@ -20,7 +20,7 @@ Security issues go through [SECURITY.md](SECURITY.md) instead.
 
 ## Building
 
-You need [Zig 0.17](https://ziglang.org/download/) and the libraries listed
+You need [Zig 0.17.1](https://ziglang.org/download/) and the libraries listed
 in the [README](README.md#requirements).
 
 ```sh
@@ -30,11 +30,12 @@ zig build run -- --daemon       # run it (arguments after --)
 ```
 
 To try a build without disturbing the Lumen you use every day, give it its
-own app id and data folders:
+own app id, config and data folders:
 
 ```sh
-LUMEN_APP_ID=dev.example.LumenDev XDG_CACHE_HOME=/tmp/lumen-dev/cache \
-  XDG_DATA_HOME=/tmp/lumen-dev/data zig-out/bin/lumen --daemon
+LUMEN_APP_ID=dev.example.LumenDev XDG_CONFIG_HOME=/tmp/lumen-dev/config \
+  XDG_CACHE_HOME=/tmp/lumen-dev/cache XDG_DATA_HOME=/tmp/lumen-dev/data \
+  zig-out/bin/lumen --daemon
 LUMEN_APP_ID=dev.example.LumenDev zig-out/bin/lumen
 ```
 

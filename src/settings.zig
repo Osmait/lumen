@@ -131,6 +131,11 @@ pub const Settings = struct {
     open_with: std.array_hash_map.String([]const u8) = .empty,
     /// `key = value` lines this version does not know, kept as they were.
     unknown: std.ArrayList([]const u8) = .empty,
+    /// `[open-with]` lines this version does not know, kept as they were.
+    unknown_open_with: std.ArrayList([]const u8) = .empty,
+    /// Known top-level keys whose value in the file was not recognized by
+    /// this version, kept as they were until changed to a valid value.
+    unrecognized_known: std.StringHashMapUnmanaged([]const u8) = .empty,
     /// Sections this version does not know (`[name]` and the lines under
     /// it), kept as they were: written back after `[open-with]`.
     unknown_sections: std.ArrayList([]const u8) = .empty,
@@ -158,7 +163,11 @@ pub const Settings = struct {
         var section: enum { top, open_with, other } = .top;
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |raw_line| {
-            const line = withoutComment(std.mem.trim(u8, raw_line, " \t\r"));
+            const raw_trimmed = std.mem.trim(u8, raw_line, " \t\r");
+            if (raw_trimmed.len == 0 or raw_trimmed[0] == '#' or raw_trimmed[0] == ';') continue;
+            if (!std.unicode.utf8ValidateSlice(raw_trimmed) or
+                std.mem.findScalar(u8, raw_trimmed, 0) != null) continue;
+            const line = withoutComment(raw_trimmed);
             if (line.len == 0) continue;
             if (line[0] == '[') {
                 section = if (std.mem.eql(u8, line, open_with_section)) .open_with else .other;
@@ -166,7 +175,7 @@ pub const Settings = struct {
             // Another version's section: none of its keys are ours, but it
             // survives a save.
             if (section == .other) {
-                settings.keepLine(&settings.unknown_sections, line) catch {
+                settings.keepLine(&settings.unknown_sections, raw_trimmed) catch {
                     settings.incomplete = true;
                 };
                 continue;
@@ -177,14 +186,24 @@ pub const Settings = struct {
             const value = std.mem.trim(u8, line[equals + 1 ..], " \t");
             if (section == .open_with) {
                 settings.setOpenWith(key, value) catch |err| switch (err) {
-                    // A bad line is ignored, like a bad value anywhere else.
-                    error.BadKey, error.BadApp => {},
+                    error.BadKey => if (isToken(key) and value.len > 0) {
+                        settings.keepLine(&settings.unknown_open_with, raw_trimmed) catch {
+                            settings.incomplete = true;
+                        };
+                    },
+                    error.BadApp => {},
                     error.OutOfMemory => settings.incomplete = true,
                 };
-            } else if (!settings.set(key, value) and isToken(key)) {
-                settings.keepLine(&settings.unknown, line) catch {
-                    settings.incomplete = true;
-                };
+            } else {
+                switch (settings.setFromFile(key, value)) {
+                    .applied => {},
+                    .unrecognized_value => settings.keepUnrecognizedKnown(key, raw_trimmed),
+                    .unknown_key => if (isToken(key)) {
+                        settings.keepLine(&settings.unknown, raw_trimmed) catch {
+                            settings.incomplete = true;
+                        };
+                    },
+                }
             }
         }
         return settings;
@@ -205,6 +224,38 @@ pub const Settings = struct {
     ) std.mem.Allocator.Error!void {
         const arena = settings.allocator();
         try lines.append(arena, try arena.dupe(u8, line));
+    }
+
+    fn keepUnrecognizedKnown(settings: *Settings, key: []const u8, raw_line: []const u8) void {
+        const arena = settings.allocator();
+        const key_copy = arena.dupe(u8, key) catch {
+            settings.incomplete = true;
+            return;
+        };
+        const line_copy = arena.dupe(u8, raw_line) catch {
+            settings.incomplete = true;
+            return;
+        };
+        settings.unrecognized_known.put(arena, key_copy, line_copy) catch {
+            settings.incomplete = true;
+        };
+    }
+
+    const FileSetResult = enum { applied, unrecognized_value, unknown_key };
+
+    fn setFromFile(settings: *Settings, key: []const u8, value: []const u8) FileSetResult {
+        if (std.meta.stringToEnum(Toggle, key)) |toggle| {
+            const enabled = parseBool(value) orelse return .unrecognized_value;
+            settings.setToggle(toggle, enabled);
+            return .applied;
+        }
+        if (std.meta.stringToEnum(Choice, key)) |choice| {
+            return if (settings.setChoice(choice, value)) .applied else .unrecognized_value;
+        }
+        if (std.meta.stringToEnum(Text, key)) |text| {
+            return if (settings.setTextValue(text, value)) .applied else .unrecognized_value;
+        }
+        return .unknown_key;
     }
 
     /// Sets a top-level key from its text value. False when the key is not
@@ -230,7 +281,10 @@ pub const Settings = struct {
     pub fn setTextValue(settings: *Settings, text: Text, value: []const u8) bool {
         if (!textValid(text, value)) return false;
         switch (text) {
-            inline else => |tag| settings.setText(&@field(settings, @tagName(tag)), value),
+            inline else => |tag| {
+                settings.setText(&@field(settings, @tagName(tag)), value);
+                _ = settings.unrecognized_known.remove(@tagName(tag));
+            },
         }
         return true;
     }
@@ -265,7 +319,10 @@ pub const Settings = struct {
 
     pub fn setToggle(settings: *Settings, toggle: Toggle, enabled: bool) void {
         switch (toggle) {
-            inline else => |tag| @field(settings, @tagName(tag)) = enabled,
+            inline else => |tag| {
+                @field(settings, @tagName(tag)) = enabled;
+                _ = settings.unrecognized_known.remove(@tagName(tag));
+            },
         }
     }
 
@@ -277,6 +334,7 @@ pub const Settings = struct {
                 const Field = @FieldType(Settings, @tagName(tag));
                 @field(settings, @tagName(tag)) = std.meta.stringToEnum(Field, value) orelse
                     return false;
+                _ = settings.unrecognized_known.remove(@tagName(tag));
             },
             .opacity => {
                 const digits = std.mem.trimEnd(u8, value, "%");
@@ -284,12 +342,14 @@ pub const Settings = struct {
                 if (percent < opacity_percent_min) return false;
                 if (percent > opacity_percent_max) return false;
                 settings.opacity = percent;
+                _ = settings.unrecognized_known.remove("opacity");
             },
             .clipboard_keep => {
                 const entries = std.fmt.parseInt(u32, value, 10) catch return false;
                 if (entries < clipboard_keep_min) return false;
                 if (entries > clipboard_keep_max) return false;
                 settings.clipboard_keep = entries;
+                _ = settings.unrecognized_known.remove("clipboard_keep");
             },
             // The tag names the field, as in `get` and `setToggle`: a text
             // choice added here can never write another one's field.
@@ -299,6 +359,7 @@ pub const Settings = struct {
                     settings.incomplete = true;
                     return false;
                 };
+                _ = settings.unrecognized_known.remove(@tagName(tag));
             },
         }
         return true;
@@ -380,11 +441,24 @@ pub const Settings = struct {
         /// The value to write for `key`: the file's when init.lua sets the
         /// key, else the current one. The key is named once, so it can
         /// never write one field's value under another's name.
-        fn value(source: Source, comptime key: []const u8) @FieldType(Settings, key) {
+        fn owner(source: Source, key: []const u8) *const Settings {
             for (source.kept_keys) |kept_key| {
-                if (std.mem.eql(u8, kept_key, key)) return @field(source.file, key);
+                if (std.mem.eql(u8, kept_key, key)) return source.file;
             }
-            return @field(source.current, key);
+            return source.current;
+        }
+
+        /// Formats `key = <value>` or returns the preserved unrecognized line from the file.
+        fn line(source: Source, buf: []u8, comptime key: []const u8) []const u8 {
+            const src = source.owner(key);
+            if (src.unrecognized_known.get(key)) |raw| return raw;
+            const field_value = @field(src, key);
+            return switch (@typeInfo(@TypeOf(field_value))) {
+                .@"enum" => std.fmt.bufPrint(buf, "{s} = {t}", .{ key, field_value }) catch unreachable,
+                .int => std.fmt.bufPrint(buf, "{s} = {d}", .{ key, field_value }) catch unreachable,
+                .bool => std.fmt.bufPrint(buf, "{s} = {}", .{ key, field_value }) catch unreachable,
+                else => std.fmt.bufPrint(buf, "{s} = {s}", .{ key, field_value }) catch unreachable,
+            };
         }
     };
 
@@ -405,58 +479,73 @@ pub const Settings = struct {
 
     /// The keys this version knows, with comments that say what each takes.
     fn writeKnown(writer: *std.Io.Writer, source: Source) std.Io.Writer.Error!void {
+        var b0: [256]u8 = undefined;
+        var b1: [256]u8 = undefined;
+        var b2: [128]u8 = undefined;
+        var b3: [128]u8 = undefined;
+        var b4: [128]u8 = undefined;
+        var b5: [128]u8 = undefined;
+        var b6: [128]u8 = undefined;
+        var b7: [128]u8 = undefined;
+        var b8: [256]u8 = undefined;
+        var b9: [128]u8 = undefined;
+        var b10: [128]u8 = undefined;
+        var b11: [128]u8 = undefined;
+        var b12: [128]u8 = undefined;
+        var b13: [256]u8 = undefined;
+        var b14: [256]u8 = undefined;
         try writer.print(
             \\# Lumen settings. Change them from Lumen (search "Settings") or here:
             \\# Lumen reads this file again when its window opens.
             \\
             \\# Appearance. Themes and styles: search "Change Theme" in Lumen.
-            \\style = {s}
-            \\theme = {s}
+            \\{s}
+            \\{s}
             \\# small, default, large
-            \\text_size = {t}
+            \\{s}
             \\# Window background opacity, percent ({d}-{d})
-            \\opacity = {d}
+            \\{s}
             \\# upper_third, center
-            \\position = {t}
+            \\{s}
             \\# Window size: narrow, default, wide; short, default, tall
-            \\width = {t}
-            \\height = {t}
+            \\{s}
+            \\{s}
             \\# Rows and icons: compact, default, comfortable
-            \\density = {t}
+            \\{s}
             \\# An icon theme for Lumen only (a folder in /usr/share/icons); empty
             \\# follows the desktop
-            \\icon_theme = {s}
+            \\{s}
             \\
             \\# Search
-            \\files_in_root = {}
-            \\suggestions = {}
+            \\{s}
+            \\{s}
             \\
             \\# Clipboard history, and how many entries it keeps
-            \\clipboard = {}
-            \\clipboard_keep = {d}
+            \\{s}
+            \\{s}
             \\
             \\# Commands; empty is automatic ($TERMINAL, $VISUAL/$EDITOR)
-            \\terminal = {s}
-            \\editor = {s}
+            \\{s}
+            \\{s}
             \\
         , .{
-            source.value("style"),
-            source.value("theme"),
-            source.value("text_size"),
+            source.line(&b0, "style"),
+            source.line(&b1, "theme"),
+            source.line(&b2, "text_size"),
             opacity_percent_min,
             opacity_percent_max,
-            source.value("opacity"),
-            source.value("position"),
-            source.value("width"),
-            source.value("height"),
-            source.value("density"),
-            source.value("icon_theme"),
-            source.value("files_in_root"),
-            source.value("suggestions"),
-            source.value("clipboard"),
-            source.value("clipboard_keep"),
-            source.value("terminal"),
-            source.value("editor"),
+            source.line(&b3, "opacity"),
+            source.line(&b4, "position"),
+            source.line(&b5, "width"),
+            source.line(&b6, "height"),
+            source.line(&b7, "density"),
+            source.line(&b8, "icon_theme"),
+            source.line(&b9, "files_in_root"),
+            source.line(&b10, "suggestions"),
+            source.line(&b11, "clipboard"),
+            source.line(&b12, "clipboard_keep"),
+            source.line(&b13, "terminal"),
+            source.line(&b14, "editor"),
         });
     }
 
@@ -490,6 +579,7 @@ pub const Settings = struct {
         while (iterator.next()) |entry| {
             try writer.print("{s} = {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
         }
+        for (settings.unknown_open_with.items) |line| try writer.print("{s}\n", .{line});
     }
 
     /// Reads `path`; a missing or unreadable file gives the defaults. When the
@@ -865,4 +955,34 @@ test "check tells unknown keys from bad values" {
     try testing.expectEqual(Settings.Check.bad_value, Settings.check("opacity", "10"));
     try testing.expectEqual(Settings.Check.bad_value, Settings.check("clipboard", "maybe"));
     try testing.expectEqual(Settings.Check.unknown_key, Settings.check("colour", "red"));
+}
+
+test "round-trip preserves unrecognized values, # values, and unknown [open-with] keys" {
+    var settings = Settings.parse(testing.allocator,
+        \\accent = #88c0d0
+        \\width = huge
+        \\[open-with]
+        \\pdf = org.gnome.Evince.desktop
+        \\ebook = foliate.desktop
+        \\.verylongextension = editor.desktop
+    );
+    defer settings.deinit();
+    // In memory, width falls back to default; accent is preserved without cutting at ' #'.
+    try testing.expectEqual(Width.default, settings.width);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try settings.write(&out.writer);
+    const written = out.written();
+    try testing.expect(std.mem.find(u8, written, "accent = #88c0d0\n") != null);
+    try testing.expect(std.mem.find(u8, written, "width = huge\n") != null);
+    try testing.expect(std.mem.find(u8, written, "ebook = foliate.desktop\n") != null);
+    try testing.expect(std.mem.find(u8, written, ".verylongextension = editor.desktop\n") != null);
+
+    // Modifying width with a valid value replaces the preserved line.
+    try testing.expect(settings.setChoice(.width, "wide"));
+    out.clearRetainingCapacity();
+    try settings.write(&out.writer);
+    try testing.expect(std.mem.find(u8, out.written(), "width = wide\n") != null);
+    try testing.expect(std.mem.find(u8, out.written(), "width = huge") == null);
+    try testing.expect(std.mem.find(u8, out.written(), "accent = #88c0d0\n") != null);
 }

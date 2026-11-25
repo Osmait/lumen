@@ -278,6 +278,7 @@ pub fn finish(ui: *Ui, choice: ?[]const u8) void {
 pub fn choose(ui: *Ui, index: u32) void {
     const session = ui.picker orelse return;
     if (index >= session.lines.items.len) return;
+    if (!session.lines.items[index].selectable) return;
     finish(ui, session.lines.items[index].text);
     ui.hide();
 }
@@ -360,4 +361,39 @@ fn itemOf(arena: std.mem.Allocator, line: Line, line_index: u32) Item {
         .keywords = line.meta,
         .action = .{ .pick = .{ .index = line_index, .selectable = line.selectable } },
     };
+}
+
+test "addLine parses rofi options and marks nonselectable rows" {
+    var session: Session = .{
+        .gpa = std.testing.allocator,
+        .caller = undefined,
+        .stream = null,
+        .cancellable = undefined,
+        .arena = .init(std.testing.allocator),
+        .prompt = "",
+        .ui = undefined,
+    };
+    defer session.arena.deinit();
+
+    addLine(&session, "Section\x00nonselectable\x1ftrue");
+    addLine(&session, "First\x00icon\x1ffolder\x1fmeta\x1fwork docs\r");
+    addLine(&session, "Emoji\x00icon\x1f🚀");
+    addLine(&session, "Invalid\xffline");
+
+    try std.testing.expectEqual(@as(usize, 3), session.lines.items.len);
+    const header = session.lines.items[0];
+    try std.testing.expectEqualStrings("Section", header.text);
+    try std.testing.expect(!header.selectable);
+    try std.testing.expect(!row_list.isSelectable(itemOf(session.arena.allocator(), header, 0)));
+
+    const first = session.lines.items[1];
+    try std.testing.expectEqualStrings("First", first.text);
+    try std.testing.expect(first.selectable);
+    try std.testing.expectEqualStrings("work docs", first.meta);
+    try std.testing.expectEqualStrings("folder", first.icon.named);
+    try std.testing.expect(row_list.isSelectable(itemOf(session.arena.allocator(), first, 1)));
+
+    const emoji = session.lines.items[2];
+    try std.testing.expectEqualStrings("Emoji", emoji.text);
+    try std.testing.expectEqualStrings("🚀", emoji.icon.emoji);
 }

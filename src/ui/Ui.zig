@@ -205,6 +205,8 @@ ext_act_generation: ExtHost.RequestGeneration = .none,
 pending_commands: std.ArrayList(ext_view.PendingCommand) = .empty,
 /// Suppresses key-repeat Backspace navigating back immediately after clearing input.
 backspace_blocked: bool = false,
+/// Consumes one stray row/grid activation triggered by the click that closed the action panel.
+suppress_next_activate: bool = false,
 /// The extension whose preferences the prefs view lists.
 prefs_ext: core.FixedStr(extension_id_bytes_max) = .{},
 /// What the input view edits: a preference (index in the registry) or a
@@ -252,9 +254,22 @@ const Navigation = struct {
     count: usize = 0,
 
     const capacity = 8;
-    const Entry = struct { view: View, key: ItemKey };
+    const Entry = struct {
+        view: View,
+        key: ItemKey,
+        query: core.FixedStr(ext_query_bytes_max) = .{},
+        ext_command: ExtHost.CommandIndex = .from(0),
+        form_command: ExtHost.CommandIndex = .from(0),
+    };
 
-    fn push(navigation: *Navigation, view: View, selected_key: []const u8) void {
+    fn push(
+        navigation: *Navigation,
+        view: View,
+        selected_key: []const u8,
+        query_text: []const u8,
+        ext_command: ExtHost.CommandIndex,
+        form_command: ExtHost.CommandIndex,
+    ) void {
         assert(navigation.count <= capacity);
         if (navigation.count == capacity) {
             std.mem.copyForwards(
@@ -265,8 +280,15 @@ const Navigation = struct {
             navigation.count -= 1;
         }
         const entry = &navigation.entries[navigation.count];
-        entry.* = .{ .view = view, .key = .{} };
+        entry.* = .{
+            .view = view,
+            .key = .{},
+            .query = .{},
+            .ext_command = ext_command,
+            .form_command = form_command,
+        };
         entry.key.set(selected_key);
+        entry.query.set(query_text);
         navigation.count += 1;
         assert(navigation.count <= capacity);
     }
@@ -489,6 +511,7 @@ pub fn hide(self: *Ui) void {
     self.confirm_key = "";
     self.ext_act_generation = .none;
     self.backspace_blocked = false;
+    self.suppress_next_activate = false;
     gtk.setVisible(self.window, false);
     backdrop.hideBackdrops(self);
 }
@@ -498,15 +521,17 @@ pub fn hide(self: *Ui) void {
 /// Opens `view`, remembering where to go back to.
 pub fn navigate(self: *Ui, view: View) void {
     const selected_key = if (self.selectedItem()) |item| item.key else "";
-    self.navigation.push(self.view, selected_key);
+    self.navigation.push(self.view, selected_key, self.query(), self.ext_command, self.form_command);
     self.setView(view);
 }
 
-/// Back to the previous view, on the row it was left from.
+/// Back to the previous view, on the row and query it was left from.
 pub fn goBack(self: *Ui) void {
     const entry = self.navigation.pop() orelse return self.setView(.root);
+    self.ext_command = entry.ext_command;
+    self.form_command = entry.form_command;
     self.reselect = entry.key;
-    self.setView(entry.view);
+    self.setViewWithQuery(entry.view, entry.query.slice());
 }
 
 /// The view's rows again, query and place kept (a setting changed).
@@ -520,6 +545,12 @@ pub fn rebuild(self: *Ui) void {
 }
 
 pub fn setView(self: *Ui, view: View) void {
+    self.setViewWithQuery(view, "");
+}
+
+/// Switches to `view` with `initial_query` in the search bar without
+/// triggering an extra intermediate refresh that would drop `reselect`.
+pub fn setViewWithQuery(self: *Ui, view: View, initial_query: [:0]const u8) void {
     assert(self.built);
     const leaving_themes = self.view == .themes and view != .themes;
     // Leaving the dmenu view answers the waiting `lumen --dmenu` with
@@ -536,6 +567,7 @@ pub fn setView(self: *Ui, view: View) void {
     self.confirm_key = "";
     self.ext_act_generation = .none;
     self.backspace_blocked = false;
+    self.suppress_next_activate = false;
     _ = self.data_arena.reset(arena_keep);
     if (view == .ext) ext_view.enter(self);
     // A password preference hides what is typed.
@@ -545,13 +577,13 @@ pub fn setView(self: *Ui, view: View) void {
     self.base = search.loadBase(self, self.data_arena.allocator());
     self.updateViewChrome();
 
-    // Clearing the text emits `changed`, which refreshes; an entry that is
-    // already empty emits nothing, so it is refreshed here.
-    const entry_empty = c.gtk_editable_get_text(gtk.editable(self.search_bar.entry))[0] == 0;
-    if (entry_empty) {
+    // Changing the text emits `changed`, which refreshes; if the entry already
+    // holds `initial_query`, refresh directly.
+    const current = std.mem.span(c.gtk_editable_get_text(gtk.editable(self.search_bar.entry)));
+    if (std.mem.eql(u8, current, initial_query)) {
         self.refresh();
     } else {
-        c.gtk_editable_set_text(gtk.editable(self.search_bar.entry), "");
+        c.gtk_editable_set_text(gtk.editable(self.search_bar.entry), initial_query.ptr);
     }
     // The rows are this base's now: nothing points into replaced app lists.
     self.apps.dropStale();
@@ -738,13 +770,14 @@ pub fn showRunning(self: *Ui) void {
 /// Runs `operation` on the selected row.
 pub fn perform(self: *Ui, operation: item_mod.Operation) void {
     const item = self.selectedItem() orelse return;
+    if (item.action == .pick and !item.action.pick.selectable) return;
     const primary = operation == .run or operation == .open;
     if (item.confirm and primary and self.needsConfirm(item)) return;
     if (operation == .clip_clear and self.needsConfirmClearClips()) return;
     self.panel.close();
     // Ranking only, and Db logs its own failures: the action goes ahead
     // whether or not the use was recorded.
-    if (primary and item.key.len > 0 and item.action != .setting) {
+    if (primary and item.key.len > 0 and item.action != .setting and item.action != .pick) {
         self.db.recordUse(item.key, os.nowSeconds()) catch {};
     }
     if (primary and item.action == .ext_command) {
@@ -777,7 +810,10 @@ pub fn perform(self: *Ui, operation: item_mod.Operation) void {
     switch (outcome) {
         .hide => self.hide(),
         .stay => {},
-        .refresh_view => self.setView(self.view),
+        .refresh_view => {
+            self.keepSelection();
+            self.rebuild();
+        },
         .open_view => |view| self.navigate(view),
         .setting => |setting_action| {
             settings_view.performSetting(self, setting_action.setting, setting_action.operation);
@@ -859,19 +895,33 @@ test "Navigation forgets the oldest view when it is full" {
     };
     for (views, 0..) |view, i| {
         var key_buffer: [8]u8 = undefined;
-        navigation.push(view, try std.fmt.bufPrint(&key_buffer, "row{d}", .{i}));
+        var query_buffer: [16]u8 = undefined;
+        navigation.push(
+            view,
+            try std.fmt.bufPrint(&key_buffer, "row{d}", .{i}),
+            try std.fmt.bufPrint(&query_buffer, "q{d}", .{i}),
+            .from(i),
+            .from(i + 1),
+        );
     }
     try std.testing.expectEqual(Navigation.capacity, navigation.count);
-    // The last `capacity` views come back newest first.
+    // The last `capacity` views come back newest first with query and commands intact.
     var expected = views.len;
     while (navigation.pop()) |entry| {
         expected -= 1;
         try std.testing.expectEqual(views[expected], entry.view);
         var key_buffer: [8]u8 = undefined;
+        var query_buffer: [16]u8 = undefined;
         try std.testing.expectEqualStrings(
             try std.fmt.bufPrint(&key_buffer, "row{d}", .{expected}),
             entry.key.slice(),
         );
+        try std.testing.expectEqualStrings(
+            try std.fmt.bufPrint(&query_buffer, "q{d}", .{expected}),
+            entry.query.slice(),
+        );
+        try std.testing.expectEqual(ExtHost.CommandIndex.from(expected), entry.ext_command);
+        try std.testing.expectEqual(ExtHost.CommandIndex.from(expected + 1), entry.form_command);
     }
     try std.testing.expectEqual(views.len - Navigation.capacity, expected);
 }

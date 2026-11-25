@@ -25,12 +25,21 @@ die() {
 }
 has() { command -v "$1" >/dev/null 2>&1; }
 
+canonical_dir() {
+    if [ -d "$dir" ]; then
+        dir=$(cd "$dir" && pwd -P)
+    fi
+}
+
 # The daemon running from `dir`, if any: another installation's is left alone.
 # One whose file was replaced since it started reads "... (deleted)".
 our_daemon() {
+    target="$dir/lumen-gtk"
+    target_f=$(readlink -f "$target" 2>/dev/null || printf '%s' "$target")
     for pid in $(pgrep -x lumen-gtk 2>/dev/null || true); do
-        case $(readlink "/proc/$pid/exe" 2>/dev/null) in
-            "$dir/lumen-gtk" | "$dir/lumen-gtk (deleted)")
+        exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+        case "$exe" in
+            "$target" | "$target (deleted)" | "$target_f" | "$target_f (deleted)")
                 say "$pid"
                 return
                 ;;
@@ -51,6 +60,7 @@ stop_daemon() {
 }
 
 if [ "${1:-}" = "--uninstall" ]; then
+    canonical_dir
     stop_daemon || true
     rm -f "$dir/lumen" "$dir/lumen-gtk"
     say "Removed lumen and lumen-gtk from $dir."
@@ -115,6 +125,7 @@ for prog in lumen lumen-gtk; do
 done
 
 mkdir -p "$dir"
+canonical_dir
 # Stage both binaries inside $dir before touching the running installation.
 for prog in lumen lumen-gtk; do
     cp "$tmp/$name/$prog" "$dir/.$prog.new.$$"

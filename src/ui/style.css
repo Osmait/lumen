@@ -177,6 +177,13 @@ window.lumen {
 .results > row:selected .hint {
   color: var(--on-accent);
 }
+.results > row:selected .hint.warn {
+  color: var(--on-accent);
+  background-color: alpha(var(--on-accent), 0.16);
+  border-radius: 8px;
+  padding: 2px 8px;
+  font-weight: 700;
+}
 .results > row:selected .title {
   font-weight: 600;
 }

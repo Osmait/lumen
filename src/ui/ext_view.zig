@@ -330,25 +330,30 @@ fn rootAnswer(
 const root_query_bytes_min = 2;
 
 /// Extension rows for the root search `query`: shown when they answer it,
-/// asked for otherwise (they arrive with rootCallback).
-pub fn addRootSections(ui: *Ui, query_typed: []const u8) void {
+/// asked for otherwise (they arrive with rootCallback). Returns true when any
+/// section header was emitted.
+pub fn addRootSections(ui: *Ui, query_typed: []const u8) bool {
     // As the answer carries it: longer, it never matched and was asked again.
     const query = Host.clipQuery(query_typed);
-    const registry = ui.ext_registry orelse return;
-    const host = ui.ext_host orelse return;
+    const registry = ui.ext_registry orelse return false;
+    const host = ui.ext_host orelse return false;
     var any = false;
     for (registry.commands) |command_entry| any = any or command_entry.answers_root_search;
-    if (!any or query.len < root_query_bytes_min) return;
+    if (!any or query.len < root_query_bytes_min) return false;
     if (ui.ext_root_search.latest) |answer| if (std.mem.eql(u8, answer.query, query)) {
+        var emitted = false;
         for (answer.sections) |section| {
             const section_command = registry.command(section.command) orelse continue;
             row_list.addSection(ui, section_command.title);
             for (section.items) |item| row_list.addItem(ui, item);
+            emitted = true;
         }
-        return;
+        return emitted;
     };
-    if (ui.ext_root_search.asking(query)) return;
-    ui.ext_root_search.sent(host.root(registry.generation, query), query);
+    if (!ui.ext_root_search.asking(query)) {
+        ui.ext_root_search.sent(host.root(registry.generation, query), query);
+    }
+    return false;
 }
 
 fn listCallback(answer: *Host.ListResult, context: ?*anyopaque) void {
@@ -394,6 +399,9 @@ fn actCallback(answer: *Host.ActResult, context: ?*anyopaque) void {
         } else if (ui.view == .form) {
             // A form "refreshes" by starting over, ready for the next one.
             form_view.reset(ui);
+            ui.rebuild();
+        } else {
+            ui.keepSelection();
             ui.rebuild();
         },
     }
@@ -441,6 +449,13 @@ fn remap(ui: *Ui, old: *const Host.Registry, new: *const Host.Registry) bool {
             ui.choosing = .{ .field = .gone };
         },
         else => {},
+    }
+    for (ui.navigation.entries[0..ui.navigation.count]) |*entry| {
+        if (entry.view == .ext) {
+            entry.ext_command = sameCommand(old, new, entry.ext_command) orelse .gone;
+        } else if (entry.view == .form) {
+            entry.form_command = sameCommand(old, new, entry.form_command) orelse .gone;
+        }
     }
     return switch (ui.view) {
         .ext => ui.ext_command == .gone,
@@ -692,10 +707,16 @@ pub fn perform(ui: *Ui, action_index: u8) void {
             ui.showRunning();
             return;
         },
-        .open => |target| open(ui, target),
+        .open => |target| if (!open(ui, target)) {
+            ui.showFailure("Could not open it");
+            return;
+        },
         .copy => |text| run.copy(text),
         .paste => |text| run.pasteText(ui.gpa, text),
-        .exec => |argv| proc.spawn(argv),
+        .exec => |argv| if (!proc.spawn(argv)) {
+            ui.showFailure("Could not run the command");
+            return;
+        },
     }
     ui.hide();
 }
@@ -707,18 +728,19 @@ const mailto_scheme = "mailto:";
 const home_prefix = "~/";
 
 /// A URL in the default app; a path ("~/" allowed) the way Lumen opens
-/// files, Default Apps included.
-fn open(ui: *Ui, target: [:0]const u8) void {
+/// files, Default Apps included. False when launching or finding the target fails.
+fn open(ui: *Ui, target: [:0]const u8) bool {
     const is_url = std.mem.find(u8, target, url_scheme_separator) != null or
         std.mem.startsWith(u8, target, mailto_scheme);
     if (is_url) {
-        const launch_context = proc.launchContext() orelse return;
+        const launch_context = proc.launchContext() orelse return false;
         defer c.g_object_unref(launch_context);
         var err: ?*c.GError = null;
         if (c.g_app_info_launch_default_for_uri(target.ptr, launch_context, &err) == 0) {
             proc.warnError(.ext, err, "open {s}", .{target});
+            return false;
         }
-        return;
+        return true;
     }
     var path_bytes: [4096]u8 = undefined;
     const path = if (std.mem.startsWith(u8, target, home_prefix))
@@ -727,14 +749,14 @@ fn open(ui: *Ui, target: [:0]const u8) void {
             "{s}/{s}",
             .{ std.mem.span(c.g_get_home_dir()), target[home_prefix.len..] },
             0,
-        ) catch return
+        ) catch return false
     else
         target;
     const info = os.info(path) orelse {
         log.warn("open {s}: no such file", .{path});
-        return;
+        return false;
     };
-    run.openFile(ui.actionContext(), path, if (info.is_dir) .folder else .file);
+    return run.openFile(ui.actionContext(), path, if (info.is_dir) .folder else .file);
 }
 
 // --------------------------------------------------------------- keymaps

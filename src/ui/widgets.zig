@@ -329,6 +329,10 @@ pub fn itemRow(look: *const RowLook, item: Item, parts: *RowParts) *c.GtkListBox
         },
     };
     c.gtk_list_box_row_set_child(row, gtk.widget(box));
+    if (item.action == .pick and !item.action.pick.selectable) {
+        c.gtk_list_box_row_set_selectable(row, 0);
+        c.gtk_list_box_row_set_activatable(row, 0);
+    }
     return row;
 }
 
@@ -479,6 +483,10 @@ pub fn calcRow(item: Item) *c.GtkListBoxRow {
     gtk.append(box, arrow);
     gtk.append(box, calcSide(answer_bytes[0..answer.len :0], right_tag));
     c.gtk_list_box_row_set_child(row, gtk.widget(box));
+    if (item.action == .pick and !item.action.pick.selectable) {
+        c.gtk_list_box_row_set_selectable(row, 0);
+        c.gtk_list_box_row_set_activatable(row, 0);
+    }
     return row;
 }
 

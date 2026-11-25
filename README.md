@@ -35,7 +35,7 @@ your machine.
 | **Styles** | whole looks switched live: Raycast, Spotlight, Alfred, rofi-like, Omarchy (with its 23 palettes), and your own in `~/.config/lumen/styles` |
 | **Default apps** | choose which app opens each kind of file, or a single file with Open With |
 
-Search ignores case and accents everywhere: `accion` finds *acción*.
+Search ignores case and accents on Latin letters everywhere: `accion` finds *acción*.
 
 | | |
 |---|---|
@@ -93,7 +93,7 @@ daemon's: after an update it says when that one is still the old one.
 
 ### From source
 
-With [Zig 0.17](https://ziglang.org/download/) and the development packages
+With [Zig 0.17.1](https://ziglang.org/download/) and the development packages
 of GTK 4 and gtk4-layer-shell (`gtk4`, `gtk4-layer-shell` on Arch; `-devel`
 on Fedora, `libgtk-4-dev libgtk4-layer-shell-dev` on Debian and Ubuntu):
 
@@ -200,8 +200,8 @@ pkill waybar; waybar &
 
 `mode` is `silent` to just run it; any other mode (`compact`, `fullOutput`,
 `inline`) shows the last lines of its output as a notification. Script commands written for other
-launchers with `@raycast.*` keys work unchanged. See
-[`examples/scripts`](examples/scripts).
+launchers with `@raycast.*` keys work unchanged, except interactive `@raycast.argument*`
+prompts are not supported. See [`examples/scripts`](examples/scripts).
 
 ## Extensions
 

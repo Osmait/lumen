@@ -132,7 +132,7 @@ pub fn shutdown() void {
             job.timer = 0;
         }
         c.g_cancellable_cancel(job.cancellable);
-        c.g_subprocess_force_exit(job.subprocess);
+        killJobGroup(job.subprocess);
         if (job.caller) |command_line| {
             c.g_application_command_line_set_exit_status(command_line, 1);
             c.g_object_unref(command_line);
@@ -141,7 +141,7 @@ pub fn shutdown() void {
     }
     for (active_removals.items) |removal| {
         c.g_cancellable_cancel(removal.cancellable);
-        if (removal.subprocess) |sub| c.g_subprocess_force_exit(sub);
+        if (removal.subprocess) |sub| killJobGroup(sub);
     }
     for (busy.items) |held| std.heap.c_allocator.free(held);
     busy.deinit(std.heap.c_allocator);
@@ -274,21 +274,86 @@ fn fail(
     comptime fmt: []const u8,
     args: anytype,
 ) void {
+    failImpl(ui, caller, false, fmt, args);
+}
+
+/// Like `fail`, keeping the message across a reload that is already in flight.
+fn failAndReload(
+    ui: *Ui,
+    caller: ?*c.GApplicationCommandLine,
+    comptime fmt: []const u8,
+    args: anytype,
+) void {
+    failImpl(ui, caller, true, fmt, args);
+}
+
+fn failImpl(
+    ui: *Ui,
+    caller: ?*c.GApplicationCommandLine,
+    pending_reload: bool,
+    comptime fmt: []const u8,
+    args: anytype,
+) void {
     var message_bytes: [failure_bytes_max]u8 = undefined;
     const message = format(&message_bytes, fmt, args);
-    const command_line = caller orelse return note(ui, message);
+    const command_line = caller orelse return note(ui, message, pending_reload);
     c.g_application_command_line_printerr(command_line, "lumen: %s\n", message.ptr);
     c.g_application_command_line_set_exit_status(command_line, 1);
 }
 
-/// The first line of `message` on the selected row (Settings has no
-/// caller), now and again once the extensions have reloaded.
-fn note(ui: *Ui, message: []const u8) void {
-    const line_end = std.mem.findScalar(u8, message, '\n') orelse message.len;
-    const line = std.mem.trim(u8, message[0..line_end], " ");
+/// Returns the last non-empty trimmed line of `message` so multi-line git
+/// failure notices surface the actual error instead of the header prefix.
+fn lastUsefulLine(message: []const u8) []const u8 {
+    var it = std.mem.splitBackwardsScalar(u8, message, '\n');
+    while (it.next()) |raw_line| {
+        const trimmed = std.mem.trim(u8, raw_line, " \t\r");
+        if (trimmed.len > 0) return trimmed;
+    }
+    return std.mem.trim(u8, message, " \t\r");
+}
+
+/// Shows `message` on the selected row (Settings has no caller); keeps it in
+/// `ui.after_reload` only when `pending_reload` is true.
+fn note(ui: *Ui, message: []const u8, pending_reload: bool) void {
+    const line = lastUsefulLine(message);
     ui.after_reload.set(line);
-    ui.after_reload_pending = true;
+    ui.after_reload_pending = pending_reload;
     ui.showFailure(ui.after_reload.slice());
+}
+
+fn validInstallName(name: []const u8) bool {
+    if (!Host.validId(name)) return false;
+    if (name[0] == '-') return false;
+    for (name) |ch| {
+        if (std.ascii.isAlphanumeric(ch)) return true;
+    }
+    return false;
+}
+
+fn isRelativeLocalPath(url: []const u8) bool {
+    if (url.len == 0 or url[0] == '/' or url[0] == '~') return false;
+    if (std.mem.find(u8, url, "://") != null) return false;
+    const colon = std.mem.findScalar(u8, url, ':');
+    const slash = std.mem.findScalar(u8, url, '/');
+    if (colon) |c_pos| {
+        if (slash == null or c_pos < slash.?) return false;
+    }
+    return true;
+}
+
+fn resolveLocalUrl(out: *[url_bytes_max]u8, url: []const u8, cwd: ?[]const u8) ?[]const u8 {
+    if (!isRelativeLocalPath(url)) return url;
+    const base = cwd orelse return url;
+    if (base.len == 0) return url;
+    const clean_rel = if (std.mem.eql(u8, url, "."))
+        ""
+    else if (std.mem.startsWith(u8, url, "./"))
+        url[2..]
+    else
+        url;
+    if (clean_rel.len == 0) return std.fmt.bufPrint(out, "{s}", .{base}) catch null;
+    const clean_base = std.mem.trimEnd(u8, base, "/");
+    return std.fmt.bufPrint(out, "{s}/{s}", .{ clean_base, clean_rel }) catch null;
 }
 
 pub fn install(
@@ -297,9 +362,17 @@ pub fn install(
     url: []const u8,
     name_given: ?[]const u8,
 ) void {
+    var resolved_buf: [url_bytes_max]u8 = undefined;
+    const cwd: ?[]const u8 = if (caller) |command_line|
+        (if (c.g_application_command_line_get_cwd(command_line)) |ptr| std.mem.span(ptr) else null)
+    else
+        null;
+    const effective_url = resolveLocalUrl(&resolved_buf, url, cwd) orelse {
+        return fail(ui, caller, "URL too long", .{});
+    };
     var name_bytes: [extension_name_bytes_max]u8 = undefined;
-    const name = name_given orelse nameFromUrl(&name_bytes, url);
-    if (!Host.validId(name)) {
+    const name = name_given orelse nameFromUrl(&name_bytes, effective_url);
+    if (!validInstallName(name)) {
         return fail(
             ui,
             caller,
@@ -330,7 +403,7 @@ pub fn install(
         return fail(ui, caller, "Could not make {s}: {t}", .{ parent, err });
     };
     var url_buffer: [url_bytes_max]u8 = undefined;
-    const url_z = std.mem.printSentinel(&url_buffer, "{s}", .{url}, 0) catch {
+    const url_z = std.mem.printSentinel(&url_buffer, "{s}", .{effective_url}, 0) catch {
         return fail(ui, caller, "URL too long", .{});
     };
     var installing_bytes: [path_bytes_max]u8 = undefined;
@@ -402,7 +475,10 @@ const update_one_script =
     \\git -C "$1" -c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always -c "protocol.file.allow=$file_allow" -c submodule.recurse=false pull --ff-only || exit 1
     \\after=$(git -C "$1" rev-parse HEAD 2>/dev/null || true)
     \\if [ -n "$before" ] && [ -n "$after" ] && [ "$before" != "$after" ]; then
+    \\  echo "lumen: updated"
     \\  git -C "$1" log --oneline --no-decorate -n 20 "$before..$after" 2>/dev/null || true
+    \\else
+    \\  echo "lumen: up to date"
     \\fi
 ;
 
@@ -644,6 +720,19 @@ pub fn uninstall(ui: *Ui, caller: ?*c.GApplicationCommandLine, name: []const u8)
     start(ui, caller, .uninstall, name, folder, folder, &argv);
 }
 
+fn childSetSid(_: ?*anyopaque) callconv(.c) void {
+    _ = std.os.linux.setsid();
+}
+
+fn killJobGroup(subprocess: *c.GSubprocess) void {
+    if (c.g_subprocess_get_identifier(subprocess)) |ident| {
+        if (std.fmt.parseInt(i32, std.mem.span(ident), 10)) |pid| {
+            if (pid > 0) _ = std.os.linux.kill(-pid, .KILL);
+        } else |_| {}
+    }
+    c.g_subprocess_force_exit(subprocess);
+}
+
 fn start(
     ui: *Ui,
     caller: ?*c.GApplicationCommandLine,
@@ -660,10 +749,12 @@ fn start(
     const flags = c.G_SUBPROCESS_FLAGS_STDOUT_PIPE | c.G_SUBPROCESS_FLAGS_STDERR_MERGE;
     const launcher = c.g_subprocess_launcher_new(flags);
     defer c.g_object_unref(launcher);
-    // Nobody can answer a prompt: git asked for credentials or a host key
-    // on the terminal the daemon was started from, and waited for ever.
+    // Nobody can answer a prompt, keep git messages in English, and isolate
+    // the child in its own session/process group so timeouts kill grandchildren too.
     c.g_subprocess_launcher_setenv(launcher, "GIT_TERMINAL_PROMPT", "0", 1);
     c.g_subprocess_launcher_setenv(launcher, "GIT_SSH_COMMAND", "ssh -oBatchMode=yes", 1);
+    c.g_subprocess_launcher_setenv(launcher, "LC_ALL", "C", 1);
+    c.g_subprocess_launcher_set_child_setup(launcher, &childSetSid, null, null);
     var err: ?*c.GError = null;
     const subprocess = c.g_subprocess_launcher_spawnv(launcher, argv, &err) orelse {
         unmarkBusy(folder);
@@ -674,7 +765,7 @@ fn start(
     };
     const job = ui.gpa.create(Job) catch {
         unmarkBusy(folder);
-        c.g_subprocess_force_exit(subprocess);
+        killJobGroup(subprocess);
         c.g_object_unref(subprocess);
         return fail(ui, caller, "out of memory", .{});
     };
@@ -722,7 +813,7 @@ fn onTimeout(data: ?*anyopaque) callconv(.c) c.gboolean {
     job.timer = 0;
     if (shutting_down) return 0;
     job.timed_out = true;
-    c.g_subprocess_force_exit(job.subprocess);
+    killJobGroup(job.subprocess);
     c.g_cancellable_cancel(job.cancellable);
     return 0;
 }
@@ -798,14 +889,14 @@ fn onDone(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
         }
         if (job.timed_out) {
             const stopped = "{s} stopped: no end after {d} s";
-            return fail(ui, caller, stopped, .{ @tagName(job.kind), job_timeout_s });
+            return failAndReload(ui, caller, stopped, .{ @tagName(job.kind), job_timeout_s });
         }
         const why = if (err) |gerror|
             std.mem.span(gerror.message)
         else
             std.mem.trim(u8, output, " \n");
         const end = tail(why, failure_output_bytes_max);
-        return fail(ui, caller, "{s} failed:\n{s}{s}", .{ @tagName(job.kind), end[0], end[1] });
+        return failAndReload(ui, caller, "{s} failed:\n{s}{s}", .{ @tagName(job.kind), end[0], end[1] });
     }
     busy_handed_over = reportSuccess(job, output);
 }
@@ -831,13 +922,13 @@ fn reportSuccess(job: *Job, output: [:0]const u8) bool {
             };
             if (os.info(init_path) == null) {
                 removeTreeThenReload(ui, job.workPath(), job.folderPath());
-                fail(ui, caller, "{s} has no init.lua: it is not a Lumen extension", .{job.nameSlice()});
+                failAndReload(ui, caller, "{s} has no init.lua: it is not a Lumen extension", .{job.nameSlice()});
                 return true;
             }
             // Into place, whole: until now nothing loaded it.
             os.rename(job.workPath(), job.folderPath()) catch |err| {
                 removeTreeThenReload(ui, job.workPath(), job.folderPath());
-                fail(
+                failAndReload(
                     ui,
                     caller,
                     "could not move the clone to {s}: {t}",
@@ -876,6 +967,7 @@ fn reportSuccess(job: *Job, output: [:0]const u8) bool {
                         job.nameSlice().len == 0,
                         output,
                     )) "Updated" else "Already up to date",
+                    true,
                 );
             }
         },
@@ -898,10 +990,14 @@ fn reportSuccess(job: *Job, output: [:0]const u8) bool {
 }
 
 /// Whether an update changed anything: a line "NAME: updated" from the
-/// update of every extension (`all`), or git's own output for one.
+/// update of every extension (`all`), or our HEAD-diff marker for one.
 fn anyUpdated(all: bool, output: []const u8) bool {
     if (all) return std.mem.find(u8, output, ": updated") != null;
-    return output.len > 0 and std.mem.find(u8, output, "Already up to date") == null;
+    if (std.mem.find(u8, output, "lumen: updated") != null) return true;
+    if (std.mem.find(u8, output, "lumen: up to date") != null) return false;
+    return output.len > 0 and
+        std.mem.find(u8, output, "Already up to date") == null and
+        std.mem.find(u8, output, "Already up-to-date") == null;
 }
 
 /// What an install, update or removal prints: the success line and git's
@@ -918,7 +1014,7 @@ fn print(
 ) void {
     var message_bytes: [print_bytes_max]u8 = undefined;
     const message = format(&message_bytes, fmt, args);
-    const command_line = caller orelse return note(ui, message);
+    const command_line = caller orelse return note(ui, message, true);
     c.g_application_command_line_print(command_line, "%s", message.ptr);
 }
 
@@ -1044,7 +1140,35 @@ test "an update says Updated only when something changed" {
     try std.testing.expect(anyUpdated(true, "a: up to date\nb: updated\n"));
     try std.testing.expect(!anyUpdated(false, ""));
     try std.testing.expect(!anyUpdated(false, "Already up to date.\n"));
+    try std.testing.expect(!anyUpdated(false, "Ya está actualizado.\nlumen: up to date\n"));
+    try std.testing.expect(anyUpdated(false, "lumen: updated\nabc1234 feat: x\n"));
     try std.testing.expect(anyUpdated(false, "Updating 1a2b..3c4d\nFast-forward\n"));
+}
+
+test "installer helpers resolve relative paths, validate names, and pick last useful error line" {
+    try std.testing.expectEqualStrings(
+        "fatal: repository not found",
+        lastUsefulLine("update failed:\nfatal: repository not found\n  \n"),
+    );
+    try std.testing.expectEqualStrings("Updated", lastUsefulLine("Updated"));
+
+    var resolved_buf: [url_bytes_max]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "/work/repos/ext",
+        resolveLocalUrl(&resolved_buf, "./repos/ext", "/work").?,
+    );
+    try std.testing.expectEqualStrings(
+        "/work/ext",
+        resolveLocalUrl(&resolved_buf, "ext", "/work").?,
+    );
+    try std.testing.expectEqualStrings(
+        "git@github.com:me/ext.git",
+        resolveLocalUrl(&resolved_buf, "git@github.com:me/ext.git", "/work").?,
+    );
+    try std.testing.expect(!validInstallName("-"));
+    try std.testing.expect(!validInstallName("---"));
+    try std.testing.expect(!validInstallName("_"));
+    try std.testing.expect(validInstallName("my-ext_1"));
 }
 
 test "busy folders: one job per folder, and the update of all against any" {

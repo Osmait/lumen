@@ -382,6 +382,9 @@ test "style.css only uses variables the themes define" {
     try std.testing.expect(used > 20);
     // No hard-coded text colours left behind: they would ignore the theme.
     try std.testing.expect(std.mem.find(u8, style, "rgba(255, 255, 255") == null);
+    // Confirmation and error row hints keep their own rule alongside footer warnings.
+    try std.testing.expect(std.mem.find(u8, style, ".results > row:selected .hint.warn") != null);
+    try std.testing.expect(std.mem.find(u8, style, ".footer-action.warn") != null);
 }
 
 test "text size and opacity reach the CSS" {

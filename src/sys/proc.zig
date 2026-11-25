@@ -12,15 +12,20 @@ pub const argv_max = 32;
 
 /// Fire and forget. Logs and gives up on failure, or when `argv` has more
 /// than `argv_max` entries.
-pub fn spawn(argv: []const [:0]const u8) void {
+pub fn spawn(argv: []const [:0]const u8) bool {
+    return spawnInDir(argv, null);
+}
+
+/// Like `spawn`, running the child in `cwd` when non-null.
+pub fn spawnInDir(argv: []const [:0]const u8, cwd: ?[*:0]const u8) bool {
     var argv_buffer: Argv = undefined;
-    const argv_z = argv_buffer.of(argv) orelse return;
+    const argv_z = argv_buffer.of(argv) orelse return false;
     var err: ?*c.GError = null;
     // Reaped here rather than by an intermediate child: GLib otherwise forks
     // the daemon twice (a ~200 MB process) for every command it starts.
     var pid: c.GPid = 0;
     const spawned = c.g_spawn_async(
-        null,
+        cwd,
         argv_z,
         null,
         c.G_SPAWN_SEARCH_PATH | c.G_SPAWN_DO_NOT_REAP_CHILD,
@@ -29,8 +34,12 @@ pub fn spawn(argv: []const [:0]const u8) void {
         &pid,
         &err,
     );
-    if (spawned == 0) return logError("spawn", argv[0], err);
+    if (spawned == 0) {
+        logError("spawn", argv[0], err);
+        return false;
+    }
     _ = c.g_child_watch_add(pid, &reapCallback, null);
+    return true;
 }
 
 /// Reaps a child spawned without GLib's intermediate one, when it exits.
@@ -40,7 +49,7 @@ fn reapCallback(pid: c.GPid, _: c_int, _: ?*anyopaque) callconv(.c) void {
 
 /// `sh -c <command>`, fire and forget.
 pub fn shell(command: [:0]const u8) void {
-    spawn(&.{ "sh", "-c", command });
+    _ = spawn(&.{ "sh", "-c", command });
 }
 
 /// How long `output` waits for a program's output: it runs on the main loop.

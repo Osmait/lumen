@@ -311,8 +311,10 @@ fn fillSuggestions(ui: *Ui, arena: std.mem.Allocator) void {
 fn fillRoot(ui: *Ui, arena: std.mem.Allocator, query_text: []const u8) void {
     if (query_text.len == 0) return fillSuggestions(ui, arena);
 
+    var had_section = false;
     if (core.calc.evaluate(query_text)) |answer| {
         row_list.addSection(ui, "Calculator");
+        had_section = true;
         var plain_bytes: [64]u8 = undefined;
         const plain = arena.dupe(u8, core.calc.formatPlain(&plain_bytes, answer.value)) catch "";
         row_list.addItem(ui, .{
@@ -324,7 +326,7 @@ fn fillRoot(ui: *Ui, arena: std.mem.Allocator, query_text: []const u8) void {
         });
     }
     // Extensions' answers (rows from `root = function(query)`).
-    ext_view.addRootSections(ui, query_text);
+    if (ext_view.addRootSections(ui, query_text)) had_section = true;
 
     // Scoring and sorting only: rows are timed apart, and fileItems times
     // itself (a deferred timer here counted it twice).
@@ -353,6 +355,7 @@ fn fillRoot(ui: *Ui, arena: std.mem.Allocator, query_text: []const u8) void {
         &.{};
     const shown = @min(hits.items.len, root_results_max);
     const head = if (files.len > 0) @min(shown, root_results_before_files_max) else shown;
+    if (had_section and head > 0) row_list.addSection(ui, "Results");
     for (hits.items[0..head]) |item| row_list.addItem(ui, item);
     if (files.len > 0) {
         row_list.addSection(ui, "Files");

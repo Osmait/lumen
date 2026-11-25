@@ -61,6 +61,8 @@ pub const GCancellable = opaque {};
 pub const GAsyncResult = opaque {};
 pub const GdkDisplay = opaque {};
 pub const GdkMonitor = opaque {};
+pub const GdkSurface = opaque {};
+pub const GtkNative = opaque {};
 pub const GdkAppLaunchContext = opaque {};
 pub const GtkApplication = opaque {};
 pub const GtkWidget = opaque {};
@@ -395,6 +397,9 @@ pub extern fn g_application_command_line_set_exit_status(
     command_line: *GApplicationCommandLine,
     status: c_int,
 ) void;
+pub extern fn g_application_command_line_get_cwd(
+    command_line: *GApplicationCommandLine,
+) ?[*:0]const u8;
 pub extern fn g_object_ref(object: *anyopaque) *anyopaque;
 pub extern fn g_object_ref_sink(object: *anyopaque) *anyopaque;
 pub extern fn g_cancellable_new() *GCancellable;
@@ -443,10 +448,17 @@ pub extern fn g_subprocess_communicate_utf8_finish(
     err: ?*?*GError,
 ) gboolean;
 pub extern fn g_subprocess_get_successful(subprocess: *GSubprocess) gboolean;
+pub extern fn g_subprocess_get_identifier(subprocess: *GSubprocess) ?[*:0]const u8;
 pub extern fn g_subprocess_get_stdout_pipe(subprocess: *GSubprocess) ?*GInputStream;
 pub extern fn g_subprocess_force_exit(subprocess: *GSubprocess) void;
 pub const GSubprocessLauncher = opaque {};
 pub extern fn g_subprocess_launcher_new(flags: c_int) *GSubprocessLauncher;
+pub extern fn g_subprocess_launcher_set_child_setup(
+    launcher: *GSubprocessLauncher,
+    child_setup: GSpawnChildSetupFunc,
+    user_data: ?*anyopaque,
+    destroy_notify: ?GDestroyNotify,
+) void;
 pub extern fn g_subprocess_launcher_setenv(
     launcher: *GSubprocessLauncher,
     variable: [*:0]const u8,
@@ -599,6 +611,10 @@ pub extern fn gdk_memory_texture_new(
 ) *GdkTexture;
 pub extern fn gdk_texture_new_from_bytes(bytes: *GBytes, err: ?*?*GError) ?*GdkTexture;
 pub extern fn gdk_display_get_monitors(display: *GdkDisplay) *GListModel;
+pub extern fn gdk_display_get_monitor_at_surface(
+    display: *GdkDisplay,
+    surface: *GdkSurface,
+) ?*GdkMonitor;
 pub extern fn gdk_display_get_app_launch_context(display: *GdkDisplay) *GdkAppLaunchContext;
 pub extern fn gdk_monitor_get_connector(monitor: *GdkMonitor) ?[*:0]const u8;
 pub extern fn gdk_monitor_get_geometry(monitor: *GdkMonitor, geometry: *GdkRectangle) void;
@@ -782,6 +798,9 @@ pub extern fn gtk_style_context_add_provider_for_display(
 
 pub extern fn gtk_event_controller_key_new() *GtkEventController;
 pub extern fn gtk_gesture_click_new() *GtkEventController;
+pub const GTK_EVENT_SEQUENCE_CLAIMED: c_int = 1;
+pub extern fn gtk_gesture_set_state(gesture: *GtkEventController, state: c_int) gboolean;
+pub extern fn gtk_native_get_surface(self: *GtkNative) ?*GdkSurface;
 pub extern fn gtk_widget_set_cursor_from_name(widget: *GtkWidget, name: ?[*:0]const u8) void;
 pub extern fn gtk_widget_set_tooltip_text(widget: *GtkWidget, text: ?[*:0]const u8) void;
 pub extern fn gtk_event_controller_set_propagation_phase(

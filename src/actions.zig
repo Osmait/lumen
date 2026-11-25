@@ -76,7 +76,10 @@ fn primary(context: Context, item: *const Item) Outcome {
         .clip => hideAfter(pasteClip(context, item)),
         .script => |script| hideAfter(runScript(script.path, script.mode, item.title)),
         .calc => hideAfter(copy(item.detail)),
-        .file => |file| hideAfter(openFile(context, file.path, file.entry())),
+        .file => |file| blk: {
+            _ = openFile(context, file.path, file.entry());
+            break :blk .hide;
+        },
         .setting => |setting| .{ .setting = .{ .setting = setting, .operation = .run } },
         // The UI runs extension commands (ext_view.zig).
         .ext_command, .ext_item, .pick => .stay,
@@ -125,6 +128,7 @@ fn closeWindow(context: Context, item: *const Item) Outcome {
     const command = std.mem.print(&command_buffer, "closewindow address:{s}", .{address}) catch
         return .stay;
     hypr.dispatch(context.gpa, command);
+    hypr.sendQueued();
     return .refresh_view;
 }
 
@@ -178,7 +182,7 @@ fn trash(path: [:0]const u8) Outcome {
 /// Opens with the app chosen in Settings > Default Apps for the file's
 /// extension or kind, else the system default for its type (directories in
 /// the file manager).
-pub fn openFile(context: Context, path: [:0]const u8, entry: core.file_kind.Entry) void {
+pub fn openFile(context: Context, path: [:0]const u8, entry: core.file_kind.Entry) bool {
     const name = baseName(path);
     const mime = if (entry == .folder) null else c.g_content_type_guess(path, null, 0, null);
     defer if (mime) |mime_type| c.g_free(mime_type);
@@ -192,22 +196,24 @@ pub fn openFile(context: Context, path: [:0]const u8, entry: core.file_kind.Entr
     if (context.settings.appFor(extension_key, kind)) |app| {
         var app_id_buffer: [256]u8 = undefined;
         const id = std.mem.printSentinel(&app_id_buffer, "{s}", .{app}, 0) catch "";
-        if (openWith(path, id)) return;
+        if (openWith(path, id)) return true;
         // Uninstalled since it was chosen: the system default still works.
         log.warn("open with {s}: app not found, using the default", .{app});
     }
-    const uri = c.g_filename_to_uri(path, null, null) orelse return;
+    const uri = c.g_filename_to_uri(path, null, null) orelse return false;
     defer c.g_free(uri);
-    const launch_context = proc.launchContext() orelse return;
+    const launch_context = proc.launchContext() orelse return false;
     defer c.g_object_unref(launch_context);
     var err: ?*c.GError = null;
     if (c.g_app_info_launch_default_for_uri(uri, launch_context, &err) == 0) {
         proc.warnError(.actions, err, "open {s}", .{path});
+        return false;
     }
+    return true;
 }
 
 /// Opens `path` with the app whose desktop file id is `app_id`; false when
-/// there is no such app.
+/// there is no such app or launching it failed.
 pub fn openWith(path: [:0]const u8, app_id: [:0]const u8) bool {
     const desktop_app_info = c.g_desktop_app_info_new(app_id) orelse return false;
     defer c.g_object_unref(desktop_app_info);
@@ -221,6 +227,7 @@ pub fn openWith(path: [:0]const u8, app_id: [:0]const u8) bool {
     var err: ?*c.GError = null;
     if (c.g_app_info_launch_uris(app_info, uris, launch_context, &err) == 0) {
         proc.warnError(.actions, err, "open with {s}", .{app_id});
+        return false;
     }
     return true;
 }
@@ -233,7 +240,7 @@ fn openAtLine(context: Context, path: [:0]const u8, line: u32) void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const argv = openAtLineArgv(arena, context.settings, path, line) catch return;
-    proc.spawn(argv);
+    _ = proc.spawn(argv);
 }
 
 fn openAtLineArgv(
@@ -509,15 +516,15 @@ fn focusWindow(context: Context, item: *const Item) void {
 fn system(context: Context, system_action: item_mod.System) void {
     switch (system_action) {
         .lock => if (proc.have("hyprlock")) {
-            proc.spawn(&.{"hyprlock"});
+            _ = proc.spawn(&.{"hyprlock"});
         } else {
-            proc.spawn(&.{ "loginctl", "lock-session" });
+            _ = proc.spawn(&.{ "loginctl", "lock-session" });
         },
-        .sleep => proc.spawn(&.{ "systemctl", "suspend" }),
-        .restart => proc.spawn(&.{ "systemctl", "reboot" }),
-        .shutdown => proc.spawn(&.{ "systemctl", "poweroff" }),
+        .sleep => _ = proc.spawn(&.{ "systemctl", "suspend" }),
+        .restart => _ = proc.spawn(&.{ "systemctl", "reboot" }),
+        .shutdown => _ = proc.spawn(&.{ "systemctl", "poweroff" }),
         .logout => hypr.dispatch(context.gpa, "exit"),
-        .volume_up => proc.spawn(&.{
+        .volume_up => _ = proc.spawn(&.{
             "wpctl",
             "set-volume",
             "-l",
@@ -525,17 +532,17 @@ fn system(context: Context, system_action: item_mod.System) void {
             "@DEFAULT_AUDIO_SINK@",
             volume_step ++ "+",
         }),
-        .volume_down => proc.spawn(&.{
+        .volume_down => _ = proc.spawn(&.{
             "wpctl",
             "set-volume",
             "@DEFAULT_AUDIO_SINK@",
             volume_step ++ "-",
         }),
-        .volume_mute => proc.spawn(&.{ "wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle" }),
-        .mic_mute => proc.spawn(&.{ "wpctl", "set-mute", "@DEFAULT_AUDIO_SOURCE@", "toggle" }),
-        .play_pause => proc.spawn(&.{ "playerctl", "play-pause" }),
-        .next_track => proc.spawn(&.{ "playerctl", "next" }),
-        .prev_track => proc.spawn(&.{ "playerctl", "previous" }),
+        .volume_mute => _ = proc.spawn(&.{ "wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle" }),
+        .mic_mute => _ = proc.spawn(&.{ "wpctl", "set-mute", "@DEFAULT_AUDIO_SOURCE@", "toggle" }),
+        .play_pause => _ = proc.spawn(&.{ "playerctl", "play-pause" }),
+        .next_track => _ = proc.spawn(&.{ "playerctl", "next" }),
+        .prev_track => _ = proc.spawn(&.{ "playerctl", "previous" }),
         .toggle_dark => proc.shell(
             \\k=org.gnome.desktop.interface
             \\if gsettings get $k color-scheme | grep -q dark; then
@@ -544,7 +551,7 @@ fn system(context: Context, system_action: item_mod.System) void {
             \\  gsettings set $k color-scheme prefer-dark
             \\fi
         ),
-        .empty_trash => proc.spawn(&.{ "gio", "trash", "--empty" }),
+        .empty_trash => _ = proc.spawn(&.{ "gio", "trash", "--empty" }),
     }
 }
 
@@ -564,8 +571,14 @@ fn windowOperation(context: Context, operation: item_mod.WindowOperation) void {
 }
 
 fn runScript(path: [:0]const u8, mode: @import("core").script_meta.Mode, title: []const u8) void {
+    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = std.Io.Dir.path.dirname(path);
+    const cwd: ?[*:0]const u8 = if (dir) |folder|
+        (std.mem.printSentinel(&cwd_buffer, "{s}", .{folder}, 0) catch null)
+    else
+        null;
     if (mode == .silent) {
-        proc.spawn(&.{path});
+        _ = proc.spawnInDir(&.{path}, cwd);
         return;
     }
     // Other modes show the output: last lines as a desktop notification.
@@ -574,13 +587,13 @@ fn runScript(path: [:0]const u8, mode: @import("core").script_meta.Mode, title: 
     var title_buffer: [512:0]u8 = undefined;
     const title_terminated = std.mem.printSentinel(&title_buffer, "{s}", .{title}, 0) catch
         "Script";
-    proc.spawn(&.{
+    _ = proc.spawnInDir(&.{
         "sh",             "-c",
         \\out=$("$1" 2>&1); notify-send -a Lumen -- "$2" "$(printf '%s' "$out" | tail -n 5)"
         ,
         "lumen-script",   path,
         title_terminated,
-    });
+    }, cwd);
 }
 
 /// Copies `text` with wl-copy (it keeps serving the selection after we hide).
@@ -658,8 +671,8 @@ fn sendPaste() void {
     const window = hypr.activeWindow(answer_allocator.allocator());
     const class = if (window) |active| active.class else "";
     switch (pasteChord(class)) {
-        .ctrl_v => proc.spawn(&.{ "wtype", "-M", "ctrl", "-k", "v", "-m", "ctrl" }),
-        .ctrl_shift_v => proc.spawn(&.{
+        .ctrl_v => _ = proc.spawn(&.{ "wtype", "-M", "ctrl", "-k", "v", "-m", "ctrl" }),
+        .ctrl_shift_v => _ = proc.spawn(&.{
             "wtype",
             "-M",
             "ctrl",
