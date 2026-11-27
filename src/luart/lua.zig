@@ -189,18 +189,18 @@ const sandbox_prelude =
     \\    local from = fi
     \\    while from <= ei do
     \\      check_deadline()
-    \\      local last = from + move_chunk - 1
-    \\      if last > ei then last = ei end
+    \\      local last = (ei - from < move_chunk - 1) and ei or (from + move_chunk - 1)
     \\      raw_move(a1, from, last, ti + (from - fi), a2)
+    \\      if last == ei then break end
     \\      from = last + 1
     \\    end
     \\  else
     \\    local last = ei
     \\    while last >= fi do
     \\      check_deadline()
-    \\      local from = last - move_chunk + 1
-    \\      if from < fi then from = fi end
+    \\      local from = (last - fi < move_chunk - 1) and fi or (last - move_chunk + 1)
     \\      raw_move(a1, from, last, ti + (from - fi), a2)
+    \\      if from == fi then break end
     \\      last = from - 1
     \\    end
     \\  end
@@ -287,12 +287,27 @@ const sandbox_prelude =
     \\  if timed_out() then error("timed out", 0) end
     \\  return rethrow_if_timed_out(raw_pcall(...))
     \\end
-    \\function xpcall(...)
+    \\function xpcall(f, msgh, ...)
     \\  if timed_out() then error("timed out", 0) end
-    \\  return rethrow_if_timed_out(raw_xpcall(...))
+    \\  if type(msgh) ~= "function" then
+    \\    error("bad argument #2 to 'xpcall' (function expected, got " .. type(msgh) .. ")", 2)
+    \\  end
+    \\  local function guarded_msgh(err)
+    \\    if timed_out() then return err end
+    \\    return msgh(err)
+    \\  end
+    \\  return rethrow_if_timed_out(raw_xpcall(f, guarded_msgh, ...))
     \\end
     \\if type(coroutine) == "table" then
     \\  local raw_create, raw_resume, raw_close = coroutine.create, coroutine.resume, coroutine.close
+    \\  local timed_out_coroutines = setmt({}, { __mode = "k" })
+    \\  local function finish_resume(co, ok, ...)
+    \\    if not ok and timed_out() then
+    \\      timed_out_coroutines[co] = true
+    \\      error("timed out", 0)
+    \\    end
+    \\    return ok, ...
+    \\  end
     \\  function coroutine.create(f)
     \\    local co = raw_create(f)
     \\    arm_hook(co)
@@ -303,7 +318,10 @@ const sandbox_prelude =
     \\    arm_hook(co)
     \\    local function unwrap(ok, ...)
     \\      if not ok then
-    \\        if timed_out() then error("timed out", 0) end
+    \\        if timed_out() then
+    \\          timed_out_coroutines[co] = true
+    \\          error("timed out", 0)
+    \\        end
     \\        error((...), 2)
     \\      end
     \\      return ...
@@ -317,11 +335,15 @@ const sandbox_prelude =
     \\  function coroutine.resume(co, ...)
     \\    if timed_out() then error("timed out", 0) end
     \\    arm_hook(co)
-    \\    return rethrow_if_timed_out(raw_resume(co, ...))
+    \\    return finish_resume(co, raw_resume(co, ...))
     \\  end
     \\  if raw_close then
     \\    function coroutine.close(...)
     \\      if timed_out() then error("timed out", 0) end
+    \\      local co = (...)
+    \\      if co ~= nil and timed_out_coroutines[co] then
+    \\        return false, "timed out"
+    \\      end
     \\      return rethrow_if_timed_out(raw_close(...))
     \\    end
     \\  end
@@ -333,18 +355,75 @@ const sandbox_prelude =
     \\    return fn(...)
     \\  end
     \\end
-    \\table.sort = guarded(table.sort)
-    \\table.insert = guarded(table.insert)
-    \\table.remove = guarded(table.remove)
+    \\local raw_rep = string.rep
+    \\function string.rep(s, n, sep)
+    \\  check_deadline()
+    \\  local ni = tointeger(n)
+    \\  if (type(s) == "string" or type(s) == "number") and ni ~= nil then
+    \\    if ni <= 0 then return "" end
+    \\    local ss = tostring(s)
+    \\    if #ss == 0 and (sep == nil or
+    \\        ((type(sep) == "string" or type(sep) == "number") and #tostring(sep) == 0)) then
+    \\      return ""
+    \\    end
+    \\  end
+    \\  return raw_rep(s, n, sep)
+    \\end
+    \\local raw_insert, raw_remove, raw_sort = table.insert, table.remove, table.sort
+    \\function table.insert(list, ...)
+    \\  check_deadline()
+    \\  if select("#", ...) == 2 and (type(list) == "table" or type(list) == "userdata") then
+    \\    local pos = tointeger((...))
+    \\    local len = #list
+    \\    if len < 0 or len >= maxinteger then
+    \\      error("bad argument #2 to 'insert' (position out of bounds)", 2)
+    \\    end
+    \\    if pos and pos >= 1 and pos <= len and len - pos + 1 >= move_chunk then
+    \\      table.move(list, pos, len, pos + 1)
+    \\      list[pos] = select(2, ...)
+    \\      return
+    \\    end
+    \\  end
+    \\  return raw_insert(list, ...)
+    \\end
+    \\function table.remove(list, pos)
+    \\  check_deadline()
+    \\  if pos ~= nil and (type(list) == "table" or type(list) == "userdata") then
+    \\    local p = tointeger(pos)
+    \\    local len = #list
+    \\    if p and len > 0 and p >= 1 and p <= len and len - p >= move_chunk then
+    \\      local removed = list[p]
+    \\      table.move(list, p + 1, len, p)
+    \\      list[len] = nil
+    \\      return removed
+    \\    end
+    \\  end
+    \\  return raw_remove(list, pos)
+    \\end
+    \\local getmt = getmetatable
+    \\function table.sort(list, comp)
+    \\  check_deadline()
+    \\  if type(list) == "table" and getmt(list) == nil and comp == nil and #list <= 256 then
+    \\    return raw_sort(list)
+    \\  end
+    \\  if comp == nil then
+    \\    return raw_sort(list, function(a, b) return a < b end)
+    \\  end
+    \\  if type(comp) ~= "function" then
+    \\    return raw_sort(list, comp)
+    \\  end
+    \\  return raw_sort(list, function(a, b) return comp(a, b) end)
+    \\end
     \\table.concat = guarded(table.concat)
     \\table.unpack = guarded(table.unpack)
-    \\string.rep = guarded(string.rep)
     \\string.dump = guarded(string.dump)
     \\collectgarbage = guarded(collectgarbage)
 ;
 
 fn isTimedOut(L: *State) Error!c_int {
-    c.lua_pushboolean(L, @intFromBool(budgetOf(L).timed_out));
+    const budget = budgetOf(L);
+    if (budget.expired()) budget.timed_out = true;
+    c.lua_pushboolean(L, @intFromBool(budget.timed_out));
     return 1;
 }
 
@@ -360,9 +439,16 @@ fn checkDeadline(L: *State) Error!c_int {
 }
 
 fn armThreadHook(L: *State) Error!c_int {
+    const budget = budgetOf(L);
+    if (budget.expired()) budget.timed_out = true;
     if (c.lua_tothread(L, 1)) |co| {
-        const count: c_int = if (budgetOf(L).timed_out) 1 else hook_instruction_count;
-        c.lua_sethook(co, &hook, c.LUA_MASKCOUNT, count);
+        const count: c_int = if (budget.timed_out) 1 else hook_instruction_count;
+        if (c.lua_gethook(co) != &hook or
+            c.lua_gethookmask(co) != c.LUA_MASKCOUNT or
+            c.lua_gethookcount(co) != count)
+        {
+            c.lua_sethook(co, &hook, c.LUA_MASKCOUNT, count);
+        }
     }
     return 0;
 }
@@ -1163,6 +1249,14 @@ test "loops in C stop at the deadline too: table.move and patterns" {
         "('a'):rep(1e6):find(('a'):rep(1e5) .. 'b')",
         "('('):rep(1e6):find('%b()')",
         "('a'):rep(1e6):find('a*b')",
+        "string.match(('a'):rep(50000), ('a'):rep(49999) .. 'b')",
+        "while true do coroutine.resume(coroutine.running()) end",
+        "local a, b; a = coroutine.create(function() while true do coroutine.resume(b) end end); b = coroutine.create(function() while true do coroutine.resume(a) end end); coroutine.resume(a)",
+        "xpcall(function() while true do end end, function(e) while true do end end)",
+        "local t = setmetatable({}, { __len = function() return math.maxinteger - 1 end }) table.insert(t, 1, 1)",
+        "local t = setmetatable({}, { __len = function() return math.maxinteger - 1 end }) table.remove(t, 1)",
+        "local t = setmetatable({}, { __len = function() return 2147483646 end, __index = type, __newindex = type }) table.sort(t)",
+        "local t = setmetatable({}, { __len = function() return 2147483646 end, __index = type, __newindex = type }) table.sort(t, rawequal)",
     };
     for (runaways) |code| {
         budget.deadline_ns = os.monotonicNs() + 50 * std.time.ns_per_ms;
@@ -1528,4 +1622,57 @@ test "deadline stops loops of expensive C functions (table.sort, string.rep)" {
     ).?;
     try testing.expect(std.mem.find(u8, rep_err, "timed out") != null);
     try testing.expect(os.monotonicNs() - rep_start_ns < std.time.ns_per_s);
+
+    // Empty string.rep with huge count returns "" immediately without timing out.
+    var empty_rep_budget: Budget = .{
+        .bytes_max = 16 << 20,
+        .deadline_ns = os.monotonicNs() + 100 * std.time.ns_per_ms,
+    };
+    const L3 = try testState(&empty_rep_budget);
+    defer c.lua_close(L3);
+    try testing.expect(runCode(
+        L3,
+        arena_state.allocator(),
+        "assert(string.rep('', math.maxinteger) == '' and (''):rep(math.maxinteger, '') == '')",
+    ) == null);
+    // Normal table.insert / table.remove / table.sort behavior still works.
+    try testing.expect(runCode(
+        L3,
+        arena_state.allocator(),
+        \\local t = { 3, 1, 2 }
+        \\table.sort(t)
+        \\assert(t[1] == 1 and t[2] == 2 and t[3] == 3)
+        \\table.insert(t, 2, 9)
+        \\assert(t[2] == 9 and #t == 4)
+        \\assert(table.remove(t, 2) == 9 and #t == 3)
+        ,
+    ) == null);
+
+    // Dead timed-out coroutine must not run __close without hook on subsequent coroutine.close().
+    var close_budget: Budget = .{
+        .bytes_max = 16 << 20,
+        .deadline_ns = os.monotonicNs() + 50 * std.time.ns_per_ms,
+    };
+    const L4 = try testState(&close_budget);
+    defer c.lua_close(L4);
+    const co_err = runCode(
+        L4,
+        arena_state.allocator(),
+        \\co_timed = coroutine.create(function()
+        \\  local g <close> = setmetatable({}, { __close = function() while true do end end })
+        \\  while true do end
+        \\end)
+        \\coroutine.resume(co_timed)
+        ,
+    ).?;
+    try testing.expect(std.mem.find(u8, co_err, "timed out") != null);
+
+    close_budget.deadline_ns = os.monotonicNs() + 100 * std.time.ns_per_ms;
+    const close_start_ns = os.monotonicNs();
+    try testing.expect(runCode(
+        L4,
+        arena_state.allocator(),
+        "local ok, why = coroutine.close(co_timed) assert(not ok and why == 'timed out')",
+    ) == null);
+    try testing.expect(os.monotonicNs() - close_start_ns < 50 * std.time.ns_per_ms);
 }

@@ -605,6 +605,20 @@ fn retryWaitMs(service: *Service) i32 {
     return @intCast(@min(left_ms, @as(u64, std.math.maxInt(i32))));
 }
 
+fn dupeDirList(gpa: std.mem.Allocator, dirs: []const []const u8) std.mem.Allocator.Error![][]u8 {
+    const kept = try gpa.alloc([]u8, dirs.len);
+    var filled: usize = 0;
+    errdefer {
+        for (kept[0..filled]) |entry| gpa.free(entry);
+        gpa.free(kept);
+    }
+    for (dirs) |dir| {
+        kept[filled] = try gpa.dupe(u8, dir);
+        filled += 1;
+    }
+    return kept;
+}
+
 /// Probes permission-denied folders outside the lock. Returns true if any
 /// recovered readability and requires a rescan.
 fn probeRetryDirs(service: *Service) bool {
@@ -617,10 +631,10 @@ fn probeRetryDirs(service: *Service) bool {
         service.lock.lockSharedUncancelable(service.io);
         defer service.lock.unlockShared(service.io);
         for (service.live.retry_dirs) |dir| {
-            const copy = service.gpa.dupe(u8, dir) catch continue;
+            const copy = service.gpa.dupe(u8, dir) catch return false;
             copy_list.append(service.gpa, copy) catch {
                 service.gpa.free(copy);
-                continue;
+                return false;
             };
         }
     }
@@ -628,6 +642,7 @@ fn probeRetryDirs(service: *Service) bool {
     var path_buf: paths.Buffer = undefined;
     var still_locked: std.ArrayList([]u8) = .empty;
     defer still_locked.deinit(service.gpa);
+    var list_complete = true;
     for (copy_list.items) |dir| {
         const dir_z = std.mem.printSentinel(&path_buf, "{s}", .{dir}, 0) catch continue;
         if (sys.openDirNoFollow(dir_z)) |fd| {
@@ -635,21 +650,20 @@ fn probeRetryDirs(service: *Service) bool {
             return true;
         } else |err| switch (err) {
             error.NotFound, error.IsLink => {},
-            else => still_locked.append(service.gpa, dir) catch {},
+            else => still_locked.append(service.gpa, dir) catch {
+                list_complete = false;
+                break;
+            },
         }
     }
     // Keep only folders that are still present and denied, and advance backoff.
     service.lock.lockUncancelable(service.io);
     defer service.lock.unlock(service.io);
-    var kept = service.gpa.alloc([]u8, still_locked.items.len) catch null;
-    if (kept) |*k| {
-        var filled: usize = 0;
-        for (still_locked.items) |dir| {
-            k.*[filled] = service.gpa.dupe(u8, dir) catch break;
-            filled += 1;
-        }
-        sys.freeList(service.gpa, service.live.retry_dirs);
-        service.live.retry_dirs = k.*[0..filled];
+    if (list_complete) {
+        if (dupeDirList(service.gpa, still_locked.items)) |kept| {
+            sys.freeList(service.gpa, service.live.retry_dirs);
+            service.live.retry_dirs = kept;
+        } else |_| {}
     }
     if (service.live.retry_dirs.len == 0) {
         service.retry_backoff_ns = 0;
@@ -1170,4 +1184,16 @@ test "service: unreadable folders are retried and watched once accessible" {
         service.lock.unlock(service.io);
         try testing.expect(service.probeRetryDirs());
     }
+}
+
+test "service: dupeDirList frees cleanly on OOM at any allocation" {
+    const dirs = [_][]const u8{ "/tmp/one", "/tmp/two", "/tmp/three" };
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn runCheck(gpa: std.mem.Allocator) !void {
+            const copy = try dupeDirList(gpa, &dirs);
+            defer sys.freeList(gpa, copy);
+            try testing.expectEqual(dirs.len, copy.len);
+            for (dirs, copy) |want, got| try testing.expectEqualStrings(want, got);
+        }
+    }.runCheck, .{});
 }

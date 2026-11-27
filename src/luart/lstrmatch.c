@@ -291,9 +291,14 @@ static const char *end_capture (MatchState *ms, const char *s,
 
 static const char *match_capture (MatchState *ms, const char *s, int l) {
   size_t len;
+  unsigned long prev;
   l = check_capture(ms, l);
   len = ms->capture[l].len;
-  if (l_unlikely(len >= LUART_FIND_CHECK_BYTES) && luart_match_timed_out(ms->L))
+  prev = ms->steps;
+  ms->steps += (unsigned long)(len >> 6);
+  if (l_unlikely((len >= LUART_FIND_CHECK_BYTES ||
+                  ms->steps / LUART_MATCH_CHECK_STEPS != prev / LUART_MATCH_CHECK_STEPS)) &&
+      luart_match_timed_out(ms->L))
     luaL_error(ms->L, "timed out");
   if ((size_t)(ms->src_end-s) >= len &&
       memcmp(ms->capture[l].init, s, len) == 0)
@@ -305,12 +310,12 @@ static const char *match_capture (MatchState *ms, const char *s, int l) {
 static const char *match (MatchState *ms, const char *s, const char *p) {
   if (l_unlikely(ms->matchdepth-- == 0))
     luaL_error(ms->L, "pattern too complex");
-  /* Lumen: the matcher backtracks in C, where the instruction hook never
-  ** runs; a pattern like ("a-"):rep(12).."b" took minutes. */
+  init: /* using goto to optimize tail recursion */
+  /* Lumen: the matcher backtracks and tail-recurses in C, where the
+  ** instruction hook never runs; check every LUART_MATCH_CHECK_STEPS steps. */
   if (l_unlikely((++ms->steps & (LUART_MATCH_CHECK_STEPS - 1)) == 0) &&
       luart_match_timed_out(ms->L))
     luaL_error(ms->L, "timed out");
-  init: /* using goto to optimize tail recursion */
   if (p != ms->p_end) {  /* end of pattern? */
     switch (*p) {
       case '(': {  /* start capture */

@@ -120,10 +120,10 @@ fn scoreWith(
         const letter = if (ascii) std.ascii.toLower(raw) else raw;
         if (letter != query[query_index]) continue;
         if (hit_first == std.math.maxInt(usize)) hit_first = i;
-        if (hit_previous +% 1 == i) total += weight.consecutive;
         if (i == 0) {
             total += weight.name_start;
         } else {
+            if (hit_previous +% 1 == i) total += weight.consecutive;
             const before = name[i - 1];
             const camel_boundary = if (ascii)
                 std.ascii.isLower(before) and std.ascii.isUpper(raw)
@@ -201,4 +201,13 @@ test "whole_name bonus requires matching the stem content, not just its length" 
         score("abcde.txt", "bdtx").?,
     );
     try testing.expect(score("Cargo.toml", "cargo").? - score("CargoX.toml", "cargo").? >= weight.whole_name);
+}
+
+test "consecutive bonus does not apply to a match at index 0" {
+    try testing.expectEqual(
+        weight.name_start - @as(i32, 5 / weight.name_bytes_per_point),
+        score("abcde", "a").?,
+    );
+    // "abzz" vs "axbz" for "ab": same length (4) and neither triggers whole_name.
+    try testing.expectEqual(weight.consecutive, score("abzz", "ab").? - score("axbz", "ab").?);
 }

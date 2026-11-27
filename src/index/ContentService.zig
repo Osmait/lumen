@@ -375,12 +375,13 @@ pub fn searchUntilWith(
     if (truncated_out) |flag| flag.* = false;
     out.clearRetainingCapacity();
     // A reference, not the lock, keeps the index while files are read.
-    const shared = blk: {
+    const shared, const version = blk: {
         service.lock.lockSharedUncancelable(service.io);
         defer service.lock.unlockShared(service.io);
         const shared = service.index orelse return 0;
+        const version = shared.version.load(.acquire);
         shared.acquire();
-        break :blk shared;
+        break :blk .{ shared, version };
     };
     defer shared.release();
     const index = &shared.index;
@@ -409,7 +410,7 @@ pub fn searchUntilWith(
         .size = index.sizes[match.doc],
         .extracted = index.sources[match.doc] == @backingInt(content.Source.extracted),
     });
-    return shared.version.load(.acquire);
+    return version;
 }
 
 /// The file holding a document's text, for verification (see PathFn).
@@ -580,6 +581,7 @@ fn extractMissing(
             .failed = failed,
         };
         service.build_pool.run(missing.items.len, &context, ExtractContext.extractOne);
+        if (service.stop.load(.acquire)) return null;
     }
     return service.leaveOut(
         arena,
@@ -683,6 +685,18 @@ fn leaveOut(
     for (failed, missing, prev_attempts, 0..) |maybe_failure, doc_index, prev, missing_index| {
         const failure = maybe_failure orelse continue;
         const doc = docs[doc_index];
+        if (failure.err == error.Cancelled) {
+            dropped[doc_index] = true;
+            retry.append(arena, .{
+                .doc = doc,
+                .attempts = prev,
+                .next_retry_ns = now_ns,
+            }) catch {
+                logOutOfMemory("setting documents aside to retry");
+                return null;
+            };
+            continue;
+        }
         if (failure.cache_write) {
             if (failure.err == error.NoSpace or failure.err == error.Access) {
                 service.worker.cache_unwritable_until_ns =
@@ -1118,20 +1132,30 @@ fn changes(
     const start_ns = sys.monotonicNs();
     if (service.listingReason(name_changes, start_ns) != null) {
         if (service.options.names) |names| _ = names.takeModified(arena) catch {};
-        docs.* = service.listAll(arena, name_changes, listed) orelse return null;
-        return service.diff(arena, docs.*.?) catch {
-            logOutOfMemory("comparing the listing");
+        if (service.listAll(arena, name_changes, listed)) |listed_docs| {
+            docs.* = listed_docs;
+            return service.diff(arena, listed_docs) catch {
+                logOutOfMemory("comparing the listing");
+                return null;
+            };
+        }
+        if (service.index == null or service.stop.load(.acquire)) return null;
+        return service.indexedChanges(arena) catch {
+            logOutOfMemory("checking the indexed files");
             return null;
         };
     }
     if (service.options.names) |names| {
         const modified = names.takeModified(arena) catch null;
         if (modified != null and service.shouldRelistForModified(modified.?)) {
-            docs.* = service.listAll(arena, name_changes, listed) orelse return null;
-            return service.diff(arena, docs.*.?) catch {
-                logOutOfMemory("comparing the listing");
-                return null;
-            };
+            if (service.listAll(arena, name_changes, listed)) |listed_docs| {
+                docs.* = listed_docs;
+                return service.diff(arena, listed_docs) catch {
+                    logOutOfMemory("comparing the listing");
+                    return null;
+                };
+            }
+            if (service.stop.load(.acquire)) return null;
         }
     }
     const changed = service.indexedChanges(arena) catch {
@@ -2269,4 +2293,185 @@ fn setMtimeNs(path: [*:0]const u8, sec: isize, nsec: isize) !void {
     };
     const rc = linux.utimensat(linux.AT.FDCWD, path, &times, 0);
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(rc));
+}
+
+test "content service: shutdown cancellation does not poison TextCache with empty file" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    var cache_dir = try TestTree.init();
+    defer cache_dir.deinit();
+    try tree.write("doc.pdf", "not a pdf");
+    var path_buffer: paths.Buffer = undefined;
+    const pdf = try tree.path(&path_buffer, "doc.pdf");
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const pool = try Pool.create(testing.allocator, testing.io, 0);
+    defer pool.destroy();
+    var service: ContentService = .{
+        .gpa = testing.allocator,
+        .io = testing.io,
+        .root = tree.absolute,
+        .cache_path = undefined,
+        .text_cache = try TextCache.init(testing.allocator, cache_dir.absolute),
+        .search_pool = pool,
+        .build_pool = pool,
+        .options = .{ .extract_retry_backoff_ns = 0 },
+        .worker = .{
+            .thread_id = std.Thread.getCurrentId(),
+            .retry_arena = .init(testing.allocator),
+        },
+    };
+    defer service.text_cache.deinit(testing.allocator);
+    defer service.worker.retry_arena.deinit();
+    const doc_stat = content_list.stat(pdf, .document).?;
+    var docs = [_]content.DocIn{.{
+        .path = pdf,
+        .mtime = doc_stat.mtime,
+        .size = doc_stat.size,
+        .source = .extracted,
+    }};
+    service.commitRetry(&.{.{
+        .doc = docs[0],
+        .attempts = extract_retries_max - 1,
+        .next_retry_ns = 0,
+    }});
+
+    // Cancellation via leaveOut must not count toward permanent_tool_fail.
+    const cancelled_out = service.leaveOut(
+        arena,
+        &docs,
+        &.{0},
+        &.{extract_retries_max - 1},
+        &[_]?ExtractContext.Failure{.{ .err = error.Cancelled }},
+        &.{},
+        &.{},
+        sys.monotonicNs(),
+    ).?;
+    try testing.expect(!service.textCached(docs[0]));
+    try testing.expectEqual(@as(usize, 0), cancelled_out.docs.len);
+    try testing.expectEqual(@as(u8, extract_retries_max - 1), cancelled_out.retry[0].attempts);
+
+    // Setting stop during extractMissing returns null before leaveOut can poison TextCache.
+    service.stop.store(true, .release);
+    try testing.expect(service.extractMissing(arena, &docs) == null);
+    try testing.expect(!service.textCached(docs[0]));
+}
+
+test "content service: searchUntilWith returns the index version captured before searching" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.root.write("doc1.txt", "unique ephemeral token\n");
+    try fixture.root.write("doc2.txt", "unique ephemeral token\n");
+
+    const service = try fixture.startWith(.{
+        .refresh_interval_ns = std.math.maxInt(u64),
+        .poke_interval_ns_min = 0,
+    });
+    defer service.shutdown();
+    try waitChecks(service, 1);
+    try testing.expectEqual(@as(u64, 1), service.indexVersion());
+
+    const Gate = struct {
+        entered: std.atomic.Value(bool) = .init(false),
+        release: std.atomic.Value(bool) = .init(false),
+        pool: *Pool,
+
+        fn hold(ctx: *@This(), item: usize) void {
+            if (item == 0) {
+                ctx.entered.store(true, .release);
+                while (!ctx.release.load(.acquire)) sys.sleepUs(1_000);
+            }
+        }
+
+        fn run(ctx: *@This()) void {
+            ctx.pool.run(2, ctx, hold);
+        }
+    };
+    var gate: Gate = .{ .pool = service.search_pool };
+    const blocker = try std.Thread.spawn(.{}, Gate.run, .{&gate});
+    errdefer {
+        gate.release.store(true, .release);
+        blocker.join();
+    }
+    while (!gate.entered.load(.acquire)) sys.sleepUs(1_000);
+
+    const SearchJob = struct {
+        service: *ContentService,
+        version: u64 = 999,
+        hits_count: usize = 0,
+
+        fn run(job: *@This()) void {
+            var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer arena_state.deinit();
+            var hits: std.ArrayList(Hit) = .empty;
+            job.version = job.service.searchUntil(
+                arena_state.allocator(),
+                "ephemeral",
+                10,
+                null,
+                &hits,
+            ) catch 999;
+            job.hits_count = hits.items.len;
+        }
+    };
+    var job: SearchJob = .{ .service = service };
+    const searcher = try std.Thread.spawn(.{}, SearchJob.run, .{&job});
+
+    // Wait until searchUntilWith holds a Shared ref and is blocked in pool.run.
+    while (true) {
+        service.lock.lockSharedUncancelable(service.io);
+        const refs = service.index.?.refs.load(.acquire);
+        service.lock.unlockShared(service.io);
+        if (refs >= 2) break;
+        sys.sleepUs(1_000);
+    }
+
+    // Mutate version in-place like a concurrent re-extraction would.
+    service.lock.lockUncancelable(service.io);
+    service.index.?.version.store(2, .release);
+    service.version.store(2, .release);
+    service.lock.unlock(service.io);
+
+    gate.release.store(true, .release);
+    blocker.join();
+    searcher.join();
+
+    try testing.expectEqual(@as(u64, 1), job.version);
+    try testing.expectEqual(@as(usize, 2), job.hits_count);
+}
+
+test "content service: unreadable subdirectory does not stall initial build or updates" {
+    if (linux.geteuid() == 0) return error.SkipZigTest;
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+
+    try fixture.root.write("ok/note.txt", "initial chameleon word\n");
+    try fixture.root.write("locked/secret.txt", "forbidden word\n");
+    var locked_buf: paths.Buffer = undefined;
+    const locked = try fixture.root.path(&locked_buf, "locked");
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(locked, 0o000)));
+    defer _ = linux.chmod(locked, 0o700);
+
+    var note_buf: paths.Buffer = undefined;
+    const note = try fixture.root.path(&note_buf, "ok/note.txt");
+    try setMtime(note, sys.nowSeconds() - 200);
+
+    const service = try fixture.start();
+    defer service.shutdown();
+    try waitChecks(service, 1);
+
+    const s = service.status();
+    try testing.expect(s.ready);
+    try testing.expect(!s.list_failed);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "chameleon")).len);
+    try testing.expectEqual(@as(usize, 0), (try fixture.find(service, "forbidden")).len);
+
+    try fixture.root.write("ok/note.txt", "updated pangolin word\n");
+    try setMtime(note, sys.nowSeconds() - 100);
+    try pokeAndWait(service);
+    try testing.expectEqual(@as(usize, 0), (try fixture.find(service, "chameleon")).len);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "pangolin")).len);
 }
