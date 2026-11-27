@@ -91,6 +91,8 @@ pub const Result = struct {
     /// Exit code; null when killed by a signal, the deadline or the cap.
     code: ?u8,
     timed_out: bool,
+    /// Killed because `options.cancel` was set rather than hitting the deadline.
+    cancelled: bool = false,
     /// Killed at `output_bytes_max` (`at_cap = .kill`).
     capped: bool = false,
 
@@ -160,8 +162,10 @@ pub fn run(
 
     // Both outputs closed, but the program may live on (it closed them, or
     // a background child holds them): wait for its exit up to the deadline.
-    const timed_out = end == .timed_out or
-        (end == .closed and !waitExit(child.id.?, &options));
+    const exited = if (end == .closed) waitExit(child.id.?, &options) else false;
+    const cancelled = end == .cancelled or
+        (end == .closed and !exited and options.cancel != null and options.cancel.?.load(.acquire));
+    const timed_out = end == .timed_out or cancelled or (end == .closed and !exited);
     var code: ?u8 = null;
     if (end == .closed and !timed_out) {
         // A wait that fails leaves the code unknown, as a signal does; the
@@ -179,6 +183,7 @@ pub fn run(
         .stderr = stderr,
         .code = code,
         .timed_out = timed_out,
+        .cancelled = cancelled,
         .capped = end == .capped,
     };
 }
@@ -207,7 +212,7 @@ const Pump = struct {
     stdout_open: bool = true,
     stderr_open: bool,
 
-    const End = enum { closed, timed_out, capped };
+    const End = enum { closed, timed_out, cancelled, capped };
 
     fn loop(pump: *Pump) Error!End {
         // A blocking stdin would let one write stall the whole poll loop,
@@ -216,7 +221,7 @@ const Pump = struct {
         while (pump.stdout_open or pump.stderr_open) {
             const now_ns = os.monotonicNs();
             if (now_ns >= pump.options.deadline_ns) return .timed_out;
-            if (pump.cancelled()) return .timed_out;
+            if (pump.cancelled()) return .cancelled;
             var poll_fds: [3]linux.pollfd = undefined;
             const poll_fds_count = pump.pollFds(&poll_fds);
             const ready_count = linux.poll(&poll_fds, poll_fds_count, pump.pollTimeoutMs(now_ns));
@@ -517,4 +522,22 @@ test "at_cap .kill kills only when output strictly exceeds output_bytes_max" {
     try testing.expect(over.capped);
     try testing.expectEqual(@as(?u8, null), over.code);
     try testing.expectEqualStrings("12345", over.stdout);
+}
+
+test "cancel sets cancelled=true while real deadline timeout sets cancelled=false" {
+    var timeout_res = try run(testing.allocator, testing.io, &.{ "sh", "-c", "sleep 5" }, .{
+        .deadline_ns = deadline(50),
+    });
+    defer timeout_res.deinit(testing.allocator);
+    try testing.expect(timeout_res.timed_out);
+    try testing.expect(!timeout_res.cancelled);
+
+    var stop: std.atomic.Value(bool) = .init(true);
+    var cancel_res = try run(testing.allocator, testing.io, &.{ "sh", "-c", "sleep 5" }, .{
+        .deadline_ns = deadline(5000),
+        .cancel = &stop,
+    });
+    defer cancel_res.deinit(testing.allocator);
+    try testing.expect(cancel_res.timed_out);
+    try testing.expect(cancel_res.cancelled);
 }

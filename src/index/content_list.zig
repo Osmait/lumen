@@ -97,7 +97,6 @@ pub fn list(
         "--no-config",
         "--files",
         "--null",
-        "--no-messages",
         "--no-ignore-parent",
     });
     for (excludes) |glob| try argv.appendSlice(arena, &.{ "-g", glob });
@@ -145,6 +144,55 @@ pub fn list(
     return docs.items;
 }
 
+const StderrClassifier = struct {
+    saw_line: bool = false,
+    all_benign_walk_errors: bool = true,
+
+    fn consumeComplete(classifier: *StderrClassifier, reader: *std.Io.Reader) void {
+        while (true) {
+            const buffered = reader.buffered();
+            const nl = std.mem.findScalar(u8, buffered, '\n') orelse break;
+            classifier.classifyLine(buffered[0..nl]);
+            reader.toss(nl + 1);
+        }
+    }
+
+    fn finish(classifier: *StderrClassifier, reader: *std.Io.Reader) void {
+        classifier.consumeComplete(reader);
+        const tail = reader.buffered();
+        if (tail.len > 0) {
+            classifier.classifyLine(tail);
+            reader.toss(tail.len);
+        }
+    }
+
+    fn classifyLine(classifier: *StderrClassifier, raw: []const u8) void {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (line.len == 0) return;
+        classifier.saw_line = true;
+        if (!isBenignWalkError(line)) classifier.all_benign_walk_errors = false;
+    }
+
+    fn ok(classifier: StderrClassifier) bool {
+        return classifier.saw_line and classifier.all_benign_walk_errors;
+    }
+};
+
+fn isBenignWalkError(line: []const u8) bool {
+    if (std.mem.eql(u8, line, "rg: .") or std.mem.startsWith(u8, line, "rg: .: ")) return false;
+    const benign = [_][]const u8{
+        "(os error 13)",
+        "(os error 1)",
+        "(os error 2)",
+        "(os error 20)",
+        "(os error 40)",
+    };
+    for (benign) |needle| {
+        if (std.mem.find(u8, line, needle) != null) return true;
+    }
+    return false;
+}
+
 /// What `argv` (ripgrep, run in `root`) prints, read in slices of 100 ms so
 /// that `stop` and the deadline are looked at while it runs.
 fn runLister(
@@ -159,13 +207,14 @@ fn runLister(
         .cwd = .{ .path = root },
         .stdin = .ignore,
         .stdout = .pipe,
-        .stderr = .ignore,
+        .stderr = .pipe,
     });
     defer child.kill(io);
-    var streams: std.Io.File.MultiReader.Buffer(1) = undefined;
+    var streams: std.Io.File.MultiReader.Buffer(2) = undefined;
     var reader: std.Io.File.MultiReader = undefined;
-    reader.init(gpa, io, streams.toStreams(), &.{child.stdout.?});
+    reader.init(gpa, io, streams.toStreams(), &.{ child.stdout.?, child.stderr.? });
     defer reader.deinit();
+    var stderr_classifier: StderrClassifier = .{};
     const deadline_ns = sys.monotonicNs() + list_timeout_ns;
     const poll_timeout: std.Io.Timeout = .{
         .duration = .{ .raw = .fromMilliseconds(list_poll_ms), .clock = .awake },
@@ -176,11 +225,14 @@ fn runLister(
             error.Timeout => {},
             else => |other| return other,
         };
+        stderr_classifier.consumeComplete(reader.reader(1));
         if (stop) |stop_flag| if (stop_flag.load(.acquire)) return error.Canceled;
         if (sys.monotonicNs() >= deadline_ns) return error.Timeout;
         if (reader.reader(0).buffered().len > list_output_bytes_max) return error.StreamTooLong;
+        if (reader.reader(1).buffered().len > list_output_bytes_max) return error.StreamTooLong;
     }
     try reader.checkAnyError();
+    stderr_classifier.finish(reader.reader(1));
     if (child.id) |pid| {
         if (!waitListerExit(pid, deadline_ns, stop)) {
             if (stop) |stop_flag| if (stop_flag.load(.acquire)) return error.Canceled;
@@ -189,9 +241,14 @@ fn runLister(
     }
     const term = try child.wait(io);
     // rg --files exits 0 when files are found and 1 when none match; exit 2
-    // or a signal (e.g. OOM-kill) must not be mistaken for an empty tree.
+    // is accepted only when every stderr line is a benign traversal error
+    // (such as an unreadable directory below the root), never a root or flag error.
     switch (term) {
-        .exited => |code| if (code != 0 and code != 1) return error.Failed,
+        .exited => |code| switch (code) {
+            0, 1 => {},
+            2 => if (!stderr_classifier.ok()) return error.Failed,
+            else => return error.Failed,
+        },
         else => return error.Failed,
     }
     return reader.toOwnedSlice(0);
@@ -580,4 +637,38 @@ test "stat does not follow symlinks" {
     const got = try listTree(arena_state.allocator(), &tree, true);
     try testing.expectEqual(@as(usize, 1), got.len);
     try testing.expectEqualStrings(real_path, got[0].path);
+}
+
+test "runLister rejects exit 2 on root or flag errors but list keeps readable files beside chmod 000" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+
+    try testing.expectError(error.Failed, runLister(
+        testing.allocator,
+        testing.io,
+        &.{ "sh", "-c", "printf 'rg: .: Permission denied (os error 13)\\n' >&2; exit 2" },
+        tree.absolute,
+        null,
+    ));
+    try testing.expectError(error.Failed, runLister(
+        testing.allocator,
+        testing.io,
+        &.{ "sh", "-c", "printf 'rg: unrecognized flag\\n' >&2; exit 2" },
+        tree.absolute,
+        null,
+    ));
+
+    if (linux.geteuid() == 0) return error.SkipZigTest;
+    try tree.write("ok/a.txt", "hello world\n");
+    try tree.write("locked/hidden.txt", "secret text\n");
+    var locked_buf: paths.Buffer = undefined;
+    const locked = try tree.path(&locked_buf, "locked");
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(locked, 0o000)));
+    defer _ = linux.chmod(locked, 0o700);
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const got = try listTree(arena_state.allocator(), &tree, true);
+    try testing.expectEqual(@as(usize, 1), got.len);
+    try testing.expect(std.mem.endsWith(u8, got[0].path, "/ok/a.txt"));
 }

@@ -281,6 +281,7 @@ pub const Error = sys.Error || error{
     /// may finish, so this says nothing about the document.
     ToolKilled,
     Timeout,
+    Cancelled,
 };
 
 /// How many bytes of markup an Office document may have per byte of text
@@ -338,6 +339,7 @@ fn runTool(
     };
     gpa.free(result.stderr);
     errdefer gpa.free(result.stdout);
+    if (result.cancelled) return error.Cancelled;
     if (result.timed_out) return error.Timeout;
     if (result.capped) return result.stdout;
     const code = result.code orelse return error.ToolKilled;
@@ -1227,7 +1229,7 @@ test "runTool: size cap and timeout kill the tool" {
     var cancel: std.atomic.Value(bool) = .init(true);
     for ([_][]const u8{ "exec sleep 30", "exec >&-; exec sleep 30" }) |script| {
         const canceled_start_ns = sys.monotonicNs();
-        try testing.expectError(error.Timeout, runTool(
+        try testing.expectError(error.Cancelled, runTool(
             gpa,
             testing.io,
             &.{ "sh", "-c", script },
