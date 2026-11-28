@@ -75,6 +75,10 @@ pub fn extractText(
         return shrink(gpa, raw, bytes_max);
     }
 
+    // Markup outweighs text several times over; the cap only guards memory.
+    const xml_bytes_read_max = @max(bytes_max, @min(bytes_max *| xml_per_text_max, xml_bytes_max));
+    if (kind == .xlsx) return extractXlsx(gpa, io, fd, bytes_max, xml_bytes_read_max, cancel);
+
     var extra_arena: std.heap.ArenaAllocator = .init(gpa);
     defer extra_arena.deinit();
     var extra_members: []const []const u8 = &.{};
@@ -94,9 +98,8 @@ pub fn extractText(
     }
 
     const base_members: []const []const u8 = switch (kind) {
-        .pdf => unreachable, // Handled above.
+        .pdf, .xlsx => unreachable, // Handled above.
         .docx => &docx_base_members,
-        .xlsx => &.{ "xl/sharedStrings.xml", "xl/worksheets/sheet*.xml" },
         .pptx => &.{"ppt/slides/slide*.xml"},
         .odt, .ods, .odp => &.{"content.xml"},
     };
@@ -105,8 +108,6 @@ pub fn extractText(
     @memcpy(members_buf[0..base_members.len], base_members);
     @memcpy(members_buf[base_members.len..members_len], extra_members);
 
-    // Markup outweighs text several times over; the cap only guards memory.
-    const xml_bytes_read_max = @max(bytes_max, @min(bytes_max *| xml_per_text_max, xml_bytes_max));
     const xml = try runUnzipMembers(
         gpa,
         io,
@@ -116,11 +117,53 @@ pub fn extractText(
         cancel,
     );
     defer gpa.free(xml);
-    const extracted = if (kind == .xlsx)
-        try xlsxXmlToText(gpa, xml, bytes_max)
-    else
-        try xmlToText(gpa, xml, bytes_max);
-    return shrink(gpa, extracted, bytes_max);
+    return shrink(gpa, try xmlToText(gpa, xml, bytes_max), bytes_max);
+}
+
+/// The text of an xlsx: its shared strings, then the inline strings of its
+/// sheets. Each read by an unzip of its own, shared strings first: unzip
+/// writes members in archive order, not the order asked for, and Excel and
+/// openpyxl put the sheets first. A workbook whose sheets passed the cap
+/// (~100 k rows of numbers) was cached with none of its strings.
+fn extractXlsx(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    fd: i32,
+    bytes_max: usize,
+    xml_bytes_read_max: usize,
+    cancel: ?*const std.atomic.Value(bool),
+) ExtractError![]u8 {
+    const shared_xml = try runUnzipMembers(
+        gpa,
+        io,
+        fd,
+        &.{"xl/sharedStrings.xml"},
+        xml_bytes_read_max,
+        cancel,
+    );
+    defer gpa.free(shared_xml);
+    const shared = try xlsxXmlToText(gpa, shared_xml, bytes_max);
+    // The sheets get what is left of both caps. Shared strings cut at the
+    // cap leave none, so a truncated tag is never joined to a sheet's.
+    const sheets_xml_bytes_max = xml_bytes_read_max - shared_xml.len;
+    if (sheets_xml_bytes_max == 0 or shared.len >= bytes_max) return shrink(gpa, shared, bytes_max);
+    defer gpa.free(shared);
+    // The first unzip read `fd` to EOF; rewind before reading the sheets.
+    _ = linux.lseek(fd, 0, linux.SEEK.SET);
+    const sheets_xml = try runUnzipMembers(
+        gpa,
+        io,
+        fd,
+        &.{"xl/worksheets/sheet*.xml"},
+        sheets_xml_bytes_max,
+        cancel,
+    );
+    defer gpa.free(sheets_xml);
+    const separator = if (shared.len > 0) "\n" else "";
+    const sheets = try xlsxXmlToText(gpa, sheets_xml, bytes_max - shared.len - separator.len);
+    defer gpa.free(sheets);
+    const text = try std.mem.concat(gpa, u8, &.{ shared, if (sheets.len > 0) separator else "", sheets });
+    return shrink(gpa, text, bytes_max);
 }
 
 const docx_rels_bytes_max = 256 << 10;
@@ -948,6 +991,44 @@ test "extract docx, xlsx, pptx (OOXML)" {
     // A wildcard in the file name must not reach unzip as a pattern.
     try zipInto(&test_dir, "x", "bo*.xlsx");
     try expectExtract(&test_dir, "bo*.xlsx", "Revenue\nCoste unitario");
+}
+
+test "extract xlsx: shared strings stored after sheets past the cap are still read" {
+    var test_dir: TestDir = undefined;
+    try test_dir.init();
+    defer test_dir.deinit();
+    const bytes_max = 1024;
+    // Numbers only, well past what is read of the markup for `bytes_max`.
+    var sheet: std.ArrayList(u8) = .empty;
+    defer sheet.deinit(testing.allocator);
+    try sheet.appendSlice(testing.allocator, "<?xml version=\"1.0\"?><worksheet><sheetData>");
+    for (0..2000) |row| {
+        try sheet.print(testing.allocator, "<row r=\"{d}\"><c><v>{d}</v></c></row>", .{ row + 1, row * 7 });
+    }
+    try sheet.appendSlice(testing.allocator, "</sheetData></worksheet>");
+    try testing.expect(sheet.items.len > bytes_max * xml_per_text_max);
+    try test_dir.write("big/xl/worksheets/sheet1.xml", sheet.items);
+    try test_dir.write(
+        "big/xl/sharedStrings.xml",
+        "<?xml version=\"1.0\"?><sst><si><t>QuarterlyRevenueHeader</t></si></sst>",
+    );
+    // In Excel's order: the sheets, then the shared strings.
+    var folder_buffer: [256]u8 = undefined;
+    const folder = try std.mem.print(&folder_buffer, "{s}/big", .{test_dir.absolute});
+    const result = std.process.run(testing.allocator, testing.io, .{
+        .argv = &.{ "zip", "-q", "-X", "../big.xlsx", "xl/worksheets/sheet1.xml", "xl/sharedStrings.xml" },
+        .cwd = .{ .path = folder },
+    }) catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    testing.allocator.free(result.stdout);
+    testing.allocator.free(result.stderr);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+
+    const got = try test_dir.extract("big.xlsx", bytes_max);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("QuarterlyRevenueHeader", got);
 }
 
 /// Zips `folder` into `name` at the test dir's top level, members (relative

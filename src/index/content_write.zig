@@ -146,6 +146,10 @@ pub fn writeDocs(
         std.mem.writeInt(u64, table[cursor..][0..8], doc.size, .little);
         cursor += @sizeOf(u64);
     }
+    for (docs) |doc| {
+        std.mem.writeInt(i64, table[cursor..][0..8], doc.ctime, .little);
+        cursor += @sizeOf(i64);
+    }
     var path_offset: usize = paths_offset;
     for (docs, 0..) |doc, doc_index| {
         if (doc_index < reused.len) {
@@ -365,6 +369,9 @@ pub fn finish(
     directory: []const SegmentEntry,
     docs_count: usize,
     table: DocTableWritten,
+    /// `Header.whole_segments_count`: the directory's length for a whole
+    /// build, the old index's for an update.
+    whole_segments_count: usize,
 ) WriteError!Header {
     try sink.padToAlignment();
     const directory_offset = sink.position();
@@ -389,6 +396,8 @@ pub fn finish(
         .docs_offset = table.offset,
         .directory_offset = directory_offset,
         .size_total = size_total,
-        .reserved = @splat(0),
+        // An update that merged the whole build's last small segments
+        // leaves fewer.
+        .whole_segments_count = @min(whole_segments_count, directory.len),
     };
 }

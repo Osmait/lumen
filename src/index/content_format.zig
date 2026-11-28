@@ -1,7 +1,7 @@
 //! The content index file's layout, which the writer (`content_write.zig`)
 //! and the reader (`ContentIndex.zig`) share:
 //!
-//!   header | doc table (columns: mtime, size, path offset, path size,
+//!   header | doc table (columns: mtime, size, ctime, path offset, path size,
 //!   source, flags) | paths | segments (sorted trigram keys, list offsets,
 //!   posting lists) | segment directory
 //!
@@ -24,7 +24,9 @@ const fold = @import("core").fold;
 /// 05: trigrams fold NFD combining diacritics onto their base letter (`core.fold`).
 /// 06: DOCX extraction includes linked headers and footers.
 /// 07: doc table stores nanosecond mtimes.
-pub const magic = "LUMCTX07";
+/// 08: XLSX shared strings are read apart from the sheets (text cache -v3),
+/// and the doc table stores ctimes.
+pub const magic = "LUMCTX08";
 pub const header_size = 64;
 
 /// The first bytes of the file. The doc table's columns and the segments'
@@ -44,7 +46,10 @@ pub const Header = extern struct {
     /// header at what it added: bytes past this are an update whose header
     /// never got written.
     size_total: u64,
-    reserved: [8]u8,
+    /// Segments the last whole build made, which updates carry over: those
+    /// updates added since are `segments_count` minus this. 0 in files
+    /// written before it was kept (these bytes were reserved, always 0).
+    whole_segments_count: u64,
 
     comptime {
         assert(builtin.cpu.arch.endian() == .little);
@@ -55,6 +60,7 @@ pub const Header = extern struct {
         assert(@offsetOf(Header, "docs_offset") == 32);
         assert(@offsetOf(Header, "directory_offset") == 40);
         assert(@offsetOf(Header, "size_total") == 48);
+        assert(@offsetOf(Header, "whole_segments_count") == 56);
     }
 
     pub fn encode(header: Header) [header_size]u8 {
@@ -83,15 +89,16 @@ pub const SegmentEntry = extern struct {
 };
 
 /// The doc table's columns, one after another, each `docs_count` long:
-/// mtime, size, path offset, path size, source, flags. `writeDocs` writes
-/// them in this order and `DocColumns.parse` reads them back.
-pub const doc_size = @sizeOf(i64) + @sizeOf(u64) + @sizeOf(u32) + @sizeOf(u16) + 1 + 1;
+/// mtime, size, ctime, path offset, path size, source, flags. `writeDocs`
+/// writes them in this order and `DocColumns.parse` reads them back.
+pub const doc_size = @sizeOf(i64) + @sizeOf(u64) + @sizeOf(i64) +
+    @sizeOf(u32) + @sizeOf(u16) + 1 + 1;
 
 comptime {
     // The columns go from the widest to the narrowest, so each one stays
     // aligned whatever `docs_count` is, as long as the table starts
     // 8-aligned.
-    assert(doc_size == 24);
+    assert(doc_size == 32);
 }
 
 /// A document whose old version an update replaced, or that is gone.
@@ -110,6 +117,11 @@ pub const DocIn = struct {
     mtime: i64,
     size: u64,
     source: Source = .plain,
+    /// Change time in nanoseconds (0: not known). A file replaced by one
+    /// with the same mtime and size (`cp -p`, `rsync -t`, `touch -r`) has
+    /// another: compared with mtime and size to tell a version, never part
+    /// of the text cache's key.
+    ctime: i64 = 0,
 };
 
 /// Trigrams of folded text, packed in 24 bits each: "Acción" gives "acc",
@@ -385,7 +397,7 @@ test "content: the header struct lays out the bytes LUMCTX04 always had" {
         .docs_offset = 4,
         .directory_offset = 5,
         .size_total = 6,
-        .reserved = @splat(0),
+        .whole_segments_count = 0,
     };
     // The layout as it was written field by field before `Header` existed.
     var expected: [header_size]u8 = @splat(0);

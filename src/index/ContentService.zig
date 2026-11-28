@@ -2,7 +2,8 @@
 //!
 //! Text changes far less often than names, so this does not watch files: it
 //! lists them again (~150 ms with ripgrep) on start, every few minutes and
-//! when the window opens, and compares (path, mtime, size) with the index.
+//! when the window opens, and compares (path, mtime, size, ctime) with the
+//! index.
 //! What changed is read again and added to the index (`content.update`);
 //! the rest is not touched. Once removed versions or segments pile up, it
 //! is rebuilt whole (~1.1 s and ~270 MB for 49 k files). Like the name
@@ -58,7 +59,9 @@ pub const Options = struct {
     /// Opening the window asks for a refresh, at most this often.
     poke_interval_ns_min: u64 = 30 * std.time.ns_per_s,
     /// Rebuilt whole instead of updated past this share of removed
-    /// documents (in percent), or this many segments.
+    /// documents (in percent), or this many segments added by updates
+    /// (those of the whole build do not count: a large corpus has more
+    /// than this from the start, and rebuilding gives them back).
     removed_percent_max: u8 = 20,
     segments_max: usize = 32,
     /// The name index over the same root: while it saw no name change that
@@ -74,7 +77,8 @@ pub const Options = struct {
     on_published: ?OnPublished = null,
     /// Minimum backoff between extraction retries for transient failures (doubles per try).
     extract_retry_backoff_ns: u64 = 5 * 60 * std.time.ns_per_s,
-    /// Backoff before retrying extractions after ENOSPC/EACCES writing the text cache.
+    /// Backoff before retrying extractions once writing the text cache
+    /// failed (full, read-only, no access).
     cache_write_backoff_ns: u64 = 10 * 60 * std.time.ns_per_s,
 };
 
@@ -120,6 +124,10 @@ const RetryEntry = struct {
     doc: content.DocIn,
     attempts: u8,
     next_retry_ns: u64,
+    /// Its re-extraction failed (`Diff.reextract`): the document is still
+    /// in the index, and is tried again through `reextract` while its text
+    /// is missing, never added a second time.
+    indexed: bool = false,
 };
 
 /// State only the service thread reads or writes, so it needs no lock and no
@@ -144,8 +152,23 @@ const Worker = struct {
     /// backoff so a pathological file does not thrash forever. In `retry_arena`.
     retry: []RetryEntry = &.{},
     retry_arena: std.heap.ArenaAllocator,
-    /// Monotonic deadline until which cache writes reported ENOSPC/EACCES.
+    /// Monotonic deadline until which writing the text cache failed.
     cache_unwritable_until_ns: u64 = 0,
+    /// Files the builds could not read (EACCES, EIO: the index marks them
+    /// removed), left out of what a listing adds while they stay as they
+    /// were: one root-owned 0600 file under $HOME made every listing an
+    /// update (two fsyncs, a new version, another removed row). Paths owned
+    /// by `ContentService.gpa`.
+    unreadable: std.ArrayList(Unreadable) = .empty,
+};
+
+/// A file a build could not read, as it was then. Its ctime too: `chmod`
+/// makes it readable without changing its mtime or size.
+const Unreadable = struct {
+    path: []const u8,
+    mtime: i64,
+    size: u64,
+    ctime: i64,
 };
 
 /// The thread pools it borrows: they must outlive the service.
@@ -216,6 +239,8 @@ pub fn shutdown(service: *ContentService) void {
     if (service.thread) |thread| thread.join();
     if (service.index) |shared| shared.release();
     service.worker.retry_arena.deinit();
+    for (service.worker.unreadable.items) |entry| service.gpa.free(entry.path);
+    service.worker.unreadable.deinit(service.gpa);
     service.gpa.free(service.root);
     service.gpa.free(service.cache_path);
     service.text_cache.deinit(service.gpa);
@@ -517,11 +542,14 @@ fn priorRetry(service: *const ContentService, doc: content.DocIn) ?RetryEntry {
 /// (a PDF takes 10-40 ms, a whole book up to ~0.7 s). Documents that cannot
 /// be extracted (a corrupt file, or repeatedly hitting Timeout/ToolKilled)
 /// get an empty cache file so they do not thrash every refresh. Unwritable
-/// caches (ENOSPC/EACCES) pause extraction for `cache_write_backoff_ns`.
+/// caches (full, read-only, no access) pause extraction for `cache_write_backoff_ns`.
+/// `indexed`: `docs` are in the index already (`Diff.reextract`), which
+/// the retry entries left say (`RetryEntry.indexed`).
 fn extractMissing(
     service: *ContentService,
     arena: std.mem.Allocator,
     docs: []content.DocIn,
+    indexed: bool,
 ) ?ExtractOutcome {
     const now_ns = sys.monotonicNs();
     const cache_blocked = now_ns < service.worker.cache_unwritable_until_ns;
@@ -534,6 +562,9 @@ fn extractMissing(
         if (doc.source != .extracted) continue;
         const text_path = service.text_cache.path(&path_buffer, doc) orelse continue;
         if (sys.exists(text_path)) continue;
+        // Cached by an older version under another name: renamed, not
+        // extracted again (an upgrade found no index to sweep by).
+        if (service.text_cache.adoptLegacy(doc)) continue;
         const prior = service.priorRetry(doc);
         const attempts: u8 = if (prior) |p| p.attempts else 0;
         const waiting_backoff = prior != null and now_ns < prior.?.next_retry_ns;
@@ -574,6 +605,7 @@ fn extractMissing(
     };
     @memset(failed, null);
     if (missing.items.len > 0) {
+        service.text_cache.ensureDirectory();
         var context: ExtractContext = .{
             .service = service,
             .docs = docs,
@@ -583,7 +615,7 @@ fn extractMissing(
         service.build_pool.run(missing.items.len, &context, ExtractContext.extractOne);
         if (service.stop.load(.acquire)) return null;
     }
-    return service.leaveOut(
+    const outcome = service.leaveOut(
         arena,
         docs,
         missing.items,
@@ -592,7 +624,9 @@ fn extractMissing(
         deferred.items,
         deferred_indices.items,
         now_ns,
-    );
+    ) orelse return null;
+    for (outcome.retry) |*entry| entry.indexed = indexed;
+    return outcome;
 }
 
 /// What the build pool's workers share while `extractMissing` runs.
@@ -644,9 +678,9 @@ const ExtractContext = struct {
         defer if (text.len > 0) service.gpa.free(text);
         sys.writeFileAtomic(text_path, text) catch |err| {
             log.warn("caching text of {s}: {t}", .{ doc.path, err });
-            if (err == error.NoSpace or err == error.Access) {
-                context.cache_unwritable.store(true, .release);
-            }
+            // The same folder and names for every document: the next
+            // write would fail as well (full, read-only, gone).
+            context.cache_unwritable.store(true, .release);
             context.failed[missing_index] = .{ .err = err, .cache_write = true };
             return;
         };
@@ -698,10 +732,8 @@ fn leaveOut(
             continue;
         }
         if (failure.cache_write) {
-            if (failure.err == error.NoSpace or failure.err == error.Access) {
-                service.worker.cache_unwritable_until_ns =
-                    now_ns +| service.options.cache_write_backoff_ns;
-            }
+            service.worker.cache_unwritable_until_ns =
+                now_ns +| service.options.cache_write_backoff_ns;
             dropped[doc_index] = true;
             failed_new_count += 1;
             if (failed_first == null) failed_first = missing_index;
@@ -727,11 +759,9 @@ fn leaveOut(
                         .{ doc.path, next_attempts, failure.err },
                     );
                     continue;
-                } else |write_err| {
-                    if (write_err == error.NoSpace or write_err == error.Access) {
-                        service.worker.cache_unwritable_until_ns =
-                            now_ns +| service.options.cache_write_backoff_ns;
-                    }
+                } else |_| {
+                    service.worker.cache_unwritable_until_ns =
+                        now_ns +| service.options.cache_write_backoff_ns;
                 }
             }
         }
@@ -776,12 +806,15 @@ fn leaveOut(
     return .{ .docs = docs[0..kept_count], .retry = retry.items };
 }
 
-/// Persists `retry` in `worker.retry_arena` once a refresh finishes. Copied
+/// Persists the entries of `parts` in `worker.retry_arena` once a refresh
+/// finishes, in place of the list before: each part is what the refresh
+/// left of it (extracted again, or still waiting out its backoff,
+/// `Diff.waiting`), so none is forgotten with its attempt count. Copied
 /// into a new arena first: out of memory, the list before stays.
-fn commitRetry(service: *ContentService, retry: []const RetryEntry) void {
+fn commitRetry(service: *ContentService, parts: []const []const RetryEntry) void {
     service.assertWorkerThread();
     var fresh_arena: std.heap.ArenaAllocator = .init(service.gpa);
-    const copy = copyRetries(fresh_arena.allocator(), retry) catch {
+    const copy = copyRetries(fresh_arena.allocator(), parts) catch {
         fresh_arena.deinit();
         logOutOfMemory("keeping the documents to retry");
         return;
@@ -793,13 +826,17 @@ fn commitRetry(service: *ContentService, retry: []const RetryEntry) void {
 
 fn copyRetries(
     arena: std.mem.Allocator,
-    entries: []const RetryEntry,
+    parts: []const []const RetryEntry,
 ) std.mem.Allocator.Error![]RetryEntry {
-    const copy = try arena.alloc(RetryEntry, entries.len);
-    for (entries, copy) |entry, *dst| {
-        dst.* = entry;
-        dst.doc.path = try arena.dupe(u8, entry.doc.path);
-    }
+    var count: usize = 0;
+    for (parts) |entries| count += entries.len;
+    const copy = try arena.alloc(RetryEntry, count);
+    var next: usize = 0;
+    for (parts) |entries| for (entries) |entry| {
+        copy[next] = entry;
+        copy[next].doc.path = try arena.dupe(u8, entry.doc.path);
+        next += 1;
+    };
     return copy;
 }
 
@@ -814,6 +851,9 @@ const Diff = struct {
     gone: []u32,
     added: []content.DocIn,
     reextract: []content.DocIn = &.{},
+    /// Documents to retry that still wait out their backoff, as they were
+    /// (`indexedChanges`): kept for the next check.
+    waiting: []const RetryEntry = &.{},
 };
 
 /// Called on the service thread, the only one that replaces the index, so
@@ -832,6 +872,8 @@ fn diff(
         if (index.removed(id)) continue;
         ids.putAssumeCapacity(index.path(id), id);
     }
+    var unreadable: std.StringHashMapUnmanaged(Unreadable) = .empty;
+    for (service.worker.unreadable.items) |entry| try unreadable.put(arena, entry.path, entry);
     const seen = try arena.alloc(bool, index.docs_count);
     @memset(seen, false);
     var gone: std.ArrayList(u32) = .empty;
@@ -847,6 +889,9 @@ fn diff(
                 continue;
             }
             try gone.append(arena, id);
+            service.forgetReplacedText(index.docIn(id), doc);
+        } else if (unreadable.get(doc.path)) |entry| {
+            if (stillUnreadable(entry, doc)) continue;
         }
         try added.append(arena, doc);
     }
@@ -859,11 +904,72 @@ fn diff(
     return .{ .gone = gone.items, .added = added.items, .reextract = reextract.items };
 }
 
+/// Whether `doc` is the file a build could not read, unchanged since:
+/// reading it again would fail again.
+fn stillUnreadable(entry: Unreadable, doc: content.DocIn) bool {
+    return entry.mtime == doc.mtime and entry.size == doc.size and entry.ctime == doc.ctime;
+}
+
+/// Records the files the build of `input` could not read: those it added
+/// that `index`, the index built, marks removed. They replace what was
+/// recorded of the files it read again (all of them, for a whole build).
+fn commitUnreadable(service: *ContentService, input: BuildInput, index: *const content.Index) void {
+    service.assertWorkerThread();
+    const gpa = service.gpa;
+    const added: []const content.DocIn, const first_id = switch (input) {
+        .whole => |docs| .{ docs, 0 },
+        .update => |changed| .{ changed.added, index.docs_count - changed.added.len },
+    };
+    const entries = &service.worker.unreadable;
+    var kept_count: usize = 0;
+    for (entries.items) |entry| {
+        const read_again = input == .whole or for (added) |doc| {
+            if (std.mem.eql(u8, doc.path, entry.path)) break true;
+        } else false;
+        if (read_again) {
+            gpa.free(entry.path);
+            continue;
+        }
+        entries.items[kept_count] = entry;
+        kept_count += 1;
+    }
+    entries.shrinkRetainingCapacity(kept_count);
+    for (added, first_id..) |doc, id| {
+        if (!index.removed(@intCast(id))) continue;
+        // Out of memory: read again by the next listing, nothing worse.
+        entries.ensureUnusedCapacity(gpa, 1) catch return;
+        const owned = gpa.dupe(u8, doc.path) catch return;
+        entries.appendAssumeCapacity(.{
+            .path = owned,
+            .mtime = doc.mtime,
+            .size = doc.size,
+            .ctime = doc.ctime,
+        });
+    }
+}
+
 /// Whether `doc` is the version of document `id` that the index holds.
 fn unchanged(index: *const content.Index, id: u32, doc: content.DocIn) bool {
     if (index.mtimes[id] != doc.mtime) return false;
     if (index.sizes[id] != doc.size) return false;
+    if (index.ctimes[id] != doc.ctime) return false;
     return index.sources[id] == @backingInt(doc.source);
+}
+
+/// Deletes the cached text of `doc` when the file is another one than the
+/// version `indexed` was, under the same text cache key (mtime and size):
+/// replaced by one that kept both, which only its ctime tells. Its text is
+/// extracted again instead of reused.
+fn forgetReplacedText(service: *ContentService, indexed: content.DocIn, doc: content.DocIn) void {
+    if (doc.source != .extracted or indexed.source != .extracted) return;
+    if (indexed.mtime != doc.mtime or indexed.size != doc.size) return;
+    if (indexed.ctime == doc.ctime) return;
+    var text_path_buffer: paths.Buffer = undefined;
+    const text_path = service.text_cache.path(&text_path_buffer, doc) orelse return;
+    switch (linux.errno(linux.unlink(text_path))) {
+        .SUCCESS, .NOENT => {},
+        else => |errno| log.warn("deleting {s}: {t}", .{ text_path, errno }),
+    }
 }
 
 const ListingStamp = struct {
@@ -937,7 +1043,9 @@ fn indexedChanges(
             .plain => .text,
         });
         if (stat_now) |stat| {
-            const same = stat.mtime == doc.mtime and stat.size == doc.size;
+            const same = stat.mtime == doc.mtime and
+                stat.size == doc.size and
+                stat.ctime == doc.ctime;
             // Its extracted text gone from the cache (a cleaner emptied it):
             // re-extract into the cache without rebuilding the index.
             if (same) {
@@ -947,6 +1055,7 @@ fn indexedChanges(
                         .mtime = doc.mtime,
                         .size = doc.size,
                         .source = doc.source,
+                        .ctime = doc.ctime,
                     });
                 }
                 continue;
@@ -955,17 +1064,24 @@ fn indexedChanges(
         try gone.append(arena, id);
         // Gone, or out of bounds now: only removed.
         const stat = stat_now orelse continue;
-        try added.append(arena, .{
+        const now: content.DocIn = .{
             .path = doc.path,
             .mtime = stat.mtime,
             .size = stat.size,
             .source = doc.source,
-        });
+            .ctime = stat.ctime,
+        };
+        service.forgetReplacedText(doc, now);
+        try added.append(arena, now);
     }
     // Not in the index (`extractMissing` left them out): as they are now,
     // respecting retry backoff unless the file changed on disk.
     const now_ns = sys.monotonicNs();
+    var waiting: std.ArrayList(RetryEntry) = .empty;
     for (service.worker.retry) |entry| {
+        // Still in the index: back in `reextract` above while its text is
+        // missing. Added as well, the path had two live documents.
+        if (entry.indexed) continue;
         const doc = entry.doc;
         if (content_list.underAny(doc.path, service.worker.slow_mounts)) continue;
         const path = std.mem.printSentinel(&path_buffer, "{s}", .{doc.path}, 0) catch continue;
@@ -974,6 +1090,7 @@ fn indexedChanges(
         if (same_version and (now_ns < entry.next_retry_ns or
             now_ns < service.worker.cache_unwritable_until_ns))
         {
+            try waiting.append(arena, entry);
             continue;
         }
         try added.append(arena, .{
@@ -981,9 +1098,15 @@ fn indexedChanges(
             .mtime = stat.mtime,
             .size = stat.size,
             .source = .extracted,
+            .ctime = stat.ctime,
         });
     }
-    return .{ .gone = gone.items, .added = added.items, .reextract = reextract.items };
+    return .{
+        .gone = gone.items,
+        .added = added.items,
+        .reextract = reextract.items,
+        .waiting = waiting.items,
+    };
 }
 
 /// Whether the extracted text of `doc` is in the text cache.
@@ -1048,11 +1171,11 @@ fn refresh(service: *ContentService) void {
     // back into TextCache without rebuilding or deleting them via dropStale.
     if (service.index != null and changed.gone.len == 0 and changed.added.len == 0) {
         const extract_start_ns = sys.monotonicNs();
-        const reextracted = service.extractMissing(arena, changed.reextract) orelse return;
+        const reextracted = service.extractMissing(arena, changed.reextract, true) orelse return;
         service.counters.extract_ns_last.store(sys.monotonicNs() - extract_start_ns, .monotonic);
         if (service.stop.load(.acquire)) return;
         service.commitListing(listed);
-        service.commitRetry(reextracted.retry);
+        service.commitRetry(&.{ reextracted.retry, changed.waiting });
         if (reextracted.docs.len > 0) {
             const next_version = service.version.load(.monotonic) + 1;
             service.lock.lockUncancelable(service.io);
@@ -1071,19 +1194,26 @@ fn refresh(service: *ContentService) void {
     }
     var start_ns = sys.monotonicNs();
     const extracted = if (whole)
-        service.extractMissing(arena, docs.?) orelse return
+        service.extractMissing(arena, docs.?, false) orelse return
     else
-        service.extractMissing(arena, changed.added) orelse return;
+        service.extractMissing(arena, changed.added, false) orelse return;
     if (whole) docs = extracted.docs else changed.added = extracted.docs;
+    // What failed to re-extract keeps its attempts and backoff.
+    var reextract_retry: []const RetryEntry = &.{};
     if (!whole and changed.reextract.len > 0) {
-        _ = service.extractMissing(arena, changed.reextract);
+        if (service.extractMissing(arena, changed.reextract, true)) |reextracted| {
+            reextract_retry = reextracted.retry;
+        }
     }
     service.counters.extract_ns_last.store(sys.monotonicNs() - start_ns, .monotonic);
     if (service.stop.load(.acquire)) return;
+    // A whole build listed every file: `changed.waiting` is empty and what
+    // still waits is in `extracted.retry`.
+    const retry = [_][]const RetryEntry{ extracted.retry, reextract_retry, changed.waiting };
     // Only documents to retry, which failed again.
     if (!whole and changed.gone.len == 0 and changed.added.len == 0) {
         service.commitListing(listed);
-        service.commitRetry(extracted.retry);
+        service.commitRetry(&retry);
         return;
     }
     start_ns = sys.monotonicNs();
@@ -1107,7 +1237,8 @@ fn refresh(service: *ContentService) void {
         break :blk old;
     };
     service.commitListing(listed);
-    service.commitRetry(extracted.retry);
+    service.commitRetry(&retry);
+    service.commitUnreadable(input, &fresh.index);
     if (service.options.on_published) |hook| hook.callback(hook.context);
     if (old) |old_shared| {
         // The service's reference: a search still reading it keeps it
@@ -1216,10 +1347,15 @@ const garbage_percent_max = 30;
 /// behind (removed versions, small segments, unused bytes) has piled up.
 fn wantsWhole(service: *const ContentService, changed: Diff) bool {
     const index = service.current() orelse return true;
+    return garbagePiledUp(index, changed, service.options);
+}
+
+fn garbagePiledUp(index: *const content.Index, changed: Diff, options: Options) bool {
     const removed_count = index.docs_removed_count + changed.gone.len;
     const docs_count = index.docs_count + changed.added.len;
-    if (removed_count * 100 > docs_count * service.options.removed_percent_max) return true;
-    if (index.segments_count >= service.options.segments_max) return true;
+    if (removed_count * 100 > docs_count * options.removed_percent_max) return true;
+    const segments_added = index.segments_count -| index.whole_segments_count;
+    if (segments_added >= options.segments_max) return true;
     return @as(u128, index.bytes.len) * 100 >
         @as(u128, index.bytes_live) * (100 + garbage_percent_max);
 }
@@ -1671,6 +1807,20 @@ test "content service: with the name index, checks without name changes only loo
     try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "cherry")).len);
 }
 
+test "content service: only segments added by updates count toward a whole rebuild" {
+    var index = try @import("content_testing.zig").smallIndex(testing.allocator);
+    defer index.deinit(testing.allocator);
+    try testing.expectEqual(index.segments_count, index.whole_segments_count);
+    const options: Options = .{ .segments_max = index.segments_count, .removed_percent_max = 100 };
+    const one_edit: Diff = .{ .gone = &.{}, .added = &.{} };
+    // As many segments as the limit, all the whole build's: an edit is
+    // appended, as it would be for a smaller corpus.
+    try testing.expect(!garbagePiledUp(&index, one_edit, options));
+    // A file from before the count was kept: all are taken as added.
+    index.whole_segments_count = 0;
+    try testing.expect(garbagePiledUp(&index, one_edit, options));
+}
+
 test "content service: rebuilt whole once removed versions pile up" {
     var fixture: Fixture = undefined;
     try fixture.init();
@@ -1948,7 +2098,7 @@ test "content service: a document whose extraction failed in passing is left out
         &.{},
         now,
     ).?;
-    service.commitRetry(first.retry);
+    service.commitRetry(&.{first.retry});
     const kept = first.docs;
     try testing.expectEqual(@as(usize, 1), kept.len);
     try testing.expect(std.mem.endsWith(u8, kept[0].path, "/b.txt"));
@@ -2000,7 +2150,7 @@ test "content service: a document whose extraction failed in passing is left out
         &.{},
         now,
     ).?;
-    service.commitRetry(third.retry);
+    service.commitRetry(&.{third.retry});
     try testing.expectEqual(@as(usize, 0), service.worker.retry.len);
     try testing.expectEqual(@as(usize, 1), third.docs.len);
     try testing.expect(service.textCached(changes_found.added[0]));
@@ -2019,6 +2169,101 @@ test "content service: a document whose extraction failed in passing is left out
     try testing.expect(service.worker.cache_unwritable_until_ns > now);
     try testing.expectEqual(@as(usize, 1), enospc.retry.len);
     try testing.expectEqual(@as(u8, 0), enospc.retry[0].attempts);
+}
+
+test "content service: a failed re-extraction is retried in place, and retries waiting their backoff are kept" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    var cache_dir = try TestTree.init();
+    defer cache_dir.deinit();
+    try tree.write("a.pdf", "not really a pdf");
+    try tree.write("b.txt", "plain words here");
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const pool = try Pool.create(testing.allocator, testing.io, 0);
+    defer pool.destroy();
+    var service: ContentService = .{
+        .gpa = testing.allocator,
+        .io = testing.io,
+        .root = tree.absolute,
+        .cache_path = undefined,
+        .text_cache = try TextCache.init(testing.allocator, cache_dir.absolute),
+        .search_pool = pool,
+        .build_pool = pool,
+        .options = .{},
+        .worker = .{
+            .thread_id = std.Thread.getCurrentId(),
+            .retry_arena = .init(testing.allocator),
+        },
+    };
+    defer service.text_cache.deinit(testing.allocator);
+    defer service.worker.retry_arena.deinit();
+    const docs = content_list.list(arena, testing.allocator, testing.io, tree.absolute, .{
+        .documents = true,
+    }) catch |err| switch (err) {
+        // Without ripgrep.
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    try testing.expectEqual(@as(usize, 2), docs.len);
+    const pdf = docs[0];
+    try testing.expectEqual(content.Source.extracted, pdf.source);
+    var text_path_buffer: paths.Buffer = undefined;
+    const text_path = service.text_cache.path(&text_path_buffer, pdf).?;
+    try sys.writeFileAtomic(text_path, "extracted words");
+    const reader: content.TextReader = .{ .read = textOf, .context = &service };
+    service.index = try Shared.create(
+        testing.allocator,
+        try content.build(testing.allocator, pool, docs, reader, null),
+        1,
+    );
+    defer service.index.?.release();
+
+    // A cleaner deleted its text, and extracting it again failed: retried later.
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.unlink(text_path)));
+    const missing = try service.indexedChanges(arena);
+    try testing.expectEqual(@as(usize, 0), missing.added.len);
+    try testing.expectEqual(@as(usize, 1), missing.reextract.len);
+    service.commitRetry(&.{&.{.{
+        .doc = pdf,
+        .attempts = 1,
+        .next_retry_ns = sys.monotonicNs() + 60 * std.time.ns_per_s,
+        .indexed = true,
+    }}});
+    // Waiting its backoff: left out of what is extracted, kept with its attempts.
+    const reextracted = service.extractMissing(arena, missing.reextract, true).?;
+    try testing.expectEqual(@as(usize, 0), reextracted.docs.len);
+    try testing.expectEqual(@as(usize, 1), reextracted.retry.len);
+    try testing.expect(reextracted.retry[0].indexed);
+    try testing.expectEqual(@as(u8, 1), reextracted.retry[0].attempts);
+
+    // Backoff over: tried again through `reextract`, never added as a second
+    // document of the same path (which then deleted the text both shared).
+    service.worker.retry[0].next_retry_ns = 0;
+    const due = try service.indexedChanges(arena);
+    try testing.expectEqual(@as(usize, 0), due.gone.len);
+    try testing.expectEqual(@as(usize, 0), due.added.len);
+    try testing.expectEqual(@as(usize, 1), due.reextract.len);
+
+    // A document left out of the index, waiting its backoff, survives a
+    // refresh that built something else.
+    try tree.write("c.pdf", "not really a pdf either");
+    var c_buffer: paths.Buffer = undefined;
+    const c_path = try tree.path(&c_buffer, "c.pdf");
+    const c_stat = content_list.stat(c_path, .document).?;
+    service.commitRetry(&.{&.{.{
+        .doc = .{ .path = c_path, .mtime = c_stat.mtime, .size = c_stat.size, .source = .extracted },
+        .attempts = 2,
+        .next_retry_ns = sys.monotonicNs() + 60 * std.time.ns_per_s,
+    }}});
+    const waiting = try service.indexedChanges(arena);
+    try testing.expectEqual(@as(usize, 0), waiting.added.len);
+    try testing.expectEqual(@as(usize, 1), waiting.waiting.len);
+    service.commitRetry(&.{ &.{}, &.{}, waiting.waiting });
+    try testing.expectEqual(@as(usize, 1), service.worker.retry.len);
+    try testing.expectEqualStrings(c_path, service.worker.retry[0].doc.path);
+    try testing.expectEqual(@as(u8, 2), service.worker.retry[0].attempts);
 }
 
 test "a shared index outlives the service's reference while a search holds one" {
@@ -2178,6 +2423,129 @@ test "content service: missing cached text is re-extracted and kept instead of d
     try testing.expectEqual(@as(u32, 2), service.status().extractions);
 }
 
+test "content service: an upgrade with an unreadable index reuses texts cached under older names" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    if (!haveTool("zip") or !haveTool("unzip")) return error.SkipZigTest;
+
+    var stage = try TestTree.init();
+    defer stage.deinit();
+    try stage.write("mimetype", "application/vnd.oasis.opendocument.text");
+    try stage.write(
+        "content.xml",
+        "<?xml version=\"1.0\"?><office:document-content><text:p>wombat notes</text:p></office:document-content>",
+    );
+    var path_buffer: paths.Buffer = undefined;
+    const notes = try fixture.root.path(&path_buffer, "notes.odt");
+    const zip_res = try std.process.run(testing.allocator, testing.io, .{
+        .argv = &.{ "zip", "-q", "-X", "-r", notes, "." },
+        .cwd = .{ .path = stage.absolute },
+    });
+    testing.allocator.free(zip_res.stdout);
+    testing.allocator.free(zip_res.stderr);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, zip_res.term);
+    const mtime_second = sys.nowSeconds() - 200;
+    try setMtimeNs(notes, @intCast(mtime_second), 123_456_789);
+    {
+        const first = try fixture.start();
+        defer first.shutdown();
+        try waitChecks(first, 1);
+        try testing.expectEqual(@as(u32, 1), first.status().extractions);
+    }
+
+    // What the version before named it (mtime in whole seconds), and an
+    // index of an older format: nothing to sweep by on start.
+    const size = sys.info(notes).?.size;
+    var hash_hex: [32]u8 = undefined;
+    var now_buffer: paths.Buffer = undefined;
+    var old_buffer: paths.Buffer = undefined;
+    const now_name = try std.mem.printSentinel(&now_buffer, "{s}/text/{s}-{d}-{d}.txt", .{
+        fixture.cache.absolute,
+        TextCache.pathHashHex(&hash_hex, notes),
+        mtime_second * std.time.ns_per_s + 123_456_789,
+        size,
+    }, 0);
+    const old_name = try std.mem.printSentinel(&old_buffer, "{s}/text/{s}-{d}-{d}.txt", .{
+        fixture.cache.absolute,
+        TextCache.pathHashHex(&hash_hex, notes),
+        mtime_second,
+        size,
+    }, 0);
+    try sys.rename(now_name, old_name);
+    var index_buffer: paths.Buffer = undefined;
+    const index_path = try fixture.cache.path(&index_buffer, "content.idx");
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.unlink(index_path)));
+
+    const service = try fixture.start();
+    defer service.shutdown();
+    try waitChecks(service, 1);
+    try testing.expectEqual(@as(u32, 0), service.status().extractions);
+    try testing.expect(sys.exists(now_name));
+    try testing.expect(!sys.exists(old_name));
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "wombat")).len);
+}
+
+test "content service: a text cache folder deleted while running is made again" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    if (!haveTool("zip") or !haveTool("unzip")) return error.SkipZigTest;
+
+    var stage = try TestTree.init();
+    defer stage.deinit();
+    try stage.write("[Content_Types].xml", "<?xml version=\"1.0\"?><Types/>");
+    try stage.write(
+        "word/document.xml",
+        \\<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Minutes about the tapir project</w:t></w:r></w:p></w:body></w:document>
+        ,
+    );
+    var path_buffer: paths.Buffer = undefined;
+    const report = try fixture.root.path(&path_buffer, "report.docx");
+    const zip_res = try std.process.run(testing.allocator, testing.io, .{
+        .argv = &.{ "zip", "-q", "-X", "-r", report, "." },
+        .cwd = .{ .path = stage.absolute },
+    });
+    testing.allocator.free(zip_res.stdout);
+    testing.allocator.free(zip_res.stderr);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, zip_res.term);
+    try setMtime(report, sys.nowSeconds() - 200);
+
+    const service = try fixture.startWith(.{
+        .refresh_interval_ns = std.math.maxInt(u64),
+        .poke_interval_ns_min = 0,
+        .removed_percent_max = 100,
+        .cache_write_backoff_ns = 0,
+    });
+    defer service.shutdown();
+    try waitChecks(service, 1);
+    try testing.expectEqual(@as(u32, 1), service.status().extractions);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "tapir")).len);
+
+    // A cleaner empties the cache, folder and all.
+    const rm_res = try std.process.run(testing.allocator, testing.io, .{
+        .argv = &.{ "rm", "-rf", service.text_cache.directory },
+    });
+    testing.allocator.free(rm_res.stdout);
+    testing.allocator.free(rm_res.stderr);
+    var directory_buffer: paths.Buffer = undefined;
+    const directory = try std.mem.printSentinel(
+        &directory_buffer,
+        "{s}",
+        .{service.text_cache.directory},
+        0,
+    );
+    try testing.expect(!sys.exists(directory));
+
+    try pokeAndWait(service);
+    try testing.expect(sys.exists(directory));
+    try testing.expectEqual(@as(u32, 2), service.status().extractions);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "tapir")).len);
+    // Cached again: not extracted on the next check.
+    try pokeAndWait(service);
+    try testing.expectEqual(@as(u32, 2), service.status().extractions);
+}
+
 test "content service: file truncated below text_bytes_max is indexed promptly via CLOSE_WRITE" {
     var fixture: Fixture = undefined;
     try fixture.init();
@@ -2286,6 +2654,144 @@ test "content service: unreadable plain file stays retryable after chmod and det
     try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "dog_word")).len);
 }
 
+test "content service: an unreadable file costs one read per version, not an update per listing" {
+    if (linux.geteuid() == 0) return error.SkipZigTest;
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var path_buffer: paths.Buffer = undefined;
+    const locked = try fixture.root.path(&path_buffer, "locked.txt");
+    try fixture.root.write("other.txt", "readable okapi words\n");
+    try fixture.root.write("locked.txt", "root owned aardvark words\n");
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(locked, 0o000)));
+
+    const service = try fixture.start();
+    defer {
+        _ = linux.chmod(locked, 0o644);
+        service.shutdown();
+    }
+    try waitChecks(service, 1);
+    try testing.expectEqual(@as(u32, 1), service.status().builds);
+    try testing.expectEqual(@as(usize, 1), service.status().docs);
+    // Every check lists (no name index): none builds again for it.
+    const version = service.indexVersion();
+    try pokeAndWait(service);
+    try pokeAndWait(service);
+    try testing.expectEqual(@as(u32, 1), service.status().builds);
+    try testing.expectEqual(version, service.indexVersion());
+
+    // Edited (as root would): read again once, still unreadable.
+    try setMtimeNs(locked, 1_700_000_000, 0);
+    try pokeAndWait(service);
+    try testing.expectEqual(@as(u32, 2), service.status().builds);
+    try pokeAndWait(service);
+    try testing.expectEqual(@as(u32, 2), service.status().builds);
+
+    // Made readable: chmod changes neither mtime nor size, only the ctime.
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(locked, 0o644)));
+    try pokeAndWait(service);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "aardvark")).len);
+}
+
+/// Replaces `name` in `tree` with a new file holding `data` (renamed over
+/// it, as an editor or `cp` through a temporary would), then gives it the
+/// mtime it had: the same size and mtime, to the nanosecond.
+fn replaceKeepingMtime(tree: *const TestTree, name: []const u8, data: []const u8) !void {
+    var path_buffer: paths.Buffer = undefined;
+    const path = try tree.path(&path_buffer, name);
+    var statx: linux.Statx = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(
+        linux.AT.FDCWD,
+        path,
+        0,
+        .{ .MTIME = true, .SIZE = true },
+        &statx,
+    )));
+    try testing.expectEqual(statx.size, data.len);
+    var temporary_buffer: paths.Buffer = undefined;
+    var temporary_name_buffer: paths.Buffer = undefined;
+    const temporary_name = try std.mem.print(&temporary_name_buffer, "{s}.new", .{name});
+    try tree.write(temporary_name, data);
+    const temporary = try tree.path(&temporary_buffer, temporary_name);
+    try setMtimeNs(temporary, @intCast(statx.mtime.sec), @intCast(statx.mtime.nsec));
+    try sys.rename(temporary, path);
+}
+
+test "content service: a file replaced keeping its size and mtime is indexed again" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.root.write("notes.txt", "the otterword is here\n");
+    var path_buffer: paths.Buffer = undefined;
+    try setMtimeNs(try fixture.root.path(&path_buffer, "notes.txt"), 1_700_000_000, 123_456_789);
+    {
+        const service = try fixture.start();
+        defer service.shutdown();
+        try waitChecks(service, 1);
+        try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "otterword")).len);
+    }
+
+    // While it was not running: found on start.
+    try replaceKeepingMtime(&fixture.root, "notes.txt", "the zebraword is here\n");
+    const service = try fixture.start();
+    defer service.shutdown();
+    try waitChecks(service, 1);
+    try testing.expectEqual(@as(usize, 0), (try fixture.find(service, "otterword")).len);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "zebraword")).len);
+
+    // While it runs.
+    try replaceKeepingMtime(&fixture.root, "notes.txt", "the lemurword is here\n");
+    try pokeAndWait(service);
+    try testing.expectEqual(@as(usize, 0), (try fixture.find(service, "zebraword")).len);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "lemurword")).len);
+
+    // An extracted document: its cached text is keyed by mtime and size,
+    // and must not be reused.
+    if (!haveTool("zip") or !haveTool("unzip")) return;
+    var stage = try TestTree.init();
+    defer stage.deinit();
+    const odt_text = "<?xml version=\"1.0\"?><office:document-content><text:p>{s} notes</text:p></office:document-content>";
+    var xml_buffer: [256]u8 = undefined;
+    try stage.write("mimetype", "application/vnd.oasis.opendocument.text");
+    try stage.write("a/mimetype", "application/vnd.oasis.opendocument.text");
+    try stage.write("content.xml", try std.mem.print(&xml_buffer, odt_text, .{"wombat"}));
+    try stage.write("a/content.xml", try std.mem.print(&xml_buffer, odt_text, .{"walrus"}));
+    var odt_buffer: paths.Buffer = undefined;
+    const odt = try fixture.root.path(&odt_buffer, "doc.odt");
+    var other_buffer: paths.Buffer = undefined;
+    const other = try fixture.root.path(&other_buffer, "doc.odt.new");
+    var a_buffer: paths.Buffer = undefined;
+    // Stored, not deflated: both zips the same size.
+    for ([_][]const u8{ stage.absolute, try stage.path(&a_buffer, "a") }, [_][]const u8{ odt, other }) |folder, zip_path| {
+        const result = try std.process.run(testing.allocator, testing.io, .{
+            .argv = &.{ "zip", "-0", "-q", "-X", zip_path, "mimetype", "content.xml" },
+            .cwd = .{ .path = folder },
+        });
+        testing.allocator.free(result.stdout);
+        testing.allocator.free(result.stderr);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    }
+    try setMtimeNs(odt, 1_700_000_000, 0);
+    try pokeAndWait(service);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "wombat")).len);
+    var walrus_buffer: paths.Buffer = undefined;
+    const walrus_zip = try readAll(other, &walrus_buffer);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.unlink(other)));
+    try replaceKeepingMtime(&fixture.root, "doc.odt", walrus_zip);
+    try pokeAndWait(service);
+    try testing.expectEqual(@as(usize, 0), (try fixture.find(service, "wombat")).len);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "walrus")).len);
+}
+
+fn readAll(path: [:0]const u8, buffer: []u8) ![]const u8 {
+    const fd = try sys.openRegular(path);
+    defer sys.close(fd);
+    const bytes_read = linux.read(fd, buffer.ptr, buffer.len);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(bytes_read));
+    try testing.expect(bytes_read < buffer.len);
+    return buffer[0..bytes_read];
+}
+
 fn setMtimeNs(path: [*:0]const u8, sec: isize, nsec: isize) !void {
     const times = [2]linux.timespec{
         .{ .sec = sec, .nsec = nsec },
@@ -2331,11 +2837,11 @@ test "content service: shutdown cancellation does not poison TextCache with empt
         .size = doc_stat.size,
         .source = .extracted,
     }};
-    service.commitRetry(&.{.{
+    service.commitRetry(&.{&.{.{
         .doc = docs[0],
         .attempts = extract_retries_max - 1,
         .next_retry_ns = 0,
-    }});
+    }}});
 
     // Cancellation via leaveOut must not count toward permanent_tool_fail.
     const cancelled_out = service.leaveOut(
@@ -2354,7 +2860,7 @@ test "content service: shutdown cancellation does not poison TextCache with empt
 
     // Setting stop during extractMissing returns null before leaveOut can poison TextCache.
     service.stop.store(true, .release);
-    try testing.expect(service.extractMissing(arena, &docs) == null);
+    try testing.expect(service.extractMissing(arena, &docs, false) == null);
     try testing.expect(!service.textCached(docs[0]));
 }
 

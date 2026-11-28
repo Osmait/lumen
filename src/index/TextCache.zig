@@ -54,6 +54,21 @@ pub fn init(gpa: std.mem.Allocator, cache_dir: []const u8) std.mem.Allocator.Err
     return .{ .directory = directory };
 }
 
+/// Creates the folder again, private, if it is gone: a cleaner that empties
+/// ~/.cache while the service runs left every text write failing with
+/// ENOENT until a restart. Before writing texts.
+pub fn ensureDirectory(cache: TextCache) void {
+    var directory_buffer: paths.Buffer = undefined;
+    const directory = std.mem.printSentinel(&directory_buffer, "{s}", .{cache.directory}, 0) catch
+        return;
+    if (sys.exists(directory)) return;
+    sys.mkdirP(directory) catch |err| {
+        log.warn("{s}: {t}, extracted text is not cached", .{ directory, err });
+        return;
+    };
+    sys.makePrivate(directory);
+}
+
 pub fn deinit(cache: *TextCache, gpa: std.mem.Allocator) void {
     gpa.free(cache.directory);
     cache.* = undefined;
@@ -70,17 +85,99 @@ pub fn path(cache: TextCache, path_buffer: []u8, doc: DocIn) ?[:0]const u8 {
 
 fn nameOf(name_buffer: *[name_bytes_max]u8, doc: DocIn) []const u8 {
     var hash_hex: [32]u8 = undefined;
-    // Bump xlsx and docx cache key suffix (-v2) so stale entries re-extract
-    // with inlineStr worksheet text and docx header/footer support.
-    const suffix = switch (extract.kindOf(doc.path) orelse .pdf) {
-        .xlsx, .docx => "-v2",
-        else => "",
-    };
     return std.mem.print(
         name_buffer,
         "{s}-{d}-{d}{s}.txt",
-        .{ pathHashHex(&hash_hex, doc.path), doc.mtime, doc.size, suffix },
+        .{ pathHashHex(&hash_hex, doc.path), doc.mtime, doc.size, suffixOf(doc) },
     ) catch unreachable;
+}
+
+/// Bump xlsx and docx cache key suffix (-v2) so stale entries re-extract
+/// with inlineStr worksheet text and docx header/footer support; xlsx -v3:
+/// shared strings stored after sheets past the cap were left out.
+fn suffixOf(doc: DocIn) []const u8 {
+    return switch (extract.kindOf(doc.path) orelse .pdf) {
+        .xlsx => "-v3",
+        .docx => "-v2",
+        else => "",
+    };
+}
+
+/// How many names older versions cached a text under (`legacyName`).
+const legacy_names_count = 3;
+
+/// The name `which` (below `legacy_names_count`) an older version cached
+/// the text of `doc` under, null when that one is not to be reused: the
+/// SHA-256 name with the mtime in whole seconds (before nanoseconds), then
+/// Wyhash names with and without size. xlsx and docx texts from before
+/// `-v2` miss inlineStr / headers & footers, and xlsx ones from before
+/// `-v3` maybe their shared strings: never reused.
+fn legacyName(name_buffer: *[name_bytes_max]u8, doc: DocIn, which: usize) ?[]const u8 {
+    if (extract.kindOf(doc.path) == .xlsx) return null;
+    const mtime_s = @divFloor(doc.mtime, std.time.ns_per_s);
+    const suffix = suffixOf(doc);
+    const legacy_hash = std.hash.Wyhash.hash(0, doc.path);
+    var hash_hex: [32]u8 = undefined;
+    return switch (which) {
+        0 => std.mem.print(
+            name_buffer,
+            "{s}-{d}-{d}{s}.txt",
+            .{ pathHashHex(&hash_hex, doc.path), mtime_s, doc.size, suffix },
+        ) catch unreachable,
+        1 => if (suffix.len > 0) null else std.mem.print(
+            name_buffer,
+            "{x:0>16}-{d}-{d}.txt",
+            .{ legacy_hash, mtime_s, doc.size },
+        ) catch unreachable,
+        2 => if (suffix.len > 0) null else std.mem.print(
+            name_buffer,
+            "{x:0>16}-{d}.txt",
+            .{ legacy_hash, mtime_s },
+        ) catch unreachable,
+        else => unreachable,
+    };
+}
+
+/// Gives the text of `doc` its current name when an older version cached
+/// it under another (`legacyName`): true when it is there now. Called
+/// before extracting, so it needs no index: a version that changed the
+/// names changed the index format as well, and the index it finds on start
+/// is not readable, so `sweep` had nothing to rename by and every document
+/// was extracted again.
+pub fn adoptLegacy(cache: TextCache, doc: DocIn) bool {
+    var current_buffer: paths.Buffer = undefined;
+    const current = cache.path(&current_buffer, doc) orelse return false;
+    for (0..legacy_names_count) |which| {
+        var name_buffer: [name_bytes_max]u8 = undefined;
+        const name = legacyName(&name_buffer, doc, which) orelse continue;
+        var legacy_buffer: paths.Buffer = undefined;
+        const legacy = std.mem.printSentinel(
+            &legacy_buffer,
+            "{s}/{s}",
+            .{ cache.directory, name },
+            0,
+        ) catch continue;
+        if (std.mem.eql(u8, legacy, current)) continue;
+        // RENAME_NOREPLACE: never clobber a text already at its name; the
+        // older one is dropped then.
+        const result = linux.renameat2(
+            linux.AT.FDCWD,
+            legacy,
+            linux.AT.FDCWD,
+            current,
+            .{ .NOREPLACE = true },
+        );
+        switch (linux.errno(result)) {
+            .SUCCESS => return true,
+            .EXIST => {
+                _ = linux.unlink(legacy);
+                return true;
+            },
+            .NOENT => {},
+            else => |errno| log.warn("renaming {s}: {t}", .{ legacy, errno }),
+        }
+    }
+    return false;
 }
 
 /// Reads the cached text of `doc` into `text`, up to `content.extracted_bytes_max`
@@ -152,8 +249,8 @@ pub fn dropStale(
 /// Deletes the cached texts no live document of `index` refers to: what
 /// `dropStale` cannot know of, versions extracted and never indexed (out
 /// of memory, a shutdown or a crash in between), half-written ones. A text
-/// cached under the name used before sizes were part of it
-/// (`<hash>-<mtime>.txt`) is renamed instead, not extracted again.
+/// cached under a name an older version used (`legacyName`) is renamed
+/// instead, not extracted again.
 pub fn sweep(cache: TextCache, gpa: std.mem.Allocator, index: *const Index) void {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
@@ -197,8 +294,8 @@ pub fn sweep(cache: TextCache, gpa: std.mem.Allocator, index: *const Index) void
 }
 
 /// The names in the cache that live documents of `index` use, each mapped
-/// to the name it should have: itself, or for legacy Wyhash names (with or
-/// without size), the current SHA-256 name.
+/// to the name it should have: itself, or for the names older versions
+/// used (`legacyName`), the current one.
 fn namesKept(
     arena: std.mem.Allocator,
     index: *const Index,
@@ -211,22 +308,14 @@ fn namesKept(
         var name_buffer: [name_bytes_max]u8 = undefined;
         const name = try arena.dupe(u8, nameOf(&name_buffer, doc));
         try keep.put(arena, name, name);
-        // Legacy xlsx and docx entries missed inlineStr / headers & footers; let sweep drop them.
-        const doc_kind = extract.kindOf(doc.path);
-        if (doc_kind == .xlsx or doc_kind == .docx) continue;
-        const legacy_hash = std.hash.Wyhash.hash(0, doc.path);
-        const mtime_s = @divFloor(doc.mtime, std.time.ns_per_s);
-        const legacy_with_size = try arena.print("{x:0>16}-{d}-{d}.txt", .{
-            legacy_hash,
-            mtime_s,
-            doc.size,
-        });
-        try keep.put(arena, legacy_with_size, name);
-        const old = try arena.print("{x:0>16}-{d}.txt", .{
-            legacy_hash,
-            mtime_s,
-        });
-        try keep.put(arena, old, name);
+        for (0..legacy_names_count) |which| {
+            var legacy_buffer: [name_bytes_max]u8 = undefined;
+            const legacy = legacyName(&legacy_buffer, doc, which) orelse continue;
+            // Already kept as a current name (an mtime of 0 gives the
+            // same name in seconds): it stays where it is.
+            if (keep.contains(legacy)) continue;
+            try keep.put(arena, try arena.dupe(u8, legacy), name);
+        }
     }
     return keep;
 }
@@ -235,11 +324,87 @@ test "xlsx and docx use versioned cache keys while other docs keep legacy rename
     const testing = std.testing;
     var buf: [name_bytes_max]u8 = undefined;
     const xlsx_name = nameOf(&buf, .{ .path = "/tmp/book.xlsx", .mtime = 10, .size = 20, .source = .extracted });
-    try testing.expect(std.mem.endsWith(u8, xlsx_name, "-10-20-v2.txt"));
+    try testing.expect(std.mem.endsWith(u8, xlsx_name, "-10-20-v3.txt"));
     var docx_buf: [name_bytes_max]u8 = undefined;
     const docx_name = nameOf(&docx_buf, .{ .path = "/tmp/doc.docx", .mtime = 10, .size = 20, .source = .extracted });
     try testing.expect(std.mem.endsWith(u8, docx_name, "-10-20-v2.txt"));
     var odt_buf: [name_bytes_max]u8 = undefined;
     const odt_name = nameOf(&odt_buf, .{ .path = "/tmp/doc.odt", .mtime = 10, .size = 20, .source = .extracted });
     try testing.expect(std.mem.endsWith(u8, odt_name, "-10-20.txt"));
+}
+
+test "texts cached under older names are renamed without an index, before extracting" {
+    const testing = std.testing;
+    var cache_dir = try sys.TestDir.init();
+    defer cache_dir.deinit();
+    var cache: TextCache = try .init(testing.allocator, cache_dir.absolute);
+    defer cache.deinit(testing.allocator);
+    const mtime_ns: i64 = 1_700_000_000_123_456_789;
+    const pdf: DocIn = .{ .path = "/home/u/a.pdf", .mtime = mtime_ns, .size = 4242, .source = .extracted };
+    const odt: DocIn = .{ .path = "/home/u/b.odt", .mtime = mtime_ns, .size = 7, .source = .extracted };
+    const docx: DocIn = .{ .path = "/home/u/c.docx", .mtime = mtime_ns, .size = 9, .source = .extracted };
+    const xlsx: DocIn = .{ .path = "/home/u/d.xlsx", .mtime = mtime_ns, .size = 5, .source = .extracted };
+    var hash_hex: [32]u8 = undefined;
+    var name_buffer: paths.Buffer = undefined;
+    // SHA-256 with the mtime in seconds (before nanoseconds), -v2 kept.
+    try cache_dir.write(try std.mem.print(&name_buffer, "text/{s}-1700000000-4242.txt", .{
+        pathHashHex(&hash_hex, pdf.path),
+    }), "pdf words");
+    try cache_dir.write(try std.mem.print(&name_buffer, "text/{s}-1700000000-9-v2.txt", .{
+        pathHashHex(&hash_hex, docx.path),
+    }), "docx words");
+    // Wyhash without size.
+    try cache_dir.write(try std.mem.print(&name_buffer, "text/{x:0>16}-1700000000.txt", .{
+        std.hash.Wyhash.hash(0, odt.path),
+    }), "odt words");
+    // An xlsx from before -v3: extracted again.
+    try cache_dir.write(try std.mem.print(&name_buffer, "text/{s}-1700000000-5-v2.txt", .{
+        pathHashHex(&hash_hex, xlsx.path),
+    }), "xlsx words");
+
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    for ([_]DocIn{ pdf, docx, odt }, [_][]const u8{ "pdf words", "docx words", "odt words" }) |doc, want| {
+        try testing.expect(cache.adoptLegacy(doc));
+        try testing.expect(try cache.read(testing.allocator, doc, &text));
+        try testing.expectEqualStrings(want, text.items);
+        // Moved, not copied: nothing left under the older name.
+        try testing.expect(!cache.adoptLegacy(doc));
+    }
+    try testing.expect(!cache.adoptLegacy(xlsx));
+    try testing.expectEqual(@as(u64, 0), cache.size(xlsx));
+}
+
+test "sweep renames a text named with the mtime in seconds instead of deleting it" {
+    const testing = std.testing;
+    var cache_dir = try sys.TestDir.init();
+    defer cache_dir.deinit();
+    var cache: TextCache = try .init(testing.allocator, cache_dir.absolute);
+    defer cache.deinit(testing.allocator);
+    const docs = [_]DocIn{.{
+        .path = "/home/u/a.pdf",
+        .mtime = 1_700_000_000_123_456_789,
+        .size = 4242,
+        .source = .extracted,
+    }};
+    const pool = try @import("Pool.zig").create(testing.allocator, testing.io, 0);
+    defer pool.destroy();
+    const NoText = struct {
+        fn read(_: *anyopaque, _: DocIn, _: *std.ArrayList(u8), _: std.mem.Allocator) std.mem.Allocator.Error!content.ReadOutcome {
+            return .none;
+        }
+    };
+    var context: u8 = 0;
+    var index = try content.build(testing.allocator, pool, &docs, .{
+        .read = NoText.read,
+        .context = &context,
+    }, null);
+    defer index.deinit(testing.allocator);
+    var hash_hex: [32]u8 = undefined;
+    var name_buffer: paths.Buffer = undefined;
+    try cache_dir.write(try std.mem.print(&name_buffer, "text/{s}-1700000000-4242.txt", .{
+        pathHashHex(&hash_hex, docs[0].path),
+    }), "pdf words");
+    cache.sweep(testing.allocator, &index);
+    try testing.expectEqual(@as(u64, "pdf words".len), cache.size(docs[0]));
 }

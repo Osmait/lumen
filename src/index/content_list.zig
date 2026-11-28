@@ -134,6 +134,7 @@ pub fn list(
                 .document => .extracted,
                 .text => .plain,
             },
+            .ctime = file_stat.ctime,
         });
     }
     std.mem.sort(content.DocIn, docs.items, {}, struct {
@@ -178,8 +179,16 @@ const StderrClassifier = struct {
     }
 };
 
+/// Whether a line ripgrep wrote to stderr is about something below the root
+/// it lists ("."), not the root itself or its flags: a folder it cannot
+/// read (any errno: EACCES, EIO on a failing disk, ESTALE...) or an ignore
+/// file with a glob it cannot parse (`rg: ./p/.gitignore: line 2: error
+/// parsing glob ...`). Either only leaves part of the tree out; the rest of
+/// the listing is good.
 fn isBenignWalkError(line: []const u8) bool {
     if (std.mem.eql(u8, line, "rg: .") or std.mem.startsWith(u8, line, "rg: .: ")) return false;
+    const below_root = "rg: ./";
+    if (std.mem.startsWith(u8, line, below_root) and line.len > below_root.len) return true;
     const benign = [_][]const u8{
         "(os error 13)",
         "(os error 1)",
@@ -241,8 +250,9 @@ fn runLister(
     }
     const term = try child.wait(io);
     // rg --files exits 0 when files are found and 1 when none match; exit 2
-    // is accepted only when every stderr line is a benign traversal error
-    // (such as an unreadable directory below the root), never a root or flag error.
+    // is accepted only when every stderr line is about something below the
+    // root (an unreadable directory, an ignore file's bad glob), never a root
+    // or flag error.
     switch (term) {
         .exited => |code| switch (code) {
             0, 1 => {},
@@ -262,13 +272,15 @@ fn waitListerExit(
     return sys.waitExitCancelable(pid, deadline_ns, stop, list_poll_ms);
 }
 
-pub const Stat = struct { mtime: i64, size: u64 };
+/// Times in nanoseconds. The ctime tells a file replaced by one with the
+/// same mtime and size, and a `chmod`, which leave the mtime as it was.
+pub const Stat = struct { mtime: i64, size: u64, ctime: i64 };
 
 /// What a listed file is indexed as: its own bytes, or extracted text.
 /// Their size bounds differ.
 pub const Kind = enum { text, document };
 
-/// A listed file's mtime and size, or null if it is not one to index (any
+/// A listed file's times and size, or null if it is not one to index (any
 /// more): not a regular file (symlinks are not followed, avoiding slow mounts
 /// and matching `scan.zig`/`Watcher.zig`), or a size out of bounds for its `kind`.
 pub fn stat(path: [*:0]const u8, kind: Kind) ?Stat {
@@ -277,7 +289,7 @@ pub fn stat(path: [*:0]const u8, kind: Kind) ?Stat {
         linux.AT.FDCWD,
         path,
         linux.AT.SYMLINK_NOFOLLOW | linux.AT.NO_AUTOMOUNT,
-        .{ .TYPE = true, .SIZE = true, .MTIME = true },
+        .{ .TYPE = true, .SIZE = true, .MTIME = true, .CTIME = true },
         &statx,
     );
     if (linux.errno(result) != .SUCCESS) return null;
@@ -290,12 +302,19 @@ pub fn stat(path: [*:0]const u8, kind: Kind) ?Stat {
         },
         .document => if (statx.size > document_bytes_max) return null,
     }
-    const mtime_ns = std.math.add(
+    return .{
+        .mtime = nanoseconds(statx.mtime),
+        .size = statx.size,
+        .ctime = nanoseconds(statx.ctime),
+    };
+}
+
+fn nanoseconds(time: linux.statx_timestamp) i64 {
+    return std.math.add(
         i64,
-        std.math.mul(i64, statx.mtime.sec, std.time.ns_per_s) catch std.math.maxInt(i64),
-        @as(i64, statx.mtime.nsec),
+        std.math.mul(i64, time.sec, std.time.ns_per_s) catch std.math.maxInt(i64),
+        @as(i64, time.nsec),
     ) catch std.math.maxInt(i64);
-    return .{ .mtime = mtime_ns, .size = statx.size };
 }
 
 pub fn documentKind(path: []const u8) bool {
@@ -671,4 +690,43 @@ test "runLister rejects exit 2 on root or flag errors but list keeps readable fi
     const got = try listTree(arena_state.allocator(), &tree, true);
     try testing.expectEqual(@as(usize, 1), got.len);
     try testing.expect(std.mem.endsWith(u8, got[0].path, "/ok/a.txt"));
+}
+
+test "runLister keeps exit 2 for warnings about ignore files and other errors below the root" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    const listing = try runLister(
+        testing.allocator,
+        testing.io,
+        &.{
+            "sh", "-c",
+            \\printf './ok/a.txt\0'
+            \\printf "rg: ./locked: Permission denied (os error 13)\n" >&2
+            \\printf "rg: ./proj/.gitignore: line 2: error parsing glob 'a{b': unclosed alternate group\n" >&2
+            \\printf "rg: ./nas/x: Input/output error (os error 5)\n" >&2
+            \\exit 2
+        },
+        tree.absolute,
+        null,
+    );
+    defer testing.allocator.free(listing);
+    try testing.expectEqualStrings("./ok/a.txt\x00", listing);
+
+    if (linux.geteuid() == 0) return error.SkipZigTest;
+    try tree.write("ok/a.txt", "hello world\n");
+    try tree.write("proj/notes.txt", "some notes here\n");
+    try tree.write("proj/.gitignore", "*.log\nbuild-{debug\n");
+    try tree.mkdir("proj/.git");
+    try tree.write("locked/hidden.txt", "secret text\n");
+    var locked_buf: paths.Buffer = undefined;
+    const locked = try tree.path(&locked_buf, "locked");
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(locked, 0o000)));
+    defer _ = linux.chmod(locked, 0o700);
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const got = try listTree(arena_state.allocator(), &tree, true);
+    try testing.expectEqual(@as(usize, 2), got.len);
+    try testing.expect(std.mem.endsWith(u8, got[0].path, "/ok/a.txt"));
+    try testing.expect(std.mem.endsWith(u8, got[1].path, "/proj/notes.txt"));
 }

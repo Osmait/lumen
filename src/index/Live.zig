@@ -350,6 +350,8 @@ pub fn apply(live: *Live, changes: []const Watcher.Change) std.mem.Allocator.Err
     // Track IN_MOVED_TO cookies in this batch so RENAME_EXCHANGE (`mv --exchange`)
     // emitting MOVED_FROM(a,c1), MOVED_TO(b,c1), MOVED_FROM(b,c2), MOVED_TO(a,c2)
     // does not let MOVED_FROM(b,c2) delete the newly arrived b from MOVED_TO(b,c1).
+    // Chained renames (`mv a b; mv b c`, `mv a b; mv b a`) emit the same
+    // events, so b is kept only while it is still there on disk.
     var moved_tos: std.HashMapUnmanaged(MoveKey, u32, MoveKeyContext, 80) = .empty;
     defer moved_tos.deinit(live.gpa);
 
@@ -371,7 +373,8 @@ pub fn apply(live: *Live, changes: []const Watcher.Change) std.mem.Allocator.Err
         .removed => |removed| {
             if (removed.cookie != 0) {
                 if (moved_tos.get(.{ .parent = removed.parent, .name = removed.name })) |to_cookie| {
-                    if (to_cookie != removed.cookie) continue;
+                    if (to_cookie != removed.cookie and
+                        live.childExists(.fromRaw(removed.parent), removed.name)) continue;
                 }
             }
             applied_count += @intFromBool(live.remove(.fromRaw(removed.parent), removed.name));
@@ -448,6 +451,22 @@ fn aliveWatched(live: *const Live, raw_id: u32) bool {
 fn isDirEntry(live: *const Live, id: EntryId) bool {
     if (id.in_delta) return live.delta.isDir(id.index);
     return live.base.isDir(id.index);
+}
+
+/// Whether `name` is in directory `parent` on disk (any kind, a dangling
+/// link too). When the parent's path cannot be made: true, so nothing is
+/// removed on a guess.
+fn childExists(live: *const Live, parent: EntryId, name: []const u8) bool {
+    var parent_buffer: paths.Buffer = undefined;
+    const parent_path = live.pathOf(parent, &parent_buffer) orelse return true;
+    var path_buffer: paths.Buffer = undefined;
+    const path = std.mem.printSentinel(
+        &path_buffer,
+        "{s}{s}{s}",
+        .{ parent_path, paths.separatorAfter(parent_path), name },
+        0,
+    ) catch return true;
+    return sys.existsAtNoFollow(linux.AT.FDCWD, path);
 }
 
 fn pathExists(live: *const Live, id: EntryId) bool {
@@ -1976,4 +1995,34 @@ test "live: renameat2 RENAME_EXCHANGE keeps both swapped files, directories, and
     try testing.expect(try tree.found("sub", "f_one/sub.txt"));
     try testing.expect(try tree.found("d_one", "d_one"));
     try testing.expect(!try tree.found("sub", "d_one/sub.txt"));
+}
+
+test "live: renames chained in one batch leave no ghost of the name in between" {
+    const tree = try Tree.create(&.{ "origen_file", "vuelta_file", "salida_file", "carpeta/hoja.txt" });
+    defer tree.destroy();
+    // a -> b -> c: MOVED_FROM(b) follows MOVED_TO(b) with another cookie,
+    // as in an exchange, but b is gone.
+    tree.move("root/origen_file", "root/intermedio_file");
+    tree.move("root/intermedio_file", "root/destino_file");
+    // a -> b -> a: undone.
+    tree.move("root/vuelta_file", "root/paso_file");
+    tree.move("root/paso_file", "root/vuelta_file");
+    // a -> b -> out of the tree.
+    tree.move("root/salida_file", "root/listo_file");
+    tree.move("root/listo_file", "outside/listo_file");
+    // The same with a directory.
+    tree.move("root/carpeta", "root/temporal");
+    tree.move("root/temporal", "root/final");
+    _ = try tree.sync();
+
+    try testing.expect(try tree.found("destino", "destino_file"));
+    try testing.expect(!try tree.found("origen", "origen_file"));
+    try testing.expect(!try tree.found("intermedio", "intermedio_file"));
+    try testing.expect(try tree.found("vuelta", "vuelta_file"));
+    try testing.expect(!try tree.found("paso", "paso_file"));
+    try testing.expect(!try tree.found("listo", "listo_file"));
+    try testing.expect(!try tree.found("salida", "salida_file"));
+    try testing.expect(try tree.found("hoja", "final/hoja.txt"));
+    try testing.expectEqual(@as(usize, 0), try tree.under("temporal", "root/temporal"));
+    try testing.expectEqual(@as(usize, 0), try tree.under("hoja", "root/carpeta"));
 }
