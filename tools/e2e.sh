@@ -24,7 +24,10 @@ if command -v hyprctl >/dev/null && hyprctl -j monitors 2>/dev/null | grep -q '"
     exit 2
 fi
 
-T=$(mktemp -d "${TMPDIR:-/tmp}/lumen-e2e.XXXXXX")
+# Without its folder every path below would start at / (H=/home): stop
+# before anything is written (MYP-598).
+T=$(mktemp -d "${TMPDIR:-/tmp}/lumen-e2e.XXXXXX") || { echo "e2e: mktemp failed" >&2; exit 2; }
+[[ -n "$T" && -d "$T" ]] || { echo "e2e: mktemp gave no folder" >&2; exit 2; }
 H=$T/home
 PASS=0
 FAIL=0

@@ -101,9 +101,16 @@ threads() {
 gpu() {
     section "GPU (nvidia-smi)"
     if ! command -v nvidia-smi >/dev/null; then echo "  nvidia-smi not found"; return; fi
-    nvidia-smi --query-gpu=name,driver_version --format=csv,noheader | sed 's/^/  /'
+    # Installed but without its driver (a dGPU asleep, a GPU since replaced)
+    # it fails: under set -e that ended the whole report here.
+    local query
+    if ! query=$(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null); then
+        echo "  nvidia-smi failed"
+        return 0
+    fi
+    sed 's/^/  /' <<<"$query"
     local line
-    line=$(nvidia-smi pmon -c 1 -s um 2>/dev/null | awk -v p="$PID" '$2 == p')
+    line=$(nvidia-smi pmon -c 1 -s um 2>/dev/null | awk -v p="$PID" '$2 == p') || line=
     if [[ -n "$line" ]]; then
         awk '{ printf "  VRAM %s MiB   SM %s%%   memory controller %s%%   (type %s)\n", $9, $4, $5, $3 }' <<<"$line"
     else

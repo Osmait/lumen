@@ -53,9 +53,12 @@ pub fn openWith(path: [:0]const u8, options: OpenOptions) Error!Db {
         log.warn("busy timeout: {s}", .{c.sqlite3_errmsg(db.handle)});
         return error.DbOpen;
     }
+    // secure_delete: what is deleted (an entry, the history cleared) is
+    // overwritten with zeros, not left readable in the free pages (MYP-450).
     try db.exec(
         \\PRAGMA journal_mode = WAL;
         \\PRAGMA synchronous = NORMAL;
+        \\PRAGMA secure_delete = ON;
         \\CREATE TABLE IF NOT EXISTS frecency (
         \\  key TEXT PRIMARY KEY,
         \\  score REAL NOT NULL,
@@ -67,17 +70,18 @@ pub fn openWith(path: [:0]const u8, options: OpenOptions) Error!Db {
         \\  content TEXT NOT NULL,
         \\  created_at INTEGER NOT NULL,
         \\  last_copied INTEGER NOT NULL,
-        \\  seq INTEGER NOT NULL DEFAULT 0,
-        \\  UNIQUE(hash, content)
+        \\  seq INTEGER NOT NULL DEFAULT 0
         \\);
     );
     try db.migrateFrecency();
-    try db.migrateClipboard();
+    const migrated = try db.migrateClipboard();
     try db.exec(
         \\DROP INDEX IF EXISTS clipboard_recent;
         \\DROP INDEX IF EXISTS clipboard_by_time;
         \\CREATE INDEX IF NOT EXISTS clipboard_by_recency ON clipboard(last_copied DESC, seq DESC);
+        \\CREATE INDEX IF NOT EXISTS clipboard_by_hash ON clipboard(hash);
     );
+    if (migrated) db.compact();
     return db;
 }
 
@@ -102,12 +106,15 @@ fn clipboardSchemaSql(db: *Db, arena: std.mem.Allocator) Error!?[]const u8 {
     return arena.dupe(u8, columnText(stmt, 0)) catch return null;
 }
 
+/// AUTOINCREMENT, and no UNIQUE: SQLite enforced UNIQUE(hash, content)
+/// with an index holding a second copy of every entry, doubling lumen.db
+/// (MYP-449). The hash is indexed instead (`clipboard_by_hash`).
 fn clipboardHasModernSchema(db: *Db) Error!bool {
     var buf: [2048]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&buf);
     const sql = try db.clipboardSchemaSql(fba.allocator()) orelse return false;
     return std.ascii.findIgnoreCase(sql, "autoincrement") != null and
-        std.ascii.findIgnoreCase(sql, "unique(hash, content)") != null;
+        std.ascii.findIgnoreCase(sql, "unique") == null;
 }
 
 /// Migrates legacy `frecency(key, count, last_used)` to `score REAL`.
@@ -131,17 +138,20 @@ fn migrateFrecency(db: *Db) Error!void {
     try db.exec("COMMIT");
 }
 
-/// Migrates legacy `clipboard` tables without `AUTOINCREMENT`, `seq`, or
-/// `UNIQUE(hash, content)`, preserving existing ids, contents, and order.
-fn migrateClipboard(db: *Db) Error!void {
+/// Migrates legacy `clipboard` tables without `AUTOINCREMENT` or `seq`, or
+/// with a UNIQUE constraint, preserving existing ids, contents, and order.
+/// Every earlier schema's UNIQUE kept the rows distinct, as `addClip` does.
+/// True when the table was rebuilt.
+fn migrateClipboard(db: *Db) Error!bool {
     const has_modern = try db.clipboardHasModernSchema();
     const has_seq = try db.hasColumn("clipboard", "seq");
-    if (has_modern and has_seq) return;
+    if (has_modern and has_seq) return false;
     try db.exec("BEGIN IMMEDIATE");
     errdefer _ = c.sqlite3_exec(db.handle, "ROLLBACK", null, null, null);
     const now_modern = try db.clipboardHasModernSchema();
     const now_seq = try db.hasColumn("clipboard", "seq");
-    if (!now_modern or !now_seq) {
+    const rebuild = !now_modern or !now_seq;
+    if (rebuild) {
         try db.exec(
             \\CREATE TABLE clipboard_new (
             \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -149,8 +159,7 @@ fn migrateClipboard(db: *Db) Error!void {
             \\  content TEXT NOT NULL,
             \\  created_at INTEGER NOT NULL,
             \\  last_copied INTEGER NOT NULL,
-            \\  seq INTEGER NOT NULL DEFAULT 0,
-            \\  UNIQUE(hash, content)
+            \\  seq INTEGER NOT NULL DEFAULT 0
             \\);
         );
         if (now_seq) {
@@ -172,6 +181,22 @@ fn migrateClipboard(db: *Db) Error!void {
         );
     }
     try db.exec("COMMIT");
+    return rebuild;
+}
+
+/// Gives back the pages a rebuilt table freed: the file would otherwise
+/// keep its old size. Once, after a migration; a failure (another process
+/// reading) only leaves the file as large as it was.
+fn compact(db: *Db) void {
+    db.exec("VACUUM") catch return;
+    db.checkpoint();
+}
+
+/// Copies the -wal into the database and empties it: a deleted entry's
+/// earlier pages stay in the -wal until then (MYP-450). A reader in the
+/// middle of a transaction can keep it from finishing; the next one does.
+fn checkpoint(db: *Db) void {
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE)") catch {};
 }
 
 /// The history holds whatever was copied, passwords too, and SQLite creates
@@ -415,11 +440,27 @@ pub fn addClip(db: *Db, content: []const u8, now: i64, keep: u32) Error!void {
     try db.exec("BEGIN IMMEDIATE");
     errdefer _ = c.sqlite3_exec(db.handle, "ROLLBACK", null, null, null);
     const seq = try db.nextClipSeq();
-    try db.execArgs(
-        \\INSERT INTO clipboard (hash, content, created_at, last_copied, seq)
-        \\VALUES (?1, ?2, ?3, ?3, ?4)
-        \\ON CONFLICT(hash, content) DO UPDATE SET last_copied = ?3, seq = ?4
-    , .{ hash, content, now, seq });
+    // The same text again moves its entry to the top (found through the
+    // hash's index; the content compared only on a hash match).
+    const existing_stmt = try db.prepare(
+        "SELECT id FROM clipboard WHERE hash = ?1 AND content = ?2 LIMIT 1",
+    );
+    defer _ = c.sqlite3_finalize(existing_stmt);
+    try db.bind(existing_stmt, .{ hash, content });
+    if (try db.nextRow(existing_stmt)) {
+        const id = c.sqlite3_column_int64(existing_stmt, 0);
+        _ = c.sqlite3_reset(existing_stmt);
+        try db.execArgs(
+            "UPDATE clipboard SET last_copied = ?2, seq = ?3 WHERE id = ?1",
+            .{ id, now, seq },
+        );
+    } else {
+        _ = c.sqlite3_reset(existing_stmt);
+        try db.execArgs(
+            \\INSERT INTO clipboard (hash, content, created_at, last_copied, seq)
+            \\VALUES (?1, ?2, ?3, ?3, ?4)
+        , .{ hash, content, now, seq });
+    }
     // What is past the newest `keep`, found through the recency index
     // (last_copied DESC, seq DESC).
     try db.execArgs(
@@ -541,11 +582,14 @@ pub fn touchClip(db: *Db, id: ClipId, now_s: i64) Error!void {
 /// another process).
 pub fn deleteClip(db: *Db, id: ClipId) Error!bool {
     try db.execArgs("DELETE FROM clipboard WHERE id = ?1", .{id.rowid()});
-    return c.sqlite3_changes(db.handle) > 0;
+    const deleted = c.sqlite3_changes(db.handle) > 0;
+    if (deleted) db.checkpoint();
+    return deleted;
 }
 
 pub fn clearClips(db: *Db) Error!void {
     try db.exec("DELETE FROM clipboard");
+    db.checkpoint();
 }
 
 test "clipboard dedupes and orders by recency" {
@@ -898,7 +942,6 @@ test "clipboard hash collision preserves distinct entries and long sidecar path 
     try db.exec(
         \\INSERT INTO clipboard (hash, content, created_at, last_copied, seq)
         \\VALUES (12345, 'colliding-b', 11, 11, 2)
-        \\ON CONFLICT(hash, content) DO UPDATE SET last_copied = 11, seq = 2
     );
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
@@ -916,4 +959,121 @@ test "clipboard hash collision preserves distinct entries and long sidecar path 
     long_buf[std.Io.Dir.max_path_bytes - 2] = 0;
     const long_path = long_buf[0 .. std.Io.Dir.max_path_bytes - 2 :0];
     try std.testing.expectError(error.DbOpen, makePrivate(long_path));
+}
+
+/// Fails unless `sql` (one row, one integer column) gives `expected`.
+fn expectCount(db: *Db, sql: [:0]const u8, expected: i64) !void {
+    const stmt = try db.prepare(sql);
+    defer _ = c.sqlite3_finalize(stmt);
+    try std.testing.expect(try db.nextRow(stmt));
+    try std.testing.expectEqual(expected, c.sqlite3_column_int64(stmt, 0));
+}
+
+test "a UNIQUE(hash, content) history migrates to the hash index (MYP-449)" {
+    var test_dir: os.TestDir = try .init();
+    defer test_dir.deinit();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try test_dir.path(&path_buf, "unique.db");
+    // The schema every database had until now, with its automatic index,
+    // and the hashes addClip gave the rows.
+    {
+        var raw_handle: ?*c.sqlite3 = null;
+        try std.testing.expectEqual(c.SQLITE_OK, c.sqlite3_open(path.ptr, &raw_handle));
+        var old: Db = .{ .handle = raw_handle.? };
+        defer old.close();
+        try old.exec(
+            \\PRAGMA journal_mode = WAL;
+            \\CREATE TABLE clipboard (
+            \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\  hash INTEGER NOT NULL,
+            \\  content TEXT NOT NULL,
+            \\  created_at INTEGER NOT NULL,
+            \\  last_copied INTEGER NOT NULL,
+            \\  seq INTEGER NOT NULL DEFAULT 0,
+            \\  UNIQUE(hash, content)
+            \\);
+            \\CREATE INDEX clipboard_by_recency ON clipboard(last_copied DESC, seq DESC);
+        );
+        var sql_buf: [256]u8 = undefined;
+        const sql = try std.mem.printSentinel(&sql_buf,
+            \\INSERT INTO clipboard (id, hash, content, created_at, last_copied, seq)
+            \\  VALUES (7, {d}, 'older', 10, 10, 1), (9, {d}, 'newer', 20, 20, 2)
+        , .{
+            @as(i64, @bitCast(std.hash.Wyhash.hash(0, "older"))),
+            @as(i64, @bitCast(std.hash.Wyhash.hash(0, "newer"))),
+        }, 0);
+        try old.exec(sql);
+    }
+
+    var db = try Db.open(path);
+    defer db.close();
+    try std.testing.expect(try db.clipboardHasModernSchema());
+    try db.expectCount(
+        \\SELECT count(*) FROM sqlite_master
+        \\WHERE tbl_name = 'clipboard' AND name LIKE 'sqlite_autoindex%'
+    , 0);
+    try db.expectCount(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'clipboard_by_hash'",
+        1,
+    );
+    try db.expectCount(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'clipboard_by_recency'",
+        1,
+    );
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var clips = try db.recentClips(arena.allocator(), 10);
+    try std.testing.expectEqual(@as(usize, 2), clips.len);
+    try std.testing.expectEqualStrings("newer", clips[0].head);
+    try std.testing.expectEqual(@as(i64, 7), clips[1].id.rowid());
+
+    // A recopy of a migrated entry moves it up instead of adding a row; new
+    // ids keep growing past the old ones.
+    try db.addClip("older", 30, 10);
+    try db.addClip("fresh", 31, 10);
+    clips = try db.recentClips(arena.allocator(), 10);
+    try std.testing.expectEqual(@as(usize, 3), clips.len);
+    try std.testing.expectEqualStrings("fresh", clips[0].head);
+    try std.testing.expect(clips[0].id.rowid() > 9);
+    try std.testing.expectEqualStrings("older", clips[1].head);
+    try std.testing.expectEqual(@as(i64, 7), clips[1].id.rowid());
+    try std.testing.expect(!(try db.migrateClipboard()));
+}
+
+test "a deleted or cleared entry leaves no trace in lumen.db or its -wal (MYP-450)" {
+    var test_dir: os.TestDir = try .init();
+    defer test_dir.deinit();
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const secret = "hunter2-MYP450-secret-marker";
+    const other = "MYP450-other-marker-for-clear";
+    var db = try Db.open(try test_dir.path(&path_buf, "lumen.db"));
+    defer db.close();
+    try db.addClip("kept entry", 1, Db.clip_entries_max);
+    try db.addClip(secret, 2, Db.clip_entries_max);
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const clips = try db.recentClips(arena.allocator(), 10);
+    try std.testing.expectEqualStrings(secret, clips[0].head);
+    try std.testing.expect(try db.deleteClip(clips[0].id));
+    try expectNotOnDisk(&test_dir, secret);
+
+    try db.addClip(other, 3, Db.clip_entries_max);
+    try db.clearClips();
+    try expectNotOnDisk(&test_dir, other);
+}
+
+fn expectNotOnDisk(test_dir: *const os.TestDir, text: []const u8) !void {
+    const linux = std.os.linux;
+    for ([_][]const u8{ "lumen.db", "lumen.db-wal" }) |name| {
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const open_result = linux.open(try test_dir.path(&path_buf, name), .{}, 0);
+        if (linux.errno(open_result) == .NOENT) continue;
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(open_result));
+        const fd: i32 = @intCast(open_result);
+        defer _ = linux.close(fd);
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(std.testing.allocator);
+        try os.readUpTo(std.testing.allocator, fd, &bytes, 64 << 20);
+        try std.testing.expect(std.mem.find(u8, bytes.items, text) == null);
+    }
 }

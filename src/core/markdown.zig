@@ -1,8 +1,9 @@
 //! A small Markdown subset to Pango markup, for extension detail panes.
 //!
-//! Blocks: `#`/`##`/`###` headings, `-`/`*`/`+` and `1.` lists, `>` quotes,
-//! fenced code (```), `---` rules, paragraphs. Inline: **bold**, *italic*
-//! and _italic_, `code`, [links](url). Everything else is text, escaped:
+//! Blocks: `#` to `######` headings (`###` and deeper alike), `-`/`*`/`+`
+//! and `1.` lists, `>` quotes, fenced code (```), `---` rules, paragraphs.
+//! Inline: **bold**, *italic* and _italic_, ***bold italic***, `code`,
+//! [links](url). Everything else is text, escaped:
 //! the output is always valid markup, whatever the input (an unclosed
 //! marker stays as it was typed).
 

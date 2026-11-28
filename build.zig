@@ -405,7 +405,10 @@ fn toolSteps(b: *std.Build, options: struct {
     // `lumen` as installed and lumen-gtk beside it. It needs a Wayland
     // session, and the window shows for a few seconds. The binary is the
     // one just installed, under --prefix too (zig-out may hold an older one).
-    const e2e_run = b.addSystemCommand(&.{ "bash", "tools/e2e.sh" });
+    // Both paths absolute: the step runs in the caller's folder, which may
+    // be a subfolder of the project (MYP-534).
+    const e2e_run = b.addSystemCommand(&.{"bash"});
+    e2e_run.addFileArg(b.path("tools/e2e.sh"));
     e2e_run.addFileArg(.{ .relative = .{ .base = .install_bin, .sub_path = "lumen" } });
     e2e_run.step.dependOn(b.getInstallStep());
     e2e_run.has_side_effects = true;
@@ -431,6 +434,7 @@ fn resolveVersion(b: *std.Build) []const u8 {
         "describe", "--tags", "--match",
         "v*.*.*",   "--long", "--abbrev=9",
     }, &exit_code, .ignore) catch return base;
+    dependOnGitRevision(b, root);
     // For example "v0.1.0-14-ga1b2c3d4e": the tag, the commits since, the hash.
     const described = std.mem.trim(u8, described_output, " \r\n");
     var parts = std.mem.splitBackwardsScalar(u8, described, '-');
@@ -447,6 +451,28 @@ fn resolveVersion(b: *std.Build) []const u8 {
     }
     if (is_dev) return b.fmt("{s}.{s}+{s}", .{ base, commits, hash[1..] });
     return b.fmt("{s}+{s}.{s}", .{ base, commits, hash[1..] });
+}
+
+/// Zig keeps the configuration between builds, the version `git describe`
+/// gave included: a build after a commit, checkout or new tag printed the
+/// older revision (MYP-485). What moves HEAD writes its reflog, and tags
+/// are loose files or packed-refs; a change to any of them configures
+/// again. Where they cannot be found, every build configures again.
+fn dependOnGitRevision(b: *std.Build, root: []const u8) void {
+    var exit_code: u8 = 0;
+    const output = b.runAllowFail(&.{
+        "git",                    "-C",        root,               "rev-parse",
+        "--path-format=absolute", "--git-dir", "--git-common-dir",
+    }, &exit_code, .ignore) catch return b.graph.poisonCache();
+    var lines = std.mem.tokenizeAny(u8, output, "\r\n");
+    const git_dir = lines.next() orelse return b.graph.poisonCache();
+    const common_dir = lines.next() orelse return b.graph.poisonCache();
+    const reflog = b.pathJoin(&.{ git_dir, "logs", "HEAD" });
+    std.Io.Dir.accessAbsolute(b.graph.io, reflog, .{}) catch return b.graph.poisonCache();
+    b.dependOnFileMetadata(.{ .cwd_relative = reflog });
+    b.dependOnFileContents(.{ .cwd_relative = b.pathJoin(&.{ git_dir, "HEAD" }) });
+    b.dependOnDirectoryMetadata(.{ .cwd_relative = b.pathJoin(&.{ common_dir, "refs", "tags" }) });
+    b.dependOnFileContents(.{ .cwd_relative = b.pathJoin(&.{ common_dir, "packed-refs" }) });
 }
 
 /// Lua 5.4's library: everything in src/ but the two programs.

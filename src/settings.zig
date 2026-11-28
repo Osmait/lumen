@@ -131,8 +131,12 @@ pub const Settings = struct {
     open_with: std.array_hash_map.String([]const u8) = .empty,
     /// `key = value` lines this version does not know, kept as they were.
     unknown: std.ArrayList([]const u8) = .empty,
-    /// `[open-with]` lines this version does not know, kept as they were.
+    /// `[open-with]` lines this version does not know or whose app it does
+    /// not take, and the user's comments there, kept as they were.
     unknown_open_with: std.ArrayList([]const u8) = .empty,
+    /// The user's comment lines before any section, kept as they were
+    /// (written after the known keys).
+    comments: std.ArrayList([]const u8) = .empty,
     /// Known top-level keys whose value in the file was not recognized by
     /// this version, kept as they were until changed to a valid value.
     unrecognized_known: std.StringHashMapUnmanaged([]const u8) = .empty,
@@ -161,12 +165,30 @@ pub const Settings = struct {
     pub fn parse(gpa: std.mem.Allocator, text: []const u8) Settings {
         var settings = Settings.init(gpa);
         var section: enum { top, open_with, other } = .top;
+        // Known keys a line has set: a later line with a value this
+        // version does not take leaves the setting as it is, and is not
+        // what a save writes for it (MYP-576).
+        var applied_keys: std.StringHashMapUnmanaged(void) = .empty;
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |raw_line| {
             const raw_trimmed = std.mem.trim(u8, raw_line, " \t\r");
-            if (raw_trimmed.len == 0 or raw_trimmed[0] == '#' or raw_trimmed[0] == ';') continue;
+            if (raw_trimmed.len == 0) continue;
             if (!std.unicode.utf8ValidateSlice(raw_trimmed) or
                 std.mem.findScalar(u8, raw_trimmed, 0) != null) continue;
+            // The user's notes and commented-out values survive a save
+            // (MYP-566); the ones Lumen writes itself are written again.
+            if (raw_trimmed[0] == '#' or raw_trimmed[0] == ';') {
+                if (isOwnComment(raw_trimmed)) continue;
+                const kept = switch (section) {
+                    .top => &settings.comments,
+                    .open_with => &settings.unknown_open_with,
+                    .other => &settings.unknown_sections,
+                };
+                settings.keepLine(kept, raw_trimmed) catch {
+                    settings.incomplete = true;
+                };
+                continue;
+            }
             const line = withoutComment(raw_trimmed);
             if (line.len == 0) continue;
             if (line[0] == '[') {
@@ -191,13 +213,21 @@ pub const Settings = struct {
                             settings.incomplete = true;
                         };
                     },
-                    error.BadApp => {},
+                    // Kept as it is until that kind or extension is given
+                    // an app (MYP-530).
+                    error.BadApp => settings.keepLine(&settings.unknown_open_with, raw_trimmed) catch {
+                        settings.incomplete = true;
+                    },
                     error.OutOfMemory => settings.incomplete = true,
                 };
             } else {
                 switch (settings.setFromFile(key, value)) {
-                    .applied => {},
-                    .unrecognized_value => settings.keepUnrecognizedKnown(key, raw_trimmed),
+                    .applied => applied_keys.put(settings.allocator(), key, {}) catch {
+                        settings.incomplete = true;
+                    },
+                    .unrecognized_value => if (!applied_keys.contains(key)) {
+                        settings.keepUnrecognizedKnown(key, raw_trimmed);
+                    },
                     .unknown_key => if (isToken(key)) {
                         settings.keepLine(&settings.unknown, raw_trimmed) catch {
                             settings.incomplete = true;
@@ -207,6 +237,39 @@ pub const Settings = struct {
             }
         }
         return settings;
+    }
+
+    /// The comment lines `write` puts in the file itself, and those earlier
+    /// versions wrote: written again by every save, they are not the
+    /// user's. A test checks `write` adds no other.
+    const own_comments = [_][]const u8{
+        "# Lumen settings. Change them from Lumen (search \"Settings\") or here:",
+        "# Lumen reads this file again when its window opens.",
+        "# Appearance. Themes and styles: search \"Change Theme\" in Lumen.",
+        "# Appearance. Themes: search \"Change Theme\" in Lumen.",
+        "# small, default, large",
+        std.fmt.comptimePrint(
+            "# Window background opacity, percent ({d}-{d})",
+            .{ opacity_percent_min, opacity_percent_max },
+        ),
+        "# upper_third, center",
+        "# Window size: narrow, default, wide; short, default, tall",
+        "# Rows and icons: compact, default, comfortable",
+        "# An icon theme for Lumen only (a folder in /usr/share/icons); empty",
+        "# follows the desktop",
+        "# Search",
+        "# Clipboard history, and how many entries it keeps",
+        "# Commands; empty is automatic ($TERMINAL, $VISUAL/$EDITOR)",
+        unknown_header,
+        "# A file kind (folder pdf image video audio markdown html text office",
+        "# archive) or an extension (.log) = the app's desktop file id",
+    };
+
+    const unknown_header = "# Not known to this version of Lumen";
+
+    fn isOwnComment(line: []const u8) bool {
+        for (own_comments) |own| if (std.mem.eql(u8, line, own)) return true;
+        return false;
     }
 
     /// `line` without a comment: a whole-line one (`#`, `;`) or one after
@@ -399,13 +462,39 @@ pub const Settings = struct {
             key;
         if (app.len == 0) {
             _ = settings.open_with.orderedRemove(key_lowercase);
+            settings.forgetKeptOpenWith(key_lowercase);
             return;
         }
         if (!isToken(app)) return error.BadApp;
         if (!std.mem.endsWith(u8, app, ".desktop")) return error.BadApp;
+        settings.forgetKeptOpenWith(key_lowercase);
         const arena = settings.allocator();
         const key_copy = try arena.dupe(u8, key_lowercase);
         try settings.open_with.put(arena, key_copy, try arena.dupe(u8, app));
+    }
+
+    /// Drops the kept `[open-with]` lines for `key` (lowercase for an
+    /// extension) whose app this version did not take: the app set now is
+    /// the one that counts.
+    fn forgetKeptOpenWith(settings: *Settings, key: []const u8) void {
+        var line_index: usize = 0;
+        while (line_index < settings.unknown_open_with.items.len) {
+            const line = settings.unknown_open_with.items[line_index];
+            const equals = std.mem.findScalar(u8, line, '=') orelse {
+                line_index += 1;
+                continue;
+            };
+            const line_key = std.mem.trim(u8, line[0..equals], " \t");
+            const same = if (key[0] == '.')
+                std.ascii.eqlIgnoreCase(line_key, key)
+            else
+                std.mem.eql(u8, line_key, key);
+            if (same) {
+                _ = settings.unknown_open_with.orderedRemove(line_index);
+            } else {
+                line_index += 1;
+            }
+        }
     }
 
     /// A kind's name ("pdf"), or a dot and an extension (".log").
@@ -488,6 +577,7 @@ pub const Settings = struct {
     ) std.Io.Writer.Error!void {
         const source: Source = .{ .current = settings, .file = file, .kept_keys = kept };
         try writeKnown(writer, source);
+        try settings.writeComments(writer);
         try settings.writeUnknown(writer);
         try settings.writeOpenWith(writer);
         try settings.writeUnknownSections(writer);
@@ -569,8 +659,15 @@ pub const Settings = struct {
     /// a newer version's settings survive a save by this one.
     fn writeUnknown(settings: *const Settings, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         if (settings.unknown.items.len == 0) return;
-        try writer.writeAll("\n# Not known to this version of Lumen\n");
+        try writer.writeAll("\n" ++ unknown_header ++ "\n");
         for (settings.unknown.items) |line| try writer.print("{s}\n", .{line});
+    }
+
+    /// The user's comments read before any section, as they were.
+    fn writeComments(settings: *const Settings, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (settings.comments.items.len == 0) return;
+        try writer.writeAll("\n");
+        for (settings.comments.items) |line| try writer.print("{s}\n", .{line});
     }
 
     /// The sections read that this version does not know, as they were.
@@ -1160,4 +1257,110 @@ test "savePatch preserves external edits to settings.conf made after load" {
     try testing.expectEqual(Width.wide, reloaded.width);
     try testing.expect(!reloaded.suggestions);
     try testing.expectEqualStrings("future_manual = preserve-me", reloaded.unknown.items[0]);
+}
+
+/// `settings` written, read back and written again: the second text.
+fn writeTwice(settings: *const Settings, first: *std.Io.Writer.Allocating) !Settings {
+    try settings.write(&first.writer);
+    return Settings.parse(testing.allocator, first.written());
+}
+
+test "a later bad value for a key already set is not what a save writes (MYP-576)" {
+    var settings = Settings.parse(testing.allocator,
+        \\clipboard = off
+        \\clipboard = disabled
+        \\theme = nord
+        \\theme = not a token
+        \\width = huge
+        \\width = wide
+    );
+    defer settings.deinit();
+    try testing.expect(!settings.clipboard);
+    try testing.expectEqualStrings("nord", settings.theme);
+    try testing.expectEqual(Width.wide, settings.width);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var back = try writeTwice(&settings, &out);
+    defer back.deinit();
+    try testing.expect(std.mem.find(u8, out.written(), "clipboard = false\n") != null);
+    try testing.expect(std.mem.find(u8, out.written(), "disabled") == null);
+    try testing.expect(!back.clipboard);
+    try testing.expectEqualStrings("nord", back.theme);
+    try testing.expectEqual(Width.wide, back.width);
+}
+
+test "an [open-with] app this version does not take is kept until one is set (MYP-530)" {
+    var settings = Settings.parse(testing.allocator,
+        \\[open-with]
+        \\pdf = org.gnome.Evince
+        \\.LOG = some future format
+        \\video = mpv.desktop
+    );
+    defer settings.deinit();
+    try testing.expect(settings.appFor("", .pdf) == null);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var back = try writeTwice(&settings, &out);
+    defer back.deinit();
+    try testing.expect(std.mem.find(u8, out.written(), "pdf = org.gnome.Evince\n") != null);
+    try testing.expect(std.mem.find(u8, out.written(), ".LOG = some future format\n") != null);
+    try testing.expect(std.mem.find(u8, out.written(), "video = mpv.desktop\n") != null);
+
+    // An app chosen for the kind or extension replaces the kept line.
+    try back.setOpenWith("pdf", "org.gnome.Evince.desktop");
+    try back.setOpenWith(".log", "");
+    out.clearRetainingCapacity();
+    try back.write(&out.writer);
+    try testing.expect(std.mem.find(u8, out.written(), "pdf = org.gnome.Evince\n") == null);
+    try testing.expect(std.mem.find(u8, out.written(), "pdf = org.gnome.Evince.desktop\n") != null);
+    try testing.expect(std.mem.find(u8, out.written(), ".LOG") == null);
+}
+
+test "the user's comments survive a save, Lumen's own are not doubled (MYP-566)" {
+    var settings = Settings.parse(testing.allocator,
+        \\# my notes: nord at night
+        \\# theme = nord
+        \\theme = dracula # inline notes are not kept
+        \\; an ini-style comment
+        \\[open-with]
+        \\# evince is too slow
+        \\pdf = zathura.desktop
+        \\[future]
+        \\# about the future section
+        \\key = value
+    );
+    defer settings.deinit();
+    var first: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer first.deinit();
+    var back = try writeTwice(&settings, &first);
+    defer back.deinit();
+    for ([_][]const u8{
+        "# my notes: nord at night\n",
+        "# theme = nord\n",
+        "; an ini-style comment\n",
+        "# evince is too slow\n",
+        "[future]\n# about the future section\nkey = value\n",
+    }) |kept| try testing.expect(std.mem.find(u8, first.written(), kept) != null);
+    try testing.expectEqualStrings("dracula", back.theme);
+    try testing.expectEqualStrings("zathura.desktop", back.appFor("", .pdf).?);
+    // Written again, the file is the same: nothing is added twice.
+    var second: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer second.deinit();
+    try back.write(&second.writer);
+    try testing.expectEqualStrings(first.written(), second.written());
+}
+
+test "every comment write adds is one of Lumen's own" {
+    var settings = Settings.parse(testing.allocator, "future_option = 1\n");
+    defer settings.deinit();
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    var back = try writeTwice(&settings, &out);
+    defer back.deinit();
+    var lines = std.mem.splitScalar(u8, out.written(), '\n');
+    while (lines.next()) |line| {
+        if (line.len > 0 and line[0] == '#') try testing.expect(Settings.isOwnComment(line));
+    }
+    try testing.expectEqual(@as(usize, 0), back.comments.items.len);
+    try testing.expectEqual(@as(usize, 0), back.unknown_open_with.items.len);
 }

@@ -115,11 +115,12 @@ A row is a table, or just a string (a row with that title).
 
 ### Markdown in the detail pane
 
-`markdown` understands a small, safe subset: `#`, `##` and `###` headings,
-**bold**, *italic*, `` `code` ``, fenced code blocks, `-` and `1.` lists,
-`>` quotes, `---` rules and `[links](https://...)` (`http`, `https` and
-`mailto` only; a link with another scheme shows as text). Anything else shows as
-typed.
+`markdown` understands a small, safe subset: `#` to `######` headings (from
+`###` on they all look alike, in bold), **bold**, *italic* and _italic_,
+***bold italic***, `` `code` ``, fenced code blocks, `-`, `*`, `+` and `1.`
+lists, `>` quotes, `---` rules and `[links](https://...)` (`http`, `https`
+and `mailto` only; a link with another scheme shows as text). Anything else
+shows as typed.
 
 ```lua
 {

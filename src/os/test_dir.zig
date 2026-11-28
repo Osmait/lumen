@@ -49,7 +49,10 @@ pub const TestDir = struct {
 /// Absolute path of a testing tmp dir, in `path_buffer`.
 pub fn tmpDirAbs(tmp_dir: *std.testing.TmpDir, path_buffer: []u8) ![]const u8 {
     var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const cwd = std.mem.sliceTo(cwd_buffer[0..linux.getcwd(&cwd_buffer, cwd_buffer.len)], 0);
+    // A failure (the folder removed, ERANGE) is -errno, not a length.
+    const cwd_result = linux.getcwd(&cwd_buffer, cwd_buffer.len);
+    if (linux.errno(cwd_result) != .SUCCESS) return error.CurrentDirUnavailable;
+    const cwd = std.mem.sliceTo(cwd_buffer[0..cwd_result], 0);
     var relative_buffer: [256]u8 = undefined;
     const relative = try tmpDirPath(tmp_dir, &relative_buffer);
     return std.mem.print(path_buffer, "{s}/{s}", .{ cwd, relative });

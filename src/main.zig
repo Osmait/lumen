@@ -17,9 +17,11 @@ const builtin = @import("builtin");
 const c = @import("c");
 const Db = @import("sys/Db.zig");
 const Ui = @import("ui/Ui.zig");
+const ui_config = @import("ui/config.zig");
 const index = @import("index");
 const stats = @import("stats.zig");
-const Settings = @import("settings.zig").Settings;
+const settings_mod = @import("settings.zig");
+const Settings = settings_mod.Settings;
 const ipc = @import("ipc.zig");
 const cli = @import("cli.zig");
 const ipc_server = @import("sys/ipc_server.zig");
@@ -237,6 +239,10 @@ fn startupCallback(gtk_app: *c.GtkApplication, data: ?*anyopaque) callconv(.c) v
     // SIG_IGN: the programs started next (GLib's spawns too) would inherit
     // it, and `cmd | head` would run on. The empty handler again.
     os.unix.ignoreSigpipe();
+    // Started by hand or by install.sh, the daemon stayed in that shell's
+    // folder: every app and terminal it launches started there too, and a
+    // drive mounted there could not be unmounted (MYP-564).
+    _ = std.os.linux.chdir(c.g_get_home_dir());
     useCNumbers();
     quitOnSignals();
     const path = dbPath() orelse {
@@ -260,7 +266,12 @@ fn startupCallback(gtk_app: *c.GtkApplication, data: ?*anyopaque) callconv(.c) v
     Ui.ext_view.start(ui);
     c.g_application_hold(daemon.app.?);
     if (c.g_getenv(ipc.env.test_mode) == null) {
-        if (ui.settings.clipboard) startClipboardWatcher();
+        // lumen.set in init.lua may turn the history off or change how much
+        // it keeps; its values come with the first registry, which starts
+        // the watcher (`settingsChangedCallback`). wl-paste hands over the
+        // current selection as it starts: started here, it was stored with
+        // the file's values alone (MYP-568).
+        if (ui.ext_host == null and ui.settings.clipboard) startClipboardWatcher();
     } else {
         // Tests feed the clipboard store directly (`--clip-store`).
         _ = c.g_timeout_add_seconds(test_instance_lifetime_s, &testWatchdogCallback, null);
@@ -747,13 +758,15 @@ fn startClipboardWatcher() void {
     };
     var pid: c.GPid = undefined;
     var err: ?*c.GError = null;
+    // The child checks it is still ours once the death signal is armed.
+    const parent_pid: usize = @intCast(std.os.linux.getpid());
     const spawned = c.g_spawn_async(
         null,
         @ptrCast(&argv),
         null,
         c.G_SPAWN_SEARCH_PATH | c.G_SPAWN_DO_NOT_REAP_CHILD,
         &dieWithParent,
-        null,
+        @ptrFromInt(parent_pid),
         &pid,
         &err,
     ) != 0;
@@ -810,6 +823,9 @@ fn settingsChangedCallback() void {
     if (c.g_getenv(ipc.env.test_mode) != null) return;
     if (daemon.shutting_down.load(.acquire)) return;
     const ui = readyUi() orelse return;
+    // Until init.lua's settings arrive, the file's are not the ones in
+    // effect: the first registry calls here again (MYP-568).
+    if (effectiveSettingsPending(ui)) return;
     const watcher = &daemon.clipboard_watcher;
     if (ui.settings.clipboard) {
         if (!watcher.running()) {
@@ -821,8 +837,14 @@ fn settingsChangedCallback() void {
     }
 }
 
-fn dieWithParent(_: ?*anyopaque) callconv(.c) void {
+/// In the child, between fork and exec. The signal only comes for a death
+/// after prctl: a daemon that died before it left the watcher an orphan,
+/// next to the one the following daemon starts (MYP-464). Its parent is
+/// then another process, and the child goes instead.
+fn dieWithParent(parent_pid: ?*anyopaque) callconv(.c) void {
     _ = c.prctl(c.PR_SET_PDEATHSIG, @as(c_ulong, c.SIGTERM));
+    const expected: std.os.linux.pid_t = @intCast(@intFromPtr(parent_pid));
+    if (std.os.linux.getppid() != expected) std.os.linux.exit_group(1);
 }
 
 fn prewarmCallback(_: ?*anyopaque) callconv(.c) c.gboolean {
@@ -852,9 +874,23 @@ fn storeClipInto(
     return true;
 }
 
+/// Whether init.lua's settings (lumen.set) are still on their way: the
+/// extension host is loading it and has not delivered its first registry.
+fn effectiveSettingsPending(ui: *const Ui) bool {
+    return ui.ext_host != null and ui.ext_registry == null;
+}
+
 /// Stores a copy handed over the socket by `lumen --clip-store`.
 fn storeClip(content: []const u8) bool {
     const ui = readyUi() orelse return false;
+    // With the history off or shorter in init.lua, the file's values would
+    // store the copy or trim the history to them (MYP-568): the first
+    // registry is waited for, as a `--command` at startup does.
+    if (effectiveSettingsPending(ui)) Ui.ext_view.ensureInitialRegistry(ui);
+    // settings.conf is read again when the window opens; a hand edit that
+    // turns the history off applies to the next copy already (MYP-448).
+    const stamp = settings_mod.Stamp.of(ui.settings_path.ptr);
+    if (!stamp.eql(ui.settings_stamp)) ui_config.reloadSettings(ui);
     return storeClipInto(
         &ui.db,
         ui.settings.clipboard,
@@ -901,7 +937,10 @@ fn clipStore(init: std.process.Init) !void {
     defer c.g_free(path);
     var db = try Db.open(std.mem.span(path));
     defer db.close();
-    try db.addClip(content, os.nowSeconds(), settings.clipboard_keep);
+    // This process does not run init.lua, whose lumen.set may keep more
+    // than the file says: trimming to the file's value deleted those
+    // entries for good (MYP-568). The daemon trims at its next copy.
+    try db.addClip(content, os.nowSeconds(), Db.clip_entries_max);
 }
 
 test "requests: flags in order, values, and what is refused" {
@@ -988,6 +1027,38 @@ test "the views the usage lists open" {
     while (views.next()) |view| {
         try std.testing.expect(std.meta.stringToEnum(Ui.View, view) != null);
     }
+}
+
+/// The wait status of `/bin/sh -c "exit 0"` run with `dieWithParent`
+/// expecting `parent_pid`.
+fn spawnStatusExpecting(parent_pid: usize) !c_int {
+    var argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", "exit 0" };
+    var wait_status: c_int = -1;
+    var err: ?*c.GError = null;
+    const spawned = c.g_spawn_sync(
+        null,
+        @ptrCast(&argv),
+        null,
+        0,
+        &dieWithParent,
+        @ptrFromInt(parent_pid),
+        null,
+        null,
+        &wait_status,
+        &err,
+    ) != 0;
+    if (!spawned) {
+        if (err) |spawn_error| c.g_error_free(spawn_error);
+        return error.SpawnFailed;
+    }
+    return wait_status;
+}
+
+test "a watcher whose parent is not the daemon that started it goes (MYP-464)" {
+    const ours: usize = @intCast(std.os.linux.getpid());
+    try std.testing.expectEqual(@as(c_int, 0), try spawnStatusExpecting(ours));
+    // As if the daemon had died before prctl: the child exits before exec.
+    try std.testing.expect(try spawnStatusExpecting(ours + 1) != 0);
 }
 
 test "storeClipInto fails on SQLite write lock and succeeds on intentional skips" {

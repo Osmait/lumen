@@ -155,8 +155,9 @@ pub fn findMonitor(all: []const MonitorJson, id: i64) ?geometry.Monitor {
     for (all) |monitor_json| {
         if (monitor_json.id != id) continue;
         const found = monitorFromJson(monitor_json);
-        // The geometry runs without overflow checks (core is ReleaseFast):
-        // a broken reply stops here, never reaching its arithmetic.
+        // The geometry asserts these bounds (`usable`) and its arithmetic
+        // would overflow past them: a broken reply stops here, and never
+        // panics the daemon.
         if (!found.plausible()) return null;
         return found;
     }
