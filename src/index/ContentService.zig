@@ -544,6 +544,9 @@ fn extractMissing(
         if (doc.source != .extracted) continue;
         const text_path = service.text_cache.path(&path_buffer, doc) orelse continue;
         if (sys.exists(text_path)) continue;
+        // Cached by an older version under another name: renamed, not
+        // extracted again (an upgrade found no index to sweep by).
+        if (service.text_cache.adoptLegacy(doc)) continue;
         const prior = service.priorRetry(doc);
         const attempts: u8 = if (prior) |p| p.attempts else 0;
         const waiting_backoff = prior != null and now_ns < prior.?.next_retry_ns;
@@ -2326,6 +2329,69 @@ test "content service: missing cached text is re-extracted and kept instead of d
     // Next poke: cached text is back, so nothing is extracted again.
     try pokeAndWait(service);
     try testing.expectEqual(@as(u32, 2), service.status().extractions);
+}
+
+test "content service: an upgrade with an unreadable index reuses texts cached under older names" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    if (!haveTool("zip") or !haveTool("unzip")) return error.SkipZigTest;
+
+    var stage = try TestTree.init();
+    defer stage.deinit();
+    try stage.write("mimetype", "application/vnd.oasis.opendocument.text");
+    try stage.write(
+        "content.xml",
+        "<?xml version=\"1.0\"?><office:document-content><text:p>wombat notes</text:p></office:document-content>",
+    );
+    var path_buffer: paths.Buffer = undefined;
+    const notes = try fixture.root.path(&path_buffer, "notes.odt");
+    const zip_res = try std.process.run(testing.allocator, testing.io, .{
+        .argv = &.{ "zip", "-q", "-X", "-r", notes, "." },
+        .cwd = .{ .path = stage.absolute },
+    });
+    testing.allocator.free(zip_res.stdout);
+    testing.allocator.free(zip_res.stderr);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, zip_res.term);
+    const mtime_second = sys.nowSeconds() - 200;
+    try setMtimeNs(notes, @intCast(mtime_second), 123_456_789);
+    {
+        const first = try fixture.start();
+        defer first.shutdown();
+        try waitChecks(first, 1);
+        try testing.expectEqual(@as(u32, 1), first.status().extractions);
+    }
+
+    // What the version before named it (mtime in whole seconds), and an
+    // index of an older format: nothing to sweep by on start.
+    const size = sys.info(notes).?.size;
+    var hash_hex: [32]u8 = undefined;
+    var now_buffer: paths.Buffer = undefined;
+    var old_buffer: paths.Buffer = undefined;
+    const now_name = try std.mem.printSentinel(&now_buffer, "{s}/text/{s}-{d}-{d}.txt", .{
+        fixture.cache.absolute,
+        TextCache.pathHashHex(&hash_hex, notes),
+        mtime_second * std.time.ns_per_s + 123_456_789,
+        size,
+    }, 0);
+    const old_name = try std.mem.printSentinel(&old_buffer, "{s}/text/{s}-{d}-{d}.txt", .{
+        fixture.cache.absolute,
+        TextCache.pathHashHex(&hash_hex, notes),
+        mtime_second,
+        size,
+    }, 0);
+    try sys.rename(now_name, old_name);
+    var index_buffer: paths.Buffer = undefined;
+    const index_path = try fixture.cache.path(&index_buffer, "content.idx");
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.unlink(index_path)));
+
+    const service = try fixture.start();
+    defer service.shutdown();
+    try waitChecks(service, 1);
+    try testing.expectEqual(@as(u32, 0), service.status().extractions);
+    try testing.expect(sys.exists(now_name));
+    try testing.expect(!sys.exists(old_name));
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "wombat")).len);
 }
 
 test "content service: a text cache folder deleted while running is made again" {
