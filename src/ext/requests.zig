@@ -96,6 +96,17 @@ pub const KeptRing = struct {
         ring.next = (ring.next + 1) % kept_ring_len;
     }
 
+    /// Lets go of every list but the newest.
+    pub fn releaseOlder(ring: *KeptRing, L: *lua.State) void {
+        const newest = (ring.next + kept_ring_len - 1) % kept_ring_len;
+        for (&ring.entries, 0..) |*entry, index| {
+            if (index == newest) continue;
+            const old = entry.* orelse continue;
+            entry.* = null;
+            lua.unref(L, old.reference);
+        }
+    }
+
     pub fn find(ring: *const KeptRing, list_generation: RequestGeneration) ?Kept {
         for (ring.entries) |maybe_kept| {
             if (maybe_kept) |kept| {
@@ -105,6 +116,23 @@ pub const KeptRing = struct {
         return null;
     }
 };
+
+/// Kept lists are whole Lua tables (with whatever their rows hold), in the
+/// extension's memory, which its commands share. Past half of it, a new
+/// list or root search first lets go of all but the newest list of each of
+/// the extension's commands: rows of an older list the window still shows
+/// lose their Lua actions ("the list changed"), rather than every new list
+/// failing for memory. And for good: a list that fails is not kept, so it
+/// never pushed the old ones out.
+fn makeRoomForList(L: *lua.State, worker_commands: []WorkerCommand, extension_index: u16) void {
+    const budget = lua.budgetOf(L);
+    if (budget.used_bytes <= budget.bytes_max / 2) return;
+    for (worker_commands) |*worker_command| {
+        if (worker_command.extension_index != extension_index) continue;
+        worker_command.list_kept.releaseOlder(L);
+        worker_command.root_search_kept.releaseOlder(L);
+    }
+}
 
 /// A Lua list kept alive in the registry so that its rows' actions can run
 /// later. An action for a row of another list is refused: the row it
@@ -286,6 +314,7 @@ pub fn listExecute(host: *Host, request: *const ListRequest) void {
     var context: ListContext = .{
         .extension = extension,
         .worker_command = worker_command,
+        .worker_commands = host.worker_commands,
         .request = request,
         .result = result,
         .rows_arena = rows.allocator(),
@@ -303,12 +332,15 @@ pub fn listExecute(host: *Host, request: *const ListRequest) void {
 const ListContext = struct {
     extension: *Extension,
     worker_command: *WorkerCommand,
+    /// All of them: the extension's other commands keep lists too.
+    worker_commands: []WorkerCommand,
     request: *const ListRequest,
     result: *ListResult,
     /// The result's arena, up to `rows_bytes_max`.
     rows_arena: std.mem.Allocator,
 
     fn run(L: *lua.State, context: *ListContext) void {
+        makeRoomForList(L, context.worker_commands, context.worker_command.extension_index);
         _ = lua.pushRef(L, context.worker_command.spec_reference);
         const spec = lua.absIndex(L, -1);
         switch (context.worker_command.mode) {
@@ -389,6 +421,7 @@ fn rootSearchCommand(
     var context: RootSearchContext = .{
         .extension = extension,
         .worker_command = worker_command,
+        .worker_commands = host.worker_commands,
         .command = command,
         .request = request,
         .rows_arena = rows.allocator(),
@@ -417,12 +450,15 @@ fn rootSearchSuperseded(host: *Host) bool {
 const RootSearchContext = struct {
     extension: *Extension,
     worker_command: *WorkerCommand,
+    /// All of them: the extension's other commands keep lists too.
+    worker_commands: []WorkerCommand,
     command: CommandIndex,
     request: *const RootSearchRequest,
     rows_arena: std.mem.Allocator,
     items: []Item = &.{},
 
     fn run(L: *lua.State, context: *RootSearchContext) void {
+        makeRoomForList(L, context.worker_commands, context.worker_command.extension_index);
         _ = lua.pushRef(L, context.worker_command.spec_reference);
         _ = lua.getField(L, -1, "root");
         lua.pushString(L, context.request.query.slice());

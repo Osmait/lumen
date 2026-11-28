@@ -98,7 +98,8 @@ pub const Action = union(enum) {
     focus_window: [:0]const u8,
     /// Row id in the clipboard table; the text is in `Item.detail`.
     clip: @import("sys/Db.zig").ClipId,
-    script: struct { path: [:0]const u8, mode: core.script_meta.Mode },
+    /// `cwd` is the folder it runs in: its own, or its `currentDirectoryPath`.
+    script: struct { path: [:0]const u8, mode: core.script_meta.Mode, cwd: [:0]const u8 },
     /// Calculator result; `Item.detail` holds the plain value to copy.
     calc,
     setting: Setting,

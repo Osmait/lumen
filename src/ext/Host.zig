@@ -1551,6 +1551,64 @@ test "lumen.storage.set rejects mixed tables and preserves previous value on dis
     try testing.expectEqualStrings("no-label", listed.items[1].title);
 }
 
+test "kept lists give way before new ones run out of the extension's memory" {
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const folder = try os.tmpDirPath(&test_dir, &path_buffer);
+    // ~14 MB a list, new strings each time: four kept ones and the one being
+    // built went past the 64 MB cap, and failing lists never freed them.
+    try writeTestFile(folder, "extensions/big/init.lua",
+        \\local n = 0
+        \\local function rows(q)
+        \\  n = n + 1
+        \\  local list = {}
+        \\  for i = 1, 1000 do
+        \\    list[i] = { title = q .. i, body = (n .. ":" .. i .. " "):rep(2400),
+        \\      actions = { { title = "Pick", run = function() end } } }
+        \\  end
+        \\  return list
+        \\end
+        \\return lumen.extension { commands = {
+        \\  { name = "big", title = "Big", items = function() return rows("r") end },
+        \\  { name = "rootbig", title = "Root Big", root = function(q) return rows(q) end },
+        \\} }
+    );
+
+    var probe: Probe = .{};
+    defer probe.deinit();
+    const host = try testHost(&probe, folder);
+    defer host.shutdown();
+    host.reload();
+    try probe.wait("registry");
+    const registry = probe.registry.?;
+
+    var last: RequestGeneration = undefined;
+    for (0..7) |_| {
+        last = host.list(registry.generation, .from(0), "");
+        const listed = try probe.take("list");
+        defer listed.destroy(testing.allocator);
+        try testing.expect(listed.error_message == null);
+        try testing.expectEqual(@as(usize, 1000), listed.items.len);
+    }
+    for (0..4) |_| {
+        _ = host.root(registry.generation, "q");
+        const found = try probe.take("root");
+        defer found.destroy(testing.allocator);
+        try testing.expectEqual(@as(usize, 1), found.sections.len);
+    }
+    // The newest list keeps its rows' actions.
+    _ = host.act(registry.generation, .from(0), .{ .row_action = .{
+        .from_root_search = false,
+        .list_generation = last,
+        .row_index = 0,
+        .action_index = 0,
+    } });
+    const acted = try probe.take("act");
+    defer acted.destroy(testing.allocator);
+    try testing.expect(acted.error_message == null);
+}
+
 test "row actions still work after switching back to an earlier cached list or root search" {
     var test_dir = testing.tmpDir(.{});
     defer test_dir.cleanup();

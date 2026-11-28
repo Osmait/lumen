@@ -86,6 +86,7 @@ typedef struct MatchState {
   lua_State *L;
   int matchdepth;  /* control for recursive depth (to avoid C stack overflow) */
   unsigned long steps;  /* calls to 'match' so far (Lumen: deadline checks) */
+  size_t written;  /* Lumen: replacement bytes walked since the last check */
   unsigned char level;  /* total number of captures (finished or unfinished) */
   struct {
     const char *init;
@@ -514,6 +515,7 @@ static void prepstate (MatchState *ms, lua_State *L,
   ms->src_end = s + ls;
   ms->p_end = p + lp;
   ms->steps = 0;
+  ms->written = 0;
 }
 
 
@@ -621,6 +623,21 @@ static int gmatch (lua_State *L) {
 }
 
 
+/* Lumen: 'add_s' walks the whole replacement for every match, in C, where
+** the hook never runs: an empty match per byte and a replacement of
+** millions of '%0's held the worker for seconds, adding nothing the
+** memory cap could stop. Check the deadline every LUART_FIND_CHECK_BYTES
+** bytes walked or copied. */
+static void replace_walked (MatchState *ms, size_t n) {
+  ms->written += n;
+  if (l_unlikely(ms->written >= LUART_FIND_CHECK_BYTES)) {
+    ms->written = 0;
+    if (luart_match_timed_out(ms->L))
+      luaL_error(ms->L, "timed out");
+  }
+}
+
+
 static void add_s (MatchState *ms, luaL_Buffer *b, const char *s,
                                                    const char *e) {
   size_t l;
@@ -628,6 +645,7 @@ static void add_s (MatchState *ms, luaL_Buffer *b, const char *s,
   const char *news = lua_tolstring(L, 3, &l);
   const char *p;
   while ((p = (char *)memchr(news, L_ESC, l)) != NULL) {
+    replace_walked(ms, (size_t)(p - news) + 2 + (size_t)(e - s));
     luaL_addlstring(b, news, p - news);
     p++;  /* skip ESC */
     if (*p == L_ESC)  /* '%%' */
@@ -647,6 +665,7 @@ static void add_s (MatchState *ms, luaL_Buffer *b, const char *s,
     l -= p + 1 - news;
     news = p + 1;
   }
+  replace_walked(ms, l);
   luaL_addlstring(b, news, l);
 }
 

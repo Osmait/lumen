@@ -78,6 +78,7 @@ fn copy(arena: std.mem.Allocator, cached: Item) std.mem.Allocator.Error!Item {
     copied.action = .{ .script = .{
         .path = try arena.dupeSentinel(u8, cached.action.script.path, 0),
         .mode = cached.action.script.mode,
+        .cwd = try arena.dupeSentinel(u8, cached.action.script.cwd, 0),
     } };
     return copied;
 }
@@ -148,7 +149,9 @@ fn scan(arena: std.mem.Allocator, path: [:0]const u8) []Item {
 }
 
 /// The row for the script `name` in the folder at `path`, or null when the
-/// file is not a script command (no title in its header).
+/// file is not a script command (no title in its header) or needs
+/// arguments, which there is no prompt for: run without them, `$1` is
+/// empty, and `rm -rf "$HOME/Downloads/$1"` removes the whole folder.
 fn itemOf(
     arena: std.mem.Allocator,
     path: [:0]const u8,
@@ -170,6 +173,10 @@ fn itemOf(
     var head_buffer: [script_header_bytes_max]u8 = undefined;
     const head = os.readHead(file_path.ptr, &head_buffer);
     const metadata = script_meta.parse(head) orelse return null;
+    if (metadata.needs_arguments) {
+        log.info("{s}: left out, it needs arguments (@raycast.argumentN)", .{name});
+        return null;
+    }
     const subtitle = if (metadata.package_name.len > 0) metadata.package_name else "Script Command";
     return .{
         .key = try arena.print("script:{s}", .{name}),
@@ -182,8 +189,31 @@ fn itemOf(
             .{ .emoji = try arena.dupeSentinel(u8, metadata.icon, 0) }
         else
             .{ .tile = .{ .name = "utilities-terminal-symbolic", .color = .gray } },
-        .action = .{ .script = .{ .path = file_path, .mode = metadata.mode } },
+        .action = .{ .script = .{
+            .path = file_path,
+            .mode = metadata.mode,
+            .cwd = try workingFolder(arena, path, metadata.current_directory_path),
+        } },
     };
+}
+
+/// The folder a script runs in: its `currentDirectoryPath`, with `~`
+/// expanded and a relative one taken from the scripts folder at `path`, or
+/// that folder when there is none. Not checked here: a folder that does not
+/// exist makes the run fail, never run it somewhere else.
+fn workingFolder(
+    arena: std.mem.Allocator,
+    path: [:0]const u8,
+    current_directory_path: []const u8,
+) std.mem.Allocator.Error![:0]const u8 {
+    const folder = current_directory_path;
+    if (folder.len == 0) return arena.dupeSentinel(u8, path, 0);
+    if (std.mem.eql(u8, folder, "~") or std.mem.startsWith(u8, folder, "~/")) {
+        const home = std.mem.span(c.g_get_home_dir());
+        return arena.printSentinel("{s}{s}", .{ home, folder[1..] }, 0);
+    }
+    if (folder[0] == '/') return arena.dupeSentinel(u8, folder, 0);
+    return arena.printSentinel("{s}/{s}", .{ path, folder }, 0);
 }
 
 /// The longest emoji taken, in bytes: a family or a flag with joiners and
@@ -277,6 +307,52 @@ test "scan skips non-executable files and sanitizes title and subtitle" {
     try std.testing.expectEqual(@as(usize, 1), items.len);
     try std.testing.expectEqualStrings("Hello World", items[0].title);
     try std.testing.expectEqualStrings("Dev Tools", items[0].subtitle);
+}
+
+test "scripts that need arguments are left out; the folder they run in" {
+    var test_dir = try os.TestDir.init();
+    defer test_dir.deinit();
+    try test_dir.mkdir("scripts");
+    const scripts = [_]struct { name: []const u8, source: []const u8 }{
+        .{ .name = "remove.sh", .source =
+        \\#!/bin/sh
+        \\# @raycast.title Remove
+        \\# @raycast.argument1 {"type":"text","placeholder":"folder"}
+        \\rm -rf "$HOME/Downloads/$1"
+        },
+        .{ .name = "sync.sh", .source =
+        \\#!/bin/sh
+        \\# @raycast.title Sync
+        \\# @raycast.currentDirectoryPath /srv/app
+        \\# @raycast.argument1 {"type":"text","placeholder":"branch","optional":true}
+        },
+    };
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    for (scripts) |script| {
+        var name_buffer: [64]u8 = undefined;
+        const relative = try std.fmt.bufPrint(&name_buffer, "scripts/{s}", .{script.name});
+        try test_dir.write(relative, script.source);
+        const script_path = try test_dir.path(&path_buffer, relative);
+        try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.fchmodat(linux.AT.FDCWD, script_path, 0o755)));
+    }
+
+    var dir_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const scripts_dir = try test_dir.path(&dir_buffer, "scripts");
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const items = scan(arena, scripts_dir);
+    try std.testing.expectEqual(@as(usize, 1), items.len);
+    try std.testing.expectEqualStrings("Sync", items[0].title);
+    try std.testing.expectEqualStrings("/srv/app", items[0].action.script.cwd);
+
+    try std.testing.expectEqualStrings("/s", try workingFolder(arena, "/s", ""));
+    try std.testing.expectEqualStrings("/s/sub", try workingFolder(arena, "/s", "sub"));
+    const home = std.mem.span(c.g_get_home_dir());
+    const projects = try workingFolder(arena, "/s", "~/Projects/app");
+    try std.testing.expect(std.mem.startsWith(u8, projects, home));
+    try std.testing.expect(std.mem.endsWith(u8, projects, "/Projects/app"));
+    try std.testing.expectEqualStrings(home, try workingFolder(arena, "/s", "~"));
 }
 
 test "emoji icons, joined ones included, and names that are not" {
