@@ -18,9 +18,13 @@
 //!     `lumen.icons` do. Adding a `defer` to such a frame means moving its
 //!     raising calls out first.
 //!   - Every state has a memory cap and an instruction-count hook that stops
-//!     code still running past its deadline.
+//!     code still running past its deadline. A timer signal arms that hook
+//!     for the next instruction when the deadline passes (`watchdog`), so an
+//!     instruction that alone takes milliseconds (`a == b`, `a < b`, `a .. b`
+//!     on long strings) cannot run thousands of times past it.
 
 const std = @import("std");
+const linux = std.os.linux;
 pub const c = @import("lua");
 const os = @import("os");
 const assert = std.debug.assert;
@@ -117,15 +121,16 @@ pub fn openLibs(L: *State) void {
     c.lua_pushcclosure(L, wrap(armThreadHook), 0);
     c.lua_pushcclosure(L, wrap(checkDeadline), 0);
     c.lua_pushcclosure(L, wrap(guardShortStringFn), 0);
-    c.lua_callk(L, 5, 0, 0, null);
+    c.lua_pushcclosure(L, wrap(resumed), 0);
+    c.lua_callk(L, 6, 0, 0, null);
     luart_cloexec_io_input(L);
 }
 
 /// Run by `openLibs` once the libraries are open, with `refuseOpen`,
-/// `isTimedOut`, `armThreadHook`, `checkDeadline` and `guardShortStringFn` as
-/// its arguments: what it replaces and why is said there.
+/// `isTimedOut`, `armThreadHook`, `checkDeadline`, `guardShortStringFn` and
+/// `resumed` as its arguments: what it replaces and why is said there.
 const sandbox_prelude =
-    \\local refuse, timed_out, arm_hook, check_deadline, guard_short_str = ...
+    \\local refuse, timed_out, arm_hook, check_deadline, guard_short_str, resumed = ...
     \\debug = nil; package.loaded.debug = nil
     \\os.exit, os.execute, os.setlocale = nil, nil, nil
     \\io.popen = nil
@@ -311,10 +316,7 @@ const sandbox_prelude =
     \\  local raw_create, raw_resume, raw_close = coroutine.create, coroutine.resume, coroutine.close
     \\  local timed_out_coroutines = setmt({}, { __mode = "k" })
     \\  local function finish_resume(co, ok, ...)
-    \\    if not ok and timed_out() then
-    \\      timed_out_coroutines[co] = true
-    \\      error("timed out", 0)
-    \\    end
+    \\    resumed(timed_out_coroutines, co, ok)
     \\    return ok, ...
     \\  end
     \\  function coroutine.create(f)
@@ -326,11 +328,8 @@ const sandbox_prelude =
     \\    local co = raw_create(f)
     \\    arm_hook(co)
     \\    local function unwrap(ok, ...)
+    \\      resumed(timed_out_coroutines, co, ok)
     \\      if not ok then
-    \\        if timed_out() then
-    \\          timed_out_coroutines[co] = true
-    \\          error("timed out", 0)
-    \\        end
     \\        if raw_close then
     \\          local _, cerr = raw_close(co)
     \\          if timed_out() then
@@ -345,13 +344,13 @@ const sandbox_prelude =
     \\    end
     \\    return function(...)
     \\      if timed_out() then error("timed out", 0) end
-    \\      arm_hook(co)
+    \\      arm_hook(co, true)
     \\      return unwrap(raw_resume(co, ...))
     \\    end
     \\  end
     \\  function coroutine.resume(co, ...)
     \\    if timed_out() then error("timed out", 0) end
-    \\    arm_hook(co)
+    \\    arm_hook(co, true)
     \\    return finish_resume(co, raw_resume(co, ...))
     \\  end
     \\  if raw_close then
@@ -503,6 +502,9 @@ fn guardShortStringFn(L: *State) Error!c_int {
     return 1;
 }
 
+/// `arm_hook(co)` arms a coroutine's hook. `arm_hook(co, true)`, right
+/// before it runs, also makes it the Lua thread the deadline timer arms
+/// (`watchdog.running`), until `resumed` gives that back to the caller.
 fn armThreadHook(L: *State) Error!c_int {
     const budget = budgetOf(L);
     if (budget.expired()) budget.timed_out = true;
@@ -514,8 +516,30 @@ fn armThreadHook(L: *State) Error!c_int {
         {
             c.lua_sethook(co, &hook, c.LUA_MASKCOUNT, count);
         }
+        if (c.lua_toboolean(L, 2) != 0) watchdog.running = co;
     }
     return 0;
+}
+
+/// `resumed(timed_out_coroutines, co, ok)`, first thing once a resume
+/// returns: the caller is again the Lua thread the deadline timer arms
+/// (never a coroutine that may be collected meanwhile). Past the deadline
+/// it raises "timed out", marking `co` first when it failed (it timed out:
+/// `coroutine.close` must not run its `__close`, which runs with no hook).
+/// In one C call, so the hook cannot raise between the two.
+fn resumed(L: *State) Error!c_int {
+    watchdog.running = L;
+    const budget = budgetOf(L);
+    if (budget.expired()) budget.timed_out = true;
+    if (!budget.timed_out) return 0;
+    if (c.lua_toboolean(L, 3) == 0 and c.lua_type(L, 1) == c.LUA_TTABLE and !isNoneOrNil(L, 2)) {
+        c.lua_pushvalue(L, 2);
+        c.lua_pushboolean(L, 1);
+        c.lua_rawset(L, 1);
+    }
+    armTimeoutHook(L);
+    pushString(L, "timed out");
+    return error.Raise;
 }
 
 /// For the sandbox's io.open and the others that open a file by name: a
@@ -538,7 +562,6 @@ fn refuseOpen(L: *State) Error!c_int {
 /// writable procfs file (even through a symlink, since `/proc/self/fd/<fd>`
 /// resolves the open target).
 fn fdAllowed(fd: i32) bool {
-    const linux = std.os.linux;
     var status: linux.Statx = undefined;
     const result = linux.statx(fd, "", linux.AT.EMPTY_PATH, .{ .TYPE = true }, &status);
     if (linux.errno(result) != .SUCCESS) return false;
@@ -580,7 +603,6 @@ const memory_device_major = 1;
 const MemoryDevice = enum(u32) { null = 3, zero = 5, full = 7, random = 8, urandom = 9 };
 
 fn opensSafely(path: [*:0]const u8) bool {
-    const linux = std.os.linux;
     const result = linux.open(
         path,
         .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true, .NOCTTY = true },
@@ -662,6 +684,11 @@ fn hook(L: ?*State, _: ?*c.lua_Debug) callconv(.c) void {
         budget.timed_out = true;
         c.lua_sethook(state, &hook, c.LUA_MASKCOUNT, 1);
         _ = c.luaL_error(state, "timed out");
+    }
+    // Armed for the next instruction by a timer that fired a hair early:
+    // back to the usual count.
+    if (c.lua_gethookcount(state) == 1) {
+        c.lua_sethook(state, &hook, c.LUA_MASKCOUNT, hook_instruction_count);
     }
 }
 
@@ -817,6 +844,168 @@ fn panic(L: ?*State) callconv(.c) c_int {
     std.debug.panic("Lua error outside a protected call: {s}", .{message});
 }
 
+// ------------------------------------------------------------- watchdog
+
+/// Arms the hook when the deadline passes, whatever the instruction count.
+/// The hook runs every `hook_instruction_count` instructions, and some
+/// instructions alone are O(length) (comparing, concatenating long
+/// strings): ~10k of them ran for seconds to minutes past the deadline. A
+/// POSIX timer sends `signal` to the thread in `protect` at the deadline;
+/// the handler calls `lua_sethook` (Lua allows that in a signal handler,
+/// lua.c does it on Ctrl+C), and the hook raises at the next instruction.
+/// When the signal has another handler there is no timer: the count hook
+/// alone still stops the code, later.
+const watchdog = struct {
+    /// Real-time and unused by GLib, GTK and Zig's std (SIGIO); the first
+    /// real-time ones are glibc's own.
+    const signal: linux.SIG = @fromBackingInt(@intCast(linux.sigrtmax() - 2));
+    const sigev_thread_id = 4;
+    const timer_abstime = 1;
+
+    /// The kernel's `struct sigevent`, with `sigev_notify_thread_id`.
+    const SigEvent = extern struct {
+        value: usize = 0,
+        signo: i32,
+        notify: i32,
+        tid: i32,
+        pad: [64 - @sizeOf(usize) - 3 * @sizeOf(i32)]u8 = @splat(0),
+    };
+
+    /// The Lua thread running on this thread in `protect` (the state it
+    /// entered, or a coroutine resumed in it): what the signal, delivered
+    /// to this thread, arms. Not the ones waiting for it: the coroutine
+    /// wrappers mark a timed-out coroutine as they get it back, before they
+    /// raise (`coroutine.close` must not run its `__close` then). Null
+    /// outside `protect`.
+    threadlocal var running: ?*State = null;
+
+    const Installed = enum(u8) { not_yet, installing, yes, no };
+    var installed: std.atomic.Value(Installed) = .init(.not_yet);
+
+    /// What `stop` undoes.
+    const Watch = struct {
+        running: ?*State,
+        timer: ?i32,
+    };
+
+    fn start(L: *State, deadline_ns: u64) Watch {
+        const watch: Watch = .{
+            .running = running,
+            .timer = if (deadline_ns == std.math.maxInt(u64)) null else timerAt(deadline_ns),
+        };
+        running = L;
+        return watch;
+    }
+
+    fn stop(watch: Watch) void {
+        // The timer goes first: a signal it sends meanwhile still finds
+        // the state it was for.
+        if (watch.timer) |timer| _ = linux.syscall1(.timer_delete, timerArgument(timer));
+        running = watch.running;
+    }
+
+    fn timerArgument(timer: i32) usize {
+        return @as(u32, @bitCast(timer));
+    }
+
+    /// A timer that signals this thread at `deadline_ns` (CLOCK_MONOTONIC,
+    /// as `os.monotonicNs`), or null when there can be none.
+    fn timerAt(deadline_ns: u64) ?i32 {
+        if (!install()) return null;
+        var event: SigEvent = .{
+            .signo = @intCast(@backingInt(signal)),
+            .notify = sigev_thread_id,
+            .tid = linux.gettid(),
+        };
+        var timer: i32 = undefined;
+        const created = linux.syscall3(
+            .timer_create,
+            @backingInt(linux.clockid_t.MONOTONIC),
+            @intFromPtr(&event),
+            @intFromPtr(&timer),
+        );
+        if (linux.errno(created) != .SUCCESS) return null;
+        const when: linux.itimerspec = .{
+            .it_interval = .{ .sec = 0, .nsec = 0 },
+            .it_value = .{
+                .sec = @intCast(deadline_ns / std.time.ns_per_s),
+                .nsec = @intCast(deadline_ns % std.time.ns_per_s),
+            },
+        };
+        const set = linux.syscall4(.timer_settime, timerArgument(timer), timer_abstime, @intFromPtr(&when), 0);
+        if (linux.errno(set) != .SUCCESS) {
+            _ = linux.syscall1(.timer_delete, timerArgument(timer));
+            return null;
+        }
+        return timer;
+    }
+
+    /// Installs `handle` for `signal`, once; false when the signal has
+    /// another handler (then there are no timers).
+    fn install() bool {
+        while (true) {
+            switch (installed.load(.acquire)) {
+                .yes => return true,
+                .no => return false,
+                .installing => std.atomic.spinLoopHint(),
+                .not_yet => if (installed.cmpxchgWeak(.not_yet, .installing, .acq_rel, .acquire) == null) {
+                    var old: linux.Sigaction = undefined;
+                    const free = linux.errno(linux.sigaction(signal, null, &old)) == .SUCCESS and
+                        old.handler.handler == linux.SIG.DFL;
+                    const action: linux.Sigaction = .{
+                        .handler = .{ .handler = &handle },
+                        .mask = linux.sigemptyset(),
+                        .flags = linux.SA.RESTART,
+                    };
+                    const ok = free and linux.errno(linux.sigaction(signal, &action, null)) == .SUCCESS;
+                    installed.store(if (ok) .yes else .no, .release);
+                },
+            }
+        }
+    }
+
+    /// Async-signal-safe: reads this thread's own variables and calls
+    /// `lua_sethook`, which Lua allows here.
+    fn handle(_: linux.SIG) callconv(.c) void {
+        if (running) |L| c.lua_sethook(L, &hook, c.LUA_MASKCOUNT, 1);
+    }
+};
+
+// ------------------------------------------------------------ collation
+
+/// glibc's `locale_t`, and what of <locale.h> is used here.
+const Locale = ?*anyopaque;
+extern "c" fn newlocale(category_mask: c_int, locale: [*:0]const u8, base: Locale) Locale;
+extern "c" fn duplocale(locale: Locale) Locale;
+extern "c" fn uselocale(locale: Locale) Locale;
+const lc_global_locale: Locale = @ptrFromInt(std.math.maxInt(usize));
+const lc_numeric_mask = 1 << 1;
+const lc_collate_mask = 1 << 3;
+
+/// The process's locale with C collation and numbers, made once.
+var c_collation: std.atomic.Value(Locale) = .init(null);
+
+/// Lua compares strings (`<`, `table.sort`) with strcoll, and GTK set the
+/// collation from the environment: ~9 ns a byte under en_US.UTF-8, 50 to
+/// 100 times C's, in an order that changes with the user's language. In
+/// `protect` this thread collates as C, byte by byte, as Lua does in a
+/// program that never calls setlocale; numbers are C's too, as the daemon
+/// sets them (main.zig). Returns the locale to restore.
+fn useCCollation() Locale {
+    var locale = c_collation.load(.acquire);
+    if (locale == null) {
+        const base = duplocale(lc_global_locale) orelse return null;
+        const made = newlocale(lc_collate_mask | lc_numeric_mask, "C", base) orelse return null;
+        // Another thread made one first: the same locale; this one leaks.
+        locale = c_collation.cmpxchgStrong(null, made, .acq_rel, .acquire) orelse made;
+    }
+    return uselocale(locale);
+}
+
+fn restoreLocale(previous: Locale) void {
+    if (previous != null) _ = uselocale(previous);
+}
+
 // ------------------------------------------------------------ protected
 
 /// Runs `handler(L, context)` in protected mode. Returns null on success,
@@ -834,10 +1023,16 @@ pub fn protect(
     const budget = budgetOf(L);
     budget.timed_out = false;
     c.lua_sethook(L, &hook, c.LUA_MASKCOUNT, hook_instruction_count);
+    // Runs last: a signal the watchdog's timer sent as it was deleted armed
+    // the hook for nothing.
     defer {
         budget.timed_out = false;
         c.lua_sethook(L, &hook, c.LUA_MASKCOUNT, hook_instruction_count);
     }
+    const previous_locale = useCCollation();
+    defer restoreLocale(previous_locale);
+    const watch = watchdog.start(L, budget.deadline_ns);
+    defer watchdog.stop(watch);
     const top = c.lua_gettop(L);
     defer c.lua_settop(L, top);
     if (c.lua_checkstack(L, 3) == 0) return "Lua stack overflow";
@@ -1322,6 +1517,9 @@ test "loops in C stop at the deadline too: table.move and patterns" {
         "('('):rep(1e6):find('%b()')",
         "('a'):rep(1e6):find('a*b')",
         "string.match(('a'):rep(50000), ('a'):rep(49999) .. 'b')",
+        // An empty match per byte, each writing a 2 MB replacement walked
+        // escape by escape: nothing added, so the memory cap never stops it.
+        "local r = ('%0'):rep(2e6) local s = ('b'):rep(600) s:gsub('x*', r)",
         "while true do coroutine.resume(coroutine.running()) end",
         "local a, b; a = coroutine.create(function() while true do coroutine.resume(b) end end); b = coroutine.create(function() while true do coroutine.resume(a) end end); coroutine.resume(a)",
         "xpcall(function() while true do end end, function(e) while true do end end)",
@@ -1359,7 +1557,6 @@ test "loops in C stop at the deadline too: table.move and patterns" {
 
 /// Descriptors of this process without close-on-exec.
 fn inheritableFds() usize {
-    const linux = std.os.linux;
     var count: usize = 0;
     var fd: i32 = 0;
     while (fd < 4096) : (fd += 1) {
@@ -1383,7 +1580,6 @@ test "a process's memory under /proc is not opened, even through a symlink" {
     var path_buffer: [512]u8 = undefined;
     const dir_path = try os.tmpDirPath(&test_dir, &path_buffer);
     const link = try std.fmt.allocPrintSentinel(arena, "{s}/x", .{dir_path}, 0);
-    const linux = std.os.linux;
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.symlink("/proc/self/mem", link)));
 
     const code = try std.fmt.allocPrintSentinel(arena,
@@ -1516,6 +1712,72 @@ test "a runaway loop stops at its deadline" {
     ) == null);
 }
 
+test "one costly operator per instruction stops at the deadline too" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Each instruction here compares, concatenates or scans megabytes: the
+    // ~10k instructions between two hook checks took seconds to minutes.
+    const runaways = [_][:0]const u8{
+        "local a = ('a'):rep(8e6) local b = a:sub(1, -2) .. 'b' while true do local _ = a == b end",
+        "local a = ('a'):rep(8e6) local b = a:sub(1, -2) .. 'b' while true do local _ = a < b end",
+        "local a = ('a'):rep(4e6) while true do local _ = a .. a end",
+        "local s = ('a'):rep(2e7) while true do s:find('b', 1, true) end",
+        "local a = ('a'):rep(8e6) local b = a:sub(1, -2) .. 'b' " ++
+            "coroutine.wrap(function() while true do local _ = a == b end end)()",
+        "local a = ('a'):rep(8e6) local b = a:sub(1, -2) .. 'b' " ++
+            "local co = coroutine.create(function() coroutine.yield() while true do local _ = a == b end end) " ++
+            "coroutine.resume(co) local x = 0 for i = 1, 100 do x = x + i end coroutine.resume(co)",
+        // Back in the caller after a coroutine yielded.
+        "local a = ('a'):rep(8e6) local b = a:sub(1, -2) .. 'b' " ++
+            "local f = coroutine.wrap(function() coroutine.yield() end) f() " ++
+            "while true do local _ = a == b end",
+    };
+    for (runaways) |code| {
+        var budget: Budget = .{ .bytes_max = 64 << 20 };
+        const L = try testState(&budget);
+        defer c.lua_close(L);
+        budget.deadline_ns = os.monotonicNs() + 50 * std.time.ns_per_ms;
+        const start_ns = os.monotonicNs();
+        const message = runCode(L, arena, code) orelse return error.TestUnexpectedResult;
+        const took_ns = os.monotonicNs() - start_ns;
+        try testing.expect(std.mem.find(u8, message, "timed out") != null);
+        try testing.expect(took_ns < 500 * std.time.ns_per_ms);
+        // With time left, the same state runs again.
+        budget.deadline_ns = std.math.maxInt(u64);
+        try testing.expect(runCode(L, arena, "local s = ('a'):rep(10) assert(s .. s == ('a'):rep(20))") == null);
+    }
+}
+
+extern "c" fn setlocale(category: c_int, locale: ?[*:0]const u8) ?[*:0]const u8;
+const lc_collate = 3;
+
+test "strings compare byte by byte whatever the user's collation" {
+    var budget: Budget = .{ .bytes_max = 8 << 20 };
+    const L = try testState(&budget);
+    defer c.lua_close(L);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // As GTK does at startup: the collation from the environment.
+    const locales = [_][*:0]const u8{ "en_US.UTF-8", "en_US.utf8", "C.UTF-8" };
+    defer _ = setlocale(lc_collate, "C");
+    const found = for (locales) |locale| {
+        if (setlocale(lc_collate, locale) != null) break true;
+    } else false;
+    if (!found) return error.SkipZigTest;
+    const before = try arena.dupeSentinel(u8, std.mem.span(setlocale(lc_collate, null).?), 0);
+    // en_US sorts "a" before "B"; bytes put "B" (66) first.
+    try testing.expect(runCode(L, arena,
+        \\assert("B" < "a" and not ("a" < "B"))
+        \\local t = { "b", "A", "a", "B" }
+        \\table.sort(t)
+        \\assert(table.concat(t) == "ABab")
+    ) == null);
+    // The process's own collation is left as it was.
+    try testing.expectEqualStrings(before, std.mem.span(setlocale(lc_collate, null).?));
+}
+
 test "memory is capped per state" {
     var budget: Budget = .{ .bytes_max = 4 << 20 };
     const L = try testState(&budget);
@@ -1570,7 +1832,6 @@ test "what the time limit cannot stop is out of reach" {
     var path_buffer: [512]u8 = undefined;
     const dir_path = try os.tmpDirPath(&test_dir, &path_buffer);
     const fifo = try std.fmt.allocPrintSentinel(arena, "{s}/fifo", .{dir_path}, 0);
-    const linux = std.os.linux;
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(
         linux.mknodat(linux.AT.FDCWD, fifo, linux.S.IFIFO | 0o600, 0),
     ));

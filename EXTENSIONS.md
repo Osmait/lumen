@@ -290,7 +290,9 @@ run programs, since it has a time limit. There is no standard input
 functions that open files refuse FIFOs, sockets and devices other than
 `/dev/null`, `zero`, `full`, `random` and `urandom`: reading one could block
 past any limit. `setmetatable` refuses a metatable with `__gc`, since
-finalizers run where no limit can stop them.
+finalizers run where no limit can stop them. Strings compare byte by byte
+(`"B" < "a"`, also in `table.sort`), whatever your language, as in a plain
+`lua`; numbers read and print with a `.`.
 
 An extension's commands share one Lua state. A table they all `require` (or a
 global) keeps values between calls until the files are reloaded.
