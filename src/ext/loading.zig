@@ -190,9 +190,10 @@ fn loadSource(
     };
     const before = load.mark();
     const used_before = cap.used_bytes;
-    var saved_bytes_max = cap.bytes_max;
-    cap.bytes_max = @min(saved_bytes_max, cap.used_bytes +| extension_load_bytes_max);
-    defer cap.bytes_max = saved_bytes_max;
+    // The file runs under its own cap; the total comes back right after,
+    // raised below if the file fails.
+    const bytes_max = cap.bytes_max;
+    cap.bytes_max = @min(bytes_max, cap.used_bytes +| extension_load_bytes_max);
     extension.load = load;
     var context: LoadContext = .{
         .extension = extension,
@@ -208,7 +209,7 @@ fn loadSource(
         LoadContext.run,
     );
     extension.load = null;
-    cap.bytes_max = saved_bytes_max;
+    cap.bytes_max = bytes_max;
     if (failure == null) {
         if (host.extensions.append(host.gpa, extension)) {
             // init.lua and the style are not extensions to list.
@@ -222,11 +223,13 @@ fn loadSource(
     }
     load.rollback(before);
     // Its bytes stay counted (the arena keeps them), and the ceiling rises
-    // by as much, so the files after it have the room they had.
+    // by as much, so the files after it have the room they had. Raised
+    // before its problem is kept: a file that filled the total would leave
+    // no room for it, and the problem would reach only the log.
     const failed_bytes = cap.used_bytes -| used_before;
     const allowance = @min(failed_bytes, load.failed_bytes_left);
     load.failed_bytes_left -= allowance;
-    saved_bytes_max +|= allowance;
+    cap.bytes_max = bytes_max +| allowance;
     load.problem(id, failure orelse "out of memory");
     extension.destroy();
 }
