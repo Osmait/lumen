@@ -269,11 +269,18 @@ reproduces it.
 
 Every index file read from disk is validated before use (layout arithmetic is
 overflow-checked, parent chains are proven to end), and fuzz tests feed them
-garbage, updates and appends included. The name index's mapping is also
-checked where it is read (name offsets, bounded parent walks), since another
-process could write the file after it was validated. Doc order across the
-content index's segments is not checked on open; queries and merges cope
-with repeats.
+garbage, updates and appends included. The mappings are also checked
+where they are read (name offsets, bounded parent walks, a parent that is
+not the folder searched; segment bounds and list offsets on queries,
+updates and appends), since another process could write the file after it
+was validated: a changed content index fails its update and is rebuilt.
+Checks cannot stop a truncation from pulling pages out from under a mapping
+(SIGBUS): after a rescan, where the file system can clone (btrfs, XFS),
+`files.idx` is a reflink copy and the mapped file has no name, so nothing
+can truncate it; elsewhere, and for the start-up snapshot and
+`content.idx`, a `cp` or `truncate` over the file still can. Doc order
+across the content index's segments is not checked on open; queries and
+merges cope with repeats.
 
 ## Measuring
 
