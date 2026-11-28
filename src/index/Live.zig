@@ -492,13 +492,13 @@ fn pathExists(live: *const Live, id: EntryId) bool {
 /// Hidden as the scan sets it: by name, and inherited from the parent.
 /// Without it, new files under a dot-dir ranked as the user's own until the
 /// next rescan.
-fn hiddenFlag(live: *const Live, parent: EntryId, name: []const u8) u8 {
+fn hiddenFlag(live: *const Live, parent: EntryId, name: []const u8, is_dir: bool) u8 {
     const parent_flags = if (parent.in_delta)
         live.delta.flags(parent.index)
     else
         live.base.flags()[parent.index];
     if (parent_flags & store_mod.flag_hidden != 0) return store_mod.flag_hidden;
-    if (scan.hiddenByName(name)) return store_mod.flag_hidden;
+    if (scan.hiddenByName(name, is_dir)) return store_mod.flag_hidden;
     return 0;
 }
 
@@ -574,7 +574,8 @@ fn add(live: *Live, parent: EntryId, name: []const u8, is_dir: bool, moved_to: b
     var parent_path_buffer: paths.Buffer = undefined;
     const parent_path = live.pathOf(parent, &parent_path_buffer) orelse return false;
     const depth = live.depthOf(parent) +| 1;
-    const hidden = live.hiddenFlag(parent, name);
+    const hidden = live.hiddenFlag(parent, name, is_dir);
+
     // A parent already in the delta is used as is; a base parent gets a
     // scaffolding root.
     const root: u32 = if (parent.in_delta)
@@ -1791,6 +1792,8 @@ test "live: new entries under a dot-dir rank like scanned ones" {
     tree.make(".zorro_punto.txt");
     tree.make("my_cache/");
     tree.make("my_cache/zorro_cacheado.txt");
+    // A file that says "cache" is not hidden: only a folder is.
+    tree.make("zorro_cache.rs");
     _ = try tree.sync();
     const cases = [_][2][]const u8{
         .{ "zorro_nuevo", ".config/zorro_nuevo.txt" },
@@ -1798,7 +1801,9 @@ test "live: new entries under a dot-dir rank like scanned ones" {
         .{ "zorro_dir", ".config/app/zorro_dir" },
         .{ "zorro_punto", ".zorro_punto.txt" },
         .{ "zorro_cacheado", "my_cache/zorro_cacheado.txt" },
+        .{ "zorro_cache", "zorro_cache.rs" },
     };
+
     var live_scores: [cases.len]i32 = undefined;
     for (cases, &live_scores) |case, *score| score.* = (try tree.scoreOf(case[0], case[1])).?;
     try tree.compact();

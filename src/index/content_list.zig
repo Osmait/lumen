@@ -324,7 +324,9 @@ pub fn documentKind(path: []const u8) bool {
     return extract.kindOf(path) != null;
 }
 
-/// True if `path` under `root` passes content-index filtering and size/type limits right now.
+/// True if `path` under `root` passes content-index filtering and size/type
+/// limits right now: what a listing would have, but for the ignore files
+/// (.gitignore) it cannot know of without ripgrep.
 pub fn eligible(root: []const u8, path: []const u8, not_under: []const []const u8) bool {
     if (underAny(path, not_under)) return false;
     const relative = if (sys.isAtOrBelow(path, root))
@@ -335,11 +337,76 @@ pub fn eligible(root: []const u8, path: []const u8, not_under: []const []const u
     while (base_parts.next()) |part| {
         if (part.len > 0 and part[0] == '.') return false;
     }
+    // A write to target/, build/ or node_modules/ made every check list
+    // every file, to find it left out again.
+    if (excluded(relative)) return false;
     const kind: Kind = if (documentKind(path)) .document else .text;
     if (kind == .text and binaryByName(path)) return false;
     var path_buffer: paths.Buffer = undefined;
     const path_z = std.mem.printSentinel(&path_buffer, "{s}", .{path}, 0) catch return false;
     return stat(path_z, kind) != null;
+}
+
+/// Whether the listing's `excludes` leave out `relative` (a path from the
+/// root, as ripgrep matches them): a `!**/<dirs>/**` glob, folders in a
+/// row among those above it; any other (no slash), its name or that of a
+/// folder above it, which ripgrep does not go into.
+fn excluded(relative: []const u8) bool {
+    const name = std.Io.Dir.path.basename(relative);
+    const folders = relative[0 .. relative.len - name.len];
+    for (excludes) |glob| {
+        const pattern = glob[1..];
+        if (std.mem.startsWith(u8, pattern, "**/") and std.mem.endsWith(u8, pattern, "/**")) {
+            if (foldersMatch(folders, pattern["**/".len .. pattern.len - "/**".len])) return true;
+            continue;
+        }
+        var components = std.mem.tokenizeScalar(u8, relative, '/');
+        while (components.next()) |component| {
+            if (globMatch(pattern, component)) return true;
+        }
+    }
+    return false;
+}
+
+/// Whether some folders in a row of `folders` ("a/b/c/", the folders above
+/// a file) match the components of `pattern` ("go/pkg"), each a glob.
+fn foldersMatch(folders: []const u8, pattern: []const u8) bool {
+    var starts = std.mem.tokenizeScalar(u8, folders, '/');
+    while (starts.peek() != null) : (_ = starts.next()) {
+        var here = starts;
+        var wanted = std.mem.tokenizeScalar(u8, pattern, '/');
+        const matched = while (wanted.next()) |want| {
+            const folder = here.next() orelse break false;
+            if (!globMatch(want, folder)) break false;
+        } else true;
+        if (matched) return true;
+    }
+    return false;
+}
+
+/// `text` against a glob of literal bytes and `*` (any run of bytes).
+fn globMatch(pattern: []const u8, text: []const u8) bool {
+    var p: usize = 0;
+    var t: usize = 0;
+    // Where the last `*` was, and the text it is taken to cover up to.
+    var star: ?usize = null;
+    var star_text: usize = 0;
+    while (t < text.len) {
+        if (p < pattern.len and pattern[p] == '*') {
+            star = p;
+            star_text = t;
+            p += 1;
+        } else if (p < pattern.len and pattern[p] == text[t]) {
+            p += 1;
+            t += 1;
+        } else if (star) |star_at| {
+            p = star_at + 1;
+            star_text += 1;
+            t = star_text;
+        } else return false;
+    }
+    while (p < pattern.len and pattern[p] == '*') p += 1;
+    return p == pattern.len;
 }
 
 /// Obviously binary by extension: skips opening them at all.
@@ -507,6 +574,18 @@ test "list: what is indexed and what is excluded" {
     const joined_got = try std.mem.join(arena, "\n", got_paths.items);
     try testing.expectEqualStrings(joined_want, joined_got);
 
+    // `eligible` (a modified file not indexed: list again?) agrees, but for
+    // the .gitignore, which only ripgrep reads.
+    for (keep ++ docs) |name| {
+        try testing.expect(eligible(tree.absolute, try tree.path(&path_buffer, name), &.{}));
+    }
+    for (drop) |name| {
+        if (std.mem.startsWith(u8, name, "proj/")) continue;
+        const is = eligible(tree.absolute, try tree.path(&path_buffer, name), &.{});
+        if (is) std.debug.print("eligible but not listed: {s}\n", .{name});
+        try testing.expect(!is);
+    }
+
     const now = sys.nowSeconds();
     for (got) |doc| {
         try testing.expectEqual(documentKind(doc.path), doc.source == .extracted);
@@ -528,7 +607,36 @@ test "list: what is indexed and what is excluded" {
     for (plain) |doc| try testing.expect(doc.source == .plain);
 }
 
+test "excluded: the listing's globs, by folders and by name" {
+    for ([_][]const u8{
+        "node_modules/a.js",
+        "w/node_modules/p/a.js",
+        "me/go/pkg/mod/x.go",
+        "a/pip_cache/x.txt",
+        "a/b/target/c/d.rs",
+        "x.min.js",
+        "a/b.lock",
+        "a/x.lock/c.txt",
+    }) |path| try testing.expect(excluded(path));
+    for ([_][]const u8{
+        "notes.md",
+        "about-cache.txt",
+        "target.txt",
+        "go/pkgs/x.go",
+        "pkg/go/x.go",
+        "a/min.js",
+        "a/targets/b.rs",
+        "build",
+    }) |path| try testing.expect(!excluded(path));
+    try testing.expect(globMatch("*cache*", "pip_cache_dir"));
+    try testing.expect(globMatch("*-lock.json", "package-lock.json"));
+    try testing.expect(!globMatch("*-lock.json", "package-lock.jsonx"));
+    try testing.expect(globMatch("*", ""));
+    try testing.expect(!globMatch("a*b", "acbd"));
+}
+
 test "list: a root below an excluded name still lists" {
+
     // Globs are matched against the path rg prints: with the root as rg's
     // argument, a root like this one (.zig-cache/tmp/...) or /srv/build/me
     // listed nothing.

@@ -448,6 +448,55 @@ pub const LockFile = struct {
     }
 };
 
+/// Deletes the `<path>.<pid>.<seq>.tmp` that `AtomicFile`s of processes
+/// gone since left next to `path`: a SIGKILL, a crash or a power cut in the
+/// middle of a write leaves one (a content index's is ~80 MB), and nothing
+/// else ever deletes it, the next run writing under another pid. With
+/// `path`'s `LockFile` held, so that no writer that takes it is in the
+/// middle of one; a temporary whose pid still runs (this process, or one
+/// that reuses the number) is left alone. Best effort.
+pub fn removeAbandonedTemporaries(path: []const u8) void {
+    var lock = LockFile.acquire(path) catch return;
+    defer lock.release();
+    const directory = std.Io.Dir.path.dirname(path) orelse ".";
+    const base = std.Io.Dir.path.basename(path);
+    var directory_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const directory_z = std.mem.printSentinel(&directory_buffer, "{s}", .{directory}, 0) catch
+        return;
+    const fd = os.openDir(directory_z) catch return;
+    defer close(fd);
+    var iterator: os.DirIter = .{ .fd = fd };
+    while (iterator.next() catch return) |entry| {
+        const pid = temporaryOwner(entry.name, base) orelse continue;
+        if (processRuns(pid)) continue;
+        var name_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const name = std.mem.printSentinel(&name_buffer, "{s}", .{entry.name}, 0) catch continue;
+        _ = linux.unlinkat(fd, name, 0);
+    }
+}
+
+/// The pid in `name` when it is an `AtomicFile` temporary of `base`
+/// (`<base>.<pid>.<seq>.tmp`).
+fn temporaryOwner(name: []const u8, base: []const u8) ?linux.pid_t {
+    if (!std.mem.startsWith(u8, name, base)) return null;
+    const rest = name[base.len..];
+    if (rest.len == 0 or rest[0] != '.') return null;
+    if (!std.mem.endsWith(u8, rest, ".tmp")) return null;
+    const numbers = rest[1 .. rest.len - ".tmp".len];
+    const dot = std.mem.findScalar(u8, numbers, '.') orelse return null;
+    const pid = std.fmt.parseInt(linux.pid_t, numbers[0..dot], 10) catch return null;
+    _ = std.fmt.parseInt(u64, numbers[dot + 1 ..], 10) catch return null;
+    if (pid <= 0) return null;
+    return pid;
+}
+
+/// Whether a process `pid` exists (one of another user's included).
+fn processRuns(pid: linux.pid_t) bool {
+    if (pid == linux.getpid()) return true;
+    // Signal 0: only whether it could be sent.
+    return linux.errno(linux.kill(pid, @fromBackingInt(@intCast(0)))) != .SRCH;
+}
+
 pub const AppendFile = struct {
     fd: i32,
     /// Where the next `write` goes.
@@ -643,6 +692,52 @@ test "atomic writes replace the file and leave no temporary behind" {
     // A directory that is not there: an error, and nothing left over.
     const bad = try std.mem.print(&path_buffer, "{s}/missing/f.conf", .{dir});
     try std.testing.expectError(error.NotFound, writeFileAtomic(bad, "x"));
+}
+
+test "removeAbandonedTemporaries: only the temporaries of processes gone" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var dir_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try os.tmpDirPath(&tmp_dir, &dir_buffer);
+    // Above any pid a 64-bit kernel hands out (pid_max is at most 2^22).
+    const gone: linux.pid_t = 1 << 22;
+    try std.testing.expect(!processRuns(gone));
+    const own = linux.getpid();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.mem.print(&path_buffer, "{s}/content.idx", .{dir});
+    // `<head><pid><tail>`.
+    const Planted = struct { head: []const u8, pid: linux.pid_t, tail: []const u8, deleted: bool };
+    const planted = [_]Planted{
+        .{ .head = "content.idx.", .pid = gone, .tail = ".7.tmp", .deleted = true },
+        .{ .head = "content.idx.", .pid = own, .tail = ".8.tmp", .deleted = false },
+        .{ .head = "content.idx.", .pid = gone, .tail = ".tmp", .deleted = false },
+        .{ .head = "content.idx.", .pid = gone, .tail = ".x.tmp", .deleted = false },
+        .{ .head = "contentXidx.", .pid = gone, .tail = ".1.tmp", .deleted = false },
+        .{ .head = "files.idx.", .pid = gone, .tail = ".1.tmp", .deleted = false },
+        .{ .head = "content.idx.", .pid = gone, .tail = ".1.tmpx", .deleted = false },
+    };
+    var names: [planted.len][std.Io.Dir.max_path_bytes]u8 = undefined;
+    var name_lengths: [planted.len]usize = undefined;
+    for (planted, 0..) |plant, index| {
+        const name = try std.mem.printSentinel(
+            &names[index],
+            "{s}/{s}{d}{s}",
+            .{ dir, plant.head, plant.pid, plant.tail },
+            0,
+        );
+        name_lengths[index] = name.len;
+        try writeFile(name, "x");
+    }
+
+    var index_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const index_path = try std.mem.printSentinel(&index_buffer, "{s}", .{path}, 0);
+    try writeFile(index_path, "index");
+    removeAbandonedTemporaries(path);
+    for (planted, 0..) |plant, index| {
+        const name = names[index][0..name_lengths[index] :0];
+        try std.testing.expectEqual(!plant.deleted, os.exists(name));
+    }
+    try std.testing.expect(os.exists(index_path));
 }
 
 test "atomic writes use unique temporaries and never clobber concurrent writers or links" {

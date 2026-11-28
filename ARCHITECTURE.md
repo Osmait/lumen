@@ -207,9 +207,11 @@ directory (2.8 s cold) and every core.
   document version in `~/.cache/lumen/text/`; a document that cannot be
   extracted is remembered, a passing failure (timeout, missing tool, memory)
   is left out of the index and retried by the next check. The cache is keyed
-  by (path, mtime, size) and swept of files no document uses on start and
-  after each whole build. unzip gets `-P ''`, so an encrypted member fails
-  instead of prompting.
+  by (path, mtime, size) and swept of files no document uses after each
+  check that listed every file (on start, texts extracted but not indexed
+  yet are kept). unzip gets `-P ''`, so an encrypted member fails instead
+  of prompting.
+
 - **Format**: one mapped file (`~/.cache/lumen/content.idx`): document table
   (path, mtime, size, ctime) and segments of sorted trigram keys with varint-delta
   posting lists. Building dedups each file's trigrams with a 16M-bit map and

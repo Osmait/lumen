@@ -68,6 +68,7 @@ pub const AppendFile = file.AppendFile;
 pub const FileId = file.FileId;
 pub const fdIdentity = file.fdIdentity;
 pub const LockFile = file.LockFile;
+pub const removeAbandonedTemporaries = file.removeAbandonedTemporaries;
 pub const mapping_alignment_bytes = file.mapping_alignment_bytes;
 pub const MappedBytes = file.MappedBytes;
 pub const mapPrivate = file.mapPrivate;
