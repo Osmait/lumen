@@ -1643,7 +1643,7 @@ test "the user's comments survive a save, Lumen's own are not doubled (MYP-566)"
     var settings = Settings.parse(testing.allocator,
         \\# my notes: nord at night
         \\# theme = nord
-        \\theme = dracula # inline notes are not kept
+        \\theme = dracula # an inline note (writeOver keeps it)
         \\; an ini-style comment
         \\[open-with]
         \\# evince is too slow
