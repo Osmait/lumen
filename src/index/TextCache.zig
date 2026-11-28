@@ -54,6 +54,21 @@ pub fn init(gpa: std.mem.Allocator, cache_dir: []const u8) std.mem.Allocator.Err
     return .{ .directory = directory };
 }
 
+/// Creates the folder again, private, if it is gone: a cleaner that empties
+/// ~/.cache while the service runs left every text write failing with
+/// ENOENT until a restart. Before writing texts.
+pub fn ensureDirectory(cache: TextCache) void {
+    var directory_buffer: paths.Buffer = undefined;
+    const directory = std.mem.printSentinel(&directory_buffer, "{s}", .{cache.directory}, 0) catch
+        return;
+    if (sys.exists(directory)) return;
+    sys.mkdirP(directory) catch |err| {
+        log.warn("{s}: {t}, extracted text is not cached", .{ directory, err });
+        return;
+    };
+    sys.makePrivate(directory);
+}
+
 pub fn deinit(cache: *TextCache, gpa: std.mem.Allocator) void {
     gpa.free(cache.directory);
     cache.* = undefined;

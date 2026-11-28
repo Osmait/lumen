@@ -76,7 +76,8 @@ pub const Options = struct {
     on_published: ?OnPublished = null,
     /// Minimum backoff between extraction retries for transient failures (doubles per try).
     extract_retry_backoff_ns: u64 = 5 * 60 * std.time.ns_per_s,
-    /// Backoff before retrying extractions after ENOSPC/EACCES writing the text cache.
+    /// Backoff before retrying extractions once writing the text cache
+    /// failed (full, read-only, no access).
     cache_write_backoff_ns: u64 = 10 * 60 * std.time.ns_per_s,
 };
 
@@ -150,7 +151,7 @@ const Worker = struct {
     /// backoff so a pathological file does not thrash forever. In `retry_arena`.
     retry: []RetryEntry = &.{},
     retry_arena: std.heap.ArenaAllocator,
-    /// Monotonic deadline until which cache writes reported ENOSPC/EACCES.
+    /// Monotonic deadline until which writing the text cache failed.
     cache_unwritable_until_ns: u64 = 0,
 };
 
@@ -523,7 +524,7 @@ fn priorRetry(service: *const ContentService, doc: content.DocIn) ?RetryEntry {
 /// (a PDF takes 10-40 ms, a whole book up to ~0.7 s). Documents that cannot
 /// be extracted (a corrupt file, or repeatedly hitting Timeout/ToolKilled)
 /// get an empty cache file so they do not thrash every refresh. Unwritable
-/// caches (ENOSPC/EACCES) pause extraction for `cache_write_backoff_ns`.
+/// caches (full, read-only, no access) pause extraction for `cache_write_backoff_ns`.
 /// `indexed`: `docs` are in the index already (`Diff.reextract`), which
 /// the retry entries left say (`RetryEntry.indexed`).
 fn extractMissing(
@@ -583,6 +584,7 @@ fn extractMissing(
     };
     @memset(failed, null);
     if (missing.items.len > 0) {
+        service.text_cache.ensureDirectory();
         var context: ExtractContext = .{
             .service = service,
             .docs = docs,
@@ -655,9 +657,9 @@ const ExtractContext = struct {
         defer if (text.len > 0) service.gpa.free(text);
         sys.writeFileAtomic(text_path, text) catch |err| {
             log.warn("caching text of {s}: {t}", .{ doc.path, err });
-            if (err == error.NoSpace or err == error.Access) {
-                context.cache_unwritable.store(true, .release);
-            }
+            // The same folder and names for every document: the next
+            // write would fail as well (full, read-only, gone).
+            context.cache_unwritable.store(true, .release);
             context.failed[missing_index] = .{ .err = err, .cache_write = true };
             return;
         };
@@ -709,10 +711,8 @@ fn leaveOut(
             continue;
         }
         if (failure.cache_write) {
-            if (failure.err == error.NoSpace or failure.err == error.Access) {
-                service.worker.cache_unwritable_until_ns =
-                    now_ns +| service.options.cache_write_backoff_ns;
-            }
+            service.worker.cache_unwritable_until_ns =
+                now_ns +| service.options.cache_write_backoff_ns;
             dropped[doc_index] = true;
             failed_new_count += 1;
             if (failed_first == null) failed_first = missing_index;
@@ -738,11 +738,9 @@ fn leaveOut(
                         .{ doc.path, next_attempts, failure.err },
                     );
                     continue;
-                } else |write_err| {
-                    if (write_err == error.NoSpace or write_err == error.Access) {
-                        service.worker.cache_unwritable_until_ns =
-                            now_ns +| service.options.cache_write_backoff_ns;
-                    }
+                } else |_| {
+                    service.worker.cache_unwritable_until_ns =
+                        now_ns +| service.options.cache_write_backoff_ns;
                 }
             }
         }
@@ -2326,6 +2324,66 @@ test "content service: missing cached text is re-extracted and kept instead of d
     try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "okapi")).len);
 
     // Next poke: cached text is back, so nothing is extracted again.
+    try pokeAndWait(service);
+    try testing.expectEqual(@as(u32, 2), service.status().extractions);
+}
+
+test "content service: a text cache folder deleted while running is made again" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    if (!haveTool("zip") or !haveTool("unzip")) return error.SkipZigTest;
+
+    var stage = try TestTree.init();
+    defer stage.deinit();
+    try stage.write("[Content_Types].xml", "<?xml version=\"1.0\"?><Types/>");
+    try stage.write(
+        "word/document.xml",
+        \\<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Minutes about the tapir project</w:t></w:r></w:p></w:body></w:document>
+        ,
+    );
+    var path_buffer: paths.Buffer = undefined;
+    const report = try fixture.root.path(&path_buffer, "report.docx");
+    const zip_res = try std.process.run(testing.allocator, testing.io, .{
+        .argv = &.{ "zip", "-q", "-X", "-r", report, "." },
+        .cwd = .{ .path = stage.absolute },
+    });
+    testing.allocator.free(zip_res.stdout);
+    testing.allocator.free(zip_res.stderr);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, zip_res.term);
+    try setMtime(report, sys.nowSeconds() - 200);
+
+    const service = try fixture.startWith(.{
+        .refresh_interval_ns = std.math.maxInt(u64),
+        .poke_interval_ns_min = 0,
+        .removed_percent_max = 100,
+        .cache_write_backoff_ns = 0,
+    });
+    defer service.shutdown();
+    try waitChecks(service, 1);
+    try testing.expectEqual(@as(u32, 1), service.status().extractions);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "tapir")).len);
+
+    // A cleaner empties the cache, folder and all.
+    const rm_res = try std.process.run(testing.allocator, testing.io, .{
+        .argv = &.{ "rm", "-rf", service.text_cache.directory },
+    });
+    testing.allocator.free(rm_res.stdout);
+    testing.allocator.free(rm_res.stderr);
+    var directory_buffer: paths.Buffer = undefined;
+    const directory = try std.mem.printSentinel(
+        &directory_buffer,
+        "{s}",
+        .{service.text_cache.directory},
+        0,
+    );
+    try testing.expect(!sys.exists(directory));
+
+    try pokeAndWait(service);
+    try testing.expect(sys.exists(directory));
+    try testing.expectEqual(@as(u32, 2), service.status().extractions);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "tapir")).len);
+    // Cached again: not extracted on the next check.
     try pokeAndWait(service);
     try testing.expectEqual(@as(u32, 2), service.status().extractions);
 }
