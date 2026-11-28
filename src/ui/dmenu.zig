@@ -50,7 +50,11 @@ const rows_filtered_max = 200;
 const match_bytes_max = 1024;
 
 const Line = struct {
+    /// What the row shows and filtering matches: valid UTF-8.
     text: [:0]const u8,
+    /// The line's bytes as read, printed when it is chosen, when they are
+    /// not valid UTF-8 (a Latin-1 file name): `text` shows them with U+FFFD.
+    raw: ?[]const u8 = null,
     icon: item_mod.Icon = .none,
     meta: []const u8 = "",
     selectable: bool = true,
@@ -241,8 +245,15 @@ fn addLine(session: *Session, raw: []const u8) void {
         }
         text = text[0..nul_index];
     }
-    if (!std.unicode.utf8ValidateSlice(text)) return;
-    line.text = arena.dupeSentinel(u8, text, 0) catch return addLineOutOfMemory();
+    if (std.unicode.utf8ValidateSlice(text)) {
+        line.text = arena.dupeSentinel(u8, text, 0) catch return addLineOutOfMemory();
+    } else {
+        // Left out, `find ~ | lumen --dmenu` lost every file named in
+        // Latin-1 without a word (MYP-447): shown made valid, printed as is.
+        line.raw = arena.dupe(u8, text) catch return addLineOutOfMemory();
+        line.text = labels.displayText(arena, text);
+        if (line.text.len == 0) return addLineOutOfMemory();
+    }
     session.lines.append(arena, line) catch return addLineOutOfMemory();
 }
 
@@ -280,8 +291,9 @@ pub fn finish(ui: *Ui, choice: ?[]const u8) void {
 pub fn choose(ui: *Ui, index: u32) void {
     const session = ui.picker orelse return;
     if (index >= session.lines.items.len) return;
-    if (!session.lines.items[index].selectable) return;
-    finish(ui, session.lines.items[index].text);
+    const line = session.lines.items[index];
+    if (!line.selectable) return;
+    finish(ui, line.raw orelse line.text);
     ui.hide();
 }
 
@@ -427,7 +439,7 @@ test "addLine parses rofi options and marks nonselectable rows" {
     addLine(&session, "Emoji\x00icon\x1f🚀");
     addLine(&session, "Invalid\xffline");
 
-    try std.testing.expectEqual(@as(usize, 3), session.lines.items.len);
+    try std.testing.expectEqual(@as(usize, 4), session.lines.items.len);
     const header = session.lines.items[0];
     try std.testing.expectEqualStrings("Section", header.text);
     try std.testing.expect(!header.selectable);
@@ -443,6 +455,12 @@ test "addLine parses rofi options and marks nonselectable rows" {
     const emoji = session.lines.items[2];
     try std.testing.expectEqualStrings("Emoji", emoji.text);
     try std.testing.expectEqualStrings("🚀", emoji.icon.emoji);
+    try std.testing.expect(emoji.raw == null);
+
+    // Not UTF-8: shown with U+FFFD, chosen as the bytes read (MYP-447).
+    const invalid = session.lines.items[3];
+    try std.testing.expectEqualStrings("Invalid\u{FFFD}line", invalid.text);
+    try std.testing.expectEqualStrings("Invalid\xffline", invalid.raw.?);
 }
 
 test "headers do not take the room of the lines to choose (MYP-473)" {

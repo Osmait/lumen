@@ -128,6 +128,12 @@ pub const GDK_KEY_Down: c_uint = 0xff54;
 pub const GDK_KEY_Page_Up: c_uint = 0xff55;
 pub const GDK_KEY_Page_Down: c_uint = 0xff56;
 pub const GDK_KEY_KP_Enter: c_uint = 0xff8d;
+pub const GDK_KEY_KP_Left: c_uint = 0xff96;
+pub const GDK_KEY_KP_Up: c_uint = 0xff97;
+pub const GDK_KEY_KP_Right: c_uint = 0xff98;
+pub const GDK_KEY_KP_Down: c_uint = 0xff99;
+pub const GDK_KEY_KP_Page_Up: c_uint = 0xff9a;
+pub const GDK_KEY_KP_Page_Down: c_uint = 0xff9b;
 pub const GDK_KEY_ISO_Lock: c_uint = 0xfe01;
 pub const GDK_KEY_ISO_Level2_Latch: c_uint = 0xfe02;
 pub const GDK_KEY_ISO_Level3_Shift: c_uint = 0xfe03;
@@ -158,6 +164,19 @@ pub const GDK_KEY_k: c_uint = 0x6b;
 pub const GDK_KEY_n: c_uint = 0x6e;
 pub const GDK_KEY_p: c_uint = 0x70;
 pub const GDK_KEY_x: c_uint = 0x78;
+pub const GDK_KEY_a: c_uint = 0x61;
+pub const GDK_KEY_v: c_uint = 0x76;
+pub const GDK_KEY_z: c_uint = 0x7a;
+pub extern fn gdk_display_translate_key(
+    display: *GdkDisplay,
+    keycode: c_uint,
+    state: GdkModifierType,
+    group: c_int,
+    keyval: ?*c_uint,
+    effective_group: ?*c_int,
+    level: ?*c_int,
+    consumed: ?*GdkModifierType,
+) gboolean;
 
 pub const GTK_ALIGN_START: c_int = 1;
 pub const GTK_ALIGN_END: c_int = 2;
@@ -765,6 +784,11 @@ pub extern fn gtk_editable_insert_text(
 pub extern fn gdk_keyval_to_unicode(keyval: c_uint) u32;
 pub extern fn gtk_widget_has_focus(widget: *GtkWidget) gboolean;
 pub extern fn gtk_editable_set_text(editable: *GtkEditable, text: [*:0]const u8) void;
+pub extern fn gtk_editable_get_selection_bounds(
+    editable: *GtkEditable,
+    start_pos: ?*c_int,
+    end_pos: ?*c_int,
+) gboolean;
 
 pub extern fn gtk_list_box_new() *GtkWidget;
 pub extern fn gtk_list_box_append(box: *GtkListBox, child: *GtkWidget) void;

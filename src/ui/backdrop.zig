@@ -97,6 +97,10 @@ pub fn onWindowPressed(
     data: ?*anyopaque,
 ) callconv(.c) void {
     const self: *Ui = @ptrCast(@alignCast(data));
+    // A press that closed the panel and was claimed never reached the list,
+    // so the flag it set may still be up: this press is a new click, and a
+    // row it lands on activates (MYP-445).
+    self.suppress_next_activate = false;
     const on_pieces = isOn(self, self.search_bar.box, x, y) or
         isOn(self, self.results, x, y) or
         isOn(self, self.footer.box, x, y);

@@ -469,7 +469,9 @@ pub fn layoutFor(ui: *Ui, view: View) void {
         c.gtk_flow_box_set_max_children_per_line(ui.grid, @intCast(ui.grid_columns));
     }
     const bar = ui.layout.searchbar;
-    const back_shows = view != .root and ui.layout.show.back and bar.has(.back);
+    // dmenu has nothing to go back to: a script waits for its answer.
+    const back_shows = view != .root and view != .dmenu and
+        ui.layout.show.back and bar.has(.back);
     gtk.setVisible(ui.search_bar.back, back_shows);
     // The magnifier gives way to the back arrow inside a view.
     c.gtk_widget_set_visible(ui.search_bar.icon, @intFromBool(
@@ -556,6 +558,8 @@ fn applyPosition(ui: *Ui, monitor_height_px: c_int) void {
 
 fn onChanged(_: *c.GtkEditable, data: ?*anyopaque) callconv(.c) void {
     const ui: *Ui = @ptrCast(@alignCast(data));
+    // A view's query being put back: it refreshes once, after (MYP-577).
+    if (ui.ignore_changed) return;
     ui.refresh();
 }
 
@@ -567,6 +571,9 @@ fn onBackClicked(
     data: ?*anyopaque,
 ) callconv(.c) void {
     const ui: *Ui = @ptrCast(@alignCast(data));
+    // In dmenu, as Esc: the script gets nothing and the window hides, not
+    // left on the launcher (MYP-596).
+    if (ui.view == .dmenu) return ui.hide();
     if (ui.view != .root) ui.goBack();
     _ = c.gtk_widget_grab_focus(gtk.widget(ui.search_bar.entry));
 }
@@ -574,24 +581,27 @@ fn onBackClicked(
 fn onKey(
     _: *c.GtkEventControllerKey,
     keyval: c_uint,
-    _: c_uint,
+    keycode: c_uint,
     state: c.GdkModifierType,
     data: ?*anyopaque,
 ) callconv(.c) c.gboolean {
     const ui: *Ui = @ptrCast(@alignCast(data));
     if (!keyboard.isModifierKey(keyval)) ui.key_ns = stats.now();
-    return keyboard.handleKeyEvent(ui, keyval, state, true);
+    const shortcut_keyval = keyboard.shortcutKeyval(keyval, keycode, state);
+    return keyboard.handleKeyEvent(ui, shortcut_keyval, state, true);
 }
 
 fn onKeyReleased(
     _: *c.GtkEventControllerKey,
     keyval: c_uint,
-    _: c_uint,
-    _: c.GdkModifierType,
+    keycode: c_uint,
+    state: c.GdkModifierType,
     data: ?*anyopaque,
 ) callconv(.c) void {
     const ui: *Ui = @ptrCast(@alignCast(data));
-    keyboard.handleKeyReleased(ui, keyval);
+    // As the press was read (`shortcutKeyval`), Ctrl let go first or not:
+    // a confirmation armed by Ctrl+Shift+X waits for this key's release.
+    keyboard.handleKeyReleased(ui, keyboard.latinKeyval(keyval, keycode, state));
 }
 
 test "style.css has the sizes the window computes with" {

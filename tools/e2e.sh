@@ -605,6 +605,17 @@ dm_result; [[ "$r" == "green exit 0 " ]] && ok "dmenu prints the choice" || ko "
 dm 'red\ngreen\n'
 L --key escape
 dm_result; [[ "$r" == "exit 1 " ]] && ok "dmenu: Esc exits 1" || ko "dmenu: Esc exits 1" "$r"
+dm 'red\ngreen\n' --query gr
+L --key escape
+dm_result; [[ "$r" == "exit 1 " ]] && ok "dmenu: Esc with a filter exits 1 at once" || ko "dmenu: Esc with a filter exits 1 at once" "$r"
+dm 'red\ngreen\n'
+L --key ctrl+g; sleep 0.1
+expect "dmenu: a keymap does not leave the picker" '^view: dmenu'
+L --key escape
+dm_result; [[ "$r" == "exit 1 " ]] && ok "dmenu: Esc after a keymap exits 1" || ko "dmenu: Esc after a keymap exits 1" "$r"
+dm 'caf\xe9\n'
+L --key enter
+dm_result; [[ "$r" == $'caf\xe9 exit 0 ' ]] && ok "dmenu: a line not in UTF-8 is printed as read" || ko "dmenu: a line not in UTF-8 is printed as read" "$r"
 dm 'red\ngreen\n' --query purple
 L --key enter
 dm_result; [[ "$r" == "purple exit 0 " ]] && ok "dmenu: no match gives the typed text" || ko "dmenu: no match gives the typed text" "$r"

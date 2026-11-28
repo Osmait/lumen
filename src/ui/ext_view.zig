@@ -740,8 +740,10 @@ pub fn activate(ui: *Ui, command_index: Host.CommandIndex) void {
         .form => form_view.open(ui, command_index),
         .provider => {},
         .list, .search => {
+            // The view left is remembered with its own command (MYP-439).
+            ui.rememberView();
             ui.ext_command = command_index;
-            ui.navigate(.ext);
+            ui.setView(.ext);
         },
     }
 }
@@ -861,11 +863,15 @@ pub fn openTarget(ui: *Ui, target: []const u8, text: ?[*:0]const u8) bool {
             },
             .list, .search => {},
         }
-        ui.ext_command = command_index;
         if (!gtk.isVisible(ui.window)) {
+            ui.ext_command = command_index;
             ui.showWith(.ext, text);
         } else {
-            ui.navigate(.ext);
+            // The view left is remembered with its own command: going back
+            // from a command a keymap opened returned to it (MYP-439).
+            ui.rememberView();
+            ui.ext_command = command_index;
+            ui.setView(.ext);
             if (text) |typed| c.gtk_editable_set_text(gtk.editable(ui.search_bar.entry), typed);
         }
         return true;
