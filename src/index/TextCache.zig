@@ -93,10 +93,12 @@ fn nameOf(name_buffer: *[name_bytes_max]u8, doc: DocIn) []const u8 {
 }
 
 /// Bump xlsx and docx cache key suffix (-v2) so stale entries re-extract
-/// with inlineStr worksheet text and docx header/footer support.
+/// with inlineStr worksheet text and docx header/footer support; xlsx -v3:
+/// shared strings stored after sheets past the cap were left out.
 fn suffixOf(doc: DocIn) []const u8 {
     return switch (extract.kindOf(doc.path) orelse .pdf) {
-        .xlsx, .docx => "-v2",
+        .xlsx => "-v3",
+        .docx => "-v2",
         else => "",
     };
 }
@@ -108,8 +110,10 @@ const legacy_names_count = 3;
 /// the text of `doc` under, null when that one is not to be reused: the
 /// SHA-256 name with the mtime in whole seconds (before nanoseconds), then
 /// Wyhash names with and without size. xlsx and docx texts from before
-/// `-v2` miss inlineStr / headers & footers: never reused.
+/// `-v2` miss inlineStr / headers & footers, and xlsx ones from before
+/// `-v3` maybe their shared strings: never reused.
 fn legacyName(name_buffer: *[name_bytes_max]u8, doc: DocIn, which: usize) ?[]const u8 {
+    if (extract.kindOf(doc.path) == .xlsx) return null;
     const mtime_s = @divFloor(doc.mtime, std.time.ns_per_s);
     const suffix = suffixOf(doc);
     const legacy_hash = std.hash.Wyhash.hash(0, doc.path);
@@ -320,7 +324,7 @@ test "xlsx and docx use versioned cache keys while other docs keep legacy rename
     const testing = std.testing;
     var buf: [name_bytes_max]u8 = undefined;
     const xlsx_name = nameOf(&buf, .{ .path = "/tmp/book.xlsx", .mtime = 10, .size = 20, .source = .extracted });
-    try testing.expect(std.mem.endsWith(u8, xlsx_name, "-10-20-v2.txt"));
+    try testing.expect(std.mem.endsWith(u8, xlsx_name, "-10-20-v3.txt"));
     var docx_buf: [name_bytes_max]u8 = undefined;
     const docx_name = nameOf(&docx_buf, .{ .path = "/tmp/doc.docx", .mtime = 10, .size = 20, .source = .extracted });
     try testing.expect(std.mem.endsWith(u8, docx_name, "-10-20-v2.txt"));
@@ -353,8 +357,8 @@ test "texts cached under older names are renamed without an index, before extrac
     try cache_dir.write(try std.mem.print(&name_buffer, "text/{x:0>16}-1700000000.txt", .{
         std.hash.Wyhash.hash(0, odt.path),
     }), "odt words");
-    // An xlsx from before -v2: extracted again.
-    try cache_dir.write(try std.mem.print(&name_buffer, "text/{s}-1700000000-5.txt", .{
+    // An xlsx from before -v3: extracted again.
+    try cache_dir.write(try std.mem.print(&name_buffer, "text/{s}-1700000000-5-v2.txt", .{
         pathHashHex(&hash_hex, xlsx.path),
     }), "xlsx words");
 

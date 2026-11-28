@@ -24,7 +24,8 @@ const fold = @import("core").fold;
 /// 05: trigrams fold NFD combining diacritics onto their base letter (`core.fold`).
 /// 06: DOCX extraction includes linked headers and footers.
 /// 07: doc table stores nanosecond mtimes.
-pub const magic = "LUMCTX07";
+/// 08: XLSX shared strings are read apart from the sheets (text cache -v3).
+pub const magic = "LUMCTX08";
 pub const header_size = 64;
 
 /// The first bytes of the file. The doc table's columns and the segments'
