@@ -35,8 +35,9 @@ const strictlyAscending = content_format.strictlyAscending;
 
 const ContentIndex = @This();
 
-/// Max segments cached inline in the struct so `list` never re-reads the
-/// segment directory from a `MAP_PRIVATE` mapping. Matches `segments_max`.
+/// Max segments cached inline in the struct so reads of a segment
+/// (`segmentAt`) never re-read the segment directory from a `MAP_PRIVATE`
+/// mapping. Above `ContentService.Options.segments_max`.
 const segments_inline_max = 64;
 
 bytes: Bytes,
@@ -285,28 +286,63 @@ pub fn open(path_z: [:0]const u8) (sys.Error || error{BadIndex})!ContentIndex {
     return parsed;
 }
 
+/// Directory entry of segment `segment_index`: the copy `parse` made of
+/// it when there is one, the mapping otherwise (checked where it is used,
+/// `segmentAt`).
+pub fn segmentEntry(index: *const ContentIndex, segment_index: usize) SegmentEntry {
+    assert(segment_index < index.segments_count);
+    if (segment_index < index.segments_copied) return index.segments_inline[segment_index];
+    return index.segments[segment_index];
+}
+
+/// A segment's arrays, in the file.
+pub const Segment = struct {
+    entry: SegmentEntry,
+    keys: []const u32,
+    /// One more than `keys`: list `k` is `postings[offsets[k]..offsets[k + 1]]`,
+    /// once `listAt` has checked those against `postings` again.
+    offsets: []const u32,
+    postings: []const u8,
+
+    /// Posting list bytes of the `key_index`th key; null when its offsets
+    /// are out of order or out of the postings.
+    pub fn listAt(view: Segment, key_index: usize) ?[]const u8 {
+        assert(key_index < view.keys.len);
+        const start = view.offsets[key_index];
+        const end = view.offsets[key_index + 1];
+        if (start > end or end > view.postings.len) return null;
+        return view.postings[start..end];
+    }
+};
+
+/// Segment `segment_index`, its bounds checked again. The one rule every
+/// read of a segment follows: `parse` checked the mapping once, but a
+/// private mapping still shows what another process writes to the file
+/// afterwards (pages not yet copied), and a merge or an update that trusted
+/// it crashed the daemon (`error.BadIndex` instead: the update fails and the
+/// next one rebuilds).
+pub fn segmentAt(index: *const ContentIndex, segment_index: usize) error{BadIndex}!Segment {
+    if (segment_index >= index.segments_count) return error.BadIndex;
+    const entry = index.segmentEntry(segment_index);
+    const file = index.file;
+    const keys_offset = try region(file.len, entry.keys_offset, entry.keys_count, 4, 4);
+    const keys_count: usize = @intCast(entry.keys_count);
+    const offsets_count = std.math.add(u64, entry.keys_count, 1) catch return error.BadIndex;
+    const offsets_offset = try region(file.len, entry.offsets_offset, offsets_count, 4, 4);
+    const postings_offset = try region(file.len, entry.postings_offset, entry.postings_size, 1, 1);
+    return .{
+        .entry = entry,
+        .keys = sliceAtConst(u32, file, keys_offset, keys_count),
+        .offsets = sliceAtConst(u32, file, offsets_offset, keys_count + 1),
+        .postings = file[postings_offset..][0..@intCast(entry.postings_size)],
+    };
+}
+
 /// Posting list bytes of `key` in segment `segment_index` (empty if
 /// absent or if bounds are violated by an external write to the mapping).
 fn list(index: *const ContentIndex, segment_index: usize, key: u32) []const u8 {
-    if (segment_index >= index.segments_count) return &.{};
-    const segment = if (segment_index < index.segments_copied)
-        index.segments_inline[segment_index]
-    else
-        index.segments[segment_index];
-    const keys_offset = region(index.file.len, segment.keys_offset, segment.keys_count, 4, 4) catch
-        return &.{};
-    const keys_count: usize = @intCast(segment.keys_count);
-    const offsets_count = std.math.add(u64, segment.keys_count, 1) catch return &.{};
-    const offsets_offset = region(index.file.len, segment.offsets_offset, offsets_count, 4, 4) catch
-        return &.{};
-    const postings_offset = region(
-        index.file.len,
-        segment.postings_offset,
-        segment.postings_size,
-        1,
-        1,
-    ) catch return &.{};
-    const keys = sliceAtConst(u32, index.file, keys_offset, keys_count);
+    const found = index.segmentAt(segment_index) catch return &.{};
+    const keys = found.keys;
     var low: usize = 0;
     var high: usize = keys.len;
     while (low < high) {
@@ -315,12 +351,7 @@ fn list(index: *const ContentIndex, segment_index: usize, key: u32) []const u8 {
     }
     if (low == keys.len) return &.{};
     if (keys[low] != key) return &.{};
-    const offsets = sliceAtConst(u32, index.file, offsets_offset, keys_count + 1);
-    const start = offsets[low];
-    const end = offsets[low + 1];
-    if (start > end or end > segment.postings_size) return &.{};
-    if (@as(u64, postings_offset) + end > index.file.len) return &.{};
-    return index.file[postings_offset + start .. postings_offset + end];
+    return found.listAt(low) orelse &.{};
 }
 
 /// Documents containing every trigram of every word, folded (words of 3+
@@ -390,9 +421,11 @@ pub fn candidates(
 }
 
 pub fn postingBytes(index: *const ContentIndex) usize {
-    var postings_size: usize = 0;
-    for (index.segments) |segment| postings_size += segment.postings_size;
-    return postings_size;
+    var postings_size: u64 = 0;
+    for (0..index.segments_count) |segment_index| {
+        postings_size +|= index.segmentEntry(segment_index).postings_size;
+    }
+    return @intCast(@min(postings_size, std.math.maxInt(usize)));
 }
 
 /// Checks that `count` items of `size` bytes at `offset` fit in a buffer of

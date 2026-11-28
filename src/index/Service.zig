@@ -226,7 +226,8 @@ fn refreshSlowMounts(service: *Service, sync_live: bool) void {
         return;
     }
     const added_mount = hasNewMount(service.slow_mounts, mounts);
-    const live_mounts = dupeDirList(service.gpa, mounts) catch {
+    // The root itself left out: no recency under the mounts below it only.
+    const live_mounts = Live.slowMountsBelow(service.gpa, &service.roots, mounts) catch {
         sys.freeList(service.gpa, mounts);
         return;
     };
@@ -362,6 +363,10 @@ pub fn status(service: *Service) Status {
 /// watches it and nothing adopts it: the service is torn down right after.
 fn saveOnShutdown(service: *Service) void {
     const gpa = service.gpa;
+    // As `rescan` does: the list read on start would let this scan walk
+    // an sshfs or NFS mounted since, and hang the exit on a dead server.
+    // The thread has stopped: nothing else reads the list.
+    service.refreshSlowMounts(false);
     var base = Live.scanSaved(
         gpa,
         service.scan_pool,
@@ -409,9 +414,8 @@ pub fn takeModified(service: *Service, arena: std.mem.Allocator) std.mem.Allocat
     const items = service.modified_paths.items;
     var out = try arena.alloc([]u8, items.len);
     var count: usize = 0;
-    errdefer {
-        // Keep undrained items untouched on OOM.
-    }
+    // Out of memory, the queue is left as it was: nothing is freed or
+    // cleared before every path is copied.
     for (items) |p| {
         out[count] = try arena.dupe(u8, p);
         count += 1;
@@ -461,23 +465,35 @@ fn isIgnoreFile(name: []const u8) bool {
 /// Whether a change may concern the content index (see `name_changes`).
 /// Under the lock, before the change is applied (its parent id resolves).
 fn concernsContent(service: *Service, change: Watcher.Change) bool {
+    var path_buffer: paths.Buffer = undefined;
     const parent: u32, const name: []const u8 = switch (change) {
         .created => |created| .{ created.parent, created.name },
         .modified => |modified| .{ modified.parent, modified.name },
         .removed => |removed| .{ removed.parent, removed.name },
-        else => return true,
+        // A watched folder deleted or moved away: by its own path, so a
+        // `trash1234` of Firefox's cache leaving does not list every file.
+        .dir_gone => |raw_id| {
+            const directory = service.live.pathOf(.fromRaw(raw_id), &path_buffer) orelse
+                return true;
+            return !service.underHidden(directory);
+        },
+        .overflow => return true,
     };
     if (name.len > 0 and name[0] == '.' and !isIgnoreFile(name)) return false;
-    var path_buffer: paths.Buffer = undefined;
     const directory = service.live.pathOf(.fromRaw(parent), &path_buffer) orelse return true;
+    return !service.underHidden(directory);
+}
+
+/// Whether a component of `path` below the root starts with a dot.
+fn underHidden(service: *const Service, path: []const u8) bool {
     const root = service.roots[0];
-    const in_root = std.mem.startsWith(u8, directory, root);
-    const relative = if (in_root) directory[root.len..] else directory;
+    const in_root = std.mem.startsWith(u8, path, root);
+    const relative = if (in_root) path[root.len..] else path;
     var parts = std.mem.tokenizeScalar(u8, relative, '/');
     while (parts.next()) |part| {
-        if (part[0] == '.') return false;
+        if (part[0] == '.') return true;
     }
-    return true;
+    return false;
 }
 
 /// How long a rescan asked for `since_ns` after the last one ended waits,
@@ -797,7 +813,18 @@ fn run(service: *Service) void {
         // Phase 2: wait for events without holding the index.
         service.lock.lockSharedUncancelable(service.io);
         const fd = service.live.watcher.fd;
+        const scans_pending = service.live.scansPending();
         service.lock.unlockShared(service.io);
+        if (scans_pending) {
+            // New folders the last batch's rounds left unread are not
+            // watched yet: what is written in them now comes with no
+            // event, so waiting for one could leave them unread for good.
+            // Read now, after a pause that lets searches in.
+            sys.sleepUs(arm_yield_us);
+            _ = arena_state.reset(.retain_capacity);
+            if (service.applyEvents(arena_state.allocator())) service.rescan();
+            continue;
+        }
         const retry_ms = service.retryWaitMs();
         switch (sys.waitServiceEvents(fd, service.wake_fd, service.mountinfo_fd, retry_ms)) {
             .ready => {},
@@ -1148,6 +1175,7 @@ test "service: name changes are counted outside hidden files and folders" {
     try makeDirectory(root, ".hidden");
     var hidden_buffer: paths.Buffer = undefined;
     const hidden = try std.mem.print(&hidden_buffer, "{s}/.hidden", .{root});
+    try makeDirectory(hidden, "trash1234");
     var index_path_buffer: paths.Buffer = undefined;
     const index_path = try std.mem.printSentinel(
         &index_path_buffer,
@@ -1162,6 +1190,10 @@ test "service: name changes are counted outside hidden files and folders" {
     const before = try waitNames(service, null);
     try touch(root, ".dotfile");
     try touch(hidden, "inside.txt");
+    // A watched hidden folder going away is no name change either.
+    var trash_buffer: paths.Buffer = undefined;
+    const trash = try std.mem.printSentinel(&trash_buffer, "{s}/trash1234", .{hidden}, 0);
+    try testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.rmdir(trash)));
     sys.sleepUs(300_000);
     try testing.expectEqual(before, service.nameChanges().?);
     try touch(root, "visible.txt");

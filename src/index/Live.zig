@@ -194,7 +194,10 @@ pub const Recheck = struct {
     /// What `readRechecks` found in it.
     found: []const Found = &.{},
 
-    pub const Status = enum { unread, read, gone, unreadable };
+    /// `partial`: listed until a read error (EIO on a flaky disk or FUSE
+    /// mount), so what is missing from `found` may still be there: what
+    /// it holds is added, and nothing is removed as a ghost.
+    pub const Status = enum { unread, read, partial, gone, unreadable };
     pub const Found = struct { name: []const u8, is_dir: bool };
 };
 
@@ -453,6 +456,14 @@ fn isDirEntry(live: *const Live, id: EntryId) bool {
     return live.base.isDir(id.index);
 }
 
+/// A folder, read or only indexed (`store.flag_folder`): what a directory
+/// on disk is in the index, whether the scan went into it or not.
+fn isFolderEntry(live: *const Live, id: EntryId) bool {
+    const folder_flags = store_mod.flag_dir | store_mod.flag_folder;
+    if (id.in_delta) return live.delta.flags(id.index) & folder_flags != 0;
+    return live.base.isFolder(id.index);
+}
+
 /// Whether `name` is in directory `parent` on disk (any kind, a dangling
 /// link too). When the parent's path cannot be made: true, so nothing is
 /// removed on a guess.
@@ -644,7 +655,12 @@ pub fn readRechecks(arena: std.mem.Allocator, rechecks: []Recheck, entries_max: 
         defer sys.close(fd);
         var found: std.ArrayList(Recheck.Found) = .empty;
         var entries: sys.DirIter = .{ .fd = fd };
-        while (entries.next() catch null) |entry| {
+        var status: Recheck.Status = .read;
+        while (true) {
+            const entry = entries.next() catch {
+                status = .partial;
+                break;
+            } orelse break;
             entries_count += 1;
             if (entries_count > entries_max) return false;
             var kind = entry.kind;
@@ -659,7 +675,7 @@ pub fn readRechecks(arena: std.mem.Allocator, rechecks: []Recheck, entries_max: 
             found.append(arena, .{ .name = name, .is_dir = is_dir }) catch return false;
         }
         recheck.found = found.items;
-        recheck.status = .read;
+        recheck.status = status;
     }
     return true;
 }
@@ -684,13 +700,22 @@ pub fn applyRechecks(live: *Live, rechecks: []const Recheck) std.mem.Allocator.E
                 continue;
             },
             .unread, .unreadable => continue,
-            .read => {},
+            .read, .partial => {},
         }
         for (recheck.found) |found| {
-            if (live.childOf(parent, found.name) != null) continue;
+            if (live.childOf(parent, found.name)) |known| {
+                // Same name, same kind: indexed already. A name that
+                // changed kind in the window (a file replaced by a folder,
+                // or the other way) came with no event either: the entry
+                // goes, subtree and all, and the name is added as it is
+                // now, so a new folder is read and watched.
+                if (live.isFolderEntry(known) == found.is_dir) continue;
+                live.stats.removed += live.tombstoneTree(known);
+                changed = true;
+            }
             if (try live.add(parent, found.name, found.is_dir, false)) changed = true;
         }
-        if (parent.in_delta) {
+        if (parent.in_delta and recheck.status == .read) {
             present.clearRetainingCapacity();
             ghosts.clearRetainingCapacity();
             present.ensureUnusedCapacity(live.gpa, @intCast(recheck.found.len)) catch {
@@ -765,20 +790,19 @@ pub fn readScans(
         sub_config.entries_max = entries_left;
         var scan_stats: scan.Stats = .{};
         var unreadable: std.ArrayList([]u8) = .empty;
-        errdefer sys.freeList(gpa, unreadable.items);
         var sub = scan.scanCollectingUnreadable(gpa, pool, &sub_config, null, &scan_stats, &unreadable) catch {
-            sys.freeList(gpa, unreadable.items);
+            freeDirList(gpa, &unreadable);
             scan_job.outcome = .failed;
             continue;
         };
         if (scan_stats.truncated) {
             sub.deinit(gpa);
-            sys.freeList(gpa, unreadable.items);
+            freeDirList(gpa, &unreadable);
             scan_job.outcome = .too_big;
             continue;
         }
         scan_job.unreadable = unreadable.toOwnedSlice(gpa) catch blk: {
-            sys.freeList(gpa, unreadable.items);
+            freeDirList(gpa, &unreadable);
             break :blk &.{};
         };
         entries_left -|= sub.len();
@@ -786,15 +810,42 @@ pub fn readScans(
     }
 }
 
+/// Frees a list of paths with the capacity it holds, not only its
+/// `items` (`sys.freeList` takes an exact slice: freeing `items` of a list
+/// with spare capacity is an invalid free).
+fn freeDirList(gpa: std.mem.Allocator, list: *std.ArrayList([]u8)) void {
+    for (list.items) |dir| gpa.free(dir);
+    list.deinit(gpa);
+}
+
 pub fn addRetryDir(live: *Live, dir: []const u8) std.mem.Allocator.Error!void {
-    for (live.retry_dirs) |existing| {
-        if (std.mem.eql(u8, existing, dir)) return;
+    return live.addRetryDirs(&.{dir});
+}
+
+/// Adds `dirs` to `retry_dirs`, each once, with one set and one realloc:
+/// one at a time, each was compared with every one before it (thousands
+/// of unreadable folders in a moved tree: millions of comparisons under
+/// the lock).
+pub fn addRetryDirs(live: *Live, dirs: []const []const u8) std.mem.Allocator.Error!void {
+    if (dirs.len == 0) return;
+    const gpa = live.gpa;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(gpa);
+    try seen.ensureTotalCapacity(gpa, @intCast(live.retry_dirs.len + dirs.len));
+    for (live.retry_dirs) |existing| seen.putAssumeCapacity(existing, {});
+    var added: std.ArrayList([]u8) = .empty;
+    errdefer freeDirList(gpa, &added);
+    for (dirs) |dir| {
+        if (seen.getOrPutAssumeCapacity(dir).found_existing) continue;
+        try added.ensureUnusedCapacity(gpa, 1);
+        added.appendAssumeCapacity(try gpa.dupe(u8, dir));
     }
-    const copy = try live.gpa.dupe(u8, dir);
-    errdefer live.gpa.free(copy);
-    const grown = try live.gpa.realloc(live.retry_dirs, live.retry_dirs.len + 1);
-    grown[grown.len - 1] = copy;
+    if (added.items.len == 0) return;
+    const count_before = live.retry_dirs.len;
+    const grown = try gpa.realloc(live.retry_dirs, count_before + added.items.len);
+    @memcpy(grown[count_before..], added.items);
     live.retry_dirs = grown;
+    added.deinit(gpa);
 }
 
 /// Adds what `readScans` found under each directory's entry and watches
@@ -802,9 +853,9 @@ pub fn addRetryDir(live: *Live, dir: []const u8) std.mem.Allocator.Error!void {
 /// `readScans`.
 pub fn addScans(live: *Live, scans: *Scans) std.mem.Allocator.Error!void {
     defer freeScans(live.gpa, scans);
+    live.retryUnreadable(scans.items);
     var added = false;
     for (scans.items) |*scan_job| {
-        for (scan_job.unreadable) |dir| live.addRetryDir(dir) catch {};
         // Removed again before it was read (later in the same batch).
         if (!live.delta.alive(scan_job.directory)) continue;
         const sub = switch (scan_job.outcome) {
@@ -842,6 +893,25 @@ pub fn addScans(live: *Live, scans: *Scans) std.mem.Allocator.Error!void {
         try live.delta.rebuild(live.gpa);
     }
     live.pruneWatches();
+}
+
+/// What `readScans` could not read in `scans`, to retry (`retry_dirs`),
+/// added at once. Out of memory, left out: as before, a folder that
+/// becomes readable then waits for the next rescan.
+fn retryUnreadable(live: *Live, scans: []const Scan) void {
+    var count: usize = 0;
+    for (scans) |scan_job| count += scan_job.unreadable.len;
+    if (count == 0) return;
+    const dirs = live.gpa.alloc([]const u8, count) catch return;
+    defer live.gpa.free(dirs);
+    var filled: usize = 0;
+    for (scans) |scan_job| {
+        for (scan_job.unreadable) |dir| {
+            dirs[filled] = dir;
+            filled += 1;
+        }
+    }
+    live.addRetryDirs(dirs) catch {};
 }
 
 /// `takeScans`, `readScans` and `addScans` with the lock held throughout,
@@ -997,23 +1067,49 @@ pub fn adopt(live: *Live, fresh: Replaced) std.mem.Allocator.Error!Replaced {
     return old;
 }
 
-/// `sys.slowMounts` under every root.
+/// `sys.slowMounts` under every root, without the roots themselves
+/// (`slowMountsBelow`).
 fn slowMountsOf(gpa: std.mem.Allocator, config: *const scan.Config) std.mem.Allocator.Error![][]u8 {
     var all: std.ArrayList([]u8) = .empty;
-    errdefer {
-        for (all.items) |mount| gpa.free(mount);
-        all.deinit(gpa);
-    }
+    errdefer freeDirList(gpa, &all);
     for (config.roots) |root| {
         const list = try sys.slowMounts(gpa, root);
-        defer gpa.free(list);
-        all.ensureUnusedCapacity(gpa, list.len) catch |err| {
-            for (list) |mount| gpa.free(mount);
+        defer sys.freeList(gpa, list);
+        const below = try slowMountsBelow(gpa, config.roots, list);
+        defer gpa.free(below);
+        all.ensureUnusedCapacity(gpa, below.len) catch |err| {
+            for (below) |mount| gpa.free(mount);
             return err;
         };
-        all.appendSliceAssumeCapacity(list);
+        all.appendSliceAssumeCapacity(below);
     }
     return all.toOwnedSlice(gpa);
+}
+
+/// Copies of `mounts` but those that are one of `roots`: what `slow_mounts`
+/// holds. A root that is such a mount itself (a home on NFS, gocryptfs)
+/// keeps its recency, as it keeps its previews (`Service.onSlowMount`)
+/// and its content index; only what is mounted below it is not stat'ed.
+/// Listing it left every result of such a home without recency.
+pub fn slowMountsBelow(
+    gpa: std.mem.Allocator,
+    roots: []const []const u8,
+    mounts: []const []const u8,
+) std.mem.Allocator.Error![][]u8 {
+    var below: std.ArrayList([]u8) = .empty;
+    errdefer freeDirList(gpa, &below);
+    next_mount: for (mounts) |mount| {
+        const mount_clean = std.mem.trimEnd(u8, mount, "/");
+        for (roots) |root| {
+            if (std.mem.eql(u8, mount_clean, std.mem.trimEnd(u8, root, "/"))) continue :next_mount;
+        }
+        const copy = try gpa.dupe(u8, mount);
+        below.append(gpa, copy) catch |err| {
+            gpa.free(copy);
+            return err;
+        };
+    }
+    return below.toOwnedSlice(gpa);
 }
 
 /// True when the layers on top weigh enough to be worth a rescan, or when
@@ -1044,14 +1140,17 @@ pub fn prepareCompaction(
         for (unreadable.items) |dir| gpa.free(dir);
         unreadable.deinit(gpa);
     }
-    const base = try scanSavedCollecting(gpa, pool, config, watcher, cache_path, &unreadable);
+    var base = try scanSavedCollecting(gpa, pool, config, watcher, cache_path, &unreadable);
+    errdefer base.deinit(gpa);
+    // Before the mounts: nothing after them may fail, or they would leak.
+    const retry_dirs = try unreadable.toOwnedSlice(gpa);
     return .{
         .base = base,
         .watcher = watcher,
         .graves = base.len() - base.liveCount(),
         // Out of memory: unknown, the list before stays.
         .slow_mounts = slowMountsOf(gpa, config) catch null,
-        .retry_dirs = try unreadable.toOwnedSlice(gpa),
+        .retry_dirs = retry_dirs,
     };
 }
 
@@ -1874,6 +1973,31 @@ test "live: adopt frees pending rechecks from the replaced delta" {
     try testing.expectEqual(@as(usize, 0), live.rechecks.items.len);
 }
 
+test "live: readScans frees the unreadable list of a folder too big to add" {
+    if (linux.geteuid() == 0) return error.SkipZigTest;
+    const tree = try Tree.create(&sample_tree);
+    defer tree.destroy();
+    tree.make("nuevo/cerrada/");
+    for ([_][]const u8{ "uno", "dos", "tres", "cuatro", "cinco" }) |name| {
+        var relative_buffer: paths.Buffer = undefined;
+        tree.make(try std.mem.print(&relative_buffer, "nuevo/grande/{s}.txt", .{name}));
+    }
+    var locked_buffer: paths.Buffer = undefined;
+    const locked = tree.absolute("root/nuevo/cerrada", &locked_buffer);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(locked, 0o000)));
+    defer _ = linux.chmod(locked, 0o755);
+    _ = try tree.live.apply(&.{
+        .{ .created = .{ .parent = 0, .name = "nuevo", .is_dir = true } },
+    });
+    var scans = tree.live.takeScans();
+    defer freeScans(testing.allocator, &scans);
+    // `cerrada` is recorded as unreadable, then `grande` goes past the
+    // cap: the list (with spare capacity) is freed whole, which the
+    // testing allocator checks.
+    readScans(testing.allocator, tree.pool, &tree.config, scans.items, 5);
+    try testing.expect(scans.items[0].outcome == .too_big);
+}
+
 test "live: rechecks remove files renamed or deleted between readScans and watching" {
     const tree = try Tree.create(&sample_tree);
     defer tree.destroy();
@@ -1901,6 +2025,52 @@ test "live: rechecks remove files renamed or deleted between readScans and watch
     try testing.expectEqual(@as(usize, 0), try tree.under("temporal", ""));
     try testing.expectEqual(@as(usize, 0), try tree.under("gone_dir", ""));
     try testing.expectEqual(@as(usize, 0), try tree.under("inside", ""));
+}
+
+test "live: a name that changes kind between readScans and watching is indexed as it is now" {
+    const tree = try Tree.create(&sample_tree);
+    defer tree.destroy();
+    tree.make("nuevo/item");
+    tree.make("nuevo/carpeta/hondo.rs");
+    _ = try tree.live.apply(&.{
+        .{ .created = .{ .parent = 0, .name = "nuevo", .is_dir = true } },
+    });
+    var scans = tree.live.takeScans();
+    readScans(testing.allocator, tree.pool, &tree.config, scans.items, 1000);
+
+    // Read, not watched yet: the kinds swap with no event to tell.
+    tree.remove("nuevo/item");
+    tree.make("nuevo/item/dentro_de_item.txt");
+    tree.remove("nuevo/carpeta/hondo.rs");
+    tree.remove("nuevo/carpeta/");
+    tree.make("nuevo/carpeta");
+
+    try tree.live.addScans(&scans);
+    try tree.live.finishScans();
+    _ = try tree.sync();
+
+    try testing.expect(!tree.live.pending_resync);
+    try testing.expect(try tree.found("dentro_de_item", "nuevo/item/dentro_de_item.txt"));
+    try testing.expect(try tree.found("carpeta", "nuevo/carpeta"));
+    try testing.expectEqual(@as(usize, 0), try tree.under("hondo", ""));
+    for (try tree.searchWith("carpeta", .{ .limit = 50, .recency = false })) |hit| {
+        if (std.mem.endsWith(u8, hit.path, "/nuevo/carpeta")) try testing.expect(!hit.is_dir);
+    }
+    // The new folder is watched: what comes later shows up.
+    tree.make("nuevo/item/despues.txt");
+    _ = try tree.sync();
+    try testing.expect(try tree.found("despues", "nuevo/item/despues.txt"));
+}
+
+test "live: a root that is a slow mount itself keeps its recency" {
+    const gpa = testing.allocator;
+    const roots = [_][]const u8{"/home/u"};
+    const mounts = [_][]const u8{ "/home/u", "/home/u/nas", "/home/u/", "/home/user" };
+    const below = try slowMountsBelow(gpa, &roots, &mounts);
+    defer sys.freeList(gpa, below);
+    try testing.expectEqual(@as(usize, 2), below.len);
+    try testing.expectEqualStrings("/home/u/nas", below[0]);
+    try testing.expectEqualStrings("/home/user", below[1]);
 }
 
 test "live: saveAndMap maps our own inode even when shared path is replaced by another writer" {

@@ -75,8 +75,9 @@ pub fn deinit(cache: *TextCache, gpa: std.mem.Allocator) void {
 }
 
 /// Where a document version's extracted text is cached. Keyed by size as
-/// well as mtime (whole seconds): an edit within the same second reused
-/// the old text, and dropping the old version's text then deleted it.
+/// well as mtime (in nanoseconds; whole seconds before, see `legacyName`):
+/// an edit within the same mtime tick reused the old text, and dropping
+/// the old version's text then deleted it.
 pub fn path(cache: TextCache, path_buffer: []u8, doc: DocIn) ?[:0]const u8 {
     var name_buffer: [name_bytes_max]u8 = undefined;
     const name = nameOf(&name_buffer, doc);
@@ -210,32 +211,58 @@ pub fn size(cache: TextCache, doc: DocIn) u64 {
     return info.size;
 }
 
+/// A document version: what a cached text is for (`path`), and what a
+/// hash set or map of versions is keyed by.
+pub const Version = struct {
+    path: []const u8,
+    mtime: i64,
+    size: u64,
+
+    pub fn of(doc: DocIn) Version {
+        return .{ .path = doc.path, .mtime = doc.mtime, .size = doc.size };
+    }
+
+    pub const Context = struct {
+        pub fn hash(_: Context, key: Version) u64 {
+            var hasher: std.hash.Wyhash = .init(0);
+            hasher.update(key.path);
+            hasher.update(std.mem.asBytes(&key.mtime));
+            hasher.update(std.mem.asBytes(&key.size));
+            return hasher.final();
+        }
+
+        pub fn eql(_: Context, a: Version, b: Version) bool {
+            return a.mtime == b.mtime and a.size == b.size and std.mem.eql(u8, a.path, b.path);
+        }
+    };
+
+    pub const Set = std.HashMapUnmanaged(Version, void, Context, std.hash_map.default_max_load_percentage);
+};
+
 /// Deletes the cached text of document versions that are gone (edited or
 /// deleted): it is keyed by mtime, so each edit otherwise left the old
 /// text in the cache for good. Versions in `kept` share the same key (e.g.
-/// a re-extracted document) and are never removed.
+/// a re-extracted document) and are never removed. `kept` is looked up as
+/// a set (O(gone x kept) when it was a list); out of memory, nothing is
+/// deleted: the next whole build's sweep does it.
 pub fn dropStale(
     cache: TextCache,
+    gpa: std.mem.Allocator,
     old: *const Index,
     gone: []const u32,
     kept: []const DocIn,
 ) void {
+    var kept_set: Version.Set = .empty;
+    defer kept_set.deinit(gpa);
+    kept_set.ensureTotalCapacity(gpa, @intCast(kept.len)) catch return;
+    for (kept) |doc| {
+        if (doc.source == .extracted) kept_set.putAssumeCapacity(.of(doc), {});
+    }
     var path_buffer: paths.Buffer = undefined;
     for (gone) |id| {
         if (old.sources[id] != @backingInt(content.Source.extracted)) continue;
         const stale = old.docIn(id);
-        var is_kept = false;
-        for (kept) |doc| {
-            if (doc.source == .extracted and
-                doc.mtime == stale.mtime and
-                doc.size == stale.size and
-                std.mem.eql(u8, doc.path, stale.path))
-            {
-                is_kept = true;
-                break;
-            }
-        }
-        if (is_kept) continue;
+        if (kept_set.contains(.of(stale))) continue;
         const text_path = cache.path(&path_buffer, stale) orelse continue;
         // Left behind, it is deleted by the next whole build's sweep.
         const result = linux.unlink(text_path);

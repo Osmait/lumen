@@ -202,19 +202,36 @@ pub fn scanCollectingUnreadable(
     return scanImpl(gpa, pool, config, watcher, stats, unreadable);
 }
 
-fn recordUnreadable(
-    gpa: std.mem.Allocator,
-    unreadable: ?*std.ArrayList([]u8),
-    path: []const u8,
-) std.mem.Allocator.Error!void {
-    const list = unreadable orelse return;
-    for (list.items) |existing| {
-        if (std.mem.eql(u8, existing, path)) return;
+/// The folders `scanImpl` found unreadable, and the same paths as a set:
+/// deduplicated by a linear search, thousands of them (rootless podman's
+/// storage) cost tens of millions of comparisons per rescan.
+const Unreadable = struct {
+    list: ?*std.ArrayList([]u8),
+    /// Keys are `list`'s own strings.
+    seen: std.StringHashMapUnmanaged(void) = .empty,
+
+    fn init(gpa: std.mem.Allocator, list: ?*std.ArrayList([]u8)) std.mem.Allocator.Error!Unreadable {
+        var unreadable: Unreadable = .{ .list = list };
+        const items: []const []u8 = if (list) |some| some.items else &.{};
+        try unreadable.seen.ensureTotalCapacity(gpa, @intCast(items.len));
+        for (items) |path| unreadable.seen.putAssumeCapacity(path, {});
+        return unreadable;
     }
-    const copy = try gpa.dupe(u8, path);
-    errdefer gpa.free(copy);
-    try list.append(gpa, copy);
-}
+
+    fn deinit(unreadable: *Unreadable, gpa: std.mem.Allocator) void {
+        unreadable.seen.deinit(gpa);
+    }
+
+    fn record(unreadable: *Unreadable, gpa: std.mem.Allocator, path: []const u8) std.mem.Allocator.Error!void {
+        const list = unreadable.list orelse return;
+        if (unreadable.seen.contains(path)) return;
+        try unreadable.seen.ensureUnusedCapacity(gpa, 1);
+        try list.ensureUnusedCapacity(gpa, 1);
+        const copy = try gpa.dupe(u8, path);
+        list.appendAssumeCapacity(copy);
+        unreadable.seen.putAssumeCapacity(copy, {});
+    }
+};
 
 fn scanImpl(
     gpa: std.mem.Allocator,
@@ -229,6 +246,8 @@ fn scanImpl(
     var builder: Builder = .empty;
     errdefer builder.deinit(gpa);
 
+    var unreadable_set: Unreadable = try .init(gpa, unreadable);
+    defer unreadable_set.deinit(gpa);
     var frontier: std.ArrayList(Frontier) = .empty;
     defer freeFrontier(gpa, &frontier);
     try addRoots(gpa, &builder, config.roots, &frontier, &totals);
@@ -247,7 +266,7 @@ fn scanImpl(
                     folder.id,
                     placement,
                 );
-                if (!watched) try recordUnreadable(gpa, unreadable, folder.path);
+                if (!watched) try unreadable_set.record(gpa, folder.path);
             }
         }
         const batches = try readLevel(gpa, pool, config, frontier.items, follow, &roots);
@@ -255,7 +274,7 @@ fn scanImpl(
         for (frontier.items, batches) |folder, batch| {
             // A folder read in part must not pass for the whole of it.
             if (batch.out_of_memory) return error.OutOfMemory;
-            if (batch.access_denied) try recordUnreadable(gpa, unreadable, folder.path);
+            if (batch.access_denied) try unreadable_set.record(gpa, folder.path);
             if (batch.over_cap) totals.truncated = true;
         }
 
