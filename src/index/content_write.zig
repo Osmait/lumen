@@ -146,6 +146,10 @@ pub fn writeDocs(
         std.mem.writeInt(u64, table[cursor..][0..8], doc.size, .little);
         cursor += @sizeOf(u64);
     }
+    for (docs) |doc| {
+        std.mem.writeInt(i64, table[cursor..][0..8], doc.ctime, .little);
+        cursor += @sizeOf(i64);
+    }
     var path_offset: usize = paths_offset;
     for (docs, 0..) |doc, doc_index| {
         if (doc_index < reused.len) {

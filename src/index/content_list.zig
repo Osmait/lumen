@@ -134,6 +134,7 @@ pub fn list(
                 .document => .extracted,
                 .text => .plain,
             },
+            .ctime = file_stat.ctime,
         });
     }
     std.mem.sort(content.DocIn, docs.items, {}, struct {
@@ -271,13 +272,15 @@ fn waitListerExit(
     return sys.waitExitCancelable(pid, deadline_ns, stop, list_poll_ms);
 }
 
-pub const Stat = struct { mtime: i64, size: u64 };
+/// Times in nanoseconds. The ctime tells a file replaced by one with the
+/// same mtime and size, and a `chmod`, which leave the mtime as it was.
+pub const Stat = struct { mtime: i64, size: u64, ctime: i64 };
 
 /// What a listed file is indexed as: its own bytes, or extracted text.
 /// Their size bounds differ.
 pub const Kind = enum { text, document };
 
-/// A listed file's mtime and size, or null if it is not one to index (any
+/// A listed file's times and size, or null if it is not one to index (any
 /// more): not a regular file (symlinks are not followed, avoiding slow mounts
 /// and matching `scan.zig`/`Watcher.zig`), or a size out of bounds for its `kind`.
 pub fn stat(path: [*:0]const u8, kind: Kind) ?Stat {
@@ -286,7 +289,7 @@ pub fn stat(path: [*:0]const u8, kind: Kind) ?Stat {
         linux.AT.FDCWD,
         path,
         linux.AT.SYMLINK_NOFOLLOW | linux.AT.NO_AUTOMOUNT,
-        .{ .TYPE = true, .SIZE = true, .MTIME = true },
+        .{ .TYPE = true, .SIZE = true, .MTIME = true, .CTIME = true },
         &statx,
     );
     if (linux.errno(result) != .SUCCESS) return null;
@@ -299,31 +302,18 @@ pub fn stat(path: [*:0]const u8, kind: Kind) ?Stat {
         },
         .document => if (statx.size > document_bytes_max) return null,
     }
-    const mtime_ns = std.math.add(
-        i64,
-        std.math.mul(i64, statx.mtime.sec, std.time.ns_per_s) catch std.math.maxInt(i64),
-        @as(i64, statx.mtime.nsec),
-    ) catch std.math.maxInt(i64);
-    return .{ .mtime = mtime_ns, .size = statx.size };
+    return .{
+        .mtime = nanoseconds(statx.mtime),
+        .size = statx.size,
+        .ctime = nanoseconds(statx.ctime),
+    };
 }
 
-/// A file's ctime in nanoseconds (symlinks not followed), or null if it
-/// cannot be stat'ed. Changes with its mode or owner, which its mtime does
-/// not.
-pub fn changeTime(path: [*:0]const u8) ?i64 {
-    var statx: linux.Statx = undefined;
-    const result = linux.statx(
-        linux.AT.FDCWD,
-        path,
-        linux.AT.SYMLINK_NOFOLLOW | linux.AT.NO_AUTOMOUNT,
-        .{ .CTIME = true },
-        &statx,
-    );
-    if (linux.errno(result) != .SUCCESS) return null;
+fn nanoseconds(time: linux.statx_timestamp) i64 {
     return std.math.add(
         i64,
-        std.math.mul(i64, statx.ctime.sec, std.time.ns_per_s) catch std.math.maxInt(i64),
-        @as(i64, statx.ctime.nsec),
+        std.math.mul(i64, time.sec, std.time.ns_per_s) catch std.math.maxInt(i64),
+        @as(i64, time.nsec),
     ) catch std.math.maxInt(i64);
 }
 

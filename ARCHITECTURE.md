@@ -209,7 +209,7 @@ directory (2.8 s cold) and every core.
   after each whole build. unzip gets `-P ''`, so an encrypted member fails
   instead of prompting.
 - **Format**: one mapped file (`~/.cache/lumen/content.idx`): document table
-  (path, mtime, size) and segments of sorted trigram keys with varint-delta
+  (path, mtime, size, ctime) and segments of sorted trigram keys with varint-delta
   posting lists. Building dedups each file's trigrams with a 16M-bit map and
   radix-sorts (trigram, doc) pairs, closing a segment every 4 M pairs, and
   reads no more documents at a time than could make 4 M pairs, so memory
@@ -236,7 +236,8 @@ directory (2.8 s cold) and every core.
   The content index has its own thread pools, so its builds and
   verification never hold up the name index or the window.
 - **Freshness**: on start, every 5 minutes and when the window opens, the
-  files are compared with the index by (path, mtime, size). Listing them
+  files are compared with the index by (path, mtime, size, ctime: a file
+  replaced keeping its mtime and size has another ctime). Listing them
   takes ripgrep ~150 ms and ~0.45 s of CPU, so it is done only when needed:
   the name index counts names created, removed or moved outside hidden
   files and folders (idle, a home's name changes are all in .cache and

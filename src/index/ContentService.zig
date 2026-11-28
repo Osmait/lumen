@@ -2,7 +2,8 @@
 //!
 //! Text changes far less often than names, so this does not watch files: it
 //! lists them again (~150 ms with ripgrep) on start, every few minutes and
-//! when the window opens, and compares (path, mtime, size) with the index.
+//! when the window opens, and compares (path, mtime, size, ctime) with the
+//! index.
 //! What changed is read again and added to the index (`content.update`);
 //! the rest is not touched. Once removed versions or segments pile up, it
 //! is rebuilt whole (~1.1 s and ~270 MB for 49 k files). Like the name
@@ -888,6 +889,7 @@ fn diff(
                 continue;
             }
             try gone.append(arena, id);
+            service.forgetReplacedText(index.docIn(id), doc);
         } else if (unreadable.get(doc.path)) |entry| {
             if (stillUnreadable(entry, doc)) continue;
         }
@@ -905,11 +907,7 @@ fn diff(
 /// Whether `doc` is the file a build could not read, unchanged since:
 /// reading it again would fail again.
 fn stillUnreadable(entry: Unreadable, doc: content.DocIn) bool {
-    if (entry.mtime != doc.mtime or entry.size != doc.size) return false;
-    var path_buffer: paths.Buffer = undefined;
-    const path = std.mem.printSentinel(&path_buffer, "{s}", .{doc.path}, 0) catch return false;
-    const ctime = content_list.changeTime(path) orelse return false;
-    return ctime == entry.ctime;
+    return entry.mtime == doc.mtime and entry.size == doc.size and entry.ctime == doc.ctime;
 }
 
 /// Records the files the build of `input` could not read: those it added
@@ -936,12 +934,8 @@ fn commitUnreadable(service: *ContentService, input: BuildInput, index: *const c
         kept_count += 1;
     }
     entries.shrinkRetainingCapacity(kept_count);
-    var path_buffer: paths.Buffer = undefined;
     for (added, first_id..) |doc, id| {
         if (!index.removed(@intCast(id))) continue;
-        const path = std.mem.printSentinel(&path_buffer, "{s}", .{doc.path}, 0) catch continue;
-        // Gone already: nothing to leave out.
-        const ctime = content_list.changeTime(path) orelse continue;
         // Out of memory: read again by the next listing, nothing worse.
         entries.ensureUnusedCapacity(gpa, 1) catch return;
         const owned = gpa.dupe(u8, doc.path) catch return;
@@ -949,7 +943,7 @@ fn commitUnreadable(service: *ContentService, input: BuildInput, index: *const c
             .path = owned,
             .mtime = doc.mtime,
             .size = doc.size,
-            .ctime = ctime,
+            .ctime = doc.ctime,
         });
     }
 }
@@ -958,7 +952,24 @@ fn commitUnreadable(service: *ContentService, input: BuildInput, index: *const c
 fn unchanged(index: *const content.Index, id: u32, doc: content.DocIn) bool {
     if (index.mtimes[id] != doc.mtime) return false;
     if (index.sizes[id] != doc.size) return false;
+    if (index.ctimes[id] != doc.ctime) return false;
     return index.sources[id] == @backingInt(doc.source);
+}
+
+/// Deletes the cached text of `doc` when the file is another one than the
+/// version `indexed` was, under the same text cache key (mtime and size):
+/// replaced by one that kept both, which only its ctime tells. Its text is
+/// extracted again instead of reused.
+fn forgetReplacedText(service: *ContentService, indexed: content.DocIn, doc: content.DocIn) void {
+    if (doc.source != .extracted or indexed.source != .extracted) return;
+    if (indexed.mtime != doc.mtime or indexed.size != doc.size) return;
+    if (indexed.ctime == doc.ctime) return;
+    var text_path_buffer: paths.Buffer = undefined;
+    const text_path = service.text_cache.path(&text_path_buffer, doc) orelse return;
+    switch (linux.errno(linux.unlink(text_path))) {
+        .SUCCESS, .NOENT => {},
+        else => |errno| log.warn("deleting {s}: {t}", .{ text_path, errno }),
+    }
 }
 
 const ListingStamp = struct {
@@ -1032,7 +1043,9 @@ fn indexedChanges(
             .plain => .text,
         });
         if (stat_now) |stat| {
-            const same = stat.mtime == doc.mtime and stat.size == doc.size;
+            const same = stat.mtime == doc.mtime and
+                stat.size == doc.size and
+                stat.ctime == doc.ctime;
             // Its extracted text gone from the cache (a cleaner emptied it):
             // re-extract into the cache without rebuilding the index.
             if (same) {
@@ -1042,6 +1055,7 @@ fn indexedChanges(
                         .mtime = doc.mtime,
                         .size = doc.size,
                         .source = doc.source,
+                        .ctime = doc.ctime,
                     });
                 }
                 continue;
@@ -1050,12 +1064,15 @@ fn indexedChanges(
         try gone.append(arena, id);
         // Gone, or out of bounds now: only removed.
         const stat = stat_now orelse continue;
-        try added.append(arena, .{
+        const now: content.DocIn = .{
             .path = doc.path,
             .mtime = stat.mtime,
             .size = stat.size,
             .source = doc.source,
-        });
+            .ctime = stat.ctime,
+        };
+        service.forgetReplacedText(doc, now);
+        try added.append(arena, now);
     }
     // Not in the index (`extractMissing` left them out): as they are now,
     // respecting retry backoff unless the file changed on disk.
@@ -1081,6 +1098,7 @@ fn indexedChanges(
             .mtime = stat.mtime,
             .size = stat.size,
             .source = .extracted,
+            .ctime = stat.ctime,
         });
     }
     return .{
@@ -2673,6 +2691,105 @@ test "content service: an unreadable file costs one read per version, not an upd
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(locked, 0o644)));
     try pokeAndWait(service);
     try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "aardvark")).len);
+}
+
+/// Replaces `name` in `tree` with a new file holding `data` (renamed over
+/// it, as an editor or `cp` through a temporary would), then gives it the
+/// mtime it had: the same size and mtime, to the nanosecond.
+fn replaceKeepingMtime(tree: *const TestTree, name: []const u8, data: []const u8) !void {
+    var path_buffer: paths.Buffer = undefined;
+    const path = try tree.path(&path_buffer, name);
+    var statx: linux.Statx = undefined;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.statx(
+        linux.AT.FDCWD,
+        path,
+        0,
+        .{ .MTIME = true, .SIZE = true },
+        &statx,
+    )));
+    try testing.expectEqual(statx.size, data.len);
+    var temporary_buffer: paths.Buffer = undefined;
+    var temporary_name_buffer: paths.Buffer = undefined;
+    const temporary_name = try std.mem.print(&temporary_name_buffer, "{s}.new", .{name});
+    try tree.write(temporary_name, data);
+    const temporary = try tree.path(&temporary_buffer, temporary_name);
+    try setMtimeNs(temporary, @intCast(statx.mtime.sec), @intCast(statx.mtime.nsec));
+    try sys.rename(temporary, path);
+}
+
+test "content service: a file replaced keeping its size and mtime is indexed again" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.root.write("notes.txt", "the otterword is here\n");
+    var path_buffer: paths.Buffer = undefined;
+    try setMtimeNs(try fixture.root.path(&path_buffer, "notes.txt"), 1_700_000_000, 123_456_789);
+    {
+        const service = try fixture.start();
+        defer service.shutdown();
+        try waitChecks(service, 1);
+        try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "otterword")).len);
+    }
+
+    // While it was not running: found on start.
+    try replaceKeepingMtime(&fixture.root, "notes.txt", "the zebraword is here\n");
+    const service = try fixture.start();
+    defer service.shutdown();
+    try waitChecks(service, 1);
+    try testing.expectEqual(@as(usize, 0), (try fixture.find(service, "otterword")).len);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "zebraword")).len);
+
+    // While it runs.
+    try replaceKeepingMtime(&fixture.root, "notes.txt", "the lemurword is here\n");
+    try pokeAndWait(service);
+    try testing.expectEqual(@as(usize, 0), (try fixture.find(service, "zebraword")).len);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "lemurword")).len);
+
+    // An extracted document: its cached text is keyed by mtime and size,
+    // and must not be reused.
+    if (!haveTool("zip") or !haveTool("unzip")) return;
+    var stage = try TestTree.init();
+    defer stage.deinit();
+    const odt_text = "<?xml version=\"1.0\"?><office:document-content><text:p>{s} notes</text:p></office:document-content>";
+    var xml_buffer: [256]u8 = undefined;
+    try stage.write("mimetype", "application/vnd.oasis.opendocument.text");
+    try stage.write("a/mimetype", "application/vnd.oasis.opendocument.text");
+    try stage.write("content.xml", try std.mem.print(&xml_buffer, odt_text, .{"wombat"}));
+    try stage.write("a/content.xml", try std.mem.print(&xml_buffer, odt_text, .{"walrus"}));
+    var odt_buffer: paths.Buffer = undefined;
+    const odt = try fixture.root.path(&odt_buffer, "doc.odt");
+    var other_buffer: paths.Buffer = undefined;
+    const other = try fixture.root.path(&other_buffer, "doc.odt.new");
+    var a_buffer: paths.Buffer = undefined;
+    // Stored, not deflated: both zips the same size.
+    for ([_][]const u8{ stage.absolute, try stage.path(&a_buffer, "a") }, [_][]const u8{ odt, other }) |folder, zip_path| {
+        const result = try std.process.run(testing.allocator, testing.io, .{
+            .argv = &.{ "zip", "-0", "-q", "-X", zip_path, "mimetype", "content.xml" },
+            .cwd = .{ .path = folder },
+        });
+        testing.allocator.free(result.stdout);
+        testing.allocator.free(result.stderr);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    }
+    try setMtimeNs(odt, 1_700_000_000, 0);
+    try pokeAndWait(service);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "wombat")).len);
+    var walrus_buffer: paths.Buffer = undefined;
+    const walrus_zip = try readAll(other, &walrus_buffer);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.unlink(other)));
+    try replaceKeepingMtime(&fixture.root, "doc.odt", walrus_zip);
+    try pokeAndWait(service);
+    try testing.expectEqual(@as(usize, 0), (try fixture.find(service, "wombat")).len);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "walrus")).len);
+}
+
+fn readAll(path: [:0]const u8, buffer: []u8) ![]const u8 {
+    const fd = try sys.openRegular(path);
+    defer sys.close(fd);
+    const bytes_read = linux.read(fd, buffer.ptr, buffer.len);
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(bytes_read));
+    try testing.expect(bytes_read < buffer.len);
+    return buffer[0..bytes_read];
 }
 
 fn setMtimeNs(path: [*:0]const u8, sec: isize, nsec: isize) !void {

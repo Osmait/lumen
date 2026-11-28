@@ -49,6 +49,7 @@ segments_count: usize,
 whole_segments_count: usize = 0,
 mtimes: []const i64,
 sizes: []const u64,
+ctimes: []const i64,
 path_offsets: []const u32,
 path_sizes: []const u16,
 sources: []const u8,
@@ -72,6 +73,7 @@ bytes_live: usize,
 const DocColumns = struct {
     mtimes: []const i64,
     sizes: []const u64,
+    ctimes: []const i64,
     path_offsets: []const u32,
     path_sizes: []const u16,
     sources: []const u8,
@@ -95,6 +97,8 @@ const DocColumns = struct {
         cursor += docs_count * @sizeOf(i64);
         columns.sizes = sliceAt(u64, file, cursor, docs_count);
         cursor += docs_count * @sizeOf(u64);
+        columns.ctimes = sliceAt(i64, file, cursor, docs_count);
+        cursor += docs_count * @sizeOf(i64);
         columns.path_offsets = sliceAt(u32, file, cursor, docs_count);
         cursor += docs_count * @sizeOf(u32);
         columns.path_sizes = sliceAt(u16, file, cursor, docs_count);
@@ -177,6 +181,7 @@ pub fn docIn(index: *const ContentIndex, doc: u32) DocIn {
         .mtime = index.mtimes[doc],
         .size = index.sizes[doc],
         .source = std.enums.fromInt(Source, index.sources[doc]) orelse .plain,
+        .ctime = index.ctimes[doc],
     };
 }
 
@@ -249,6 +254,7 @@ pub fn parse(whole: Bytes, backing: format.Backing) error{BadIndex}!ContentIndex
         .whole_segments_count = @intCast(@min(header.whole_segments_count, segments_count)),
         .mtimes = columns.mtimes,
         .sizes = columns.sizes,
+        .ctimes = columns.ctimes,
         .path_offsets = columns.path_offsets,
         .path_sizes = columns.path_sizes,
         .sources = columns.sources,
@@ -589,15 +595,15 @@ test "corrupt content indexes are rejected, not trusted" {
         .{ .offset = directory_offset + 32, .value = good.len }, // Postings longer than the file.
         .{ .offset = directory_offset + 32, .value = 0 }, // Offsets beyond the postings.
         // A path past the end of the file, an unknown document kind.
-        .{ .offset = docs_offset + docs_count * 16, .value = 0xffff_fff0, .wide = false },
-        .{ .offset = docs_offset + docs_count * 22, .value = 9, .wide = false },
+        .{ .offset = docs_offset + docs_count * 24, .value = 0xffff_fff0, .wide = false },
+        .{ .offset = docs_offset + docs_count * 30, .value = 9, .wide = false },
         // Keys out of order (binary search would miss), offsets going back.
         .{ .offset = segment.keys_offset, .value = 0xffff_ff, .wide = false },
         .{ .offset = segment.offsets_offset + 4, .value = 0xffff_ffff, .wide = false },
     };
     for (cases, 0..) |case, i| {
         @memcpy(bad, good);
-        if (case.offset == docs_offset + docs_count * 22) {
+        if (case.offset == docs_offset + docs_count * 30) {
             bad[case.offset] = @intCast(case.value);
         } else if (case.wide) {
             Patch.write64(bad, case.offset, case.value);
@@ -676,8 +682,8 @@ test "post-parse mutations to mmap buffer are rejected safely" {
     const docs_offset = std.mem.readInt(u64, bad[32..40], .little);
     const docs_count = mutated.docs_count;
     // Corrupt doc 0 path offset past EOF and doc 1 source to invalid enum 99.
-    std.mem.writeInt(u32, bad[docs_offset + docs_count * 16 ..][0..4], 0xffff_ff00, .little);
-    bad[docs_offset + docs_count * 22 + 1] = 99;
+    std.mem.writeInt(u32, bad[docs_offset + docs_count * 24 ..][0..4], 0xffff_ff00, .little);
+    bad[docs_offset + docs_count * 30 + 1] = 99;
     // Corrupt posting offset end in segment 0 backwards (start > end).
     const segment = mutated.segments_inline[0];
     if (segment.keys_count > 0) {
