@@ -260,14 +260,17 @@ pub fn nameFromUrl(out: []u8, url: []const u8) []const u8 {
 }
 
 /// `fmt` written to `out`, cut to what fits, as valid UTF-8: it goes to the
-/// caller over D-Bus, whose strings must be.
+/// caller over D-Bus, whose strings must be. A byte that is not UTF-8 (in
+/// a path) shows as U+FFFD; it cut the message there (MYP-533).
 fn format(out: []u8, comptime fmt: []const u8, args: anytype) [:0]const u8 {
-    var writer: std.Io.Writer = .fixed(out[0 .. out.len - 1]);
+    assert(out.len <= print_bytes_max);
+    var raw: [print_bytes_max]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(raw[0 .. out.len - 1]);
     // Full: what fits is kept, which is the cut this function promises.
     writer.print(fmt, args) catch {};
-    const valid_length = core.utf8.validPrefix(writer.buffered()).len;
-    out[valid_length] = 0;
-    return out[0..valid_length :0];
+    const shown = core.utf8.sanitizeCut(out[0 .. out.len - 1], writer.buffered());
+    out[shown.len] = 0;
+    return out[0..shown.len :0];
 }
 
 /// The end of `text` in at most `bytes_max` bytes, from a character on,
@@ -444,8 +447,18 @@ pub fn install(
         return fail(ui, caller, left, .{ data, name });
     }
     var clone_buf: [20]?[*:0]const u8 = undefined;
-    const argv = gitCloneArgv(&clone_buf, url_z.ptr, installing.ptr, Ui.testMode());
+    const allow_file = Ui.testMode() or isLocalUrl(effective_url);
+    const argv = gitCloneArgv(&clone_buf, url_z.ptr, installing.ptr, allow_file);
     start(ui, caller, .install, name, folder, installing, argv);
+}
+
+/// A repository on this machine, as `--install` was given it (a path, made
+/// absolute by `resolveLocalUrl`, or a file:// URL): cloned with git's
+/// file transport, which `protocol.allow=never` blocked, so that every
+/// local install failed outside the tests (MYP-528). Anything else keeps
+/// to https and ssh.
+fn isLocalUrl(url: []const u8) bool {
+    return std.mem.startsWith(u8, url, "/") or std.mem.startsWith(u8, url, "file://");
 }
 
 fn gitCloneArgv(
@@ -501,6 +514,9 @@ const update_one_script =
     \\  exit 1
     \\fi
     \\file_allow=${3:-never}
+    \\case $(git -C "$1" ls-remote --get-url 2>/dev/null) in
+    \\/*|file://*) file_allow=always ;;
+    \\esac
     \\before=$(git -C "$1" rev-parse HEAD 2>/dev/null || true)
     \\git -C "$1" -c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always -c "protocol.file.allow=$file_allow" -c submodule.recurse=false pull --ff-only || exit 1
     \\after=$(git -C "$1" rev-parse HEAD 2>/dev/null || true)
@@ -522,6 +538,38 @@ fn hasGitMarker(folder: []const u8) bool {
     var marker_buffer: [path_bytes_max + "/.git".len]u8 = undefined;
     const marker = std.mem.printSentinel(&marker_buffer, "{s}/.git", .{folder}, 0) catch return false;
     return os.info(marker) != null;
+}
+
+/// The commit checked out in `folder`, for lumen.lock: read from its files
+/// (`gitHeadSha`), else asked of git. A reftable repository (git 3's
+/// default) keeps its refs where those files are not, and nothing was
+/// recorded (MYP-529). git runs on the GTK thread, but only after an
+/// install or update, locally, and for `rev_parse_timeout_ns` at most.
+fn headSha(gpa: std.mem.Allocator, io: std.Io, folder: []const u8, out: *[64]u8) ?[]const u8 {
+    if (gitHeadSha(folder, out)) |sha| return sha;
+    return revParseHead(gpa, io, folder, out) orelse {
+        log.warn("{s}: no commit checked out found: lumen.lock does not record it", .{folder});
+        return null;
+    };
+}
+
+const rev_parse_timeout_ns = 2 * std.time.ns_per_s;
+
+/// `git rev-parse HEAD` in `folder`, into `out`.
+fn revParseHead(gpa: std.mem.Allocator, io: std.Io, folder: []const u8, out: *[64]u8) ?[]const u8 {
+    const argv = [_][]const u8{ "git", "-C", folder, "rev-parse", "--verify", "--quiet", "HEAD" };
+    var result = os.child.run(gpa, io, &argv, .{
+        .deadline_ns = os.monotonicNs() + rev_parse_timeout_ns,
+        .stderr = .ignore,
+        .output_bytes_max = 4096,
+    }) catch return null;
+    defer result.deinit(gpa);
+    if (result.code != 0) return null;
+    const sha = std.mem.trim(u8, result.stdout, "\r\n ");
+    if (sha.len < 40 or sha.len > out.len) return null;
+    for (sha) |character| if (!std.ascii.isHex(character)) return null;
+    @memcpy(out[0..sha.len], sha);
+    return out[0..sha.len];
 }
 
 /// Reads the commit SHA pointed to by HEAD in git repository/worktree `folder`.
@@ -652,7 +700,7 @@ fn updateLockFile(
     };
 }
 
-fn recordAllLocks(gpa: std.mem.Allocator, config_dir: []const u8) void {
+fn recordAllLocks(gpa: std.mem.Allocator, io: std.Io, config_dir: []const u8) void {
     var ext_dir_buf: [path_bytes_max]u8 = undefined;
     const ext_dir = std.mem.printSentinel(
         &ext_dir_buf,
@@ -672,7 +720,7 @@ fn recordAllLocks(gpa: std.mem.Allocator, config_dir: []const u8) void {
         ) catch continue;
         if (!hasGitMarker(folder)) continue;
         var sha_buf: [64]u8 = undefined;
-        if (gitHeadSha(folder, &sha_buf)) |sha| updateLockFile(gpa, config_dir, name, sha);
+        if (headSha(gpa, io, folder, &sha_buf)) |sha| updateLockFile(gpa, config_dir, name, sha);
     }
 }
 
@@ -680,9 +728,9 @@ fn recordAllLocks(gpa: std.mem.Allocator, config_dir: []const u8) void {
 /// extension it named, or every one.
 fn recordUpdateLocks(job: *Job) void {
     const ui = job.ui;
-    if (job.nameSlice().len == 0) return recordAllLocks(ui.gpa, ui.config_dir);
+    if (job.nameSlice().len == 0) return recordAllLocks(ui.gpa, ui.io, ui.config_dir);
     var sha_buf: [64]u8 = undefined;
-    if (gitHeadSha(job.folderPath(), &sha_buf)) |sha| {
+    if (headSha(ui.gpa, ui.io, job.folderPath(), &sha_buf)) |sha| {
         updateLockFile(ui.gpa, ui.config_dir, job.nameSlice(), sha);
     }
 }
@@ -735,8 +783,12 @@ pub fn update(ui: *Ui, caller: ?*c.GApplicationCommandLine, name: ?[]const u8) v
         \\  [ -e "./${d}.git" ] || continue
         \\  [ "$(git -C "./$d" rev-parse --show-toplevel 2>/dev/null)" = "$(cd -- "./$d" && pwd -P)" ] || continue
         \\  printf '%s: ' "${d%/}"
+        \\  allow=$file_allow
+        \\  case $(git -C "./$d" ls-remote --get-url 2>/dev/null) in
+        \\  /*|file://*) allow=always ;;
+        \\  esac
         \\  before=$(git -C "./$d" rev-parse HEAD 2>/dev/null)
-        \\  if git -C "./$d" -c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always -c "protocol.file.allow=$file_allow" -c submodule.recurse=false pull --ff-only --quiet; then
+        \\  if git -C "./$d" -c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always -c "protocol.file.allow=$allow" -c submodule.recurse=false pull --ff-only --quiet; then
         \\    after=$(git -C "./$d" rev-parse HEAD 2>/dev/null)
         \\    if [ "$after" = "$before" ]; then
         \\      echo up to date
@@ -806,8 +858,13 @@ fn start(
     defer c.g_object_unref(launcher);
     // Nobody can answer a prompt, keep git messages in English, and isolate
     // the child in its own session/process group so timeouts kill grandchildren too.
+    // Without a terminal (setsid) and with stdin on /dev/null, ssh cannot
+    // ask either, and SSH_ASKPASS_REQUIRE=never keeps it from a window. The
+    // user's own ssh command stays (GIT_SSH_COMMAND, core.sshCommand: the
+    // key a private repository needs); `ssh -oBatchMode=yes` set here
+    // replaced it (MYP-614).
     c.g_subprocess_launcher_setenv(launcher, "GIT_TERMINAL_PROMPT", "0", 1);
-    c.g_subprocess_launcher_setenv(launcher, "GIT_SSH_COMMAND", "ssh -oBatchMode=yes", 1);
+    c.g_subprocess_launcher_setenv(launcher, "SSH_ASKPASS_REQUIRE", "never", 1);
     c.g_subprocess_launcher_setenv(launcher, "LC_ALL", "C", 1);
     c.g_subprocess_launcher_unsetenv(launcher, "CDPATH");
     c.g_subprocess_launcher_set_child_setup(launcher, &childSetSid, null, null);
@@ -1003,7 +1060,7 @@ fn reportSuccess(job: *Job, output: [:0]const u8) bool {
                 return true;
             };
             var sha_buf: [64]u8 = undefined;
-            if (gitHeadSha(job.folderPath(), &sha_buf)) |sha| {
+            if (headSha(ui.gpa, ui.io, job.folderPath(), &sha_buf)) |sha| {
                 updateLockFile(ui.gpa, ui.config_dir, job.nameSlice(), sha);
             }
             print(
@@ -1147,6 +1204,8 @@ test "long output keeps its end, and messages stay valid UTF-8" {
     // Too long: what fits, never half a character.
     try std.testing.expectEqualStrings("abcdé", format(&message_bytes, "{s}", .{"abcdéé"}));
     try std.testing.expectEqualStrings("ok", format(&message_bytes, "{s}", .{"ok"}));
+    // A byte that is not UTF-8 midway: the rest still shows (MYP-533).
+    try std.testing.expectEqualStrings("a\u{FFFD}bc", format(&message_bytes, "{s}", .{"a\xffbc"}));
 }
 
 test "extension names come from the repository" {
@@ -1337,12 +1396,23 @@ test "updating a manual folder inside a parent git repo leaves the parent intact
     defer gpa.free(wt_head_after);
     try testing.expectEqualStrings(seed_head, wt_head_after);
 
-    // 3. Updating via file:// must fail when file:// protocol is restricted.
+    // 3. An extension installed from a path on this machine updates outside
+    // test mode too: its origin is local (MYP-528).
+    var local_res = try os.child.run(gpa, io, &.{
+        "sh", "-c", update_one_script, "lumen-update", wt, "worktree", "never",
+    }, .{ .deadline_ns = deadline_ns });
+    defer local_res.deinit(gpa);
+    try testing.expectEqual(@as(?u8, 0), local_res.code);
+    // Any other remote keeps to https and ssh.
+    gpa.free(try runGit(gpa, io, deadline_ns, &.{
+        "git", "-C", wt, "remote", "set-url", "origin", "ext::sh -c false",
+    }));
     var blocked_res = try os.child.run(gpa, io, &.{
         "sh", "-c", update_one_script, "lumen-update", wt, "worktree", "never",
     }, .{ .deadline_ns = deadline_ns });
     defer blocked_res.deinit(gpa);
     try testing.expect(blocked_res.code != 0);
+    try testing.expect(std.mem.find(u8, blocked_res.stderr, "not allowed") != null);
 
     // 4. gitHeadSha + lockfile record/remove work on both normal repos and worktrees.
     var sha_buf: [64]u8 = undefined;
@@ -1393,6 +1463,85 @@ test "gitCloneArgv restricts git protocols and disables submodules" {
         if (std.mem.eql(u8, std.mem.span(arg), "protocol.file.allow=always")) saw_test_file = true;
     }
     try std.testing.expect(saw_test_file);
+}
+
+test "a repository on this machine is cloned with the file transport outside test mode (MYP-528)" {
+    try std.testing.expect(isLocalUrl("/home/me/ext"));
+    try std.testing.expect(isLocalUrl("file:///home/me/ext"));
+    try std.testing.expect(!isLocalUrl("https://example.com/ext.git"));
+    try std.testing.expect(!isLocalUrl("git@example.com:me/ext.git"));
+    try std.testing.expect(!isLocalUrl("ext::sh -c false"));
+    // A relative path is made absolute from the caller's folder first.
+    var resolved_buf: [url_bytes_max]u8 = undefined;
+    const resolved = resolveLocalUrl(&resolved_buf, "./ext", "/home/me").?;
+    try std.testing.expect(isLocalUrl(resolved));
+
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const deadline_ns = os.monotonicNs() + 15 * std.time.ns_per_s;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [path_bytes_max]u8 = undefined;
+    const root = try os.tmpDirAbs(&tmp, &root_buf);
+    var seed_buf: [path_bytes_max:0]u8 = undefined;
+    const seed = try std.fmt.bufPrintSentinel(&seed_buf, "{s}/seed", .{root}, 0);
+    var dest_buf: [path_bytes_max:0]u8 = undefined;
+    const dest = try std.fmt.bufPrintSentinel(&dest_buf, "{s}/dest", .{root}, 0);
+    const setup = [_][]const []const u8{
+        &.{ "git", "init", "-q", seed },
+        &.{ "git", "-C", seed, "-c", "user.name=T", "-c", "user.email=t@e", "commit", "-q", "--allow-empty", "-m", "c1" },
+    };
+    for (setup) |argv| {
+        var res = try os.child.run(gpa, io, argv, .{ .deadline_ns = deadline_ns });
+        defer res.deinit(gpa);
+        try std.testing.expectEqual(@as(?u8, 0), res.code);
+    }
+    // The argv `install` runs, as outside the tests.
+    var clone_buf: [20]?[*:0]const u8 = undefined;
+    const argv_z = gitCloneArgv(&clone_buf, seed.ptr, dest.ptr, isLocalUrl(seed));
+    var argv: std.ArrayList([]const u8) = .empty;
+    defer argv.deinit(gpa);
+    var i: usize = 0;
+    while (argv_z[i]) |arg| : (i += 1) try argv.append(gpa, std.mem.span(arg));
+    var clone_res = try os.child.run(gpa, io, argv.items, .{ .deadline_ns = deadline_ns });
+    defer clone_res.deinit(gpa);
+    try std.testing.expectEqual(@as(?u8, 0), clone_res.code);
+}
+
+test "lumen.lock records the commit of a reftable repository (MYP-529)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const deadline_ns = os.monotonicNs() + 15 * std.time.ns_per_s;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [path_bytes_max]u8 = undefined;
+    const root = try os.tmpDirAbs(&tmp, &root_buf);
+    var repo_buf: [path_bytes_max]u8 = undefined;
+    const repo = try std.fmt.bufPrint(&repo_buf, "{s}/repo", .{root});
+    {
+        // A git without reftable (before 2.45) has nothing to test.
+        var res = try os.child.run(gpa, io, &.{
+            "git", "-c", "init.defaultRefFormat=reftable", "init", "-q", "--ref-format=reftable", repo,
+        }, .{ .deadline_ns = deadline_ns });
+        defer res.deinit(gpa);
+        if (res.code != 0) return error.SkipZigTest;
+    }
+    var commit_res = try os.child.run(gpa, io, &.{
+        "git", "-C", repo, "-c", "user.name=T", "-c", "user.email=t@e", "commit", "-q", "--allow-empty", "-m", "c1",
+    }, .{ .deadline_ns = deadline_ns });
+    defer commit_res.deinit(gpa);
+    try std.testing.expectEqual(@as(?u8, 0), commit_res.code);
+    var head_res = try os.child.run(gpa, io, &.{ "git", "-C", repo, "rev-parse", "HEAD" }, .{
+        .deadline_ns = deadline_ns,
+    });
+    defer head_res.deinit(gpa);
+    const expected = std.mem.trim(u8, head_res.stdout, "\r\n ");
+
+    var sha_buf: [64]u8 = undefined;
+    // Its files do not say (HEAD names "refs/heads/.invalid")...
+    try std.testing.expect(gitHeadSha(repo, &sha_buf) == null);
+    // ...git does.
+    try std.testing.expectEqualStrings(expected, headSha(gpa, io, repo, &sha_buf).?);
 }
 
 test "update scripts work with CDPATH set and dash-prefixed extension folders" {

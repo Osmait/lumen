@@ -168,8 +168,11 @@ fn TextureRing(comptime capacity: usize, comptime Key: type) type {
 }
 
 /// A key for what `path` holds now, decoded at that size: an edited file gets
-/// a new one (mtime to the nanosecond, size, inode). Null when it is gone.
+/// a new one (mtime to the nanosecond, size, inode). Null when it is gone,
+/// or on a mount whose stat can hang (`SlowMounts`): stated here, on the GTK
+/// thread, a picture on a stalled NFS share froze the window (MYP-446).
 fn fileKey(path: [*:0]const u8, width_px: c_int, height_px: c_int) ?u64 {
+    if (SlowMounts.holds(std.mem.span(path))) return null;
     const stamp = os.Stamp.of(path);
     if (stamp.eql(.none)) return null;
     var hash: std.hash.Wyhash = .init(0);
@@ -185,6 +188,41 @@ fn fileKey(path: [*:0]const u8, width_px: c_int, height_px: c_int) ?u64 {
     hash.update(std.mem.asBytes(&parts));
     return hash.final();
 }
+
+/// Mounts whose file system can hang a stat or a read (`os.slowMounts`):
+/// a row's icon or a grid picture there is not looked at, as the detail
+/// pane does not preview a file there. Read again once older than
+/// `max_age_ns`, at most once per build. Main thread.
+const SlowMounts = struct {
+    var list: [][]u8 = &.{};
+    var read_ns: ?u64 = null;
+
+    /// Mounts come and go: a share mounted after the window opened counts
+    /// from the next build this much later.
+    const max_age_ns = 2 * std.time.ns_per_s;
+
+    fn holds(path: []const u8) bool {
+        refresh();
+        const home = std.mem.span(c.g_get_home_dir());
+        for (list) |mount| {
+            // The mount the home folder is on (a home on NFS, or `/`) has
+            // every file looked at already: only the others are left alone.
+            if (os.isAtOrBelow(home, mount)) continue;
+            if (os.isAtOrBelow(path, mount)) return true;
+        }
+        return false;
+    }
+
+    fn refresh() void {
+        const now_ns = os.monotonicNs();
+        if (read_ns) |at_ns| if (now_ns -| at_ns < max_age_ns) return;
+        read_ns = now_ns;
+        // Out of memory: the last list read stays.
+        const fresh = os.slowMounts(std.heap.c_allocator, "/") catch return;
+        os.freeList(std.heap.c_allocator, list);
+        list = fresh;
+    }
+};
 
 /// How result rows look, from the Density setting and lumen.layout. Ui
 /// keeps one (applyLayout, applyStructure, scanIconDir fill it) and hands
@@ -240,9 +278,6 @@ const RowIcons = struct {
         const placeholder = iconWidget(look, .none, size_px);
         gtk.append(holder, placeholder);
         const wait = look.gpa.create(Wait) catch return gtk.widget(holder);
-        // Not in a row yet: its reference is still floating (see GridPictures).
-        _ = c.g_object_ref_sink(holder);
-        _ = c.g_object_ref(placeholder);
         wait.* = .{
             .gpa = look.gpa,
             .key = key,
@@ -251,7 +286,25 @@ const RowIcons = struct {
             .placeholder = placeholder,
         };
         const lane = &pictures.icon_lane;
-        pictures.requestPicture(look.gpa, path, decode_px, decode_px, lane, .back, &requestCallback, wait);
+        const asked = pictures.requestPicture(
+            look.gpa,
+            path,
+            decode_px,
+            decode_px,
+            .contain,
+            lane,
+            .back,
+            &requestCallback,
+            wait,
+        );
+        if (!asked) {
+            look.gpa.destroy(wait);
+            return gtk.widget(holder);
+        }
+        // Not in a row yet: its reference is still floating (see GridPictures).
+        // Taken once asked: the callback, which releases them, comes later.
+        _ = c.g_object_ref_sink(holder);
+        _ = c.g_object_ref(placeholder);
         return gtk.widget(holder);
     }
 
@@ -337,18 +390,23 @@ pub fn itemRow(look: *const RowLook, item: Item, parts: *RowParts) *c.GtkListBox
 }
 
 /// A grid cell: a picture (an image file, scaled down as it is decoded) or
-/// a large icon, and the title under it. `width_px` is the cell's width.
-pub fn gridCell(look: *const RowLook, item: Item, width_px: c_int) *c.GtkWidget {
+/// a large icon, and the title under it. `width_px` is the cell's width;
+/// `scale` the monitor's (the picture is decoded with that many device
+/// pixels per pixel).
+pub fn gridCell(look: *const RowLook, item: Item, width_px: c_int, scale: c_int) *c.GtkWidget {
     // Ui keeps a cell at least a pixel wide, however narrow the layout.
     assert(width_px > 0);
+    assert(scale > 0);
     const box = vbox(6);
     gtk.addClass(box, "cell");
     const picture_height_px = @max(
         @divTrunc(width_px * grid_picture_height_parts, grid_picture_width_parts),
         1,
     );
+    const decode_width_px = width_px * scale;
+    const decode_height_px = picture_height_px * scale;
     const key = if (item.image.len > 0)
-        fileKey(item.image.ptr, width_px, picture_height_px)
+        fileKey(item.image.ptr, decode_width_px, decode_height_px)
     else
         null;
     const cached = if (key) |cache_key| GridPictures.ring.get(cache_key) else null;
@@ -377,7 +435,8 @@ pub fn gridCell(look: *const RowLook, item: Item, width_px: c_int) *c.GtkWidget 
     gtk.append(box, title);
     gtk.setSizeRequest(box, width_px, -1);
     if (decode) {
-        GridPictures.request(look.gpa, item.image, width_px, picture_height_px, key.?, box, shown);
+        const decode_px = [2]c_int{ decode_width_px, decode_height_px };
+        GridPictures.request(look.gpa, item.image, decode_px, picture_height_px, key.?, box, shown);
     }
     return gtk.widget(box);
 }
@@ -409,21 +468,18 @@ const GridPictures = struct {
         icon: *c.GtkWidget,
     };
 
+    /// Asks for the picture at `path`, decoded at `decode_px` (device
+    /// pixels) to cover the cell, shown `height_px` tall.
     fn request(
         gpa: std.mem.Allocator,
         path: []const u8,
-        width_px: c_int,
+        decode_px: [2]c_int,
         height_px: c_int,
         key: u64,
         box: *c.GtkBox,
         icon: *c.GtkWidget,
     ) void {
         const wait = gpa.create(Wait) catch return;
-        // The cell is not in the grid yet: its reference is still floating.
-        // A plain ref left it floating, so the grid's ref_sink took that one
-        // and a cell never added leaked; sunk here, the grid adds its own.
-        _ = c.g_object_ref_sink(box);
-        _ = c.g_object_ref(icon);
         wait.* = .{
             .gpa = gpa,
             .key = key,
@@ -432,7 +488,24 @@ const GridPictures = struct {
             .icon = icon,
         };
         const lane = &pictures.grid_lane;
-        pictures.requestPicture(gpa, path, width_px, height_px, lane, .back, &requestCallback, wait);
+        const asked = pictures.requestPicture(
+            gpa,
+            path,
+            decode_px[0],
+            decode_px[1],
+            .cover,
+            lane,
+            .back,
+            &requestCallback,
+            wait,
+        );
+        if (!asked) return gpa.destroy(wait);
+        // The cell is not in the grid yet: its reference is still floating.
+        // A plain ref left it floating, so the grid's ref_sink took that one
+        // and a cell never added leaked; sunk here, the grid adds its own.
+        // Taken once asked: the callback, which releases them, comes later.
+        _ = c.g_object_ref_sink(box);
+        _ = c.g_object_ref(icon);
     }
 
     fn requestCallback(context: ?*anyopaque, decoded: ?*c.GdkPixbuf, current: bool) void {

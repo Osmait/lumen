@@ -215,7 +215,9 @@ fn buildItemRow(ui: *Ui, item_index: usize) void {
     ui.rows.ensureUnusedCapacity(arena, 1) catch return;
     if (ui.grid_mode) {
         const cell_width_px = window_layout.gridCellWidth(ui);
-        const cell = widgets.gridCell(&ui.row_look, item, cell_width_px);
+        // Pictures as sharp as the monitor shows them (2 on HiDPI).
+        const scale = @max(c.gtk_widget_get_scale_factor(gtk.widget(ui.grid)), 1);
+        const cell = widgets.gridCell(&ui.row_look, item, cell_width_px, scale);
         c.gtk_flow_box_append(ui.grid, cell);
         const child = c.gtk_flow_box_get_child_at_index(
             ui.grid,
@@ -451,15 +453,18 @@ const hint_bytes_max = 1024;
 /// terminating zero. On the stack: these run on every arrow key, and the
 /// query arena they used to take from is only freed when the query changes.
 fn hintText(buffer: *[hint_bytes_max]u8, parts: []const []const u8) [:0]const u8 {
+    var joined: [hint_bytes_max - 1]u8 = undefined;
     var length: usize = 0;
     for (parts) |part| {
-        const take = @min(part.len, buffer.len - 1 - length);
-        @memcpy(buffer[length..][0..take], part[0..take]);
+        const take = @min(part.len, joined.len - length);
+        @memcpy(joined[length..][0..take], part[0..take]);
         length += take;
     }
-    length = core.utf8.validPrefix(buffer[0..length]).len;
-    buffer[length] = 0;
-    return buffer[0..length :0];
+    // A byte that is not UTF-8 (a file name in a failure) shows as U+FFFD
+    // instead of cutting the text there (MYP-533).
+    const shown = core.utf8.sanitizeCut(buffer[0 .. buffer.len - 1], joined[0..length]);
+    buffer[shown.len] = 0;
+    return buffer[0..shown.len :0];
 }
 
 /// The footer's "what Enter does" (hidden with nothing selected).

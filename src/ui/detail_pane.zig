@@ -192,11 +192,14 @@ fn showImage(gpa: std.mem.Allocator, detail: *DetailPane, path: [:0]const u8, mt
     @memcpy(detail.image_path[0..path.len], path);
     detail.image_path_length = path.len;
     detail.image_mtime = mtime;
-    pictures.requestPicture(
+    // Not asked (closing, out of memory): no picture, as for a file that
+    // does not decode.
+    _ = pictures.requestPicture(
         gpa,
         path,
         preview_px,
         preview_px,
+        .contain,
         &pictures.preview_lane,
         .front,
         &requestPictureCallback,

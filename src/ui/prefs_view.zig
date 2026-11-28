@@ -183,7 +183,9 @@ pub fn display(
             if (std.mem.eql(u8, choice.value, value)) break choice.label;
         } else arena.dupeSentinel(u8, value, 0) catch "",
         .text => if (value.len == 0) "Not set" else blk: {
-            const shown = core.utf8.validPrefix(value[0..@min(value.len, text_value_bytes_max)]);
+            // Not cut short at a byte that is not UTF-8 (MYP-533).
+            var shown_bytes: [text_value_bytes_max]u8 = undefined;
+            const shown = core.utf8.sanitizeCut(&shown_bytes, value);
             break :blk arena.dupeSentinel(u8, shown, 0) catch "";
         },
         .password => if (value.len == 0) "Not set" else "••••••••",

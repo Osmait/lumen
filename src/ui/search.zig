@@ -12,6 +12,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const core = @import("core");
+const os = @import("os");
 const index = @import("index");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
@@ -142,8 +143,10 @@ fn clipCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
 
 fn windowCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
     var out: std.ArrayList(Item) = .empty;
+    const now_ns = os.monotonicNs();
     for (hypr.clients(arena)) |client| {
         if (!client.mapped or !hypr.validAddress(client.address)) continue;
+        if (ui.closed_window.hides(client.address, now_ns)) continue;
         const icon: item_mod.Icon = if (ui.apps.iconForClass(client.class)) |gicon|
             .{ .gicon = gicon }
         else
@@ -176,6 +179,9 @@ pub fn answerPending(ui: *Ui, start_ns: u64) bool {
     if (!ui.content_query.showingLatest()) return false;
     const latest = ui.content_query.latest.?;
     if (isContentResultFresh(latest, query_text, contentIndexVersion(ui))) return false;
+    // Already on its way (a rebuild for an app reload, say): sent again, the
+    // search under way stopped and started over.
+    if (ui.content_query.asking(ContentSearch.clip(query_text))) return true;
     ui.content_query.sent(content_search.submit(query_text, start_ns), query_text);
     return true;
 }

@@ -41,22 +41,35 @@ pub fn trimIncompleteEdges(text: []const u8) []const u8 {
     while (start < text.len and start < continuation_bytes_max and isContinuation(text[start])) {
         start += 1;
     }
-    const body = text[start..];
-    var end = body.len;
-    // Check if the last <= 3 bytes begin a multi-byte sequence truncated at `end`.
+    return withoutCutEnd(text[start..]);
+}
+
+/// `text` without a multi-byte sequence cut at its end (its last 3 bytes or
+/// fewer start one longer than what is left), as a full buffer stops a
+/// character partway.
+pub fn withoutCutEnd(text: []const u8) []const u8 {
     var back: usize = 1;
-    while (back <= continuation_bytes_max and back <= body.len) : (back += 1) {
-        const idx = body.len - back;
-        if (!isContinuation(body[idx])) {
-            const seq_len = std.unicode.utf8ByteSequenceLength(body[idx]) catch 1;
-            if (idx + seq_len > body.len) end = idx;
+    while (back <= continuation_bytes_max and back <= text.len) : (back += 1) {
+        const idx = text.len - back;
+        if (!isContinuation(text[idx])) {
+            const seq_len = std.unicode.utf8ByteSequenceLength(text[idx]) catch 1;
+            if (idx + seq_len > text.len) return text[0..idx];
             break;
         }
     }
-    return body[0..end];
+    return text;
 }
 
 pub const replacement = "\u{FFFD}";
+
+/// `text` in `out` as valid UTF-8, cut between characters to fit: invalid
+/// sequences and NUL bytes become U+FFFD (`sanitizeInto`), and a character
+/// cut at the end of `text` (a full buffer) is left out. `validPrefix` cut
+/// everything after the first invalid byte: "Open bad-\xff-name.txt With"
+/// read "Open bad-" (MYP-533).
+pub fn sanitizeCut(out: []u8, text: []const u8) []const u8 {
+    return sanitizeInto(out, withoutCutEnd(text));
+}
 
 /// Writes `raw` to `out`, replacing invalid UTF-8 sequences and NUL bytes with U+FFFD.
 /// `out.len` should be at least `raw.len * 3` in the worst case (all single invalid bytes).
@@ -157,6 +170,20 @@ test "validPrefix stops at the first invalid sequence" {
     // Overlong and surrogate encodings are invalid, as std says.
     try std.testing.expectEqualStrings("a", validPrefix("a\xc0\x80"));
     try std.testing.expectEqualStrings("a", validPrefix("a\xed\xa0\x80"));
+}
+
+test "sanitizeCut keeps what follows an invalid byte and never splits a character (MYP-533)" {
+    var out: [64]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Open bad-\u{FFFD}\u{FFFD}-name.txt With",
+        sanitizeCut(&out, "Open bad-\xff\xfe-name.txt With"),
+    );
+    // Cut by a full buffer partway through "é": left out, not replaced.
+    try std.testing.expectEqualStrings("caf", sanitizeCut(&out, "caf\xc3"));
+    // Cut to fit `out` between characters.
+    var small: [5]u8 = undefined;
+    try std.testing.expectEqualStrings("abcd", sanitizeCut(&small, "abcdé"));
+    try std.testing.expectEqualStrings("a\u{FFFD}b", sanitizeCut(&small, "a\xffbcdef"));
 }
 
 test "validPrefix agrees with the longest valid prefix on random bytes" {

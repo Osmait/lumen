@@ -36,8 +36,14 @@ pub const picture_limits: Limits = .{
 /// metadata than this (then the whole file is read and looked at again).
 const header_probe_bytes = 64 << 10;
 
-/// `path` decoded to fit `width_px`×`height_px` (never larger than it is), or null: not a
-/// regular file, over `limits`, or not an image whose size `image_size`
+/// How a picture is to fill its box: whole inside it (`contain`), or
+/// covering all of it, cropped where it overflows (`cover`, as a grid
+/// cell's GtkPicture draws it: decoded to fit, a portrait was drawn
+/// enlarged and blurred, MYP-561).
+pub const Fit = enum { contain, cover };
+
+/// `path` decoded for a box of `width_px`×`height_px` as `fit` says (never
+/// larger than it is), or null: not a regular file, over `limits`, or not an image whose size `image_size`
 /// reads (SVG excepted: it is drawn at the size asked for, which must be
 /// within `limits.pixels`, from no more than `limits.svg_bytes`). Thread-safe.
 /// The bytes come from a descriptor opened non-blocking and checked to be a
@@ -48,6 +54,7 @@ pub fn decodeImage(
     path: [*:0]const u8,
     width_px: c_int,
     height_px: c_int,
+    fit: Fit,
     limits: Limits,
 ) ?*c.GdkPixbuf {
     var data: std.ArrayList(u8) = .empty;
@@ -67,7 +74,7 @@ pub fn decodeImage(
         }
     }
     if (data.items.len > limits.bytes) return null;
-    const size = decodeSize(data.items, width_px, height_px, limits) orelse return null;
+    const size = decodeSize(data.items, width_px, height_px, fit, limits) orelse return null;
     // The size was read as one format; the decoder picks its own from the
     // bytes, and reads its own size: a file made to look like two formats
     // was decoded whole, past the limit (MYP-608).
@@ -109,9 +116,15 @@ fn decoderReadsAs(format: image_size.Format, data: []const u8) bool {
     return false;
 }
 
-/// Width and height to decode `data` at, within `width_px`×`height_px`; null: not to be
-/// decoded.
-fn decodeSize(data: []const u8, width_px: c_int, height_px: c_int, limits: Limits) ?[2]c_int {
+/// Width and height to decode `data` at, for a box of `width_px`×`height_px`
+/// filled as `fit` says; null: not to be decoded.
+fn decodeSize(
+    data: []const u8,
+    width_px: c_int,
+    height_px: c_int,
+    fit: Fit,
+    limits: Limits,
+) ?[2]c_int {
     if (image_size.read(data)) |size| {
         if (size.width_px * size.height_px > limits.pixels) return null;
         // Decoded as stored and turned after: a photo whose EXIF turns it
@@ -120,10 +133,27 @@ fn decodeSize(data: []const u8, width_px: c_int, height_px: c_int, limits: Limit
             .{ height_px, width_px }
         else
             .{ width_px, height_px };
+        const box_width: u64 = @intCast(box[0]);
+        const box_height: u64 = @intCast(box[1]);
         // GTK scales up as it draws; a bigger copy would only cost memory.
+        if (fit == .contain) return .{
+            @intCast(@min(size.width_px, box_width)),
+            @intCast(@min(size.height_px, box_height)),
+        };
+        // Covering: scaled by the larger of the two sides' ratios, the other
+        // side overflows the box (cropped as it is drawn). A side no larger
+        // than the box already: as stored.
+        if (size.width_px <= box_width or size.height_px <= box_height) return .{
+            @intCast(size.width_px),
+            @intCast(size.height_px),
+        };
+        if (box_width * size.height_px >= box_height * size.width_px) return .{
+            box[0],
+            @intCast(divCeil(size.height_px * box_width, size.width_px)),
+        };
         return .{
-            @intCast(@min(size.width_px, @as(u64, @intCast(box[0])))),
-            @intCast(@min(size.height_px, @as(u64, @intCast(box[1])))),
+            @intCast(divCeil(size.width_px * box_height, size.height_px)),
+            box[1],
         };
     }
     if (!isSvg(data)) return null;
@@ -134,6 +164,11 @@ fn decodeSize(data: []const u8, width_px: c_int, height_px: c_int, limits: Limit
     const pixels = @as(u64, @intCast(width_px)) * @as(u64, @intCast(height_px));
     if (pixels > limits.pixels) return null;
     return .{ width_px, height_px };
+}
+
+fn divCeil(numerator: u64, denominator: u64) u64 {
+    assert(denominator > 0);
+    return (numerator + denominator - 1) / denominator;
 }
 
 /// How far into a file `isSvg` looks for the `<svg` tag: past an XML
@@ -185,6 +220,7 @@ const Request = struct {
     path: [:0]u8,
     width_px: c_int,
     height_px: c_int,
+    fit: Fit,
     lane: *Lane,
     generation: u32,
     done: Done,
@@ -251,35 +287,40 @@ var in_flight: std.atomic.Value(u32) = .init(0);
 /// (it is what is being looked at), grid pictures behind.
 pub const QueuePlace = enum { front, back };
 
-/// Decodes `path` to fit `width_px`×`height_px` on a worker thread, within
-/// `picture_limits`, and calls `done`. Main thread.
+/// Decodes `path` for a box of `width_px`×`height_px` (`fit`) on a worker
+/// thread, within `picture_limits`, and calls `done` later, from the main
+/// loop. False when it was not asked (the daemon is closing, out of
+/// memory): `done` is never called then. Called at once, `done` released
+/// the widgets its caller was about to put in a row, which got them freed
+/// (MYP-444). Main thread.
 pub fn requestPicture(
     gpa: std.mem.Allocator,
     path: []const u8,
     width_px: c_int,
     height_px: c_int,
+    fit: Fit,
     lane: *Lane,
     place: QueuePlace,
     done: Done,
     context: ?*anyopaque,
-) void {
+) bool {
     os.assertMainThread();
     // A size of 0 would make the decoder scale to nothing.
     assert(width_px > 0);
     assert(height_px > 0);
-    if (shutting_down.load(.acquire)) return done(context, null, false);
+    if (shutting_down.load(.acquire)) return false;
     if (waiting_gpa == null) waiting_gpa = gpa;
     const queue_gpa = waiting_gpa.?;
-    // Out of memory: as good as dropped (nothing is learnt about the file).
-    const request = gpa.create(Request) catch return done(context, null, false);
+    const request = gpa.create(Request) catch return false;
     request.* = .{
         .gpa = gpa,
         .path = gpa.dupeSentinel(u8, path, 0) catch {
             gpa.destroy(request);
-            return done(context, null, false);
+            return false;
         },
         .width_px = width_px,
         .height_px = height_px,
+        .fit = fit,
         .lane = lane,
         .generation = lane.current(),
         .done = done,
@@ -289,8 +330,15 @@ pub fn requestPicture(
         .front => waiting.pushFront(queue_gpa, request),
         .back => waiting.pushBack(queue_gpa, request),
     };
-    queued catch return finishRequest(request, null, false);
+    queued catch {
+        gpa.free(request.path);
+        gpa.destroy(request);
+        return false;
+    };
+    // The request just queued is of its lane's current generation: it is
+    // decoded, never finished from here.
     startNext();
+    return true;
 }
 
 fn startNext() void {
@@ -327,6 +375,7 @@ fn decodeRequest(
         request.path.ptr,
         request.width_px,
         request.height_px,
+        request.fit,
         picture_limits,
     );
     c.g_task_return_pointer(task, pixbuf, &unrefObject);
@@ -383,23 +432,23 @@ test "a picture over the limits is never decoded" {
     const testing = std.testing;
     const limits: Limits = .{ .bytes = 1 << 20, .pixels = 4096 * 4096, .svg_bytes = 64 << 10 };
     const bomb = "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x4e\x20\x00\x00\x4e\x20\x08\x02";
-    try testing.expect(decodeSize(bomb, 512, 512, limits) == null);
+    try testing.expect(decodeSize(bomb, 512, 512, .contain, limits) == null);
     // Within the limits: never decoded larger than it is.
     const small = "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x10\x00\x00\x00\x20\x08\x02";
-    try testing.expectEqual([2]c_int{ 16, 32 }, decodeSize(small, 512, 512, limits).?);
-    try testing.expectEqual([2]c_int{ 16, 20 }, decodeSize(small, 512, 20, limits).?);
+    try testing.expectEqual([2]c_int{ 16, 32 }, decodeSize(small, 512, 512, .contain, limits).?);
+    try testing.expectEqual([2]c_int{ 16, 20 }, decodeSize(small, 512, 20, .contain, limits).?);
     // SVG is drawn at the size asked for; an unknown format is not decoded.
     const svg = "\xef\xbb\xbf<?xml version=\"1.0\"?>\n<svg width=\"30000\" height=\"30000\"/>";
-    try testing.expectEqual([2]c_int{ 64, 64 }, decodeSize(svg, 64, 64, limits).?);
+    try testing.expectEqual([2]c_int{ 64, 64 }, decodeSize(svg, 64, 64, .contain, limits).?);
     // ...but not at a size over the pixel limit, nor from too much text.
-    try testing.expect(decodeSize(svg, 8192, 8192, limits) == null);
-    try testing.expect(decodeSize(svg, 0, 64, limits) == null);
+    try testing.expect(decodeSize(svg, 8192, 8192, .contain, limits) == null);
+    try testing.expect(decodeSize(svg, 0, 64, .contain, limits) == null);
     const svg_big = try testing.allocator.alloc(u8, limits.svg_bytes + 1);
     defer testing.allocator.free(svg_big);
     @memset(svg_big, ' ');
     @memcpy(svg_big[0..svg.len], svg);
-    try testing.expect(decodeSize(svg_big, 64, 64, limits) == null);
-    try testing.expect(decodeSize("P6 30000 30000 255 ", 64, 64, limits) == null);
+    try testing.expect(decodeSize(svg_big, 64, 64, .contain, limits) == null);
+    try testing.expect(decodeSize("P6 30000 30000 255 ", 64, 64, .contain, limits) == null);
 
     var test_dir: os.TestDir = try .init();
     defer test_dir.deinit();
@@ -407,7 +456,7 @@ test "a picture over the limits is never decoded" {
     // Refused from its header: gdk-pixbuf is never called.
     try test_dir.write("bomb.png", bomb);
     const bomb_path = try test_dir.path(&path_bytes, "bomb.png");
-    try testing.expect(decodeImage(testing.allocator, bomb_path, 64, 64, limits) == null);
+    try testing.expect(decodeImage(testing.allocator, bomb_path, 64, 64, .contain, limits) == null);
     // A file larger than `bytes` is not decoded either.
     const big = try testing.allocator.alloc(u8, limits.bytes + 1);
     defer testing.allocator.free(big);
@@ -415,7 +464,7 @@ test "a picture over the limits is never decoded" {
     @memcpy(big[0..small.len], small);
     try test_dir.write("big.png", big);
     const big_path = try test_dir.path(&path_bytes, "big.png");
-    try testing.expect(decodeImage(testing.allocator, big_path, 64, 64, limits) == null);
+    try testing.expect(decodeImage(testing.allocator, big_path, 64, 64, .contain, limits) == null);
     // Larger than the header probe: refused from its first bytes alone.
     const padded = try testing.allocator.alloc(u8, header_probe_bytes * 2);
     defer testing.allocator.free(padded);
@@ -423,11 +472,11 @@ test "a picture over the limits is never decoded" {
     @memcpy(padded[0..bomb.len], bomb);
     try test_dir.write("padded.png", padded);
     const padded_path = try test_dir.path(&path_bytes, "padded.png");
-    try testing.expect(decodeImage(testing.allocator, padded_path, 64, 64, limits) == null);
+    try testing.expect(decodeImage(testing.allocator, padded_path, 64, 64, .contain, limits) == null);
     // A FIFO named like a picture: refused at once, not waited on.
     const fifo = try test_dir.path(&path_bytes, "fifo.png");
     try testing.expect(std.os.linux.mknod(fifo, std.os.linux.S.IFIFO | 0o600, 0) == 0);
-    try testing.expect(decodeImage(testing.allocator, fifo, 64, 64, limits) == null);
+    try testing.expect(decodeImage(testing.allocator, fifo, 64, 64, .contain, limits) == null);
 }
 
 test "a photo turned a quarter by its EXIF fits the box turned (MYP-553)" {
@@ -437,8 +486,23 @@ test "a photo turned a quarter by its EXIF fits the box turned (MYP-553)" {
     // Stored 4000×3000, shown 3000×4000.
     const sof0 = "\xff\xc0\x00\x11\x08\x0b\xb8\x0f\xa0\x03";
     const turned = "\xff\xd8\xff\xe1\x00" ++ [_]u8{2 + exif.len} ++ exif ++ sof0;
-    try std.testing.expectEqual([2]c_int{ 300, 400 }, decodeSize(turned, 400, 300, limits).?);
-    try std.testing.expectEqual([2]c_int{ 400, 300 }, decodeSize("\xff\xd8" ++ sof0, 400, 300, limits).?);
+    try std.testing.expectEqual([2]c_int{ 300, 400 }, decodeSize(turned, 400, 300, .contain, limits).?);
+    try std.testing.expectEqual([2]c_int{ 400, 300 }, decodeSize("\xff\xd8" ++ sof0, 400, 300, .contain, limits).?);
+}
+
+test "a grid picture is decoded to cover its cell, not to fit in it (MYP-561)" {
+    const limits: Limits = .{ .bytes = 1 << 20, .pixels = 4096 * 4096, .svg_bytes = 64 << 10 };
+    const png = "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR";
+    // 1080×1920 and 1920×1080 in a 132×82 cell.
+    const portrait = png ++ "\x00\x00\x04\x38\x00\x00\x07\x80\x08\x02";
+    const landscape = png ++ "\x00\x00\x07\x80\x00\x00\x04\x38\x08\x02";
+    // To fit: the box, which the decoder fills keeping the aspect (46×82).
+    try std.testing.expectEqual([2]c_int{ 132, 82 }, decodeSize(portrait, 132, 82, .contain, limits).?);
+    try std.testing.expectEqual([2]c_int{ 132, 235 }, decodeSize(portrait, 132, 82, .cover, limits).?);
+    try std.testing.expectEqual([2]c_int{ 146, 82 }, decodeSize(landscape, 132, 82, .cover, limits).?);
+    // Never larger than stored, even when one side is short of the cell.
+    const narrow = png ++ "\x00\x00\x00\x64\x00\x00\x03\xe8\x08\x02";
+    try std.testing.expectEqual([2]c_int{ 100, 1000 }, decodeSize(narrow, 132, 82, .cover, limits).?);
 }
 
 test "the decoder must take the bytes for the format their size was read as (MYP-608)" {
@@ -476,6 +540,7 @@ test "pictures shutdown forgets lanes, drains queued requests, and rejects new r
         .path = try gpa.dupeSentinel(u8, "/tmp/nonexistent.png", 0),
         .width_px = 32,
         .height_px = 32,
+        .fit = .contain,
         .lane = &preview_lane,
         .generation = preview_lane.current(),
         .done = &Counter.cb,
@@ -489,10 +554,20 @@ test "pictures shutdown forgets lanes, drains queued requests, and rejects new r
     try std.testing.expectEqual(@as(usize, 1), counter.called);
     try std.testing.expect(!counter.last_current);
 
-    // Requests arriving after shutdown invoke callback immediately without queuing.
-    requestPicture(gpa, "/tmp/nonexistent.png", 32, 32, &preview_lane, .front, &Counter.cb, &counter);
-    try std.testing.expectEqual(@as(usize, 2), counter.called);
-    try std.testing.expect(!counter.last_current);
+    // Requests arriving after shutdown are refused without queuing, and
+    // their callback is never called: the caller still owns its context.
+    try std.testing.expect(!requestPicture(
+        gpa,
+        "/tmp/nonexistent.png",
+        32,
+        32,
+        .contain,
+        &preview_lane,
+        .front,
+        &Counter.cb,
+        &counter,
+    ));
+    try std.testing.expectEqual(@as(usize, 1), counter.called);
     try std.testing.expectEqual(@as(usize, 0), waiting.len);
 }
 

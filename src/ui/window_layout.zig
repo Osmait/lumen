@@ -144,13 +144,23 @@ fn listHeightMax(ui: *const Ui) c_int {
 }
 
 /// A grid cell's content width for `ui.grid_columns` cells across the
-/// pieces' width: at least a pixel, since lumen.layout's width and a
+/// list's width: at least a pixel, since lumen.layout's width and a
 /// command's columns can leave no room, and a cell of no width would ask
-/// for pictures of no size.
+/// for pictures of no size. Beside the detail pane the list has ~40% of
+/// the width (`sizeList`): cells sized for all of it widened the window
+/// past its width and left the pane a few pixels (MYP-570).
 pub fn gridCellWidth(ui: *const Ui) c_int {
     const gaps_px = grid_spacing_px * (ui.grid_columns - 1) + grid_frame_px;
-    const cell_px = @divTrunc(panelWidth(ui) - gaps_px, ui.grid_columns);
+    const width_px = listWidth(ui, gtk.isVisible(ui.detail.box)) orelse panelWidth(ui);
+    const cell_px = @divTrunc(width_px - gaps_px, ui.grid_columns);
     return @max(cell_px - 2 * style_css.grid_cell_padding_px, 1);
+}
+
+/// The list's width beside the detail pane; null when it takes the full
+/// width (no pane, or the pane below it).
+fn listWidth(ui: *const Ui, has_detail: bool) ?c_int {
+    if (!has_detail or ui.layout.detail == .bottom) return null;
+    return @divTrunc(panelWidth(ui) * 2, 5);
 }
 
 /// Makes the window and every widget in it, hidden. The settings are read
@@ -443,11 +453,7 @@ pub fn applyLayout(ui: *Ui) void {
 /// and ~half the height.
 fn sizeList(ui: *Ui, has_detail: bool) void {
     const detail_below = ui.layout.detail == .bottom;
-    c.gtk_widget_set_size_request(
-        gtk.widget(ui.scroller),
-        if (has_detail and !detail_below) @divTrunc(panelWidth(ui) * 2, 5) else -1,
-        -1,
-    );
+    c.gtk_widget_set_size_request(gtk.widget(ui.scroller), listWidth(ui, has_detail) orelse -1, -1);
     gtk.setHexpand(ui.scroller, !has_detail or detail_below);
     const list_height_max = listHeightMax(ui);
     c.gtk_scrolled_window_set_max_content_height(
