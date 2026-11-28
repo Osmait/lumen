@@ -482,10 +482,12 @@ fn wake(host: *Host) void {
 // ------------------------------------------------------------ the worker
 
 /// The worker's loop. It sleeps until a request comes, takes every pending
-/// request under the lock, then runs them outside it, in this order: a
-/// reload first, so that requests made against the old registry are
-/// refused; then an action and a submit, so that the lists asked for with
-/// them show what they changed; then the lists.
+/// request under the lock, then runs them outside it, in this order: the
+/// actions and submits, made against the registry the window shows, so
+/// they run there (after a reload they were refused, and the window, given
+/// the new registry first, dropped that answer unseen); then a reload, so
+/// that the lists asked for against the old registry are refused; then the
+/// lists, which show what the actions changed.
 fn run(host: *Host) void {
     defer host.worker_done.store(true, .release);
     var wake_sequence_seen: u32 = 0;
@@ -496,7 +498,6 @@ fn run(host: *Host) void {
             pending.destroyOperations(host.gpa);
             break;
         }
-        if (pending.reload) loading.reloadExecute(host);
         for (pending.operations[0..pending.operations_len], 0..) |op, index| {
             if (host.stop.load(.acquire)) {
                 pending.destroyOperationsFrom(host.gpa, index);
@@ -507,6 +508,8 @@ fn run(host: *Host) void {
                 .submit => |request| requests.submitExecute(host, request),
             }
         }
+        if (host.stop.load(.acquire)) break;
+        if (pending.reload) loading.reloadExecute(host);
         if (host.stop.load(.acquire)) break;
         if (pending.list) |request| requests.listExecute(host, &request);
         if (host.stop.load(.acquire)) break;
@@ -887,7 +890,7 @@ test "extensions load, list, search and run actions" {
     _ = host.list(registry.generation, .from(1), "");
     const old = try probe.take("list");
     defer old.destroy(testing.allocator);
-    try testing.expectEqualStrings("Extensions were reloaded", old.error_message.?);
+    try testing.expectEqualStrings("Extensions were reloaded; try again", old.error_message.?);
 }
 
 test "errors in extensions come back as messages" {
@@ -1067,8 +1070,12 @@ test "storage clone stops cycles, deep nesting and exponential DAGs; invalid the
         \\}
     );
     try writeTestFile(folder, "init.lua",
-        \\local ok = pcall(lumen.theme, { id = "bad", name = "Bad", bg = string.rep("x", 10000), fg = "#ffffff", accent = "#000000" })
-        \\assert(not ok)
+        \\local ok, err = pcall(lumen.theme, { id = "bad", name = "Bad", bg = string.rep("x", 10000), fg = "#ffffff", accent = "#000000" })
+        \\assert(not ok and type(err) == "string" and err:find('theme.bg: "#rrggbb" expected', 1, true), tostring(err))
+        \\ok, err = pcall(lumen.theme, { id = "bad", name = "Bad", bg = "#000000", fg = 7, accent = "#000000" })
+        \\assert(not ok and type(err) == "string" and err:find("theme.fg: string expected, got number", 1, true), tostring(err))
+        \\ok, err = pcall(lumen.theme, { id = "bad", name = "Bad", bg = "#000000", fg = "#ffffff" })
+        \\assert(not ok and type(err) == "string" and err:find("theme.accent is missing", 1, true), tostring(err))
     );
 
     var probe: Probe = .{};
@@ -1083,6 +1090,7 @@ test "storage clone stops cycles, deep nesting and exponential DAGs; invalid the
     var saw_bad_choice = false;
     for (registry.problems) |p| {
         if (std.mem.eql(u8, p.extension, "bad_choice")) saw_bad_choice = true;
+        try testing.expect(!std.mem.eql(u8, p.extension, config_extension_id));
     }
     try testing.expect(saw_bad_choice);
 
@@ -1363,6 +1371,14 @@ test "lumen.set deduplicates repeated keys instead of overflowing kept_keys_max"
         \\  lumen.set { width = i % 2 == 0 and "wide" or "narrow" }
         \\end
         \\lumen.set { density = "compact" }
+        \\-- A call that fails applies none of its keys, whatever their order.
+        \\assert(not pcall(lumen.set, {
+        \\  width = "narrow", density = "comfortable", suggestions = false,
+        \\  clipboard = false, files_in_root = false, bogus = "x",
+        \\}))
+        \\assert(not pcall(lumen.icons, {
+        \\  ["app:firefox"] = "a", ["cmd:clipboard"] = "b", ["sys:lock"] = "c", nocolon = "d",
+        \\}))
     );
 
     var probe: Probe = .{};
@@ -1378,6 +1394,8 @@ test "lumen.set deduplicates repeated keys instead of overflowing kept_keys_max"
     try testing.expectEqualStrings("wide", registry.settings[0].value);
     try testing.expectEqualStrings("density", registry.settings[1].key);
     try testing.expectEqualStrings("compact", registry.settings[1].value);
+    try testing.expectEqual(@as(usize, 0), registry.icons.len);
+    try testing.expectEqual(@as(usize, 0), registry.problems.len);
 }
 
 test "multiple act and submit operations queue FIFO without dropping earlier ones" {
@@ -1438,6 +1456,104 @@ test "multiple act and submit operations queue FIFO without dropping earlier one
     const listed = try probe.take("list");
     defer listed.destroy(testing.allocator);
     try testing.expectEqualStrings("r1,r2,f:a,f:b", listed.items[0].title);
+}
+
+/// Pumps the main loop until `probe` saw `count` action answers (up to 10 s).
+fn waitActs(probe: *Probe, count: usize) !void {
+    const until_ns = os.monotonicNs() + 10 * std.time.ns_per_s;
+    while (probe.acts_seen < count) {
+        if (os.monotonicNs() > until_ns) return error.Timeout;
+        if (c.g_main_context_iteration(null, 0) == 0) {
+            _ = std.os.linux.poll(&[0]std.os.linux.pollfd{}, 0, 1);
+        }
+    }
+}
+
+test "an action asked for as the files reload runs on the files it was asked of" {
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const folder = try os.tmpDirPath(&test_dir, &path_buffer);
+    try writeTestFile(folder, "extensions/ops/init.lua",
+        \\return lumen.extension { commands = {
+        \\  { name = "slow", title = "Slow", run = function()
+        \\      local until_t = os.clock() + 0.3
+        \\      while os.clock() < until_t do end
+        \\      return "stay"
+        \\  end },
+        \\  { name = "fast", title = "Fast", run = function() return "stay" end },
+        \\} }
+    );
+
+    var probe: Probe = .{};
+    defer probe.deinit();
+    const host = try testHost(&probe, folder);
+    defer host.shutdown();
+    host.reload();
+    const first = try probe.take("registry");
+    defer first.destroy(testing.allocator);
+
+    // The worker is busy: the reload and the action are taken together.
+    _ = host.act(first.generation, .from(0), .command_run);
+    os.sleepUs(50 * std.time.us_per_ms);
+    host.reload();
+    const fast = host.act(first.generation, .from(1), .command_run);
+    try waitActs(&probe, 2);
+    try testing.expect(!probe.act_had_error);
+    try testing.expectEqual(fast, probe.act.?.generation);
+    const second = try probe.take("registry");
+    defer second.destroy(testing.allocator);
+    try testing.expect(second.generation != first.generation);
+
+    // Asked of the old files once the new ones loaded: refused, and says so.
+    _ = host.act(first.generation, .from(1), .command_run);
+    try waitActs(&probe, 3);
+    try testing.expectEqualStrings("Extensions were reloaded; try again", probe.act.?.error_message.?);
+}
+
+test "an action waits for the root provider running, not for the rest" {
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const folder = try os.tmpDirPath(&test_dir, &path_buffer);
+    try writeTestFile(folder, "extensions/slowroot/init.lua",
+        \\local function provider(name)
+        \\  return { name = name, title = name, root = function(q)
+        \\    local until_t = os.clock() + 0.4
+        \\    while os.clock() < until_t do end
+        \\    return { name .. " " .. q }
+        \\  end }
+        \\end
+        \\return lumen.extension { commands = {
+        \\  { name = "run", title = "Run", run = function() return "stay" end },
+        \\  provider("p1"), provider("p2"), provider("p3"),
+        \\} }
+    );
+
+    var probe: Probe = .{};
+    defer probe.deinit();
+    const host = try testHost(&probe, folder);
+    defer host.shutdown();
+    host.reload();
+    try probe.wait("registry");
+    const generation = probe.registry.?.generation;
+
+    const searched = host.root(generation, "ab");
+    os.sleepUs(50 * std.time.us_per_ms);
+    const start_ns = os.monotonicNs();
+    _ = host.act(generation, .from(0), .command_run);
+    const acted = try probe.take("act");
+    defer acted.destroy(testing.allocator);
+    try testing.expect(acted.error_message == null);
+    // One provider's 0.4 s at most, not the three's.
+    try testing.expect(os.monotonicNs() - start_ns < 750 * std.time.ns_per_ms);
+
+    // The search started over after it, and answers whole.
+    const found = try probe.take("root");
+    defer found.destroy(testing.allocator);
+    try testing.expectEqual(searched, found.generation);
+    try testing.expectEqual(@as(usize, 3), found.sections.len);
+    try testing.expectEqualStrings("p3 ab", found.sections[2].items[0].title);
 }
 
 test "takePendingRegistry waits for initial load even with load problems" {

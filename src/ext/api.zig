@@ -209,20 +209,37 @@ fn writeStorage(L: *lua.State) lua.Error!c_int {
 /// object is never written over: that would lose every value in it.
 const prelude =
     \\local lumen, write_storage = ...
-    \\-- The object in the file: {} when there is none yet, nil and why when
-    \\-- it cannot be read as one.
+    \\-- The object in the file: {} when there is none yet; else nil, why, and
+    \\-- whether that may pass: the file could not be read just now (no
+    \\-- descriptor left, out of memory), which says nothing of what it holds.
     \\local function read_json(path)
     \\  local f, err, code = io.open(path, "r")
     \\  if not f then
     \\    if code == 2 then return {} end -- ENOENT
-    \\    return nil, err
+    \\    return nil, tostring(err), true
     \\  end
-    \\  local text = f:read("a")
+    \\  local read, text, read_err = pcall(f.read, f, "a")
     \\  f:close()
-    \\  if text and not text:find("%S") then return {} end
-    \\  local ok, value = pcall(lumen.json.decode, text or "")
-    \\  if ok and type(value) == "table" and #value == 0 then return value end
-    \\  return nil, path .. " is not a JSON object"
+    \\  if not (read and text) then
+    \\    return nil, path .. " cannot be read now: " .. tostring(read and read_err or text), true
+    \\  end
+    \\  if not text:find("%S") then return {} end
+    \\  local ok, value = pcall(lumen.json.decode, text)
+    \\  if ok then
+    \\    if type(value) == "table" and #value == 0 then return value end
+    \\    return nil, path .. " is not a JSON object"
+    \\  end
+    \\  value = tostring(value)
+    \\  if value:find("out of memory", 1, true) or value:find("not enough memory", 1, true) then
+    \\    return nil, path .. " cannot be read now: " .. value, true
+    \\  end
+    \\  return nil, path .. " is not a JSON object (" .. value .. ")"
+    \\end
+    \\-- Logs why a file is ignored, once per reason in a row: one that may
+    \\-- pass comes back on every read until it does.
+    \\local noted
+    \\local function note(err)
+    \\  if err ~= noted then noted = err lumen.log("ignoring " .. err) end
     \\end
     \\
     \\local defaults = {}
@@ -254,11 +271,12 @@ const prelude =
     \\lumen.preferences = setmetatable({}, {
     \\  __index = function(_, name)
     \\    if not saved then
-    \\      local values, err = read_json(lumen.data_dir .. "/preferences.json")
-    \\      if not values then lumen.log("ignoring " .. err) end
-    \\      saved = values or {}
+    \\      local values, err, passing = read_json(lumen.data_dir .. "/preferences.json")
+    \\      if not values then note(err) end
+    \\      -- What may pass is read again next time.
+    \\      if values or not passing then saved = values or {} end
     \\    end
-    \\    local v = saved[name]
+    \\    local v = saved and saved[name]
     \\    if v == nil then v = defaults[name] end
     \\    return v
     \\  end,
@@ -266,27 +284,35 @@ const prelude =
     \\})
     \\
     \\local storage, data, unreadable = {}, nil, nil
+    \\-- The values in storage.json, and why it must not be written over when
+    \\-- it could not be read: kept until a reload, unless that may pass.
     \\local function load()
     \\  if not data then
-    \\    local values, err = read_json(lumen.data_dir .. "/storage.json")
-    \\    if not values then lumen.log("ignoring " .. err) unreadable = err end
+    \\    local values, err, passing = read_json(lumen.data_dir .. "/storage.json")
+    \\    if not values then
+    \\      note(err)
+    \\      if passing then return {}, err end
+    \\      unreadable = err
+    \\    end
     \\    data = values or {}
     \\  end
-    \\  return data
+    \\  return data, unreadable
     \\end
     \\-- Sets the key and writes the file; when either fails, nothing changes.
     \\local function save(key, value)
-    \\  local d = load()
-    \\  if unreadable then error("lumen.storage: " .. unreadable .. "; not overwritten", 3) end
+    \\  local d, why = load()
+    \\  if why then error("lumen.storage: " .. why .. "; not overwritten", 3) end
     \\  local old = d[key]
+    \\  -- Dropped meanwhile: a timeout raises through pcall, past the line that
+    \\  -- puts the old value back, and the next call then reads the file.
+    \\  data = nil
     \\  d[key] = value
     \\  local encoded, text = pcall(lumen.json.encode, d)
     \\  local done, err = false, text
     \\  if encoded then done, err = write_storage(text) end
-    \\  if not done then
-    \\    d[key] = old
-    \\    error("lumen.storage: " .. tostring(err), 3)
-    \\  end
+    \\  if not done then d[key] = old end
+    \\  data = d
+    \\  if not done then error("lumen.storage: " .. tostring(err), 3) end
     \\end
     \\local function check(key)
     \\  if type(key) ~= "string" then error("lumen.storage: keys are strings, not " .. type(key), 3) end
@@ -305,11 +331,14 @@ const prelude =
     \\  seen[v] = nil
     \\  return out
     \\end
-    \\function storage.get(key) check(key) return clone(load()[key], {}, 0, { n = 0 }) end
+    \\function storage.get(key) check(key) return clone((load())[key], {}, 0, { n = 0 }) end
     \\function storage.set(key, value) check(key) save(key, clone(value, {}, 0, { n = 0 })) end
     \\function storage.remove(key) check(key) save(key, nil) end
+    \\-- Each value within the limits `set` took it with.
     \\function storage.all()
-    \\  return clone(load(), {}, 0, { n = 0 })
+    \\  local out = {}
+    \\  for key, value in pairs((load())) do out[key] = clone(value, {}, 0, { n = 0 }) end
+    \\  return out
     \\end
     \\lumen.storage = storage
     \\return defaults
@@ -541,10 +570,12 @@ fn color(
     field: [:0]const u8,
     default: ?u24,
 ) lua.Error!u24 {
+    // Restored on success only: a failure's message must stay on top for
+    // `wrap` to raise (a `defer` popped it, and the theme table was raised).
     const mark: lua.StackMark = .init(L);
-    defer mark.restore(L);
     switch (lua.getField(L, 1, field)) {
         lua.c.LUA_TNIL => {
+            mark.restore(L);
             if (default) |default_color| return default_color;
             return lua.fail(L, "theme.{s} is missing", .{field});
         },
@@ -555,8 +586,10 @@ fn color(
         },
     }
     const text = lua.toSlice(L, -1).?;
-    return parseHex(text) orelse
-        lua.fail(L, "theme.{s}: \"#rrggbb\" expected (got \"{s}\")", .{ field, text });
+    const parsed = parseHex(text) orelse
+        return lua.fail(L, "theme.{s}: \"#rrggbb\" expected (got \"{s}\")", .{ field, text });
+    mark.restore(L);
+    return parsed;
 }
 
 pub fn parseHex(text: []const u8) ?u24 {
@@ -656,6 +689,8 @@ fn set(L: *lua.State) lua.Error!c_int {
         &load.style_settings
     else
         &load.settings;
+    // All checked before any is applied: a call that fails changes nothing.
+    var checked: std.ArrayList(registry_mod.SettingOverride) = .empty;
     lua.c.lua_pushnil(L);
     while (lua.c.lua_next(L, 1) != 0) {
         const key = lua.toSlice(L, -2) orelse {
@@ -693,23 +728,21 @@ fn set(L: *lua.State) lua.Error!c_int {
                 return lua.fail(L, "lumen.set: \"{s}\" is not a value for {s}", .{ value, key });
             },
         }
-        const duped_value = arena.dupeSentinel(u8, value, 0) catch return lua.failOom(L);
-        var updated = false;
-        for (settings.items) |*entry| {
-            if (std.mem.eql(u8, entry.key, key)) {
-                entry.value = duped_value;
-                updated = true;
-                break;
-            }
-        }
-        if (!updated) {
-            settings.append(arena, .{
-                .key = arena.dupeSentinel(u8, key, 0) catch return lua.failOom(L),
-                .value = duped_value,
-            }) catch return lua.failOom(L);
-        }
+        checked.append(arena, .{
+            .key = arena.dupeSentinel(u8, key, 0) catch return lua.failOom(L),
+            .value = arena.dupeSentinel(u8, value, 0) catch return lua.failOom(L),
+        }) catch return lua.failOom(L);
         // Pops the value; `lua_next` takes the key off next.
         lua.pop(L, 1);
+    }
+    settings.ensureUnusedCapacity(arena, checked.items.len) catch return lua.failOom(L);
+    for (checked.items) |override| {
+        for (settings.items) |*entry| {
+            if (std.mem.eql(u8, entry.key, override.key)) {
+                entry.value = override.value;
+                break;
+            }
+        } else settings.appendAssumeCapacity(override);
     }
     return 0;
 }
@@ -850,9 +883,11 @@ fn icons(L: *lua.State) lua.Error!c_int {
     try lua.argTable(L, 1, "lumen.icons");
     const load = try loadOfConfig(L, "lumen.icons", .init_lua);
     const arena = load.arena;
+    // All checked before any is added: a call that fails changes nothing.
+    var checked: std.ArrayList(registry_mod.IconOverride) = .empty;
     lua.c.lua_pushnil(L);
     while (lua.c.lua_next(L, 1) != 0) {
-        if (load.icons.items.len >= icons_max) {
+        if (load.icons.items.len + checked.items.len >= icons_max) {
             return lua.fail(L, "lumen.icons: at most {d} overrides", .{icons_max});
         }
         const key = lua.toSlice(L, -2) orelse return lua.fail(
@@ -870,11 +905,12 @@ fn icons(L: *lua.State) lua.Error!c_int {
         const icon = rows.parseIcon(L, arena, -1, "lumen.icons") orelse
             return lua.fail(L, "lumen.icons: no icon for {s}", .{key});
         const full_key = iconKey(arena, key) catch return lua.failOom(L);
-        load.icons.append(arena, .{ .key = full_key, .icon = icon }) catch
+        checked.append(arena, .{ .key = full_key, .icon = icon }) catch
             return lua.failOom(L);
         // Pops the value; `lua_next` takes the key off next.
         lua.pop(L, 1);
     }
+    load.icons.appendSlice(arena, checked.items) catch return lua.failOom(L);
     return 0;
 }
 
@@ -974,4 +1010,158 @@ test "theme colours parse as #rrggbb" {
     try std.testing.expectEqual(@as(?u24, null), parseHex("#+12345"));
     try std.testing.expectEqual(@as(?u24, null), parseHex("#-00000"));
     try std.testing.expectEqual(@as(?u24, null), parseHex("#ff_ff0"));
+}
+
+/// An extension's state with `lumen` installed, its data folder `data`,
+/// and no host running: only `host.gpa` is set, which `lumen.json` takes.
+const TestExtension = struct {
+    host: Host,
+    extension: Extension,
+    arena_state: std.heap.ArenaAllocator,
+
+    fn init(test_extension: *TestExtension, data: [:0]const u8) !void {
+        test_extension.host = undefined;
+        test_extension.host.gpa = std.testing.allocator;
+        test_extension.extension = .{
+            .host = &test_extension.host,
+            .id = "probe",
+            .folder = data,
+            .data = data,
+        };
+        test_extension.extension.L = lua.newState(&test_extension.extension.budget) orelse
+            return error.OutOfMemory;
+        test_extension.arena_state = .init(std.testing.allocator);
+        const Install = struct {
+            fn run(L: *lua.State, extension: *Extension) void {
+                lua.openLibs(L);
+                install(L, extension);
+            }
+        };
+        const extension = &test_extension.extension;
+        const arena = test_extension.arena_state.allocator();
+        const failure = extension.run(arena, std.time.ns_per_s, Extension, extension, Install.run);
+        if (failure) |message| {
+            std.debug.print("{s}\n", .{message});
+            return error.TestUnexpectedResult;
+        }
+    }
+
+    fn deinit(test_extension: *TestExtension) void {
+        lua.c.lua_close(test_extension.extension.L);
+        test_extension.arena_state.deinit();
+    }
+
+    /// Runs `code` with `budget_ns` to finish: its error, or null.
+    fn run(test_extension: *TestExtension, code: [:0]const u8, budget_ns: u64) ?[:0]const u8 {
+        const Code = struct {
+            text: [:0]const u8,
+            fn run(L: *lua.State, context: *@This()) void {
+                const loaded = lua.c.luaL_loadstring(L, context.text.ptr);
+                if (loaded != lua.c.LUA_OK) _ = lua.c.lua_error(L);
+                lua.c.lua_callk(L, 0, 0, 0, null);
+            }
+        };
+        var context: Code = .{ .text = code };
+        const arena = test_extension.arena_state.allocator();
+        return test_extension.extension.run(arena, budget_ns, Code, &context, Code.run);
+    }
+
+    fn expectOk(test_extension: *TestExtension, code: [:0]const u8) !void {
+        if (test_extension.run(code, 10 * std.time.ns_per_s)) |message| {
+            std.debug.print("{s}\n", .{message});
+            return error.TestUnexpectedResult;
+        }
+    }
+};
+
+fn testDataDir(test_dir: *std.testing.TmpDir, buffer: []u8) ![:0]const u8 {
+    const path = try os.tmpDirPath(test_dir, buffer[0 .. buffer.len - 1]);
+    buffer[path.len] = 0;
+    return buffer[0..path.len :0];
+}
+
+test "a file that cannot be read just now is read again, not taken as empty" {
+    var test_dir = std.testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const data = try testDataDir(&test_dir, &path_buffer);
+    var file_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const preferences = try std.mem.printSentinel(&file_buffer, "{s}/preferences.json", .{data}, 0);
+    try os.writeFile(preferences, "{\"token\": \"secret\"}");
+    const storage = try std.mem.printSentinel(&file_buffer, "{s}/storage.json", .{data}, 0);
+    try os.writeFile(storage, "{\"k\": \"v\"}");
+
+    var probe: TestExtension = undefined;
+    try probe.init(data);
+    defer probe.deinit();
+    // Every descriptor the extension may hold is taken: neither file opens.
+    try probe.expectOk(
+        \\lumen.extension { preferences = { { name = "token", default = "dflt" } } }
+        \\held = {}
+        \\for i = 1, 64 do held[i] = assert(io.open("/dev/null")) end
+        \\assert(not io.open("/dev/null"))
+        \\assert(lumen.preferences.token == "dflt")
+        \\assert(lumen.storage.get("k") == nil)
+        \\local ok, err = pcall(lumen.storage.set, "x", 1)
+        \\assert(not ok and err:find("not overwritten"), tostring(err))
+        \\for _, f in ipairs(held) do f:close() end
+        \\held = nil
+    );
+    try probe.expectOk(
+        \\assert(lumen.preferences.token == "secret", tostring(lumen.preferences.token))
+        \\assert(lumen.storage.get("k") == "v")
+        \\lumen.storage.set("x", 1)
+        \\assert(lumen.storage.all().k == "v" and lumen.storage.get("x") == 1)
+    );
+}
+
+test "lumen.storage: a set cut short by the deadline leaves nothing changed" {
+    var test_dir = std.testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const data = try testDataDir(&test_dir, &path_buffer);
+
+    var probe: TestExtension = undefined;
+    try probe.init(data);
+    defer probe.deinit();
+    try probe.expectOk(
+        \\lumen.storage.set("k", "old")
+        \\encode = lumen.json.encode
+    );
+    const message = probe.run(
+        \\lumen.json.encode = function() while true do end end
+        \\lumen.storage.set("k", "new")
+    , 50 * std.time.ns_per_ms) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.find(u8, message, "timed out") != null);
+    try probe.expectOk(
+        \\lumen.json.encode = encode
+        \\assert(lumen.storage.get("k") == "old", tostring(lumen.storage.get("k")))
+        \\assert(lumen.storage.all().k == "old")
+    );
+}
+
+test "lumen.storage.all returns whatever set took" {
+    var test_dir = std.testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const data = try testDataDir(&test_dir, &path_buffer);
+
+    var probe: TestExtension = undefined;
+    try probe.init(data);
+    defer probe.deinit();
+    try probe.expectOk(
+        \\local function many(n) local t = {} for i = 1, n do t[i] = {} end return t end
+        \\lumen.storage.set("a", many(4000))
+        \\lumen.storage.set("b", many(4000))
+        \\lumen.storage.set("c", many(4000))
+        \\local deep = {}
+        \\local tail = deep
+        \\for _ = 1, 31 do tail.next = {} tail = tail.next end
+        \\lumen.storage.set("deep", deep)
+        \\local all = lumen.storage.all()
+        \\assert(#all.a == 4000 and #all.b == 4000 and #all.c == 4000)
+        \\local depth, t = 1, all.deep
+        \\while t.next do depth = depth + 1 t = t.next end
+        \\assert(depth == 32, depth)
+    );
 }
