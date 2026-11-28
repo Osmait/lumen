@@ -64,10 +64,37 @@ pub const MonitorJson = struct {
 /// fields are ignored; missing optional ones take their defaults). Out of
 /// memory is null too: every caller works without Hyprland's answer.
 pub fn parse(comptime T: type, arena: std.mem.Allocator, json: []const u8) ?T {
-    return std.json.parseFromSliceLeaky(T, arena, json, .{
+    // std.json refuses a whole document over one string that is not UTF-8,
+    // and Hyprland passes window titles on as the app set them (an X11
+    // title in Latin-1): one such window emptied the window list.
+    const valid_json = makeValidUtf8(arena, json) catch return null;
+    return std.json.parseFromSliceLeaky(T, arena, valid_json, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     }) catch null;
+}
+
+/// `bytes` with each byte that does not start a valid UTF-8 sequence
+/// replaced by U+FFFD: `bytes` itself when it is valid already. JSON's own
+/// syntax is ASCII, so only the text inside strings changes.
+fn makeValidUtf8(arena: std.mem.Allocator, bytes: []const u8) error{OutOfMemory}![]const u8 {
+    if (std.unicode.utf8ValidateSlice(bytes)) return bytes;
+    const replacement = "\u{FFFD}";
+    var valid: std.ArrayList(u8) = .empty;
+    try valid.ensureTotalCapacity(arena, bytes.len + bytes.len / 2);
+    var index: usize = 0;
+    while (index < bytes.len) {
+        const sequence_len = std.unicode.utf8ByteSequenceLength(bytes[index]) catch 0;
+        const fits = sequence_len > 0 and index + sequence_len <= bytes.len;
+        if (fits and std.unicode.utf8ValidateSlice(bytes[index..][0..sequence_len])) {
+            try valid.appendSlice(arena, bytes[index..][0..sequence_len]);
+            index += sequence_len;
+        } else {
+            try valid.appendSlice(arena, replacement);
+            index += 1;
+        }
+    }
+    return valid.items;
 }
 
 fn query(arena: std.mem.Allocator, comptime T: type, what: [:0]const u8) ?T {
@@ -853,6 +880,21 @@ test "clients: recorded output, extra fields ignored, ordered by focus" {
     // The one on the special workspace is not mapped: the UI skips it.
     try testing.expect(!all[1].mapped);
     try testing.expectEqual(@as(i64, -99), all[1].workspace.id);
+}
+
+test "a title that is not UTF-8 shows U+FFFD and the other windows still list" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const json = @embedFile("testdata/hypr_clients_latin1.json");
+    const all = parse([]Client, arena.allocator(), json) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 2), all.len);
+    sortByFocus(all);
+    try testing.expectEqualStrings("shell", all[0].title);
+    // "café" in Latin-1, a cut sequence, then valid UTF-8 kept as it is.
+    try testing.expectEqualStrings("caf\u{FFFD} \u{FFFD}\u{FFFD} \u{1F3B5} ok", all[1].title);
+    // The focused one, likewise.
+    const window = parse(Client, arena.allocator(), "{\"address\":\"0x1\",\"title\":\"\xe9t\xe9\"}").?;
+    try testing.expectEqualStrings("\u{FFFD}t\u{FFFD}", window.title);
 }
 
 test "activewindow with no window focused parses as an empty client" {
