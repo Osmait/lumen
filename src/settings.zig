@@ -5,7 +5,8 @@
 //! edit shows the next time the window opens.
 //!
 //! Anything unreadable falls back to its default: a broken file never stops
-//! Lumen from starting. Unknown keys are kept and written back.
+//! Lumen from starting. A save keeps the file as it is (comments, unknown
+//! keys and sections, lines it cannot read) and rewrites only what changed.
 
 const std = @import("std");
 const core = @import("core");
@@ -161,10 +162,14 @@ pub const Settings = struct {
         return settings.arena.allocator();
     }
 
+    /// The part of the file a line is in: before any section, `[open-with]`,
+    /// or a section this version does not know.
+    const Section = enum { top, open_with, other };
+
     /// Settings from the text of a settings file.
     pub fn parse(gpa: std.mem.Allocator, text: []const u8) Settings {
         var settings = Settings.init(gpa);
-        var section: enum { top, open_with, other } = .top;
+        var section: Section = .top;
         // Known keys a line has set: a later line with a value this
         // version does not take leaves the setting as it is, and is not
         // what a save writes for it (MYP-576).
@@ -479,22 +484,46 @@ pub const Settings = struct {
     fn forgetKeptOpenWith(settings: *Settings, key: []const u8) void {
         var line_index: usize = 0;
         while (line_index < settings.unknown_open_with.items.len) {
-            const line = settings.unknown_open_with.items[line_index];
-            const equals = std.mem.findScalar(u8, line, '=') orelse {
-                line_index += 1;
-                continue;
-            };
-            const line_key = std.mem.trim(u8, line[0..equals], " \t");
-            const same = if (key[0] == '.')
-                std.ascii.eqlIgnoreCase(line_key, key)
-            else
-                std.mem.eql(u8, line_key, key);
-            if (same) {
+            if (keptLineSets(settings.unknown_open_with.items[line_index], key)) {
                 _ = settings.unknown_open_with.orderedRemove(line_index);
             } else {
                 line_index += 1;
             }
         }
+    }
+
+    /// Whether a kept `[open-with]` line is one for `key` (lowercase for an
+    /// extension).
+    fn keptLineSets(line: []const u8, key: []const u8) bool {
+        const equals = std.mem.findScalar(u8, line, '=') orelse return false;
+        return sameOpenWithKey(std.mem.trim(u8, line[0..equals], " \t"), key);
+    }
+
+    /// Kinds match exactly, extensions in any case.
+    fn sameOpenWithKey(a: []const u8, b: []const u8) bool {
+        if (a.len > 0 and a[0] == '.') return std.ascii.eqlIgnoreCase(a, b);
+        return std.mem.eql(u8, a, b);
+    }
+
+    /// `key` as `open_with` holds it: an extension in lowercase, in `buffer`.
+    fn openWithMapKey(buffer: *[extension_key_bytes_max]u8, key: []const u8) []const u8 {
+        assert(key.len <= buffer.len);
+        return if (key[0] == '.') std.ascii.lowerString(buffer, key) else key;
+    }
+
+    /// Whether `a` and `b` choose the same for `key`: the same app, and both
+    /// or neither keep a line this version did not take.
+    fn sameOpenWith(a: *const Settings, b: *const Settings, key: []const u8) bool {
+        const app_a = a.open_with.get(key);
+        const app_b = b.open_with.get(key);
+        if ((app_a == null) != (app_b == null)) return false;
+        if (app_a != null and !std.mem.eql(u8, app_a.?, app_b.?)) return false;
+        return keepsOpenWithLine(a, key) == keepsOpenWithLine(b, key);
+    }
+
+    fn keepsOpenWithLine(settings: *const Settings, key: []const u8) bool {
+        for (settings.unknown_open_with.items) |line| if (keptLineSets(line, key)) return true;
+        return false;
     }
 
     /// A kind's name ("pdf"), or a dot and an extension (".log").
@@ -565,7 +594,66 @@ pub const Settings = struct {
                 else => std.fmt.bufPrint(buf, "{s} = {s}", .{ key, field_value }) catch unreachable,
             };
         }
+
+        /// `line` for a key named at run time; null when it is not a known
+        /// one.
+        fn lineFor(source: Source, buf: *[line_bytes_max]u8, key: []const u8) ?[]const u8 {
+            inline for (known_keys) |known| {
+                if (std.mem.eql(u8, known, key)) return source.line(buf, known);
+            }
+            return null;
+        }
+
+        /// The known keys a file has no line for, after the last line of its
+        /// top part; whether there were any.
+        fn writeMissingKnown(
+            source: Source,
+            writer: *std.Io.Writer,
+            seen: *const [known_keys.len]bool,
+            after_lines: bool,
+        ) std.Io.Writer.Error!bool {
+            var any = false;
+            inline for (known_keys, 0..) |key, index| {
+                if (!seen[index]) {
+                    if (!any and after_lines) try writer.writeAll("\n");
+                    any = true;
+                    var buffer: [line_bytes_max]u8 = undefined;
+                    try writer.print("{s}\n", .{source.line(&buffer, key)});
+                }
+            }
+            return any;
+        }
     };
+
+    /// A `key = value` line `Source.line` formats: the longest key, " = "
+    /// and a token.
+    const line_bytes_max = 256;
+
+    /// The top-level keys this version knows, in the order `writeKnown`
+    /// writes them.
+    const known_keys = [_][]const u8{
+        "style",       "theme",     "text_size",      "opacity",    "position",
+        "width",       "height",    "density",        "icon_theme", "files_in_root",
+        "suggestions", "clipboard", "clipboard_keep", "terminal",   "editor",
+    };
+
+    comptime {
+        @setEvalBranchQuota(20_000);
+        const tags = @typeInfo(Toggle).@"enum".field_names.len +
+            @typeInfo(Choice).@"enum".field_names.len + @typeInfo(Text).@"enum".field_names.len;
+        assert(known_keys.len == tags);
+        for (known_keys) |key| {
+            assert(std.meta.stringToEnum(Toggle, key) != null or
+                std.meta.stringToEnum(Choice, key) != null or
+                std.meta.stringToEnum(Text, key) != null);
+            assert(key.len + " = ".len + token_bytes_max <= line_bytes_max);
+        }
+    }
+
+    fn knownIndex(key: []const u8) ?usize {
+        for (known_keys, 0..) |known, index| if (std.mem.eql(u8, known, key)) return index;
+        return null;
+    }
 
     /// Writes `settings`, except the keys in `kept`, which keep their
     /// values from `file` (keys init.lua sets stay out of the file).
@@ -683,11 +771,7 @@ pub const Settings = struct {
 
     /// The `[open-with]` section: the app chosen for each kind or extension.
     fn writeOpenWith(settings: *const Settings, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        try writer.writeAll("\n" ++ open_with_section ++ "\n" ++
-            \\# A file kind (folder pdf image video audio markdown html text office
-            \\# archive) or an extension (.log) = the app's desktop file id
-            \\
-        );
+        try writer.writeAll("\n" ++ open_with_heading);
         var iterator = settings.open_with.iterator();
         while (iterator.next()) |entry| {
             try writer.print("{s} = {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
@@ -695,30 +779,257 @@ pub const Settings = struct {
         for (settings.unknown_open_with.items) |line| try writer.print("{s}\n", .{line});
     }
 
+    const open_with_heading = open_with_section ++ "\n" ++
+        \\# A file kind (folder pdf image video audio markdown html text office
+        \\# archive) or an extension (.log) = the app's desktop file id
+        \\
+    ;
+
+    /// The lines of a settings file, each with the part of the file it is in
+    /// and the key it sets, read the way `parse` reads them.
+    const FileLines = struct {
+        rest: []const u8,
+        section: Section = .top,
+
+        const Line = struct {
+            /// As it is in the file, without its newline.
+            raw: []const u8,
+            section: Section,
+            /// Empty, or only spaces.
+            blank: bool = false,
+            /// A known top-level key, or an `[open-with]` kind or extension,
+            /// the line sets; null for any other line.
+            key: ?[]const u8 = null,
+        };
+
+        fn next(lines: *FileLines) ?Line {
+            if (lines.rest.len == 0) return null;
+            const end = std.mem.findScalar(u8, lines.rest, '\n');
+            const raw = lines.rest[0 .. end orelse lines.rest.len];
+            lines.rest = if (end) |newline| lines.rest[newline + 1 ..] else "";
+            const trimmed = std.mem.trim(u8, raw, " \t\r");
+            if (trimmed.len == 0) return .{ .raw = raw, .section = lines.section, .blank = true };
+            var line: Line = .{ .raw = raw, .section = lines.section };
+            if (!std.unicode.utf8ValidateSlice(trimmed) or
+                std.mem.findScalar(u8, trimmed, 0) != null) return line;
+            const text = withoutComment(trimmed);
+            if (text.len == 0) return line;
+            if (text[0] == '[') {
+                lines.section = if (std.mem.eql(u8, text, open_with_section)) .open_with else .other;
+                line.section = lines.section;
+                return line;
+            }
+            const equals = std.mem.findScalar(u8, text, '=') orelse return line;
+            const key = std.mem.trim(u8, text[0..equals], " \t");
+            line.key = switch (lines.section) {
+                .top => if (knownIndex(key) != null) key else null,
+                .open_with => if (isOpenWithKey(key)) key else null,
+                .other => null,
+            };
+            return line;
+        }
+    };
+
+    pub const WriteOverError = std.Io.Writer.Error || std.mem.Allocator.Error;
+
+    /// Writes `settings` over the text of the file they are saved to,
+    /// `original`, keeping its layout (MYP-566): every line stays where it
+    /// is and as it is (comments, inline comments, lines this version cannot
+    /// read), except the lines of keys whose value changed, rewritten in
+    /// place with their inline comment. Known keys and `[open-with]` entries
+    /// the file does not have yet go at the end of their part of it.
+    /// `file` is `original` parsed; the keys in `kept` keep its values.
+    pub fn writeOver(
+        settings: *const Settings,
+        gpa: std.mem.Allocator,
+        writer: *std.Io.Writer,
+        original: []const u8,
+        file: *const Settings,
+        kept: []const []const u8,
+    ) WriteOverError!void {
+        const source: Source = .{ .current = settings, .file = file, .kept_keys = kept };
+        const before: Source = .{ .current = file, .file = file, .kept_keys = &.{} };
+        var arena_state: std.heap.ArenaAllocator = .init(gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        // The `[open-with]` keys the file has a line for, as `open_with`
+        // holds them.
+        var open_with_in_file: std.StringHashMapUnmanaged(void) = .empty;
+        var scan: FileLines = .{ .rest = original };
+        while (scan.next()) |line| {
+            if (line.section != .open_with) continue;
+            const key = line.key orelse continue;
+            var key_buffer: [extension_key_bytes_max]u8 = undefined;
+            const map_key = openWithMapKey(&key_buffer, key);
+            try open_with_in_file.put(arena, try arena.dupe(u8, map_key), {});
+        }
+
+        var known_seen: [known_keys.len]bool = @splat(false);
+        // Changed `[open-with]` keys already written: their other lines go.
+        var open_with_written: std.StringHashMapUnmanaged(void) = .empty;
+        var open_with_added = false;
+        var section: Section = .top;
+        // Where the blank lines before the next line start: what a part of
+        // the file lacks goes before the blank lines that end it.
+        var blank_from: ?usize = null;
+        // Whether the part of the file being written has a line yet.
+        var part_written = false;
+        var lines: FileLines = .{ .rest = original };
+        while (lines.next()) |line| {
+            const offset = @intFromPtr(line.raw.ptr) - @intFromPtr(original.ptr);
+            if (line.blank) {
+                if (blank_from == null) blank_from = offset;
+                continue;
+            }
+            if (line.section != section) {
+                var added = false;
+                if (section == .top) {
+                    added = try source.writeMissingKnown(writer, &known_seen, part_written);
+                } else if (section == .open_with and !open_with_added) {
+                    added = try settings.writeMissingOpenWith(writer, &open_with_in_file);
+                    open_with_added = true;
+                }
+                // A part that ended with no blank line before the heading
+                // gets one after what was added to it.
+                if (added and blank_from == null) try writer.writeAll("\n");
+                section = line.section;
+                part_written = false;
+            }
+            if (blank_from) |from| try writer.writeAll(original[from..offset]);
+            blank_from = null;
+            part_written = true;
+            const key = line.key orelse {
+                try writer.print("{s}\n", .{line.raw});
+                continue;
+            };
+            switch (line.section) {
+                .top => {
+                    const index = knownIndex(key).?;
+                    const first = !known_seen[index];
+                    known_seen[index] = true;
+                    var now_buffer: [line_bytes_max]u8 = undefined;
+                    var before_buffer: [line_bytes_max]u8 = undefined;
+                    const now = source.lineFor(&now_buffer, key).?;
+                    if (std.mem.eql(u8, now, before.lineFor(&before_buffer, key).?)) {
+                        try writer.print("{s}\n", .{line.raw});
+                    } else if (first) {
+                        // Changed: its first line takes the new value and any
+                        // other one goes (a later one would override it).
+                        try writeReplaced(writer, line.raw, now);
+                    }
+                },
+                .open_with => {
+                    var key_buffer: [extension_key_bytes_max]u8 = undefined;
+                    const map_key = openWithMapKey(&key_buffer, key);
+                    if (sameOpenWith(settings, file, map_key)) {
+                        try writer.print("{s}\n", .{line.raw});
+                        continue;
+                    }
+                    if (open_with_written.contains(map_key)) continue;
+                    try open_with_written.put(arena, try arena.dupe(u8, map_key), {});
+                    // No app now: all of its lines go.
+                    const app = settings.open_with.get(map_key) orelse continue;
+                    var entry_buffer: [line_bytes_max]u8 = undefined;
+                    const entry = std.fmt.bufPrint(&entry_buffer, "{s} = {s}", .{ key, app }) catch
+                        unreachable;
+                    try writeReplaced(writer, line.raw, entry);
+                },
+                .other => unreachable,
+            }
+        }
+        // The end of the file ends its last part.
+        if (section == .top) _ = try source.writeMissingKnown(writer, &known_seen, part_written);
+        if (section == .open_with and !open_with_added) {
+            _ = try settings.writeMissingOpenWith(writer, &open_with_in_file);
+            open_with_added = true;
+        }
+        if (blank_from) |from| try writer.writeAll(original[from..]);
+        if (!open_with_added and settings.hasOpenWithMissing(&open_with_in_file)) {
+            try writer.writeAll("\n" ++ open_with_heading);
+            _ = try settings.writeMissingOpenWith(writer, &open_with_in_file);
+        }
+    }
+
+    /// `raw` with its setting replaced by `setting`, its indentation and
+    /// inline comment kept.
+    fn writeReplaced(
+        writer: *std.Io.Writer,
+        raw: []const u8,
+        setting: []const u8,
+    ) std.Io.Writer.Error!void {
+        const unindented = std.mem.trimStart(u8, raw, " \t");
+        const indent = raw[0 .. raw.len - unindented.len];
+        const trimmed = std.mem.trimEnd(u8, unindented, " \t\r");
+        // A value is a token, never " #": a setting with one is a line kept
+        // from the file as it was, its own comment and all.
+        const comment = if (std.mem.find(u8, setting, " #") == null)
+            trimmed[withoutComment(trimmed).len..]
+        else
+            "";
+        const carriage_return = if (std.mem.endsWith(u8, raw, "\r")) "\r" else "";
+        try writer.print("{s}{s}{s}{s}\n", .{ indent, setting, comment, carriage_return });
+    }
+
+    /// The `[open-with]` entries the file has no line for; whether there were
+    /// any.
+    fn writeMissingOpenWith(
+        settings: *const Settings,
+        writer: *std.Io.Writer,
+        in_file: *const std.StringHashMapUnmanaged(void),
+    ) std.Io.Writer.Error!bool {
+        var any = false;
+        var iterator = settings.open_with.iterator();
+        while (iterator.next()) |entry| {
+            if (in_file.contains(entry.key_ptr.*)) continue;
+            any = true;
+            try writer.print("{s} = {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+        }
+        return any;
+    }
+
+    fn hasOpenWithMissing(
+        settings: *const Settings,
+        in_file: *const std.StringHashMapUnmanaged(void),
+    ) bool {
+        for (settings.open_with.keys()) |key| if (!in_file.contains(key)) return true;
+        return false;
+    }
+
     /// Reads `path`; a missing or unreadable file gives the defaults. When the
     /// file exists but cannot be read (permissions, I/O error, non-regular
     /// file, or larger than the buffer), `incomplete` is set so a later `save`
     /// refuses to overwrite the user's file with defaults.
     pub fn load(gpa: std.mem.Allocator, path: [*:0]const u8) Settings {
-        const fd = sys.openRegular(path) catch |err| {
-            var defaults = Settings.init(gpa);
-            if (err != error.NotFound) defaults.incomplete = true;
-            return defaults;
-        };
-        defer sys.close(fd);
         var text: std.ArrayList(u8) = .empty;
         defer text.deinit(gpa);
-        // One byte past the limit tells a file longer than it.
-        sys.readUpTo(gpa, fd, &text, file_bytes_max + 1) catch {
-            var defaults = Settings.init(gpa);
-            defaults.incomplete = true;
-            return defaults;
-        };
-        const whole = text.items.len <= file_bytes_max;
-        var settings = parse(gpa, text.items[0..@min(text.items.len, file_bytes_max)]);
-        // The file goes on past what was read: saving would cut it there.
-        if (!whole) settings.incomplete = true;
+        const read = readText(gpa, path, &text);
+        var settings = parse(gpa, text.items);
+        switch (read) {
+            .missing, .whole => {},
+            // The file goes on past what was read: saving would cut it there.
+            .cut, .failed => settings.incomplete = true,
+        }
         return settings;
+    }
+
+    const Read = enum { missing, whole, cut, failed };
+
+    /// The text of `path`, up to `file_bytes_max` bytes, in `text`; nothing
+    /// when it is missing or cannot be read.
+    fn readText(gpa: std.mem.Allocator, path: [*:0]const u8, text: *std.ArrayList(u8)) Read {
+        const fd = sys.openRegular(path) catch |err| {
+            return if (err == error.NotFound) .missing else .failed;
+        };
+        defer sys.close(fd);
+        // One byte past the limit tells a file longer than it.
+        sys.readUpTo(gpa, fd, text, file_bytes_max + 1) catch {
+            text.clearRetainingCapacity();
+            return .failed;
+        };
+        if (text.items.len <= file_bytes_max) return .whole;
+        text.shrinkRetainingCapacity(file_bytes_max);
+        return .cut;
     }
 
     /// The largest settings file read: Lumen writes a few KB.
@@ -791,11 +1102,13 @@ pub const Settings = struct {
         settings.* = disk;
     }
 
-    pub const SaveError = sys.Error || std.Io.Writer.Error || error{ Incomplete, TooLarge };
+    pub const SaveError = sys.Error || WriteOverError || error{ Incomplete, TooLarge };
 
     /// Writes `path` atomically (temporary file, fsync, rename): a crash or a
     /// full disk never leaves half a file. Owner-only, like Lumen's other
-    /// files. The keys in `kept` keep the values the file has now.
+    /// files. The keys in `kept` keep the values the file has now. An
+    /// existing file keeps its layout and the user's comments (`writeOver`);
+    /// a new or empty one is written whole, with a comment for each setting.
     pub fn save(
         settings: *const Settings,
         gpa: std.mem.Allocator,
@@ -804,12 +1117,22 @@ pub const Settings = struct {
     ) SaveError!void {
         if (settings.incomplete) return error.Incomplete;
         if (std.mem.findScalarLast(u8, path, '/')) |slash| try sys.mkdirP(path[0..slash]);
-        var file = if (kept.len > 0) load(gpa, path.ptr) else Settings.init(gpa);
+        var original: std.ArrayList(u8) = .empty;
+        defer original.deinit(gpa);
+        switch (readText(gpa, path.ptr, &original)) {
+            .missing, .whole => {},
+            .cut, .failed => return error.Incomplete,
+        }
+        var file = parse(gpa, original.items);
         defer file.deinit();
         if (file.incomplete) return error.Incomplete;
         var output: std.Io.Writer.Allocating = .init(gpa);
         defer output.deinit();
-        try settings.writeKeeping(&output.writer, &file, kept);
+        if (std.mem.trim(u8, original.items, " \t\r\n").len == 0) {
+            try settings.writeKeeping(&output.writer, &file, kept);
+        } else {
+            try settings.writeOver(gpa, &output.writer, original.items, &file, kept);
+        }
         // `load` reads no more than this: a longer file would come back
         // incomplete and refuse every later save. The file on disk stays.
         if (output.written().len > file_bytes_max) return error.TooLarge;
@@ -1320,7 +1643,7 @@ test "the user's comments survive a save, Lumen's own are not doubled (MYP-566)"
     var settings = Settings.parse(testing.allocator,
         \\# my notes: nord at night
         \\# theme = nord
-        \\theme = dracula # inline notes are not kept
+        \\theme = dracula # an inline note (writeOver keeps it)
         \\; an ini-style comment
         \\[open-with]
         \\# evince is too slow
@@ -1363,4 +1686,191 @@ test "every comment write adds is one of Lumen's own" {
     }
     try testing.expectEqual(@as(usize, 0), back.comments.items.len);
     try testing.expectEqual(@as(usize, 0), back.unknown_open_with.items.len);
+}
+
+/// `original` written over by its settings after `change`: the new text.
+fn savedOver(
+    out: *std.Io.Writer.Allocating,
+    original: []const u8,
+    kept: []const []const u8,
+    change: *const fn (*Settings) anyerror!void,
+) !void {
+    var file = Settings.parse(testing.allocator, original);
+    defer file.deinit();
+    var settings = Settings.parse(testing.allocator, original);
+    defer settings.deinit();
+    try change(&settings);
+    try settings.writeOver(testing.allocator, &out.writer, original, &file, kept);
+}
+
+fn noChange(_: *Settings) !void {}
+
+test "a save keeps the file's layout, comments and lines it cannot read (MYP-566)" {
+    const original =
+        "# my notes: nord at night\n" ++
+        "# theme = nord\n" ++
+        "theme = dracula   # nord is too blue\n" ++
+        "  clipboard = off\r\n" ++
+        "my key = 1\n" ++
+        "bad \xff utf-8\n" ++
+        "future_option = 42 # from 2.0\n" ++
+        "\n" ++
+        "[open-with]\n" ++
+        "# evince is too slow\n" ++
+        "pdf = zathura.desktop # fast\n" ++
+        ".LOG = some future format\n" ++
+        "\n" ++
+        "[future]\n" ++
+        "theme = other # not ours\n";
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    // Nothing changed: the same file, with only the keys it lacks added at
+    // the end of its top part.
+    try savedOver(&out, original, &.{}, noChange);
+    const unchanged = out.written();
+    const top_end = std.mem.find(u8, original, "\n\n[open-with]").? + 1;
+    try testing.expectStringStartsWith(unchanged, original[0..top_end]);
+    try testing.expectStringEndsWith(unchanged, original[top_end..]);
+    try testing.expect(std.mem.find(u8, unchanged, "\nstyle = \n") != null);
+    try testing.expect(std.mem.find(u8, unchanged, "\neditor = \n") != null);
+    // Added once: saved again, nothing more is added.
+    var again: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer again.deinit();
+    try savedOver(&again, unchanged, &.{}, noChange);
+    try testing.expectEqualStrings(unchanged, again.written());
+
+    // Changed values are rewritten in place, inline comment, indentation
+    // and line ending kept.
+    var changed: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer changed.deinit();
+    try savedOver(&changed, unchanged, &.{}, struct {
+        fn change(settings: *Settings) !void {
+            try testing.expect(settings.setTextValue(.theme, "nord"));
+            settings.setToggle(.clipboard, true);
+            try settings.setOpenWith("pdf", "org.gnome.Evince.desktop");
+            try settings.setOpenWith(".log", "zed.desktop");
+            try settings.setOpenWith("image", "imv.desktop");
+        }
+    }.change);
+    try testing.expectStringStartsWith(changed.written(), "# my notes: nord at night\n" ++
+        "# theme = nord\n" ++
+        "theme = nord   # nord is too blue\n" ++
+        "  clipboard = true\r\n" ++
+        "my key = 1\n" ++
+        "bad \xff utf-8\n" ++
+        "future_option = 42 # from 2.0\n");
+    try testing.expect(std.mem.find(u8, changed.written(), "\n[open-with]\n" ++
+        "# evince is too slow\n" ++
+        "pdf = org.gnome.Evince.desktop # fast\n" ++
+        ".LOG = zed.desktop\n" ++
+        "image = imv.desktop\n" ++
+        "\n[future]\ntheme = other # not ours\n") != null);
+    var back = Settings.parse(testing.allocator, changed.written());
+    defer back.deinit();
+    try testing.expectEqualStrings("nord", back.theme);
+    try testing.expect(back.clipboard);
+    try testing.expectEqualStrings("zed.desktop", back.appFor(".log", null).?);
+    try testing.expectEqualStrings("imv.desktop", back.appFor("", .image).?);
+}
+
+test "a changed key's other lines go, an unchanged one's stay (MYP-566, MYP-576)" {
+    const original =
+        \\clipboard = off
+        \\clipboard = disabled
+        \\width = huge
+        \\width = wide
+        \\[open-with]
+        \\pdf = a.desktop
+        \\pdf = b.desktop
+        \\video = mpv.desktop
+        \\
+    ;
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try savedOver(&out, original, &.{}, struct {
+        fn change(settings: *Settings) !void {
+            settings.setToggle(.clipboard, true);
+            try settings.setOpenWith("pdf", "c.desktop");
+            try settings.setOpenWith("video", "");
+        }
+    }.change);
+    const written = out.written();
+    try testing.expectStringStartsWith(written, "clipboard = true\nwidth = huge\nwidth = wide\n");
+    try testing.expect(std.mem.find(u8, written, "disabled") == null);
+    try testing.expectStringEndsWith(written, "\n[open-with]\npdf = c.desktop\n");
+    var back = Settings.parse(testing.allocator, written);
+    defer back.deinit();
+    try testing.expect(back.clipboard);
+    try testing.expectEqual(Width.wide, back.width);
+    try testing.expectEqualStrings("c.desktop", back.appFor("", .pdf).?);
+    try testing.expect(back.appFor("", .video) == null);
+}
+
+test "keys init.lua sets keep the file's lines; a file without [open-with] gets one" {
+    const original = "width = narrow # mine\n";
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try savedOver(&out, original, &.{"width"}, struct {
+        fn change(settings: *Settings) !void {
+            try testing.expect(settings.setChoice(.width, "wide"));
+            try settings.setOpenWith(".md", "obsidian.desktop");
+        }
+    }.change);
+    const written = out.written();
+    try testing.expectStringStartsWith(written, original ++ "\n");
+    try testing.expectStringEndsWith(
+        written,
+        "\n" ++ Settings.open_with_heading ++ ".md = obsidian.desktop\n",
+    );
+    var back = Settings.parse(testing.allocator, written);
+    defer back.deinit();
+    try testing.expectEqual(Width.narrow, back.width);
+    try testing.expectEqualStrings("obsidian.desktop", back.appFor(".md", null).?);
+}
+
+test "save keeps an existing file's comments, a new one is written whole (MYP-566)" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var dir_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try sys.tmpDirPath(&tmp_dir, &dir_buffer);
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.mem.printSentinel(&path_buffer, "{s}/settings.conf", .{dir}, 0);
+
+    var settings = Settings.load(testing.allocator, path);
+    defer settings.deinit();
+    try settings.save(testing.allocator, path, &.{});
+    var whole: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer whole.deinit();
+    try settings.write(&whole.writer);
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    try testing.expectEqual(Settings.Read.whole, Settings.readText(testing.allocator, path, &text));
+    try testing.expectEqualStrings(whole.written(), text.items);
+
+    // A comment and an inline one added by hand survive a change from
+    // Settings, and the rest of the file stays the same.
+    const edited = try std.mem.replaceOwned(
+        u8,
+        testing.allocator,
+        text.items,
+        "theme = lumen-dark\n",
+        "# nord at night\ntheme = lumen-dark # for now\n",
+    );
+    defer testing.allocator.free(edited);
+    try sys.writeFile(path, edited);
+    try settings.savePatch(testing.allocator, path, &.{}, .{
+        .text = .{ .key = .theme, .value = "nord" },
+    });
+    text.clearRetainingCapacity();
+    try testing.expectEqual(Settings.Read.whole, Settings.readText(testing.allocator, path, &text));
+    const expected = try std.mem.replaceOwned(
+        u8,
+        testing.allocator,
+        edited,
+        "theme = lumen-dark # for now\n",
+        "theme = nord # for now\n",
+    );
+    defer testing.allocator.free(expected);
+    try testing.expectEqualStrings(expected, text.items);
+    try testing.expectEqualStrings("nord", settings.theme);
 }

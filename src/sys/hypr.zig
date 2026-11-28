@@ -7,7 +7,8 @@
 //!   while Lumen's layer still has the focus is undone when it hides. The
 //!   queue is sent once Hyprland gives the focus back (`sendAfterHide`,
 //!   which waits for `activewindow` on the event socket), or on the next
-//!   idle if the window does not hide.
+//!   idle if the window does not hide. They are written in the syntax the
+//!   running Hyprland takes (`Syntax`): hyprlang, or Lua with hyprland.lua.
 //! - `afterFocusChange` is that wait, for anyone else too (a paste).
 //! - Layouts turn a `geometry.Layout` into dispatches for the active window.
 //!
@@ -262,14 +263,20 @@ const dispatch_reply_timeout_ms = 500;
 
 const ReplyMode = enum { async, sync };
 
+/// Whether every command of a reply succeeded: one "ok" each, run together
+/// ("okok"), or apart on lines of their own ("ok\n\n\nok", Hyprland 0.57).
 fn isAllOk(reply: []const u8) bool {
-    const trimmed = std.mem.trimEnd(u8, reply, "\r\n");
-    if (trimmed.len == 0 or trimmed.len % 2 != 0) return false;
-    var i: usize = 0;
-    while (i < trimmed.len) : (i += 2) {
-        if (!std.mem.eql(u8, trimmed[i..][0..2], "ok")) return false;
+    var any = false;
+    var words = std.mem.tokenizeAny(u8, reply, " \t\r\n");
+    while (words.next()) |word| {
+        if (word.len % 2 != 0) return false;
+        var i: usize = 0;
+        while (i < word.len) : (i += 2) {
+            if (!std.mem.eql(u8, word[i..][0..2], "ok")) return false;
+        }
+        any = true;
     }
-    return true;
+    return any;
 }
 
 const DispatchReply = struct {
@@ -420,18 +427,220 @@ fn dispatchOver(message: []const u8, mode: ReplyMode) bool {
 
 // ---------------------------------------------------------------- dispatches
 
+/// How the running Hyprland takes a dispatch. With a Lua config
+/// (hyprland.lua: 0.55 and later, the only kind from 0.57) `dispatch X` is
+/// `hl.dispatch(X)`, so X is a Lua call (`hl.dsp.focus({ ... })`) and every
+/// hyprlang one ("focuswindow address:0x...") is a syntax error (MYP-521).
+pub const Syntax = enum { hyprlang, lua };
+
+/// A dispatch Lumen sends, written for either syntax. Window addresses are
+/// `validAddress`: nothing else ever goes into the text.
+pub const Dispatch = union(enum) {
+    focus_window: []const u8,
+    close_window: []const u8,
+    exit,
+    // The active window's.
+    toggle_floating,
+    toggle_fullscreen,
+    toggle_maximize,
+    toggle_pin,
+    close_active,
+    next_workspace,
+    previous_workspace,
+    move_to_next_monitor,
+    // A layout's, on the window at `address` (the active one).
+    leave_fullscreen: []const u8,
+    set_floating: []const u8,
+    resize: Placement,
+    move: Placement,
+
+    pub const Placement = struct { address: []const u8, x: i64, y: i64 };
+
+    /// The dispatcher and its arguments: what follows "dispatch ".
+    pub fn write(
+        command: Dispatch,
+        syntax: Syntax,
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        switch (command) {
+            .focus_window,
+            .close_window,
+            .leave_fullscreen,
+            .set_floating,
+            => |address| assert(validAddress(address)),
+            .resize, .move => |placement| assert(validAddress(placement.address)),
+            else => {},
+        }
+        switch (syntax) {
+            .hyprlang => try command.writeHyprlang(writer),
+            .lua => try command.writeLua(writer),
+        }
+    }
+
+    fn writeHyprlang(command: Dispatch, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (command) {
+            .focus_window => |address| try writer.print("focuswindow address:{s}", .{address}),
+            .close_window => |address| try writer.print("closewindow address:{s}", .{address}),
+            .exit => try writer.writeAll("exit"),
+            .toggle_floating => try writer.writeAll("togglefloating"),
+            .toggle_fullscreen => try writer.writeAll("fullscreen 0"),
+            .toggle_maximize => try writer.writeAll("fullscreen 1"),
+            .toggle_pin => try writer.writeAll("pin"),
+            .close_active => try writer.writeAll("killactive"),
+            .next_workspace => try writer.writeAll("workspace e+1"),
+            .previous_workspace => try writer.writeAll("workspace e-1"),
+            .move_to_next_monitor => try writer.writeAll("movewindow mon:+1"),
+            // Acts on the active window, which the layout's is.
+            .leave_fullscreen => try writer.writeAll("fullscreenstate 0 0"),
+            .set_floating => |address| try writer.print("setfloating address:{s}", .{address}),
+            .resize => |size| try writer.print(
+                "resizewindowpixel exact {d} {d},address:{s}",
+                .{ size.x, size.y, size.address },
+            ),
+            .move => |position| try writer.print(
+                "movewindowpixel exact {d} {d},address:{s}",
+                .{ position.x, position.y, position.address },
+            ),
+        }
+    }
+
+    /// Hyprland's Lua dispatchers (src/config/lua/bindings/
+    /// LuaBindingsDispatchers.cpp, the same from 0.55 to 0.57): a table of
+    /// named arguments, `window` a selector, the active window without it.
+    fn writeLua(command: Dispatch, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (command) {
+            .focus_window => |address| try writer.print(
+                "hl.dsp.focus({{ window = \"address:{s}\" }})",
+                .{address},
+            ),
+            .close_window => |address| try writer.print(
+                "hl.dsp.window.close({{ window = \"address:{s}\" }})",
+                .{address},
+            ),
+            .exit => try writer.writeAll("hl.dsp.exit()"),
+            .toggle_floating => try writer.writeAll("hl.dsp.window.float({ action = \"toggle\" })"),
+            .toggle_fullscreen => try writer.writeAll(
+                "hl.dsp.window.fullscreen({ mode = \"fullscreen\" })",
+            ),
+            .toggle_maximize => try writer.writeAll(
+                "hl.dsp.window.fullscreen({ mode = \"maximized\" })",
+            ),
+            .toggle_pin => try writer.writeAll("hl.dsp.window.pin({ action = \"toggle\" })"),
+            // `close` asks the window to close, as killactive did; `kill`
+            // would kill its process.
+            .close_active => try writer.writeAll("hl.dsp.window.close()"),
+            .next_workspace => try writer.writeAll("hl.dsp.focus({ workspace = \"e+1\" })"),
+            .previous_workspace => try writer.writeAll("hl.dsp.focus({ workspace = \"e-1\" })"),
+            .move_to_next_monitor => try writer.writeAll(
+                "hl.dsp.window.move({ monitor = \"+1\" })",
+            ),
+            .leave_fullscreen => |address| try writer.print(
+                "hl.dsp.window.fullscreen_state({{ internal = 0, client = 0, " ++
+                    "window = \"address:{s}\" }})",
+                .{address},
+            ),
+            .set_floating => |address| try writer.print(
+                "hl.dsp.window.float({{ action = \"enable\", window = \"address:{s}\" }})",
+                .{address},
+            ),
+            // Without `relative`, both are exact: a size, and a position in
+            // the layout's coordinates, as the hyprlang "exact" ones.
+            .resize => |size| try writer.print(
+                "hl.dsp.window.resize({{ x = {d}, y = {d}, window = \"address:{s}\" }})",
+                .{ size.x, size.y, size.address },
+            ),
+            .move => |position| try writer.print(
+                "hl.dsp.window.move({{ x = {d}, y = {d}, window = \"address:{s}\" }})",
+                .{ position.x, position.y, position.address },
+            ),
+        }
+    }
+
+    /// `commands` written for `syntax`, in `arena`.
+    fn writeAll(
+        arena: std.mem.Allocator,
+        commands: []const Dispatch,
+        syntax: Syntax,
+    ) std.mem.Allocator.Error![]const []const u8 {
+        const texts = try arena.alloc([]const u8, commands.len);
+        for (commands, texts) |command, *text| {
+            var out: std.Io.Writer.Allocating = .init(arena);
+            command.write(syntax, &out.writer) catch return error.OutOfMemory;
+            text.* = out.written();
+        }
+        return texts;
+    }
+};
+
+/// What a Lua config answers `dispatch` with, and nothing else does: a
+/// dispatcher that does nothing. A hyprlang config has no dispatcher by that
+/// name ("Invalid dispatcher"), and runs none.
+const lua_probe = dispatch_keyword ++ "hl.dsp.no_op()";
+
+fn syntaxFromProbe(reply: []const u8) Syntax {
+    return if (isAllOk(reply)) .lua else .hyprlang;
+}
+
+/// The syntax found for the Hyprland instance named in `signature`: one
+/// instance keeps its config's kind until it exits.
+const SyntaxCache = struct {
+    signature: [signature_bytes_max]u8 = undefined,
+    signature_len: usize = 0,
+    syntax: ?Syntax = null,
+
+    const signature_bytes_max = 128;
+
+    fn get(cache: *const SyntaxCache, signature: []const u8) ?Syntax {
+        if (!std.mem.eql(u8, cache.signature[0..cache.signature_len], signature)) return null;
+        return cache.syntax;
+    }
+
+    fn put(cache: *SyntaxCache, signature: []const u8, syntax: Syntax) void {
+        if (signature.len > signature_bytes_max) return;
+        @memcpy(cache.signature[0..signature.len], signature);
+        cache.signature_len = signature.len;
+        cache.syntax = syntax;
+    }
+};
+
+/// Main thread only, like the queue.
+var syntax_cache: SyntaxCache = .{};
+
+/// The syntax of the Hyprland running, asked once per instance with
+/// `lua_probe` (~0.05 ms over its socket). Hyprlang, not remembered, when
+/// Hyprland cannot be reached: the next dispatch asks again.
+fn currentSyntax(gpa: std.mem.Allocator) Syntax {
+    const signature_z = c.g_getenv("HYPRLAND_INSTANCE_SIGNATURE") orelse return .hyprlang;
+    const signature = std.mem.span(signature_z);
+    if (syntax_cache.get(signature)) |syntax| return syntax;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const reply = talk(arena_state.allocator(), lua_probe) orelse return .hyprlang;
+    const syntax = syntaxFromProbe(reply);
+    log.debug("dispatch syntax: {t}", .{syntax});
+    syntax_cache.put(signature, syntax);
+    return syntax;
+}
+
 /// `batch` of one command.
-pub fn dispatch(gpa: std.mem.Allocator, command: []const u8) void {
+pub fn dispatch(gpa: std.mem.Allocator, command: Dispatch) void {
     os.assertMainThread();
     batch(gpa, &.{command});
 }
 
-/// Queues `commands` ("focuswindow address:0x..."): they go on the next
-/// idle, or once the window has hidden and the focus is back
+/// Queues `commands`, written for the running Hyprland's syntax: they go on
+/// the next idle, or once the window has hidden and the focus is back
 /// (`sendAfterHide`).
-pub fn batch(gpa: std.mem.Allocator, commands: []const []const u8) void {
+pub fn batch(gpa: std.mem.Allocator, commands: []const Dispatch) void {
     os.assertMainThread();
-    batchWith(gpa, commands, &sendQueued, &spawnBatch);
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const texts = Dispatch.writeAll(
+        arena_state.allocator(),
+        commands,
+        currentSyntax(gpa),
+    ) catch return;
+    batchWith(gpa, texts, &sendQueued, &spawnBatch);
 }
 
 fn spawnBatch(gpa: std.mem.Allocator, commands: []const []const u8) void {
@@ -846,23 +1055,23 @@ pub fn layoutCommands(
     window: Client,
     monitor_area: geometry.Monitor,
     layout: geometry.Layout,
-) std.mem.Allocator.Error![]const []const u8 {
+) std.mem.Allocator.Error![]const Dispatch {
     if (!validAddress(window.address)) return &.{};
     const current_size: geometry.Size = .{ .width = window.size[0], .height = window.size[1] };
     const placed = geometry.place(layout, monitor_area.usable(), current_size, layout_gap_px);
-    var commands: std.ArrayList([]const u8) = .empty;
-    if (window.fullscreen != 0) try commands.append(arena, "fullscreenstate 0 0");
-    if (!window.floating) {
-        try commands.append(arena, try arena.print("setfloating address:{s}", .{window.address}));
-    }
-    try commands.append(arena, try arena.print(
-        "resizewindowpixel exact {d} {d},address:{s}",
-        .{ placed.width, placed.height, window.address },
-    ));
-    try commands.append(arena, try arena.print(
-        "movewindowpixel exact {d} {d},address:{s}",
-        .{ placed.x, placed.y, window.address },
-    ));
+    var commands: std.ArrayList(Dispatch) = .empty;
+    if (window.fullscreen != 0) try commands.append(arena, .{ .leave_fullscreen = window.address });
+    if (!window.floating) try commands.append(arena, .{ .set_floating = window.address });
+    try commands.append(arena, .{ .resize = .{
+        .address = window.address,
+        .x = placed.width,
+        .y = placed.height,
+    } });
+    try commands.append(arena, .{ .move = .{
+        .address = window.address,
+        .x = placed.x,
+        .y = placed.y,
+    } });
     return commands.items;
 }
 
@@ -948,15 +1157,29 @@ test "layout commands: tiled window floats first, fullscreen leaves first" {
     const discord = all[0];
     const discord_monitor = findMonitor(monitors, discord.monitor).?;
     const commands = try layoutCommands(allocator, discord, discord_monitor, .left_half);
-    try testing.expectEqual(@as(usize, 3), commands.len);
-    try testing.expectEqualStrings("setfloating address:0x5600000000a0", commands[0]);
+    const hyprlang = try Dispatch.writeAll(allocator, commands, .hyprlang);
+    try testing.expectEqual(@as(usize, 3), hyprlang.len);
+    try testing.expectEqualStrings("setfloating address:0x5600000000a0", hyprlang[0]);
     try testing.expectEqualStrings(
         "resizewindowpixel exact 756 810,address:0x5600000000a0",
-        commands[1],
+        hyprlang[1],
     );
     try testing.expectEqualStrings(
         "movewindowpixel exact 2395 46,address:0x5600000000a0",
-        commands[2],
+        hyprlang[2],
+    );
+    const lua = try Dispatch.writeAll(allocator, commands, .lua);
+    try testing.expectEqualStrings(
+        "hl.dsp.window.float({ action = \"enable\", window = \"address:0x5600000000a0\" })",
+        lua[0],
+    );
+    try testing.expectEqualStrings(
+        "hl.dsp.window.resize({ x = 756, y = 810, window = \"address:0x5600000000a0\" })",
+        lua[1],
+    );
+    try testing.expectEqualStrings(
+        "hl.dsp.window.move({ x = 2395, y = 46, window = \"address:0x5600000000a0\" })",
+        lua[2],
     );
 
     var full = all[1];
@@ -964,20 +1187,111 @@ test "layout commands: tiled window floats first, fullscreen leaves first" {
     full.floating = true;
     const full_monitor = findMonitor(monitors, 0).?;
     const full_commands = try layoutCommands(allocator, full, full_monitor, .maximize);
-    try testing.expectEqualStrings("fullscreenstate 0 0", full_commands[0]);
     try testing.expectEqual(@as(usize, 3), full_commands.len);
+    const full_hyprlang = try Dispatch.writeAll(allocator, full_commands[0..1], .hyprlang);
+    try testing.expectEqualStrings("fullscreenstate 0 0", full_hyprlang[0]);
+    const full_lua = try Dispatch.writeAll(allocator, full_commands[0..1], .lua);
+    try testing.expectEqualStrings(
+        "hl.dsp.window.fullscreen_state({ internal = 0, client = 0, " ++
+            "window = \"address:0x5600000000b0\" })",
+        full_lua[0],
+    );
     for ([_]i64{ 1, 2, 3 }) |state| {
         full.fullscreen = state;
-        const state_cmds = try layoutCommands(allocator, full, full_monitor, .left_half);
-        try testing.expectEqualStrings("fullscreenstate 0 0", state_cmds[0]);
+        const state_commands = try layoutCommands(allocator, full, full_monitor, .left_half);
+        try testing.expect(state_commands[0] == .leave_fullscreen);
     }
 
-    const joined = try batchString(testing.allocator, commands[0..2]);
+    const joined = try batchString(testing.allocator, hyprlang[0..2]);
     defer testing.allocator.free(joined);
     try testing.expectEqualStrings(
         "dispatch setfloating address:0x5600000000a0 ; dispatch resizewindowpixel exact 756 810,address:0x5600000000a0",
         joined,
     );
+}
+
+test "every dispatch in both syntaxes (MYP-521)" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const address = "0x55d0c0ffee10";
+    const Case = struct { command: Dispatch, hyprlang: []const u8, lua: []const u8 };
+    const cases = [_]Case{
+        .{
+            .command = .{ .focus_window = address },
+            .hyprlang = "focuswindow address:" ++ address,
+            .lua = "hl.dsp.focus({ window = \"address:" ++ address ++ "\" })",
+        },
+        .{
+            .command = .{ .close_window = address },
+            .hyprlang = "closewindow address:" ++ address,
+            .lua = "hl.dsp.window.close({ window = \"address:" ++ address ++ "\" })",
+        },
+        .{ .command = .exit, .hyprlang = "exit", .lua = "hl.dsp.exit()" },
+        .{
+            .command = .toggle_floating,
+            .hyprlang = "togglefloating",
+            .lua = "hl.dsp.window.float({ action = \"toggle\" })",
+        },
+        .{
+            .command = .toggle_fullscreen,
+            .hyprlang = "fullscreen 0",
+            .lua = "hl.dsp.window.fullscreen({ mode = \"fullscreen\" })",
+        },
+        .{
+            .command = .toggle_maximize,
+            .hyprlang = "fullscreen 1",
+            .lua = "hl.dsp.window.fullscreen({ mode = \"maximized\" })",
+        },
+        .{
+            .command = .toggle_pin,
+            .hyprlang = "pin",
+            .lua = "hl.dsp.window.pin({ action = \"toggle\" })",
+        },
+        .{ .command = .close_active, .hyprlang = "killactive", .lua = "hl.dsp.window.close()" },
+        .{
+            .command = .next_workspace,
+            .hyprlang = "workspace e+1",
+            .lua = "hl.dsp.focus({ workspace = \"e+1\" })",
+        },
+        .{
+            .command = .previous_workspace,
+            .hyprlang = "workspace e-1",
+            .lua = "hl.dsp.focus({ workspace = \"e-1\" })",
+        },
+        .{
+            .command = .move_to_next_monitor,
+            .hyprlang = "movewindow mon:+1",
+            .lua = "hl.dsp.window.move({ monitor = \"+1\" })",
+        },
+        .{
+            .command = .{ .move = .{ .address = address, .x = -20, .y = 0 } },
+            .hyprlang = "movewindowpixel exact -20 0,address:" ++ address,
+            .lua = "hl.dsp.window.move({ x = -20, y = 0, window = \"address:" ++ address ++ "\" })",
+        },
+    };
+    for (cases) |case| {
+        const hyprlang = try Dispatch.writeAll(arena.allocator(), &.{case.command}, .hyprlang);
+        try testing.expectEqualStrings(case.hyprlang, hyprlang[0]);
+        const lua = try Dispatch.writeAll(arena.allocator(), &.{case.command}, .lua);
+        try testing.expectEqualStrings(case.lua, lua[0]);
+        // A ";" would split the call in two in a batch.
+        try testing.expect(std.mem.findScalar(u8, lua[0], ';') == null);
+    }
+}
+
+test "the probe's reply tells a Lua config from a hyprlang one" {
+    try testing.expectEqualStrings("dispatch hl.dsp.no_op()", lua_probe);
+    try testing.expectEqual(Syntax.lua, syntaxFromProbe("ok"));
+    try testing.expectEqual(Syntax.hyprlang, syntaxFromProbe("Invalid dispatcher"));
+    try testing.expectEqual(Syntax.hyprlang, syntaxFromProbe("unknown request"));
+    try testing.expectEqual(Syntax.hyprlang, syntaxFromProbe(""));
+
+    var cache: SyntaxCache = .{};
+    try testing.expect(cache.get("a_1") == null);
+    cache.put("a_1", .lua);
+    try testing.expectEqual(Syntax.lua, cache.get("a_1").?);
+    // Another instance (Hyprland restarted) is asked again.
+    try testing.expect(cache.get("b_2") == null);
 }
 
 test "garbage or a changed shape does not crash" {
@@ -1084,6 +1398,9 @@ test "batch flushes queued commands before overflowing and afterFocusChange upda
 test "isAllOk accepts concatenated ok replies and rejects errors" {
     try testing.expect(isAllOk("ok"));
     try testing.expect(isAllOk("okokok\n"));
+    try testing.expect(isAllOk("ok\n\n\nok\n"));
+    try testing.expect(!isAllOk("ok\n\n\nerror: 3 [string \"return hl.dispatch(x)\"]"));
+    try testing.expect(!isAllOk("\n"));
     try testing.expect(!isAllOk(""));
     try testing.expect(!isAllOk("o"));
     try testing.expect(!isAllOk("Invalid dispatcher"));
