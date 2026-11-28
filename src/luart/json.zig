@@ -1,14 +1,14 @@
 //! `lumen.json`: JSON text to Lua values and back.
 //!
 //! null becomes nil (absent in objects, a hole in arrays). A table encodes
-//! as an array when it has a sequence part (`#t > 0`), else as an object
-//! with string keys; `{}` encodes as `{}`. Strings are bytes in Lua: what
+//! as an array when it has a sequence part (`#t > 0`) and only integer keys
+//! in `1..#t`, else as an object with string keys when `#t == 0`; mixed tables
+//! fail cleanly, and `{}` encodes as `{}`. Strings are bytes in Lua: what
 //! is not UTF-8 encodes as U+FFFD, so the text always decodes again.
 //!
 //! Both run in Zig, where the state's memory cap and instruction hook do
-//! not reach: the memory they take outside the state is capped at what is
-//! left under its cap (the result has to fit in there anyway), and a long
-//! encode checks the deadline itself.
+//! not reach: the memory they take outside the state is charged directly to
+//! the state's live budget, and both check the deadline incrementally.
 
 const std = @import("std");
 const lua = @import("lua.zig");
@@ -16,22 +16,67 @@ const c = lua.c;
 
 const depth_max = 200;
 
+/// Scanner wrapper checking `lua.pastDeadline` incrementally so deeply
+/// duplicated JSON keys or huge token streams cannot overrun the deadline.
+const DeadlineScanner = struct {
+    inner: *std.json.Scanner,
+    L: *lua.State,
+    tokens_count: u32 = 0,
+
+    const tokens_per_deadline_check = 4096;
+
+    pub const NextError = std.json.Scanner.NextError || error{TimedOut};
+    pub const PeekError = std.json.Scanner.PeekError;
+    pub const AllocError = std.json.Scanner.AllocError || error{TimedOut};
+
+    pub fn next(self: *DeadlineScanner) NextError!std.json.Token {
+        self.tokens_count +%= 1;
+        if (self.tokens_count % tokens_per_deadline_check == 0 and lua.pastDeadline(self.L)) {
+            return error.TimedOut;
+        }
+        return self.inner.next();
+    }
+
+    pub fn nextAllocMax(
+        self: *DeadlineScanner,
+        allocator: std.mem.Allocator,
+        when: std.json.AllocWhen,
+        max_value_len: usize,
+    ) AllocError!std.json.Token {
+        self.tokens_count +%= 1;
+        if (self.tokens_count % tokens_per_deadline_check == 0 and lua.pastDeadline(self.L)) {
+            return error.TimedOut;
+        }
+        return self.inner.nextAllocMax(allocator, when, max_value_len);
+    }
+};
+
 /// `lumen.json.decode(text)`: pushes the decoded value. Parsing allocates
 /// from `gpa`, freed before returning; the push runs under `tryCall`.
 pub fn decode(L: *lua.State, gpa: std.mem.Allocator, text: []const u8) lua.Error!void {
+    if (lua.pastDeadline(L)) return lua.fail(L, "timed out", .{});
     const status = blk: {
         var capped: lua.Capped = .chargedTo(L, gpa);
-        var parsed = std.json.parseFromSlice(
+        var scanner = std.json.Scanner.initCompleteInput(capped.allocator(), text);
+        defer scanner.deinit();
+        var deadline_scanner: DeadlineScanner = .{ .inner = &scanner, .L = L };
+        var parsed = std.json.parseFromTokenSource(
             std.json.Value,
             capped.allocator(),
-            text,
-            .{ .duplicate_field_behavior = .use_last },
-        ) catch |err|
+            &deadline_scanner,
+            .{
+                .duplicate_field_behavior = .use_last,
+                .max_value_len = text.len,
+                .allocate = .alloc_if_needed,
+            },
+        ) catch |err| {
+            if (err == error.TimedOut) return lua.fail(L, "timed out", .{});
             return lua.fail(L, "json.decode: {s}", .{switch (err) {
                 error.OutOfMemory => "out of memory",
                 error.SyntaxError, error.UnexpectedEndOfInput => "invalid JSON",
                 else => @errorName(err),
             }});
+        };
         defer parsed.deinit();
         var decoder: Decoder = .{ .root = parsed.value };
         break :blk lua.tryCall(L, Decoder, &decoder, Decoder.run, 0, 1);
@@ -97,10 +142,11 @@ const Decoder = struct {
 /// `lumen.json.encode(value)`: encodes the value at `index` and pushes the
 /// text. The walk runs under `tryCall`; the buffer is freed either way.
 pub fn encode(L: *lua.State, gpa: std.mem.Allocator, index: c_int) lua.Error!void {
+    if (lua.pastDeadline(L)) return lua.fail(L, "timed out", .{});
     // Shared tables are written once per reference: `t = {t, t}` forty
     // times over is 2^40 values in a few bytes of Lua.
     const status: lua.TryCallResult = blk: {
-        var capped: lua.Capped = .leftIn(L, gpa);
+        var capped: lua.Capped = .chargedTo(L, gpa);
         var output: std.Io.Writer.Allocating = .init(capped.allocator());
         defer output.deinit();
         var encoder: Encoder = .{ .writer = &output.writer };
@@ -138,13 +184,17 @@ const Encoder = struct {
         encoder.value(L, lua.trampoline_first_argument, 0);
     }
 
-    fn value(encoder: *Encoder, L: *lua.State, index: c_int, depth: usize) void {
-        if (depth > depth_max) lua.raise(L, "json.encode: nested too deeply (a cycle?)", .{});
-        if (c.lua_checkstack(L, 3) == 0) lua.raise(L, "json.encode: nested too deeply", .{});
+    fn countValue(encoder: *Encoder, L: *lua.State) void {
         encoder.values_count +%= 1;
         if (encoder.values_count % values_per_deadline_check == 0 and lua.pastDeadline(L)) {
             lua.raise(L, "timed out", .{});
         }
+    }
+
+    fn value(encoder: *Encoder, L: *lua.State, index: c_int, depth: usize) void {
+        if (depth > depth_max) lua.raise(L, "json.encode: nested too deeply (a cycle?)", .{});
+        if (c.lua_checkstack(L, 3) == 0) lua.raise(L, "json.encode: nested too deeply", .{});
+        encoder.countValue(L);
         const mark: lua.StackMark = .init(L);
         encoder.write(L, index, depth) catch lua.raise(L, "json.encode: not enough memory", .{});
         mark.expectPushed(L, 0);
@@ -172,17 +222,42 @@ const Encoder = struct {
                 }
                 try writer.print("{d}", .{number});
             },
-            c.LUA_TSTRING => try writeString(writer, lua.toSlice(L, index).?),
+            c.LUA_TSTRING => try writeString(L, writer, lua.toSlice(L, index).?),
             c.LUA_TTABLE => {
                 const table = lua.absIndex(L, index);
                 const items_count = c.lua_rawlen(L, table);
                 if (items_count > 0) {
+                    encoder.ensurePureArray(L, table, items_count);
                     try encoder.writeArray(L, table, items_count, depth);
                 } else {
                     try encoder.writeObject(L, table, depth);
                 }
             },
             else => lua.raise(L, "json.encode: cannot encode a {s}", .{lua.typeName(L, index)}),
+        }
+    }
+
+    /// Rejects mixed tables (`{ "item", label = "x" }` or sparse keys outside `1..items_count`)
+    /// so JSON encoding never silently drops keys.
+    fn ensurePureArray(encoder: *Encoder, L: *lua.State, table: c_int, items_count: u64) void {
+        if (c.lua_checkstack(L, 2) == 0) lua.raise(L, "json.encode: nested too deeply", .{});
+        c.lua_pushnil(L);
+        while (c.lua_next(L, table) != 0) {
+            encoder.countValue(L);
+            if (c.lua_type(L, -2) != c.LUA_TNUMBER or c.lua_isinteger(L, -2) == 0) {
+                lua.pop(L, 2);
+                lua.raise(L, "json.encode: cannot encode mixed table (array and object keys)", .{});
+            }
+            const key = c.lua_tointegerx(L, -2, null);
+            if (key < 1 or @as(u64, @intCast(key)) > items_count) {
+                lua.pop(L, 2);
+                lua.raise(
+                    L,
+                    "json.encode: cannot encode mixed table (array and non-sequence keys)",
+                    .{},
+                );
+            }
+            lua.pop(L, 1);
         }
     }
 
@@ -226,7 +301,7 @@ const Encoder = struct {
             }
             if (!first) try encoder.writer.writeByte(',');
             first = false;
-            try writeString(encoder.writer, key);
+            try writeString(L, encoder.writer, key);
             try encoder.writer.writeByte(':');
             encoder.value(L, -1, depth + 1);
             // Pops the value; `lua_next` takes the key off next.
@@ -239,27 +314,33 @@ const Encoder = struct {
 /// `text` as a JSON string, each byte that does not start a valid UTF-8
 /// sequence as U+FFFD: std.json, like any JSON reader, refuses text that
 /// is not UTF-8, and storage.json written that way could not be read back.
-fn writeString(writer: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
+fn writeString(L: *lua.State, writer: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
     try writer.writeByte('"');
+    const chunk_bytes = 64 << 10;
     var start: usize = 0;
+    var checked_at: usize = 0;
     while (start < text.len) {
-        const end = validUtf8End(text, start);
-        try std.json.Stringify.encodeJsonStringChars(text[start..end], .{}, writer);
-        if (end < text.len) {
-            try writer.writeAll("\u{FFFD}");
-            start = end + 1;
-        } else {
+        if (start - checked_at >= chunk_bytes) {
+            checked_at = start;
+            if (lua.pastDeadline(L)) lua.raise(L, "timed out", .{});
+        }
+        const end = validUtf8End(text, start, start +| chunk_bytes);
+        if (end > start) {
+            try std.json.Stringify.encodeJsonStringChars(text[start..end], .{}, writer);
             start = end;
+        } else {
+            try writer.writeAll("\u{FFFD}");
+            start += 1;
         }
     }
     try writer.writeByte('"');
 }
 
-/// Where the valid UTF-8 that starts at `start` ends: the first byte that
-/// does not start a valid sequence, or the end of `text`.
-fn validUtf8End(text: []const u8, start: usize) usize {
+/// Where the valid UTF-8 that starts at `start` ends (capped at `limit`):
+/// the first byte that does not start a valid sequence, `limit`, or `text.len`.
+fn validUtf8End(text: []const u8, start: usize, limit: usize) usize {
     var end = start;
-    while (end < text.len) {
+    while (end < text.len and end < limit) {
         if (text[end] < 0x80) {
             end += 1;
             continue;
@@ -413,5 +494,58 @@ test "json.decode shares Lua Budget across parse tree and pushed Lua values" {
     try testing.expect(
         std.mem.find(u8, message, "out of memory") != null or
             std.mem.find(u8, message, "not enough memory") != null,
+    );
+}
+
+test "json.encode rejects mixed tables so array encoding never drops keys" {
+    try expectError("json.encode({ 'item', label = 'user label' })", "mixed table");
+    try expectError("json.encode({ [1] = 'a', [0] = 'z' })", "mixed table");
+    try expectError("json.encode({ [1] = 'a', [100] = 'far' })", "mixed table");
+    try expectOk(
+        \\assert(json.encode({ 1, nil, 3 }) == '[1,null,3]')
+        \\assert(json.encode({ [1] = 'a', [2] = 'b' }) == '["a","b"]')
+        \\assert(json.encode({ a = 1, b = 2 }) ~= nil)
+    );
+}
+
+test "json.decode and json.encode stop at the deadline on huge duplicate keys and long strings" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+
+    var decode_budget: lua.Budget = .{ .bytes_max = 1 << 30 };
+    decode_budget.deadline_ns = os.monotonicNs() + 40 * std.time.ns_per_ms;
+    const decode_start_ns = os.monotonicNs();
+    const decode_msg = (try runIn(
+        &decode_budget,
+        "local s = '{' .. string.rep('\"a\":1,', 100000) .. '\"a\":1}' while true do json.decode(s) end",
+    )).?;
+    defer testing.allocator.free(decode_msg);
+    try testing.expect(std.mem.find(u8, decode_msg, "timed out") != null);
+    try testing.expect(os.monotonicNs() - decode_start_ns < 2 * std.time.ns_per_s);
+
+    var encode_budget: lua.Budget = .{ .bytes_max = 1 << 30 };
+    encode_budget.deadline_ns = os.monotonicNs() + 40 * std.time.ns_per_ms;
+    const encode_start_ns = os.monotonicNs();
+    const encode_msg = (try runIn(
+        &encode_budget,
+        "local s = string.rep('\\x01', 2000000) while true do pcall(json.encode, s) end",
+    )).?;
+    defer testing.allocator.free(encode_msg);
+    try testing.expect(std.mem.find(u8, encode_msg, "timed out") != null);
+    try testing.expect(os.monotonicNs() - encode_start_ns < 2 * std.time.ns_per_s);
+}
+
+test "json.encode shares Lua Budget across output buffer and pushed Lua string" {
+    var budget: lua.Budget = .{ .bytes_max = 256 << 10 };
+    const message = (try runIn(&budget,
+        \\local hold = string.rep("x", 100000)
+        \\local big = string.rep("a", 90000)
+        \\json.encode(big)
+        \\assert(hold)
+    )).?;
+    defer testing.allocator.free(message);
+    try testing.expect(
+        std.mem.find(u8, message, "not enough memory") != null or
+            std.mem.find(u8, message, "out of memory") != null,
     );
 }

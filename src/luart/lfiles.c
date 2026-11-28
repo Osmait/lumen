@@ -21,10 +21,12 @@
 #include "lualib.h"
 
 /* In src/luart/lua.zig: take a slot (0 when none is left), give it back,
-** and verify the opened descriptor is not a FIFO, device or procfs mem. */
+** verify the opened descriptor is not a FIFO, device or procfs mem, and
+** check whether the Lua state has passed its execution deadline. */
 int luart_file_opened (lua_State *L);
 void luart_file_closed (lua_State *L);
 int luart_fd_allowed (int fd);
+int luart_match_timed_out (lua_State *L);
 
 /* What liolib's 'l_checkmode' accepts: [rwa]%+?b* */
 static int valid_mode (const char *mode) {
@@ -159,7 +161,139 @@ static int luart_io_tmpfile (lua_State *L) {
   return 1;
 }
 
-/* Replaces io.open and io.tmpfile with these. */
+typedef struct {
+  lua_State *L;
+  int fd;
+  int read_errno;
+  int timed_out;
+  int first_chunk;
+  char buf[4096];
+} LoadFileReader;
+
+static ssize_t read_load_chunk (LoadFileReader *r) {
+  for (;;) {
+    if (luart_match_timed_out(r->L)) {
+      r->timed_out = 1;
+      return -1;
+    }
+    ssize_t n = read(r->fd, r->buf, sizeof(r->buf));
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      r->read_errno = errno;
+      return -1;
+    }
+    return n;
+  }
+}
+
+static const char *loadfile_reader (lua_State *L, void *ud, size_t *size) {
+  (void)L;
+  LoadFileReader *r = (LoadFileReader *)ud;
+  if (r->timed_out || r->read_errno != 0) {
+    *size = 0;
+    return NULL;
+  }
+  for (;;) {
+    ssize_t n = read_load_chunk(r);
+    if (n <= 0) {
+      *size = 0;
+      return NULL;
+    }
+    size_t start = 0;
+    size_t len = (size_t)n;
+    if (r->first_chunk) {
+      r->first_chunk = 0;
+      if (len >= 3 &&
+          (unsigned char)r->buf[0] == 0xEF &&
+          (unsigned char)r->buf[1] == 0xBB &&
+          (unsigned char)r->buf[2] == 0xBF) {
+        start = 3;
+      }
+      if (start < len && r->buf[start] == '#') {
+        /* Keep the leading '\n' so Lua line numbers match the file. */
+        char *nl = memchr(r->buf + start, '\n', len - start);
+        while (nl == NULL) {
+          ssize_t next_n = read_load_chunk(r);
+          if (next_n <= 0) {
+            *size = 0;
+            return NULL;
+          }
+          len = (size_t)next_n;
+          nl = memchr(r->buf, '\n', len);
+        }
+        start = (size_t)(nl - r->buf);
+      }
+    }
+    if (start < len) {
+      *size = len - start;
+      return r->buf + start;
+    }
+  }
+}
+
+static int luart_loadfile (lua_State *L) {
+  const char *filename = luaL_checkstring(L, 1);
+  if (luart_match_timed_out(L)) return luaL_error(L, "timed out");
+  const char *mode = luaL_optstring(L, 2, "t");
+  if (strcmp(mode, "t") != 0) {
+    luaL_pushfail(L);
+    lua_pushliteral(L, "loadfile: binary chunks are not allowed");
+    return 2;
+  }
+  int has_env = !lua_isnone(L, 3);
+  /* Allocate chunkname before opening fd so a Lua OOM longjmp cannot leak it. */
+  const char *chunkname = lua_pushfstring(L, "@%s", filename);
+  int fd = open(filename, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOCTTY);
+  if (fd < 0) {
+    int saved_errno = errno;
+    if (saved_errno == ENXIO) {
+      return luaL_error(
+          L,
+          "%s: not a regular file (Lumen does not open FIFOs, sockets, devices or a process's memory)",
+          filename);
+    }
+    luaL_pushfail(L);
+    lua_pushfstring(L, "cannot open %s: %s", filename, strerror(saved_errno));
+    return 2;
+  }
+  if (!luart_fd_allowed(fd)) {
+    close(fd);
+    return luaL_error(
+        L,
+        "%s: not a regular file (Lumen does not open FIFOs, sockets, devices or a process's memory)",
+        filename);
+  }
+  int fl = fcntl(fd, F_GETFL);
+  if (fl != -1) fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+  LoadFileReader reader = {
+    .L = L,
+    .fd = fd,
+    .read_errno = 0,
+    .timed_out = 0,
+    .first_chunk = 1,
+  };
+  int status = lua_load(L, loadfile_reader, &reader, chunkname, "t");
+  close(fd);
+  if (reader.timed_out) return luaL_error(L, "timed out");
+  if (reader.read_errno != 0) {
+    lua_pop(L, 1);
+    luaL_pushfail(L);
+    lua_pushfstring(L, "cannot read %s: %s", filename, strerror(reader.read_errno));
+    return 2;
+  }
+  if (status != LUA_OK) {
+    luaL_pushfail(L);
+    lua_insert(L, -2);
+    return 2;
+  }
+  if (has_env) {
+    lua_pushvalue(L, 3);
+    if (lua_setupvalue(L, -2, 1) == NULL) lua_pop(L, 1);
+  }
+  return 1;
+}
+
+/* Replaces io.open, io.tmpfile and loadfile with these. */
 int luart_open_files (lua_State *L) {
   static const luaL_Reg files[] = {
     {"open", luart_io_open},
@@ -169,6 +303,8 @@ int luart_open_files (lua_State *L) {
   lua_getglobal(L, "io");
   luaL_setfuncs(L, files, 0);
   lua_pop(L, 1);
+  lua_pushcfunction(L, luart_loadfile);
+  lua_setglobal(L, "loadfile");
   return 0;
 }
 

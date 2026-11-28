@@ -63,10 +63,47 @@ pub const WorkerCommand = struct {
     spec_reference: c_int,
     mode: Mode,
     answers_root_search: bool,
-    /// The list its last `items` or `search` returned; null before one.
-    list_kept: ?Kept = null,
-    /// The list its last `root` returned; null before one.
-    root_search_kept: ?Kept = null,
+    /// Recent `items` / `search` row lists kept alive so navigating back to a
+    /// cached UI query can still invoke its Lua row actions.
+    list_kept: KeptRing = .{},
+    /// Recent `root` row lists kept alive for the same reason.
+    root_search_kept: KeptRing = .{},
+};
+
+pub const kept_ring_len = 4;
+
+/// Small fixed ring of kept Lua row lists keyed by `list_generation`.
+pub const KeptRing = struct {
+    entries: [kept_ring_len]?Kept = @splat(null),
+    next: usize = 0,
+
+    pub fn push(
+        ring: *KeptRing,
+        L: *lua.State,
+        rows: c_int,
+        list_generation: RequestGeneration,
+    ) void {
+        if (ring.entries[ring.next]) |old| {
+            lua.unref(L, old.reference);
+            // `ref` below may raise: no reference to a freed slot is left.
+            ring.entries[ring.next] = null;
+        }
+        lua.c.lua_pushvalue(L, rows);
+        ring.entries[ring.next] = .{
+            .reference = lua.ref(L),
+            .list_generation = list_generation,
+        };
+        ring.next = (ring.next + 1) % kept_ring_len;
+    }
+
+    pub fn find(ring: *const KeptRing, list_generation: RequestGeneration) ?Kept {
+        for (ring.entries) |maybe_kept| {
+            if (maybe_kept) |kept| {
+                if (kept.list_generation == list_generation) return kept;
+            }
+        }
+        return null;
+    }
 };
 
 /// A Lua list kept alive in the registry so that its rows' actions can run
@@ -105,11 +142,15 @@ pub const Pending = struct {
     }
 
     pub fn destroyOperations(pending: *Pending, gpa: std.mem.Allocator) void {
-        for (pending.operations[0..pending.operations_len]) |op| switch (op) {
+        pending.destroyOperationsFrom(gpa, 0);
+    }
+
+    pub fn destroyOperationsFrom(pending: *Pending, gpa: std.mem.Allocator, start: usize) void {
+        for (pending.operations[start..pending.operations_len]) |op| switch (op) {
             .act => {},
             .submit => |request| request.destroy(gpa),
         };
-        pending.operations_len = 0;
+        pending.operations_len = start;
     }
 };
 
@@ -294,21 +335,10 @@ const ListContext = struct {
             .command = context.request.command,
             .extension_id = context.extension.id,
         }, Host.items_max);
-        // Only replace the previously kept list once `parseItems` succeeded.
-        keep(L, &context.worker_command.list_kept, rows, context.request.request_generation);
+        // Only replace the oldest kept list once `parseItems` succeeded.
+        context.worker_command.list_kept.push(L, rows, context.request.request_generation);
     }
 };
-
-/// Keeps the list at `rows` for its rows' actions, until the next one.
-fn keep(L: *lua.State, kept: *?Kept, rows: c_int, list_generation: RequestGeneration) void {
-    if (kept.*) |old| {
-        lua.unref(L, old.reference);
-        // `ref` below may raise: no reference to a freed slot is left.
-        kept.* = null;
-    }
-    lua.c.lua_pushvalue(L, rows);
-    kept.* = .{ .reference = lua.ref(L), .list_generation = list_generation };
-}
 
 pub fn rootSearchExecute(host: *Host, request: *const RootSearchRequest) void {
     const result = host.answerCreate(RootResult, "root", .{
@@ -409,8 +439,8 @@ const RootSearchContext = struct {
             .from_root_search = true,
             .extension_id = context.extension.id,
         }, Host.root_search_items_max);
-        // Only replace the previously kept list once `parseItems` succeeded.
-        keep(L, &context.worker_command.root_search_kept, rows, context.request.request_generation);
+        // Only replace the oldest kept list once `parseItems` succeeded.
+        context.worker_command.root_search_kept.push(L, rows, context.request.request_generation);
     }
 };
 
@@ -552,13 +582,12 @@ fn pushRowAction(
     worker_command: *const WorkerCommand,
     row_action: ActRequest.RowAction,
 ) void {
-    const kept_or_null = if (row_action.from_root_search)
-        worker_command.root_search_kept
+    const ring = if (row_action.from_root_search)
+        &worker_command.root_search_kept
     else
-        worker_command.list_kept;
+        &worker_command.list_kept;
     const list_changed = "the list changed meanwhile; try again";
-    const kept = kept_or_null orelse lua.raise(L, list_changed, .{});
-    if (kept.list_generation != row_action.list_generation) lua.raise(L, list_changed, .{});
+    const kept = ring.find(row_action.list_generation) orelse lua.raise(L, list_changed, .{});
     _ = lua.pushRef(L, kept.reference);
     const rows = lua.absIndex(L, -1);
     if (lua.c.lua_rawgeti(L, rows, @intCast(row_action.row_index + 1)) != lua.c.LUA_TTABLE) {

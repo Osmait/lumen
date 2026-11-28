@@ -458,11 +458,11 @@ fn post(
 /// Waits up to `timeout_ms` for the initial registry load during startup and
 /// takes the newest pending `.registry` delivery directly (removing its idle source).
 pub fn takePendingRegistry(host: *Host, timeout_ms: u64) ?*Registry {
-    const deadline_ns = os.monotonicNs() +| timeout_ms * std.time.ns_per_ms;
+    const deadline_ns = os.monotonicNs() +| (timeout_ms *| std.time.ns_per_ms);
     while (!host.initial_registry_ready.load(.acquire)) {
         if (host.stop.load(.acquire)) return null;
         if (os.monotonicNs() >= deadline_ns) return null;
-        os.sleepUs(5 * std.time.ns_per_ms);
+        os.sleepUs(5 * std.time.us_per_ms);
     }
     const isRegistry = struct {
         fn match(answer: Answer) bool {
@@ -491,13 +491,25 @@ fn run(host: *Host) void {
     var wake_sequence_seen: u32 = 0;
     while (host.waitForWork(wake_sequence_seen)) |wake_sequence| {
         wake_sequence_seen = wake_sequence;
-        const pending = host.pendingTake();
+        var pending = host.pendingTake();
+        if (host.stop.load(.acquire)) {
+            pending.destroyOperations(host.gpa);
+            break;
+        }
         if (pending.reload) loading.reloadExecute(host);
-        for (pending.operations[0..pending.operations_len]) |op| switch (op) {
-            .act => |request| requests.actExecute(host, request),
-            .submit => |request| requests.submitExecute(host, request),
-        };
+        for (pending.operations[0..pending.operations_len], 0..) |op, index| {
+            if (host.stop.load(.acquire)) {
+                pending.destroyOperationsFrom(host.gpa, index);
+                return;
+            }
+            switch (op) {
+                .act => |request| requests.actExecute(host, request),
+                .submit => |request| requests.submitExecute(host, request),
+            }
+        }
+        if (host.stop.load(.acquire)) break;
         if (pending.list) |request| requests.listExecute(host, &request);
+        if (host.stop.load(.acquire)) break;
         if (pending.root_search) |request| requests.rootSearchExecute(host, &request);
     }
 }
@@ -508,6 +520,7 @@ fn waitForWork(host: *Host, wake_sequence_seen: u32) ?u32 {
     while (true) {
         if (host.stop.load(.acquire)) return null;
         const wake_sequence = host.wake_sequence.load(.acquire);
+        if (host.stop.load(.acquire)) return null;
         if (wake_sequence != wake_sequence_seen) return wake_sequence;
         host.io.futexWaitUncancelable(u32, &host.wake_sequence.raw, wake_sequence_seen);
     }
@@ -853,9 +866,11 @@ test "extensions load, list, search and run actions" {
     defer none.destroy(testing.allocator);
     try testing.expectEqual(@as(usize, 0), none.sections.len);
 
-    // An action against a list that has been replaced is refused.
-    _ = host.list(registry.generation, .from(1), "");
-    (try probe.take("list")).destroy(testing.allocator);
+    // An action against a list evicted from the kept ring is refused.
+    for (0..requests.kept_ring_len) |_| {
+        _ = host.list(registry.generation, .from(1), "");
+        (try probe.take("list")).destroy(testing.allocator);
+    }
     _ = host.act(registry.generation, .from(1), .{ .row_action = .{
         .from_root_search = false,
         .list_generation = fruits.generation,
@@ -1441,8 +1456,10 @@ test "takePendingRegistry waits for initial load even with load problems" {
     const host = try testHost(&probe, folder);
     defer host.shutdown();
     host.reload();
+    const start_ns = os.monotonicNs();
     const registry = host.takePendingRegistry(5000) orelse return error.TestUnexpectedResult;
     defer registry.destroy(testing.allocator);
+    try testing.expect(os.monotonicNs() - start_ns < std.time.ns_per_s);
     try testing.expectEqual(@as(usize, 1), registry.commands.len);
     try testing.expectEqual(@as(usize, 1), registry.problems.len);
 }
@@ -1482,4 +1499,300 @@ test "plain-table extensions keep numeric preference defaults coerced to string"
     try testing.expect(listed.error_message == null);
     try testing.expectEqualStrings("5", listed.items[0].title);
     try testing.expectEqualStrings("string", listed.items[1].title);
+}
+
+test "lumen.storage.set rejects mixed tables and preserves previous value on disk and in memory" {
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const folder = try os.tmpDirPath(&test_dir, &path_buffer);
+    try writeTestFile(folder, "extensions/store/init.lua",
+        \\local lumen = require("lumen")
+        \\return lumen.extension {
+        \\  commands = {
+        \\    { name = "save_valid", title = "Save valid", run = function()
+        \\        lumen.storage.set("items", { "item" })
+        \\    end },
+        \\    { name = "save_mixed", title = "Save mixed", run = function()
+        \\        lumen.storage.set("items", { "item", label = "user label" })
+        \\    end },
+        \\    { name = "read", title = "Read", items = function()
+        \\        local v = lumen.storage.get("items")
+        \\        return { v and v[1] or "none", v and v.label or "no-label" }
+        \\    end },
+        \\  },
+        \\}
+    );
+
+    var probe: Probe = .{};
+    defer probe.deinit();
+    const host = try testHost(&probe, folder);
+    defer host.shutdown();
+    host.reload();
+    try probe.wait("registry");
+    const registry = probe.registry.?;
+
+    _ = host.act(registry.generation, .from(0), .command_run);
+    const valid_act = try probe.take("act");
+    defer valid_act.destroy(testing.allocator);
+    try testing.expect(valid_act.error_message == null);
+
+    _ = host.act(registry.generation, .from(1), .command_run);
+    const mixed_act = try probe.take("act");
+    defer mixed_act.destroy(testing.allocator);
+    try testing.expect(mixed_act.error_message != null);
+    try testing.expect(std.mem.find(u8, mixed_act.error_message.?, "mixed table") != null);
+
+    _ = host.list(registry.generation, .from(2), "");
+    const listed = try probe.take("list");
+    defer listed.destroy(testing.allocator);
+    try testing.expect(listed.error_message == null);
+    try testing.expectEqualStrings("item", listed.items[0].title);
+    try testing.expectEqualStrings("no-label", listed.items[1].title);
+}
+
+test "row actions still work after switching back to an earlier cached list or root search" {
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const folder = try os.tmpDirPath(&test_dir, &path_buffer);
+    try writeTestFile(folder, "extensions/cached/init.lua",
+        \\local lumen = require("lumen")
+        \\local picked = "none"
+        \\return lumen.extension {
+        \\  commands = {
+        \\    { name = "find", title = "Find", search = function(q)
+        \\        return { { title = q, actions = { { title = "Pick", run = function(row) picked = row.title end } } } }
+        \\    end },
+        \\    { name = "check", title = "Check", items = function() return { picked } end },
+        \\    { name = "rootfind", title = "Root", root = function(q)
+        \\        return { { title = "r:" .. q, actions = { { title = "Pick", run = function(row) picked = row.title end } } } }
+        \\    end },
+        \\  },
+        \\}
+    );
+
+    var probe: Probe = .{};
+    defer probe.deinit();
+    const host = try testHost(&probe, folder);
+    defer host.shutdown();
+    host.reload();
+    try probe.wait("registry");
+    const registry = probe.registry.?;
+
+    // Search G1 ("ab"), then overwrite latest in worker with G2 ("abc") as if UI dropped G2.
+    const g1 = host.list(registry.generation, .from(0), "ab");
+    const l1 = try probe.take("list");
+    defer l1.destroy(testing.allocator);
+    try testing.expectEqual(g1, l1.generation);
+
+    const g2 = host.list(registry.generation, .from(0), "abc");
+    const l2 = try probe.take("list");
+    defer l2.destroy(testing.allocator);
+    try testing.expectEqual(g2, l2.generation);
+
+    // Row action against G1 still finds G1 in WorkerCommand's kept ring.
+    _ = host.act(registry.generation, .from(0), .{ .row_action = .{
+        .from_root_search = false,
+        .list_generation = g1,
+        .row_index = 0,
+        .action_index = 0,
+    } });
+    const a1 = try probe.take("act");
+    defer a1.destroy(testing.allocator);
+    try testing.expect(a1.error_message == null);
+
+    // Root search RG1 ("2"), then overwrite with RG2 ("3"), then act on RG1.
+    const rg1 = host.root(registry.generation, "2");
+    const r1 = try probe.take("root");
+    defer r1.destroy(testing.allocator);
+    try testing.expectEqual(rg1, r1.generation);
+
+    const rg2 = host.root(registry.generation, "3");
+    const r2 = try probe.take("root");
+    defer r2.destroy(testing.allocator);
+    try testing.expectEqual(rg2, r2.generation);
+
+    _ = host.act(registry.generation, .from(2), .{ .row_action = .{
+        .from_root_search = true,
+        .list_generation = rg1,
+        .row_index = 0,
+        .action_index = 0,
+    } });
+    const a2 = try probe.take("act");
+    defer a2.destroy(testing.allocator);
+    try testing.expect(a2.error_message == null);
+
+    _ = host.list(registry.generation, .from(1), "");
+    const checked = try probe.take("list");
+    defer checked.destroy(testing.allocator);
+    try testing.expectEqualStrings("r:2", checked.items[0].title);
+}
+
+test "lumen.exec enforces 16 MB output cap with kill and stops at extension deadline or stop" {
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const folder = try os.tmpDirPath(&test_dir, &path_buffer);
+    try writeTestFile(folder, "extensions/execs/init.lua",
+        \\local lumen = require("lumen")
+        \\return lumen.extension {
+        \\  commands = {
+        \\    { name = "big", title = "Big", items = function()
+        \\        local out, err_or_code = lumen.exec({ "sh", "-c", "head -c 17000000 /dev/zero | tr '\\0' x" })
+        \\        return { tostring(out), tostring(err_or_code) }
+        \\    end },
+        \\    { name = "opt_timeout", title = "OptTimeout", items = function()
+        \\        local out, why = lumen.exec({ "sleep", "1" }, { timeout = 0.02 })
+        \\        return { tostring(out), tostring(why) }
+        \\    end },
+        \\    { name = "loop_timeout", title = "LoopTimeout", run = function()
+        \\        for _ = 1, 2000 do
+        \\          lumen.exec({ "sleep", "1" }, { timeout = 0.05 })
+        \\        end
+        \\    end },
+        \\  },
+        \\}
+    );
+
+    var probe: Probe = .{};
+    defer probe.deinit();
+    const host = try testHost(&probe, folder);
+    defer host.shutdown();
+    host.reload();
+    try probe.wait("registry");
+    const registry = probe.registry.?;
+
+    _ = host.list(registry.generation, .from(0), "");
+    const big = try probe.take("list");
+    defer big.destroy(testing.allocator);
+    try testing.expect(big.error_message == null);
+    try testing.expectEqualStrings("nil", big.items[0].title);
+    try testing.expect(std.mem.find(u8, big.items[1].title, "output past 16 MB") != null);
+
+    _ = host.list(registry.generation, .from(1), "");
+    const opt_to = try probe.take("list");
+    defer opt_to.destroy(testing.allocator);
+    try testing.expect(opt_to.error_message == null);
+    try testing.expectEqualStrings("nil", opt_to.items[0].title);
+    try testing.expect(std.mem.find(u8, opt_to.items[1].title, "timed out") != null);
+
+    // Stopping host cancels in-flight loop_timeout quickly instead of running 2000 spawns.
+    const start_ns = os.monotonicNs();
+    _ = host.act(registry.generation, .from(2), .command_run);
+    os.sleepUs(80 * std.time.us_per_ms);
+    host.stop.store(true, .release);
+    host.wake();
+    try testing.expect(host.waitWorkerDone());
+    try testing.expect(os.monotonicNs() - start_ns < 2 * std.time.ns_per_s);
+}
+
+test "lumen.exec stops at extension deadline without continuing child spawns" {
+    const lua = @import("luart").lua;
+    const api = @import("api.zig");
+
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const folder = try os.tmpDirPath(&test_dir, &path_buffer);
+    var config_buffer: [4096]u8 = undefined;
+    const config_dir = try std.mem.printSentinel(&config_buffer, "{s}", .{folder}, 0);
+    var data_buffer: [4096]u8 = undefined;
+    const data_dir = try std.mem.printSentinel(&data_buffer, "{s}/data", .{folder}, 0);
+
+    var local_host: Host = .{
+        .gpa = testing.allocator,
+        .io = testing.io,
+        .config_dir = config_dir,
+        .data_dir = data_dir,
+        .callbacks = undefined,
+        .worker_arena = .init(testing.allocator),
+    };
+    defer local_host.worker_arena.deinit();
+
+    const extension = Extension.create(&local_host, "deadline", folder) orelse
+        return error.OutOfMemory;
+    defer extension.destroy();
+
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const Handler = struct {
+        extension: *Extension,
+        fn setup(L: *lua.State, self: *@This()) void {
+            lua.openLibs(L);
+            api.install(L, self.extension);
+        }
+        fn runLoop(L: *lua.State, _: *@This()) void {
+            const code: [:0]const u8 =
+                \\local lumen = require("lumen")
+                \\for _ = 1, 2000 do
+                \\  lumen.exec({ "sleep", "1" }, { timeout = 0.02 })
+                \\end
+            ;
+            if (lua.c.luaL_loadstring(L, code.ptr) != lua.c.LUA_OK) _ = lua.c.lua_error(L);
+            lua.c.lua_callk(L, 0, 0, 0, null);
+        }
+    };
+    var handler: Handler = .{ .extension = extension };
+    if (extension.run(arena, 5 * std.time.ns_per_s, Handler, &handler, Handler.setup)) |err| {
+        std.debug.print("{s}\n", .{err});
+        return error.TestUnexpectedResult;
+    }
+
+    const start_ns = os.monotonicNs();
+    const message = extension.run(
+        arena,
+        80 * std.time.ns_per_ms,
+        Handler,
+        &handler,
+        Handler.runLoop,
+    ) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.find(u8, message, "timed out") != null);
+    try testing.expect(os.monotonicNs() - start_ns < std.time.ns_per_s);
+}
+
+test "worker drops queued submit and list operations cleanly once host.stop is set" {
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [4096]u8 = undefined;
+    const folder = try os.tmpDirPath(&test_dir, &path_buffer);
+    const marker = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/ran.txt", .{folder}, 0);
+    defer testing.allocator.free(marker);
+    const lua_code = try std.fmt.allocPrintSentinel(testing.allocator,
+        \\local lumen = require("lumen")
+        \\return lumen.extension {{
+        \\  commands = {{
+        \\    {{ name = "slow", title = "Slow", run = function()
+        \\        lumen.exec({{ "sleep", "0.2" }})
+        \\    end }},
+        \\    {{ name = "f", title = "F", fields = {{ {{ name = "x", title = "X" }} }}, submit = function()
+        \\        local fh = assert(io.open("{s}", "w"))
+        \\        fh:write("ran")
+        \\        fh:close()
+        \\    end }},
+        \\  }},
+        \\}}
+    , .{marker}, 0);
+    defer testing.allocator.free(lua_code);
+    try writeTestFile(folder, "extensions/stopcheck/init.lua", lua_code);
+
+    var probe: Probe = .{};
+    defer probe.deinit();
+    const host = try testHost(&probe, folder);
+    defer host.shutdown();
+    host.reload();
+    try probe.wait("registry");
+    const registry = probe.registry.?;
+
+    // Busy-wait on first action, queue a submit and reload, then signal stop before submit starts.
+    _ = host.act(registry.generation, .from(0), .command_run);
+    os.sleepUs(20 * std.time.us_per_ms);
+    _ = host.submit(registry.generation, .from(1), &.{.{ .name = "x", .value = "1", .toggle = false }});
+    host.stop.store(true, .release);
+    host.wake();
+    try testing.expect(host.waitWorkerDone());
+
+    try testing.expect(!os.isRegular(marker));
 }

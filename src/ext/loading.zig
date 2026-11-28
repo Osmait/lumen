@@ -78,8 +78,10 @@ fn loadAll(host: *Host, load: *Load, cap: *lua.Capped) void {
             break :blk "";
         };
     };
+    if (host.stop.load(.acquire)) return;
     if (style.len > 0) loadStyle(host, load, cap, style);
 
+    if (host.stop.load(.acquire)) return;
     if (worker_arena.printSentinel("{s}/init.lua", .{host.config_dir}, 0)) |path| {
         if (os.isRegular(path)) {
             loadSource(host, load, cap, config_extension_id, host.config_dir, .{ .file = path });

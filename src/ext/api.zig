@@ -385,12 +385,14 @@ fn lumenExec(L: *lua.State) lua.Error!c_int {
     const arguments = try execArguments(L, &argv);
 
     const extension = extensionOf(L);
+    if (lua.pastDeadline(L)) return lua.fail(L, "timed out", .{});
     // Never past the deadline of the call that runs it.
     const timeout_end_ns = os.monotonicNs() +| arguments.timeout_ns;
     const deadline_ns = @min(extension.budget.deadline_ns, timeout_end_ns);
     var result = child.run(extension.gpa(), extension.io(), argv[0..arguments.words_count], .{
         .stdin = .{ .bytes = arguments.stdin },
         .deadline_ns = deadline_ns,
+        .at_cap = .kill,
         .cancel = &extension.host.stop,
     }) catch |err| {
         const why = switch (err) {
@@ -405,9 +407,22 @@ fn lumenExec(L: *lua.State) lua.Error!c_int {
     // Freed before anything is pushed outside tryCall: a push can raise (the
     // memory cap) and a raise skips defers (lua.zig), leaking the output.
     if (result.timed_out) {
+        const cancelled = result.cancelled;
         result.deinit(extension.gpa());
+        if (cancelled or lua.pastDeadline(L)) {
+            const budget = lua.budgetOf(L);
+            budget.timed_out = true;
+            lua.armTimeoutHook(L);
+            return lua.fail(L, "timed out", .{});
+        }
         lua.c.lua_pushnil(L);
         lua.pushFmt(L, "lumen.exec: {s} timed out", .{argv[0]});
+        return 2;
+    }
+    if (result.capped) {
+        result.deinit(extension.gpa());
+        lua.c.lua_pushnil(L);
+        lua.pushFmt(L, "lumen.exec: {s}: output past 16 MB", .{argv[0]});
         return 2;
     }
     const status = lua.tryCall(L, child.Result, &result, pushExec, 0, 3);
