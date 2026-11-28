@@ -58,42 +58,142 @@ pub fn handleKeyEvent(
         }
         return 1;
     }
+    // Text selected in the search bar: Ctrl+X cuts it, as in any text
+    // field, instead of trashing the selected file (MYP-567).
+    if (editsSelection(ui, key)) return 0;
     if (itemShortcut(ui, key)) return 1;
-    if (key.keyval == c.GDK_KEY_BackSpace and
-        backspaceGoesBack(ui.view, ui.query().len == 0, &ui.backspace_blocked, from_keyboard))
-    {
-        ui.goBack();
-        return 1;
+    if (key.keyval == c.GDK_KEY_BackSpace) {
+        const query_empty = ui.query().len == 0;
+        switch (backspaceAction(ui.view, query_empty, &ui.backspace_guard, from_keyboard)) {
+            .type => {},
+            .swallow => return 1,
+            .go_back => {
+                ui.goBack();
+                // The new view cleared the guard: the repeats of this press
+                // must neither go back again nor edit its query (MYP-535).
+                if (from_keyboard) ui.backspace_guard = .went_back;
+                return 1;
+            },
+        }
     }
-    // Then the keymaps from init.lua and extensions.
-    if (Ui.ext_view.keymap(ui, keyval, state)) return 1;
+    // Then the keymaps from init.lua and extensions. Not in dmenu: opening
+    // another view answers the script with nothing and leaves the launcher
+    // open (MYP-596).
+    if (ui.view != .dmenu and Ui.ext_view.keymap(ui, keyval, state)) return 1;
     if (typeAltChord(ui, keyval, state)) return 1;
     return 0;
 }
 
 pub fn handleKeyReleased(ui: *Ui, keyval: c_uint) void {
-    if (keyval == c.GDK_KEY_BackSpace) ui.backspace_blocked = false;
+    if (keyval == c.GDK_KEY_BackSpace) ui.backspace_guard = .free;
     const lower = c.gdk_keyval_to_lower(keyval);
     if (ui.confirm_repeat_keyval == lower) ui.confirm_repeat_keyval = null;
 }
 
-/// True when a Backspace press should navigate back. Never leaves `.root` or
-/// `.dmenu`, and from a physical keyboard (`from_keyboard = true`) ignores held
-/// repeats until Backspace is released and pressed again on an empty bar.
-pub fn backspaceGoesBack(
+/// Backspace held down, from a physical keyboard: its repeats come until it
+/// is released.
+pub const BackspaceGuard = enum {
+    /// Not held (or released since).
+    free,
+    /// Held while deleting text: reaching an empty bar does not go back.
+    held,
+    /// Held after it went back: its repeats do nothing at all, neither go
+    /// back again nor delete the query the view came back with.
+    went_back,
+};
+
+/// What a Backspace press does.
+pub const Backspace = enum { type, go_back, swallow };
+
+/// What a Backspace press does: delete text (`type`), go back a view, or
+/// nothing. Never leaves `.root` or `.dmenu`, and from a physical keyboard
+/// (`from_keyboard = true`) ignores held repeats until Backspace is released
+/// and pressed again on an empty bar. Going back sets no guard itself: the
+/// new view clears it, so the caller sets `.went_back` once there.
+pub fn backspaceAction(
     view: Ui.View,
     query_empty: bool,
-    blocked: *bool,
+    guard: *BackspaceGuard,
     from_keyboard: bool,
-) bool {
-    if (view == .root or view == .dmenu) return false;
+) Backspace {
+    if (from_keyboard and guard.* == .went_back) return .swallow;
+    if (view == .root or view == .dmenu) return .type;
     if (!query_empty) {
-        if (from_keyboard) blocked.* = true;
-        return false;
+        if (from_keyboard) guard.* = .held;
+        return .type;
     }
-    if (from_keyboard and blocked.*) return false;
-    if (from_keyboard) blocked.* = true;
-    return true;
+    if (from_keyboard and guard.* == .held) return .type;
+    return .go_back;
+}
+
+/// The chords a text field uses on its selection: cut, copy, paste over,
+/// select all, undo and redo.
+fn isSelectionChord(key: KeyPress) bool {
+    if (!key.ctrl) return false;
+    return switch (key.keyval) {
+        c.GDK_KEY_x, c.GDK_KEY_c, c.GDK_KEY_v, c.GDK_KEY_a => !key.shift,
+        c.GDK_KEY_z => true,
+        else => false,
+    };
+}
+
+/// True when `key` is for the text selected in the focused search bar, not
+/// for the selected row's shortcuts.
+fn editsSelection(ui: *Ui, key: KeyPress) bool {
+    if (!isSelectionChord(key)) return false;
+    const entry = ui.search_bar.entry;
+    if (c.gtk_widget_has_focus(gtk.widget(entry)) == 0) return false;
+    var start: c_int = 0;
+    var end: c_int = 0;
+    return c.gtk_editable_get_selection_bounds(gtk.editable(entry), &start, &end) != 0;
+}
+
+/// Keyvals from here up to `unicode_keyval_min` name keys, not characters
+/// (arrows, Enter, modifiers, function keys); from there up they are
+/// Unicode characters (0x01000000 plus the code point).
+const key_keyval_min = 0xfe00;
+const unicode_keyval_min = 0x01000000;
+/// Layouts (xkb groups) a keymap holds at most.
+const layout_groups_max = 4;
+
+/// With Ctrl (or Super) held on a layout without Latin letters (Russian,
+/// Greek), the Latin letter the same key types in another layout: Ctrl+K
+/// there is Cyrillic_el, and Ctrl+K, Ctrl+N and the row and init.lua
+/// shortcuts did nothing (MYP-562). `keyval` otherwise.
+pub fn shortcutKeyval(keyval: c_uint, keycode: c_uint, state: c.GdkModifierType) c_uint {
+    if (state & (c.GDK_CONTROL_MASK | c.GDK_SUPER_MASK) == 0) return keyval;
+    return latinKeyval(keyval, keycode, state);
+}
+
+/// `keyval`, or when it is a letter of a non-Latin layout, the ASCII letter
+/// its key (`keycode`) has in the first layout that has one.
+pub fn latinKeyval(keyval: c_uint, keycode: c_uint, state: c.GdkModifierType) c_uint {
+    if (!isNonLatinCharacter(c.gdk_keyval_to_lower(keyval))) return keyval;
+    const display = c.gdk_display_get_default() orelse return keyval;
+    for (0..layout_groups_max) |group| {
+        var translated: c_uint = 0;
+        const known = c.gdk_display_translate_key(
+            display,
+            keycode,
+            state,
+            @intCast(group),
+            &translated,
+            null,
+            null,
+            null,
+        ) != 0;
+        const letter = translated < 0x80 and std.ascii.isAlphabetic(@intCast(translated));
+        if (known and letter) return translated;
+    }
+    return keyval;
+}
+
+/// A character past Latin-1: a letter of Cyrillic, Greek, Hebrew, Arabic and
+/// the like. Latin layouts' own letters (ñ, ö, é) are kept as they are.
+fn isNonLatinCharacter(keyval: c_uint) bool {
+    const latin1_max = 0xff;
+    if (keyval <= latin1_max) return false;
+    return keyval < key_keyval_min or keyval >= unicode_keyval_min;
 }
 
 /// A printable key with Alt alone (no Ctrl or Super) types its character,
@@ -172,7 +272,7 @@ const KeyPress = struct {
         state: c.GdkModifierType,
         context: struct { panel_open: bool },
     ) KeyPress {
-        const lower = c.gdk_keyval_to_lower(keyval);
+        const lower = c.gdk_keyval_to_lower(keypadAsMain(keyval));
         const ctrl = state & c.GDK_CONTROL_MASK != 0;
         const down = lower == c.GDK_KEY_Down or
             (ctrl and (lower == c.GDK_KEY_n or lower == c.GDK_KEY_j));
@@ -186,6 +286,20 @@ const KeyPress = struct {
             .shift = state & c.GDK_SHIFT_MASK != 0,
             .vertical = if (down) .down else if (up) .up else null,
             .enter = lower == c.GDK_KEY_Return or lower == c.GDK_KEY_KP_Enter,
+        };
+    }
+
+    /// The keypad's arrows and page keys (NumLock off) as the main ones:
+    /// they moved nothing, while its Enter worked (MYP-595).
+    fn keypadAsMain(keyval: c_uint) c_uint {
+        return switch (keyval) {
+            c.GDK_KEY_KP_Up => c.GDK_KEY_Up,
+            c.GDK_KEY_KP_Down => c.GDK_KEY_Down,
+            c.GDK_KEY_KP_Left => c.GDK_KEY_Left,
+            c.GDK_KEY_KP_Right => c.GDK_KEY_Right,
+            c.GDK_KEY_KP_Page_Up => c.GDK_KEY_Page_Up,
+            c.GDK_KEY_KP_Page_Down => c.GDK_KEY_Page_Down,
+            else => keyval,
         };
     }
 
@@ -219,8 +333,9 @@ fn panelKey(ui: *Ui, key: KeyPress) void {
 
 /// Esc: clears what is typed, then goes back a view, then hides.
 fn escape(ui: *Ui) void {
-    // A dmenu caller is waiting: Esc answers "nothing" and hides.
-    if (ui.view == .dmenu and ui.query().len == 0) {
+    // A dmenu caller is waiting: Esc answers "nothing" and hides, filter
+    // typed or not, as dmenu and rofi do (MYP-487).
+    if (ui.view == .dmenu) {
         ui.hide();
     } else if (ui.view == .input) {
         // The text is the value being edited: Esc leaves it unsaved.
@@ -327,23 +442,74 @@ test "modifier keys are excluded from recent typing while normal keys count" {
 }
 
 test "held backspace never exits a view or aborts dmenu" {
-    var blocked = false;
-    // Holding Backspace while deleting text sets `blocked`, then hitting empty still refuses exit.
-    try std.testing.expect(!backspaceGoesBack(.settings, false, &blocked, true));
-    try std.testing.expect(blocked);
-    try std.testing.expect(!backspaceGoesBack(.settings, true, &blocked, true));
-    // Releasing Backspace clears `blocked`; pressing again on empty navigates back once.
-    blocked = false;
-    try std.testing.expect(backspaceGoesBack(.settings, true, &blocked, true));
-    try std.testing.expect(blocked);
-    try std.testing.expect(!backspaceGoesBack(.settings, true, &blocked, true));
+    var guard: BackspaceGuard = .free;
+    // Holding Backspace while deleting text sets the guard, then hitting empty still refuses exit.
+    try std.testing.expectEqual(Backspace.type, backspaceAction(.settings, false, &guard, true));
+    try std.testing.expectEqual(BackspaceGuard.held, guard);
+    try std.testing.expectEqual(Backspace.type, backspaceAction(.settings, true, &guard, true));
+    // Releasing Backspace clears the guard; pressing again on empty navigates back once.
+    guard = .free;
+    try std.testing.expectEqual(Backspace.go_back, backspaceAction(.settings, true, &guard, true));
     // dmenu and root never navigate back on Backspace.
-    blocked = false;
-    try std.testing.expect(!backspaceGoesBack(.dmenu, true, &blocked, true));
-    try std.testing.expect(!backspaceGoesBack(.dmenu, true, &blocked, false));
-    try std.testing.expect(!backspaceGoesBack(.root, true, &blocked, false));
+    guard = .free;
+    try std.testing.expectEqual(Backspace.type, backspaceAction(.dmenu, true, &guard, true));
+    try std.testing.expectEqual(Backspace.type, backspaceAction(.dmenu, true, &guard, false));
+    try std.testing.expectEqual(Backspace.type, backspaceAction(.root, true, &guard, false));
     // Synthetic `--key backspace` continues to navigate back on non-dmenu subviews.
-    try std.testing.expect(backspaceGoesBack(.settings, true, &blocked, false));
+    try std.testing.expectEqual(Backspace.go_back, backspaceAction(.settings, true, &guard, false));
+}
+
+test "held backspace goes back once, and leaves the query gone back to (MYP-535)" {
+    // Gone back (handleKeyEvent sets `went_back` once the view changed).
+    var guard: BackspaceGuard = .went_back;
+    // Repeats on an empty view do not go back again...
+    try std.testing.expectEqual(Backspace.swallow, backspaceAction(.default_apps, true, &guard, true));
+    try std.testing.expectEqual(Backspace.swallow, backspaceAction(.settings, true, &guard, true));
+    // ...nor delete the query restored ("report" in Files).
+    try std.testing.expectEqual(Backspace.swallow, backspaceAction(.files, false, &guard, true));
+    try std.testing.expectEqual(BackspaceGuard.went_back, guard);
+    // Released, a press deletes the restored query again.
+    guard = .free;
+    try std.testing.expectEqual(Backspace.type, backspaceAction(.files, false, &guard, true));
+}
+
+test "the keypad's arrows and page keys move like the main ones (MYP-595)" {
+    try std.testing.expectEqual(@as(?KeyPress.Vertical, .down), KeyPress.decode(c.GDK_KEY_KP_Down, 0, .{ .panel_open = false }).vertical);
+    try std.testing.expectEqual(@as(?KeyPress.Vertical, .up), KeyPress.decode(c.GDK_KEY_KP_Up, 0, .{ .panel_open = false }).vertical);
+    try std.testing.expectEqual(c.GDK_KEY_Left, KeyPress.decode(c.GDK_KEY_KP_Left, 0, .{ .panel_open = false }).keyval);
+    try std.testing.expectEqual(c.GDK_KEY_Right, KeyPress.decode(c.GDK_KEY_KP_Right, 0, .{ .panel_open = false }).keyval);
+    try std.testing.expectEqual(c.GDK_KEY_Page_Up, KeyPress.decode(c.GDK_KEY_KP_Page_Up, 0, .{ .panel_open = false }).keyval);
+    try std.testing.expectEqual(c.GDK_KEY_Page_Down, KeyPress.decode(c.GDK_KEY_KP_Page_Down, 0, .{ .panel_open = false }).keyval);
+    try std.testing.expect(KeyPress.decode(c.GDK_KEY_KP_Enter, 0, .{ .panel_open = false }).enter);
+}
+
+test "a text field's chords on a selection are left to the search bar (MYP-567)" {
+    const ctrl = c.GDK_CONTROL_MASK;
+    const shift = c.GDK_SHIFT_MASK;
+    try std.testing.expect(isSelectionChord(.decode(c.GDK_KEY_x, ctrl, .{ .panel_open = false })));
+    try std.testing.expect(isSelectionChord(.decode('X', ctrl, .{ .panel_open = false })));
+    try std.testing.expect(isSelectionChord(.decode(c.GDK_KEY_c, ctrl, .{ .panel_open = false })));
+    try std.testing.expect(isSelectionChord(.decode(c.GDK_KEY_z, ctrl | shift, .{ .panel_open = false })));
+    // The row's own chords: Delete All Entries, Copy Path, Open With.
+    try std.testing.expect(!isSelectionChord(.decode('X', ctrl | shift, .{ .panel_open = false })));
+    try std.testing.expect(!isSelectionChord(.decode('C', ctrl | shift, .{ .panel_open = false })));
+    try std.testing.expect(!isSelectionChord(.decode(c.GDK_KEY_o, ctrl, .{ .panel_open = false })));
+    try std.testing.expect(!isSelectionChord(.decode(c.GDK_KEY_x, 0, .{ .panel_open = false })));
+}
+
+test "only letters of non-Latin layouts are looked up in another layout (MYP-562)" {
+    const cyrillic_el = 0x6cc;
+    const greek_kappa = 0x7ea;
+    const armenian_ke = unicode_keyval_min + 0x584;
+    try std.testing.expect(isNonLatinCharacter(cyrillic_el));
+    try std.testing.expect(isNonLatinCharacter(greek_kappa));
+    try std.testing.expect(isNonLatinCharacter(armenian_ke));
+    try std.testing.expect(!isNonLatinCharacter(c.GDK_KEY_k));
+    try std.testing.expect(!isNonLatinCharacter(0xf1)); // ñ
+    try std.testing.expect(!isNonLatinCharacter(c.GDK_KEY_Return));
+    try std.testing.expect(!isNonLatinCharacter(c.GDK_KEY_Escape));
+    // Without Ctrl or Super, keys are typed as they are.
+    try std.testing.expectEqual(@as(c_uint, cyrillic_el), shortcutKeyval(cyrillic_el, 45, 0));
 }
 
 test "KeyPress.decode handles uppercase Ctrl letters when Caps Lock is active" {

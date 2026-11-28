@@ -125,6 +125,9 @@ view: View = .root,
 navigation: Navigation = .{},
 /// Row to select once the view is built (by its item key).
 reselect: ItemKey = .{},
+/// Where the row to select again was, for when no row has its key any more
+/// (`keepPlace`): the row that took its place is selected instead.
+reselect_row: ?usize = null,
 /// Lives until the view changes: clipboard entries, window list, scripts.
 data_arena: std.heap.ArenaAllocator,
 /// Candidates of the current view before filtering.
@@ -207,8 +210,12 @@ ext_root_search: Inflight(ExtHost.RootResult, ext_query_bytes_max) = .{},
 ext_act_generation: ExtHost.RequestGeneration = .none,
 /// Deferred `--command` invocations waiting for initial extension load.
 pending_commands: std.ArrayList(ext_view.PendingCommand) = .empty,
-/// Suppresses key-repeat Backspace navigating back immediately after clearing input.
-backspace_blocked: bool = false,
+/// Suppresses key-repeat Backspace navigating back immediately after clearing input,
+/// and editing the view gone back to (keyboard.backspaceAction).
+backspace_guard: keyboard.BackspaceGuard = .free,
+/// Set while `setViewWithQuery` puts the view's query in the search bar:
+/// the `changed` it emits are not refreshes of their own (MYP-577).
+ignore_changed: bool = false,
 /// Consumes one stray row/grid activation triggered by the click that closed the action panel.
 suppress_next_activate: bool = false,
 /// The extension whose preferences the prefs view lists.
@@ -304,6 +311,21 @@ const Navigation = struct {
         return navigation.entries[navigation.count];
     }
 
+    /// The newest view that can still show. A command or form an extension
+    /// reload took away (`ext_view.remap` marks it `.gone`) is passed over:
+    /// it opened empty, and needed going back once more (MYP-617).
+    fn popLive(navigation: *Navigation) ?Entry {
+        while (navigation.pop()) |entry| {
+            const gone = switch (entry.view) {
+                .ext => entry.ext_command == .gone,
+                .form => entry.form_command == .gone,
+                else => false,
+            };
+            if (!gone) return entry;
+        }
+        return null;
+    }
+
     fn clear(navigation: *Navigation) void {
         navigation.count = 0;
     }
@@ -397,6 +419,15 @@ pub fn build(self: *Ui) void {
 /// key), wherever it moved.
 pub fn keepSelection(self: *Ui) void {
     if (self.selectedItem()) |item| self.setReselect("{s}", .{item.key});
+}
+
+/// Like `keepSelection`, and when the row is gone (deleted, trashed, closed)
+/// or has no key (clipboard entries, windows), the row now in its place is
+/// selected: the next Ctrl+X deletes the neighbour, not the first row
+/// (MYP-536).
+pub fn keepPlace(self: *Ui) void {
+    self.keepSelection();
+    self.reselect_row = self.selected;
 }
 
 pub fn setReselect(self: *Ui, comptime fmt: []const u8, args: anytype) void {
@@ -515,7 +546,7 @@ pub fn hide(self: *Ui) void {
     self.confirm_key = "";
     self.confirm_repeat_keyval = null;
     self.ext_act_generation = .none;
-    self.backspace_blocked = false;
+    self.backspace_guard = .free;
     self.suppress_next_activate = false;
     gtk.setVisible(self.window, false);
     backdrop.hideBackdrops(self);
@@ -525,16 +556,27 @@ pub fn hide(self: *Ui) void {
 
 /// Opens `view`, remembering where to go back to.
 pub fn navigate(self: *Ui, view: View) void {
+    self.rememberView();
+    self.setView(view);
+}
+
+/// Remembers the view shown now (its row, query, command and form) to go
+/// back to. Opening a command or form calls it before setting
+/// `ext_command` or `form_command`: after, going back from a command
+/// opened by another returned to the new one (MYP-439).
+pub fn rememberView(self: *Ui) void {
     const selected_key = if (self.selectedItem()) |item| item.key else "";
     self.navigation.push(self.view, selected_key, self.query(), self.ext_command, self.form_command);
-    self.setView(view);
 }
 
 /// Back to the previous view, on the row and query it was left from.
 pub fn goBack(self: *Ui) void {
-    const entry = self.navigation.pop() orelse return self.setView(.root);
+    const entry = self.navigation.popLive() orelse return self.setView(.root);
+    // The values are those of the form left: another form's start over.
+    const form_changed = entry.view == .form and entry.form_command != self.form_command;
     self.ext_command = entry.ext_command;
     self.form_command = entry.form_command;
+    if (form_changed) form_view.reset(self);
     self.reselect = entry.key;
     self.setViewWithQuery(entry.view, entry.query.slice());
 }
@@ -561,6 +603,8 @@ pub fn setViewWithQuery(self: *Ui, view: View, initial_query: [:0]const u8) void
     // Leaving the dmenu view answers the waiting `lumen --dmenu` with
     // nothing.
     if (self.view == .dmenu and view != .dmenu) dmenu.finish(self, null);
+    // A place kept is the old view's (`keepPlace`): its rows are going.
+    self.reselect_row = null;
     // Change Theme starts on the theme in use.
     if (view == .themes and self.reselect.len == 0) {
         self.setReselect("theme:{s}", .{self.settings.theme});
@@ -572,7 +616,7 @@ pub fn setViewWithQuery(self: *Ui, view: View, initial_query: [:0]const u8) void
     self.confirm_key = "";
     self.confirm_repeat_keyval = null;
     self.ext_act_generation = .none;
-    self.backspace_blocked = false;
+    self.backspace_guard = .free;
     self.suppress_next_activate = false;
     _ = self.data_arena.reset(arena_keep);
     if (view == .ext) ext_view.enter(self);
@@ -583,14 +627,18 @@ pub fn setViewWithQuery(self: *Ui, view: View, initial_query: [:0]const u8) void
     self.base = search.loadBase(self, self.data_arena.allocator());
     self.updateViewChrome();
 
-    // Changing the text emits `changed`, which refreshes; if the entry already
-    // holds `initial_query`, refresh directly.
+    // One refresh, with `initial_query` typed. Replacing a text with another
+    // emits `changed` twice (deleted, then inserted): the first refresh, on
+    // an empty query, took `reselect`, and the second selected the first
+    // row (MYP-577).
     const current = std.mem.span(c.gtk_editable_get_text(gtk.editable(self.search_bar.entry)));
-    if (std.mem.eql(u8, current, initial_query)) {
-        self.refresh();
-    } else {
+    if (!std.mem.eql(u8, current, initial_query)) {
+        assert(!self.ignore_changed);
+        self.ignore_changed = true;
+        defer self.ignore_changed = false;
         c.gtk_editable_set_text(gtk.editable(self.search_bar.entry), initial_query.ptr);
     }
+    self.refresh();
     // The rows are this base's now: nothing points into replaced app lists.
     self.apps.dropStale();
     self.refocusSearch();
@@ -852,7 +900,7 @@ pub fn perform(self: *Ui, operation: item_mod.Operation) void {
         .hide => self.hide(),
         .stay => {},
         .refresh_view => {
-            self.keepSelection();
+            self.keepPlace();
             self.rebuild();
         },
         .open_view => |view| self.navigate(view),
@@ -966,6 +1014,23 @@ test "Navigation forgets the oldest view when it is full" {
         try std.testing.expectEqual(ExtHost.CommandIndex.from(expected + 1), entry.form_command);
     }
     try std.testing.expectEqual(views.len - Navigation.capacity, expected);
+}
+
+test "going back passes over commands and forms a reload took away (MYP-617)" {
+    var navigation: Navigation = .{};
+    navigation.push(.root, "", "", .from(0), .from(0));
+    navigation.push(.ext, "row", "kept", .from(3), .from(0));
+    navigation.push(.form, "", "", .from(3), .gone);
+    navigation.push(.ext, "", "", .gone, .from(0));
+    const entry = navigation.popLive().?;
+    try std.testing.expectEqual(View.ext, entry.view);
+    try std.testing.expectEqual(ExtHost.CommandIndex.from(3), entry.ext_command);
+    try std.testing.expectEqualStrings("kept", entry.query.slice());
+    try std.testing.expectEqual(View.root, navigation.popLive().?.view);
+    try std.testing.expect(navigation.popLive() == null);
+    // Only gone entries left: nothing to go back to (the caller opens root).
+    navigation.push(.form, "", "", .from(0), .gone);
+    try std.testing.expect(navigation.popLive() == null);
 }
 
 test "confirmStep requires a second matching press after key release before confirming" {

@@ -266,7 +266,8 @@ pub fn showEmptyOrResults(ui: *Ui, arena: std.mem.Allocator, query_text: []const
     gtk.setClass(ui.column, "alone", alone);
 }
 
-/// Selects the first row, or the one asked for with `setReselect`.
+/// Selects the first row, or the one asked for with `setReselect` (or, it
+/// gone, the one in its place, with `Ui.keepPlace`).
 pub fn selectAfterRefresh(ui: *Ui) void {
     const adjustment = c.gtk_scrolled_window_get_vadjustment(ui.scroller);
     c.gtk_adjustment_set_value(adjustment, 0);
@@ -274,9 +275,13 @@ pub fn selectAfterRefresh(ui: *Ui) void {
     // until its rows come: the row to select again is looked for then
     // (`listCallback`), not among no rows at all (MYP-607).
     const ext_loading = ui.view == .ext and ui.ext_list.pending and ui.items.items.len == 0;
-    if (ext_loading and ui.reselect.len > 0) return select(ui, null);
+    const reselecting = ui.reselect.len > 0 or ui.reselect_row != null;
+    if (ext_loading and reselecting) return select(ui, null);
     var first = nextSelectable(ui, null, 1);
     const top = first;
+    const place = ui.reselect_row;
+    ui.reselect_row = null;
+    var found: ?usize = null;
     if (ui.reselect.len > 0) {
         // A copy: clearing writes into the buffer `slice` points at.
         const reselect = ui.reselect;
@@ -285,15 +290,20 @@ pub fn selectAfterRefresh(ui: *Ui) void {
         // Among the rows built, else built up to it from those queued:
         // building them all, to look, cost dmenu ~115 ms a tick while its
         // input streamed in.
-        first = rowOfKey(
+        found = rowOfKey(
             ui,
             wanted_key,
         ) orelse if (pendingOfKey(ui, wanted_key)) |pending_index| blk: {
             buildPending(ui, pending_index + 1);
-            break :blk rowOfKey(ui, wanted_key) orelse first;
-        } else first;
+            break :blk rowOfKey(ui, wanted_key);
+        } else null;
     }
+    if (found == null) if (place) |row_place| {
+        found = rowNear(ui, row_place);
+    };
+    if (found) |row_found| first = row_found;
     assert(ui.reselect.len == 0);
+    assert(ui.reselect_row == null);
     if (first) |row_first| assert(ui.rows.items[row_first].item != null);
     // The list was just scrolled to the top, where the first row is: no
     // need to wait a frame for its place to scroll to it.
@@ -307,6 +317,25 @@ pub fn isSelectable(item: Item) bool {
         .pick => |pick| pick.selectable,
         else => true,
     };
+}
+
+/// The selectable row at `row_index`, or the nearest one after it, else
+/// before it (the last rows went): where a row taken away was. Builds the
+/// queued rows up to there.
+fn rowNear(ui: *Ui, row_index: usize) ?usize {
+    const missing = (row_index + 1) -| ui.rows.items.len;
+    if (missing > 0 and ui.pending.items.len > 0) buildPending(ui, missing);
+    if (ui.rows.items.len == 0) return null;
+    const at = @min(row_index, ui.rows.items.len - 1);
+    if (ui.rows.items[at].item) |item_index| {
+        if (isSelectable(ui.items.items[item_index])) return at;
+    }
+    // `nextSelectable` gives back `at` when it finds none that way.
+    const below = nextSelectable(ui, at, 1);
+    if (below != at) return below;
+    const above = nextSelectable(ui, at, -1);
+    if (above != at) return above;
+    return null;
 }
 
 /// The built row showing the selectable item `key`.
@@ -535,7 +564,9 @@ pub fn onRowActivated(
     if (row_tag == 0 or row_tag - 1 >= ui.rows.items.len) return;
     const item_index = ui.rows.items[row_tag - 1].item orelse return;
     if (!isSelectable(ui.items.items[item_index])) return;
-    select(ui, row_tag - 1);
+    // Selecting again forgets a confirmation asked for: a second click on
+    // Shut Down asked again instead of shutting down (MYP-559).
+    if (ui.selected != row_tag - 1) select(ui, row_tag - 1);
     const item = ui.selectedItem() orelse return;
     ui.performEntry(item_mod.actionsFor(item)[0]);
     ui.refocusSearch();
@@ -553,7 +584,9 @@ pub fn onGridActivated(
     }
     const cell_index = c.gtk_flow_box_child_get_index(child);
     if (cell_index < 0 or cell_index >= ui.rows.items.len) return;
-    select(ui, @intCast(cell_index));
+    // As in a list (MYP-559): a second click confirms.
+    const cell: usize = @intCast(cell_index);
+    if (ui.selected != cell) select(ui, cell);
     const item = ui.selectedItem() orelse return;
     ui.performEntry(item_mod.actionsFor(item)[0]);
     ui.refocusSearch();

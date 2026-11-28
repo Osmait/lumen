@@ -25,9 +25,12 @@ fn command(ui: *Ui) ?*const Host.Command {
 
 /// Opens form `index` with its fields at their defaults.
 pub fn open(ui: *Ui, index: Host.CommandIndex) void {
+    // Remembered before `form_command` changes, or going back would return
+    // to this form (MYP-439).
+    ui.rememberView();
     ui.form_command = index;
     reset(ui);
-    ui.navigate(.form);
+    ui.setView(.form);
 }
 
 /// Every field back to its default.
