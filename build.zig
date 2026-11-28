@@ -468,11 +468,24 @@ fn dependOnGitRevision(b: *std.Build, root: []const u8) void {
     const git_dir = lines.next() orelse return b.graph.poisonCache();
     const common_dir = lines.next() orelse return b.graph.poisonCache();
     const reflog = b.pathJoin(&.{ git_dir, "logs", "HEAD" });
-    std.Io.Dir.accessAbsolute(b.graph.io, reflog, .{}) catch return b.graph.poisonCache();
+    const head = b.pathJoin(&.{ git_dir, "HEAD" });
+    const tags = b.pathJoin(&.{ common_dir, "refs", "tags" });
+    const packed_refs = b.pathJoin(&.{ common_dir, "packed-refs" });
+    // A path depended on that is missing fails the configuration
+    // (FileSystemFailure): a fresh clone or CI checkout may have no
+    // packed-refs, and no refs/tags folder.
+    for ([_][]const u8{ reflog, head, tags }) |path| {
+        std.Io.Dir.accessAbsolute(b.graph.io, path, .{}) catch return b.graph.poisonCache();
+    }
     b.dependOnFileMetadata(.{ .cwd_relative = reflog });
-    b.dependOnFileContents(.{ .cwd_relative = b.pathJoin(&.{ git_dir, "HEAD" }) });
-    b.dependOnDirectoryMetadata(.{ .cwd_relative = b.pathJoin(&.{ common_dir, "refs", "tags" }) });
-    b.dependOnFileContents(.{ .cwd_relative = b.pathJoin(&.{ common_dir, "packed-refs" }) });
+    b.dependOnFileContents(.{ .cwd_relative = head });
+    b.dependOnDirectoryMetadata(.{ .cwd_relative = tags });
+    if (std.Io.Dir.accessAbsolute(b.graph.io, packed_refs, .{})) |_| {
+        b.dependOnFileContents(.{ .cwd_relative = packed_refs });
+    } else |_| {
+        // Its creation (`git pack-refs`, a fetch) changes the folder.
+        b.dependOnDirectoryMetadata(.{ .cwd_relative = common_dir });
+    }
 }
 
 /// Lua 5.4's library: everything in src/ but the two programs.
