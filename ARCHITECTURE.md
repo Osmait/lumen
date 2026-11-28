@@ -256,7 +256,8 @@ directory (2.8 s cold) and every core.
   ignored). Two edited files: 1.5 MB written and 11 ms, against a 79 MB
   rewrite (180 ms) or a 1.6 s rebuild before. A run of 4 small segments at
   the end is merged into the next update's, without removed documents'
-  postings. Past 20 % removed, 32 segments or 30 % of the file no longer
+  postings. Past 20 % removed, 32 segments added by updates (the header
+  keeps how many the whole build made) or 30 % of the file no longer
   used, it is rebuilt whole. Either way the result is swapped in under a
   lock.
 

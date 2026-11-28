@@ -342,7 +342,7 @@ fn buildInto(
     try indexDocs(sink, pool, &directory, docs, 0, text, &build_stats, &.{}, &unavailable);
     try markUnavailable(sink, table, unavailable.items);
     build_stats.docs_indexed = docs.len - unavailable.items.len;
-    const header = try finish(sink, directory.items, docs.len, table);
+    const header = try finish(sink, directory.items, docs.len, table, directory.items.len);
     build_stats.report(start_ns, stats);
     return header;
 }
@@ -387,7 +387,7 @@ fn updateInto(
     );
     try markUnavailable(sink, table, unavailable.items);
     build_stats.docs_indexed = added.len - unavailable.items.len;
-    const header = try finish(sink, directory.items, docs.len, table);
+    const header = try finish(sink, directory.items, docs.len, table, old.whole_segments_count);
     build_stats.report(start_ns, stats);
     return header;
 }
@@ -493,7 +493,7 @@ fn appendInto(
         .path_offsets_reused = old.path_offsets,
     });
     build_stats.docs_indexed = added.len - unavailable.items.len;
-    const header = try finish(sink, directory.items, docs.len, table);
+    const header = try finish(sink, directory.items, docs.len, table, old.whole_segments_count);
     build_stats.report(start_ns, stats);
     return header;
 }
@@ -1100,6 +1100,42 @@ fn exerciseUpdates(index: *const Index, gpa: std.mem.Allocator, pool: *Pool) !vo
     var appended = try appendMemory(gpa, pool, index, gone, &added, reader);
     defer appended.deinit(gpa);
     try exerciseIndex(&appended, gpa);
+}
+
+test "the header keeps how many segments the whole build made, through updates and appends" {
+    const gpa = testing.allocator;
+    const pool = try Pool.create(gpa, testing.io, 1);
+    defer pool.destroy();
+    var index = try segmentedIndex(gpa, pool);
+    defer index.deinit(gpa);
+    // One segment from the whole build, one per update after it.
+    try testing.expectEqual(@as(usize, 1 + segments_small_merge_min), index.segments_count);
+    try testing.expectEqual(@as(usize, 1), index.whole_segments_count);
+
+    var test_dir = try sys.TestDir.init();
+    defer test_dir.deinit();
+    var index_path_buffer: paths.Buffer = undefined;
+    const index_path = try test_dir.path(&index_path_buffer, "content.idx");
+    try index.save(index_path);
+    var mapped = try Index.open(index_path);
+    defer mapped.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), mapped.whole_segments_count);
+    var test_docs: TestDocs = .{ .texts = &update_texts };
+    const added = [_]DocIn{.{ .path = "0", .mtime = 300, .size = 1 }};
+    // Merges every small segment, the whole build's last one too.
+    var appended = (try appendFile(
+        gpa,
+        pool,
+        &mapped,
+        &.{},
+        &added,
+        .{ .read = TestDocs.readText, .context = &test_docs },
+        index_path,
+        null,
+    )).?;
+    defer appended.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), appended.segments_count);
+    try testing.expect(appended.whole_segments_count <= appended.segments_count);
 }
 
 test "segments that repeat or reorder doc ids (a damaged file): queries, updates and appends cope" {

@@ -58,7 +58,9 @@ pub const Options = struct {
     /// Opening the window asks for a refresh, at most this often.
     poke_interval_ns_min: u64 = 30 * std.time.ns_per_s,
     /// Rebuilt whole instead of updated past this share of removed
-    /// documents (in percent), or this many segments.
+    /// documents (in percent), or this many segments added by updates
+    /// (those of the whole build do not count: a large corpus has more
+    /// than this from the start, and rebuilding gives them back).
     removed_percent_max: u8 = 20,
     segments_max: usize = 32,
     /// The name index over the same root: while it saw no name change that
@@ -1216,10 +1218,15 @@ const garbage_percent_max = 30;
 /// behind (removed versions, small segments, unused bytes) has piled up.
 fn wantsWhole(service: *const ContentService, changed: Diff) bool {
     const index = service.current() orelse return true;
+    return garbagePiledUp(index, changed, service.options);
+}
+
+fn garbagePiledUp(index: *const content.Index, changed: Diff, options: Options) bool {
     const removed_count = index.docs_removed_count + changed.gone.len;
     const docs_count = index.docs_count + changed.added.len;
-    if (removed_count * 100 > docs_count * service.options.removed_percent_max) return true;
-    if (index.segments_count >= service.options.segments_max) return true;
+    if (removed_count * 100 > docs_count * options.removed_percent_max) return true;
+    const segments_added = index.segments_count -| index.whole_segments_count;
+    if (segments_added >= options.segments_max) return true;
     return @as(u128, index.bytes.len) * 100 >
         @as(u128, index.bytes_live) * (100 + garbage_percent_max);
 }
@@ -1669,6 +1676,20 @@ test "content service: with the name index, checks without name changes only loo
     try testing.expectEqual(@as(u32, 2), status_now.listings);
     try testing.expectEqual(@as(usize, 2), status_now.docs);
     try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "cherry")).len);
+}
+
+test "content service: only segments added by updates count toward a whole rebuild" {
+    var index = try @import("content_testing.zig").smallIndex(testing.allocator);
+    defer index.deinit(testing.allocator);
+    try testing.expectEqual(index.segments_count, index.whole_segments_count);
+    const options: Options = .{ .segments_max = index.segments_count, .removed_percent_max = 100 };
+    const one_edit: Diff = .{ .gone = &.{}, .added = &.{} };
+    // As many segments as the limit, all the whole build's: an edit is
+    // appended, as it would be for a smaller corpus.
+    try testing.expect(!garbagePiledUp(&index, one_edit, options));
+    // A file from before the count was kept: all are taken as added.
+    index.whole_segments_count = 0;
+    try testing.expect(garbagePiledUp(&index, one_edit, options));
 }
 
 test "content service: rebuilt whole once removed versions pile up" {

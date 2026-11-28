@@ -365,6 +365,9 @@ pub fn finish(
     directory: []const SegmentEntry,
     docs_count: usize,
     table: DocTableWritten,
+    /// `Header.whole_segments_count`: the directory's length for a whole
+    /// build, the old index's for an update.
+    whole_segments_count: usize,
 ) WriteError!Header {
     try sink.padToAlignment();
     const directory_offset = sink.position();
@@ -389,6 +392,8 @@ pub fn finish(
         .docs_offset = table.offset,
         .directory_offset = directory_offset,
         .size_total = size_total,
-        .reserved = @splat(0),
+        // An update that merged the whole build's last small segments
+        // leaves fewer.
+        .whole_segments_count = @min(whole_segments_count, directory.len),
     };
 }

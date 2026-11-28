@@ -44,6 +44,9 @@ backing: format.Backing,
 file_id: ?sys.FileId = null,
 docs_count: usize,
 segments_count: usize,
+/// Of `segments_count`, those the last whole build made (0: not known, a
+/// file from before it was kept); the rest were added by updates.
+whole_segments_count: usize = 0,
 mtimes: []const i64,
 sizes: []const u64,
 path_offsets: []const u32,
@@ -243,6 +246,7 @@ pub fn parse(whole: Bytes, backing: format.Backing) error{BadIndex}!ContentIndex
         .backing = backing,
         .docs_count = docs_count,
         .segments_count = segments_count,
+        .whole_segments_count = @intCast(@min(header.whole_segments_count, segments_count)),
         .mtimes = columns.mtimes,
         .sizes = columns.sizes,
         .path_offsets = columns.path_offsets,

@@ -44,7 +44,10 @@ pub const Header = extern struct {
     /// header at what it added: bytes past this are an update whose header
     /// never got written.
     size_total: u64,
-    reserved: [8]u8,
+    /// Segments the last whole build made, which updates carry over: those
+    /// updates added since are `segments_count` minus this. 0 in files
+    /// written before it was kept (these bytes were reserved, always 0).
+    whole_segments_count: u64,
 
     comptime {
         assert(builtin.cpu.arch.endian() == .little);
@@ -55,6 +58,7 @@ pub const Header = extern struct {
         assert(@offsetOf(Header, "docs_offset") == 32);
         assert(@offsetOf(Header, "directory_offset") == 40);
         assert(@offsetOf(Header, "size_total") == 48);
+        assert(@offsetOf(Header, "whole_segments_count") == 56);
     }
 
     pub fn encode(header: Header) [header_size]u8 {
@@ -385,7 +389,7 @@ test "content: the header struct lays out the bytes LUMCTX04 always had" {
         .docs_offset = 4,
         .directory_offset = 5,
         .size_total = 6,
-        .reserved = @splat(0),
+        .whole_segments_count = 0,
     };
     // The layout as it was written field by field before `Header` existed.
     var expected: [header_size]u8 = @splat(0);
