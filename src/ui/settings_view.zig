@@ -453,8 +453,9 @@ pub fn performSetting(ui: *Ui, setting: item_mod.Setting, operation: item_mod.Op
     }
     switch (setting) {
         .toggle => |toggle| {
-            ui.settings.setToggle(toggle, !ui.settings.get(toggle));
-            config.saveSettings(ui);
+            const next_value = !ui.settings.get(toggle);
+            ui.settings.setToggle(toggle, next_value);
+            config.saveSettingsPatch(ui, .{ .toggle = .{ .key = toggle, .value = next_value } });
             ui.setReselect("set:{t}", .{toggle});
             ui.rebuild();
         },
@@ -476,13 +477,13 @@ pub fn performSetting(ui: *Ui, setting: item_mod.Setting, operation: item_mod.Op
         },
         .theme => |id| {
             _ = ui.settings.setTextValue(.theme, id);
-            config.saveSettings(ui);
+            config.saveSettingsPatch(ui, .{ .text = .{ .key = .theme, .value = id } });
             ui.goBack();
         },
         .style => |id| {
             // Its CSS now, its Lua (layout, themes, lumen.set) on the reload.
             _ = ui.settings.setTextValue(.style, id);
-            config.saveSettings(ui);
+            config.saveSettingsPatch(ui, .{ .text = .{ .key = .style, .value = id } });
             ui.style_defaults_pending = true;
             ext_view.syncStyle(ui);
             ui.setReselect("style:{s}", .{id});

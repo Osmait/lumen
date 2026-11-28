@@ -151,6 +151,10 @@ row_look: widgets.RowLook = .{},
 primary: [:0]const u8 = "",
 /// Key of the destructive item waiting for its second Enter.
 confirm_key: []const u8 = "",
+/// Lowercased keyval that armed `confirm_key` on a physical key press; cleared on release.
+confirm_repeat_keyval: ?c_uint = null,
+/// Lowercased keyval during an active physical `handleKeyEvent`.
+active_keyboard_keyval: ?c_uint = null,
 /// Frecency values, reloaded each time the window opens.
 frecency_arena: std.heap.ArenaAllocator,
 frecency: std.StringHashMapUnmanaged(f64) = .empty,
@@ -509,6 +513,7 @@ pub fn hide(self: *Ui) void {
     if (self.view == .themes) config.applyAppearance(self, null);
     self.panel.close();
     self.confirm_key = "";
+    self.confirm_repeat_keyval = null;
     self.ext_act_generation = .none;
     self.backspace_blocked = false;
     self.suppress_next_activate = false;
@@ -565,6 +570,7 @@ pub fn setViewWithQuery(self: *Ui, view: View, initial_query: [:0]const u8) void
     if (leaving_themes) config.applyAppearance(self, null);
     self.panel.close();
     self.confirm_key = "";
+    self.confirm_repeat_keyval = null;
     self.ext_act_generation = .none;
     self.backspace_blocked = false;
     self.suppress_next_activate = false;
@@ -687,6 +693,7 @@ pub fn refresh(self: *Ui) void {
     assert(!self.panel.isOpen());
     row_list.resetRows(self);
     self.confirm_key = "";
+    self.confirm_repeat_keyval = null;
     c.gtk_flow_box_remove_all(self.grid);
     widgets.forgetGridPictures();
     widgets.forgetRowIcons();
@@ -726,17 +733,36 @@ pub fn performEntry(self: *Ui, entry: item_mod.Entry) void {
 const clip_clear_confirm_key = "clip:clear";
 
 /// Updates `confirm_key` for `target`: returns true when waiting for a
-/// second confirmation press, false once confirmed.
-fn confirmStep(confirm_key: *[]const u8, target: []const u8) bool {
-    if (std.mem.eql(u8, confirm_key.*, target)) return false;
+/// second confirmation press, false once confirmed. When `keyboard_keyval` is
+/// non-null (a physical keyboard event), auto-repeats of the same key before
+/// release keep returning true instead of confirming.
+pub fn confirmStep(
+    confirm_key: *[]const u8,
+    repeat_keyval: *?c_uint,
+    target: []const u8,
+    keyboard_keyval: ?c_uint,
+) bool {
+    if (std.mem.eql(u8, confirm_key.*, target)) {
+        if (keyboard_keyval) |kv| {
+            if (repeat_keyval.* == kv) return true;
+        }
+        repeat_keyval.* = null;
+        return false;
+    }
     confirm_key.* = target;
+    repeat_keyval.* = keyboard_keyval;
     return true;
 }
 
 /// Destructive commands need a second Enter: true while waiting for it
 /// (the row says so).
 pub fn needsConfirm(self: *Ui, item: *const Item) bool {
-    if (!confirmStep(&self.confirm_key, item.key)) return false;
+    if (!confirmStep(
+        &self.confirm_key,
+        &self.confirm_repeat_keyval,
+        item.key,
+        self.active_keyboard_keyval,
+    )) return false;
     self.primary = self.query_arena.allocator().printSentinel(
         "Press ↵ again to {s}",
         .{item.title},
@@ -748,7 +774,12 @@ pub fn needsConfirm(self: *Ui, item: *const Item) bool {
 
 /// Clearing the entire clipboard history requires a second confirmation press.
 fn needsConfirmClearClips(self: *Ui) bool {
-    if (!confirmStep(&self.confirm_key, clip_clear_confirm_key)) return false;
+    if (!confirmStep(
+        &self.confirm_key,
+        &self.confirm_repeat_keyval,
+        clip_clear_confirm_key,
+        self.active_keyboard_keyval,
+    )) return false;
     self.primary = "Press again to delete all clipboard entries";
     row_list.setHint(self, self.primary, .warning);
     return true;
@@ -926,12 +957,34 @@ test "Navigation forgets the oldest view when it is full" {
     try std.testing.expectEqual(views.len - Navigation.capacity, expected);
 }
 
-test "confirmStep requires a second matching press before confirming" {
+test "confirmStep requires a second matching press after key release before confirming" {
     var key: []const u8 = "";
-    try std.testing.expect(confirmStep(&key, clip_clear_confirm_key));
+    var repeat_keyval: ?c_uint = null;
+
+    // Synthetic (--key) presses confirm on the second call.
+    try std.testing.expect(confirmStep(&key, &repeat_keyval, clip_clear_confirm_key, null));
     try std.testing.expectEqualStrings(clip_clear_confirm_key, key);
-    try std.testing.expect(!confirmStep(&key, clip_clear_confirm_key));
+    try std.testing.expect(!confirmStep(&key, &repeat_keyval, clip_clear_confirm_key, null));
+
+    // Held physical Enter repeats without release do NOT confirm.
+    key = "";
+    repeat_keyval = null;
+    try std.testing.expect(confirmStep(&key, &repeat_keyval, "sys:shutdown", c.GDK_KEY_Return));
+    try std.testing.expect(confirmStep(&key, &repeat_keyval, "sys:shutdown", c.GDK_KEY_Return));
+    try std.testing.expect(confirmStep(&key, &repeat_keyval, "sys:shutdown", c.GDK_KEY_Return));
+    // Releasing Return clears repeat_keyval; the next press confirms.
+    repeat_keyval = null;
+    try std.testing.expect(!confirmStep(&key, &repeat_keyval, "sys:shutdown", c.GDK_KEY_Return));
+
+    // Held physical Ctrl+Shift+X repeats without release do NOT clear clipboard history.
+    key = "";
+    repeat_keyval = null;
+    try std.testing.expect(confirmStep(&key, &repeat_keyval, clip_clear_confirm_key, c.GDK_KEY_x));
+    try std.testing.expect(confirmStep(&key, &repeat_keyval, clip_clear_confirm_key, c.GDK_KEY_x));
+    repeat_keyval = null;
+    try std.testing.expect(!confirmStep(&key, &repeat_keyval, clip_clear_confirm_key, c.GDK_KEY_x));
+
     // Switching target requires confirmation for the new target.
-    try std.testing.expect(confirmStep(&key, "cmd:restart"));
+    try std.testing.expect(confirmStep(&key, &repeat_keyval, "cmd:restart", c.GDK_KEY_Return));
     try std.testing.expectEqualStrings("cmd:restart", key);
 }

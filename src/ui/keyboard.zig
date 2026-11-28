@@ -24,6 +24,9 @@ pub fn handleKeyEvent(
 ) c.gboolean {
     ui.suppress_next_activate = false;
     const key: KeyPress = .decode(keyval, state, .{ .panel_open = ui.panel.isOpen() });
+    const previous_keyval = ui.active_keyboard_keyval;
+    ui.active_keyboard_keyval = if (from_keyboard) key.keyval else null;
+    defer ui.active_keyboard_keyval = previous_keyval;
 
     if (ui.panel.isOpen()) {
         panelKey(ui, key);
@@ -66,6 +69,12 @@ pub fn handleKeyEvent(
     if (Ui.ext_view.keymap(ui, keyval, state)) return 1;
     if (typeAltChord(ui, keyval, state)) return 1;
     return 0;
+}
+
+pub fn handleKeyReleased(ui: *Ui, keyval: c_uint) void {
+    if (keyval == c.GDK_KEY_BackSpace) ui.backspace_blocked = false;
+    const lower = c.gdk_keyval_to_lower(keyval);
+    if (ui.confirm_repeat_keyval == lower) ui.confirm_repeat_keyval = null;
 }
 
 /// True when a Backspace press should navigate back. Never leaves `.root` or

@@ -611,6 +611,73 @@ pub const Settings = struct {
     /// The largest settings file read: Lumen writes a few KB.
     const file_bytes_max = 64 * 1024;
 
+    pub const KeyValue = struct { key: []const u8, value: []const u8 };
+
+    pub const Patch = union(enum) {
+        all,
+        toggle: struct { key: Toggle, value: bool },
+        choice: struct { key: Choice, value: []const u8 },
+        text: struct { key: Text, value: []const u8 },
+        open_with: struct { key: []const u8, value: []const u8 },
+        keys: []const KeyValue,
+    };
+
+    fn isKeptKey(kept: []const []const u8, key: []const u8) bool {
+        for (kept) |kept_key| {
+            if (std.mem.eql(u8, kept_key, key)) return true;
+        }
+        return false;
+    }
+
+    /// Re-reads `path` before applying `patch` so external edits made while
+    /// Settings was open are preserved instead of overwritten from memory.
+    pub fn savePatch(
+        settings: *Settings,
+        gpa: std.mem.Allocator,
+        path: [:0]const u8,
+        kept: []const []const u8,
+        patch: Patch,
+    ) SaveError!void {
+        if (patch == .all) return settings.save(gpa, path, kept);
+        if (settings.incomplete) return error.Incomplete;
+        var disk = load(gpa, path.ptr);
+        errdefer disk.deinit();
+        if (disk.incomplete) return error.Incomplete;
+        switch (patch) {
+            .all => unreachable,
+            .toggle => |toggle| {
+                if (!isKeptKey(kept, @tagName(toggle.key))) {
+                    disk.setToggle(toggle.key, toggle.value);
+                }
+            },
+            .choice => |choice| {
+                if (!isKeptKey(kept, @tagName(choice.key))) {
+                    _ = disk.setChoice(choice.key, choice.value);
+                }
+            },
+            .text => |text| {
+                if (!isKeptKey(kept, @tagName(text.key))) {
+                    _ = disk.setTextValue(text.key, text.value);
+                }
+            },
+            .open_with => |open_with| {
+                disk.setOpenWith(open_with.key, open_with.value) catch |err| switch (err) {
+                    error.OutOfMemory => return error.Incomplete,
+                    error.BadKey, error.BadApp => {},
+                };
+            },
+            .keys => |items| {
+                for (items) |entry| {
+                    if (!isKeptKey(kept, entry.key)) _ = disk.set(entry.key, entry.value);
+                }
+            },
+        }
+        if (disk.incomplete) return error.Incomplete;
+        try disk.save(gpa, path, kept);
+        settings.deinit();
+        settings.* = disk;
+    }
+
     pub const SaveError = sys.Error || std.Io.Writer.Error || error{Incomplete};
 
     /// Writes `path` atomically (temporary file, fsync, rename): a crash or a
@@ -985,4 +1052,33 @@ test "round-trip preserves unrecognized values, # values, and unknown [open-with
     try testing.expect(std.mem.find(u8, out.written(), "width = wide\n") != null);
     try testing.expect(std.mem.find(u8, out.written(), "width = huge") == null);
     try testing.expect(std.mem.find(u8, out.written(), "accent = #88c0d0\n") != null);
+}
+
+test "savePatch preserves external edits to settings.conf made after load" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var dir_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try sys.tmpDirPath(&tmp_dir, &dir_buffer);
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.mem.printSentinel(&path_buffer, "{s}/settings.conf", .{dir}, 0);
+
+    try sys.writeFile(path, "width = default\nsuggestions = true\n");
+    var settings = Settings.load(testing.allocator, path);
+    defer settings.deinit();
+    try testing.expectEqual(Width.default, settings.width);
+    try testing.expect(settings.suggestions);
+
+    // External edit happens while Settings is open.
+    try sys.writeFile(path, "width = wide\nsuggestions = true\nfuture_manual = preserve-me\n");
+
+    settings.setToggle(.suggestions, false);
+    try settings.savePatch(testing.allocator, path, &.{}, .{
+        .toggle = .{ .key = .suggestions, .value = false },
+    });
+
+    var reloaded = Settings.load(testing.allocator, path);
+    defer reloaded.deinit();
+    try testing.expectEqual(Width.wide, reloaded.width);
+    try testing.expect(!reloaded.suggestions);
+    try testing.expectEqualStrings("future_manual = preserve-me", reloaded.unknown.items[0]);
 }
