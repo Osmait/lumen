@@ -31,7 +31,11 @@ FAIL=0
 DAEMON=
 
 cleanup() {
-    [[ -n "$DAEMON" ]] && kill "$DAEMON" 2>/dev/null
+    if [[ -n "$DAEMON" ]]; then
+        kill "$DAEMON" 2>/dev/null
+        for _ in $(seq 20); do kill -0 "$DAEMON" 2>/dev/null || break; sleep 0.1; done
+        kill -KILL "$DAEMON" 2>/dev/null
+    fi
     rm -rf "$T"
 }
 # TERM too: `timeout` kills with SIGTERM, and bash skips EXIT traps then,
@@ -136,11 +140,13 @@ done
 # system's up to date).
 command -v update-desktop-database >/dev/null && update-desktop-database "$T/share/applications"
 
-L() {
-    env -u HYPRLAND_INSTANCE_SIGNATURE \
-        HOME="$H" XDG_CONFIG_HOME="$H/.config" XDG_DATA_HOME="$T/data" XDG_CACHE_HOME="$T/cache" \
-        XDG_DATA_DIRS="$T/share" LUMEN_TEST=1 LUMEN_APP_ID=dev.osmait.LumenE2E "$BIN" "$@"
-}
+APP_ID=dev.osmait.LumenE2E
+LUMEN_ENV=(env -u HYPRLAND_INSTANCE_SIGNATURE
+    HOME="$H" XDG_CONFIG_HOME="$H/.config" XDG_DATA_HOME="$T/data" XDG_CACHE_HOME="$T/cache"
+    XDG_DATA_DIRS="$T/share" LUMEN_TEST=1 LUMEN_APP_ID="$APP_ID")
+L() { "${LUMEN_ENV[@]}" "$BIN" "$@"; }
+# The processes of this suite's instance: their environment names its app id.
+e2e_instances() { grep -lsxF "LUMEN_APP_ID=$APP_ID" --null-data /proc/[0-9]*/environ | cut -d/ -f3; }
 
 # --------------------------------------------------------------- asserting
 ok() { PASS=$((PASS + 1)); printf '  \033[32mok\033[0m   %s\n' "$1"; }
@@ -171,7 +177,9 @@ expect_soon() {
 }
 
 # ------------------------------------------------------------------- start
-L --daemon &
+# A command, not the function: `L &` forks a subshell, and $! would be its
+# pid, not the daemon's (lumen execs lumen-gtk in the process it starts).
+"${LUMEN_ENV[@]}" "$BIN" --daemon &
 DAEMON=$!
 for _ in $(seq 50); do L --dump >/dev/null 2>&1 && break; sleep 0.1; done
 echo "lumen e2e: $BIN (pid $DAEMON), fixture $T"
@@ -252,7 +260,7 @@ expect_soon "match count in detail" 'Matches = line 3'
 query contents "fn main"
 expect_soon "phrase in code" 'main.zig|lib.rs'
 query contents "ze"
-expect "needs 3 characters" 'Type at least 3 characters'
+expect "needs 3 characters" 'Type a word of at least 3 characters'
 query contents "axolotl zebrafish"
 expect_soon "all words must be present" 'zebrafish.md'
 query contents "zebrafish unicorn"
@@ -343,6 +351,8 @@ expect "the current value is marked and selected" '> Default \|  \| ✓'
 L --key down; L --key enter; sleep 0.2
 expect "picking returns to settings, on the same row" '> Text Size \|  \| Large'
 grep -q '^text_size = large' "$C" && ok "choice saved" || ko "choice saved" "$(cat "$C")"
+# The first Esc clears the query Settings came back with, the second leaves.
+L --key escape; sleep 0.1
 L --key escape; sleep 0.1
 expect "escape from settings goes back to the main view" '^view: root'
 
@@ -559,12 +569,15 @@ if command -v git >/dev/null; then
     expect "extensions listed in Settings" '> greeter \| greeter \| 1 command'
     L --key enter; sleep 0.3
     expect "an extension's page offers updating it" 'Update \| git pull'
-    L --key down; L --key enter
+    L --key down; L --key enter; sleep 0.1
+    expect "update asks for a second enter" 'primary: Press ↵ again to Update'
+    L --key enter
     expect_soon "update from Settings says how it went" 'primary: (Already up to date|Updated)'
     L --key down; L --key enter; sleep 0.1
     expect "uninstall asks for a second enter" 'primary: Press ↵ again to Uninstall'
     L --key enter
     if wait_for '^view: settings' 5 && [[ ! -d "$H/.config/lumen/extensions/greeter" ]]; then ok "uninstall from Settings removes it"; else ko "uninstall from Settings removes it" "$(L --dump)"; fi
+    [[ ! -e "$T/data/lumen/extensions/greeter" ]] && ok "uninstall removes its data" || ko "uninstall removes its data" "$(ls -la "$T/data/lumen/extensions" 2>&1)"
     out=$(L --uninstall greeter 2>&1); st=$?
     [[ $st == 1 && "$out" == *"no extension named"* ]] && ok "uninstall of a missing extension fails" || ko "uninstall of a missing extension fails" "$st $out"
 else
@@ -618,6 +631,8 @@ echo "quit"
 L --quit
 for _ in $(seq 50); do kill -0 "$DAEMON" 2>/dev/null || break; sleep 0.1; done
 if kill -0 "$DAEMON" 2>/dev/null; then ko "daemon exits on --quit"; else ok "daemon exits on --quit"; DAEMON=; fi
+left=$(e2e_instances)
+[[ -z "$left" ]] && ok "no instance of the suite is left" || ko "no instance of the suite is left" "$left"
 [[ -f "$T/cache/lumen/files.idx" ]] && ok "file index saved" || ko "file index saved"
 [[ -f "$T/cache/lumen/content.idx" ]] && ok "content index saved" || ko "content index saved"
 [[ $(stat -c %a "$T/cache/lumen") == 700 ]] && ok "cache dir is owner-only" || ko "cache dir is owner-only ($(stat -c %a "$T/cache/lumen"))"

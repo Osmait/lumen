@@ -188,12 +188,11 @@ pub fn openFile(context: Context, path: [:0]const u8, entry: core.file_kind.Entr
     defer if (mime) |mime_type| c.g_free(mime_type);
     const mime_text = if (mime) |mime_type| std.mem.span(mime_type) else "";
     const kind = core.file_kind.of(mime_text, name, entry);
-    var extension_buffer: [16]u8 = undefined;
-    const extension_key = switch (entry) {
-        .folder => "",
-        .file => core.file_kind.extensionKey(&extension_buffer, name),
+    const chosen = switch (entry) {
+        .folder => context.settings.appFor("", kind),
+        .file => context.settings.appForName(name, kind),
     };
-    if (context.settings.appFor(extension_key, kind)) |app| {
+    if (chosen) |app| {
         var app_id_buffer: [256]u8 = undefined;
         const id = std.mem.printSentinel(&app_id_buffer, "{s}", .{app}, 0) catch "";
         if (openWith(path, id)) return true;

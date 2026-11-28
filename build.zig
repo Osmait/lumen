@@ -403,9 +403,10 @@ fn toolSteps(b: *std.Build, options: struct {
 
     // End-to-end: an isolated instance driven through --dump/--key, with
     // `lumen` as installed and lumen-gtk beside it. It needs a Wayland
-    // session, and the window shows for a few seconds.
+    // session, and the window shows for a few seconds. The binary is the
+    // one just installed, under --prefix too (zig-out may hold an older one).
     const e2e_run = b.addSystemCommand(&.{ "bash", "tools/e2e.sh" });
-    e2e_run.addArg("zig-out/bin/lumen");
+    e2e_run.addFileArg(.{ .relative = .{ .base = .install_bin, .sub_path = "lumen" } });
     e2e_run.step.dependOn(b.getInstallStep());
     e2e_run.has_side_effects = true;
     b.step("e2e", "End-to-end tests against an isolated instance").dependOn(&e2e_run.step);

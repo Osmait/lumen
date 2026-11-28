@@ -122,7 +122,10 @@ pub fn saveSettingsPatch(ui: *Ui, patch: Settings.Patch) void {
         patch,
     ) catch |err| {
         log.warn("saving settings: {t}", .{err});
-        ui.showFailure("Could not save the settings");
+        ui.showFailure(switch (err) {
+            error.TooLarge => "Settings not saved: settings.conf would pass 64 KB",
+            else => "Could not save the settings",
+        });
     };
     applyOverrides(ui);
     ui.settings_stamp = settings_mod.Stamp.of(ui.settings_path.ptr);

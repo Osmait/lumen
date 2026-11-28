@@ -490,12 +490,14 @@ lumen --install https://github.com/someone/lumen-weather    # → extensions/wea
 lumen --install git@host:me/tools.git --as tools           # pick the name
 lumen --update weather                                      # git pull it
 lumen --update                                              # every git extension
-lumen --uninstall weather
+lumen --uninstall weather                                   # its data too
 ```
 
 Settings > Extensions lists every installed extension, those that failed
 to load included: its preferences, its folder, Update (for git checkouts)
-and Uninstall.
+and Uninstall. Uninstalling removes the extension's folder and its data
+(`~/.local/share/lumen/extensions/NAME`: storage and preferences). An
+install refuses a name whose data folder is still there.
 
 The name comes from the repository (`lumen-`, `lumen-ext-` and `-lumen` are
 dropped) unless `--as` gives one; `config` and `style` are taken. A

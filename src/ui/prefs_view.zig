@@ -151,7 +151,7 @@ fn manageRows(ui: *Ui, arena: std.mem.Allocator, out: *std.ArrayList(Item)) void
         .key = "manage:uninstall",
         .section = "Manage",
         .title = "Uninstall",
-        .subtitle = "Removes its folder",
+        .subtitle = "Removes its folder and its data",
         .icon = .{ .tile = .{ .name = "user-trash-symbolic", .color = .red } },
         .confirm = true,
         .action = .{ .setting = .{ .ext_uninstall = id } },
@@ -389,12 +389,17 @@ fn save(ui: *Ui, preference: *const Host.Preference, value: std.json.Value) bool
         ui.showFailure("Could not save the setting");
         return false;
     };
-    const json = std.json.Stringify.valueAlloc(
-        arena,
-        std.json.Value{ .object = values },
-        .{ .whitespace = .indent_2 },
-    ) catch {
-        ui.showFailure("Could not save the setting");
+    const json = encode(arena, values) catch |err| {
+        switch (err) {
+            error.TooLarge => {
+                log.warn("{s}: would pass {d} bytes; not overwritten", .{
+                    preference.file,
+                    preferences_bytes_max,
+                });
+                ui.showFailure("Not saved: preferences.json would pass 1 MB");
+            },
+            error.OutOfMemory => ui.showFailure("Could not save the setting"),
+        }
         return false;
     };
     if (std.mem.findScalarLast(u8, preference.file, '/')) |slash| {
@@ -411,4 +416,31 @@ fn save(ui: *Ui, preference: *const Host.Preference, value: std.json.Value) bool
     };
     if (ui.ext_host) |host| host.reload();
     return true;
+}
+
+/// `values` as the text of preferences.json; `TooLarge` past what
+/// `readStored` reads, so a save never writes a file it would refuse.
+fn encode(arena: std.mem.Allocator, values: std.json.ObjectMap) error{ OutOfMemory, TooLarge }![]const u8 {
+    const json = try std.json.Stringify.valueAlloc(
+        arena,
+        std.json.Value{ .object = values },
+        .{ .whitespace = .indent_2 },
+    );
+    if (json.len > preferences_bytes_max) return error.TooLarge;
+    return json;
+}
+
+test "encode refuses preferences past what readStored reads" {
+    var arena_instance: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    var values: std.json.ObjectMap = .empty;
+    try values.put(arena, "flag", .{ .bool = true });
+    const small = try encode(arena, values);
+    try std.testing.expect(std.mem.find(u8, small, "\"flag\": true") != null);
+    // Its own bytes under the limit, the indented object a few over it.
+    const filler = try arena.alloc(u8, preferences_bytes_max - 8);
+    @memset(filler, 'x');
+    try values.put(arena, "big", .{ .string = filler });
+    try std.testing.expectError(error.TooLarge, encode(arena, values));
 }
