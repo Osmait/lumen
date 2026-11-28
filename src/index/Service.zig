@@ -690,6 +690,9 @@ fn addNewDirectories(
 /// Called with the lock held.
 fn rescanDue(service: *const Service) bool {
     if (service.live.pending_resync) return true;
+    // Another process truncated files.idx under its mapping: the pages it
+    // lost read as zeros, and the next save replaces it.
+    if (service.live.base.damaged()) return true;
     return service.live.needsCompaction();
 }
 

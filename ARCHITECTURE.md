@@ -212,6 +212,19 @@ directory (2.8 s cold) and every core.
   yet are kept). unzip gets `-P ''`, so an encrypted member fails instead
   of prompting.
 
+- **Extractors are confined** (`src/os/sandbox.zig`): the documents are
+  anyone's (a download), and poppler and unzip have had memory-corruption
+  bugs. Each tool is forked by hand and, before its exec, takes no new
+  privileges, a Landlock ruleset (no file or folder created, written,
+  truncated, removed or renamed anywhere, no TCP, no signal or abstract
+  socket outside it) and a seccomp filter (no socket at all, so neither the
+  network nor the session bus; no ptrace, io_uring, chmod/chown/xattrs),
+  plus its memory and CPU limits, a session of its own and an empty
+  environment. Reads stay open (libraries, fonts and data live wherever the
+  distribution put them; what is read only reaches Lumen's pipe). Each part
+  is skipped on a kernel without it, never failing the extraction; the
+  oldest kernels keep only the limits.
+
 - **Format**: one mapped file (`~/.cache/lumen/content.idx`): document table
   (path, mtime, size, ctime) and segments of sorted trigram keys with varint-delta
   posting lists. Building dedups each file's trigrams with a 16M-bit map and
@@ -278,11 +291,20 @@ where they are read (name offsets, bounded parent walks, a parent that is
 not the folder searched; segment bounds and list offsets on queries,
 updates and appends), since another process could write the file after it
 was validated: a changed content index fails its update and is rebuilt.
-Checks cannot stop a truncation from pulling pages out from under a mapping
-(SIGBUS): after a rescan, where the file system can clone (btrfs, XFS),
-`files.idx` is a reflink copy and the mapped file has no name, so nothing
-can truncate it; elsewhere, and for the start-up snapshot and
-`content.idx`, a `cp` or `truncate` over the file still can. Doc order
+A truncation (`cp` or `truncate` over the file) pulls pages out from under
+a mapping, and reading one raised SIGBUS. Every mapping of a file is
+registered (`src/os/mapguard.zig`) and a SIGBUS handler puts a page of
+zeros where the read faulted: one more rewrite of the file, which the
+checks above already survive. The mapping is marked damaged, and its
+owner replaces it: files.idx at the next batch of events (a rescan),
+content.idx at its next check (rebuilt whole). This covers the start-up
+snapshot, content.idx, the extracted texts searches map, and file
+systems without reflinks, at no cost: nothing is copied, a mapping stays
+reclaimable page cache, opening one adds a slot write (`lumen-find bench`,
+1.5 M entries, warm: map and check 14.2–14.5 ms before, 14.8–14.9 ms
+after, within run-to-run noise). Where the file system can clone (btrfs,
+XFS), a rescan also gives `files.idx` a reflink copy, so the mapped file
+has no name and is not truncated at all. Doc order
 across the content index's segments is not checked on open; queries and
 merges cope with repeats.
 

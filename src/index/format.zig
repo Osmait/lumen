@@ -39,6 +39,13 @@ pub fn release(bytes: Bytes, backing: Backing, gpa: std.mem.Allocator) void {
     }
 }
 
+/// Whether another process truncated the file under a mapped index: what
+/// it lost reads as zeros (`sys.mappingDamaged`), and the index is to be
+/// replaced.
+pub fn damaged(bytes: Bytes, backing: Backing) bool {
+    return backing == .mapped and sys.mappingDamaged(bytes);
+}
+
 /// Smith input for a fuzz test that starts with one `slice()`: the length
 /// as a little-endian u32, then the bytes.
 pub fn corpusEntry(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {

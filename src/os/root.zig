@@ -9,11 +9,14 @@
 //! - `folder.zig`: folders read straight from getdents64, made, owner-only.
 //! - `file.zig`: regular files read and written whole, replaced atomically,
 //!   grown in place, mapped.
+//! - `mapguard.zig`: those mappings kept alive when another process
+//!   truncates the file (SIGBUS).
 //! - `mounts.zig`: mount points whose file system can hang a `stat`.
 //! - `time.zig`: clocks and sleeping.
 //! - `wait.zig`: waiting on a descriptor or for a child to exit.
 //! - `unix.zig`: Unix sockets, reads and writes with a deadline.
 //! - `child.zig`: programs run to a deadline, fed stdin, output collected.
+//! - `sandbox.zig`: those run on untrusted input, confined.
 //! - `test_dir.zig`: temporary folders for tests.
 
 const std = @import("std");
@@ -25,9 +28,11 @@ const mounts = @import("mounts.zig");
 const time = @import("time.zig");
 const wait = @import("wait.zig");
 const test_dir = @import("test_dir.zig");
+const mapguard = @import("mapguard.zig");
 
 pub const unix = @import("unix.zig");
 pub const child = @import("child.zig");
+pub const sandbox = @import("sandbox.zig");
 
 pub const Error = syscall.Error;
 pub const close = syscall.close;
@@ -74,6 +79,8 @@ pub const MappedBytes = file.MappedBytes;
 pub const mapPrivate = file.mapPrivate;
 pub const mapPrivateWithId = file.mapPrivateWithId;
 pub const unmap = file.unmap;
+pub const mappingDamaged = file.mappingDamaged;
+pub const mappingPagesReplaced = mapguard.replacedPages;
 
 pub const slowMounts = mounts.slowMounts;
 pub const isAtOrBelow = mounts.isAtOrBelow;
@@ -154,4 +161,5 @@ test {
     std.testing.refAllDecls(time);
     std.testing.refAllDecls(wait);
     std.testing.refAllDecls(test_dir);
+    std.testing.refAllDecls(mapguard);
 }

@@ -27,6 +27,7 @@ const cli = @import("cli.zig");
 const ipc_server = @import("sys/ipc_server.zig");
 const proc = @import("sys/proc.zig");
 const hypr = @import("sys/hypr.zig");
+const session_env = @import("sys/session_env.zig");
 const os = @import("os");
 
 const version_line = std.fmt.comptimePrint("{s}\n", .{@import("build_options").version});
@@ -152,6 +153,11 @@ pub fn main(init: std.process.Init) !void {
     // it never takes the bus name either (taking it even briefly made a
     // daemon starting at the same moment fail to register).
     const client_only = cli.needsDaemon(arg_slices);
+    // A daemon started from a terminal took its TERM, TMUX, virtualenv and,
+    // from a tmux server older than the login, a dead Hyprland instance:
+    // and gave them to every app it launched (MYP-564). Fixed by running
+    // again in the session's environment, before GTK starts any thread.
+    if (!client_only) session_env.reexecInSession(init.gpa, init.minimal.environ, argv.items);
     const launcher = if (client_only) c.G_APPLICATION_IS_LAUNCHER else 0;
     const flags = c.G_APPLICATION_HANDLES_COMMAND_LINE | launcher;
     const gtk_app = c.gtk_application_new(daemon.app_id.ptr, flags) orelse {
@@ -994,6 +1000,7 @@ test {
     _ = @import("sys/proc.zig");
     _ = @import("sys/ipc_server.zig");
     _ = @import("sys/hypr.zig");
+    _ = @import("sys/session_env.zig");
     _ = @import("ui/Ui.zig");
     _ = @import("ui/ContentSearch.zig");
     _ = @import("ui/labels.zig");

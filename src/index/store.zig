@@ -174,6 +174,11 @@ pub const Store = struct {
     backing: format.Backing,
     layout: Layout,
 
+    /// Whether its file was truncated under it (`format.damaged`).
+    pub fn damaged(store: *const Store) bool {
+        return format.damaged(store.bytes, store.backing);
+    }
+
     pub fn deinit(store: *Store, gpa: std.mem.Allocator) void {
         format.release(store.bytes, store.backing, gpa);
         store.* = undefined;
@@ -764,6 +769,52 @@ test "save and map give the same index; tombstones stay in memory" {
     var again = try Store.open(index_path);
     defer again.deinit(testing.allocator);
     try testing.expect(!again.isTombstoned(3));
+}
+
+test "files.idx truncated by another process while mapped: no crash, marked damaged" {
+    // MYP-556: `cp copy.idx files.idx` truncates the file in place, and
+    // `name` or `path` of an entry past the new end was a SIGBUS.
+    const gpa = testing.allocator;
+    var builder: Builder = .empty;
+    const root = try builder.push(gpa, "/home/u", no_parent, flag_dir, 0);
+    var name_buffer: [16]u8 = undefined;
+    const entries_count = 20_000;
+    for (0..entries_count) |i| {
+        const entry_name = try std.mem.print(&name_buffer, "f{d:0>6}", .{i});
+        _ = try builder.push(gpa, entry_name, root, 0, 1);
+    }
+    var store = try builder.finish(gpa);
+    defer store.deinit(gpa);
+    var test_dir = try sys.TestDir.init();
+    defer test_dir.deinit();
+    var index_path_buffer: paths.Buffer = undefined;
+    const index_path = try test_dir.path(&index_path_buffer, "files.idx");
+    const last: u32 = entries_count;
+
+    var path_buffer: [256]u8 = undefined;
+
+    // The start-up snapshot, mapped as it is on disk.
+    try store.save(index_path);
+    var opened = try Store.open(index_path);
+    defer opened.deinit(gpa);
+    try testing.expectEqualStrings("/home/u/f019999", opened.path(last, &path_buffer).?);
+    try sys.writeFile(index_path, store.bytes[0..4096]);
+    // Reads as zeros past the end now: whatever comes back, no crash.
+    std.mem.doNotOptimizeAway(opened.name(last));
+    std.mem.doNotOptimizeAway(opened.path(last, &path_buffer));
+    std.mem.doNotOptimizeAway(opened.findChild(0, "f010000"));
+    std.mem.doNotOptimizeAway(opened.liveCount());
+    try testing.expect(opened.damaged());
+
+    // What a rescan maps: the same on a file system that cannot clone; on
+    // one that can, the truncation does not reach it.
+    var saved = try store.saveAndMap(index_path);
+    defer saved.deinit(gpa);
+    try sys.writeFile(index_path, store.bytes[0..4096]);
+    std.mem.doNotOptimizeAway(saved.name(last));
+    std.mem.doNotOptimizeAway(saved.path(last, &path_buffer));
+    std.mem.doNotOptimizeAway(saved.findChild(0, "f010000"));
+    std.mem.doNotOptimizeAway(saved.liveCount());
 }
 
 test "mask prefilter" {

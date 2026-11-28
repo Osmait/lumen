@@ -137,6 +137,11 @@ const DocColumns = struct {
     }
 };
 
+/// Whether its file was truncated under it (`format.damaged`).
+pub fn damaged(index: *const ContentIndex) bool {
+    return format.damaged(index.bytes, index.backing);
+}
+
 pub fn deinit(index: *ContentIndex, gpa: std.mem.Allocator) void {
     format.release(index.bytes, index.backing, gpa);
     index.* = undefined;
