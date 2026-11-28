@@ -136,12 +136,20 @@ pub fn main(init: std.process.Init) !void {
             daemon.app_id,
         });
     }
+    // A command line that is not one is refused here, with or without a
+    // daemon: as the primary instance GApplication would hold on after the
+    // usage was printed, a daemon nobody asked for.
+    if (parseRequest(arg_slices) == null) {
+        printToStderr(init.io, cli.usage);
+        std.process.exit(@intCast(status_usage));
+    }
     // Commands that only talk to a running daemon must not become one: with
     // none running GApplication makes the caller the primary instance, so
-    // `lumen --stats` would start a whole new daemon and never return. As a
-    // launcher it never takes the bus name either (taking it even briefly
-    // made a daemon starting at the same moment fail to register).
-    const client_only = if (first_flag) |flag| cli.specs.get(flag).needs_daemon else false;
+    // `lumen --stats` would start a whole new daemon and never return. Any
+    // flag counts, not only the first (`--prompt X --dmenu`). As a launcher
+    // it never takes the bus name either (taking it even briefly made a
+    // daemon starting at the same moment fail to register).
+    const client_only = cli.needsDaemon(arg_slices);
     const launcher = if (client_only) c.G_APPLICATION_IS_LAUNCHER else 0;
     const flags = c.G_APPLICATION_HANDLES_COMMAND_LINE | launcher;
     const gtk_app = c.gtk_application_new(daemon.app_id.ptr, flags) orelse {
@@ -212,6 +220,10 @@ fn printToStdout(io: std.Io, text: []const u8) void {
     };
 }
 
+fn printToStderr(io: std.Io, text: []const u8) void {
+    std.Io.File.stderr().writeStreamingAll(io, text) catch {};
+}
+
 /// A test instance takes no keyboard, so nobody can close it by hand: if
 /// its script dies, it must not stay on screen. Far beyond any test run.
 const test_instance_lifetime_s = 300;
@@ -221,6 +233,12 @@ fn startupCallback(gtk_app: *c.GtkApplication, data: ?*anyopaque) callconv(.c) v
     os.assertMainThread();
     const start: *const Start = @ptrCast(@alignCast(data.?));
     assert(daemon.ui == null);
+    // Registering on the session bus opened GDBus, which set SIGPIPE to
+    // SIG_IGN: the programs started next (GLib's spawns too) would inherit
+    // it, and `cmd | head` would run on. The empty handler again.
+    os.unix.ignoreSigpipe();
+    useCNumbers();
+    quitOnSignals();
     const path = dbPath() orelse {
         log.err("cannot create the data directory", .{});
         return;
@@ -254,6 +272,33 @@ fn startupCallback(gtk_app: *c.GtkApplication, data: ?*anyopaque) callconv(.c) v
     // Prewarm once the main loop is idle, so it does not delay startup.
     _ = c.g_idle_add(&prewarmCallback, null);
     stats.startup_ns = stats.now() - stats.started_ns;
+}
+
+/// SIGTERM (systemd, a session ending, pkill), SIGINT (Ctrl+C) and SIGHUP
+/// (its terminal closed) shut the daemon down as `--quit` does: the socket
+/// is removed, the name index saved, the extension host stopped. GLib
+/// delivers them on the main loop.
+fn quitOnSignals() void {
+    for ([_]c_int{ c.SIGTERM, c.SIGINT, c.SIGHUP }) |signal| {
+        _ = c.g_unix_signal_add(signal, &quitSignalCallback, null);
+    }
+}
+
+fn quitSignalCallback(_: ?*anyopaque) callconv(.c) c.gboolean {
+    os.assertMainThread();
+    log.info("signal received: shutting down", .{});
+    if (daemon.app) |app| c.g_application_quit(app);
+    // Kept: a second signal while shutting down finds the same answer.
+    return 1;
+}
+
+/// GTK set the whole locale from the environment when it started (before
+/// `startupCallback`). Numbers go back to C's: the extensions' Lua formats
+/// and reads them through the C library, and `tostring(1.5)` must be "1.5"
+/// for every user, as in standard Lua and `lumen.json`, not "1,5" under
+/// de_DE. GTK formats its own numbers with g_ascii_*.
+fn useCNumbers() void {
+    _ = c.setlocale(c.LC_NUMERIC, "C");
 }
 
 /// Where a command's answer goes: the GApplication command line that ran
@@ -877,6 +922,22 @@ test "requests: flags in order, values, and what is refused" {
     try std.testing.expect(parseRequest(&.{ "--view", "ext" }) == null);
     try std.testing.expect(parseRequest(&.{ "--view", "nope", "--dump" }) == null);
     try std.testing.expect(parseRequest(&.{}).?.window.mode == .toggle);
+}
+
+test "numbers use a decimal point under a comma-decimal locale" {
+    const comma_locales = [_][*:0]const u8{
+        "de_DE.UTF-8", "de_DE.utf8", "es_ES.UTF-8", "es_ES.utf8", "fr_FR.UTF-8", "fr_FR.utf8",
+    };
+    defer _ = c.setlocale(c.LC_ALL, "C");
+    // As GTK does at startup, with a locale that writes 1,5.
+    const found = for (comma_locales) |locale| {
+        if (c.setlocale(c.LC_ALL, locale) == null) continue;
+        if (c.localeconv().decimal_point[0] == ',') break true;
+    } else false;
+    if (!found) return error.SkipZigTest;
+    useCNumbers();
+    // What Lua's tostring and tonumber go by (lua_getlocaledecpoint).
+    try std.testing.expectEqual('.', c.localeconv().decimal_point[0]);
 }
 
 test "requestsHelp distinguishes help flag from option values" {

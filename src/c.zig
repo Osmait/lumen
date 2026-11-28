@@ -185,11 +185,21 @@ pub const PANGO_ELLIPSIZE_START: c_int = 1;
 pub const PANGO_ELLIPSIZE_END: c_int = 3;
 pub const PANGO_WRAP_WORD_CHAR: c_int = 2;
 
+pub const SIGHUP: c_int = 1;
+pub const SIGINT: c_int = 2;
 pub const SIGTERM: c_int = 15;
 pub const PR_SET_PDEATHSIG: c_int = 1;
 
+/// glibc's locale categories.
+pub const LC_NUMERIC: c_int = 1;
+pub const LC_ALL: c_int = 6;
+
 // ------------------------------------------------------------------ libc
 
+/// struct lconv, only its first field (the rest is never read).
+pub const lconv = extern struct { decimal_point: [*:0]const u8 };
+pub extern fn setlocale(category: c_int, locale: ?[*:0]const u8) ?[*:0]const u8;
+pub extern fn localeconv() *const lconv;
 pub extern fn kill(pid: c_int, signal: c_int) c_int;
 pub extern fn prctl(option: c_int, ...) c_int;
 pub extern fn read(fd: c_int, buffer: *anyopaque, count: usize) isize;
@@ -852,6 +862,7 @@ pub extern fn g_unix_fd_add(
     function: GUnixFDSourceFunc,
     data: ?*anyopaque,
 ) c_uint;
+pub extern fn g_unix_signal_add(signum: c_int, handler: GSourceFunc, data: ?*anyopaque) c_uint;
 pub extern fn gtk_widget_realize(widget: *GtkWidget) void;
 pub extern fn gtk_widget_measure(
     widget: *GtkWidget,

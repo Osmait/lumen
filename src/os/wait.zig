@@ -5,27 +5,29 @@ const std = @import("std");
 const linux = std.os.linux;
 const os = @import("root.zig");
 
+const log = std.log.scoped(.os);
+
 /// Waits for child `pid` to exit, until `deadline_ns` (monotonic): true when
-/// it did (it is left to be reaped). Without a pidfd (old kernel, no free
-/// descriptor) it does not wait: false, so the caller kills it, and
-/// reaping a killed child cannot hang.
+/// it did (it is left to be reaped). Without a pidfd (a kernel before 5.3,
+/// no free descriptor) it looks every `exit_poll_ms` instead.
 pub fn waitExit(pid: linux.pid_t, deadline_ns: u64) bool {
     return waitExitCancelable(pid, deadline_ns, null, 0);
 }
 
 /// Like `waitExit`, opening `pidfd_open` once and checking `cancel` every
-/// `poll_ms` ms when `cancel` is non-null. Returns false immediately if
-/// `pidfd_open` fails or `poll` errors, never busy-spinning.
+/// `poll_ms` ms when `cancel` is non-null. Never busy-spins: a `poll` that
+/// fails gives up (false), and without a pidfd it falls back to
+/// `waitExitPolling`, so a program that exited is not taken for one that
+/// hung (and killed with its process group).
 pub fn waitExitCancelable(
     pid: linux.pid_t,
     deadline_ns: u64,
     cancel: ?*const std.atomic.Value(bool),
     poll_ms: u64,
 ) bool {
-    const fd = linux.pidfd_open(pid, 0);
-    if (linux.errno(fd) != .SUCCESS) return false;
-    defer os.close(@intCast(fd));
-    const pidfd: i32 = @intCast(fd);
+    const fd = openPidfd(pid) orelse return waitExitPolling(pid, deadline_ns, cancel);
+    defer os.close(fd);
+    const pidfd: i32 = fd;
     while (true) {
         if (cancel) |flag| if (flag.load(.acquire)) return false;
         const now_ns = os.monotonicNs();
@@ -49,6 +51,75 @@ pub fn waitExitCancelable(
             .INTR => continue,
             else => return false,
         }
+    }
+}
+
+/// Whether `pidfd_open` failed once already: said in the log only once.
+var pidfd_failure_logged: std.atomic.Value(bool) = .init(false);
+
+/// A pidfd for process `pid` (readable once it exits), or null when the
+/// kernel gives none: logged once, since without it waits fall back to
+/// polling.
+pub fn openPidfd(pid: linux.pid_t) ?i32 {
+    const result = linux.pidfd_open(pid, 0);
+    const errno = linux.errno(result);
+    if (errno == .SUCCESS) return @intCast(result);
+    // Not a process (pid <= 0, gone): nothing worth a warning.
+    if (errno != .INVAL and errno != .SRCH and !pidfd_failure_logged.swap(true, .monotonic)) {
+        log.warn("pidfd_open: {t}; waiting for programs by polling", .{errno});
+    }
+    return null;
+}
+
+/// How often `waitExitPolling` looks whether the child exited.
+const exit_poll_ms = 10;
+
+/// What `childState` found.
+pub const ChildState = enum {
+    running,
+    /// Exited (or killed), left to be reaped.
+    exited,
+    /// Not a child of this process, or reaped already.
+    gone,
+};
+
+/// Whether child `pid` has exited, without reaping it (WNOWAIT) and
+/// without waiting.
+pub fn childState(pid: linux.pid_t) ChildState {
+    var info: linux.siginfo_t = undefined;
+    @memset(std.mem.asBytes(&info), 0);
+    const flags = linux.W.EXITED | linux.W.NOHANG | linux.W.NOWAIT;
+    while (true) {
+        const result = linux.waitid(.PID, pid, &info, flags, null);
+        switch (linux.errno(result)) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => return .gone,
+        }
+    }
+    // With WNOHANG and nothing to report, the kernel leaves the pid zero.
+    return if (info.fields.common.first.piduid.pid == 0) .running else .exited;
+}
+
+/// `waitExitCancelable` without a pidfd: looks every `exit_poll_ms` whether
+/// child `pid` exited, until `deadline_ns` or `cancel`. True when it did (it
+/// is left to be reaped).
+pub fn waitExitPolling(
+    pid: linux.pid_t,
+    deadline_ns: u64,
+    cancel: ?*const std.atomic.Value(bool),
+) bool {
+    while (true) {
+        switch (childState(pid)) {
+            .exited => return true,
+            .gone => return false,
+            .running => {},
+        }
+        if (cancel) |flag| if (flag.load(.acquire)) return false;
+        const now_ns = os.monotonicNs();
+        if (now_ns >= deadline_ns) return false;
+        const left_us = (deadline_ns - now_ns + std.time.ns_per_us - 1) / std.time.ns_per_us;
+        os.sleepUs(@min(left_us, exit_poll_ms * std.time.us_per_ms));
     }
 }
 
@@ -179,12 +250,32 @@ pub fn waitReadable(fd: i32, timeout_ms: i32) bool {
     return pollUntil(fd, linux.POLL.IN, deadline_ns) == .ready;
 }
 
-test "waitExitCancelable returns immediately when pidfd_open fails" {
+test "waitExitCancelable returns at once for a pid that is not a child" {
     var cancel: std.atomic.Value(bool) = .init(false);
     const start_ns = os.monotonicNs();
     const ok = waitExitCancelable(-1, start_ns + 5 * std.time.ns_per_s, &cancel, 50);
     try std.testing.expect(!ok);
     try std.testing.expect(os.monotonicNs() - start_ns < std.time.ns_per_s);
+}
+
+test "without a pidfd, a child that exits is still seen to exit" {
+    const fork_result = linux.fork();
+    try std.testing.expectEqual(.SUCCESS, linux.errno(fork_result));
+    if (fork_result == 0) {
+        os.sleepUs(50 * std.time.us_per_ms);
+        linux.exit_group(0);
+    }
+    const pid: linux.pid_t = @intCast(fork_result);
+    try std.testing.expectEqual(ChildState.running, childState(pid));
+    const start_ns = os.monotonicNs();
+    try std.testing.expect(waitExitPolling(pid, start_ns + 5 * std.time.ns_per_s, null));
+    try std.testing.expect(os.monotonicNs() - start_ns < 2 * std.time.ns_per_s);
+    // Left to be reaped: seen exited again, then reaped once.
+    try std.testing.expectEqual(ChildState.exited, childState(pid));
+    var status: i32 = 0;
+    try std.testing.expectEqual(.SUCCESS, linux.errno(linux.wait4(pid, &status, 0, null)));
+    try std.testing.expectEqual(ChildState.gone, childState(pid));
+    try std.testing.expect(!waitExitPolling(pid, os.monotonicNs() + std.time.ns_per_s, null));
 }
 
 test "waitEventsTimeout distinguishes ready, woken, timed_out and POLLNVAL" {
