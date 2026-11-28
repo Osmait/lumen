@@ -135,11 +135,12 @@ pub fn freeList(gpa: std.mem.Allocator, list: []const []u8) void {
 }
 
 /// File systems whose calls may block for as long as a server takes to
-/// answer: network ones, and FUSE (any user program behind it).
+/// answer: network ones, FUSE (any user program behind it), and autofs
+/// mount points (touching them can trigger a blocking mount).
 const fstypes_that_may_hang: std.StaticStringMap(void) = .initComptime(.{
-    .{"fuse"},      .{"nfs"},  .{"nfs4"},   .{"cifs"}, .{"smb3"},  .{"smbfs"},
-    .{"9p"},        .{"ceph"}, .{"lustre"}, .{"afs"},  .{"davfs"}, .{"ncpfs"},
-    .{"glusterfs"},
+    .{"autofs"}, .{"fuse"},      .{"nfs"},  .{"nfs4"},   .{"cifs"}, .{"smb3"},
+    .{"smbfs"},  .{"9p"},        .{"ceph"}, .{"lustre"}, .{"afs"},  .{"davfs"},
+    .{"ncpfs"},  .{"glusterfs"},
 });
 
 /// FUSE file systems report themselves as "fuse.<name>" ("fuse.sshfs").
@@ -183,10 +184,15 @@ test "slow mounts: escapes undone, only below the root" {
     defer gpa.free(long);
     @memset(long, 'a');
     try std.testing.expect(try unescapeMount(gpa, long) == null);
-    for ([_][]const u8{ "fuse.sshfs", "nfs4" }) |fstype| try std.testing.expect(mayHang(fstype));
+    for ([_][]const u8{ "autofs", "fuse.sshfs", "nfs4" }) |fstype| try std.testing.expect(mayHang(fstype));
     for ([_][]const u8{ "fuseblk", "ext4", "btrfs", "tmpfs" }) |fstype| {
         try std.testing.expect(!mayHang(fstype));
     }
+    const autofs_sample = "10 1 0:1 / /home/u/nas rw - autofs systemd-1 rw\n";
+    const autofs_mounts = try parseSlowMounts(gpa, autofs_sample, "/home/u", "/home/u");
+    defer freeList(gpa, autofs_mounts);
+    try std.testing.expectEqual(@as(usize, 1), autofs_mounts.len);
+    try std.testing.expectEqualStrings("/home/u/nas", autofs_mounts[0]);
     try std.testing.expect(isAtOrBelow("/home", "/home"));
     try std.testing.expect(isAtOrBelow("/home/u", "/home"));
     try std.testing.expect(isAtOrBelow("/home/u", "/home/"));

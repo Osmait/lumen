@@ -40,11 +40,17 @@ pub const Change = union(enum) {
     /// Something appeared in directory `parent`; a directory must be
     /// scanned whole (it may have filled before we watched it).
     /// `moved_to` is true only for `IN_MOVED_TO` (replacing a directory via `mv -T`).
-    created: struct { parent: u32, name: []const u8, is_dir: bool, moved_to: bool = false },
+    created: struct {
+        parent: u32,
+        name: []const u8,
+        is_dir: bool,
+        moved_to: bool = false,
+        cookie: u32 = 0,
+    },
     /// A non-directory file in `parent` finished being written.
     modified: struct { parent: u32, name: []const u8 },
     /// Something left `parent` (deleted or moved away).
-    removed: struct { parent: u32, name: []const u8 },
+    removed: struct { parent: u32, name: []const u8, cookie: u32 = 0 },
     /// The watched directory itself went away.
     dir_gone: u32,
     /// Kernel queue overflow or unmounted filesystem: changes may be missed. Rescan.
@@ -269,11 +275,16 @@ fn parse(
                 .name = owned,
                 .is_dir = event.mask & linux.IN.ISDIR != 0,
                 .moved_to = event.mask & linux.IN.MOVED_TO != 0,
+                .cookie = if (event.mask & linux.IN.MOVED_TO != 0) event.cookie else 0,
             } });
         } else if (event.mask & linux.IN.CLOSE_WRITE != 0 and event.mask & linux.IN.ISDIR == 0) {
             try out.append(arena, .{ .modified = .{ .parent = id, .name = owned } });
         } else if (event.mask & (linux.IN.DELETE | linux.IN.MOVED_FROM) != 0) {
-            try out.append(arena, .{ .removed = .{ .parent = id, .name = owned } });
+            try out.append(arena, .{ .removed = .{
+                .parent = id,
+                .name = owned,
+                .cookie = if (event.mask & linux.IN.MOVED_FROM != 0) event.cookie else 0,
+            } });
         }
     }
 }

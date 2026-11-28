@@ -51,6 +51,7 @@ stop: std.atomic.Value(bool) = .init(false),
 /// when none could be made: the thread then waits at most 100 ms at a time
 /// on inotify, to look at `stop`.
 wake_fd: ?i32 = null,
+mountinfo_fd: ?i32 = null,
 thread: ?std.Thread = null,
 search_pool: *Pool,
 scan_pool: *Pool,
@@ -87,6 +88,7 @@ backoff_ns: u64 = 0,
 /// Exponential backoff for retrying permission-denied folders (`retry_dirs`).
 retry_backoff_ns: u64 = 0,
 next_retry_ns: u64 = 0,
+last_rescan_failed: bool = false,
 
 pub const StartError = std.mem.Allocator.Error || std.Thread.SpawnError ||
     Watcher.CreateError;
@@ -140,7 +142,7 @@ fn init(
         .config = .{ .roots = &service.roots },
         .cache_path = cache,
     };
-    service.refreshSlowMounts();
+    service.refreshSlowMounts(false);
     errdefer sys.freeList(gpa, service.slow_mounts);
     var base = Store.open(service.cache_path) catch blk: {
         var empty: store_mod.Builder = .empty;
@@ -157,6 +159,8 @@ fn init(
     const event_fd = linux.eventfd(0, linux.EFD.CLOEXEC | linux.EFD.NONBLOCK);
     // Without one, `pause` looks at `stop` every 100 ms instead.
     if (linux.errno(event_fd) == .SUCCESS) service.wake_fd = @intCast(event_fd);
+    const mountinfo_res = linux.open("/proc/self/mountinfo", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(mountinfo_res) == .SUCCESS) service.mountinfo_fd = @intCast(mountinfo_res);
 }
 
 /// The pools the content index runs on, lent for the service's lifetime.
@@ -166,6 +170,7 @@ pub fn contentPools(service: *const Service) ContentService.Pools {
 
 /// Frees what `init` made. The thread must have stopped (or never started).
 fn deinit(service: *Service) void {
+    if (service.mountinfo_fd) |mountinfo_fd| sys.close(mountinfo_fd);
     if (service.wake_fd) |wake_fd| sys.close(wake_fd);
     service.live.deinit();
     const pools: Pools = .{
@@ -182,14 +187,63 @@ fn deinit(service: *Service) void {
     service.gpa.free(service.cache_path);
 }
 
+fn mountListsEqual(left: []const []const u8, right: []const []const u8) bool {
+    if (left.len != right.len) return false;
+    for (left, right) |a, b| {
+        if (!std.mem.eql(u8, a, b)) return false;
+    }
+    return true;
+}
+
+fn hasNewMount(previous: []const []const u8, current: []const []const u8) bool {
+    for (current) |mount| {
+        var found = false;
+        for (previous) |prev| {
+            if (std.mem.eql(u8, mount, prev)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return true;
+    }
+    return false;
+}
+
 /// Reads the slow mounts under the root again (mounted or unmounted since)
-/// into `config.not_opened`. Unreadable or out of memory, the last list
-/// stays. Service thread, before a full scan: nothing else reads them.
-fn refreshSlowMounts(service: *Service) void {
+/// into `config.not_opened`, and when `sync_live` is true also updates
+/// `live.slow_mounts` under lock so hot-mounted slow filesystems never stall
+/// statx on the UI thread.
+fn refreshSlowMounts(service: *Service, sync_live: bool) void {
     const mounts = sys.slowMounts(service.gpa, service.roots[0]) catch return;
-    sys.freeList(service.gpa, service.slow_mounts);
-    service.slow_mounts = mounts;
-    service.config.not_opened = mounts;
+    if (!sync_live) {
+        sys.freeList(service.gpa, service.slow_mounts);
+        service.slow_mounts = mounts;
+        service.config.not_opened = mounts;
+        return;
+    }
+    if (mountListsEqual(service.slow_mounts, mounts)) {
+        sys.freeList(service.gpa, mounts);
+        return;
+    }
+    const added_mount = hasNewMount(service.slow_mounts, mounts);
+    const live_mounts = dupeDirList(service.gpa, mounts) catch {
+        sys.freeList(service.gpa, mounts);
+        return;
+    };
+    var old_service_mounts: [][]u8 = &.{};
+    var old_live_mounts: [][]u8 = &.{};
+    {
+        service.lock.lockUncancelable(service.io);
+        defer service.lock.unlock(service.io);
+        old_service_mounts = service.slow_mounts;
+        service.slow_mounts = mounts;
+        service.config.not_opened = mounts;
+        old_live_mounts = service.live.slow_mounts;
+        service.live.slow_mounts = live_mounts;
+        if (added_mount) service.live.pending_resync = true;
+    }
+    sys.freeList(service.gpa, old_service_mounts);
+    sys.freeList(service.gpa, old_live_mounts);
 }
 
 /// The four pools a service owns. Two are its own; the content ones it only
@@ -331,11 +385,13 @@ fn freeReplaced(gpa: std.mem.Allocator, old: Live.Replaced) void {
 }
 
 /// `name_changes`, or null while it cannot be trusted: watches not all
-/// armed yet, or directories left unwatched (the inotify limit).
+/// armed yet, directories left unwatched (the inotify limit), or rescan pending.
 pub fn nameChanges(service: *Service) ?u64 {
     service.lock.lockSharedUncancelable(service.io);
     defer service.lock.unlockShared(service.io);
-    if (!service.live.fullyArmed() or service.live.unwatched() > 0) return null;
+    if (!service.live.fullyArmed() or service.live.unwatched() > 0 or service.live.pending_resync) {
+        return null;
+    }
     return service.name_changes.load(.acquire);
 }
 
@@ -396,6 +452,12 @@ fn recordModifiedLocked(service: *Service, parent: u32, name: []const u8) void {
     };
 }
 
+fn isIgnoreFile(name: []const u8) bool {
+    return std.mem.eql(u8, name, ".ignore") or
+        std.mem.eql(u8, name, ".gitignore") or
+        std.mem.eql(u8, name, ".rgignore");
+}
+
 /// Whether a change may concern the content index (see `name_changes`).
 /// Under the lock, before the change is applied (its parent id resolves).
 fn concernsContent(service: *Service, change: Watcher.Change) bool {
@@ -405,7 +467,7 @@ fn concernsContent(service: *Service, change: Watcher.Change) bool {
         .removed => |removed| .{ removed.parent, removed.name },
         else => return true,
     };
-    if (name.len > 0 and name[0] == '.') return false;
+    if (name.len > 0 and name[0] == '.' and !isIgnoreFile(name)) return false;
     var path_buffer: paths.Buffer = undefined;
     const directory = service.live.pathOf(.fromRaw(parent), &path_buffer) orelse return true;
     const root = service.roots[0];
@@ -454,7 +516,7 @@ fn rescan(service: *Service) void {
         }
     }
     const start_ns = sys.monotonicNs();
-    service.refreshSlowMounts();
+    service.refreshSlowMounts(true);
     // Nobody can tell what changed while the index is rebuilt.
     defer _ = service.name_changes.fetchAdd(1, .release);
     defer {
@@ -464,9 +526,31 @@ fn rescan(service: *Service) void {
         _ = service.rescans.fetchAdd(1, .monotonic);
         @import("root.zig").trimHeap();
     }
+    // Free existing inotify watches before scanning/arming a replacement so
+    // rebuilding an N-watch tree near max_user_watches never needs 2*N watches.
+    const empty_watcher = Watcher.create(service.gpa) catch |err| {
+        log.warn("rescan: {t}", .{err});
+        service.last_rescan_failed = true;
+        service.lock.lockUncancelable(service.io);
+        service.live.pending_resync = true;
+        service.lock.unlock(service.io);
+        return;
+    };
+    const old_watcher = blk: {
+        service.lock.lockUncancelable(service.io);
+        defer service.lock.unlock(service.io);
+        service.live.pending_resync = true;
+        const previous = service.live.watcher;
+        service.live.watcher = empty_watcher;
+        service.live.arm_cursor = null;
+        service.live.stats.watches = 0;
+        break :blk previous;
+    };
+    old_watcher.destroy(service.gpa);
+
     const fresh = service.prepareCompaction() catch |err| {
         log.warn("rescan: {t}", .{err});
-        // Keep `pending_resync` set so backoff spaces retries instead of stranding stale state.
+        service.last_rescan_failed = true;
         return;
     };
     const old = blk: {
@@ -474,12 +558,13 @@ fn rescan(service: *Service) void {
         defer service.lock.unlock(service.io);
         break :blk service.live.adopt(fresh);
     };
-    // Outside the lock: closing tens of thousands of watches is kernel time
-    // no search should pay.
+    // Outside the lock: dropping the old store/mounts is outside query latency.
     if (old) |replaced| {
+        service.last_rescan_failed = false;
         freeReplaced(service.gpa, replaced);
     } else |err| {
         log.warn("rescan: {t}", .{err});
+        service.last_rescan_failed = true;
         freeReplaced(service.gpa, fresh);
     }
 }
@@ -501,7 +586,7 @@ fn applyEvents(service: *Service, arena: std.mem.Allocator) bool {
         var bumped_names = false;
         for (changes.items) |change| {
             if (!service.concernsContent(change)) continue;
-            if (change == .modified) {
+            if (change == .modified and !isIgnoreFile(change.modified.name)) {
                 service.recordModifiedLocked(change.modified.parent, change.modified.name);
                 continue;
             }
@@ -619,6 +704,13 @@ fn dupeDirList(gpa: std.mem.Allocator, dirs: []const []const u8) std.mem.Allocat
     return kept;
 }
 
+fn advanceRetryBackoffLocked(service: *Service) void {
+    const min_ns = service.live.limits.retry_dir_min_ns;
+    const max_ns = service.live.limits.retry_dir_max_ns;
+    service.retry_backoff_ns = std.math.clamp(service.retry_backoff_ns *| 2, min_ns, max_ns);
+    service.next_retry_ns = sys.monotonicNs() +| service.retry_backoff_ns;
+}
+
 /// Probes permission-denied folders outside the lock. Returns true if any
 /// recovered readability and requires a rescan.
 fn probeRetryDirs(service: *Service) bool {
@@ -647,6 +739,11 @@ fn probeRetryDirs(service: *Service) bool {
         const dir_z = std.mem.printSentinel(&path_buf, "{s}", .{dir}, 0) catch continue;
         if (sys.openDirNoFollow(dir_z)) |fd| {
             sys.close(fd);
+            // Advance backoff before returning so a failing rescan waits with
+            // backoff rather than polling immediately at 100% CPU.
+            service.lock.lockUncancelable(service.io);
+            defer service.lock.unlock(service.io);
+            service.advanceRetryBackoffLocked();
             return true;
         } else |err| switch (err) {
             error.NotFound, error.IsLink => {},
@@ -669,10 +766,7 @@ fn probeRetryDirs(service: *Service) bool {
         service.retry_backoff_ns = 0;
         service.next_retry_ns = 0;
     } else {
-        const min_ns = service.live.limits.retry_dir_min_ns;
-        const max_ns = service.live.limits.retry_dir_max_ns;
-        service.retry_backoff_ns = std.math.clamp(service.retry_backoff_ns *| 2, min_ns, max_ns);
-        service.next_retry_ns = sys.monotonicNs() +| service.retry_backoff_ns;
+        service.advanceRetryBackoffLocked();
     }
     return false;
 }
@@ -705,15 +799,21 @@ fn run(service: *Service) void {
         const fd = service.live.watcher.fd;
         service.lock.unlockShared(service.io);
         const retry_ms = service.retryWaitMs();
-        switch (sys.waitEventsTimeout(fd, service.wake_fd, retry_ms)) {
+        switch (sys.waitServiceEvents(fd, service.wake_fd, service.mountinfo_fd, retry_ms)) {
             .ready => {},
+            .mounts_changed => {
+                service.refreshSlowMounts(true);
+                continue;
+            },
             .woken, .timed_out => {
                 if (retry_ms >= 0 and !service.stop.load(.acquire) and
                     sys.monotonicNs() >= service.next_retry_ns)
                 {
                     if (service.probeRetryDirs()) {
-                        service.last_rescan_end_ns = null;
-                        service.backoff_ns = 0;
+                        if (!service.last_rescan_failed) {
+                            service.last_rescan_end_ns = null;
+                            service.backoff_ns = 0;
+                        }
                         service.rescan();
                     }
                 }
@@ -1196,4 +1296,65 @@ test "service: dupeDirList frees cleanly on OOM at any allocation" {
             for (dirs, copy) |want, got| try testing.expectEqualStrings(want, got);
         }
     }.runCheck, .{});
+}
+
+test "service: probeRetryDirs advances backoff on recovery and nameChanges respects pending_resync" {
+    const gpa = testing.allocator;
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory_buffer: paths.Buffer = undefined;
+    const directory = try temporaryPath(&temporary, &directory_buffer);
+    try makeDirectory(directory, "root");
+    var root_buffer: paths.Buffer = undefined;
+    const root = try std.mem.print(&root_buffer, "{s}/root", .{directory});
+    try makeDirectory(root, "ok");
+    var ok_buffer: paths.Buffer = undefined;
+    const ok_dir = try std.mem.print(&ok_buffer, "{s}/ok", .{root});
+    var index_path_buffer: paths.Buffer = undefined;
+    const index_path = try std.mem.printSentinel(&index_path_buffer, "{s}/files.idx", .{directory}, 0);
+
+    const service = try Service.start(gpa, testing.io, root, index_path);
+    defer service.shutdown();
+    try settle(service);
+
+    // While pending_resync is true, nameChanges returns null so content listing waits.
+    service.lock.lockUncancelable(service.io);
+    service.live.pending_resync = true;
+    service.lock.unlock(service.io);
+    try testing.expect(service.nameChanges() == null);
+
+    service.lock.lockUncancelable(service.io);
+    service.live.pending_resync = false;
+    try service.live.addRetryDir(ok_dir);
+    service.retry_backoff_ns = 10 * std.time.ns_per_ms;
+    service.next_retry_ns = 0;
+    service.lock.unlock(service.io);
+
+    // When probeRetryDirs succeeds, it must advance retry_backoff_ns and next_retry_ns.
+    try testing.expect(service.probeRetryDirs());
+    try testing.expectEqual(@as(u64, 1 * std.time.ns_per_s), service.retry_backoff_ns);
+    try testing.expect(service.next_retry_ns > 0);
+
+    // Clear injected retry_dirs and wake the loop via an inotify event so wake_fd stays clean.
+    try makeDirectory(root, "extra");
+    var extra_buffer: paths.Buffer = undefined;
+    const extra_dir = try std.mem.print(&extra_buffer, "{s}/extra", .{root});
+    try makeDirectory(extra_dir, "nested");
+    const rescans_before = service.rescans.load(.monotonic);
+    service.lock.lockUncancelable(service.io);
+    sys.freeList(gpa, service.live.retry_dirs);
+    service.live.retry_dirs = &.{};
+    service.live.pending_resync = true;
+    service.lock.unlock(service.io);
+    try touch(root, "wake_rescan.txt");
+    const deadline_ns = sys.monotonicNs() + 5 * std.time.ns_per_s;
+    while (service.rescans.load(.monotonic) == rescans_before) {
+        if (sys.monotonicNs() > deadline_ns) return error.Timeout;
+        sys.sleepUs(2_000);
+    }
+    try settle(service);
+    try testing.expect(!service.last_rescan_failed);
+    const st = service.status();
+    try testing.expectEqual(@as(u32, 0), st.unwatched);
+    try testing.expect(st.watches >= 4);
 }

@@ -47,7 +47,7 @@ const Daemon = struct {
     app_id: [:0]const u8 = ipc.app_id_default,
     /// The window, built in `startupCallback`; see `readyUi`.
     ui: ?Ui = null,
-    shutting_down: bool = false,
+    shutting_down: std.atomic.Value(bool) = .init(false),
     clipboard_watcher: ClipboardWatcher = .{},
     content_index_idle_queued: std.atomic.Value(bool) = .init(false),
 };
@@ -576,7 +576,7 @@ fn usage(reply: *const Reply) c_int {
 
 fn shutdownCallback(_: *c.GtkApplication, _: ?*anyopaque) callconv(.c) void {
     os.assertMainThread();
-    daemon.shutting_down = true;
+    daemon.shutting_down.store(true, .release);
     // The socket, and the clients still connected to it.
     ipc_server.shutdown();
     if (daemon.clipboard_watcher.pid) |pid| _ = c.kill(pid, c.SIGTERM);
@@ -652,7 +652,7 @@ fn startFileIndex(ui: *Ui) void {
 }
 
 fn onContentIndexPublished(_: ?*anyopaque) void {
-    if (daemon.shutting_down) return;
+    if (daemon.shutting_down.load(.acquire)) return;
     if (daemon.content_index_idle_queued.swap(true, .acq_rel)) return;
     if (c.g_idle_add(&contentIndexPublishedIdle, null) == 0) {
         daemon.content_index_idle_queued.store(false, .release);
@@ -662,7 +662,7 @@ fn onContentIndexPublished(_: ?*anyopaque) void {
 fn contentIndexPublishedIdle(_: ?*anyopaque) callconv(.c) c.gboolean {
     os.assertMainThread();
     daemon.content_index_idle_queued.store(false, .release);
-    if (daemon.shutting_down) return 0;
+    if (daemon.shutting_down.load(.acquire)) return 0;
     const ui = readyUi() orelse return 0;
     if (ui.view == .contents and c.gtk_widget_get_visible(@ptrCast(ui.window)) != 0) {
         ui.refresh();
@@ -736,7 +736,7 @@ fn clipboardWatcherExitCallback(pid: c.GPid, status: c_int, _: ?*anyopaque) call
     const watcher = &daemon.clipboard_watcher;
     if (watcher.pid == pid) watcher.pid = null;
     // Stopped on purpose: shutting down, or history turned off.
-    if (daemon.shutting_down) return;
+    if (daemon.shutting_down.load(.acquire)) return;
     const ui = readyUi() orelse return;
     if (!ui.settings.clipboard) return;
     if (stats.now() - watcher.started_ns > ClipboardWatcher.healthy_after_ns) {
@@ -753,7 +753,7 @@ fn clipboardWatcherExitCallback(pid: c.GPid, status: c_int, _: ?*anyopaque) call
 fn clipboardWatcherRestartCallback(_: ?*anyopaque) callconv(.c) c.gboolean {
     // Meanwhile Settings may have turned the history off, or on again
     // (which started a watcher of its own).
-    if (daemon.shutting_down) return 0;
+    if (daemon.shutting_down.load(.acquire)) return 0;
     if (daemon.clipboard_watcher.running()) return 0;
     const ui = readyUi() orelse return 0;
     if (ui.settings.clipboard) startClipboardWatcher();
@@ -763,7 +763,7 @@ fn clipboardWatcherRestartCallback(_: ?*anyopaque) callconv(.c) c.gboolean {
 /// Clipboard History on/off in Settings starts or stops the watcher.
 fn settingsChangedCallback() void {
     if (c.g_getenv(ipc.env.test_mode) != null) return;
-    if (daemon.shutting_down) return;
+    if (daemon.shutting_down.load(.acquire)) return;
     const ui = readyUi() orelse return;
     const watcher = &daemon.clipboard_watcher;
     if (ui.settings.clipboard) {

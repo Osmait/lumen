@@ -21,7 +21,7 @@ pub const Stamp = struct {
         const result = linux.statx(
             linux.AT.FDCWD,
             path,
-            0,
+            linux.AT.NO_AUTOMOUNT,
             .{ .SIZE = true, .MTIME = true, .INO = true },
             &stx,
         );
@@ -56,7 +56,7 @@ pub fn kindAt(dir_fd: i32, name: [*:0]const u8) u8 {
     const result = linux.statx(
         dir_fd,
         name,
-        linux.AT.SYMLINK_NOFOLLOW,
+        linux.AT.SYMLINK_NOFOLLOW | linux.AT.NO_AUTOMOUNT,
         .{ .TYPE = true },
         &stx,
     );
@@ -72,19 +72,33 @@ pub fn kindAt(dir_fd: i32, name: [*:0]const u8) u8 {
 /// dangling symlinks), without following symlinks on the final component.
 pub fn existsAtNoFollow(dir_fd: i32, relative_path: [*:0]const u8) bool {
     var stx: linux.Statx = undefined;
-    const result = linux.statx(dir_fd, relative_path, linux.AT.SYMLINK_NOFOLLOW, .{}, &stx);
+    const result = linux.statx(
+        dir_fd,
+        relative_path,
+        linux.AT.SYMLINK_NOFOLLOW | linux.AT.NO_AUTOMOUNT,
+        .{},
+        &stx,
+    );
     return linux.errno(result) == .SUCCESS;
 }
 
 /// True for a regular file (not a FIFO, device, socket or directory).
 pub fn isRegular(path: [*:0]const u8) bool {
     var stx: linux.Statx = undefined;
-    const result = linux.statx(linux.AT.FDCWD, path, 0, .{ .TYPE = true }, &stx);
+    const result = linux.statx(
+        linux.AT.FDCWD,
+        path,
+        linux.AT.NO_AUTOMOUNT,
+        .{ .TYPE = true },
+        &stx,
+    );
     return linux.errno(result) == .SUCCESS and stx.mode & linux.S.IFMT == linux.S.IFREG;
 }
 
 pub fn exists(path: [*:0]const u8) bool {
-    return linux.errno(linux.faccessat(linux.AT.FDCWD, path, linux.F_OK, 0)) == .SUCCESS;
+    var stx: linux.Statx = undefined;
+    const result = linux.statx(linux.AT.FDCWD, path, linux.AT.NO_AUTOMOUNT, .{}, &stx);
+    return linux.errno(result) == .SUCCESS;
 }
 
 /// Modification time in unix seconds, or null.
@@ -93,7 +107,7 @@ pub fn mtime(path: [*:0]const u8) ?i64 {
     const result = linux.statx(
         linux.AT.FDCWD,
         path,
-        linux.AT.SYMLINK_NOFOLLOW,
+        linux.AT.SYMLINK_NOFOLLOW | linux.AT.NO_AUTOMOUNT,
         .{ .MTIME = true },
         &stx,
     );
@@ -108,7 +122,7 @@ pub fn info(path: [*:0]const u8) ?Info {
     const result = linux.statx(
         linux.AT.FDCWD,
         path,
-        0,
+        linux.AT.NO_AUTOMOUNT,
         .{ .TYPE = true, .SIZE = true, .MTIME = true },
         &stx,
     );

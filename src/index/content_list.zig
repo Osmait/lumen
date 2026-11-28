@@ -276,7 +276,7 @@ pub fn stat(path: [*:0]const u8, kind: Kind) ?Stat {
     const result = linux.statx(
         linux.AT.FDCWD,
         path,
-        linux.AT.SYMLINK_NOFOLLOW,
+        linux.AT.SYMLINK_NOFOLLOW | linux.AT.NO_AUTOMOUNT,
         .{ .TYPE = true, .SIZE = true, .MTIME = true },
         &statx,
     );

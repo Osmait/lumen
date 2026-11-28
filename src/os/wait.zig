@@ -52,7 +52,7 @@ pub fn waitExitCancelable(
     }
 }
 
-pub const EventWait = enum { ready, woken, timed_out, failed };
+pub const EventWait = enum { ready, woken, mounts_changed, timed_out, failed };
 
 /// Waits until `fd` is readable (`.ready`) or `wake` is written (`.woken`).
 /// Without `wake`, gives up every 100 ms so the caller can look around.
@@ -62,6 +62,12 @@ pub fn waitEvents(fd: i32, wake: ?i32) EventWait {
 
 /// Like `waitEvents`, but waits at most `timeout_ms` ms when `timeout_ms >= 0`.
 pub fn waitEventsTimeout(fd: i32, wake: ?i32, timeout_ms: i32) EventWait {
+    return waitServiceEvents(fd, wake, null, timeout_ms);
+}
+
+/// Like `waitEventsTimeout`, also watching `mountinfo` for `POLLPRI` changes
+/// (`/proc/self/mountinfo` signals mount table updates via exceptional events).
+pub fn waitServiceEvents(fd: i32, wake: ?i32, mountinfo: ?i32, timeout_ms: i32) EventWait {
     if (fd < 0) return .failed;
     const effective_timeout_ms: i32 = if (wake == null)
         (if (timeout_ms >= 0 and timeout_ms < 100) timeout_ms else 100)
@@ -71,7 +77,21 @@ pub fn waitEventsTimeout(fd: i32, wake: ?i32, timeout_ms: i32) EventWait {
         os.monotonicNs() + @as(u64, @intCast(effective_timeout_ms)) * std.time.ns_per_ms
     else
         null;
-    const poll_fds_count: usize = if (wake == null) 1 else 2;
+    var poll_fds: [3]linux.pollfd = undefined;
+    poll_fds[0] = .{ .fd = fd, .events = linux.POLL.IN, .revents = 0 };
+    var poll_fds_count: usize = 1;
+    const wake_slot: ?usize = if (wake) |wake_fd| blk: {
+        const idx = poll_fds_count;
+        poll_fds[idx] = .{ .fd = wake_fd, .events = linux.POLL.IN, .revents = 0 };
+        poll_fds_count += 1;
+        break :blk idx;
+    } else null;
+    const mount_slot: ?usize = if (mountinfo) |mount_fd| blk: {
+        const idx = poll_fds_count;
+        poll_fds[idx] = .{ .fd = mount_fd, .events = linux.POLL.PRI, .revents = 0 };
+        poll_fds_count += 1;
+        break :blk idx;
+    } else null;
     while (true) {
         const remaining_ms: i32 = if (deadline_ns) |limit| blk: {
             if (effective_timeout_ms == 0) break :blk 0;
@@ -80,10 +100,7 @@ pub fn waitEventsTimeout(fd: i32, wake: ?i32, timeout_ms: i32) EventWait {
             const left_ms = (limit - now_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms;
             break :blk @intCast(@min(left_ms, std.math.maxInt(i32)));
         } else -1;
-        var poll_fds = [2]linux.pollfd{
-            .{ .fd = fd, .events = linux.POLL.IN, .revents = 0 },
-            .{ .fd = wake orelse -1, .events = linux.POLL.IN, .revents = 0 },
-        };
+        for (poll_fds[0..poll_fds_count]) |*pfd| pfd.revents = 0;
         const ready_count = linux.poll(&poll_fds, poll_fds_count, remaining_ms);
         switch (linux.errno(ready_count)) {
             .SUCCESS => {},
@@ -92,8 +109,15 @@ pub fn waitEventsTimeout(fd: i32, wake: ?i32, timeout_ms: i32) EventWait {
         }
         if (ready_count == 0) return .timed_out;
         if (poll_fds[0].revents & linux.POLL.NVAL != 0) return .failed;
-        if (poll_fds_count > 1 and poll_fds[1].revents & linux.POLL.NVAL != 0) return .failed;
-        if (poll_fds_count > 1 and poll_fds[1].revents & linux.POLL.IN != 0) return .woken;
+        if (wake_slot) |slot| {
+            if (poll_fds[slot].revents & linux.POLL.NVAL != 0) return .failed;
+            if (poll_fds[slot].revents & linux.POLL.IN != 0) return .woken;
+        }
+        if (mount_slot) |slot| {
+            if (poll_fds[slot].revents & (linux.POLL.PRI | linux.POLL.ERR) != 0) {
+                return .mounts_changed;
+            }
+        }
         if (poll_fds[0].revents & (linux.POLL.ERR | linux.POLL.HUP) != 0 and
             poll_fds[0].revents & linux.POLL.IN == 0)
         {
@@ -191,4 +215,17 @@ test "waitEventsTimeout distinguishes ready, woken, timed_out and POLLNVAL" {
     os.close(closed_fd);
     os.close(bad_pipe[1]);
     try std.testing.expectEqual(EventWait.failed, waitEventsTimeout(closed_fd, null, 0));
+
+    // Drain `event_pipe` and verify polling /proc/self/mountinfo with POLLPRI
+    // does not spuriously wake when mountinfo has not changed.
+    _ = linux.read(event_pipe[0], &drain, 1);
+    const mountinfo_res = linux.open("/proc/self/mountinfo", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(mountinfo_res) == .SUCCESS) {
+        const mountinfo_fd: i32 = @intCast(mountinfo_res);
+        defer os.close(mountinfo_fd);
+        try std.testing.expectEqual(
+            EventWait.timed_out,
+            waitServiceEvents(event_pipe[0], wake_pipe[0], mountinfo_fd, 0),
+        );
+    }
 }
