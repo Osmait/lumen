@@ -257,11 +257,14 @@ pub fn scoreFieldsQuery(query: Query, fields: []const []const u8) i32 {
 }
 
 /// On folded `text`: after a separator, or a capital after a small letter
-/// in the original ("fileManager", "ÁrbolÉpico").
+/// in the original ("fileManager", "ÁrbolÉpico"). A separator is any ASCII
+/// byte that is not a letter or digit (a tab, "(", "[", a quote, ",", "&"),
+/// as the file index's matcher has it (`index/fine.zig`); bytes of UTF-8
+/// sequences count as letters (MYP-550).
 fn isBoundary(text: []const u8, upper: []const bool, index: usize) bool {
     if (index == 0) return true;
     const before = text[index - 1];
-    if (std.mem.findScalar(u8, " -_./", before) != null) return true;
+    if (before < 0x80 and !std.ascii.isAlphanumeric(before)) return true;
     return std.ascii.isLower(before) and !upper[index - 1] and upper[index];
 }
 
@@ -270,6 +273,19 @@ test "word starts and runs" {
     try std.testing.expect(score("vsc", "Visual Studio Code") > 0);
     try std.testing.expectEqual(no_match, score("xff", "Firefox"));
     try std.testing.expectEqual(no_match, score("left", "File Manager"));
+}
+
+test "any ASCII symbol starts a word (MYP-550)" {
+    try std.testing.expect(score("st", "123\tsome text") > 0);
+    try std.testing.expect(score("code insiders", "Visual Studio Code (Insiders)") > 0);
+    try std.testing.expect(score("rf", "Report (final).docx") > 0);
+    try std.testing.expect(score("pw", "[Proton] Witcher") > 0);
+    try std.testing.expect(score("gc", "\"git commit\"") > 0);
+    try std.testing.expect(score("tg", "Tom&Gerry") > 0);
+    try std.testing.expect(score("ab", "a,b") > 0);
+    // Letters and digits still join a word; UTF-8 bytes count as letters.
+    try std.testing.expectEqual(no_match, score("ab", "a1b"));
+    try std.testing.expectEqual(no_match, score("ab", "a×b"));
 }
 
 test "prefix beats middle substring beats scattered" {

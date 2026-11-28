@@ -249,6 +249,11 @@ fn registryCallback(registry: *Host.Registry, context: ?*anyopaque) void {
     // may have changed (or stopped changing) settings.
     config.reloadSettings(ui);
     if (ui.style_defaults_pending) applyStyleDefaults(ui, registry);
+    // Every row is built again, those still queued (`Ui.pending`) too: their
+    // icons may be the old registry's (lumen.icons). The contents view keeps
+    // its rows while an answer is on its way (`search.answerPending`); once
+    // it forgets which answer they show, it builds them again (MYP-437).
+    ui.content_query.shown = null;
     if (lost or (ui.view == .ext and command(ui) == null)) {
         ui.setView(.root);
     } else if (ui.view == .ext) {
@@ -431,9 +436,7 @@ fn actCallback(answer: *Host.ActResult, context: ?*anyopaque) void {
         .close => ui.hide(),
         .stay => row_list.select(ui, ui.selected),
         .refresh => if (ui.view == .ext) {
-            const old_list = ui.ext_list.forget();
-            refreshExtView(ui);
-            if (old_list) |result| result.destroy(ui.gpa);
+            askAgain(ui);
         } else if (ui.view == .form) {
             // A form "refreshes" by starting over, ready for the next one.
             form_view.reset(ui);
@@ -665,6 +668,19 @@ pub fn prepare(ui: *Ui, query_typed: []const u8) bool {
         ask(ui, query);
     }
     return false;
+}
+
+/// An action returned "refresh": the open command is asked for its rows
+/// again, and the rows on screen stay until they come (`listCallback`
+/// rebuilds them, the selection kept). Forgetting the last answer showed
+/// "Loading..." in between, which lost the selection (MYP-607).
+fn askAgain(ui: *Ui) void {
+    const open_command = command(ui) orelse return;
+    switch (open_command.mode) {
+        .list => ask(ui, ""),
+        .search => ask(ui, Host.clipQuery(std.mem.trim(u8, ui.query(), " "))),
+        .run, .provider, .form => {},
+    }
 }
 
 /// Asks the open command for its rows for `query`.

@@ -35,8 +35,16 @@ pub fn onContentResult(result: *Ui.ContentSearch.Result, context: ?*anyopaque) v
         return;
     }
     if (result.err) |err| log.warn("content search for \"{s}\": {t}", .{ result.query, err });
+    // The same query searched again, the index having changed under it: the
+    // selection (and an Enter about to be pressed) stays on its file, not
+    // the first row's (MYP-606).
+    const searched_again = if (ui.content_query.shown) |shown|
+        std.mem.eql(u8, shown.query, result.query)
+    else
+        false;
     const replaced = ui.content_query.take(result);
     if (ui.view == .contents) {
+        if (searched_again) ui.keepSelection();
         ui.refresh();
         // Latency from the keystroke that asked, not from this rebuild.
         if (stats.pending) |*pending_stats| {
@@ -59,6 +67,9 @@ pub fn itemsFromHits(
         const path = arena.dupeSentinel(u8, hit.path, 0) catch continue;
         const slash = std.mem.findScalarLast(u8, hit.path, '/') orelse 0;
         out.append(arena, .{
+            // The file's, as in the file search: one row per file, found
+            // again by it when the rows are built again (MYP-606).
+            .key = arena.print(file_key_prefix ++ "{s}", .{hit.path}) catch "",
             .title = labels.displayText(arena, hit.path[slash + 1 ..]),
             // The list is narrow beside the preview: the folder goes to the
             // detail pane, the name keeps the room.

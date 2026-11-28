@@ -180,6 +180,8 @@ git branch --format='%(refname:short)' | lumen --dmenu --prompt Branch | xargs g
 ```
 
 Lines show as they arrive, so a slow command does not hold the window up.
+The list holds the first 500 lines, or the best 200 matches once you type;
+a last row says how many more there are, and typing finds them.
 rofi's row options work too: `printf 'Firefox\0icon\x1ffirefox\n'` shows an
 icon, and `meta` adds words to search by. It needs Lumen running (the daemon).
 

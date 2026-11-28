@@ -593,6 +593,16 @@ pub fn setViewWithQuery(self: *Ui, view: View, initial_query: [:0]const u8) void
     }
     // The rows are this base's now: nothing points into replaced app lists.
     self.apps.dropStale();
+    self.refocusSearch();
+}
+
+/// Gives the search bar the keyboard back, its text left unselected, if
+/// something took it while the window shows: typing after a click on a row
+/// went to the row, or to a row already gone (MYP-552).
+pub fn refocusSearch(self: *Ui) void {
+    if (!gtk.isVisible(self.window)) return;
+    if (c.gtk_widget_has_focus(gtk.widget(self.search_bar.entry)) != 0) return;
+    _ = c.gtk_text_grab_focus_without_selecting(self.search_bar.entry);
 }
 
 /// Applies layout, placeholder, scope chip, and footer title for `self.view`

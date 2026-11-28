@@ -38,7 +38,9 @@ const read_chunk_bytes = 256 * 1024;
 const rebuild_delay_ms = 50;
 const rebuild_slow_delay_ms = 250;
 const rebuild_slow_lines_min = 10_000;
-/// Rows listed with nothing typed, and best matches listed when filtering.
+/// Rows listed with nothing typed, and best matches listed when filtering
+/// (as many again of non-selectable ones, MYP-473). The lines past them
+/// are reached by typing: a last row says how many there are (MYP-589).
 const rows_unfiltered_max = 500;
 const rows_filtered_max = 200;
 /// Bytes of a line, and of its meta, that filtering matches against. Each
@@ -306,12 +308,13 @@ pub fn fill(ui: *Ui, arena: std.mem.Allocator, query: []const u8) void {
     const session = ui.picker orelse return;
     const lines = session.lines.items;
     if (query.len == 0) {
-        for (lines[0..@min(lines.len, rows_unfiltered_max)], 0..) |line, i| {
+        const shown = @min(lines.len, rows_unfiltered_max);
+        for (lines[0..shown], 0..) |line, i| {
             row_list.addItem(ui, itemOf(arena, line, @intCast(i)));
         }
+        if (moreRow(arena, lines.len - shown, "lines")) |more| row_list.addItem(ui, more);
         return;
     }
-    const Hit = struct { score: i32, line_index: u32 };
     var hits: std.ArrayList(Hit) = .empty;
     // Folded once: up to 200 000 lines, two fields each, per keystroke.
     var query_buffer: [core.fuzzy.text_chars_max]u8 = undefined;
@@ -329,8 +332,52 @@ pub fn fill(ui: *Ui, arena: std.mem.Allocator, query: []const u8) void {
             return x.line_index < y.line_index;
         }
     }.better);
-    const best = hits.items[0..@min(hits.items.len, rows_filtered_max)];
-    for (best) |hit| row_list.addItem(ui, itemOf(arena, lines[hit.line_index], hit.line_index));
+    const best = keepBest(hits.items, lines);
+    for (best.kept) |hit| row_list.addItem(ui, itemOf(arena, lines[hit.line_index], hit.line_index));
+    if (moreRow(arena, best.left_out, "matches")) |more| row_list.addItem(ui, more);
+}
+
+const Hit = struct { score: i32, line_index: u32 };
+
+/// The best of `hits` (sorted best first), moved to its front: up to
+/// `rows_filtered_max` lines that can be chosen, and the non-selectable
+/// ones (headers) ranked among them, up to as many again. Counted
+/// together, 200 matching headers hid every line to choose, and Enter
+/// printed the query (MYP-473). `left_out` counts the lines to choose that
+/// did not fit.
+fn keepBest(hits: []Hit, lines: []const Line) struct { kept: []Hit, left_out: usize } {
+    var kept: usize = 0;
+    var selectable: usize = 0;
+    var headers: usize = 0;
+    var left_out: usize = 0;
+    for (hits) |hit| {
+        if (lines[hit.line_index].selectable) {
+            if (selectable == rows_filtered_max) {
+                left_out += 1;
+                continue;
+            }
+            selectable += 1;
+        } else {
+            // Past the last line listed, a header heads nothing.
+            if (headers == rows_filtered_max or selectable == rows_filtered_max) continue;
+            headers += 1;
+        }
+        hits[kept] = hit;
+        kept += 1;
+    }
+    return .{ .kept = hits[0..kept], .left_out = left_out };
+}
+
+/// A last row, not selectable, saying that `count` more `what` are left
+/// out and typing finds them; null when none are.
+fn moreRow(arena: std.mem.Allocator, count: usize, what: []const u8) ?Item {
+    if (count == 0) return null;
+    const text = arena.printSentinel("… {d} more {s}: type to filter", .{ count, what }, 0) catch
+        return null;
+    return .{
+        .title = text,
+        .action = .{ .pick = .{ .index = std.math.maxInt(u32), .selectable = false } },
+    };
 }
 
 /// The part of `text` filtering looks at.
@@ -396,4 +443,44 @@ test "addLine parses rofi options and marks nonselectable rows" {
     const emoji = session.lines.items[2];
     try std.testing.expectEqualStrings("Emoji", emoji.text);
     try std.testing.expectEqualStrings("🚀", emoji.icon.emoji);
+}
+
+test "headers do not take the room of the lines to choose (MYP-473)" {
+    var lines: [rows_filtered_max + 3]Line = undefined;
+    var hits: [lines.len]Hit = undefined;
+    // 201 matching headers ranked first, then two lines to choose.
+    for (lines[0 .. lines.len - 2], hits[0 .. lines.len - 2], 0..) |*line, *hit, i| {
+        line.* = .{ .text = "header", .selectable = false };
+        hit.* = .{ .score = 100, .line_index = @intCast(i) };
+    }
+    lines[lines.len - 2] = .{ .text = "heading to choose" };
+    hits[lines.len - 2] = .{ .score = 50, .line_index = lines.len - 2 };
+    lines[lines.len - 1] = .{ .text = "heading too" };
+    hits[lines.len - 1] = .{ .score = 40, .line_index = lines.len - 1 };
+    const best = keepBest(&hits, &lines);
+    try std.testing.expectEqual(@as(usize, rows_filtered_max + 2), best.kept.len);
+    try std.testing.expectEqual(@as(usize, 0), best.left_out);
+    try std.testing.expectEqual(@as(u32, lines.len - 2), best.kept[rows_filtered_max].line_index);
+    try std.testing.expectEqual(@as(u32, lines.len - 1), best.kept[rows_filtered_max + 1].line_index);
+}
+
+test "lines past the limit are counted and said, headers after them dropped (MYP-589)" {
+    var lines: [rows_filtered_max + 7]Line = undefined;
+    var hits: [lines.len]Hit = undefined;
+    for (&lines, &hits, 0..) |*line, *hit, i| {
+        line.* = .{ .text = "line" };
+        hit.* = .{ .score = 10, .line_index = @intCast(i) };
+    }
+    lines[lines.len - 1].selectable = false;
+    const best = keepBest(&hits, &lines);
+    try std.testing.expectEqual(@as(usize, rows_filtered_max), best.kept.len);
+    try std.testing.expectEqual(@as(usize, 6), best.left_out);
+
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expect(moreRow(arena, 0, "lines") == null);
+    const more = moreRow(arena, 500, "lines").?;
+    try std.testing.expectEqualStrings("… 500 more lines: type to filter", more.title);
+    try std.testing.expect(!row_list.isSelectable(more));
 }

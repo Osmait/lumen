@@ -221,6 +221,8 @@ fn buildItemRow(ui: *Ui, item_index: usize) void {
             ui.grid,
             @intCast(item_index),
         ) orelse return;
+        // As a list row (gtk.listBoxRow): a click keeps the search bar's focus.
+        gtk.unfocusable(child);
         ui.rows.appendAssumeCapacity(.{ .widget = .{ .grid_cell = child }, .item = item_index });
         return;
     }
@@ -268,6 +270,11 @@ pub fn showEmptyOrResults(ui: *Ui, arena: std.mem.Allocator, query_text: []const
 pub fn selectAfterRefresh(ui: *Ui) void {
     const adjustment = c.gtk_scrolled_window_get_vadjustment(ui.scroller);
     c.gtk_adjustment_set_value(adjustment, 0);
+    // An extension's list reloaded (its files changed) shows "Loading..."
+    // until its rows come: the row to select again is looked for then
+    // (`listCallback`), not among no rows at all (MYP-607).
+    const ext_loading = ui.view == .ext and ui.ext_list.pending and ui.items.items.len == 0;
+    if (ext_loading and ui.reselect.len > 0) return select(ui, null);
     var first = nextSelectable(ui, null, 1);
     const top = first;
     if (ui.reselect.len > 0) {
@@ -339,7 +346,7 @@ pub fn nextSelectable(ui: *Ui, from: ?usize, direction: i32) ?usize {
             false;
         if (up_from_end or down_past_built) ensureRows(ui);
     }
-    const row_count = ui.rows.items.len;
+    var row_count = ui.rows.items.len;
     if (row_count == 0) return null;
     var i: i64 = if (from) |start|
         @as(i64, @intCast(start)) + direction
@@ -347,9 +354,16 @@ pub fn nextSelectable(ui: *Ui, from: ?usize, direction: i32) ?usize {
         0
     else
         @as(i64, @intCast(row_count)) - 1;
-    while (i >= 0 and i < row_count) : (i += direction) {
-        const item_index = ui.rows.items[@intCast(i)].item orelse continue;
-        if (isSelectable(ui.items.items[item_index])) return @intCast(i);
+    while (true) {
+        while (i >= 0 and i < row_count) : (i += direction) {
+            const item_index = ui.rows.items[@intCast(i)].item orelse continue;
+            if (isSelectable(ui.items.items[item_index])) return @intCast(i);
+        }
+        // Every row built so far is a header (dmenu's non-selectable
+        // lines): the one to select may still be queued (MYP-473).
+        if (direction < 0 or ui.pending.items.len == 0) break;
+        ensureRows(ui);
+        row_count = ui.rows.items.len;
     }
     return from;
 }
@@ -524,6 +538,7 @@ pub fn onRowActivated(
     select(ui, row_tag - 1);
     const item = ui.selectedItem() orelse return;
     ui.performEntry(item_mod.actionsFor(item)[0]);
+    ui.refocusSearch();
 }
 
 pub fn onGridActivated(
@@ -541,6 +556,7 @@ pub fn onGridActivated(
     select(ui, @intCast(cell_index));
     const item = ui.selectedItem() orelse return;
     ui.performEntry(item_mod.actionsFor(item)[0]);
+    ui.refocusSearch();
 }
 
 test "hint text is joined on the stack, cut as valid UTF-8" {

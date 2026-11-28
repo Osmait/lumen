@@ -115,8 +115,19 @@ pub fn listBox() *c.GtkListBox {
     return @ptrCast(c.gtk_list_box_new());
 }
 
+/// A list row that never takes the keyboard: clicked, a focusable row took
+/// it from the search bar, and what was typed next was lost (MYP-552).
+/// Lumen's key controller moves the selection itself.
 pub fn listBoxRow() *c.GtkListBoxRow {
-    return @ptrCast(c.gtk_list_box_row_new());
+    const row: *c.GtkListBoxRow = @ptrCast(c.gtk_list_box_row_new());
+    unfocusable(row);
+    return row;
+}
+
+/// `object` neither takes the keyboard nor is given it by a click.
+pub fn unfocusable(object: anytype) void {
+    setFocusable(object, false);
+    c.gtk_widget_set_focus_on_click(widget(object), 0);
 }
 
 pub fn flowBox() *c.GtkFlowBox {

@@ -8,12 +8,26 @@ const std = @import("std");
 
 pub const Size = struct { width_px: u64, height_px: u64 };
 
+/// The formats whose size `read` knows. The decoder picks its own from the
+/// bytes: pictures.zig checks that it is this one (MYP-608).
+pub const Format = enum { png, jpeg, gif, webp, bmp, tiff, qoi, heif };
+
+pub const Header = struct { format: Format, size: Size };
+
 /// The size an image file declares, which is what a decoder allocates:
 /// PNG, JPEG, GIF (every frame), WebP, BMP, TIFF (every directory),
 /// HEIF/AVIF and QOI. Null for anything else, or a size of zero.
 pub fn read(data: []const u8) ?Size {
-    const size = headerSize(data) orelse return null;
-    return if (size.width_px == 0 or size.height_px == 0) null else size;
+    const header = readHeader(data) orelse return null;
+    return header.size;
+}
+
+/// `read`, with the format the size was read as.
+pub fn readHeader(data: []const u8) ?Header {
+    const format = formatOf(data) orelse return null;
+    const size = headerSize(format, data) orelse return null;
+    if (size.width_px == 0 or size.height_px == 0) return null;
+    return .{ .format = format, .size = size };
 }
 
 /// Where each format keeps what `headerSize` reads, as byte offsets from the
@@ -62,6 +76,14 @@ const riff = struct {
 const iso_box = struct {
     const type_offset = 4;
     const ftyp = "ftyp";
+    /// `ftyp`'s major brand, right after its type.
+    const brand_bytes = 4;
+    /// The major brands of HEIF and AVIF images (shared-mime-info's, which
+    /// the decoder goes by).
+    const heif_brands = [_][]const u8{
+        "heic", "heix", "hevc", "hevx", "heim", "heis", "hevm", "hevs",
+        "mif1", "msf1", "avif", "avis",
+    };
     const header_bytes = 8;
     /// A size of 1: a 64-bit size follows the type.
     const large_size_marker = 1;
@@ -84,20 +106,35 @@ const iso_box = struct {
     const depth_max = 4;
 };
 
-fn headerSize(data: []const u8) ?Size {
+fn formatOf(data: []const u8) ?Format {
     const starts = std.mem.startsWith;
-    if (starts(u8, data, png.signature)) return pngSize(data);
-    if (starts(u8, data, jpeg.start_of_image)) return jpegSize(data);
-    if (starts(u8, data, gif.signature_87a) or starts(u8, data, gif.signature_89a)) {
-        return gifSize(data);
+    if (starts(u8, data, png.signature)) return .png;
+    if (starts(u8, data, jpeg.start_of_image)) return .jpeg;
+    if (starts(u8, data, gif.signature_87a) or starts(u8, data, gif.signature_89a)) return .gif;
+    if (isWebp(data)) return .webp;
+    if (starts(u8, data, bmp.signature)) return .bmp;
+    if (starts(u8, data, tiff.signature_little) or starts(u8, data, tiff.signature_big)) {
+        return .tiff;
     }
-    if (isWebp(data)) return webpSize(data);
-    if (starts(u8, data, bmp.signature)) return bmpSize(data);
-    if (starts(u8, data, tiff.signature_little)) return tiffSize(data, .little);
-    if (starts(u8, data, tiff.signature_big)) return tiffSize(data, .big);
-    if (starts(u8, data, qoi.signature)) return qoiSize(data);
-    if (isHeif(data)) return heifSize(data);
+    if (starts(u8, data, qoi.signature)) return .qoi;
+    if (isHeif(data)) return .heif;
     return null;
+}
+
+fn headerSize(format: Format, data: []const u8) ?Size {
+    return switch (format) {
+        .png => pngSize(data),
+        .jpeg => jpegSize(data),
+        .gif => gifSize(data),
+        .webp => webpSize(data),
+        .bmp => bmpSize(data),
+        .tiff => tiffSize(data, if (std.mem.startsWith(u8, data, tiff.signature_little))
+            .little
+        else
+            .big),
+        .qoi => qoiSize(data),
+        .heif => heifSize(data),
+    };
 }
 
 fn pngSize(data: []const u8) ?Size {
@@ -125,11 +162,20 @@ fn isWebp(data: []const u8) bool {
     return std.mem.eql(u8, data[riff.form_offset..riff.chunk_type_offset], riff.webp_form);
 }
 
-/// An ISO base media file: its first box is `ftyp`.
+/// An ISO base media file whose first box is `ftyp` with a HEIF or AVIF
+/// major brand. Any `ftyp` was taken: one whose first bytes made it a TGA
+/// to the decoder was decoded at the TGA's size, not the `ispe`'s
+/// (MYP-608).
 fn isHeif(data: []const u8) bool {
     const box_type_end = iso_box.type_offset + iso_box.ftyp.len;
-    if (data.len < box_type_end) return false;
-    return std.mem.eql(u8, data[iso_box.type_offset..box_type_end], iso_box.ftyp);
+    const brand_end = box_type_end + iso_box.brand_bytes;
+    if (data.len < brand_end) return false;
+    if (!std.mem.eql(u8, data[iso_box.type_offset..box_type_end], iso_box.ftyp)) return false;
+    const brand = data[box_type_end..brand_end];
+    for (iso_box.heif_brands) |known| {
+        if (std.mem.eql(u8, brand, known)) return true;
+    }
+    return false;
 }
 
 fn bmpSize(data: []const u8) ?Size {
@@ -168,6 +214,8 @@ const jpeg = struct {
     /// The image's end and the start of its data: no frame header after.
     const end_of_image = 0xd9;
     const start_of_scan = 0xda;
+    /// Where EXIF is kept.
+    const app1 = 0xe1;
     /// SOF0 to SOF15, without the three markers in that range that are not
     /// frame headers: DHT, JPG and DAC.
     const frame_first = 0xc0;
@@ -184,23 +232,106 @@ const jpeg = struct {
 /// The first frame header (SOFn), past the segments before it (EXIF and
 /// its thumbnail included).
 fn jpegSize(data: []const u8) ?Size {
-    var at: usize = jpeg.start_of_image.len;
-    while (at + jpeg.marker_bytes + jpeg.length_bytes <= data.len) {
-        if (data[at] != jpeg.marker_prefix) return null;
-        const marker = data[at + 1];
-        switch (marker) {
-            jpeg.fill => at += 1,
-            jpeg.temporary, jpeg.restart_first...jpeg.start_of_image_marker => {
-                at += jpeg.marker_bytes;
-            },
-            jpeg.end_of_image, jpeg.start_of_scan => return null,
-            else => {
-                if (isJpegFrame(marker)) return jpegFrameSize(data, at);
-                const length = int(u16, data, at + jpeg.marker_bytes, .big) orelse return null;
-                if (length < jpeg.length_bytes) return null;
-                at += jpeg.marker_bytes + @as(usize, length);
-            },
+    var segments: JpegSegments = .{ .data = data };
+    while (segments.next()) |segment| {
+        if (isJpegFrame(segment.marker)) return jpegFrameSize(data, segment.at);
+    }
+    return null;
+}
+
+/// A JPEG's segments up to its first frame header, as a decoder reads them.
+const JpegSegments = struct {
+    data: []const u8,
+    at: usize = jpeg.start_of_image.len,
+
+    const Segment = struct {
+        marker: u8,
+        /// Where its marker is.
+        at: usize,
+        /// Its bytes after the marker and the length.
+        body: []const u8,
+    };
+
+    /// The next segment with a length, or null at the image's data, its
+    /// end, or bytes no decoder reads the same way: a marker of 0x00 (a
+    /// decoder takes "FF 00" for a stuffed zero and reads on, a frame
+    /// header hidden past it) or a reserved one (MYP-608).
+    fn next(segments: *JpegSegments) ?Segment {
+        const data = segments.data;
+        while (segments.at + jpeg.marker_bytes + jpeg.length_bytes <= data.len) {
+            const at = segments.at;
+            if (data[at] != jpeg.marker_prefix) return null;
+            const marker = data[at + 1];
+            switch (marker) {
+                jpeg.fill => segments.at += 1,
+                jpeg.temporary, jpeg.restart_first...jpeg.start_of_image_marker => {
+                    segments.at += jpeg.marker_bytes;
+                },
+                jpeg.end_of_image, jpeg.start_of_scan => return null,
+                0...jpeg.temporary - 1, jpeg.temporary + 1...jpeg.frame_first - 1 => return null,
+                else => {
+                    const length = int(u16, data, at + jpeg.marker_bytes, .big) orelse return null;
+                    if (length < jpeg.length_bytes) return null;
+                    const body_at = at + jpeg.marker_bytes + jpeg.length_bytes;
+                    const end = at + jpeg.marker_bytes + @as(usize, length);
+                    segments.at = end;
+                    return .{
+                        .marker = marker,
+                        .at = at,
+                        .body = data[@min(body_at, data.len)..@min(end, data.len)],
+                    };
+                },
+            }
         }
+        return null;
+    }
+};
+
+/// Whether a JPEG's EXIF orientation (5 to 8) turns it a quarter: shown
+/// upright, its width and height swap. The decoder leaves the pixels as
+/// stored (MYP-553).
+pub fn swapsSides(data: []const u8) bool {
+    if (!std.mem.startsWith(u8, data, jpeg.start_of_image)) return false;
+    var segments: JpegSegments = .{ .data = data };
+    while (segments.next()) |segment| {
+        if (isJpegFrame(segment.marker)) return false;
+        if (segment.marker != jpeg.app1) continue;
+        if (!std.mem.startsWith(u8, segment.body, exif.signature)) continue;
+        const orientation = exifOrientation(segment.body[exif.signature.len..]) orelse return false;
+        return orientation >= exif.orientation_swapped_first and
+            orientation <= exif.orientation_swapped_last;
+    }
+    return false;
+}
+
+const exif = struct {
+    /// An APP1 segment that holds EXIF starts so; a TIFF header follows.
+    const signature = "Exif\x00\x00";
+    const tag_orientation = 0x0112;
+    /// Transpose, rotate 90°, transverse, rotate 270°.
+    const orientation_swapped_first = 5;
+    const orientation_swapped_last = 8;
+};
+
+/// The orientation in the first directory of `tiff_data` (EXIF's TIFF
+/// header and what follows it), or null.
+fn exifOrientation(tiff_data: []const u8) ?u16 {
+    const endian: std.builtin.Endian = if (std.mem.startsWith(u8, tiff_data, tiff.signature_little))
+        .little
+    else if (std.mem.startsWith(u8, tiff_data, tiff.signature_big))
+        .big
+    else
+        return null;
+    const directory = int(u32, tiff_data, tiff.first_directory_offset, endian) orelse return null;
+    const entry_count = int(u16, tiff_data, directory, endian) orelse return null;
+    const entries_at = @as(usize, directory) + tiff.entry_count_bytes;
+    for (0..entry_count) |entry_index| {
+        const entry = entries_at + entry_index * tiff.entry_bytes;
+        const tag = int(u16, tiff_data, entry, endian) orelse return null;
+        if (tag != exif.tag_orientation) continue;
+        const value_type = int(u16, tiff_data, entry + tiff.entry_type_offset, endian) orelse return null;
+        if (value_type != tiff.type_short) return null;
+        return int(u16, tiff_data, entry + tiff.entry_value_offset, endian);
     }
     return null;
 }
@@ -373,12 +504,15 @@ const tiff = struct {
 };
 
 /// The largest width and height in any directory (pages, reduced copies).
+/// Null when one is given in a type other than SHORT or LONG: skipped, a
+/// LONG8 width of 9000 in the first directory, which is the one decoded,
+/// let a 16×16 one in the next stand for the file (MYP-608).
 fn tiffSize(data: []const u8, endian: std.builtin.Endian) ?Size {
     var size: Size = .{ .width_px = 0, .height_px = 0 };
     var directory: usize = int(u32, data, tiff.first_directory_offset, endian) orelse return null;
     var directory_count: usize = 0;
     while (directory != 0 and directory_count < tiff.directories_max) : (directory_count += 1) {
-        directory = tiffDirectory(data, directory, endian, &size) orelse break;
+        directory = (tiffDirectory(data, directory, endian, &size) catch return null) orelse break;
     }
     return size;
 }
@@ -391,7 +525,7 @@ fn tiffDirectory(
     directory: usize,
     endian: std.builtin.Endian,
     size: *Size,
-) ?usize {
+) error{UnreadSizeType}!?usize {
     const entry_count = int(u16, data, directory, endian) orelse return null;
     const entries_at = directory + tiff.entry_count_bytes;
     for (0..entry_count) |entry_index| {
@@ -403,7 +537,7 @@ fn tiffDirectory(
         const value: u64 = switch (value_type) {
             tiff.type_short => int(u16, data, value_at, endian) orelse break,
             tiff.type_long => int(u32, data, value_at, endian) orelse break,
-            else => continue,
+            else => return error.UnreadSizeType,
         };
         if (tag == tiff.tag_image_width) {
             size.width_px = @max(size.width_px, value);
@@ -500,6 +634,68 @@ test "image sizes are read from headers" {
     try testing.expect(read("hello") == null);
     try testing.expect(read(png_file[0..20]) == null);
     try testing.expect(read("GIF89a\x00\x00\x00\x00\x00\x00\x00") == null);
+}
+
+test "headers a decoder reads otherwise are not read (MYP-608)" {
+    const testing = std.testing;
+    const sof0_16 = "\xff\xc0\x00\x11\x08\x00\x10\x00\x10\x03";
+    // JPEG: "FF 00" is a stuffed zero to a decoder, which reads on byte by
+    // byte; it is no segment with a length to skip.
+    try testing.expect(read("\xff\xd8\xff\x00\x00\x04ab" ++ sof0_16) == null);
+    // A reserved marker neither.
+    try testing.expect(read("\xff\xd8\xff\x02\x00\x04ab" ++ sof0_16) == null);
+    try testing.expectEqual(
+        Size{ .width_px = 16, .height_px = 16 },
+        read("\xff\xd8\xff\xe1\x00\x04ab" ++ sof0_16).?,
+    );
+    // TIFF: a width in LONG8 (16) is not skipped for the next directory's.
+    const tiff_long8 = "II*\x00\x08\x00\x00\x00" ++ "\x02\x00" ++
+        "\x00\x01\x10\x00\x01\x00\x00\x00\x28\x23\x00\x00" ++
+        "\x01\x01\x03\x00\x01\x00\x00\x00\x10\x00\x00\x00" ++ "\x26\x00\x00\x00" ++
+        "\x02\x00" ++
+        "\x00\x01\x03\x00\x01\x00\x00\x00\x10\x00\x00\x00" ++
+        "\x01\x01\x03\x00\x01\x00\x00\x00\x10\x00\x00\x00" ++ "\x00\x00\x00\x00";
+    try testing.expect(read(tiff_long8) == null);
+    // HEIF: an `ftyp` box with a brand that is not an image's.
+    const ispe = "\x00\x00\x00\x14ispe\x00\x00\x00\x00\x00\x00\x00\x10\x00\x00\x00\x10";
+    const ipco = "\x00\x00\x00\x1cipco" ++ ispe;
+    const iprp = "\x00\x00\x00\x24iprp" ++ ipco;
+    const meta = "\x00\x00\x00\x30meta\x00\x00\x00\x00" ++ iprp;
+    try testing.expect(read("\x00\x00\x00\x10ftypxxxx\x00\x00\x00\x00" ++ meta) == null);
+    try testing.expectEqual(
+        Header{ .format = .heif, .size = .{ .width_px = 16, .height_px = 16 } },
+        readHeader("\x00\x00\x00\x10ftypavif\x00\x00\x00\x00" ++ meta).?,
+    );
+}
+
+test "a JPEG's EXIF orientation says whether its sides swap (MYP-553)" {
+    const testing = std.testing;
+    const sof0 = "\xff\xc0\x00\x11\x08\x00\x64\x00\xc8\x03";
+    // APP1: "Exif\0\0", a TIFF header, one directory with Orientation.
+    const exif_little = "Exif\x00\x00II*\x00\x08\x00\x00\x00\x01\x00" ++
+        "\x12\x01\x03\x00\x01\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00\x00";
+    const app1_little = "\xff\xe1\x00" ++ [_]u8{2 + exif_little.len} ++ exif_little;
+    try testing.expect(swapsSides("\xff\xd8" ++ app1_little ++ sof0));
+    const exif_big = "Exif\x00\x00MM\x00*\x00\x00\x00\x08\x00\x01" ++
+        "\x01\x12\x00\x03\x00\x00\x00\x01\x00\x08\x00\x00\x00\x00\x00\x00";
+    const app1_big = "\xff\xe1\x00" ++ [_]u8{2 + exif_big.len} ++ exif_big;
+    try testing.expect(swapsSides("\xff\xd8" ++ app1_big ++ sof0));
+    // Upright (1) or turned a half (3): the sides stay.
+    var upright = ("\xff\xd8" ++ app1_little ++ sof0).*;
+    const orientation_at = std.mem.find(u8, &upright, "\x12\x01\x03\x00").? + 8;
+    for ([_]u8{ 1, 3 }) |orientation| {
+        upright[orientation_at] = orientation;
+        try testing.expect(!swapsSides(&upright));
+    }
+    // No EXIF, or after the frame header, or not a JPEG.
+    try testing.expect(!swapsSides("\xff\xd8" ++ sof0));
+    try testing.expect(!swapsSides("\xff\xd8" ++ sof0 ++ app1_little));
+    try testing.expect(!swapsSides(exif_little));
+    // The size read stays the stored one.
+    try testing.expectEqual(
+        Size{ .width_px = 200, .height_px = 100 },
+        read("\xff\xd8" ++ app1_little ++ sof0).?,
+    );
 }
 
 test "jpegSize handles maximum-length segments without overflowing u16" {
