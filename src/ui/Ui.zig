@@ -132,6 +132,9 @@ reselect_row: ?usize = null,
 data_arena: std.heap.ArenaAllocator,
 /// Candidates of the current view before filtering.
 base: []Item = &.{},
+/// The window Close Window was last sent to: the windows view leaves it out
+/// for a while (`ClosedWindow`).
+closed_window: ClosedWindow = .{},
 /// Lives until the next keystroke: the visible items and rows.
 query_arena: std.heap.ArenaAllocator,
 /// Visible items, in row order.
@@ -353,6 +356,27 @@ const choose_title_bytes_max = 96;
 /// this (a deep file path) is cut, and the row is then not found again:
 /// the first row is selected instead.
 const ItemKey = core.FixedStr(80);
+
+/// A window asked to close. Hyprland lists it until its client has closed
+/// it, a few ms after the list built right after the request is read: the
+/// row stayed, and Enter on it focused a window that was gone (MYP-538).
+pub const ClosedWindow = struct {
+    /// Hyprland's address ("0x" and up to 16 hex digits).
+    address: core.FixedStr(32) = .{},
+    at_ns: u64 = 0,
+
+    /// How long after the request the window is left out of the list. A
+    /// client that does not close (unsaved changes) shows again on a
+    /// later rebuild; an address Hyprland gives a new window is not
+    /// hidden for long.
+    pub const hidden_ns = 1 * std.time.ns_per_s;
+
+    /// Whether the window at `address` was just asked to close.
+    pub fn hides(closed: *const ClosedWindow, address: []const u8, now_ns: u64) bool {
+        if (closed.address.len == 0) return false;
+        return closed.address.eql(address) and now_ns -| closed.at_ns < hidden_ns;
+    }
+};
 
 /// What the view and query arenas keep for next time when reset. They kept
 /// all they had ever held: a view that once needed hundreds of MB (the
@@ -903,6 +927,12 @@ pub fn perform(self: *Ui, operation: item_mod.Operation) void {
         .hide => self.hide(),
         .stay => {},
         .refresh_view => {
+            if (operation == .close_window) {
+                // Hyprland only asks the client to close: the list read
+                // now still has the window, a few ms more (MYP-538).
+                self.closed_window.address.set(whole.action.focus_window);
+                self.closed_window.at_ns = os.monotonicNs();
+            }
             self.keepPlace();
             self.rebuild();
         },
@@ -1066,4 +1096,14 @@ test "confirmStep requires a second matching press after key release before conf
     // Switching target requires confirmation for the new target.
     try std.testing.expect(confirmStep(&key, &repeat_keyval, "cmd:restart", c.GDK_KEY_Return));
     try std.testing.expectEqualStrings("cmd:restart", key);
+}
+
+test "a window asked to close is left out of the list for a moment only (MYP-538)" {
+    var closed: ClosedWindow = .{};
+    try std.testing.expect(!closed.hides("", 0));
+    closed.address.set("0x55d0c0a1b2c0");
+    closed.at_ns = 10 * std.time.ns_per_s;
+    try std.testing.expect(closed.hides("0x55d0c0a1b2c0", closed.at_ns + 5 * std.time.ns_per_ms));
+    try std.testing.expect(!closed.hides("0x55d0c0a1b2c1", closed.at_ns));
+    try std.testing.expect(!closed.hides("0x55d0c0a1b2c0", closed.at_ns + ClosedWindow.hidden_ns));
 }
