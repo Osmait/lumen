@@ -271,12 +271,7 @@ pub fn finish(ui: *Ui, choice: ?[]const u8) void {
     const session = ui.picker orelse return;
     ui.picker = null;
     if (choice) |choice_text| {
-        c.g_application_command_line_print(
-            session.caller,
-            "%.*s\n",
-            @as(c_int, @intCast(@min(choice_text.len, std.math.maxInt(c_int)))),
-            choice_text.ptr,
-        );
+        printChoice(session.gpa, session.caller, choice_text);
         c.g_application_command_line_set_exit_status(session.caller, 0);
     } else c.g_application_command_line_set_exit_status(session.caller, 1);
     // The caller's `lumen --dmenu` returns once this is released.
@@ -289,6 +284,80 @@ pub fn finish(ui: *Ui, choice: ?[]const u8) void {
     // The rows point into the session's lines.
     if (ui.view == .dmenu) row_list.clearRows(ui);
     if (session.reading) c.g_cancellable_cancel(session.cancellable) else session.destroy();
+}
+
+/// What starts a choice sent to the caller, base64 after it: a remote
+/// command line's output crosses D-Bus as a string, which GLib refuses for
+/// bytes that are not UTF-8 (they arrived as "[Invalid UTF-8]"), and a line
+/// of stdin is printed as read (MYP-447). The caller's `lumen-gtk --dmenu`
+/// decodes it (`installCallerOutput`). Starts with ESC: no line of text
+/// GLib would print begins so.
+const choice_marker = "\x1b]lumen-dmenu;";
+
+/// Prints `choice` to the caller, encoded, and a newline after it.
+fn printChoice(gpa: std.mem.Allocator, caller: *c.GApplicationCommandLine, choice: []const u8) void {
+    const message = encodeChoice(gpa, choice) catch {
+        log.warn("out of memory: the choice is not printed", .{});
+        return;
+    };
+    defer gpa.free(message);
+    c.g_application_command_line_print(caller, "%s", message.ptr);
+}
+
+fn encodeChoice(gpa: std.mem.Allocator, choice: []const u8) std.mem.Allocator.Error![:0]u8 {
+    const encoder = std.base64.standard.Encoder;
+    const encoded_len = encoder.calcSize(choice.len);
+    const message = try gpa.allocSentinel(u8, choice_marker.len + encoded_len + 1, 0);
+    @memcpy(message[0..choice_marker.len], choice_marker);
+    _ = encoder.encode(message[choice_marker.len..][0..encoded_len], choice);
+    message[message.len - 1] = '\n';
+    return message;
+}
+
+/// The choice `message` carries, with its newline, or null when it is not
+/// one (then it is printed as it is).
+fn decodeChoice(gpa: std.mem.Allocator, message: []const u8) ?[]u8 {
+    if (!std.mem.startsWith(u8, message, choice_marker)) return null;
+    if (!std.mem.endsWith(u8, message, "\n")) return null;
+    const encoded = message[choice_marker.len .. message.len - 1];
+    const decoder = std.base64.standard.Decoder;
+    const decoded_len = decoder.calcSizeForSlice(encoded) catch return null;
+    const choice = gpa.alloc(u8, decoded_len + 1) catch return null;
+    decoder.decode(choice[0..decoded_len], encoded) catch {
+        gpa.free(choice);
+        return null;
+    };
+    choice[decoded_len] = '\n';
+    return choice;
+}
+
+/// In the process `lumen --dmenu` runs (a launcher, or the primary instance
+/// when no daemon runs): GLib prints a remote's output with g_print, and
+/// this handler writes a choice back as the bytes it was.
+pub fn installCallerOutput() void {
+    _ = c.g_set_print_handler(&printToStdout);
+}
+
+fn printToStdout(message: [*:0]const u8) callconv(.c) void {
+    const text = std.mem.span(message);
+    const gpa = std.heap.page_allocator;
+    if (decodeChoice(gpa, text)) |choice| {
+        defer gpa.free(choice);
+        writeStdout(choice);
+    } else writeStdout(text);
+}
+
+fn writeStdout(bytes: []const u8) void {
+    const linux = std.os.linux;
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const result = linux.write(1, bytes[written..].ptr, bytes.len - written);
+        switch (linux.errno(result)) {
+            .SUCCESS => written += result,
+            .INTR => {},
+            else => return,
+        }
+    }
 }
 
 /// Enter on a row.
@@ -512,4 +581,20 @@ test "lines past the limit are counted and said, headers after them dropped (MYP
     const more = moreRow(arena, 500, "lines").?;
     try std.testing.expectEqualStrings("… 500 more lines: type to filter", more.title);
     try std.testing.expect(!row_list.isSelectable(more));
+}
+
+test "a choice crosses to the caller as the bytes it was, UTF-8 or not" {
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{ "caf\xe9", "plain", "", "emoji \u{2b50}", "\x00\xff\x1b]lumen-dmenu;x" }) |choice| {
+        const message = try encodeChoice(gpa, choice);
+        defer gpa.free(message);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(message));
+        const decoded = decodeChoice(gpa, message).?;
+        defer gpa.free(decoded);
+        try std.testing.expectEqualStrings(choice, decoded[0 .. decoded.len - 1]);
+        try std.testing.expectEqual(@as(u8, '\n'), decoded[decoded.len - 1]);
+    }
+    // Anything else is printed as it is.
+    try std.testing.expect(decodeChoice(gpa, "lumen: not running\n") == null);
+    try std.testing.expect(decodeChoice(gpa, choice_marker ++ "!!!\n") == null);
 }

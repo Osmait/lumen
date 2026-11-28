@@ -142,10 +142,13 @@ pub fn main(init: std.process.Init) !void {
     // A command line that is not one is refused here, with or without a
     // daemon: as the primary instance GApplication would hold on after the
     // usage was printed, a daemon nobody asked for.
-    if (parseRequest(arg_slices) == null) {
+    const request = parseRequest(arg_slices) orelse {
         printToStderr(init.io, cli.usage);
         std.process.exit(@intCast(status_usage));
-    }
+    };
+    // The daemon sends the choice encoded: a remote command line's output
+    // must be UTF-8, a line of stdin need not be.
+    if (request == .window and request.window.dmenu) Ui.dmenu.installCallerOutput();
     // Commands that only talk to a running daemon must not become one: with
     // none running GApplication makes the caller the primary instance, so
     // `lumen --stats` would start a whole new daemon and never return. Any
