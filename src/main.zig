@@ -136,12 +136,20 @@ pub fn main(init: std.process.Init) !void {
             daemon.app_id,
         });
     }
+    // A command line that is not one is refused here, with or without a
+    // daemon: as the primary instance GApplication would hold on after the
+    // usage was printed, a daemon nobody asked for.
+    if (parseRequest(arg_slices) == null) {
+        printToStderr(init.io, cli.usage);
+        std.process.exit(@intCast(status_usage));
+    }
     // Commands that only talk to a running daemon must not become one: with
     // none running GApplication makes the caller the primary instance, so
-    // `lumen --stats` would start a whole new daemon and never return. As a
-    // launcher it never takes the bus name either (taking it even briefly
-    // made a daemon starting at the same moment fail to register).
-    const client_only = if (first_flag) |flag| cli.specs.get(flag).needs_daemon else false;
+    // `lumen --stats` would start a whole new daemon and never return. Any
+    // flag counts, not only the first (`--prompt X --dmenu`). As a launcher
+    // it never takes the bus name either (taking it even briefly made a
+    // daemon starting at the same moment fail to register).
+    const client_only = cli.needsDaemon(arg_slices);
     const launcher = if (client_only) c.G_APPLICATION_IS_LAUNCHER else 0;
     const flags = c.G_APPLICATION_HANDLES_COMMAND_LINE | launcher;
     const gtk_app = c.gtk_application_new(daemon.app_id.ptr, flags) orelse {
@@ -210,6 +218,10 @@ fn printToStdout(io: std.Io, text: []const u8) void {
         error.BrokenPipe => {},
         else => log.warn("cannot write to stdout: {t}", .{err}),
     };
+}
+
+fn printToStderr(io: std.Io, text: []const u8) void {
+    std.Io.File.stderr().writeStreamingAll(io, text) catch {};
 }
 
 /// A test instance takes no keyboard, so nobody can close it by hand: if

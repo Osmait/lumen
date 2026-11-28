@@ -198,6 +198,38 @@ pub fn parse(text: []const u8) ?Flag {
     return null;
 }
 
+/// Whether any flag of `arguments` (without the program's name; `[:0]const
+/// u8` or `[*:0]const u8` each) only asks a running daemon, wherever it is
+/// (`--prompt X --dmenu`, `--show --stats`). Values are skipped as lumen-gtk
+/// reads them (`--query --stats` asks for nothing of the kind); words that
+/// are not flags are left to the parse that refuses them.
+pub fn needsDaemon(arguments: anytype) bool {
+    var argument_index: usize = 0;
+    while (argument_index < arguments.len) : (argument_index += 1) {
+        const flag = parse(argumentText(arguments[argument_index])) orelse continue;
+        const spec = specs.get(flag);
+        if (spec.needs_daemon) return true;
+        switch (spec.value) {
+            .none => {},
+            .required => argument_index += 1,
+            // Taken only when the next argument is not itself a flag.
+            .optional => {
+                const next_index = argument_index + 1;
+                if (next_index < arguments.len and
+                    !std.mem.startsWith(u8, argumentText(arguments[next_index]), "-"))
+                {
+                    argument_index = next_index;
+                }
+            },
+        }
+    }
+    return false;
+}
+
+fn argumentText(argument: anytype) []const u8 {
+    return if (@TypeOf(argument) == [*:0]const u8) std.mem.span(argument) else argument;
+}
+
 const help_indent: [23]u8 = @splat(' ');
 
 pub const usage: [:0]const u8 = blk: {
@@ -240,4 +272,23 @@ test "names, parsing and the usage" {
         const listed = std.mem.find(u8, usage, name(flag)) != null;
         try std.testing.expectEqual(specs.get(flag).group != .hidden, listed);
     }
+}
+
+test "needsDaemon looks at every flag, not just the first" {
+    const Args = []const [:0]const u8;
+    try std.testing.expect(needsDaemon(@as(Args, &.{ "--prompt", "Pick:", "--dmenu" })));
+    try std.testing.expect(needsDaemon(@as(Args, &.{ "--query", "foo", "--dmenu" })));
+    try std.testing.expect(needsDaemon(@as(Args, &.{ "--as", "x", "--install", "https://e/x" })));
+    try std.testing.expect(needsDaemon(@as(Args, &.{ "--show", "--stats" })));
+    try std.testing.expect(needsDaemon(@as(Args, &.{"--hide"})));
+    // Values are not flags.
+    try std.testing.expect(!needsDaemon(@as(Args, &.{ "--query", "--stats" })));
+    try std.testing.expect(!needsDaemon(@as(Args, &.{ "--prompt", "--dmenu" })));
+    try std.testing.expect(!needsDaemon(@as(Args, &.{ "--view", "files", "--query", "x" })));
+    try std.testing.expect(!needsDaemon(@as(Args, &.{})));
+    try std.testing.expect(!needsDaemon(@as(Args, &.{"--daemon"})));
+    // --update needs a daemon whether or not it takes the next word.
+    try std.testing.expect(needsDaemon(@as(Args, &.{ "--update", "--show" })));
+    const pointers = [_][*:0]const u8{ "--show", "--reload" };
+    try std.testing.expect(needsDaemon(@as([]const [*:0]const u8, &pointers)));
 }
