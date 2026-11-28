@@ -1442,3 +1442,30 @@ test "fuzz: a real content index with random damage never crashes, nor updating 
     defer index.deinit(gpa);
     try testing.fuzz(FlipsContext{ .good = index.bytes, .pool = pool }, fuzzFlips, .{});
 }
+
+test "content.idx truncated by another process while mapped: no crash, marked damaged" {
+    const gpa = testing.allocator;
+    var index = try smallIndex(gpa);
+    defer index.deinit(gpa);
+    var test_dir = try sys.TestDir.init();
+    defer test_dir.deinit();
+    var index_path_buffer: paths.Buffer = undefined;
+    const index_path = try test_dir.path(&index_path_buffer, "content.idx");
+    try index.save(index_path);
+    var mapped = try Index.open(index_path);
+    defer mapped.deinit(gpa);
+    try testing.expect(!mapped.damaged());
+
+    // `cp` or `truncate` over it: every page of the mapping is gone. Each
+    // read of one was a SIGBUS.
+    try sys.writeFile(index_path, "");
+    var got: std.ArrayList(u32) = .empty;
+    defer got.deinit(gpa);
+    for ([_][]const u8{ "arena", "zig", "lumen" }) |word| {
+        mapped.candidates(gpa, &.{word}, &got) catch {};
+    }
+    var sum: usize = mapped.postingBytes();
+    for (0..mapped.docs_count) |doc| sum +%= mapped.path(@intCast(doc)).len;
+    std.mem.doNotOptimizeAway(sum);
+    try testing.expect(mapped.damaged());
+}

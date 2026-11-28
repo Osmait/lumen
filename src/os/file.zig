@@ -11,6 +11,7 @@ const syscall = @import("syscall.zig");
 const Error = syscall.Error;
 const check = syscall.check;
 const close = syscall.close;
+const mapguard = @import("mapguard.zig");
 
 /// How much more room `readUpTo` makes each time its buffer fills.
 const read_chunk_bytes = 64 << 10;
@@ -187,6 +188,7 @@ pub fn writeFileAtomic(path: []const u8, data: []const u8) Error!void {
 /// inode written, before any external writer can replace `path`. Where the
 /// file system can clone (`publishClone`), `path` gets a clone and the
 /// mapped inode no name, so writing to `path` never reaches the mapping.
+/// Elsewhere a truncation of `path` costs zeros, not a SIGBUS (`mapguard.zig`).
 pub fn writeFileAtomicMapped(path: []const u8, data: []const u8) Error!MappedBytes {
     if (data.len == 0) return error.NotFound;
     const print = std.mem.printSentinel;
@@ -249,6 +251,7 @@ pub fn writeFileAtomicMapped(path: []const u8, data: []const u8) Error!MappedByt
         0,
     ));
     const mapping: [*]align(mapping_alignment_bytes) u8 = @ptrFromInt(mapping_address);
+    mapguard.register(mapping[0..data.len]);
     return mapping[0..data.len];
 }
 
@@ -580,10 +583,18 @@ pub const MappedBytes = []align(mapping_alignment_bytes) u8;
 /// Unmaps what `mapPrivate` mapped. munmap fails only on a range that is
 /// not a mapping, and `MappedBytes` always is one.
 pub fn unmap(mapping: MappedBytes) void {
+    mapguard.unregister(mapping);
     _ = linux.munmap(mapping.ptr, mapping.len);
 }
 
-/// Private, writable (copy-on-write) mapping of a whole file.
+/// Whether another process truncated the file under `mapping`: the pages
+/// it pulled out read as zeros now (`mapguard.zig`). Its owner replaces it.
+pub fn mappingDamaged(mapping: MappedBytes) bool {
+    return mapguard.damaged(mapping);
+}
+
+/// Private, writable (copy-on-write) mapping of a whole file. Truncated by
+/// another process, what it lost reads as zeros (`mapguard.zig`).
 pub fn mapPrivate(path: [*:0]const u8) Error!MappedBytes {
     return (try mapPrivateWithId(path)).bytes;
 }
@@ -604,6 +615,7 @@ pub fn mapPrivateWithId(path: [*:0]const u8) Error!struct { bytes: MappedBytes, 
         0,
     ));
     const mapping: [*]align(mapping_alignment_bytes) u8 = @ptrFromInt(mapping_address);
+    mapguard.register(mapping[0..size]);
     return .{ .bytes = mapping[0..size], .id = id };
 }
 
@@ -631,7 +643,7 @@ test "special files are refused without blocking" {
     try std.testing.expect(os.isRegular("/proc/self/status"));
 }
 
-test "a mapped atomic write survives the file being truncated where it can clone" {
+test "a mapped atomic write survives the file being truncated" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
     var dir_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
@@ -644,8 +656,8 @@ test "a mapped atomic write survives the file being truncated where it can clone
     @memset(data, 'x');
     const mapping = try writeFileAtomicMapped(path, data);
     defer unmap(mapping);
-    // Only a clone protects the mapping: without one, `path` is the mapped
-    // inode and truncating it is the SIGBUS this guards against.
+    // A clone keeps the mapping whole: without one, `path` is the mapped
+    // inode, and what truncating it pulls out reads as zeros (`mapguard`).
     var probe_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const probe = try std.mem.printSentinel(&probe_buffer, "{s}/probe", .{dir}, 0);
     try writeFileAtomic(probe, "probe");
@@ -653,7 +665,7 @@ test "a mapped atomic write survives the file being truncated where it can clone
     defer close(probe_fd);
     var clone_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const clone = try std.mem.print(&clone_buffer, "{s}/clone", .{dir});
-    if (!publishClone(clone, probe_fd)) return error.SkipZigTest;
+    const clones = publishClone(clone, probe_fd);
     // `cp` over it: O_TRUNC, then a few bytes.
     const truncated = linux.open(path, .{ .ACCMODE = .WRONLY, .TRUNC = true, .CLOEXEC = true }, 0);
     try expectSuccess(truncated);
@@ -661,7 +673,13 @@ test "a mapped atomic write survives the file being truncated where it can clone
     close(@intCast(truncated));
     var sum: usize = 0;
     for (mapping) |byte| sum += byte;
-    try std.testing.expectEqual(@as(usize, 'x') * data.len, sum);
+    if (clones) {
+        try std.testing.expectEqual(@as(usize, 'x') * data.len, sum);
+        try std.testing.expect(!mappingDamaged(mapping));
+    } else {
+        try std.testing.expect(sum < @as(usize, 'x') * data.len);
+        try std.testing.expect(mappingDamaged(mapping));
+    }
 }
 
 test "atomic writes replace the file and leave no temporary behind" {

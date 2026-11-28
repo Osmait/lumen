@@ -1196,7 +1196,12 @@ fn refresh(service: *ContentService) void {
     var listed: ?ListingStamp = null;
     var changed = service.changes(arena, name_changes, &docs, &listed) orelse return;
     if (service.stop.load(.acquire)) return;
+    // content.idx truncated under its mapping (it reads as zeros where it
+    // lost pages): rebuilt whole, not updated.
+    const damaged = if (service.current()) |index| index.damaged() else false;
+    if (damaged) service.worker.rebuild_whole = true;
     if (service.index != null and
+        !damaged and
         changed.gone.len == 0 and
         changed.added.len == 0 and
         changed.reextract.len == 0)
@@ -1212,7 +1217,7 @@ fn refresh(service: *ContentService) void {
     defer @import("root.zig").trimHeap();
     // Only missing cached texts for unchanged indexed documents: extract them
     // back into TextCache without rebuilding or deleting them via dropStale.
-    if (service.index != null and changed.gone.len == 0 and changed.added.len == 0) {
+    if (service.index != null and !damaged and changed.gone.len == 0 and changed.added.len == 0) {
         const extract_start_ns = sys.monotonicNs();
         const reextracted = service.extractMissing(arena, changed.reextract, true) orelse return;
         service.counters.extract_ns_last.store(sys.monotonicNs() - extract_start_ns, .monotonic);
