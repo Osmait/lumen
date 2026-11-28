@@ -36,11 +36,17 @@ checks() {
 }
 
 # `zig build perf` exits 1 when one of its own limits fails: the numbers
-# are still printed, and still compared.
+# are still printed, and still compared. A fixed version string keeps git
+# out of both builds' configuration: what is measured does not depend on
+# it, and a side whose build.zig cannot read this checkout's git state
+# would otherwise give no numbers.
+perf() {
+    zig build perf -Dversion-string=perf-compare
+}
 for round in $(seq "$rounds"); do
     echo "round $round/$rounds" >&2
-    (cd "$work/base" && zig build perf >"$work/base.$round" 2>&1) || true
-    zig build perf >"$work/head.$round" 2>&1 || true
+    (cd "$work/base" && perf >"$work/base.$round" 2>&1) || true
+    perf >"$work/head.$round" 2>&1 || true
 done
 
 for side in base head; do
