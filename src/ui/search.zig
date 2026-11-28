@@ -15,6 +15,7 @@ const core = @import("core");
 const index = @import("index");
 const item_mod = @import("../item.zig");
 const Item = item_mod.Item;
+const Db = @import("../sys/Db.zig");
 const hypr = @import("../sys/hypr.zig");
 const commands = @import("../providers/commands.zig");
 const scripts = @import("../providers/scripts.zig");
@@ -393,11 +394,18 @@ fn fillFiltered(
     // Folded once, not for every field of every row.
     var query_buffer: [core.fuzzy.text_chars_max]u8 = undefined;
     const query_prepared = core.fuzzy.prepare(&query_buffer, query_text);
+    const long_matches = clipsMatchingPastScored(ui, arena, query_text);
     for (ui.base) |item| {
         const detail_scored = item.detail[0..@min(item.detail.len, filtered_detail_bytes_max)];
         const text = if (item.detail.len > 0) detail_scored else item.title;
         const fields = [_][]const u8{ text, item.subtitle };
-        const score = core.fuzzy.scoreFieldsQuery(query_prepared, &fields);
+        var score = core.fuzzy.scoreFieldsQuery(query_prepared, &fields);
+        if (score == core.fuzzy.no_match and item.action == .clip and
+            std.sort.binarySearch(Db.ClipId, long_matches, item.action.clip, orderClipId) != null)
+        {
+            // Found in text the filter does not score: after those it does.
+            score = long_match_score;
+        }
         if (score == core.fuzzy.no_match) continue;
         var copy = item;
         copy.score = score;
@@ -407,6 +415,34 @@ fn fillFiltered(
     ui.search_ns += stats.now() - search_start_ns;
     const shown = hits.items[0..@min(hits.items.len, filtered_results_max)];
     for (shown) |item| row_list.addItem(ui, item);
+}
+
+/// The score of a clipboard entry that holds the query past the bytes the
+/// filter scores: below any fuzzy match (those start at 0).
+const long_match_score = -1;
+
+/// The clipboard entries longer than the filter scores
+/// (`filtered_detail_bytes_max`) that hold `query_text` further on, sorted.
+/// Asked of the database only when an entry that long is listed (MYP-491).
+fn clipsMatchingPastScored(ui: *Ui, arena: std.mem.Allocator, query_text: []const u8) []Db.ClipId {
+    if (ui.view != .clipboard) return &.{};
+    for (ui.base) |item| {
+        if (item.action == .clip and item.detail.len >= filtered_detail_bytes_max) break;
+    } else return &.{};
+    const ids = ui.db.clipsContaining(arena, query_text, filtered_detail_bytes_max) catch |err| {
+        log.warn("clipboard search past each entry's head: {t}", .{err});
+        return &.{};
+    };
+    std.mem.sort(Db.ClipId, ids, {}, struct {
+        fn lessThan(_: void, x: Db.ClipId, y: Db.ClipId) bool {
+            return @backingInt(x) < @backingInt(y);
+        }
+    }.lessThan);
+    return ids;
+}
+
+fn orderClipId(wanted: Db.ClipId, id: Db.ClipId) std.math.Order {
+    return std.math.order(@backingInt(wanted), @backingInt(id));
 }
 
 /// Best first; equal scores by title, so the order never depends on the
@@ -477,7 +513,6 @@ test "content results become stale when the content index version advances" {
 }
 
 test "clipboard view loads entries beyond 500 up to clipboard_keep_max" {
-    const Db = @import("../sys/Db.zig");
     var db = try Db.open(Db.in_memory);
     defer db.close();
     for (0..600) |i| {

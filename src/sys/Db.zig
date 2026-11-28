@@ -483,6 +483,36 @@ pub fn recentClips(
     return list.toOwnedSlice(arena);
 }
 
+/// The entries of more than `scored_bytes` bytes that hold `needle`
+/// anywhere (ASCII case aside), in `arena`. The clipboard filter scores
+/// only the first bytes of each entry's head: a match further on hid the
+/// entry (MYP-491).
+pub fn clipsContaining(
+    db: *Db,
+    arena: std.mem.Allocator,
+    needle: []const u8,
+    scored_bytes: usize,
+) (Error || std.mem.Allocator.Error)![]ClipId {
+    // LIKE's wildcards in the needle stand for themselves.
+    var pattern: std.ArrayList(u8) = .empty;
+    try pattern.ensureTotalCapacity(arena, 2 * needle.len + 2);
+    pattern.appendAssumeCapacity('%');
+    for (needle) |byte| {
+        if (byte == '%' or byte == '_' or byte == '\\') pattern.appendAssumeCapacity('\\');
+        pattern.appendAssumeCapacity(byte);
+    }
+    pattern.appendAssumeCapacity('%');
+    const stmt = try db.prepare(
+        \\SELECT id FROM clipboard
+        \\WHERE length(CAST(content AS BLOB)) > ?2 AND content LIKE ?1 ESCAPE '\'
+    );
+    defer _ = c.sqlite3_finalize(stmt);
+    try db.bind(stmt, .{ pattern.items, std.math.cast(i64, scored_bytes) orelse std.math.maxInt(i64) });
+    var ids: std.ArrayList(ClipId) = .empty;
+    while (try db.nextRow(stmt)) try ids.append(arena, .of(c.sqlite3_column_int64(stmt, 0)));
+    return ids.toOwnedSlice(arena);
+}
+
 /// All of entry `id`, in `arena`; null when it is gone.
 pub fn clipContent(
     db: *Db,
@@ -578,6 +608,28 @@ test "the list loads each entry's head, the entry is read whole by id" {
     try std.testing.expect(try db.deleteClip(clips[0].id));
     try std.testing.expect(try db.clipContent(allocator, clips[0].id) == null);
     try std.testing.expect(!(try db.deleteClip(clips[0].id)));
+}
+
+test "a long entry is found by text past its head (MYP-491)" {
+    var db = try Db.open(Db.in_memory);
+    defer db.close();
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const long = try allocator.alloc(u8, head_chars + 1 + "\nQuokka_Suffix".len);
+    @memset(long[0 .. head_chars + 1], 'a');
+    @memcpy(long[head_chars + 1 ..], "\nQuokka_Suffix");
+    try db.addClip(long, 1, Db.clip_entries_max);
+    try db.addClip("short quokka_suffix", 2, Db.clip_entries_max);
+    const clips = try db.recentClips(allocator, 10);
+    const long_id = clips[1].id;
+    const found = try db.clipsContaining(allocator, "quokka_suffix", head_chars);
+    try std.testing.expectEqualSlices(ClipId, &.{long_id}, found);
+    // "_" and "%" are not wildcards.
+    try std.testing.expectEqual(0, (try db.clipsContaining(allocator, "quokka%suffix", head_chars)).len);
+    try std.testing.expectEqual(0, (try db.clipsContaining(allocator, "quokkaxsuffix", head_chars)).len);
+    // Only entries longer than the bytes scored are looked at.
+    try std.testing.expectEqual(0, (try db.clipsContaining(allocator, "quokka", long.len)).len);
 }
 
 test "the database and its -wal and -shm are owner-only" {
