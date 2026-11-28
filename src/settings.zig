@@ -428,6 +428,22 @@ pub const Settings = struct {
         }
     }
 
+    /// The app chosen for the file called `name`: its longest extension
+    /// first (".tar.gz" before ".gz"), then as `appFor` does.
+    pub fn appForName(settings: *const Settings, name: []const u8, kind: ?Kind) ?[]const u8 {
+        // A leading dot starts a hidden name (".bashrc"), not an extension.
+        var start: usize = 1;
+        while (std.mem.findScalarPos(u8, name, start, '.')) |dot| : (start = dot + 1) {
+            const suffix = name[dot..];
+            if (suffix.len < 2) break;
+            if (suffix.len > extension_key_bytes_max) continue;
+            var lowercase_buffer: [extension_key_bytes_max]u8 = undefined;
+            const key = std.ascii.lowerString(&lowercase_buffer, suffix);
+            if (settings.open_with.get(key)) |app| return app;
+        }
+        return settings.appFor("", kind);
+    }
+
     pub fn write(settings: *const Settings, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         return settings.writeKeeping(writer, settings, &.{});
     }
@@ -678,7 +694,7 @@ pub const Settings = struct {
         settings.* = disk;
     }
 
-    pub const SaveError = sys.Error || std.Io.Writer.Error || error{Incomplete};
+    pub const SaveError = sys.Error || std.Io.Writer.Error || error{ Incomplete, TooLarge };
 
     /// Writes `path` atomically (temporary file, fsync, rename): a crash or a
     /// full disk never leaves half a file. Owner-only, like Lumen's other
@@ -697,6 +713,9 @@ pub const Settings = struct {
         var output: std.Io.Writer.Allocating = .init(gpa);
         defer output.deinit();
         try settings.writeKeeping(&output.writer, &file, kept);
+        // `load` reads no more than this: a longer file would come back
+        // incomplete and refuse every later save. The file on disk stays.
+        if (output.written().len > file_bytes_max) return error.TooLarge;
         // Written where a link points: the rename of the atomic write
         // replaced the link itself, and a settings.conf kept in a dotfiles
         // repository (stow, home-manager) silently became a copy.
@@ -910,6 +929,31 @@ test "open-with: extension beats kind, Markdown falls back to text" {
     try testing.expectError(error.BadApp, settings.setOpenWith("pdf", "x\ny.desktop"));
 }
 
+test "a compound extension rule wins over the last extension, else the order stays" {
+    var settings = Settings.init(testing.allocator);
+    defer settings.deinit();
+    try settings.setOpenWith("archive", "ark.desktop");
+    try testing.expectEqualStrings("ark.desktop", settings.appForName("backup.tar.gz", .archive).?);
+    try settings.setOpenWith(".gz", "gz.desktop");
+    try testing.expectEqualStrings("gz.desktop", settings.appForName("backup.tar.gz", .archive).?);
+    try settings.setOpenWith(".TAR.GZ", "example.desktop");
+    try testing.expectEqualStrings(
+        "example.desktop",
+        settings.appForName("Backup.Tar.GZ", .archive).?,
+    );
+    // Only the full suffix matches: "x.gz" has no ".tar".
+    try testing.expectEqualStrings("gz.desktop", settings.appForName("x.gz", .archive).?);
+    try settings.setOpenWith(".tar.gz", "");
+    try testing.expectEqualStrings("gz.desktop", settings.appForName("backup.tar.gz", .archive).?);
+    try settings.setOpenWith(".gz", "");
+    try testing.expectEqualStrings("ark.desktop", settings.appForName("backup.tar.gz", .archive).?);
+    // A hidden name and a trailing dot have no extension.
+    try settings.setOpenWith(".bashrc", "zed.desktop");
+    try testing.expectEqual(@as(?[]const u8, null), settings.appForName(".bashrc", null));
+    try testing.expectEqual(@as(?[]const u8, null), settings.appForName("notes.", null));
+    try testing.expectEqualStrings("zed.desktop", settings.appForName("x.bashrc", null).?);
+}
+
 test "save is atomic and owner-only; load survives a missing file" {
     var test_dir = testing.tmpDir(.{});
     defer test_dir.cleanup();
@@ -964,6 +1008,41 @@ test "save is atomic and owner-only; load survives a missing file" {
         error.Incomplete,
         settings.save(testing.allocator, fifo_path, &.{"width"}),
     );
+}
+
+test "save refuses an output past what load reads, the file stays" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var dir_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try sys.tmpDirPath(&tmp_dir, &dir_buffer);
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.mem.printSentinel(&path_buffer, "{s}/settings.conf", .{dir}, 0);
+
+    // Unknown keys just under the read limit: the file loads whole, but the
+    // header and generated keys a save adds take it past the limit.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    var line_index: usize = 0;
+    while (text.items.len + 32 < Settings.file_bytes_max - 200) : (line_index += 1) {
+        try text.print(testing.allocator, "future_key_{d:0>6} = some-value\n", .{line_index});
+    }
+    try sys.writeFile(path, text.items);
+    var settings = Settings.load(testing.allocator, path);
+    defer settings.deinit();
+    try testing.expect(!settings.incomplete);
+    try testing.expect(settings.setChoice(.editor, "hx"));
+    try testing.expectError(error.TooLarge, settings.save(testing.allocator, path, &.{}));
+    try testing.expectError(error.TooLarge, settings.savePatch(testing.allocator, path, &.{}, .{
+        .choice = .{ .key = .editor, .value = "hx" },
+    }));
+
+    // The file is the one written, and still loads whole.
+    var back = Settings.load(testing.allocator, path);
+    defer back.deinit();
+    try testing.expect(!back.incomplete);
+    var stx: std.os.linux.Statx = undefined;
+    _ = std.os.linux.statx(std.os.linux.AT.FDCWD, path, 0, .{ .SIZE = true }, &stx);
+    try testing.expectEqual(@as(u64, text.items.len), stx.size);
 }
 
 test "each text choice sets its own field" {
