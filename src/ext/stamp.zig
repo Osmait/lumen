@@ -49,19 +49,63 @@ const stamp_depth_max = 8;
 /// files stamp differently (a reload for nothing).
 fn hashLua(hasher: *std.hash.Wyhash, folder: [:0]const u8) void {
     hasher.update(folder);
+    // init.lua by name, whatever `stamp_entries_max` leaves out: on btrfs
+    // readdir lists files in the order they were made, and a checkout (or
+    // an editor's save, a new file renamed over it) put it after a folder
+    // of a thousand icons.
+    var init_buffer: [4096]u8 = undefined;
+    if (std.mem.printSentinel(&init_buffer, "{s}/init.lua", .{folder}, 0)) |path| {
+        hashFile(hasher, path);
+    } else |_| {}
     var entries_seen: usize = 0;
     const files_sum = hashLuaDir(folder, 0, &entries_seen);
     hasher.update(std.mem.asBytes(&files_sum));
 }
 
+/// What `hashLua` sums for `folder` (`depth` 0 is the extension's or the
+/// style's own): its files first, then its subfolders, so the `.lua` files
+/// beside a big subfolder are never the ones `stamp_entries_max` leaves out.
 fn hashLuaDir(folder: [:0]const u8, depth: usize, entries_seen: *usize) u64 {
-    const fd = os.openDirNoFollow(folder.ptr) catch return 0;
+    // The extension's own folder may be a link (to where it is written);
+    // links below it are not followed.
+    const opened = if (depth == 0) os.openDir(folder.ptr) else os.openDirNoFollow(folder.ptr);
+    const fd = opened catch return 0;
     defer os.close(fd);
     var iter: os.DirIter = .{ .fd = fd };
     var sum: u64 = 0;
+    var entries_here: usize = 0;
+    var has_subfolders = false;
     while (iter.next() catch null) |entry| {
         if (entries_seen.* >= stamp_entries_max) break;
         entries_seen.* += 1;
+        entries_here += 1;
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        // Hashed by `hashLua` already.
+        if (depth == 0 and std.mem.eql(u8, entry.name, "init.lua")) continue;
+        var path_buffer: [4096]u8 = undefined;
+        const path = std.mem.printSentinel(
+            &path_buffer,
+            "{s}/{s}",
+            .{ folder, entry.name },
+            0,
+        ) catch continue;
+        if (isFolder(entry, path)) {
+            has_subfolders = true;
+            continue;
+        }
+        if (!std.mem.endsWith(u8, entry.name, ".lua")) continue;
+        var file_hasher: std.hash.Wyhash = .init(0);
+        hashFile(&file_hasher, path);
+        sum +%= file_hasher.final();
+    }
+    if (!has_subfolders or depth + 1 >= stamp_depth_max) return sum;
+    // Again from the start, for the subfolders among the entries read.
+    const linux = std.os.linux;
+    if (linux.errno(linux.lseek(fd, 0, linux.SEEK.SET)) != .SUCCESS) return sum;
+    iter = .{ .fd = fd };
+    var index: usize = 0;
+    while (index < entries_here) : (index += 1) {
+        const entry = (iter.next() catch null) orelse break;
         if (entry.name.len == 0 or entry.name[0] == '.') continue;
         var path_buffer: [4096]u8 = undefined;
         const path = std.mem.printSentinel(
@@ -70,27 +114,22 @@ fn hashLuaDir(folder: [:0]const u8, depth: usize, entries_seen: *usize) u64 {
             .{ folder, entry.name },
             0,
         ) catch continue;
-        const is_dir = switch (entry.kind) {
-            os.Kind.directory => true,
-            os.Kind.unknown => if (os.info(path)) |entry_info| entry_info.is_dir else false,
-            else => false,
-        };
-        if (is_dir) {
-            if (depth + 1 < stamp_depth_max) {
-                var dir_hasher: std.hash.Wyhash = .init(0);
-                dir_hasher.update(path);
-                const sub_sum = hashLuaDir(path, depth + 1, entries_seen);
-                dir_hasher.update(std.mem.asBytes(&sub_sum));
-                sum +%= dir_hasher.final();
-            }
-            continue;
-        }
-        if (!std.mem.endsWith(u8, entry.name, ".lua")) continue;
-        var file_hasher: std.hash.Wyhash = .init(0);
-        hashFile(&file_hasher, path);
-        sum +%= file_hasher.final();
+        if (!isFolder(entry, path)) continue;
+        var dir_hasher: std.hash.Wyhash = .init(0);
+        dir_hasher.update(path);
+        const sub_sum = hashLuaDir(path, depth + 1, entries_seen);
+        dir_hasher.update(std.mem.asBytes(&sub_sum));
+        sum +%= dir_hasher.final();
     }
     return sum;
+}
+
+fn isFolder(entry: os.DirIter.Entry, path: [:0]const u8) bool {
+    return switch (entry.kind) {
+        os.Kind.directory => true,
+        os.Kind.unknown => if (os.info(path)) |entry_info| entry_info.is_dir else false,
+        else => false,
+    };
 }
 
 /// The .lua files in each folder of <config>/<kind>.
@@ -143,4 +182,44 @@ test "stamp tracks nested lua modules and ignores directory symlinks" {
     const link_path = try test_dir.path(&link_buf, "extensions/demo/helper/loop");
     try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.symlink("..", link_path)));
     _ = stamp(test_dir.absolute, "");
+}
+
+test "stamp sees an extension's own .lua files past a big folder beside them" {
+    var test_dir = try os.TestDir.init();
+    defer test_dir.deinit();
+    // Made first, so readdir lists them first where it keeps that order.
+    var name_buffer: [64]u8 = undefined;
+    for (0..stamp_entries_max + 100) |number| {
+        const name = try std.fmt.bufPrint(&name_buffer, "extensions/demo/assets/{d}.svg", .{number});
+        try test_dir.write(name, "<svg/>");
+    }
+    try test_dir.write("extensions/demo/init.lua", "return {}\n");
+    try test_dir.write("extensions/demo/util.lua", "return 1\n");
+
+    const before = stamp(test_dir.absolute, "");
+    try test_dir.write("extensions/demo/init.lua", "return { edited = true }\n");
+    const after_init = stamp(test_dir.absolute, "");
+    try std.testing.expect(before != after_init);
+    try test_dir.write("extensions/demo/util.lua", "return 22\n");
+    try std.testing.expect(stamp(test_dir.absolute, "") != after_init);
+}
+
+test "stamp follows an extension folder that is a link" {
+    var test_dir = try os.TestDir.init();
+    defer test_dir.deinit();
+    try test_dir.write("code/demo/init.lua", "return {}\n");
+    try test_dir.write("code/demo/lib/helper.lua", "return 1\n");
+    try test_dir.mkdir("extensions");
+    var target_buffer: [4096]u8 = undefined;
+    const target = try test_dir.path(&target_buffer, "code/demo");
+    var link_buffer: [4096]u8 = undefined;
+    const link = try test_dir.path(&link_buffer, "extensions/demo");
+    try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.symlink(target, link)));
+
+    const before = stamp(test_dir.absolute, "");
+    try test_dir.write("code/demo/init.lua", "return { edited = true }\n");
+    const after_init = stamp(test_dir.absolute, "");
+    try std.testing.expect(before != after_init);
+    try test_dir.write("code/demo/lib/helper.lua", "return 22\n");
+    try std.testing.expect(stamp(test_dir.absolute, "") != after_init);
 }

@@ -238,7 +238,9 @@ fn registryCallback(registry: *Host.Registry, context: ?*anyopaque) void {
     // requests drops them when they arrive.
     const old_list = ui.ext_list.forget();
     const old_root = ui.ext_root_search.forget();
-    ui.ext_act_generation = .none;
+    // Not an action's: its answer still comes (refused when it was made
+    // against the old files, "Extensions were reloaded; try again"), and
+    // dropping it left "Running..." gone with nothing said.
     // What the views point at by index, found again by id (before anything
     // rebuilds them): the open view may have lost it.
     const lost = if (old_registry) |old| remap(ui, old, registry) else false;
@@ -1030,7 +1032,7 @@ test "indexes into the registry follow their ids across a reload" {
 test "cleared ext_act_generation rejects late Lua action responses" {
     var generation: Host.RequestGeneration = @fromBackingInt(@as(u32, 7));
     const answer_gen = generation;
-    // Simulating Ui.hide() / Ui.setView() / registryCallback() clearing it.
+    // Simulating Ui.hide() / Ui.setView() clearing it.
     generation = .none;
     try testing.expect(answer_gen != generation);
 }

@@ -83,6 +83,14 @@ pub const KeptRing = struct {
         rows: c_int,
         list_generation: RequestGeneration,
     ) void {
+        // The same request again (a root search that started over after
+        // an action): its rows now are the ones the window gets.
+        for (&ring.entries) |*entry| {
+            const same = entry.* orelse continue;
+            if (same.list_generation != list_generation) continue;
+            entry.* = null;
+            lua.unref(L, same.reference);
+        }
         if (ring.entries[ring.next]) |old| {
             lua.unref(L, old.reference);
             // `ref` below may raise: no reference to a freed slot is left.
@@ -265,7 +273,7 @@ pub const SubmitRequest = struct {
 };
 
 /// The error a request gets when the files were reloaded after it was made.
-const reloaded = "Extensions were reloaded";
+const reloaded = "Extensions were reloaded; try again";
 
 /// The command a request names; null when the files were reloaded after
 /// the request was made (its command index is from a registry that is
@@ -378,7 +386,8 @@ pub fn rootSearchExecute(host: *Host, request: *const RootSearchRequest) void {
         .query = "",
         .arena = .init(host.gpa),
     }) orelse return;
-    defer host.deliver(.{ .root = result });
+    var postponed = false;
+    defer if (postponed) result.destroy(host.gpa) else host.deliver(.{ .root = result });
     const arena = result.arena.allocator();
     const query = request.query.slice();
     // Out of memory, no rows: an answer for "" would show no rows anyway.
@@ -389,8 +398,15 @@ pub fn rootSearchExecute(host: *Host, request: *const RootSearchRequest) void {
     var rows: lua.Capped = .{ .child = arena, .bytes_max = rows_bytes_max };
     for (host.worker_commands, 0..) |*worker_command, command_index| {
         if (!worker_command.answers_root_search) continue;
-        // A newer query came in: this one is already stale.
-        if (rootSearchSuperseded(host)) break;
+        switch (rootSearchGoesOn(host, request)) {
+            .go_on => {},
+            // A newer query came in: this one is already stale.
+            .superseded => break,
+            .postponed => {
+                postponed = true;
+                return;
+            },
+        }
         const command: CommandIndex = .from(command_index);
         const items = rootSearchCommand(host, arena, &rows, worker_command, command, request);
         if (items.len == 0) continue;
@@ -439,12 +455,25 @@ fn rootSearchCommand(
     return &.{};
 }
 
-fn rootSearchSuperseded(host: *Host) bool {
+const RootSearchNext = enum { go_on, superseded, postponed };
+
+/// Whether a root search runs its next provider. A newer search makes it
+/// stale. What the window asked for meanwhile (an action, a submit, a list,
+/// a reload) goes first: each provider has up to 3 s, and a user's Enter
+/// waited for all of them on a query nobody looked at any more. The search
+/// is then pending again, and starts over once they ran (the window waits
+/// for its answer, and asks no more for that query).
+fn rootSearchGoesOn(host: *Host, request: *const RootSearchRequest) RootSearchNext {
     // Shutting down: nobody waits for the rest.
-    if (host.stop.load(.acquire)) return true;
+    if (host.stop.load(.acquire)) return .superseded;
     host.lock.lockUncancelable(host.io);
     defer host.lock.unlock(host.io);
-    return host.pending.root_search != null;
+    const pending = &host.pending;
+    if (pending.root_search != null) return .superseded;
+    if (pending.operations_len == 0 and pending.list == null and !pending.reload) return .go_on;
+    // The worker takes it with them: they woke it already.
+    pending.root_search = request.*;
+    return .postponed;
 }
 
 const RootSearchContext = struct {

@@ -314,6 +314,7 @@ const sandbox_prelude =
     \\end
     \\if type(coroutine) == "table" then
     \\  local raw_create, raw_resume, raw_close = coroutine.create, coroutine.resume, coroutine.close
+    \\  local raw_status = coroutine.status
     \\  local timed_out_coroutines = setmt({}, { __mode = "k" })
     \\  local function finish_resume(co, ok, ...)
     \\    resumed(timed_out_coroutines, co, ok)
@@ -327,16 +328,18 @@ const sandbox_prelude =
     \\  function coroutine.wrap(f)
     \\    local co = raw_create(f)
     \\    arm_hook(co)
-    \\    local function unwrap(ok, ...)
+    \\    local function unwrap(was_suspended, ok, ...)
     \\      resumed(timed_out_coroutines, co, ok)
     \\      if not ok then
-    \\        if raw_close then
-    \\          local _, cerr = raw_close(co)
+    \\        -- As Lua's own wrap: closed only when it died of an error, not
+    \\        -- when it was dead or running already (the message says so).
+    \\        if raw_close and was_suspended and raw_status(co) == "dead" then
+    \\          local closed, cerr = raw_close(co)
     \\          if timed_out() then
     \\            timed_out_coroutines[co] = true
     \\            error("timed out", 0)
     \\          end
-    \\          error(cerr, 2)
+    \\          if not closed then error(cerr, 2) end
     \\        end
     \\        error((...), 2)
     \\      end
@@ -344,8 +347,9 @@ const sandbox_prelude =
     \\    end
     \\    return function(...)
     \\      if timed_out() then error("timed out", 0) end
+    \\      local was_suspended = raw_status(co) == "suspended"
     \\      arm_hook(co, true)
-    \\      return unwrap(raw_resume(co, ...))
+    \\      return unwrap(was_suspended, raw_resume(co, ...))
     \\    end
     \\  end
     \\  function coroutine.resume(co, ...)
@@ -454,6 +458,20 @@ const sandbox_prelude =
     \\end
     \\collectgarbage = guarded(collectgarbage)
 ;
+
+/// Pushes the chunk in the text file at `path`, read as the sandbox's
+/// `loadfile` reads it (lfiles.c): in blocks that check the deadline, since
+/// the parser runs in C where the hook never does (a long comment over a
+/// sparse gigabyte held the worker for seconds), and never a FIFO or a
+/// device. Raises the error message when it cannot. Call inside `protect`.
+pub fn loadFile(L: *State, path: [:0]const u8) void {
+    c.lua_pushcclosure(L, &luart_loadfile, 0);
+    _ = c.lua_pushlstring(L, path.ptr, path.len);
+    c.lua_callk(L, 1, 2, 0, null);
+    // The chunk and nil, or nil and the message.
+    if (c.lua_type(L, -2) == c.LUA_TNIL) _ = c.lua_error(L);
+    pop(L, 1);
+}
 
 fn isTimedOut(L: *State) Error!c_int {
     const budget = budgetOf(L);
@@ -648,6 +666,7 @@ fn alloc(
 extern fn luart_open_patterns(L: *State) c_int;
 extern fn luart_open_files(L: *State) c_int;
 extern fn luart_cloexec_io_input(L: *State) void;
+extern fn luart_loadfile(L: ?*State) callconv(.c) c_int;
 
 /// For io.open (lfiles.c): takes one of the state's `open_files_max`
 /// slots; 0 when none is left.
@@ -1732,6 +1751,11 @@ test "one costly operator per instruction stops at the deadline too" {
         "local a = ('a'):rep(8e6) local b = a:sub(1, -2) .. 'b' " ++
             "local f = coroutine.wrap(function() coroutine.yield() end) f() " ++
             "while true do local _ = a == b end",
+        // A 10 MB `[...]` class walked twice per position, in C: the
+        // matcher's step count alone ran for seconds between checks.
+        "local p = '[' .. ('b'):rep(1e7) .. ']' ('a'):rep(1024):find(p)",
+        "local p = '[^' .. ('b'):rep(1e7) .. ']*$' ('a'):rep(4096):find(p)",
+        "local p = '%f[' .. ('b'):rep(1e7) .. ']' ('a'):rep(1024):find(p)",
     };
     for (runaways) |code| {
         var budget: Budget = .{ .bytes_max = 64 << 20 };
@@ -2182,4 +2206,89 @@ test "coroutine.wrap closes <close> variables immediately on error and skips on 
     const msg = runCode(L, arena, timeout_check) orelse return error.TestUnexpectedResult;
     try testing.expect(std.mem.find(u8, msg, "timed out") != null);
     try testing.expect(os.monotonicNs() - start_ns < std.time.ns_per_s);
+}
+
+test "coroutine.wrap reports resuming a dead or running coroutine as Lua does" {
+    var budget: Budget = .{ .bytes_max = 8 << 20 };
+    const L = try testState(&budget);
+    defer c.lua_close(L);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const checks =
+        \\local gen = coroutine.wrap(function() coroutine.yield(1) end)
+        \\assert(gen() == 1)
+        \\gen()
+        \\local ok, err = pcall(gen)
+        \\assert(not ok and type(err) == 'string', tostring(err))
+        \\assert(err:find('cannot resume dead coroutine', 1, true), err)
+        \\local self
+        \\self = coroutine.wrap(function() return self() end)
+        \\ok, err = pcall(self)
+        \\assert(not ok and err:find('cannot resume non%-suspended coroutine'), tostring(err))
+        \\local failing = coroutine.wrap(function() error('inner failure') end)
+        \\ok, err = pcall(failing)
+        \\assert(not ok and err:find('inner failure'), tostring(err))
+        \\ok, err = pcall(failing)
+        \\assert(not ok and err:find('cannot resume dead coroutine', 1, true), tostring(err))
+        \\local tagged = coroutine.wrap(function() error({ tag = 1 }) end)
+        \\ok, err = pcall(tagged)
+        \\assert(not ok and type(err) == 'table' and err.tag == 1)
+    ;
+    if (runCode(L, arena, checks)) |msg| {
+        std.debug.print("{s}\n", .{msg});
+        return error.TestUnexpectedResult;
+    }
+    const uncaught = runCode(
+        L,
+        arena,
+        "local g = coroutine.wrap(function() end) g() g()",
+    ) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.find(u8, uncaught, "cannot resume dead coroutine") != null);
+}
+
+test "loading a huge file stops at the deadline: loadfile and loadFile" {
+    var budget: Budget = .{ .bytes_max = 8 << 20 };
+    const L = try testState(&budget);
+    defer c.lua_close(L);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [512]u8 = undefined;
+    const dir_path = try os.tmpDirPath(&test_dir, &path_buffer);
+    const path = try std.fmt.allocPrintSentinel(arena, "{s}/huge.lua", .{dir_path}, 0);
+    // A long comment over a sparse gigabyte: made at once, no memory used
+    // to parse it, so only the deadline stops it.
+    const make = try std.fmt.allocPrintSentinel(arena,
+        \\local f = assert(io.open('{s}', 'w'))
+        \\f:write('--[[') f:seek('set', 1 << 30) f:write(']] return 1') f:close()
+    , .{path}, 0);
+    try testing.expect(runCode(L, arena, make) == null);
+
+    const call = try std.fmt.allocPrintSentinel(arena, "pcall(loadfile, '{s}')", .{path}, 0);
+    budget.deadline_ns = os.monotonicNs() + 50 * std.time.ns_per_ms;
+    var start_ns = os.monotonicNs();
+    const message = runCode(L, arena, call) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.find(u8, message, "timed out") != null);
+    try testing.expect(os.monotonicNs() - start_ns < 500 * std.time.ns_per_ms);
+
+    const Context = struct {
+        path: [:0]const u8,
+        fn run(state: *State, context: *@This()) void {
+            loadFile(state, context.path);
+        }
+    };
+    var context: Context = .{ .path = path };
+    budget.deadline_ns = os.monotonicNs() + 50 * std.time.ns_per_ms;
+    start_ns = os.monotonicNs();
+    const load_message = protect(L, arena, Context, &context, Context.run) orelse
+        return error.TestUnexpectedResult;
+    try testing.expect(std.mem.find(u8, load_message, "timed out") != null);
+    try testing.expect(os.monotonicNs() - start_ns < 500 * std.time.ns_per_ms);
+    budget.deadline_ns = std.math.maxInt(u64);
+    try testing.expectEqual(@as(u32, 0), budget.open_files);
 }

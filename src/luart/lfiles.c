@@ -231,7 +231,9 @@ static const char *loadfile_reader (lua_State *L, void *ud, size_t *size) {
   }
 }
 
-static int luart_loadfile (lua_State *L) {
+/* loadfile; also how the daemon loads init.lua files (loadFile in
+** src/luart/lua.zig), so their parse stops at the deadline too. */
+int luart_loadfile (lua_State *L) {
   const char *filename = luaL_checkstring(L, 1);
   if (luart_match_timed_out(L)) return luaL_error(L, "timed out");
   const char *mode = luaL_optstring(L, 2, "t");
