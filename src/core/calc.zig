@@ -25,6 +25,7 @@ pub const Result = struct {
 pub fn evaluate(input: []const u8) ?Result {
     const text = std.mem.trim(u8, input, " \t");
     if (text.len == 0 or !hasDigit(text)) return null;
+    if (looksLikeIdentifier(text)) return null;
 
     if (splitConversion(text)) |conversion| return conversion;
 
@@ -37,6 +38,33 @@ pub fn evaluate(input: []const u8) ?Result {
     if (!parser.saw_operator) return null;
     if (!std.math.isFinite(value)) return null;
     return .{ .value = value };
+}
+
+/// Digit groups glued by `-` or `/` that read as a date, a phone number or
+/// an ISBN ("2024-06-01", "15/06/2024", "1-800-555-0199", "2024-06"): two
+/// or more separators, or a group after a separator with a leading zero.
+/// "10-3", "1/3" and "2024 - 6" are still calculations.
+fn looksLikeIdentifier(text: []const u8) bool {
+    var separators: usize = 0;
+    var leading_zero = false;
+    var group_start: usize = 0;
+    for (text, 0..) |char, i| {
+        switch (char) {
+            '0'...'9' => if (separators > 0 and i == group_start and char == '0' and
+                i + 1 < text.len and std.ascii.isDigit(text[i + 1]))
+            {
+                leading_zero = true;
+            },
+            '-', '/' => {
+                if (i == group_start) return false;
+                separators += 1;
+                group_start = i + 1;
+            },
+            else => return false,
+        }
+    }
+    if (group_start == text.len) return false;
+    return separators >= 2 or leading_zero;
 }
 
 fn hasDigit(text: []const u8) bool {
@@ -218,6 +246,22 @@ test "not a calculation" {
     try std.testing.expect(evaluate("2 +") == null);
     try std.testing.expect(evaluate("1/0") == null);
     try std.testing.expect(evaluate("code 2") == null);
+    // Dates, phone numbers and ISBNs.
+    try std.testing.expect(evaluate("2024-06-01") == null);
+    try std.testing.expect(evaluate("2024-06") == null);
+    try std.testing.expect(evaluate("15/06/2024") == null);
+    try std.testing.expect(evaluate("6/15/2024") == null);
+    try std.testing.expect(evaluate("1-800-555-0199") == null);
+    try std.testing.expect(evaluate("978-3-16-148410-0") == null);
+    try std.testing.expect(evaluate("2024/06") == null);
+    // Still calculations.
+    try expectValue("10-3", 7);
+    try expectValue("1/3", 1.0 / 3.0);
+    try expectValue("2024 - 6", 2018);
+    try expectValue("10-0", 10);
+    try expectValue("-5-3", -8);
+    try expectValue("2024-6", 2018);
+    try expectValue("2024-06 + 1", 2019);
 }
 
 test "unit conversions" {
