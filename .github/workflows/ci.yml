@@ -6,6 +6,8 @@ on:
   pull_request:
     # `labeled`: adding `perf-accepted` re-runs the comparison below.
     types: [opened, synchronize, reopened, labeled]
+  # By hand, e.g. to run the end-to-end job again.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -70,3 +72,34 @@ jobs:
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           tools/perf-compare.sh "origin/$BASE_REF"
+
+  # The end-to-end suite (tools/e2e.sh) in a headless sway: it drives a real
+  # window, so a slow or noisy runner can fail it now and then. It is
+  # reported, and never blocks a merge (MYP-475).
+  e2e:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    continue-on-error: true
+    timeout-minutes: 20
+    steps:
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm --needed git gtk4 gtk4-layer-shell \
+            ripgrep poppler unzip zip pkgconf gcc binutils \
+            sway dbus desktop-file-utils shared-mime-info ttf-dejavu
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+
+      - name: Build
+        run: zig build
+
+      - name: End-to-end tests
+        # Software rendering on a shared runner: every wait and latency
+        # limit of the suite, 4 times longer.
+        env:
+          PERF_SCALE: "4"
+        run: tools/e2e-headless.sh zig build e2e

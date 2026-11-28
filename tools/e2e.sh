@@ -11,8 +11,26 @@
 #
 # State is read with `lumen --dump` (view, rows, selection, detail, panel)
 # and keys are sent with `lumen --key`.
+#
+# PERF_SCALE (1) multiplies every time limit: the waits for the window and
+# the indexes, and the latency checks at the end. A slower machine (CI's
+# shared runners, software rendering: tools/e2e-headless.sh) sets it, as for
+# `zig build perf`, instead of the limits being loosened for everyone.
 
 set -uo pipefail
+
+SCALE=${PERF_SCALE:-1}
+if ! [[ "$SCALE" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! awk -v s="$SCALE" 'BEGIN { exit !(s >= 1) }'; then
+    echo "e2e: PERF_SCALE must be a number of at least 1, not '$SCALE'" >&2
+    exit 2
+fi
+# `scaled n`: n (seconds or ms) times PERF_SCALE; `scaled_whole n`, rounded up.
+scaled() { awk -v n="$1" -v s="$SCALE" 'BEGIN { print n * s }'; }
+scaled_whole() { awk -v n="$1" -v s="$SCALE" 'BEGIN { v = n * s; print (v == int(v)) ? v : int(v) + 1 }'; }
+# A pause for the window to catch up, PERF_SCALE times longer.
+nap() {
+    if [[ "$SCALE" == 1 ]]; then sleep "$1"; else sleep "$(scaled "$1")"; fi
+}
 
 BIN=$(realpath "${1:-zig-out/bin/lumen}")
 [[ -x "$BIN" ]] || { echo "no lumen binary at $BIN" >&2; exit 2; }
@@ -36,7 +54,7 @@ DAEMON=
 cleanup() {
     if [[ -n "$DAEMON" ]]; then
         kill "$DAEMON" 2>/dev/null
-        for _ in $(seq 20); do kill -0 "$DAEMON" 2>/dev/null || break; sleep 0.1; done
+        for _ in $(seq 20); do kill -0 "$DAEMON" 2>/dev/null || break; nap 0.1; done
         kill -KILL "$DAEMON" 2>/dev/null
     fi
     rm -rf "$T"
@@ -166,14 +184,14 @@ expect_not() {
 }
 # wait_for pattern [seconds]: polls the dump (indexes build in the background).
 wait_for() {
-    local deadline=$((SECONDS + ${2:-15}))
+    local deadline=$((SECONDS + $(scaled_whole "${2:-15}")))
     while ((SECONDS < deadline)); do
         L --dump | grep -qE -- "$1" && return 0
-        sleep 0.2
+        nap 0.2
     done
     return 1
 }
-query() { L --view "$1" --query "$2"; sleep 0.15; }
+query() { L --view "$1" --query "$2"; nap 0.15; }
 # Content results arrive from a worker thread: poll for them.
 expect_soon() {
     if wait_for "$2" "${3:-3}"; then ok "$1"; else ko "$1 (no /$2/)" "$(L --dump)"; fi
@@ -184,7 +202,7 @@ expect_soon() {
 # pid, not the daemon's (lumen execs lumen-gtk in the process it starts).
 "${LUMEN_ENV[@]}" "$BIN" --daemon &
 DAEMON=$!
-for _ in $(seq 50); do L --dump >/dev/null 2>&1 && break; sleep 0.1; done
+for _ in $(seq 50); do L --dump >/dev/null 2>&1 && break; nap 0.1; done
 echo "lumen e2e: $BIN (pid $DAEMON), fixture $T"
 
 echo "indexes"
@@ -251,7 +269,7 @@ L --view files --query "capybara"
 if wait_for 'fresh-capybara.txt' 10; then ok "new file appears (inotify)"; else ko "new file appears (inotify)" "$(L --dump)"; fi
 rm "$H/notes/fresh-capybara.txt"
 L --view files --query "capybara"
-sleep 0.5
+nap 0.5
 L --view files --query "capybar"
 L --view files --query "capybara"
 if wait_for 'No Results' 10; then ok "deleted file disappears"; else ko "deleted file disappears" "$(L --dump)"; fi
@@ -284,10 +302,12 @@ expect_soon "file with a newline in its name is content-searchable" 'line1 line2
 query contents "invalid utf8 name marker"
 expect_soon "file with an invalid UTF-8 name is content-searchable" 'bad-'
 rm "$H/notes/victim.txt"; mkfifo "$H/notes/victim.txt"
+# The shell under `timeout` gets L and its environment too: without
+# LUMEN_ENV it asked the session's own Lumen (or none, in CI).
 query contents "fifoword"
-if timeout 5 bash -c "$(declare -f L); H='$H' T='$T' BIN='$BIN'; L --dump >/dev/null"; then ok "a file turned into a FIFO does not freeze search"; else ko "a file turned into a FIFO does not freeze search"; fi
+if timeout "$(scaled 5)" bash -c "$(declare -p LUMEN_ENV); $(declare -f L); H='$H' T='$T' BIN='$BIN'; L --dump >/dev/null"; then ok "a file turned into a FIFO does not freeze search"; else ko "a file turned into a FIFO does not freeze search"; fi
 query files "victim"
-if timeout 5 bash -c "$(declare -f L); H='$H' T='$T' BIN='$BIN'; L --dump >/dev/null"; then ok "nor its preview"; else ko "nor its preview"; fi
+if timeout "$(scaled 5)" bash -c "$(declare -p LUMEN_ENV); $(declare -f L); H='$H' T='$T' BIN='$BIN'; L --dump >/dev/null"; then ok "nor its preview"; else ko "nor its preview"; fi
 query contents "accion"
 expect_soon "accent-insensitive content search" 'español.txt'
 query contents "ÑANDÚ"
@@ -299,7 +319,7 @@ echo "clipboard"
 printf 'e2e clipboard entry 42' | CLIPBOARD_STATE=data L --clip-store
 printf 'e2e second entry' | CLIPBOARD_STATE=data L --clip-store
 printf 'secret' | CLIPBOARD_STATE=sensitive L --clip-store
-L --view clipboard; sleep 0.2
+L --view clipboard; nap 0.2
 expect "clipboard lists entries, newest first" '> e2e second entry'
 expect "older entry listed" 'e2e clipboard entry 42'
 expect_not "password-manager copies are skipped" 'secret'
@@ -311,118 +331,118 @@ expect "a filtered entry keeps its copy time" 'Copied = Today'
 printf 'e2e entry to delete' | CLIPBOARD_STATE=data L --clip-store
 query clipboard "to delete"
 expect "entry to delete listed" '> e2e entry to delete'
-L --key ctrl+x; sleep 0.3
+L --key ctrl+x; nap 0.3
 query clipboard ""
 expect_not "Ctrl X deletes the entry, as its action says" 'e2e entry to delete'
 expect "other entries stay" 'e2e clipboard entry 42'
 
 echo "windows"
-L --view windows; sleep 0.2
+L --view windows; nap 0.2
 expect "windows view opens without Hyprland" '^view: windows'
 
 echo "frecency"
 query root "kitty e2e"
 L --key enter
-sleep 0.3
-L --show; sleep 0.2
+nap 0.3
+L --show; nap 0.2
 expect "used app shows up in suggestions" '# Suggestions'
 L --hide
 
 echo "settings"
 C="$H/.config/lumen/settings.conf"
 opened() { grep -c "$1" "$T/opened" 2>/dev/null || echo 0; }
-L --view settings; sleep 0.2
+L --view settings; nap 0.2
 expect "settings list with current values" 'Theme \|  \| Lumen Dark'
 expect "settings grouped in sections" '# Clipboard'
 expect "first row selected" '> Theme'
 query settings "files in main"
-L --key enter; sleep 0.2
+L --key enter; nap 0.2
 expect "a toggle switches in place" '> Show Files in Main Search \|  \| Off'
 grep -q '^files_in_root = false' "$C" && ok "the change is saved to settings.conf" || ko "the change is saved to settings.conf" "$(cat "$C" 2>&1)"
 [[ $(stat -c %a "$C") == 600 ]] && ok "settings.conf is owner-only" || ko "settings.conf is owner-only"
 query root "zebrafish"
 expect_not "files hidden from the main search when off" '# Files'
 query settings "files in main"
-L --key enter; sleep 0.2
+L --key enter; nap 0.2
 query root "zebrafish"
 expect "and back when on" '# Files'
 
 query settings "text size"
-L --key enter; sleep 0.2
+L --key enter; nap 0.2
 expect "a choice opens its values" '^view: choose'
 expect "the current value is marked and selected" '> Default \|  \| ✓'
-L --key down; L --key enter; sleep 0.2
+L --key down; L --key enter; nap 0.2
 expect "picking returns to settings, on the same row" '> Text Size \|  \| Large'
 grep -q '^text_size = large' "$C" && ok "choice saved" || ko "choice saved" "$(cat "$C")"
 # The first Esc clears the query Settings came back with, the second leaves.
-L --key escape; sleep 0.1
-L --key escape; sleep 0.1
+L --key escape; nap 0.1
+L --key escape; nap 0.1
 expect "escape from settings goes back to the main view" '^view: root'
 
 query themes "nord"
 expect "themes have previews" 'Nord \|  \|  \| swatch:nord'
-L --key enter; sleep 0.2
+L --key enter; nap 0.2
 grep -q '^theme = nord' "$C" && ok "theme chosen" || ko "theme chosen" "$(cat "$C")"
-L --view settings; sleep 0.2
+L --view settings; nap 0.2
 expect "settings show the theme" 'Theme \|  \| Nord'
-L --view themes; sleep 0.2
+L --view themes; nap 0.2
 expect "change theme starts on the current theme" '> Nord \|  \| ✓'
-L --key down; sleep 0.1
-L --key escape; sleep 0.1
+L --key down; nap 0.1
+L --key escape; nap 0.1
 grep -q '^theme = nord' "$C" && ok "a previewed theme is not saved" || ko "a previewed theme is not saved"
 
 sed -i 's/^theme = .*/theme = dracula/' "$C"
-L --hide; L --view settings; sleep 0.2
+L --hide; L --view settings; nap 0.2
 expect "hand edits are read when the window opens" 'Theme \|  \| Dracula'
 printf 'garbage line\n\x00\xff\ntext_size = enormous\ntheme = no-such-theme\n[open-with]\npdf = ;rm -rf /\n' >"$C"
-L --hide; L --view settings; sleep 0.2
+L --hide; L --view settings; nap 0.2
 expect "a broken file falls back to defaults" 'Text Size \|  \| Default'
 expect "an unknown theme falls back to the default" 'Theme \|  \| no-such-theme|Theme \|  \| Lumen Dark'
 
 query default_apps "pdf"
 expect "default apps list file kinds" 'PDF Documents'
-L --key enter; sleep 0.2
+L --key enter; nap 0.2
 expect "apps declaring the type come first" '# Recommended'
 expect "the system default is offered" 'System Default'
 query choose "pdf viewer"
-L --key enter; sleep 0.2
+L --key enter; nap 0.2
 grep -q '^pdf = pdf-viewer-e2e.desktop' "$C" && ok "default app saved" || ko "default app saved" "$(cat "$C")"
-L --view default_apps; sleep 0.2
+L --view default_apps; nap 0.2
 expect "default apps show the choice" 'PDF Documents \|  \| PDF Viewer E2E'
 query files "quarterly report"
 L --key enter
-for _ in $(seq 30); do [[ $(opened quarterly-report.pdf) -gt 0 ]] && break; sleep 0.1; done
+for _ in $(seq 30); do [[ $(opened quarterly-report.pdf) -gt 0 ]] && break; nap 0.1; done
 grep -q 'pdf-viewer-e2e .*quarterly-report.pdf' "$T/opened" 2>/dev/null && ok "files open with the chosen app" || ko "files open with the chosen app" "$(cat "$T/opened" 2>&1)"
 
 query files "zebrafish.md"
-L --key ctrl+o; sleep 0.2
+L --key ctrl+o; nap 0.2
 expect "open with lists apps for one file" 'title: Open zebrafish.md With'
 query choose "text opener"
 L --key enter
-for _ in $(seq 30); do [[ $(opened zebrafish.md) -gt 0 ]] && break; sleep 0.1; done
+for _ in $(seq 30); do [[ $(opened zebrafish.md) -gt 0 ]] && break; nap 0.1; done
 grep -q 'text-opener-e2e .*zebrafish.md' "$T/opened" 2>/dev/null && ok "open with opens the file once" || ko "open with opens the file once" "$(cat "$T/opened" 2>&1)"
 grep -q '^markdown' "$C" && ko "open once does not change the default" || ok "open once does not change the default"
 query files "zebrafish.md"
-L --key ctrl+o; sleep 0.2
+L --key ctrl+o; nap 0.2
 query choose "text opener"
-L --key ctrl+enter; sleep 0.3
+L --key ctrl+enter; nap 0.3
 grep -q '^markdown = text-opener-e2e.desktop' "$C" && ok "open and always use remembers the kind" || ko "open and always use remembers the kind" "$(cat "$C")"
 
 query settings "clipboard history"
-L --key enter; sleep 0.2
+L --key enter; nap 0.2
 expect "clipboard history off" 'Clipboard History \|  \| Off'
 printf 'copied while history is off' | CLIPBOARD_STATE=data L --clip-store
-L --view clipboard; sleep 0.2
+L --view clipboard; nap 0.2
 expect_not "nothing is recorded while off" 'copied while history is off'
 query settings "clipboard history"
-L --key enter; sleep 0.2
+L --key enter; nap 0.2
 
 query settings "reset all"
-L --key enter; sleep 0.1
+L --key enter; nap 0.1
 expect "reset asks for a second enter" 'primary: Press ↵ again'
-L --key enter; sleep 0.2
+L --key enter; nap 0.2
 grep -q '^theme = lumen-dark' "$C" && ! grep -q '^pdf' "$C" && ok "reset restores the defaults" || ko "reset restores the defaults" "$(cat "$C")"
-L --key escape; L --key backspace; sleep 0.1
+L --key escape; L --key backspace; nap 0.1
 expect "backspace leaves settings" '^view: root'
 
 echo "extensions (Lua)"
@@ -430,19 +450,19 @@ query root "fixture fruits"
 expect "extension command in root" '> Fixture Fruits \| Fixture \| Command \| emoji:🧪'
 query root "failed to load"
 expect "broken extension reported" 'Extension "broken" failed to load .*give it items, search or run'
-L --command fixture.fruits; sleep 0.4
+L --command fixture.fruits; nap 0.4
 expect "command lists its items" '^title: Fixture Fruits'
 expect "item with subtitle" '> Mango \| sweet'
 expect "items without icon wear the command's" 'Kiwi .*emoji:🧪'
 expect "detail pane shows the item's detail" 'text = a mango detail'
-L --command fixture.fruits --query papaya; sleep 0.3
+L --command fixture.fruits --query papaya; nap 0.3
 expect "markdown detail" 'text = Papaya'
 expect "metadata in the detail pane" 'Origin = Mexico'
 expect "metadata numbers read as text" 'Weight = 900'
-L --command fixture.fruits --query kiw; sleep 0.3
+L --command fixture.fruits --query kiw; nap 0.3
 expect "list commands filter as you type" '> Kiwi'
 expect_not "filtered out" 'Mango'
-L --command fixture.fruits; sleep 0.3
+L --command fixture.fruits; nap 0.3
 L --key ctrl+k
 expect "action panel lists the item's actions" 'Record Mango \[Ctrl ↵\]'
 L --key escape
@@ -451,29 +471,29 @@ L --key escape
 query root "fixture fruits"
 L --key ctrl+k
 expect "action panel open in the root search" '^panel:'
-L --reload; sleep 0.5
+L --reload; nap 0.5
 expect_not "rows rebuilt by a reload close the action panel" '^panel:'
-L --command fixture.fruits; sleep 0.3
+L --command fixture.fruits; nap 0.3
 L --key ctrl+enter
 if wait_for '^visible: false' 3 && [[ "$(cat "$T/ext-ran" 2>/dev/null)" == Mango ]]; then ok "Lua action ran and closed the window"; else ko "Lua action ran and closed the window" "$(L --dump; cat "$T/ext-ran" 2>&1)"; fi
 L --command fixture.echo --query "hi there"
 expect_soon "search commands get the query" '> echo: hi there'
-L --command fixture.tiles; sleep 0.3
+L --command fixture.tiles; nap 0.3
 expect "grid lists its cells" '> One \|'
 L --key right; expect "grid: right moves one cell" '> Two \|'
 L --key down; expect "grid: down moves a line" '> Five \|'
 L --key down; expect "grid: down stops at the end" '> Five \|'
 L --key left; L --key up; expect "grid: up moves a line back" '> One \|'
-L --command fixture.order; sleep 0.3
+L --command fixture.order; nap 0.3
 expect "form lists its fields" '> Fruit \* \|.*\| Not set'
 expect "form submit row" 'Submit \|'
-for _ in 1 2 3; do L --key down; done; L --key enter; sleep 0.1
+for _ in 1 2 3; do L --key down; done; L --key enter; nap 0.1
 expect "required fields are checked" 'primary: Fill in Fruit first'
-for _ in 1 2 3; do L --key up; done; L --key enter; sleep 0.2
+for _ in 1 2 3; do L --key up; done; L --key enter; nap 0.2
 expect "text fields open the input view" '^view: input'
-L --text "mango"; L --key enter; sleep 0.2
-L --key down; L --key enter; sleep 0.2; L --key down; L --key enter; sleep 0.2
-L --key down; L --key enter; sleep 0.2
+L --text "mango"; L --key enter; nap 0.2
+L --key down; L --key enter; nap 0.2; L --key down; L --key enter; nap 0.2
+L --key down; L --key enter; nap 0.2
 expect "form shows the values" 'Fruit \* \|.*\| mango'
 L --key down; L --key enter
 if wait_for '^visible: false' 3 && [[ "$(cat "$T/ext-ran" 2>/dev/null)" == "mango/big/true" ]]; then ok "form submits its values"; else ko "form submits its values" "$(L --dump; cat "$T/ext-ran" 2>&1)"; fi
@@ -484,21 +504,21 @@ expect_not "a root provider is not a command" 'Fixture Upper \| Fixture \| Comma
 L --key enter
 if wait_for '^visible: false' 3 && [[ "$(cat "$T/ext-ran" 2>/dev/null)" == "QUIET WORDS" ]]; then ok "root row's Lua action ran"; else ko "root row's Lua action ran" "$(L --dump; cat "$T/ext-ran" 2>&1)"; fi
 query root ""
-L --key ctrl+g; sleep 0.3
+L --key ctrl+g; nap 0.3
 expect "keymap from init.lua opens a command" '^title: Fixture Fruits'
 query themes "e2e night"
 expect "theme from init.lua in Change Theme" 'E2E Night .*swatch:e2e-night'
 query settings "fixture"
 expect "extension preferences in Settings" '> Fixture \| .*1 setting'
-L --key enter; sleep 0.2
+L --key enter; nap 0.2
 expect "preferences view" '> Loud Fruit .*\| Off'
-L --key enter; sleep 0.5
+L --key enter; nap 0.5
 expect "toggling a preference" '> Loud Fruit .*\| On'
 PF="$T/data/lumen/extensions/fixture/preferences.json"
 grep -q '"loud": true' "$PF" && ok "preference saved" || ko "preference saved" "$(cat "$PF" 2>&1)"
 # A file it cannot read is never written over (it held every other value).
 printf 'not json, but somebody else'"'"'s values' >"$PF"
-L --key enter; sleep 0.3
+L --key enter; nap 0.3
 expect "an unreadable preferences file is reported" '^primary: Could not read the preferences file'
 grep -q 'somebody else' "$PF" && ok "an unreadable preferences file is kept" || ko "an unreadable preferences file is kept" "$(cat "$PF" 2>&1)"
 printf '{\n  "loud": true\n}\n' >"$PF"
@@ -512,23 +532,23 @@ query settings "icon theme"
 expect "icon theme setting" 'Icon Theme \|.*Automatic'
 query settings "density"
 expect "lumen.set shows in Settings" 'Density \| Set in init.lua \| Compact'
-L --key enter; sleep 0.1
+L --key enter; nap 0.1
 expect "settings init.lua fixes cannot change" 'primary: Set in init.lua'
 cp "$H/.config/lumen/init.lua" "$T/init.lua.bak"
 printf '\nlumen.layout { width = 700, panels = "single", search = "bottom", footer = true, rows = "inline", prompt = "go", placeholder = "Go…", searchbar = { "prompt", "entry" }, row = { "text", "icon" } }\n' >>"$H/.config/lumen/init.lua"
-L --reload; sleep 0.5; query root "fixture fruits"
+L --reload; nap 0.5; query root "fixture fruits"
 expect "lumen.layout changes the window" '^layout: 700x[0-9]+ panels=single search=bottom detail=right rows=inline footer=true'
 expect "the footer says what Enter does" '^footer: Lumen \| Open Command'
 expect "search bar and row parts in order" 'bar=prompt,entry row=text,icon prompt=go placeholder=Go…'
 query settings "window width"
 expect "a layout width shows as set in init.lua" 'Window Width \| Set in init.lua'
-cp "$T/init.lua.bak" "$H/.config/lumen/init.lua"; L --reload; sleep 0.5
+cp "$T/init.lua.bak" "$H/.config/lumen/init.lua"; L --reload; nap 0.5
 L --hide; query root ""
 expect "back to the default layout" '^layout: [0-9]+x[0-9]+ panels=split search=top'
 # Styles, chosen in Change Theme: built in, or a folder in styles/.
 query themes "minimal"
 expect "built-in styles are listed" 'Minimal \| rofi-like.*style:minimal'
-L --key enter; sleep 0.6
+L --key enter; nap 0.6
 expect "a chosen style is applied at once" '^style: minimal'
 expect "with its layout" '^layout: 560x420 panels=single search=bottom detail=bottom.* prompt=run'
 grep -q '^theme = minimal' "$C" && ok "the style's lumen.set becomes the settings" || ko "the style's lumen.set becomes the settings" "$(cat "$C")"
@@ -538,12 +558,12 @@ mkdir -p "$H/.config/lumen/styles/e2e-look"
 printf 'lumen.layout { width = 640, panels = "single" }\nlumen.theme { id = "e2e-ink", name = "E2E Ink", bg = "#101010", fg = "#eeeeee", accent = "#ff8800" }\nlumen.set { theme = "e2e-ink" }\n' >"$H/.config/lumen/styles/e2e-look/init.lua"
 query themes "e2e look"
 expect "a style folder is listed under Custom" 'E2e Look \| ~/.config/lumen/styles/e2e-look'
-L --key enter; sleep 0.6
+L --key enter; nap 0.6
 expect "a custom style is applied" '^layout: 640x'
 query themes "e2e ink"
 expect "its themes are listed under its name" 'E2E Ink \| .*✓'
 query themes "lumen"
-L --key enter; sleep 0.6
+L --key enter; nap 0.6
 L --hide; query root ""
 expect "back to Lumen's own style" '^layout: [0-9]+x[0-9]+ panels=split search=top'
 grep -q '^theme = auto' "$C" && ok "Lumen's style brings its theme back" || ko "Lumen's style brings its theme back" "$(cat "$C")"
@@ -570,13 +590,13 @@ if command -v git >/dev/null; then
     expect_soon "updated extension reloads" '> Greeter Hello'
     query settings "greeter"
     expect "extensions listed in Settings" '> greeter \| greeter \| 1 command'
-    L --key enter; sleep 0.3
+    L --key enter; nap 0.3
     expect "an extension's page offers updating it" 'Update \| git pull'
-    L --key down; L --key enter; sleep 0.1
+    L --key down; L --key enter; nap 0.1
     expect "update asks for a second enter" 'primary: Press ↵ again to Update'
     L --key enter
     expect_soon "update from Settings says how it went" 'primary: (Already up to date|Updated)'
-    L --key down; L --key enter; sleep 0.1
+    L --key down; L --key enter; nap 0.1
     expect "uninstall asks for a second enter" 'primary: Press ↵ again to Uninstall'
     L --key enter
     if wait_for '^view: settings' 5 && [[ ! -d "$H/.config/lumen/extensions/greeter" ]]; then ok "uninstall from Settings removes it"; else ko "uninstall from Settings removes it" "$(L --dump)"; fi
@@ -612,7 +632,7 @@ dm 'red\ngreen\n' --query gr
 L --key escape
 dm_result; [[ "$r" == "exit 1 " ]] && ok "dmenu: Esc with a filter exits 1 at once" || ko "dmenu: Esc with a filter exits 1 at once" "$r"
 dm 'red\ngreen\n'
-L --key ctrl+g; sleep 0.1
+L --key ctrl+g; nap 0.1
 expect "dmenu: a keymap does not leave the picker" '^view: dmenu'
 L --key escape
 dm_result; [[ "$r" == "exit 1 " ]] && ok "dmenu: Esc after a keymap exits 1" || ko "dmenu: Esc after a keymap exits 1" "$r"
@@ -635,6 +655,7 @@ check() {
     local view=$1 col=$2 label=$3 limit=$4 v
     v=$(awk -v v="$view" -v c="$col" '$1 == v { print $c }' <<<"$stats")
     if [[ -z "$v" ]]; then ko "$view: no samples"; return; fi
+    limit=$(scaled "$limit")
     if awk -v p="$v" -v l="$limit" 'BEGIN { exit !(p < l) }'; then ok "$view $label ${v} ms < $limit ms"; else ko "$view $label ${v} ms >= $limit ms" "$stats"; fi
 }
 check root 3 p50 20; check root 4 p95 150
@@ -643,7 +664,7 @@ check contents 3 p50 40; check contents 4 p95 200
 
 echo "quit"
 L --quit
-for _ in $(seq 50); do kill -0 "$DAEMON" 2>/dev/null || break; sleep 0.1; done
+for _ in $(seq 50); do kill -0 "$DAEMON" 2>/dev/null || break; nap 0.1; done
 if kill -0 "$DAEMON" 2>/dev/null; then ko "daemon exits on --quit"; else ok "daemon exits on --quit"; DAEMON=; fi
 left=$(e2e_instances)
 [[ -z "$left" ]] && ok "no instance of the suite is left" || ko "no instance of the suite is left" "$left"
