@@ -122,6 +122,10 @@ const RetryEntry = struct {
     doc: content.DocIn,
     attempts: u8,
     next_retry_ns: u64,
+    /// Its re-extraction failed (`Diff.reextract`): the document is still
+    /// in the index, and is tried again through `reextract` while its text
+    /// is missing, never added a second time.
+    indexed: bool = false,
 };
 
 /// State only the service thread reads or writes, so it needs no lock and no
@@ -520,10 +524,13 @@ fn priorRetry(service: *const ContentService, doc: content.DocIn) ?RetryEntry {
 /// be extracted (a corrupt file, or repeatedly hitting Timeout/ToolKilled)
 /// get an empty cache file so they do not thrash every refresh. Unwritable
 /// caches (ENOSPC/EACCES) pause extraction for `cache_write_backoff_ns`.
+/// `indexed`: `docs` are in the index already (`Diff.reextract`), which
+/// the retry entries left say (`RetryEntry.indexed`).
 fn extractMissing(
     service: *ContentService,
     arena: std.mem.Allocator,
     docs: []content.DocIn,
+    indexed: bool,
 ) ?ExtractOutcome {
     const now_ns = sys.monotonicNs();
     const cache_blocked = now_ns < service.worker.cache_unwritable_until_ns;
@@ -585,7 +592,7 @@ fn extractMissing(
         service.build_pool.run(missing.items.len, &context, ExtractContext.extractOne);
         if (service.stop.load(.acquire)) return null;
     }
-    return service.leaveOut(
+    const outcome = service.leaveOut(
         arena,
         docs,
         missing.items,
@@ -594,7 +601,9 @@ fn extractMissing(
         deferred.items,
         deferred_indices.items,
         now_ns,
-    );
+    ) orelse return null;
+    for (outcome.retry) |*entry| entry.indexed = indexed;
+    return outcome;
 }
 
 /// What the build pool's workers share while `extractMissing` runs.
@@ -778,12 +787,15 @@ fn leaveOut(
     return .{ .docs = docs[0..kept_count], .retry = retry.items };
 }
 
-/// Persists `retry` in `worker.retry_arena` once a refresh finishes. Copied
+/// Persists the entries of `parts` in `worker.retry_arena` once a refresh
+/// finishes, in place of the list before: each part is what the refresh
+/// left of it (extracted again, or still waiting out its backoff,
+/// `Diff.waiting`), so none is forgotten with its attempt count. Copied
 /// into a new arena first: out of memory, the list before stays.
-fn commitRetry(service: *ContentService, retry: []const RetryEntry) void {
+fn commitRetry(service: *ContentService, parts: []const []const RetryEntry) void {
     service.assertWorkerThread();
     var fresh_arena: std.heap.ArenaAllocator = .init(service.gpa);
-    const copy = copyRetries(fresh_arena.allocator(), retry) catch {
+    const copy = copyRetries(fresh_arena.allocator(), parts) catch {
         fresh_arena.deinit();
         logOutOfMemory("keeping the documents to retry");
         return;
@@ -795,13 +807,17 @@ fn commitRetry(service: *ContentService, retry: []const RetryEntry) void {
 
 fn copyRetries(
     arena: std.mem.Allocator,
-    entries: []const RetryEntry,
+    parts: []const []const RetryEntry,
 ) std.mem.Allocator.Error![]RetryEntry {
-    const copy = try arena.alloc(RetryEntry, entries.len);
-    for (entries, copy) |entry, *dst| {
-        dst.* = entry;
-        dst.doc.path = try arena.dupe(u8, entry.doc.path);
-    }
+    var count: usize = 0;
+    for (parts) |entries| count += entries.len;
+    const copy = try arena.alloc(RetryEntry, count);
+    var next: usize = 0;
+    for (parts) |entries| for (entries) |entry| {
+        copy[next] = entry;
+        copy[next].doc.path = try arena.dupe(u8, entry.doc.path);
+        next += 1;
+    };
     return copy;
 }
 
@@ -816,6 +832,9 @@ const Diff = struct {
     gone: []u32,
     added: []content.DocIn,
     reextract: []content.DocIn = &.{},
+    /// Documents to retry that still wait out their backoff, as they were
+    /// (`indexedChanges`): kept for the next check.
+    waiting: []const RetryEntry = &.{},
 };
 
 /// Called on the service thread, the only one that replaces the index, so
@@ -967,7 +986,11 @@ fn indexedChanges(
     // Not in the index (`extractMissing` left them out): as they are now,
     // respecting retry backoff unless the file changed on disk.
     const now_ns = sys.monotonicNs();
+    var waiting: std.ArrayList(RetryEntry) = .empty;
     for (service.worker.retry) |entry| {
+        // Still in the index: back in `reextract` above while its text is
+        // missing. Added as well, the path had two live documents.
+        if (entry.indexed) continue;
         const doc = entry.doc;
         if (content_list.underAny(doc.path, service.worker.slow_mounts)) continue;
         const path = std.mem.printSentinel(&path_buffer, "{s}", .{doc.path}, 0) catch continue;
@@ -976,6 +999,7 @@ fn indexedChanges(
         if (same_version and (now_ns < entry.next_retry_ns or
             now_ns < service.worker.cache_unwritable_until_ns))
         {
+            try waiting.append(arena, entry);
             continue;
         }
         try added.append(arena, .{
@@ -985,7 +1009,12 @@ fn indexedChanges(
             .source = .extracted,
         });
     }
-    return .{ .gone = gone.items, .added = added.items, .reextract = reextract.items };
+    return .{
+        .gone = gone.items,
+        .added = added.items,
+        .reextract = reextract.items,
+        .waiting = waiting.items,
+    };
 }
 
 /// Whether the extracted text of `doc` is in the text cache.
@@ -1050,11 +1079,11 @@ fn refresh(service: *ContentService) void {
     // back into TextCache without rebuilding or deleting them via dropStale.
     if (service.index != null and changed.gone.len == 0 and changed.added.len == 0) {
         const extract_start_ns = sys.monotonicNs();
-        const reextracted = service.extractMissing(arena, changed.reextract) orelse return;
+        const reextracted = service.extractMissing(arena, changed.reextract, true) orelse return;
         service.counters.extract_ns_last.store(sys.monotonicNs() - extract_start_ns, .monotonic);
         if (service.stop.load(.acquire)) return;
         service.commitListing(listed);
-        service.commitRetry(reextracted.retry);
+        service.commitRetry(&.{ reextracted.retry, changed.waiting });
         if (reextracted.docs.len > 0) {
             const next_version = service.version.load(.monotonic) + 1;
             service.lock.lockUncancelable(service.io);
@@ -1073,19 +1102,26 @@ fn refresh(service: *ContentService) void {
     }
     var start_ns = sys.monotonicNs();
     const extracted = if (whole)
-        service.extractMissing(arena, docs.?) orelse return
+        service.extractMissing(arena, docs.?, false) orelse return
     else
-        service.extractMissing(arena, changed.added) orelse return;
+        service.extractMissing(arena, changed.added, false) orelse return;
     if (whole) docs = extracted.docs else changed.added = extracted.docs;
+    // What failed to re-extract keeps its attempts and backoff.
+    var reextract_retry: []const RetryEntry = &.{};
     if (!whole and changed.reextract.len > 0) {
-        _ = service.extractMissing(arena, changed.reextract);
+        if (service.extractMissing(arena, changed.reextract, true)) |reextracted| {
+            reextract_retry = reextracted.retry;
+        }
     }
     service.counters.extract_ns_last.store(sys.monotonicNs() - start_ns, .monotonic);
     if (service.stop.load(.acquire)) return;
+    // A whole build listed every file: `changed.waiting` is empty and what
+    // still waits is in `extracted.retry`.
+    const retry = [_][]const RetryEntry{ extracted.retry, reextract_retry, changed.waiting };
     // Only documents to retry, which failed again.
     if (!whole and changed.gone.len == 0 and changed.added.len == 0) {
         service.commitListing(listed);
-        service.commitRetry(extracted.retry);
+        service.commitRetry(&retry);
         return;
     }
     start_ns = sys.monotonicNs();
@@ -1109,7 +1145,7 @@ fn refresh(service: *ContentService) void {
         break :blk old;
     };
     service.commitListing(listed);
-    service.commitRetry(extracted.retry);
+    service.commitRetry(&retry);
     if (service.options.on_published) |hook| hook.callback(hook.context);
     if (old) |old_shared| {
         // The service's reference: a search still reading it keeps it
@@ -1969,7 +2005,7 @@ test "content service: a document whose extraction failed in passing is left out
         &.{},
         now,
     ).?;
-    service.commitRetry(first.retry);
+    service.commitRetry(&.{first.retry});
     const kept = first.docs;
     try testing.expectEqual(@as(usize, 1), kept.len);
     try testing.expect(std.mem.endsWith(u8, kept[0].path, "/b.txt"));
@@ -2021,7 +2057,7 @@ test "content service: a document whose extraction failed in passing is left out
         &.{},
         now,
     ).?;
-    service.commitRetry(third.retry);
+    service.commitRetry(&.{third.retry});
     try testing.expectEqual(@as(usize, 0), service.worker.retry.len);
     try testing.expectEqual(@as(usize, 1), third.docs.len);
     try testing.expect(service.textCached(changes_found.added[0]));
@@ -2040,6 +2076,101 @@ test "content service: a document whose extraction failed in passing is left out
     try testing.expect(service.worker.cache_unwritable_until_ns > now);
     try testing.expectEqual(@as(usize, 1), enospc.retry.len);
     try testing.expectEqual(@as(u8, 0), enospc.retry[0].attempts);
+}
+
+test "content service: a failed re-extraction is retried in place, and retries waiting their backoff are kept" {
+    var tree = try TestTree.init();
+    defer tree.deinit();
+    var cache_dir = try TestTree.init();
+    defer cache_dir.deinit();
+    try tree.write("a.pdf", "not really a pdf");
+    try tree.write("b.txt", "plain words here");
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const pool = try Pool.create(testing.allocator, testing.io, 0);
+    defer pool.destroy();
+    var service: ContentService = .{
+        .gpa = testing.allocator,
+        .io = testing.io,
+        .root = tree.absolute,
+        .cache_path = undefined,
+        .text_cache = try TextCache.init(testing.allocator, cache_dir.absolute),
+        .search_pool = pool,
+        .build_pool = pool,
+        .options = .{},
+        .worker = .{
+            .thread_id = std.Thread.getCurrentId(),
+            .retry_arena = .init(testing.allocator),
+        },
+    };
+    defer service.text_cache.deinit(testing.allocator);
+    defer service.worker.retry_arena.deinit();
+    const docs = content_list.list(arena, testing.allocator, testing.io, tree.absolute, .{
+        .documents = true,
+    }) catch |err| switch (err) {
+        // Without ripgrep.
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    try testing.expectEqual(@as(usize, 2), docs.len);
+    const pdf = docs[0];
+    try testing.expectEqual(content.Source.extracted, pdf.source);
+    var text_path_buffer: paths.Buffer = undefined;
+    const text_path = service.text_cache.path(&text_path_buffer, pdf).?;
+    try sys.writeFileAtomic(text_path, "extracted words");
+    const reader: content.TextReader = .{ .read = textOf, .context = &service };
+    service.index = try Shared.create(
+        testing.allocator,
+        try content.build(testing.allocator, pool, docs, reader, null),
+        1,
+    );
+    defer service.index.?.release();
+
+    // A cleaner deleted its text, and extracting it again failed: retried later.
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.unlink(text_path)));
+    const missing = try service.indexedChanges(arena);
+    try testing.expectEqual(@as(usize, 0), missing.added.len);
+    try testing.expectEqual(@as(usize, 1), missing.reextract.len);
+    service.commitRetry(&.{&.{.{
+        .doc = pdf,
+        .attempts = 1,
+        .next_retry_ns = sys.monotonicNs() + 60 * std.time.ns_per_s,
+        .indexed = true,
+    }}});
+    // Waiting its backoff: left out of what is extracted, kept with its attempts.
+    const reextracted = service.extractMissing(arena, missing.reextract, true).?;
+    try testing.expectEqual(@as(usize, 0), reextracted.docs.len);
+    try testing.expectEqual(@as(usize, 1), reextracted.retry.len);
+    try testing.expect(reextracted.retry[0].indexed);
+    try testing.expectEqual(@as(u8, 1), reextracted.retry[0].attempts);
+
+    // Backoff over: tried again through `reextract`, never added as a second
+    // document of the same path (which then deleted the text both shared).
+    service.worker.retry[0].next_retry_ns = 0;
+    const due = try service.indexedChanges(arena);
+    try testing.expectEqual(@as(usize, 0), due.gone.len);
+    try testing.expectEqual(@as(usize, 0), due.added.len);
+    try testing.expectEqual(@as(usize, 1), due.reextract.len);
+
+    // A document left out of the index, waiting its backoff, survives a
+    // refresh that built something else.
+    try tree.write("c.pdf", "not really a pdf either");
+    var c_buffer: paths.Buffer = undefined;
+    const c_path = try tree.path(&c_buffer, "c.pdf");
+    const c_stat = content_list.stat(c_path, .document).?;
+    service.commitRetry(&.{&.{.{
+        .doc = .{ .path = c_path, .mtime = c_stat.mtime, .size = c_stat.size, .source = .extracted },
+        .attempts = 2,
+        .next_retry_ns = sys.monotonicNs() + 60 * std.time.ns_per_s,
+    }}});
+    const waiting = try service.indexedChanges(arena);
+    try testing.expectEqual(@as(usize, 0), waiting.added.len);
+    try testing.expectEqual(@as(usize, 1), waiting.waiting.len);
+    service.commitRetry(&.{ &.{}, &.{}, waiting.waiting });
+    try testing.expectEqual(@as(usize, 1), service.worker.retry.len);
+    try testing.expectEqualStrings(c_path, service.worker.retry[0].doc.path);
+    try testing.expectEqual(@as(u8, 2), service.worker.retry[0].attempts);
 }
 
 test "a shared index outlives the service's reference while a search holds one" {
@@ -2352,11 +2483,11 @@ test "content service: shutdown cancellation does not poison TextCache with empt
         .size = doc_stat.size,
         .source = .extracted,
     }};
-    service.commitRetry(&.{.{
+    service.commitRetry(&.{&.{.{
         .doc = docs[0],
         .attempts = extract_retries_max - 1,
         .next_retry_ns = 0,
-    }});
+    }}});
 
     // Cancellation via leaveOut must not count toward permanent_tool_fail.
     const cancelled_out = service.leaveOut(
@@ -2375,7 +2506,7 @@ test "content service: shutdown cancellation does not poison TextCache with empt
 
     // Setting stop during extractMissing returns null before leaveOut can poison TextCache.
     service.stop.store(true, .release);
-    try testing.expect(service.extractMissing(arena, &docs) == null);
+    try testing.expect(service.extractMissing(arena, &docs, false) == null);
     try testing.expect(!service.textCached(docs[0]));
 }
 
