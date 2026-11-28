@@ -667,6 +667,7 @@ pub extern fn gtk_widget_set_margin_bottom(widget: *GtkWidget, margin: c_int) vo
 pub extern fn gtk_widget_set_margin_start(widget: *GtkWidget, margin: c_int) void;
 pub extern fn gtk_widget_set_margin_end(widget: *GtkWidget, margin: c_int) void;
 pub extern fn gtk_widget_set_focusable(widget: *GtkWidget, focusable: gboolean) void;
+pub extern fn gtk_widget_set_focus_on_click(widget: *GtkWidget, focus_on_click: gboolean) void;
 pub extern fn gtk_widget_get_frame_clock(widget: *GtkWidget) ?*anyopaque;
 pub extern fn gtk_widget_add_controller(widget: *GtkWidget, controller: *GtkEventController) void;
 pub extern fn gtk_widget_compute_bounds(
@@ -751,6 +752,7 @@ pub extern fn gtk_widget_set_overflow(widget: *GtkWidget, overflow: c_int) void;
 pub extern fn gtk_text_new() *GtkWidget;
 pub extern fn gtk_text_set_placeholder_text(text_entry: *GtkText, text: ?[*:0]const u8) void;
 pub extern fn gtk_text_set_visibility(text_entry: *GtkText, visible: gboolean) void;
+pub extern fn gtk_text_grab_focus_without_selecting(text_entry: *GtkText) gboolean;
 pub extern fn gtk_editable_get_text(editable: *GtkEditable) [*:0]const u8;
 pub extern fn gtk_editable_set_position(editable: *GtkEditable, position: c_int) void;
 pub extern fn gtk_editable_get_position(editable: *GtkEditable) c_int;

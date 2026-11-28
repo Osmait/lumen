@@ -221,6 +221,8 @@ fn buildItemRow(ui: *Ui, item_index: usize) void {
             ui.grid,
             @intCast(item_index),
         ) orelse return;
+        // As a list row (gtk.listBoxRow): a click keeps the search bar's focus.
+        gtk.unfocusable(child);
         ui.rows.appendAssumeCapacity(.{ .widget = .{ .grid_cell = child }, .item = item_index });
         return;
     }
@@ -531,6 +533,7 @@ pub fn onRowActivated(
     select(ui, row_tag - 1);
     const item = ui.selectedItem() orelse return;
     ui.performEntry(item_mod.actionsFor(item)[0]);
+    ui.refocusSearch();
 }
 
 pub fn onGridActivated(
@@ -548,6 +551,7 @@ pub fn onGridActivated(
     select(ui, @intCast(cell_index));
     const item = ui.selectedItem() orelse return;
     ui.performEntry(item_mod.actionsFor(item)[0]);
+    ui.refocusSearch();
 }
 
 test "hint text is joined on the stack, cut as valid UTF-8" {

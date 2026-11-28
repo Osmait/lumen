@@ -115,4 +115,5 @@ fn onRowActivated(_: *c.GtkListBox, row: *c.GtkListBoxRow, data: ?*anyopaque) ca
     if (raw_index < 0) return;
     const entry_index: usize = @intCast(raw_index);
     if (entry_index < ui.panel.entries.len) ui.performEntry(ui.panel.entries[entry_index]);
+    ui.refocusSearch();
 }
