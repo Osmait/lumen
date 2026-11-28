@@ -215,6 +215,17 @@ fn extensionFolder(ui: *Ui, out: []u8, name: []const u8) ?[:0]const u8 {
     return std.mem.printSentinel(out, "{s}/extensions/{s}", .{ ui.config_dir, name }, 0) catch null;
 }
 
+/// Where extension `name` keeps its storage and preferences (passwords
+/// among them), written to `out`: `Extension.data`.
+fn extensionDataFolder(ui: *Ui, out: []u8, name: []const u8) ?[:0]const u8 {
+    if (ui.ext_host) |host| {
+        return std.mem.printSentinel(out, "{s}/extensions/{s}", .{ host.data_dir, name }, 0) catch null;
+    }
+    // As `ext_view.start` gives the host.
+    const data_home = std.mem.span(c.g_get_user_data_dir());
+    return std.mem.printSentinel(out, "{s}/lumen/extensions/{s}", .{ data_home, name }, 0) catch null;
+}
+
 /// What a repository's name carries that its extension's name does not:
 /// git's suffix, and the project's name before or after it. The prefixes
 /// go longest first, so "lumen-ext-x" loses "lumen-ext-", not "lumen-".
@@ -396,7 +407,9 @@ pub fn install(
     const folder = extensionFolder(ui, &folder_bytes, name) orelse {
         return fail(ui, caller, "path too long", .{});
     };
-    if (os.info(folder) != null) {
+    // Not followed: a dangling link there is taken too, and the rename at
+    // the end of the clone would fail on it.
+    if (os.existsAtNoFollow(std.os.linux.AT.FDCWD, folder)) {
         return fail(ui, caller, "{s} already exists: lumen --update {s}, or --as another name", .{
             folder,
             name,
@@ -414,9 +427,21 @@ pub fn install(
     const installing = installingFolder(ui, &installing_bytes, name) orelse {
         return fail(ui, caller, "path too long", .{});
     };
-    if (!busyWith(folder) and os.info(installing) != null) {
+    if (!busyWith(folder) and os.existsAtNoFollow(std.os.linux.AT.FDCWD, installing)) {
         const left = "{s} is left from an install that stopped: remove it, then install again";
         return fail(ui, caller, left, .{installing});
+    }
+    // An extension of this name was there once (removed by hand, or by a
+    // version that kept its data): its preferences, passwords included,
+    // would go to this one.
+    var data_bytes: [path_bytes_max]u8 = undefined;
+    const data = extensionDataFolder(ui, &data_bytes, name) orelse {
+        return fail(ui, caller, "path too long", .{});
+    };
+    if (os.existsAtNoFollow(std.os.linux.AT.FDCWD, data)) {
+        const left = "{s} holds the data of an earlier extension named {s}: " ++
+            "remove it, or install with --as another name";
+        return fail(ui, caller, left, .{ data, name });
     }
     var clone_buf: [20]?[*:0]const u8 = undefined;
     const argv = gitCloneArgv(&clone_buf, url_z.ptr, installing.ptr, Ui.testMode());
@@ -486,6 +511,12 @@ const update_one_script =
     \\  echo "lumen: up to date"
     \\fi
 ;
+
+/// A regular file at `path` itself: not a link (one in a clone can point
+/// anywhere outside it), a folder or a FIFO.
+fn isPlainFile(path: [*:0]const u8) bool {
+    return os.kindOf(path) != os.Kind.symlink and os.isRegular(path);
+}
 
 fn hasGitMarker(folder: []const u8) bool {
     var marker_buffer: [path_bytes_max + "/.git".len]u8 = undefined;
@@ -645,6 +676,17 @@ fn recordAllLocks(gpa: std.mem.Allocator, config_dir: []const u8) void {
     }
 }
 
+/// The commits an update left checked out, into lumen.lock: the one
+/// extension it named, or every one.
+fn recordUpdateLocks(job: *Job) void {
+    const ui = job.ui;
+    if (job.nameSlice().len == 0) return recordAllLocks(ui.gpa, ui.config_dir);
+    var sha_buf: [64]u8 = undefined;
+    if (gitHeadSha(job.folderPath(), &sha_buf)) |sha| {
+        updateLockFile(ui.gpa, ui.config_dir, job.nameSlice(), sha);
+    }
+}
+
 pub fn update(ui: *Ui, caller: ?*c.GApplicationCommandLine, name: ?[]const u8) void {
     var folder_bytes: [path_bytes_max]u8 = undefined;
     const file_allow: [*:0]const u8 = if (Ui.testMode()) "always" else "never";
@@ -719,10 +761,17 @@ pub fn uninstall(ui: *Ui, caller: ?*c.GApplicationCommandLine, name: []const u8)
     const folder = extensionFolder(ui, &folder_bytes, name) orelse {
         return fail(ui, caller, "path too long", .{});
     };
-    if (os.info(folder) == null) {
+    // A dangling link is still there to remove.
+    if (!os.existsAtNoFollow(std.os.linux.AT.FDCWD, folder)) {
         return fail(ui, caller, "no extension named \"{s}\"", .{name});
     }
-    var argv = [_:null]?[*:0]const u8{ "rm", "-rf", "--", folder.ptr };
+    // Its data goes with it: the next extension of this name would get its
+    // preferences, passwords included.
+    var data_bytes: [path_bytes_max]u8 = undefined;
+    const data = extensionDataFolder(ui, &data_bytes, name) orelse {
+        return fail(ui, caller, "path too long", .{});
+    };
+    var argv = [_:null]?[*:0]const u8{ "rm", "-rf", "--", folder.ptr, data.ptr };
     start(ui, caller, .uninstall, name, folder, folder, &argv);
 }
 
@@ -899,6 +948,9 @@ fn onDone(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
             removeTreeThenReload(ui, job.workPath(), job.folderPath());
             busy_handed_over = true;
         } else {
+            // The update of all fails when one does: the others pulled
+            // already, and the lock follows what is checked out.
+            if (job.kind == .update) recordUpdateLocks(job);
             ext_view.reload(ui);
         }
         if (job.timed_out) {
@@ -934,7 +986,7 @@ fn reportSuccess(job: *Job, output: [:0]const u8) bool {
                 fail(ui, caller, "{s}: path too long to check its init.lua", .{job.workPath()});
                 return true;
             };
-            if (os.info(init_path) == null) {
+            if (!isPlainFile(init_path)) {
                 removeTreeThenReload(ui, job.workPath(), job.folderPath());
                 failAndReload(ui, caller, "{s} has no init.lua: it is not a Lumen extension", .{job.nameSlice()});
                 return true;
@@ -962,14 +1014,7 @@ fn reportSuccess(job: *Job, output: [:0]const u8) bool {
             );
         },
         .update => {
-            if (job.nameSlice().len > 0) {
-                var sha_buf: [64]u8 = undefined;
-                if (gitHeadSha(job.folderPath(), &sha_buf)) |sha| {
-                    updateLockFile(ui.gpa, ui.config_dir, job.nameSlice(), sha);
-                }
-            } else {
-                recordAllLocks(ui.gpa, ui.config_dir);
-            }
+            recordUpdateLocks(job);
             if (caller != null) {
                 const end = tail(if (output.len > 0) output else "Up to date\n", print_bytes_max - 8);
                 print(ui, caller, "{s}{s}", .{ end[0], end[1] });
@@ -1480,4 +1525,35 @@ test "g_subprocess_wait_async waits for killed process exit when wait_cancellabl
     try std.testing.expect(state.done);
     try std.testing.expect(state.ran);
     try std.testing.expect(!state.alive_after_done);
+}
+
+test "an init.lua must be a file of the clone itself, and a dangling link is an entry" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [path_bytes_max]u8 = undefined;
+    const root = try os.tmpDirAbs(&tmp, &root_buf);
+    var plain_buf: [path_bytes_max]u8 = undefined;
+    const plain = try std.mem.printSentinel(&plain_buf, "{s}/plain.lua", .{root}, 0);
+    try os.writeFile(plain, "return {}\n");
+    try std.testing.expect(isPlainFile(plain));
+
+    // A link to a file outside the clone reads like one, and is not.
+    var link_buf: [path_bytes_max]u8 = undefined;
+    const link = try std.mem.printSentinel(&link_buf, "{s}/init.lua", .{root}, 0);
+    try std.testing.expectEqual(@as(usize, 0), std.os.linux.symlink(plain, link));
+    try std.testing.expect(os.info(link) != null);
+    try std.testing.expect(!isPlainFile(link));
+
+    var folder_buf: [path_bytes_max]u8 = undefined;
+    const folder = try std.mem.printSentinel(&folder_buf, "{s}/folder.lua", .{root}, 0);
+    try os.mkdirP(folder);
+    try std.testing.expect(!isPlainFile(folder));
+
+    // A dangling link: `os.info` does not see it, an install or uninstall must.
+    var dangling_buf: [path_bytes_max]u8 = undefined;
+    const dangling = try std.mem.printSentinel(&dangling_buf, "{s}/gone", .{root}, 0);
+    try std.testing.expectEqual(@as(usize, 0), std.os.linux.symlink("nowhere", dangling));
+    try std.testing.expect(!isPlainFile(dangling));
+    try std.testing.expect(os.info(dangling) == null);
+    try std.testing.expect(os.existsAtNoFollow(std.os.linux.AT.FDCWD, dangling));
 }

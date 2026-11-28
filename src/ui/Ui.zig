@@ -926,6 +926,7 @@ test {
     _ = @import("dump.zig");
     _ = @import("ActionPanel.zig");
     _ = @import("choose_view.zig");
+    _ = @import("prefs_view.zig");
 }
 
 test "Navigation forgets the oldest view when it is full" {
