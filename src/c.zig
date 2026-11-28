@@ -98,6 +98,8 @@ pub const GAsyncReadyCallback = *const fn (
 pub const GDestroyNotify = *const fn (?*anyopaque) callconv(.c) void;
 pub const GSpawnChildSetupFunc = *const fn (?*anyopaque) callconv(.c) void;
 pub const GSourceFunc = *const fn (?*anyopaque) callconv(.c) gboolean;
+pub const GPrintFunc = ?*const fn ([*:0]const u8) callconv(.c) void;
+pub extern fn g_set_print_handler(func: GPrintFunc) GPrintFunc;
 
 // ------------------------------------------------------------ constants
 
