@@ -153,6 +153,21 @@ const Worker = struct {
     retry_arena: std.heap.ArenaAllocator,
     /// Monotonic deadline until which writing the text cache failed.
     cache_unwritable_until_ns: u64 = 0,
+    /// Files the builds could not read (EACCES, EIO: the index marks them
+    /// removed), left out of what a listing adds while they stay as they
+    /// were: one root-owned 0600 file under $HOME made every listing an
+    /// update (two fsyncs, a new version, another removed row). Paths owned
+    /// by `ContentService.gpa`.
+    unreadable: std.ArrayList(Unreadable) = .empty,
+};
+
+/// A file a build could not read, as it was then. Its ctime too: `chmod`
+/// makes it readable without changing its mtime or size.
+const Unreadable = struct {
+    path: []const u8,
+    mtime: i64,
+    size: u64,
+    ctime: i64,
 };
 
 /// The thread pools it borrows: they must outlive the service.
@@ -223,6 +238,8 @@ pub fn shutdown(service: *ContentService) void {
     if (service.thread) |thread| thread.join();
     if (service.index) |shared| shared.release();
     service.worker.retry_arena.deinit();
+    for (service.worker.unreadable.items) |entry| service.gpa.free(entry.path);
+    service.worker.unreadable.deinit(service.gpa);
     service.gpa.free(service.root);
     service.gpa.free(service.cache_path);
     service.text_cache.deinit(service.gpa);
@@ -854,6 +871,8 @@ fn diff(
         if (index.removed(id)) continue;
         ids.putAssumeCapacity(index.path(id), id);
     }
+    var unreadable: std.StringHashMapUnmanaged(Unreadable) = .empty;
+    for (service.worker.unreadable.items) |entry| try unreadable.put(arena, entry.path, entry);
     const seen = try arena.alloc(bool, index.docs_count);
     @memset(seen, false);
     var gone: std.ArrayList(u32) = .empty;
@@ -869,6 +888,8 @@ fn diff(
                 continue;
             }
             try gone.append(arena, id);
+        } else if (unreadable.get(doc.path)) |entry| {
+            if (stillUnreadable(entry, doc)) continue;
         }
         try added.append(arena, doc);
     }
@@ -879,6 +900,58 @@ fn diff(
         try gone.append(arena, id);
     }
     return .{ .gone = gone.items, .added = added.items, .reextract = reextract.items };
+}
+
+/// Whether `doc` is the file a build could not read, unchanged since:
+/// reading it again would fail again.
+fn stillUnreadable(entry: Unreadable, doc: content.DocIn) bool {
+    if (entry.mtime != doc.mtime or entry.size != doc.size) return false;
+    var path_buffer: paths.Buffer = undefined;
+    const path = std.mem.printSentinel(&path_buffer, "{s}", .{doc.path}, 0) catch return false;
+    const ctime = content_list.changeTime(path) orelse return false;
+    return ctime == entry.ctime;
+}
+
+/// Records the files the build of `input` could not read: those it added
+/// that `index`, the index built, marks removed. They replace what was
+/// recorded of the files it read again (all of them, for a whole build).
+fn commitUnreadable(service: *ContentService, input: BuildInput, index: *const content.Index) void {
+    service.assertWorkerThread();
+    const gpa = service.gpa;
+    const added: []const content.DocIn, const first_id = switch (input) {
+        .whole => |docs| .{ docs, 0 },
+        .update => |changed| .{ changed.added, index.docs_count - changed.added.len },
+    };
+    const entries = &service.worker.unreadable;
+    var kept_count: usize = 0;
+    for (entries.items) |entry| {
+        const read_again = input == .whole or for (added) |doc| {
+            if (std.mem.eql(u8, doc.path, entry.path)) break true;
+        } else false;
+        if (read_again) {
+            gpa.free(entry.path);
+            continue;
+        }
+        entries.items[kept_count] = entry;
+        kept_count += 1;
+    }
+    entries.shrinkRetainingCapacity(kept_count);
+    var path_buffer: paths.Buffer = undefined;
+    for (added, first_id..) |doc, id| {
+        if (!index.removed(@intCast(id))) continue;
+        const path = std.mem.printSentinel(&path_buffer, "{s}", .{doc.path}, 0) catch continue;
+        // Gone already: nothing to leave out.
+        const ctime = content_list.changeTime(path) orelse continue;
+        // Out of memory: read again by the next listing, nothing worse.
+        entries.ensureUnusedCapacity(gpa, 1) catch return;
+        const owned = gpa.dupe(u8, doc.path) catch return;
+        entries.appendAssumeCapacity(.{
+            .path = owned,
+            .mtime = doc.mtime,
+            .size = doc.size,
+            .ctime = ctime,
+        });
+    }
 }
 
 /// Whether `doc` is the version of document `id` that the index holds.
@@ -1147,6 +1220,7 @@ fn refresh(service: *ContentService) void {
     };
     service.commitListing(listed);
     service.commitRetry(&retry);
+    service.commitUnreadable(input, &fresh.index);
     if (service.options.on_published) |hook| hook.callback(hook.context);
     if (old) |old_shared| {
         // The service's reference: a search still reading it keeps it
@@ -2560,6 +2634,45 @@ test "content service: unreadable plain file stays retryable after chmod and det
     try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "aardvark")).len);
     try testing.expectEqual(@as(usize, 0), (try fixture.find(service, "cat_word")).len);
     try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "dog_word")).len);
+}
+
+test "content service: an unreadable file costs one read per version, not an update per listing" {
+    if (linux.geteuid() == 0) return error.SkipZigTest;
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var path_buffer: paths.Buffer = undefined;
+    const locked = try fixture.root.path(&path_buffer, "locked.txt");
+    try fixture.root.write("other.txt", "readable okapi words\n");
+    try fixture.root.write("locked.txt", "root owned aardvark words\n");
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(locked, 0o000)));
+
+    const service = try fixture.start();
+    defer {
+        _ = linux.chmod(locked, 0o644);
+        service.shutdown();
+    }
+    try waitChecks(service, 1);
+    try testing.expectEqual(@as(u32, 1), service.status().builds);
+    try testing.expectEqual(@as(usize, 1), service.status().docs);
+    // Every check lists (no name index): none builds again for it.
+    const version = service.indexVersion();
+    try pokeAndWait(service);
+    try pokeAndWait(service);
+    try testing.expectEqual(@as(u32, 1), service.status().builds);
+    try testing.expectEqual(version, service.indexVersion());
+
+    // Edited (as root would): read again once, still unreadable.
+    try setMtimeNs(locked, 1_700_000_000, 0);
+    try pokeAndWait(service);
+    try testing.expectEqual(@as(u32, 2), service.status().builds);
+    try pokeAndWait(service);
+    try testing.expectEqual(@as(u32, 2), service.status().builds);
+
+    // Made readable: chmod changes neither mtime nor size, only the ctime.
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(locked, 0o644)));
+    try pokeAndWait(service);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "aardvark")).len);
 }
 
 fn setMtimeNs(path: [*:0]const u8, sec: isize, nsec: isize) !void {

@@ -307,6 +307,26 @@ pub fn stat(path: [*:0]const u8, kind: Kind) ?Stat {
     return .{ .mtime = mtime_ns, .size = statx.size };
 }
 
+/// A file's ctime in nanoseconds (symlinks not followed), or null if it
+/// cannot be stat'ed. Changes with its mode or owner, which its mtime does
+/// not.
+pub fn changeTime(path: [*:0]const u8) ?i64 {
+    var statx: linux.Statx = undefined;
+    const result = linux.statx(
+        linux.AT.FDCWD,
+        path,
+        linux.AT.SYMLINK_NOFOLLOW | linux.AT.NO_AUTOMOUNT,
+        .{ .CTIME = true },
+        &statx,
+    );
+    if (linux.errno(result) != .SUCCESS) return null;
+    return std.math.add(
+        i64,
+        std.math.mul(i64, statx.ctime.sec, std.time.ns_per_s) catch std.math.maxInt(i64),
+        @as(i64, statx.ctime.nsec),
+    ) catch std.math.maxInt(i64);
+}
+
 pub fn documentKind(path: []const u8) bool {
     // The extractor's own test: a document it refuses (an Office lock file,
     // `~$x.docx`) was listed as extracted, never extracted, and checked
