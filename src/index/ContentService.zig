@@ -1572,14 +1572,21 @@ fn run(service: *ContentService) void {
     // older naming.
     service.sweepText();
     service.refresh();
+    // A poke that came within `poke_interval_ns_min` of the last check:
+    // answered once that much time has passed. Dropped, a file edited and
+    // looked for 15 s after the window last opened was not found for
+    // minutes (MYP-554).
+    var poke_pending = false;
     while (!service.stop.load(.acquire)) {
-        // Sleep until the next periodic check; `poke` and `shutdown` wake
-        // the thread sooner. The wait's only error is cancelation, which
-        // never comes (this thread is joined, never canceled); waking early
-        // for any reason is harmless, since the loop looks at `stop` and
-        // the clock either way.
+        // Sleep until the next periodic check, or the held poke's; `poke`
+        // and `shutdown` wake the thread sooner. The wait's only error is
+        // cancelation, which never comes (this thread is joined, never
+        // canceled); waking early for any reason is harmless, since the
+        // loop looks at `stop` and the clock either way.
         const since_check_ns = sys.monotonicNs() - service.counters.check_ns_last.load(.acquire);
-        const due_ns = service.options.refresh_interval_ns -| since_check_ns;
+        const refresh_due_ns = service.options.refresh_interval_ns -| since_check_ns;
+        const poke_due_ns = service.options.poke_interval_ns_min -| since_check_ns;
+        const due_ns = if (poke_pending) @min(refresh_due_ns, poke_due_ns) else refresh_due_ns;
         service.io.futexWaitTimeout(u32, &service.wake.raw, seen, .{ .duration = .{
             .raw = .fromNanoseconds(@max(due_ns, std.time.ns_per_s)),
             .clock = .awake,
@@ -1587,11 +1594,11 @@ fn run(service: *ContentService) void {
         if (service.stop.load(.acquire)) return;
         const since_ns = sys.monotonicNs() - service.counters.check_ns_last.load(.acquire);
         const wake_now = service.wake.load(.acquire);
-        const poked = wake_now != seen;
+        if (wake_now != seen) poke_pending = true;
         seen = wake_now;
-        if (since_ns >= service.options.refresh_interval_ns) {
-            service.refresh();
-        } else if (poked and since_ns >= service.options.poke_interval_ns_min) {
+        const refresh_due = since_ns >= service.options.refresh_interval_ns;
+        if (refresh_due or (poke_pending and since_ns >= service.options.poke_interval_ns_min)) {
+            poke_pending = false;
             service.refresh();
         }
     }
@@ -1843,6 +1850,27 @@ test "content service: with the name index, checks without name changes only loo
     try testing.expectEqual(@as(u32, 2), status_now.listings);
     try testing.expectEqual(@as(usize, 2), status_now.docs);
     try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "cherry")).len);
+}
+
+test "content service: a poke within the rate limit is answered once it passes (MYP-554)" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    try fixture.root.write("a.txt", "first apricot\n");
+    const service = try fixture.startWith(.{
+        .refresh_interval_ns = std.math.maxInt(u64),
+        .poke_interval_ns_min = std.time.ns_per_s,
+        .removed_percent_max = 100,
+    });
+    defer service.shutdown();
+    try waitChecks(service, 1);
+    var path_buffer: paths.Buffer = undefined;
+    try fixture.root.write("a.txt", "second banana\n");
+    try setMtime(try fixture.root.path(&path_buffer, "a.txt"), sys.nowSeconds() - 100);
+    // Right after the first check: held until the limit passes, not dropped.
+    service.poke();
+    try waitChecks(service, 2);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "banana")).len);
 }
 
 test "content service: only segments added by updates count toward a whole rebuild" {
