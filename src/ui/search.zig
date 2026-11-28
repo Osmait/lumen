@@ -6,8 +6,9 @@
 //! mixes in the calculator, extensions' answers and the best files; the
 //! clipboard and windows views filter their lists; settings-like views
 //! filter by section. Files and contents are searched straight from the
-//! index, the contents view through the ContentSearch worker: its answers
-//! arrive later and refresh again. Main thread only.
+//! index, the contents view through the ContentSearch worker, and a long
+//! clipboard history through the ClipSearch worker (clip_view.zig): their
+//! answers arrive later and refresh again. Main thread only.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -21,7 +22,6 @@ const hypr = @import("../sys/hypr.zig");
 const commands = @import("../providers/commands.zig");
 const scripts = @import("../providers/scripts.zig");
 const stats = @import("../stats.zig");
-const settings_mod = @import("../settings.zig");
 const dmenu = @import("dmenu.zig");
 const ext_view = @import("ext_view.zig");
 const file_results = @import("file_results.zig");
@@ -33,6 +33,7 @@ const settings_view = @import("settings_view.zig");
 const choose_view = @import("choose_view.zig");
 const ContentSearch = @import("ContentSearch.zig");
 const ClipFilter = @import("ClipFilter.zig");
+const clip_view = @import("clip_view.zig");
 const Ui = @import("Ui.zig");
 
 const log = std.log.scoped(.ui);
@@ -43,12 +44,8 @@ const root_results_max = 60;
 const file_results_max = 60;
 const content_results_max = 50;
 
-/// Clipboard and window searches: the lists are short already.
+/// Window searches: the lists are short already.
 const filtered_results_max = 200;
-
-/// Clipboard entries the clipboard view loads, newest first: matches the
-/// largest `clipboard_keep` value so kept entries are always searchable.
-const clipboard_rows_max = settings_mod.clipboard_keep_max;
 
 /// Files in the root search, after this many of the best other results.
 const root_files_max = 5;
@@ -60,10 +57,6 @@ const suggestions_max = 6;
 /// Files join the root search from this many bytes typed: shorter queries
 /// match half the disk.
 const root_files_query_bytes_min = 3;
-
-/// How much of a clipboard entry's text the filter scores. Each keystroke
-/// scores every entry on the main thread.
-const filtered_detail_bytes_max = 2000;
 
 /// Frecency is a small float (core.frecency); scores are integers. Scaled
 /// by this, suggestions keep three decimals of their order.
@@ -79,16 +72,15 @@ comptime {
     assert(root_files_max <= file_results_max);
     assert(suggestions_max <= root_results_max);
     assert(index.content.trigram_chars <= ContentSearch.query_bytes_max);
-    assert(clipboard_rows_max >= settings_mod.clipboard_keep_max);
 }
 
 /// The view's candidates before filtering, in `arena` (the view's).
 pub fn loadBase(ui: *Ui, arena: std.mem.Allocator) []Item {
-    // What it kept of the last candidates goes with them.
-    ui.clip_filter.reset();
+    // The last clipboard entries go, once the worker is done with them.
+    clip_view.reset(ui);
     return switch (ui.view) {
         .root => rootCandidates(ui, arena),
-        .clipboard => clipCandidates(ui, arena),
+        .clipboard => clip_view.candidates(ui),
         .windows => windowCandidates(ui, arena),
         // Searched on every keystroke, straight from the index.
         .files, .contents => &.{},
@@ -127,23 +119,6 @@ fn rootCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
     return all;
 }
 
-fn clipCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
-    const clips = ui.db.recentClips(arena, clipboard_rows_max) catch return &.{};
-    var out: std.ArrayList(Item) = .empty;
-    for (clips) |clip| {
-        out.append(arena, .{
-            .title = labels.firstLine(arena, clip.head),
-            .icon = .{ .tile = .{ .name = "edit-copy-symbolic", .color = .gray } },
-            // The head only: the detail pane and the actions read the whole
-            // entry (`clipContent`).
-            .action = .{ .clip = clip.id },
-            .detail = clip.head,
-            .time_s = clip.last_copied,
-        }) catch break;
-    }
-    return out.items;
-}
-
 fn windowCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
     var out: std.ArrayList(Item) = .empty;
     const now_ns = os.monotonicNs();
@@ -173,6 +148,7 @@ fn windowCandidates(ui: *Ui, arena: std.mem.Allocator) []Item {
 /// per keystroke. True when that is the case and the query was sent.
 pub fn answerPending(ui: *Ui, start_ns: u64) bool {
     const query_text = std.mem.trim(u8, ui.query(), " ");
+    if (clip_view.answerPending(ui, query_text, start_ns)) return true;
     // An extension's search command keeps its rows until it answers.
     if (ui.view == .ext and ext_view.waitingForSearch(ui, query_text)) return true;
     // In the contents view, the rows on screen are the last result's.
@@ -209,7 +185,12 @@ fn contentIndexVersion(ui: *const Ui) u64 {
 pub fn fill(ui: *Ui, arena: std.mem.Allocator, query_text: []const u8, start_ns: u64) void {
     switch (ui.view) {
         .root => fillRoot(ui, arena, query_text),
-        .clipboard => fillFiltered(ui, arena, query_text, .by_day),
+        .clipboard => if (query_text.len > 0) {
+            clip_view.fill(ui, arena, query_text, start_ns);
+        } else {
+            clip_view.nothingTyped(ui);
+            fillFiltered(ui, arena, query_text, .by_day);
+        },
         .windows => fillFiltered(ui, arena, query_text, .flat),
         .files => if (query_text.len > 0) {
             row_list.addSection(ui, "Files");
@@ -403,82 +384,24 @@ fn fillFiltered(
     // Folded once, not for every field of every row.
     var query_buffer: [core.fuzzy.text_chars_max]u8 = undefined;
     const query_prepared = core.fuzzy.prepare(&query_buffer, query_text);
-    const long_matches: LongMatches = .{ .ids = clipsMatchingPastScored(ui, arena, query_text) };
-    // The clipboard's entries are many and long: scored on text folded once
-    // (MYP-613), the plain way below if that runs out of memory.
-    const clip_scored = ui.view == .clipboard and query_prepared.folded.len > 0 and
-        ui.clip_filter.score(
-            ui.data_arena.allocator(),
-            arena,
-            ui.base,
-            filtered_detail_bytes_max,
-            query_text,
-            query_prepared,
-            long_matches,
-            LongMatches.has,
-            long_match_score,
-            &hits,
-        );
-    if (!clip_scored) for (ui.base) |item| {
-        const text = ClipFilter.scoredText(item, filtered_detail_bytes_max);
+    for (ui.base) |item| {
+        const text = ClipFilter.scoredText(item, clip_view.detail_bytes_max);
         const fields = [_][]const u8{ text, item.subtitle };
-        var score = core.fuzzy.scoreFieldsQuery(query_prepared, &fields);
-        if (score == core.fuzzy.no_match and long_matches.has(item)) {
-            // Found in text the filter does not score: after those it does.
-            score = long_match_score;
-        }
+        const score = core.fuzzy.scoreFieldsQuery(query_prepared, &fields);
         if (score == core.fuzzy.no_match) continue;
         var copy = item;
         copy.score = score;
         hits.append(arena, copy) catch break;
-    };
+    }
     sortByScore(hits.items);
     ui.search_ns += stats.now() - search_start_ns;
     const shown = hits.items[0..@min(hits.items.len, filtered_results_max)];
     for (shown) |item| row_list.addItem(ui, item);
 }
 
-/// The score of a clipboard entry that holds the query past the bytes the
-/// filter scores: below any fuzzy match (those start at 0).
-const long_match_score = -1;
-
-/// The clipboard entries longer than the filter scores
-/// (`filtered_detail_bytes_max`) that hold `query_text` further on, sorted.
-/// Asked of the database only when an entry that long is listed (MYP-491).
-fn clipsMatchingPastScored(ui: *Ui, arena: std.mem.Allocator, query_text: []const u8) []Db.ClipId {
-    if (ui.view != .clipboard) return &.{};
-    for (ui.base) |item| {
-        if (item.action == .clip and item.detail.len >= filtered_detail_bytes_max) break;
-    } else return &.{};
-    const ids = ui.db.clipsContaining(arena, query_text, filtered_detail_bytes_max) catch |err| {
-        log.warn("clipboard search past each entry's head: {t}", .{err});
-        return &.{};
-    };
-    std.mem.sort(Db.ClipId, ids, {}, struct {
-        fn lessThan(_: void, x: Db.ClipId, y: Db.ClipId) bool {
-            return @backingInt(x) < @backingInt(y);
-        }
-    }.lessThan);
-    return ids;
-}
-
-/// `clipsMatchingPastScored`'s entries, sorted.
-const LongMatches = struct {
-    ids: []const Db.ClipId,
-
-    fn has(long_matches: LongMatches, item: Item) bool {
-        if (item.action != .clip) return false;
-        const id = item.action.clip;
-        return std.sort.binarySearch(Db.ClipId, long_matches.ids, id, orderClipId) != null;
-    }
-};
-
-fn orderClipId(wanted: Db.ClipId, id: Db.ClipId) std.math.Order {
-    return std.math.order(@backingInt(wanted), @backingInt(id));
-}
-
 /// Best first; equal scores by title, so the order never depends on the
-/// sort's whims (two apps tied for "e2e" swapped between runs).
+/// sort's whims (two apps tied for "e2e" swapped between runs). The
+/// clipboard filter orders its hits the same way (`ClipFilter.run`).
 fn sortByScore(items: []Item) void {
     std.mem.sort(Item, items, {}, struct {
         fn better(_: void, x: Item, y: Item) bool {
@@ -496,6 +419,7 @@ pub fn emptyText(ui: *Ui, arena: std.mem.Allocator) [:0]const u8 {
         return file_results.contentsHint(ui, arena, query_text.len);
     }
     if (ui.view == .contents and ui.content_query.pending) return "Searching...";
+    if (clip_view.searching(ui) and query_text.len > 0) return "Searching...";
     const content_error = if (ui.content_query.latest) |result| result.err else null;
     if (ui.view == .contents and content_error != null) {
         return arena.printSentinel(
@@ -554,7 +478,7 @@ test "clipboard view loads entries beyond 500 up to clipboard_keep_max" {
     }
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
-    const clips = try db.recentClips(arena.allocator(), clipboard_rows_max);
+    const clips = try db.recentClips(arena.allocator(), clip_view.rows_max);
     try std.testing.expectEqual(@as(usize, 600), clips.len);
     try std.testing.expectEqualStrings("entry 599", clips[0].head);
     try std.testing.expectEqualStrings("entry 0", clips[599].head);

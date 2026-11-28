@@ -58,7 +58,7 @@ const ipc = @import("../ipc.zig");
 const layout_mod = @import("../layout.zig");
 const Inflight = @import("inflight.zig").Inflight;
 const ActionPanel = @import("ActionPanel.zig");
-const ClipFilter = @import("ClipFilter.zig");
+const clip_view = @import("clip_view.zig");
 
 const log = std.log.scoped(.ui);
 const Kind = core.file_kind.Kind;
@@ -132,12 +132,13 @@ reselect_row: ?usize = null,
 /// Where the list was scrolled, to stay there when the row to select again
 /// is found (`keepView`): a rebuild nothing typed asked for.
 reselect_scroll: ?f64 = null,
-/// Lives until the view changes: clipboard entries, window list, scripts.
+/// Lives until the view changes: window list, scripts.
 data_arena: std.heap.ArenaAllocator,
 /// Candidates of the current view before filtering.
 base: []Item = &.{},
-/// The clipboard view's filter, kept from one query to the next.
-clip_filter: ClipFilter = .{},
+/// The clipboard view's entries (`base` points into them), its filter
+/// worker and its queries.
+clip: clip_view.State = .{},
 /// The window Close Window was last sent to: the windows view leaves it out
 /// for a while (`ClosedWindow`).
 closed_window: ClosedWindow = .{},
@@ -966,13 +967,15 @@ pub fn perform(self: *Ui, operation: item_mod.Operation) void {
 // ----------------------------------------------------------------- apps
 
 /// At shutdown: the timers and idle callbacks the window keeps pending,
-/// so none runs against a window being torn down.
+/// so none runs against a window being torn down, and the clipboard
+/// filter's worker (its answers are such callbacks).
 pub fn removeSources(self: *Ui) void {
     os.assertMainThread();
     if (self.apps_reload_timer != 0) _ = c.g_source_remove(self.apps_reload_timer);
     self.apps_reload_timer = 0;
     if (self.pending_idle != 0) _ = c.g_source_remove(self.pending_idle);
     self.pending_idle = 0;
+    clip_view.shutdown(self);
     if (self.scroll.tick != 0) {
         c.gtk_widget_remove_tick_callback(gtk.widget(self.scroller), self.scroll.tick);
         self.scroll.tick = 0;
@@ -1010,7 +1013,7 @@ fn reloadApps(data: ?*anyopaque) callconv(.c) c.gboolean {
         // reloads many times.
         row_list.clearRows(self);
         self.base = &.{};
-        self.clip_filter.reset();
+        clip_view.reset(self);
         self.apps.dropStale();
     }
     return 0;
@@ -1023,6 +1026,7 @@ test {
     _ = @import("row_list.zig");
     _ = @import("search.zig");
     _ = @import("ClipFilter.zig");
+    _ = @import("ClipSearch.zig");
     _ = @import("config.zig");
     _ = @import("dump.zig");
     _ = @import("ActionPanel.zig");
