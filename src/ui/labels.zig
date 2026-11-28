@@ -32,11 +32,16 @@ fn belowHome(path: []const u8, home: []const u8) ?[]const u8 {
 /// Text fit for a GtkLabel. Linux file names are bytes: they can hold invalid
 /// UTF-8 (Pango then warns and draws garbage, and `--dump` failed outright)
 /// or a newline (a two-line row). Invalid sequences become U+FFFD and
-/// control characters a space. Bidirectional controls are left out: with
-/// them `invoice\u{202E}fdp.sh` showed as "invoicehs.pdf"; without, text
-/// shows in the order it is stored. Only for display: actions keep the raw
-/// path.
+/// control characters a space, the line and paragraph separators too
+/// (U+2028, U+2029: Pango breaks the line at each, MYP-578). Bidirectional
+/// controls are left out: with them `invoice\u{202E}fdp.sh` showed as
+/// "invoicehs.pdf"; without, text shows in the order it is stored. Only
+/// for display: actions keep the raw path.
 pub fn displayText(arena: std.mem.Allocator, raw: []const u8) [:0]const u8 {
+    // Most text is printable ASCII, which stays as it is.
+    for (raw) |byte| {
+        if (byte < ascii_space or byte >= ascii_delete) break;
+    } else return arena.dupeSentinel(u8, raw, 0) catch "";
     var out: std.ArrayList(u8) = .empty;
     out.ensureTotalCapacity(arena, raw.len + 1) catch return "";
     var at: usize = 0;
@@ -50,10 +55,10 @@ pub fn displayText(arena: std.mem.Allocator, raw: []const u8) [:0]const u8 {
             at += 1;
             continue;
         }
-        const control = sequence_bytes == 1 and (raw[at] < ascii_space or raw[at] == ascii_delete);
-        if (control) {
+        const code_point = std.unicode.utf8Decode(raw[at..sequence_end]) catch 0;
+        if (shownAsSpace(code_point)) {
             out.append(arena, ' ') catch return "";
-        } else if (!isBidiControl(std.unicode.utf8Decode(raw[at..sequence_end]) catch 0)) {
+        } else if (!isBidiControl(code_point)) {
             out.appendSlice(arena, raw[at..sequence_end]) catch return "";
         }
         at = sequence_end;
@@ -64,6 +69,15 @@ pub fn displayText(arena: std.mem.Allocator, raw: []const u8) [:0]const u8 {
 /// ASCII's control characters: below the space, and DEL.
 const ascii_space = 0x20;
 const ascii_delete = 0x7f;
+
+/// Control characters (C0, DEL, C1 with NEL) and the line and paragraph
+/// separators: shown as a space.
+fn shownAsSpace(code_point: u21) bool {
+    return switch (code_point) {
+        0...ascii_space - 1, ascii_delete...0x9f, 0x2028, 0x2029 => true,
+        else => false,
+    };
+}
 
 /// Embeddings and overrides (U+202A–202E), isolates (U+2066–2069) and the
 /// marks (U+200E, U+200F, U+061C): they reorder or place the text around
@@ -239,6 +253,10 @@ pub fn formatSize(arena: std.mem.Allocator, bytes: u64) [:0]const u8 {
 pub const DayBounds = struct {
     today_start_s: i64,
     yesterday_start_s: i64,
+    tomorrow_start_s: i64,
+    /// This year's first second, and next year's.
+    year_start_s: i64,
+    next_year_start_s: i64,
 
     pub fn section(bounds: DayBounds, time_s: i64) [:0]const u8 {
         if (time_s >= bounds.today_start_s) return "Today";
@@ -246,20 +264,34 @@ pub const DayBounds = struct {
         return "Earlier";
     }
 
+    /// A file from 2019 read as this year's, and one dated in the future
+    /// as today's (MYP-560): the year shows when it is not this one, and
+    /// only today is "Today".
     pub fn dateFormat(bounds: DayBounds, time_s: i64) [*:0]const u8 {
-        if (time_s >= bounds.today_start_s) return "Today at %H:%M";
-        if (time_s >= bounds.yesterday_start_s) return "Yesterday at %H:%M";
-        return "%b %e at %H:%M";
+        if (time_s >= bounds.today_start_s and time_s < bounds.tomorrow_start_s) {
+            return "Today at %H:%M";
+        }
+        if (time_s >= bounds.yesterday_start_s and time_s < bounds.today_start_s) {
+            return "Yesterday at %H:%M";
+        }
+        if (time_s >= bounds.year_start_s and time_s < bounds.next_year_start_s) {
+            return "%b %e at %H:%M";
+        }
+        return "%b %e %Y";
     }
 };
 
-/// Today's and yesterday's local calendar midnights in `tz` for `now_s`.
-/// Using `GDateTime` + `g_date_time_add_days` instead of subtracting 86400 s
-/// keeps "Yesterday" aligned with calendar midnight across 23 h / 25 h DST days.
+/// Today's, yesterday's and tomorrow's local calendar midnights in `tz` for
+/// `now_s`, and the year's bounds. Using `GDateTime` +
+/// `g_date_time_add_days` instead of subtracting 86400 s keeps "Yesterday"
+/// aligned with calendar midnight across 23 h / 25 h DST days.
 pub fn dayBoundsInZone(now_s: i64, tz: *c.GTimeZone) DayBounds {
     const fallback: DayBounds = .{
         .today_start_s = std.math.maxInt(i64),
         .yesterday_start_s = std.math.maxInt(i64),
+        .tomorrow_start_s = std.math.maxInt(i64),
+        .year_start_s = std.math.maxInt(i64),
+        .next_year_start_s = std.math.maxInt(i64),
     };
     const utc_now = c.g_date_time_new_from_unix_utc(now_s) orelse return fallback;
     defer c.g_date_time_unref(utc_now);
@@ -277,21 +309,32 @@ pub fn dayBoundsInZone(now_s: i64, tz: *c.GTimeZone) DayBounds {
     defer c.g_date_time_unref(today_midnight);
     const yesterday_midnight = c.g_date_time_add_days(today_midnight, -1) orelse return fallback;
     defer c.g_date_time_unref(yesterday_midnight);
+    const tomorrow_midnight = c.g_date_time_add_days(today_midnight, 1) orelse return fallback;
+    defer c.g_date_time_unref(tomorrow_midnight);
+    const year = c.g_date_time_get_year(local_now);
+    const year_start = c.g_date_time_new(tz, year, 1, 1, 0, 0, 0) orelse return fallback;
+    defer c.g_date_time_unref(year_start);
+    const next_year_start = c.g_date_time_add_years(year_start, 1) orelse return fallback;
+    defer c.g_date_time_unref(next_year_start);
     return .{
         .today_start_s = c.g_date_time_to_unix(today_midnight),
         .yesterday_start_s = c.g_date_time_to_unix(yesterday_midnight),
+        .tomorrow_start_s = c.g_date_time_to_unix(tomorrow_midnight),
+        .year_start_s = c.g_date_time_to_unix(year_start),
+        .next_year_start_s = c.g_date_time_to_unix(next_year_start),
     };
 }
 
-/// Today's and yesterday's local calendar midnights in Unix seconds.
+/// Today's, yesterday's and tomorrow's local calendar midnights, and the
+/// year's bounds, in Unix seconds.
 pub fn dayBounds() DayBounds {
     const tz = c.g_time_zone_new_local();
     defer c.g_time_zone_unref(tz);
     return dayBoundsInZone(os.nowSeconds(), tz);
 }
 
-/// "Today at 09:30", "Yesterday at 18:05" or "Mar 3 at 12:00" for a time
-/// in seconds since the Unix epoch.
+/// "Today at 09:30", "Yesterday at 18:05", "Mar 3 at 12:00" or, from
+/// another year, "Mar 3 2019" for a time in seconds since the Unix epoch.
 pub fn formatWhen(arena: std.mem.Allocator, time_s: i64) [:0]const u8 {
     const date_time = c.g_date_time_new_from_unix_local(time_s) orelse return "";
     defer c.g_date_time_unref(date_time);
@@ -335,6 +378,36 @@ test "displayText makes any file name safe for a label" {
     try std.testing.expectEqualStrings("line1 line2.txt", displayText(arena, "line1\nline2.txt"));
     try std.testing.expectEqualStrings("acción ñandú 🔊", displayText(arena, "acción ñandú 🔊"));
     try std.testing.expectEqualStrings("trunc\u{FFFD}", displayText(arena, "trunc\xc3"));
+    try std.testing.expectEqualStrings("plain name.txt", displayText(arena, "plain name.txt"));
+    try std.testing.expectEqualStrings("a b", displayText(arena, "a\x7fb"));
+    // Line and paragraph separators, NEL and C1 controls: one line, as a
+    // newline is (MYP-578).
+    try std.testing.expectEqualStrings(
+        "report.pdf .sh",
+        displayText(arena, "report.pdf\u{2029}.sh"),
+    );
+    try std.testing.expectEqualStrings("a b c d", displayText(arena, "a\u{2028}b\u{85}c\u{9b}d"));
+    try std.testing.expectEqualStrings("\u{a0}é", displayText(arena, "\u{a0}é"));
+}
+
+test "a date shows its year unless it is this year's, and only today is Today (MYP-560)" {
+    const utc = c.g_time_zone_new_identifier("UTC") orelse return error.SkipZigTest;
+    defer c.g_time_zone_unref(utc);
+    // 2026-11-27 12:00 UTC.
+    const now_s: i64 = 1795780800;
+    const bounds = dayBoundsInZone(now_s, utc);
+    try std.testing.expectEqualStrings("Today at %H:%M", std.mem.span(bounds.dateFormat(now_s)));
+    const day_s = std.time.s_per_day;
+    try std.testing.expectEqualStrings(
+        "Yesterday at %H:%M",
+        std.mem.span(bounds.dateFormat(now_s - day_s)),
+    );
+    // Earlier this year (2026-03-03), and in 2019.
+    try std.testing.expectEqualStrings("%b %e at %H:%M", std.mem.span(bounds.dateFormat(1772539200)));
+    try std.testing.expectEqualStrings("%b %e %Y", std.mem.span(bounds.dateFormat(1551614400)));
+    // Tomorrow is not today, and next year shows its year.
+    try std.testing.expectEqualStrings("%b %e at %H:%M", std.mem.span(bounds.dateFormat(now_s + day_s)));
+    try std.testing.expectEqualStrings("%b %e %Y", std.mem.span(bounds.dateFormat(now_s + 60 * day_s)));
 }
 
 test "bidirectional controls cannot disguise a name" {

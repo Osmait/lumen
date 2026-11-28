@@ -50,10 +50,12 @@ const rows_filtered_max = 200;
 const match_bytes_max = 1024;
 
 const Line = struct {
-    /// What the row shows and filtering matches: valid UTF-8.
+    /// What the row shows and filtering matches: valid UTF-8, on one line
+    /// (`labels.displayText`).
     text: [:0]const u8,
-    /// The line's bytes as read, printed when it is chosen, when they are
-    /// not valid UTF-8 (a Latin-1 file name): `text` shows them with U+FFFD.
+    /// The line's bytes as read, printed when it is chosen, when `text`
+    /// shows them otherwise: not valid UTF-8 (a Latin-1 file name, shown
+    /// with U+FFFD), or holding controls or line separators.
     raw: ?[]const u8 = null,
     icon: item_mod.Icon = .none,
     meta: []const u8 = "",
@@ -66,8 +68,10 @@ pub const Session = struct {
     caller: *c.GApplicationCommandLine,
     stream: ?*c.GInputStream,
     cancellable: *c.GCancellable,
-    /// Holds the lines and their text.
+    /// Holds the lines' text.
     arena: std.heap.ArenaAllocator,
+    /// In `gpa`: grown in the arena, each larger copy left the last one
+    /// there, about twice the memory for 200 000 lines.
     lines: std.ArrayList(Line) = .empty,
     /// The end of the input not yet ended by a newline.
     partial: std.ArrayList(u8) = .empty,
@@ -88,6 +92,7 @@ pub const Session = struct {
         if (session.stream) |stream| c.g_object_unref(stream);
         c.g_object_unref(session.cancellable);
         session.partial.deinit(session.gpa);
+        session.lines.deinit(session.gpa);
         session.arena.deinit();
         session.gpa.destroy(session);
     }
@@ -245,16 +250,15 @@ fn addLine(session: *Session, raw: []const u8) void {
         }
         text = text[0..nul_index];
     }
-    if (std.unicode.utf8ValidateSlice(text)) {
-        line.text = arena.dupeSentinel(u8, text, 0) catch return addLineOutOfMemory();
-    } else {
-        // Left out, `find ~ | lumen --dmenu` lost every file named in
-        // Latin-1 without a word (MYP-447): shown made valid, printed as is.
+    // Shown made valid and on one line, printed as is: left out, `find ~ |
+    // lumen --dmenu` lost every file named in Latin-1 without a word
+    // (MYP-447), and a U+2029 in a line took a row two lines (MYP-578).
+    line.text = labels.displayText(arena, text);
+    if (line.text.len == 0 and text.len > 0) return addLineOutOfMemory();
+    if (!std.mem.eql(u8, line.text, text)) {
         line.raw = arena.dupe(u8, text) catch return addLineOutOfMemory();
-        line.text = labels.displayText(arena, text);
-        if (line.text.len == 0) return addLineOutOfMemory();
     }
-    session.lines.append(arena, line) catch return addLineOutOfMemory();
+    session.lines.append(session.gpa, line) catch return addLineOutOfMemory();
 }
 
 fn addLineOutOfMemory() void {
@@ -433,6 +437,7 @@ test "addLine parses rofi options and marks nonselectable rows" {
         .ui = undefined,
     };
     defer session.arena.deinit();
+    defer session.lines.deinit(std.testing.allocator);
 
     addLine(&session, "Section\x00nonselectable\x1ftrue");
     addLine(&session, "First\x00icon\x1ffolder\x1fmeta\x1fwork docs\r");
@@ -461,6 +466,12 @@ test "addLine parses rofi options and marks nonselectable rows" {
     const invalid = session.lines.items[3];
     try std.testing.expectEqualStrings("Invalid\u{FFFD}line", invalid.text);
     try std.testing.expectEqualStrings("Invalid\xffline", invalid.raw.?);
+
+    // A paragraph separator: one row, the line printed as read (MYP-578).
+    addLine(&session, "report.pdf\u{2029}.sh");
+    const separated = session.lines.items[4];
+    try std.testing.expectEqualStrings("report.pdf .sh", separated.text);
+    try std.testing.expectEqualStrings("report.pdf\u{2029}.sh", separated.raw.?);
 }
 
 test "headers do not take the room of the lines to choose (MYP-473)" {

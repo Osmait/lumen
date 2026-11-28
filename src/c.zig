@@ -319,6 +319,7 @@ pub extern fn g_date_time_new_from_unix_utc(unix_time_s: i64) ?*GDateTime;
 pub extern fn g_date_time_new_from_unix_local(unix_time_s: i64) ?*GDateTime;
 pub extern fn g_date_time_to_timezone(date_time: *GDateTime, tz: *GTimeZone) ?*GDateTime;
 pub extern fn g_date_time_add_days(date_time: *GDateTime, days: c_int) ?*GDateTime;
+pub extern fn g_date_time_add_years(date_time: *GDateTime, years: c_int) ?*GDateTime;
 pub extern fn g_date_time_unref(date_time: *GDateTime) void;
 pub extern fn g_date_time_get_year(date_time: *GDateTime) c_int;
 pub extern fn g_date_time_get_month(date_time: *GDateTime) c_int;
