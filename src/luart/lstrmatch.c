@@ -87,6 +87,7 @@ typedef struct MatchState {
   int matchdepth;  /* control for recursive depth (to avoid C stack overflow) */
   unsigned long steps;  /* calls to 'match' so far (Lumen: deadline checks) */
   size_t written;  /* Lumen: replacement bytes walked since the last check */
+  size_t classes;  /* Lumen: '[...]' class bytes walked since the last check */
   unsigned char level;  /* total number of captures (finished or unfinished) */
   struct {
     const char *init;
@@ -126,6 +127,20 @@ static int capture_to_close (MatchState *ms) {
 }
 
 
+/* Lumen: a '[...]' class is walked whole by 'classend' and again by
+** 'matchbracketclass' for every character tried, and the step count does
+** not see its length: a class of 10 MB ran for seconds between two checks.
+** Check the deadline every LUART_FIND_CHECK_BYTES class bytes walked. */
+static void class_walked (MatchState *ms, size_t n) {
+  ms->classes += n;
+  if (l_unlikely(ms->classes >= LUART_FIND_CHECK_BYTES)) {
+    ms->classes = 0;
+    if (luart_match_timed_out(ms->L))
+      luaL_error(ms->L, "timed out");
+  }
+}
+
+
 static const char *classend (MatchState *ms, const char *p) {
   switch (*p++) {
     case L_ESC: {
@@ -134,6 +149,7 @@ static const char *classend (MatchState *ms, const char *p) {
       return p+1;
     }
     case '[': {
+      const char *start = p;
       if (*p == '^') p++;
       do {  /* look for a ']' */
         if (l_unlikely(p == ms->p_end))
@@ -141,6 +157,7 @@ static const char *classend (MatchState *ms, const char *p) {
         if (*(p++) == L_ESC && p < ms->p_end)
           p++;  /* skip escapes (e.g. '%]') */
       } while (*p != ']');
+      class_walked(ms, (size_t)(p - start));
       return p+1;
     }
     default: {
@@ -202,7 +219,10 @@ static int singlematch (MatchState *ms, const char *s, const char *p,
     switch (*p) {
       case '.': return 1;  /* matches any char */
       case L_ESC: return match_class(c, uchar(*(p+1)));
-      case '[': return matchbracketclass(c, p, ep-1);
+      case '[': {
+        class_walked(ms, (size_t)(ep - p));
+        return matchbracketclass(c, p, ep-1);
+      }
       default:  return (uchar(*p) == c);
     }
   }
@@ -352,6 +372,7 @@ static const char *match (MatchState *ms, const char *s, const char *p) {
               luaL_error(ms->L, "missing '[' after '%%f' in pattern");
             ep = classend(ms, p);  /* points to what is next */
             previous = (s == ms->src_init) ? '\0' : *(s - 1);
+            class_walked(ms, 2 * (size_t)(ep - p));
             if (!matchbracketclass(uchar(previous), p, ep - 1) &&
                matchbracketclass(uchar(*s), p, ep - 1)) {
               p = ep; goto init;  /* return match(ms, s, ep); */
@@ -516,6 +537,7 @@ static void prepstate (MatchState *ms, lua_State *L,
   ms->p_end = p + lp;
   ms->steps = 0;
   ms->written = 0;
+  ms->classes = 0;
 }
 
 

@@ -244,17 +244,20 @@ pub const LoadContext = struct {
     fn run(L: *lua.State, context: *LoadContext) void {
         lua.openLibs(L);
         api.install(L, context.extension);
-        const loaded = switch (context.code) {
-            .file => |path| lua.c.luaL_loadfilex(L, path.ptr, "t"),
-            .built_in => |built_in| lua.c.luaL_loadbufferx(
-                L,
-                built_in.lua.ptr,
-                built_in.lua.len,
-                built_in.name.ptr,
-                "t",
-            ),
-        };
-        if (loaded != lua.c.LUA_OK) _ = lua.c.lua_error(L);
+        switch (context.code) {
+            // Read in blocks that check the deadline: the parser runs in C.
+            .file => |path| lua.loadFile(L, path),
+            .built_in => |built_in| {
+                const loaded = lua.c.luaL_loadbufferx(
+                    L,
+                    built_in.lua.ptr,
+                    built_in.lua.len,
+                    built_in.name.ptr,
+                    "t",
+                );
+                if (loaded != lua.c.LUA_OK) _ = lua.c.lua_error(L);
+            },
+        }
         lua.c.lua_callk(L, 0, 1, 0, null);
         switch (lua.c.lua_type(L, -1)) {
             lua.c.LUA_TNIL => {},

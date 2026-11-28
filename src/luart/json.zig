@@ -55,7 +55,14 @@ const DeadlineScanner = struct {
 /// from `gpa`, freed before returning; the push runs under `tryCall`.
 pub fn decode(L: *lua.State, gpa: std.mem.Allocator, text: []const u8) lua.Error!void {
     if (lua.pastDeadline(L)) return lua.fail(L, "timed out", .{});
-    const status = blk: {
+    // Why parsing failed: pushed once the scanner is freed, as pushing may
+    // raise (out of memory) and a raise skips the `defer`s.
+    const Outcome = union(enum) {
+        pushed: lua.TryCallResult,
+        timed_out,
+        failed: []const u8,
+    };
+    const outcome: Outcome = blk: {
         var capped: lua.Capped = .chargedTo(L, gpa);
         var scanner = std.json.Scanner.initCompleteInput(capped.allocator(), text);
         defer scanner.deinit();
@@ -69,22 +76,24 @@ pub fn decode(L: *lua.State, gpa: std.mem.Allocator, text: []const u8) lua.Error
                 .max_value_len = text.len,
                 .allocate = .alloc_if_needed,
             },
-        ) catch |err| {
-            if (err == error.TimedOut) return lua.fail(L, "timed out", .{});
-            return lua.fail(L, "json.decode: {s}", .{switch (err) {
-                error.OutOfMemory => "out of memory",
-                error.SyntaxError, error.UnexpectedEndOfInput => "invalid JSON",
-                else => @errorName(err),
-            }});
+        ) catch |err| break :blk switch (err) {
+            error.TimedOut => .timed_out,
+            error.OutOfMemory => .{ .failed = "out of memory" },
+            error.SyntaxError, error.UnexpectedEndOfInput => .{ .failed = "invalid JSON" },
+            else => .{ .failed = @errorName(err) },
         };
         defer parsed.deinit();
         var decoder: Decoder = .{ .root = parsed.value };
-        break :blk lua.tryCall(L, Decoder, &decoder, Decoder.run, 0, 1);
+        break :blk .{ .pushed = lua.tryCall(L, Decoder, &decoder, Decoder.run, 0, 1) };
     };
-    return switch (status) {
-        .ok => {},
-        .raised => error.Raise,
-        .stack_overflow => lua.fail(L, "Lua stack overflow", .{}),
+    return switch (outcome) {
+        .pushed => |status| switch (status) {
+            .ok => {},
+            .raised => error.Raise,
+            .stack_overflow => lua.fail(L, "Lua stack overflow", .{}),
+        },
+        .timed_out => lua.fail(L, "timed out", .{}),
+        .failed => |reason| lua.fail(L, "json.decode: {s}", .{reason}),
     };
 }
 
@@ -548,4 +557,32 @@ test "json.encode shares Lua Budget across output buffer and pushed Lua string" 
         std.mem.find(u8, message, "not enough memory") != null or
             std.mem.find(u8, message, "out of memory") != null,
     );
+}
+
+test "json.decode frees its scanner when its error message does not fit" {
+    var budget: lua.Budget = .{ .bytes_max = 16 << 20 };
+    const L = lua.newState(&budget) orelse return error.OutOfMemory;
+    defer c.lua_close(L);
+    const Bad = struct {
+        fn decodeBad(state: ?*lua.State) callconv(.c) c_int {
+            decode(state.?, testing.allocator, "{\"key\": nope") catch return c.lua_error(state);
+            return 1;
+        }
+    };
+    // From no room at all up: at some point the scanner fits, the parse
+    // after it does not, and neither does the message then pushed. A raise
+    // there skipped the scanner's `defer`, and testing.allocator reports
+    // what it held.
+    const room = budget.bytes_max;
+    var slack: usize = 0;
+    while (slack < 4096) : (slack += 8) {
+        // The message is made anew each time, not found interned.
+        _ = c.lua_gc(L, c.LUA_GCCOLLECT);
+        c.lua_pushcclosure(L, &Bad.decodeBad, 0);
+        budget.bytes_max = budget.used_bytes + slack;
+        const status = c.lua_pcallk(L, 0, 1, 0, 0, null);
+        budget.bytes_max = room;
+        try testing.expect(status != c.LUA_OK);
+        c.lua_settop(L, 0);
+    }
 }
