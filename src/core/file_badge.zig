@@ -136,6 +136,40 @@ pub fn isKnown(name: []const u8) bool {
     return knownColor(lower) != null;
 }
 
+/// Whether a file of content type `mime` named `name` is a picture, a
+/// sound or a video: the theme's icon for its type says that better than
+/// letters or a logo, for any such type, not only those in `themed`
+/// (MYP-583). GLib calls some source files videos (.ts, "vitest.config.mts"
+/// as MPEG transport streams): a language Lumen knows wins over that, as
+/// `file_kind.of` has it.
+pub fn isMedia(mime: []const u8, name: []const u8) bool {
+    if (std.mem.startsWith(u8, mime, "image/")) return true;
+    if (std.mem.startsWith(u8, mime, "audio/")) return true;
+    return std.mem.startsWith(u8, mime, "video/") and !isKnown(name);
+}
+
+test "media types get the theme's icon, source files GLib calls videos do not (MYP-583)" {
+    // As Gio.content_type_guess names them.
+    const media = [_][2][]const u8{
+        .{ "00001.MTS", "video/mp2t" },   .{ "clip.m2ts", "video/mp2t" },
+        .{ "clip.mpg", "video/mpeg" },    .{ "clip.wmv", "video/x-ms-wmv" },
+        .{ "clip.m4v", "video/x-m4v" },   .{ "song.aac", "audio/aac" },
+        .{ "photo.jxl", "image/jxl" },    .{ "IMG_0001.CR2", "image/x-canon-cr2" },
+        .{ "clip.mp4", "video/mp4" },     .{ "track.mka", "audio/x-matroska" },
+        .{ "logo.svg", "image/svg+xml" },
+    };
+    for (media) |file| try std.testing.expect(isMedia(file[1], file[0]));
+    const not_media = [_][2][]const u8{
+        .{ "vitest.config.mts", "video/mp2t" },
+        .{ "index.ts", "video/mp2t" },
+        .{ "index.ts", "text/vnd.trolltech.linguist" },
+        .{ "lib.cts", "application/typescript" },
+        .{ "notes.md", "text/markdown" },
+        .{ "book.pdf", "application/pdf" },
+    };
+    for (not_media) |file| try std.testing.expect(!isMedia(file[1], file[0]));
+}
+
 test "languages get their colour and short uppercase text" {
     var text_buffer: [4]u8 = undefined;
     const badge = of("handler_test.go", &text_buffer).?;

@@ -179,8 +179,9 @@ pub fn fileItems(ui: *Ui, arena: std.mem.Allocator, query: []const u8, limit: us
 const file_key_prefix = "file:";
 const extension_bytes_max = 16;
 
-/// Icon for a file's type, guessed from its name (no I/O): the extension
-/// badge for code and text, the theme's icon for the rest.
+/// Icon for a file's type, guessed from its name (no I/O): the theme's
+/// icon for media (`file_badge.isMedia`), else the logo or extension badge
+/// for code and text, else the theme's icon.
 pub fn fileIcon(ui: *Ui, path: [:0]const u8, is_directory: bool) item_mod.Icon {
     if (is_directory) {
         if (config.keyIcon(ui, file_key_prefix ++ "folder")) |icon| return icon;
@@ -196,21 +197,26 @@ pub fn fileIcon(ui: *Ui, path: [:0]const u8, is_directory: bool) item_mod.Icon {
             const key_lower = std.ascii.lowerString(key_bytes[0..key.len], key);
             if (config.keyIcon(ui, key_lower)) |icon| return icon;
         }
-        if (core.file_badge.logoOf(name)) |logo| return .{ .logo = logo };
-        var badge_text: [4]u8 = undefined;
-        if (core.file_badge.of(name, &badge_text)) |badge| {
-            const text = ui.query_arena.allocator().dupeSentinel(
-                u8,
-                badge.text,
-                0,
-            ) catch return .none;
-            return .{ .badge = .{ .text = text, .color = badge.color } };
+        const guessed_type = c.g_content_type_guess(path, null, 0, null);
+        defer if (guessed_type) |type_name| c.g_free(type_name);
+        const content_type: [*:0]const u8 = guessed_type orelse labels.mime_unknown;
+        // Pictures, sounds and videos by their type, whatever the extension:
+        // a list of extensions left most with a grey badge (MYP-583).
+        if (!core.file_badge.isMedia(std.mem.span(content_type), name)) {
+            if (fileBadge(ui, name)) |icon| return icon;
         }
+        return .{ .gicon = typeIcon(content_type) orelse return .none };
     }
-    const guessed_type = if (is_directory) null else c.g_content_type_guess(path, null, 0, null);
-    defer if (guessed_type) |type_name| c.g_free(type_name);
-    const content_type = guessed_type orelse "inode/directory";
-    return .{ .gicon = typeIcon(content_type) orelse return .none };
+    return .{ .gicon = typeIcon("inode/directory") orelse return .none };
+}
+
+/// The logo or extension badge of a code or text file's `name`.
+fn fileBadge(ui: *Ui, name: []const u8) ?item_mod.Icon {
+    if (core.file_badge.logoOf(name)) |logo| return .{ .logo = logo };
+    var badge_text: [4]u8 = undefined;
+    const badge = core.file_badge.of(name, &badge_text) orelse return null;
+    const text = ui.query_arena.allocator().dupeSentinel(u8, badge.text, 0) catch return .none;
+    return .{ .badge = .{ .text = text, .color = badge.color } };
 }
 
 /// One GIcon per content type, kept for good (a few dozen): the files view
