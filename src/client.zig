@@ -4,16 +4,19 @@
 //! libraries, which every press of the shortcut used to pay before the
 //! window could open. Static, no libc.
 //!
-//! Anything it does not pass on runs lumen-gtk, the whole program, next to
-//! it, with the same arguments: no daemon yet (that starts one), --daemon,
-//! --dmenu, installs, mistakes (lumen-gtk prints the usage).
+//! With no daemon yet, it starts `lumen-gtk --daemon` apart from the
+//! terminal (its own session, no standard streams) and asks it once it
+//! listens. Anything it does not pass on runs lumen-gtk, the whole program,
+//! next to it, with the same arguments: --daemon, --dmenu, installs,
+//! mistakes (lumen-gtk prints the usage).
 
 const std = @import("std");
 const linux = std.os.linux;
 const ipc = @import("ipc.zig");
 const cli = @import("cli.zig");
 const version = @import("build_options").version;
-const unix = @import("os").unix;
+const os = @import("os");
+const unix = os.unix;
 const failed = unix.failed;
 const writeAll = unix.writeAll;
 
@@ -53,10 +56,94 @@ pub fn main(init: std.process.Init.Minimal) void {
         if (passable(arguments)) {
             if (encodeArguments(arguments)) |request_head| {
                 if (ask(runtime_dir, app_id, request_head)) |status| linux.exit_group(status);
+                // No daemon: one is started apart from this terminal, and
+                // asked once it listens. Commands that only ask a running
+                // daemon do not start one (lumen-gtk says it is not running),
+                // nor does a socket path too long to listen at.
+                var path_buffer: [256]u8 = undefined;
+                const listens = ipc.socketPath(&path_buffer, runtime_dir, app_id) != null;
+                if (listens and !cli.needsDaemon(arguments)) {
+                    const home = getEnv(init.environ, "HOME");
+                    if (startDaemon(argv, envp, home)) |daemon_pid| {
+                        const status = askStarted(runtime_dir, app_id, request_head, daemon_pid);
+                        if (status) |answered| linux.exit_group(answered);
+                    }
+                }
             }
         }
     }
     runFull(argv, envp);
+}
+
+/// How long a daemon just started gets to open its socket. It takes well
+/// under a second; past this, lumen-gtk runs here as it did before.
+const daemon_start_timeout_ns = 10 * std.time.ns_per_s;
+/// How often its socket is tried meanwhile.
+const daemon_start_poll_us = 20 * std.time.us_per_ms;
+
+/// Starts `lumen-gtk --daemon` in a session of its own, with its standard
+/// streams on /dev/null and its folder `home`: a daemon started from a
+/// terminal neither holds the shell nor dies with it. Its pid, or null when
+/// it could not be started.
+fn startDaemon(
+    argv: []const [*:0]const u8,
+    envp: [*:null]const ?[*:0]const u8,
+    home: ?[]const u8,
+) ?linux.pid_t {
+    // Before the fork: the child only makes system calls.
+    var home_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const home_z: [:0]const u8 = if (home) |path|
+        std.mem.printSentinel(&home_buffer, "{s}", .{path}, 0) catch "/"
+    else
+        "/";
+    const program_name: [*:0]const u8 = if (argv.len > 0) argv[0] else "lumen";
+    const daemon_argv = [_:null]?[*:0]const u8{ program_name, "--daemon" };
+    const fork_result = linux.fork();
+    if (failed(fork_result) != null) return null;
+    if (fork_result != 0) return @intCast(fork_result);
+    // The child.
+    _ = linux.setsid();
+    detachStdio();
+    if (failed(linux.chdir(home_z.ptr)) != null) _ = linux.chdir("/");
+    execFull(&daemon_argv, envp);
+}
+
+/// Points stdin, stdout and stderr at /dev/null.
+fn detachStdio() void {
+    const open_result = linux.open("/dev/null", .{ .ACCMODE = .RDWR }, 0);
+    if (failed(open_result) != null) return;
+    const null_fd: linux.fd_t = @intCast(open_result);
+    for ([_]linux.fd_t{ 0, 1, 2 }) |fd| {
+        if (fd != null_fd) _ = linux.dup2(null_fd, fd);
+    }
+    if (null_fd > 2) _ = linux.close(null_fd);
+}
+
+/// Asks the daemon `daemon_pid` just started, once its socket answers: its
+/// exit status, or null when it never did (it exited, or took too long).
+fn askStarted(
+    runtime_dir: []const u8,
+    app_id: []const u8,
+    request_bytes: []const u8,
+    daemon_pid: linux.pid_t,
+) ?u8 {
+    const deadline_ns = os.monotonicNs() + daemon_start_timeout_ns;
+    while (os.monotonicNs() < deadline_ns) {
+        if (ask(runtime_dir, app_id, request_bytes)) |status| return status;
+        // It exited: another daemon won the race (asked once more), or it
+        // failed (lumen-gtk runs here and says why).
+        if (exitedChild(daemon_pid)) return ask(runtime_dir, app_id, request_bytes);
+        os.sleepUs(daemon_start_poll_us);
+    }
+    return null;
+}
+
+/// Whether child `pid` has exited (it is reaped then).
+fn exitedChild(pid: linux.pid_t) bool {
+    var status: i32 = 0;
+    const result = linux.wait4(pid, &status, linux.W.NOHANG, null);
+    if (failed(result) != null) return true;
+    return result != 0;
 }
 
 /// `--clip-store`: the copy is read whole before the daemon is asked, so an
@@ -206,7 +293,15 @@ fn failedAnswer(message: []const u8) ipc.Answer {
 
 /// lumen-gtk beside this file, else on PATH.
 fn runFull(argv: []const [*:0]const u8, envp: [*:null]const ?[*:0]const u8) noreturn {
-    const argv_terminated: [*:null]const ?[*:0]const u8 = @ptrCast(argv.ptr);
+    // The process's own argv ends with a null.
+    execFull(@ptrCast(argv.ptr), envp);
+}
+
+/// lumen-gtk beside this file, else on PATH, with `argv_terminated`.
+fn execFull(
+    argv_terminated: [*:null]const ?[*:0]const u8,
+    envp: [*:null]const ?[*:0]const u8,
+) noreturn {
     var self_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var candidate_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     // An execve that returns failed: the next place is tried.

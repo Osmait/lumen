@@ -62,7 +62,10 @@ pub const specs: std.enums.EnumArray(Flag, Spec) = .init(.{
     },
     .show = .{ .group = .window, .socket = true, .help = "Show the window" },
     .hide = .{ .group = .window, .socket = true, .needs_daemon = true, .help = "Hide the window" },
-    .daemon = .{ .group = .window, .help = "Start in the background with the window hidden" },
+    .daemon = .{
+        .group = .window,
+        .help = "Run the daemon here, with the window hidden\n(without a daemon, `lumen` starts one apart)",
+    },
     .quit = .{ .group = .window, .socket = true, .needs_daemon = true, .help = "Stop the daemon" },
     .view = .{
         .group = .window,

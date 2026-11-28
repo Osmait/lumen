@@ -238,6 +238,7 @@ fn startupCallback(gtk_app: *c.GtkApplication, data: ?*anyopaque) callconv(.c) v
     // it, and `cmd | head` would run on. The empty handler again.
     os.unix.ignoreSigpipe();
     useCNumbers();
+    quitOnSignals();
     const path = dbPath() orelse {
         log.err("cannot create the data directory", .{});
         return;
@@ -271,6 +272,24 @@ fn startupCallback(gtk_app: *c.GtkApplication, data: ?*anyopaque) callconv(.c) v
     // Prewarm once the main loop is idle, so it does not delay startup.
     _ = c.g_idle_add(&prewarmCallback, null);
     stats.startup_ns = stats.now() - stats.started_ns;
+}
+
+/// SIGTERM (systemd, a session ending, pkill), SIGINT (Ctrl+C) and SIGHUP
+/// (its terminal closed) shut the daemon down as `--quit` does: the socket
+/// is removed, the name index saved, the extension host stopped. GLib
+/// delivers them on the main loop.
+fn quitOnSignals() void {
+    for ([_]c_int{ c.SIGTERM, c.SIGINT, c.SIGHUP }) |signal| {
+        _ = c.g_unix_signal_add(signal, &quitSignalCallback, null);
+    }
+}
+
+fn quitSignalCallback(_: ?*anyopaque) callconv(.c) c.gboolean {
+    os.assertMainThread();
+    log.info("signal received: shutting down", .{});
+    if (daemon.app) |app| c.g_application_quit(app);
+    // Kept: a second signal while shutting down finds the same answer.
+    return 1;
 }
 
 /// GTK set the whole locale from the environment when it started (before
