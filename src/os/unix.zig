@@ -16,25 +16,46 @@ pub fn failed(result: usize) ?linux.E {
 
 pub const ConnectOptions = struct { nonblock: bool = false };
 
-/// A connected socket at `path`, or null (nothing listening, no such path).
+/// What `open` found at a socket path.
+pub const Connection = union(enum) {
+    /// Connected.
+    fd: linux.fd_t,
+    /// A listener whose backlog stayed full: alive, not accepting (a daemon
+    /// or a compositor that hangs). Waiting for it could last forever.
+    busy,
+    /// Nothing listening there (no such path, refused, a path too long).
+    none,
+};
+
+/// A connected socket at `path`, or null (nothing listening, no such path,
+/// a listener too busy to take it).
 pub fn connect(path: []const u8, options: ConnectOptions) ?linux.fd_t {
+    return switch (open(path, options)) {
+        .fd => |fd| fd,
+        .busy, .none => null,
+    };
+}
+
+/// Connects to `path` without ever blocking for long: the connect itself is
+/// non-blocking (a blocking one sleeps as long as the listener's backlog
+/// stays full, and SO_SNDTIMEO is infinite), and the socket becomes
+/// blocking afterwards unless `options.nonblock`.
+pub fn open(path: []const u8, options: ConnectOptions) Connection {
     var address: linux.sockaddr.un = .{ .path = @splat(0) };
     // The path must leave room for its terminating zero.
-    if (path.len >= address.path.len) return null;
+    if (path.len >= address.path.len) return .none;
     @memcpy(address.path[0..path.len], path);
-    const flags: u32 = if (options.nonblock) linux.SOCK.NONBLOCK else 0;
     const socket_result = linux.socket(
         linux.AF.UNIX,
-        linux.SOCK.STREAM | linux.SOCK.CLOEXEC | flags,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC | linux.SOCK.NONBLOCK,
         0,
     );
-    if (failed(socket_result) != null) return null;
+    if (failed(socket_result) != null) return .none;
     const fd: linux.fd_t = @intCast(socket_result);
-    if (!connectTo(fd, &address)) {
-        _ = linux.close(fd);
-        return null;
-    }
-    return fd;
+    const outcome = connectTo(fd, &address);
+    if (outcome == .connected and (options.nonblock or setBlocking(fd))) return .{ .fd = fd };
+    _ = linux.close(fd);
+    return if (outcome == .busy) .busy else .none;
 }
 
 /// How many times a connect the listener's full backlog turned away
@@ -45,27 +66,37 @@ const connect_retry_ms = 10;
 /// How long a connect still in progress (EINPROGRESS) is waited for.
 const connect_wait_ms = 1000;
 
-fn connectTo(fd: linux.fd_t, address: *const linux.sockaddr.un) bool {
+const ConnectOutcome = enum { connected, busy, failed };
+
+fn connectTo(fd: linux.fd_t, address: *const linux.sockaddr.un) ConnectOutcome {
+    var busy = false;
     var attempt: usize = 0;
     while (attempt < connect_attempts_max) : (attempt += 1) {
         const errno = failed(linux.connect(fd, address, @sizeOf(linux.sockaddr.un))) orelse
-            return true;
+            return .connected;
         switch (errno) {
             // A retried connect that the first one completed.
-            .ISCONN => return true,
+            .ISCONN => return .connected,
             .INTR => continue,
-            .AGAIN => os.sleepUs(connect_retry_ms * std.time.us_per_ms),
+            .AGAIN => {
+                busy = true;
+                os.sleepUs(connect_retry_ms * std.time.us_per_ms);
+            },
             .INPROGRESS, .ALREADY => return connectFinished(fd),
-            else => return false,
+            else => return .failed,
         }
     }
-    return false;
+    return if (busy) .busy else .failed;
 }
 
-/// Waits for a connect in progress on `fd`; whether it succeeded.
-fn connectFinished(fd: linux.fd_t) bool {
+/// Waits for a connect in progress on `fd`.
+fn connectFinished(fd: linux.fd_t) ConnectOutcome {
     const deadline_ns = os.monotonicNs() + connect_wait_ms * std.time.ns_per_ms;
-    if (os.pollUntil(fd, linux.POLL.OUT, deadline_ns) != .ready) return false;
+    switch (os.pollUntil(fd, linux.POLL.OUT, deadline_ns)) {
+        .ready => {},
+        .timed_out => return .busy,
+        .failed => return .failed,
+    }
     var socket_error: i32 = 0;
     var socket_error_len: linux.socklen_t = @sizeOf(i32);
     const result = linux.getsockopt(
@@ -75,7 +106,15 @@ fn connectFinished(fd: linux.fd_t) bool {
         @ptrCast(&socket_error),
         &socket_error_len,
     );
-    return failed(result) == null and socket_error == 0;
+    return if (failed(result) == null and socket_error == 0) .connected else .failed;
+}
+
+/// Clears O_NONBLOCK on `fd`, keeping its other flags; false when it could not.
+fn setBlocking(fd: linux.fd_t) bool {
+    const flags = linux.fcntl(fd, linux.F.GETFL, 0);
+    if (failed(flags) != null) return false;
+    const nonblock: usize = @as(u32, @bitCast(linux.O{ .NONBLOCK = true }));
+    return failed(linux.fcntl(fd, linux.F.SETFL, flags & ~nonblock)) == null;
 }
 
 fn noopSigpipe(_: linux.SIG) callconv(.c) void {}
@@ -210,6 +249,52 @@ test "whole reads and writes over a socket pair" {
     try std.testing.expect(os.monotonicNs() - start_ns < std.time.ns_per_s);
 
     try std.testing.expect(connect("/nonexistent/lumen.sock", .{}) == null);
+}
+
+test "a listener whose backlog is full is busy, not waited for" {
+    var dir_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try os.tmpDirPath(&tmp, &dir_buffer);
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/s", .{dir}, 0);
+    if (path.len >= @sizeOf(@FieldType(linux.sockaddr.un, "path"))) return error.SkipZigTest;
+
+    try std.testing.expect(open(path, .{}) == .none);
+    const listen_result = linux.socket(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0);
+    try std.testing.expect(failed(listen_result) == null);
+    const listen_fd: linux.fd_t = @intCast(listen_result);
+    defer _ = linux.close(listen_fd);
+    var address: linux.sockaddr.un = .{ .path = @splat(0) };
+    @memcpy(address.path[0..path.len], path);
+    try std.testing.expect(failed(linux.bind(listen_fd, @ptrCast(&address), @sizeOf(linux.sockaddr.un))) == null);
+    // Never accepted: the backlog fills after a connection or two.
+    try std.testing.expect(failed(linux.listen(listen_fd, 1)) == null);
+
+    var connected: [8]linux.fd_t = undefined;
+    var connected_count: usize = 0;
+    defer for (connected[0..connected_count]) |fd| {
+        _ = linux.close(fd);
+    };
+    const start_ns = os.monotonicNs();
+    const busy = while (connected_count < connected.len) {
+        switch (open(path, .{})) {
+            .fd => |fd| {
+                // Blocking, as asked.
+                const flags = linux.fcntl(fd, linux.F.GETFL, 0);
+                const nonblock: u32 = @bitCast(linux.O{ .NONBLOCK = true });
+                try std.testing.expect(flags & nonblock == 0);
+                connected[connected_count] = fd;
+                connected_count += 1;
+            },
+            .busy => break true,
+            .none => break false,
+        }
+    } else false;
+    try std.testing.expect(busy);
+    try std.testing.expect(connected_count > 0);
+    try std.testing.expect(connect(path, .{}) == null);
+    try std.testing.expect(os.monotonicNs() - start_ns < 2 * std.time.ns_per_s);
 }
 
 test "a descriptor poll rejects fails the read instead of spinning to the deadline" {

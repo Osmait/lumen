@@ -257,7 +257,12 @@ fn ask(runtime_dir: []const u8, app_id: []const u8, request_bytes: []const u8) ?
 fn exchange(runtime_dir: []const u8, app_id: []const u8, request_bytes: []const u8) ?ipc.Answer {
     var path_buffer: [256]u8 = undefined;
     const path = ipc.socketPath(&path_buffer, runtime_dir, app_id) orelse return null;
-    const fd = unix.connect(path, .{}) orelse return null;
+    const fd = switch (unix.open(path, .{})) {
+        .fd => |fd| fd,
+        .none => return null,
+        // Alive but hung: neither waited for nor replaced by lumen-gtk.
+        .busy => return failedAnswer(not_answering),
+    };
     // Our own daemon only: in a runtime folder others can write to, someone
     // else's socket would get the arguments and the copy.
     if (unix.peerUid(fd) != linux.getuid()) {
@@ -266,7 +271,8 @@ fn exchange(runtime_dir: []const u8, app_id: []const u8, request_bytes: []const 
         return null;
     }
     // From here on there is no going back to lumen-gtk: the daemon may act
-    // on what it gets.
+    // on what it gets. A daemon that stops reading fails the send in time.
+    setSendTimeout(fd, answer_timeout_s);
     if (!unix.sendAll(fd, request_bytes)) {
         _ = linux.close(fd);
         return failedAnswer("lumen: the daemon closed the connection\n");
@@ -277,14 +283,38 @@ fn exchange(runtime_dir: []const u8, app_id: []const u8, request_bytes: []const 
         _ = linux.close(fd);
         return failedAnswer("lumen: cannot finish the request to the daemon\n");
     }
-    // The daemon answers when it is done, however long that takes.
-    const answer_bytes = unix.readAll(fd, &answer_buffer, unix.deadline_ns_none) catch 0;
+    // The daemon answers on its main loop, at once for every command the
+    // socket takes; one that has not after this long is hung.
+    const deadline_ns = os.monotonicNs() + answer_timeout_s * std.time.ns_per_s;
+    const answer_bytes = unix.readAll(fd, &answer_buffer, deadline_ns) catch |err| {
+        _ = linux.close(fd);
+        return switch (err) {
+            error.Timeout => failedAnswer(not_answering),
+            error.Syscall => failedAnswer("lumen: no answer from the daemon\n"),
+        };
+    };
     _ = linux.close(fd);
     if (answer_bytes < ipc.answer_header_bytes) {
         return failedAnswer("lumen: no answer from the daemon\n");
     }
     return ipc.parseAnswer(answer_buffer[0..answer_bytes]) orelse
         failedAnswer("lumen: a truncated answer from the daemon\n");
+}
+
+/// How long a request may take to send, and its answer to come.
+const answer_timeout_s = 30;
+const not_answering = "lumen: the daemon is not answering\n";
+
+/// Sends on `fd` fail (EAGAIN) after `seconds` without progress.
+fn setSendTimeout(fd: linux.fd_t, seconds: i64) void {
+    const timeout: linux.timeval = .{ .sec = seconds, .usec = 0 };
+    _ = linux.setsockopt(
+        fd,
+        linux.SOL.SOCKET,
+        linux.SO.SNDTIMEO,
+        std.mem.asBytes(&timeout),
+        @sizeOf(linux.timeval),
+    );
 }
 
 fn failedAnswer(message: []const u8) ipc.Answer {

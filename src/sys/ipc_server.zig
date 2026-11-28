@@ -136,11 +136,19 @@ fn listenAt(socket_path: [:0]const u8) ListenError!linux.fd_t {
     // answers on is not. Only the primary instance gets here, except
     // without a session bus, where every instance is: the second one took
     // the first one's socket. One that cannot be removed makes the bind
-    // below fail, and that is logged.
-    if (os.unix.connect(socket_path, .{})) |live_fd| {
-        _ = linux.close(live_fd);
-        log.warn("{s}: another Lumen daemon answers there", .{socket_path});
-        return error.InUse;
+    // below fail, and that is logged. One that hangs with its backlog full
+    // is alive too: it is not waited for, nor taken over.
+    switch (os.unix.open(socket_path, .{})) {
+        .fd => |live_fd| {
+            _ = linux.close(live_fd);
+            log.warn("{s}: another Lumen daemon answers there", .{socket_path});
+            return error.InUse;
+        },
+        .busy => {
+            log.warn("{s}: another Lumen daemon listens there, not answering", .{socket_path});
+            return error.InUse;
+        },
+        .none => {},
     }
     _ = linux.unlink(socket_path.ptr);
     var address: linux.sockaddr.un = .{ .path = @splat(0) };
