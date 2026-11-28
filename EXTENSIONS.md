@@ -539,6 +539,11 @@ bind = ALT SHIFT, G, exec, lumen --command github.prs
 Code still running at its limit is stopped with an error. Lists run one at a
 time, and a newer query replaces one that has not started yet.
 
+The last few lists each command returned stay in the extension's memory, and
+everything their rows hold, so the actions of rows still on screen can run.
+Once the extension uses half its memory, a new list first lets go of all but
+the newest one of each command.
+
 ## When something goes wrong
 
 - A file that fails to load shows up in the root search as *Extension "name"
