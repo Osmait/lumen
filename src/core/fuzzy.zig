@@ -2,7 +2,8 @@
 //! of the candidate, or when its letters can be taken in order from word
 //! starts and runs: "vsc" finds "Visual Studio Code", "left" does not find
 //! "File Manager". Case- and accent-insensitive (`fold.zig`): "configuracion"
-//! finds "Configuración"; other bytes compare exactly.
+//! finds "Configuración"; other bytes compare exactly. Queries longer than
+//! `fuzzy_query_chars_max` match as substrings only.
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -60,7 +61,13 @@ const Score = struct {
 pub const substring_outranks_fuzzy_chars_max =
     (Score.substring_floor - 1) / Score.fuzzy_letter_max;
 
+/// Longer queries, in folded characters, match as substrings only. The
+/// fuzzy alignment costs query × text: a pasted 1000-character query took
+/// 8 ms per 2 KB line, and dmenu scores every line on the GTK thread.
+pub const fuzzy_query_chars_max = 64;
+
 comptime {
+    assert(fuzzy_query_chars_max > substring_outranks_fuzzy_chars_max);
     assert(substring_outranks_fuzzy_chars_max >= 3);
     assert(substring_outranks_fuzzy_chars_max * Score.fuzzy_letter_max < Score.substring_floor);
     assert((substring_outranks_fuzzy_chars_max + 1) * Score.fuzzy_letter_max >=
@@ -102,6 +109,7 @@ pub fn scoreQuery(query_prepared: Query, text_in: []const u8) i32 {
         assert(result >= Score.substring_floor);
         return result;
     }
+    if (query.len > fuzzy_query_chars_max) return no_match;
     // Most texts do not even hold the letters in order: one pass says so,
     // before `scoreFuzzy`'s 16 KB frame is set up.
     if (!isSubsequence(query, text)) return no_match;
@@ -314,6 +322,27 @@ test "fuzzy finds the best alignment, not the first" {
     // "Editor" does.
     try std.testing.expect(score("ted", "Text Editor") > 0);
     try std.testing.expect(score("abc", "a_xb ab_c") > 0);
+}
+
+test "a long query matches as a substring only (MYP-463)" {
+    // "a b c … a b c …": every letter at a word start.
+    var word_starts: [2 * (fuzzy_query_chars_max + 1)]u8 = undefined;
+    var letters: [fuzzy_query_chars_max + 1]u8 = undefined;
+    for (&letters, 0..) |*letter, i| {
+        letter.* = 'a' + @as(u8, @intCast(i % 26));
+        word_starts[2 * i] = letter.*;
+        word_starts[2 * i + 1] = ' ';
+    }
+    // 64 letters taken from word starts still match fuzzily, 65 do not.
+    try std.testing.expect(score(letters[0..fuzzy_query_chars_max], &word_starts) > 0);
+    try std.testing.expectEqual(no_match, score(&letters, &word_starts));
+    // A substring of any length still matches.
+    var long_query: [1000]u8 = undefined;
+    @memset(&long_query, 'a');
+    var long_line: [1200]u8 = undefined;
+    @memset(&long_line, 'x');
+    @memcpy(long_line[100..][0..long_query.len], &long_query);
+    try std.testing.expect(score(&long_query, &long_line) > 0);
 }
 
 test "letters inside a word only match as a run" {

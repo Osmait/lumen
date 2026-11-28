@@ -52,8 +52,17 @@ const themed = [_][]const u8{
     "mp4", "mkv", "webm", "mov",   "avi",     "mp3",      "ogg",  "flac",  "wav",  "m4a",  "opus",
     "pdf", "doc", "docx", "xls",   "xlsx",    "ppt",      "pptx", "odt",   "ods",  "odp",  "epub",
     "zip", "gz",  "xz",   "zst",   "bz2",     "tar",      "7z",   "rar",   "deb",  "rpm",  "iso",
-    "ttf", "otf", "woff", "woff2", "desktop", "appimage", "exe",  "blend",
+    "ttf", "otf", "woff", "woff2", "desktop", "appimage", "exe",  "blend", "m2ts", "mpg",  "mpeg",
+    "wmv", "m4v", "flv",  "3gp",   "ogv",     "aac",      "wma",  "aiff",  "jxl",  "heif", "cr2",
+    "cr3", "nef", "arw",  "dng",   "orf",     "rw2",      "raf",  "psd",   "xcf",
 };
+
+/// AVCHD camera clips, "00001.MTS": cameras write the extension in
+/// capitals, TypeScript modules ("vitest.config.mts") in small letters.
+/// GLib calls both video/mp2t.
+pub fn isCameraClip(name: []const u8) bool {
+    return name.len > ".MTS".len and std.mem.endsWith(u8, name, ".MTS");
+}
 
 /// Files named for their role rather than an extension.
 const named = [_]struct { []const u8, []const u8, Color }{
@@ -101,7 +110,7 @@ pub fn of(name: []const u8, text_buffer: *[4]u8) ?Badge {
     var extension_buffer: [16]u8 = undefined;
     const lower = lowerExtension(&extension_buffer, name) orelse return null;
     const extension = name[name.len - lower.len ..];
-    if (themed_extensions.has(lower)) return null;
+    if (themed_extensions.has(lower) or isCameraClip(name)) return null;
     const color = knownColor(lower);
     if (color == null and extension.len > text_buffer.len) return null;
     // Only letters and digits make a badge: "tar.gz~" or "c++" do not.
@@ -121,6 +130,7 @@ fn knownColor(lower_extension: []const u8) ?Color {
 /// extension (those get a gray badge but may be anything, binaries too).
 pub fn isKnown(name: []const u8) bool {
     if (named_badges.has(name)) return true;
+    if (isCameraClip(name)) return false;
     var extension_buffer: [16]u8 = undefined;
     const lower = lowerExtension(&extension_buffer, name) orelse return false;
     return knownColor(lower) != null;
@@ -146,6 +156,11 @@ test "themed types, odd names and no extension get no badge" {
     try std.testing.expectEqualStrings("MAKE", of("Makefile", &text_buffer).?.text);
     // Unknown but short: gray.
     try std.testing.expectEqual(Color.gray, of("notes.foo", &text_buffer).?.color);
+    // Media the theme knows, camera clips and RAW photos among them.
+    for ([_][]const u8{
+        "00001.MTS", "clip.m2ts", "clip.mpg",     "clip.wmv",     "clip.m4v",
+        "song.aac",  "photo.jxl", "IMG_0001.CR2", "DSC_0001.NEF", "art.psd",
+    }) |name| try std.testing.expect(of(name, &text_buffer) == null);
 }
 
 // ------------------------------------------------------------------ logos
@@ -232,6 +247,7 @@ const logos_by_extension: std.StaticStringMap(Logo) = .initComptime(logos);
 /// The official logo for a file name, or null (then `of` gives a badge).
 pub fn logoOf(name: []const u8) ?Logo {
     if (logos_by_name.get(name)) |logo| return logo;
+    if (isCameraClip(name)) return null;
     var extension_buffer: [16]u8 = undefined;
     const lower = lowerExtension(&extension_buffer, name) orelse return null;
     return logos_by_extension.get(lower);
@@ -244,6 +260,10 @@ test "logos for languages, badges stay for the rest" {
     try std.testing.expectEqualStrings("docker", logoOf("Dockerfile").?.name);
     try std.testing.expect(logoOf("Cargo.toml") == null);
     try std.testing.expect(logoOf("photo.png") == null);
+    // A camera clip is a video, not TypeScript (MYP-583).
+    try std.testing.expect(logoOf("00001.MTS") == null);
+    try std.testing.expect(!isKnown("00001.MTS"));
+    try std.testing.expect(isKnown("vitest.config.mts"));
 }
 
 test "the maps answer what the tables say, for every entry" {

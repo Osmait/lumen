@@ -41,7 +41,24 @@ pub const Monitor = struct {
         for (monitor.reserved) |reserved| {
             if (!inRange(reserved, 0, pixels_max)) return false;
         }
+        // Bars that leave no room at all: a usable area of negative size.
+        const logical = monitor.logicalSize();
+        const reserved_left, const reserved_top, const reserved_right, const reserved_bottom =
+            monitor.reserved;
+        if (reserved_left + reserved_right >= logical.width) return false;
+        if (reserved_top + reserved_bottom >= logical.height) return false;
         return true;
+    }
+
+    /// The size in logical pixels, rotated.
+    fn logicalSize(monitor: Monitor) Size {
+        var width: f64 = @floatFromInt(monitor.width);
+        var height: f64 = @floatFromInt(monitor.height);
+        if (@mod(monitor.transform, 2) == 1) std.mem.swap(f64, &width, &height);
+        return .{
+            .width = @intFromFloat(@round(width / monitor.scale)),
+            .height = @intFromFloat(@round(height / monitor.scale)),
+        };
     }
 
     fn inRange(value: i32, value_min: i32, value_max: i32) bool {
@@ -51,19 +68,17 @@ pub const Monitor = struct {
     /// The area windows may use, in global layout coordinates.
     pub fn usable(monitor: Monitor) Rect {
         assert(plausible(monitor));
-        var width: f64 = @floatFromInt(monitor.width);
-        var height: f64 = @floatFromInt(monitor.height);
-        if (@mod(monitor.transform, 2) == 1) std.mem.swap(f64, &width, &height);
-        const logical_width: i32 = @intFromFloat(@round(width / monitor.scale));
-        const logical_height: i32 = @intFromFloat(@round(height / monitor.scale));
+        const logical = monitor.logicalSize();
         const reserved_left, const reserved_top, const reserved_right, const reserved_bottom =
             monitor.reserved;
-        return .{
+        const area: Rect = .{
             .x = monitor.x + reserved_left,
             .y = monitor.y + reserved_top,
-            .width = logical_width - reserved_left - reserved_right,
-            .height = logical_height - reserved_top - reserved_bottom,
+            .width = logical.width - reserved_left - reserved_right,
+            .height = logical.height - reserved_top - reserved_bottom,
         };
+        assert(area.width > 0 and area.height > 0);
+        return area;
     }
 };
 
@@ -131,8 +146,16 @@ pub fn place(layout: Layout, outer: Rect, current: Size, gap_px: i32) Rect {
     };
     // On any area with room for the gaps, the window stays inside it.
     const room_for_gaps = third >= 0 and half_width >= 0 and half_height >= 0;
-    if (room_for_gaps) assert(contains(area, placed));
-    return placed;
+    if (room_for_gaps) {
+        assert(contains(area, placed));
+        return placed;
+    }
+    // Too small for the gaps: still a size a compositor takes, never a
+    // negative one ("resizewindowpixel exact 468 -76").
+    var clamped = placed;
+    clamped.width = @max(clamped.width, 1);
+    clamped.height = @max(clamped.height, 1);
+    return clamped;
 }
 
 /// Whether `inner` lies within `outer`, edges included.
@@ -191,4 +214,34 @@ test "center keeps size" {
 
     const negative = place(.center, area, .{ .width = -50, .height = -20 }, 0);
     try std.testing.expectEqual(Rect{ .x = 500, .y = 400, .width = 0, .height = 0 }, negative);
+}
+
+test "bars larger than the monitor are not plausible (MYP-460)" {
+    // 1920x1080 at scale 2 is 960x540 logical: 600 reserved on top leave
+    // no room.
+    var monitor: Monitor = .{
+        .x = 0,
+        .y = 0,
+        .width = 1920,
+        .height = 1080,
+        .scale = 2,
+        .transform = 0,
+        .reserved = .{ 0, 600, 0, 0 },
+    };
+    try std.testing.expect(!monitor.plausible());
+    monitor.reserved = .{ 0, 270, 0, 270 };
+    try std.testing.expect(!monitor.plausible());
+    monitor.reserved = .{ 480, 0, 480, 0 };
+    try std.testing.expect(!monitor.plausible());
+    monitor.reserved = .{ 0, 38, 0, 0 };
+    try std.testing.expect(monitor.plausible());
+    try std.testing.expectEqual(@as(i32, 502), monitor.usable().height);
+}
+
+test "an area too small for the gaps still gets a positive size" {
+    const tiny: Rect = .{ .x = 0, .y = 0, .width = 10, .height = 4 };
+    for (std.enums.values(Layout)) |layout| {
+        const placed = place(layout, tiny, .{ .width = 0, .height = 0 }, 8);
+        try std.testing.expect(placed.width >= 1 and placed.height >= 1);
+    }
 }

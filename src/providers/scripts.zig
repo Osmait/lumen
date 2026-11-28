@@ -84,7 +84,7 @@ fn copy(arena: std.mem.Allocator, cached: Item) std.mem.Allocator.Error!Item {
 }
 
 /// What the scripts folder looked like: whether it exists, and a hash of
-/// its files' names, sizes and mtimes. A tagged union rather than special
+/// its files' names, sizes, mtimes, inodes and modes. A tagged union rather than special
 /// hash values: any u64 is a possible hash.
 const FolderStamp = union(enum) {
     missing,
@@ -117,9 +117,22 @@ fn stamp(path: [:0]const u8) FolderStamp {
         hasher.update(std.mem.asBytes(&file_stamp.mtime_subsecond_ns));
         hasher.update(std.mem.asBytes(&file_stamp.size));
         hasher.update(std.mem.asBytes(&file_stamp.inode));
+        // chmod +x changes none of the above, and it decides whether the
+        // file is a command (`itemOf`).
+        const file_mode = modeOf(file_path.ptr);
+        hasher.update(std.mem.asBytes(&file_mode));
         files_sum +%= hasher.final();
     }
     return .{ .hashed = files_sum };
+}
+
+/// The type and permission bits of the file at `path` (followed when a
+/// link), or 0 when it cannot be read.
+fn modeOf(path: [*:0]const u8) u16 {
+    var stx: linux.Statx = undefined;
+    const result = linux.statx(linux.AT.FDCWD, path, 0, .{ .TYPE = true, .MODE = true }, &stx);
+    if (linux.errno(result) != .SUCCESS) return 0;
+    return stx.mode;
 }
 
 /// Scans the scripts directory at `path`. Everything lives in `arena`.
@@ -280,9 +293,22 @@ test "a missing folder and an empty one stamp differently, and edits show" {
     try std.testing.expect(std.meta.eql(one_file, stamp(missing)));
 
     // Atomic replacement of same size within the same second alters inode / nsec stamp.
-    const script_path = try test_dir.path(&path_buffer, "scripts/hello.sh");
+    // Its own buffer: `missing` lives in `path_buffer` (sharing it made
+    // `missing` name the script, and every stamp after this `.missing`).
+    var script_path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const script_path = try test_dir.path(&script_path_buffer, "scripts/hello.sh");
     try os.writeFileAtomic(script_path, "#!/bin/ba\n");
     try std.testing.expect(!std.meta.eql(one_file, stamp(missing)));
+
+    // chmod +x alone changes the stamp: it decides whether the script is
+    // a command (MYP-493).
+    const before_chmod = stamp(missing);
+    try std.testing.expect(before_chmod == .hashed);
+    try std.testing.expectEqual(
+        linux.E.SUCCESS,
+        linux.errno(linux.fchmodat(linux.AT.FDCWD, script_path, 0o755)),
+    );
+    try std.testing.expect(!std.meta.eql(before_chmod, stamp(missing)));
 }
 
 test "scan skips non-executable files and sanitizes title and subtitle" {

@@ -47,7 +47,7 @@ pub fn perform(context: Context, item: *const Item, operation: item_mod.Operatio
         .copy_path => hideAfter(copyPath(item)),
         .show_in_folder => hideAfter(showInFolder(fileOf(item).path)),
         // Offered only for a content match (item.actionsFor).
-        .open_at_line => hideAfter(openAtLine(context, fileOf(item).path, fileOf(item).line.?)),
+        .open_at_line => openAtLine(context, fileOf(item).path, fileOf(item).line.?),
         .copy_file => hideAfter(copyFile(context, fileOf(item).path)),
         .trash => trash(fileOf(item).path),
         .reset_ranking => resetRanking(context, item),
@@ -67,7 +67,7 @@ pub fn perform(context: Context, item: *const Item, operation: item_mod.Operatio
 /// What Enter does on a row.
 fn primary(context: Context, item: *const Item) Outcome {
     return switch (item.action) {
-        .app => |app_info| hideAfter(launch(app_info)),
+        .app => |app_info| launch(app_info),
         .view => |view| .{ .open_view = view },
         .system => |system_action| hideAfter(system(context, system_action)),
         .layout => |layout| hideAfter(hypr.applyLayout(context.gpa, layout)),
@@ -76,10 +76,10 @@ fn primary(context: Context, item: *const Item) Outcome {
         .clip => hideAfter(pasteClip(context, item)),
         .script => |script| runScript(script.path, script.mode, script.cwd, item.title),
         .calc => hideAfter(copy(item.detail)),
-        .file => |file| blk: {
-            _ = openFile(context, file.path, file.entry());
-            break :blk .hide;
-        },
+        .file => |file| if (openFile(context, file.path, file.entry()))
+            .hide
+        else
+            .{ .failed = "Could not open it" },
         .setting => |setting| .{ .setting = .{ .setting = setting, .operation = .run } },
         // The UI runs extension commands (ext_view.zig).
         .ext_command, .ext_item, .pick => .stay,
@@ -234,12 +234,15 @@ pub fn openWith(path: [:0]const u8, app_id: [:0]const u8) bool {
 /// The editor from Settings (else $VISUAL/$EDITOR, else nvim) at `line`:
 /// GUI editors directly, terminal ones inside the terminal from Settings
 /// (else $TERMINAL, else the first one installed).
-fn openAtLine(context: Context, path: [:0]const u8, line: u32) void {
+/// Fails (and the window stays) when the editor or the terminal cannot be
+/// started; an editor missing inside a terminal shows there.
+fn openAtLine(context: Context, path: [:0]const u8, line: u32) Outcome {
+    const failed: Outcome = .{ .failed = "Could not open the editor" };
     var arena_state: std.heap.ArenaAllocator = .init(context.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const argv = openAtLineArgv(arena, context.settings, path, line) catch return;
-    _ = proc.spawn(argv);
+    const argv = openAtLineArgv(arena, context.settings, path, line) catch return failed;
+    return if (proc.spawn(argv)) .hide else failed;
 }
 
 fn openAtLineArgv(
@@ -406,7 +409,7 @@ const terminal_prefixes = [_]TerminalPrefix{
     // Their -e takes one command line as a single word: the line number
     // and the path never reached the editor. -x takes the rest as argv.
     .{
-        .names = &.{ "xfce4-terminal", "terminator", "mate-terminal" },
+        .names = &.{ "xfce4-terminal", "terminator", "mate-terminal", "tilix" },
         .words = &.{"-x"},
     },
 };
@@ -494,12 +497,16 @@ fn copyFile(context: Context, path: [:0]const u8) void {
     proc.pipeTo(&.{ "wl-copy", "--type", "text/uri-list" }, list);
 }
 
-fn launch(app_info: *c.GAppInfo) void {
-    const launch_context = proc.launchContext() orelse return;
+fn launch(app_info: *c.GAppInfo) Outcome {
+    const failed: Outcome = .{ .failed = "Could not launch it" };
+    const launch_context = proc.launchContext() orelse return failed;
     defer c.g_object_unref(launch_context);
     var err: ?*c.GError = null;
-    const launched = c.g_app_info_launch(app_info, null, launch_context, &err) != 0;
-    if (!launched) proc.warnError(.actions, err, "launch", .{});
+    if (c.g_app_info_launch(app_info, null, launch_context, &err) == 0) {
+        proc.warnError(.actions, err, "launch", .{});
+        return failed;
+    }
+    return .hide;
 }
 
 fn focusWindow(context: Context, item: *const Item) void {
@@ -586,13 +593,18 @@ fn runScript(
     }
     // Other modes show the output: last lines as a desktop notification.
     // After `--`, a title or an output line starting with "-" is text, not
-    // an option of notify-send's.
+    // an option of notify-send's. At most the last 1024 bytes of them: one
+    // long line went past what an argument may hold ("Argument list too
+    // long") and no notification came. sed drops the bytes of a character
+    // cut in two at the start, which D-Bus would refuse.
     var title_buffer: [512:0]u8 = undefined;
     const title_terminated = std.mem.printSentinel(&title_buffer, "{s}", .{title}, 0) catch
         "Script";
     const spawned = proc.spawnInDir(&.{
         "sh",             "-c",
-        \\out=$("$1" 2>&1); notify-send -a Lumen -- "$2" "$(printf '%s' "$out" | tail -n 5)"
+        \\continuation=$(printf '\200-\277')
+        \\out=$("$1" 2>&1 | tail -n 5 | tail -c 1024 | LC_ALL=C sed "1s/^[$continuation]*//")
+        \\notify-send -a Lumen -- "$2" "$out"
         ,
         "lumen-script",   path,
         title_terminated,
@@ -694,30 +706,27 @@ fn sendPaste() void {
 
 pub const Chord = enum { ctrl_v, ctrl_shift_v };
 
-/// Terminal emulators by Wayland app id / window class (lowercased match).
+/// Terminal emulators by Wayland app id / window class: a dot-separated
+/// part of it, in any case ("org.gnome.Ptyxis.Devel", "XTerm"). Matched
+/// as a substring, "rio" took "Mario" for a terminal.
 pub fn pasteChord(class: []const u8) Chord {
     const terminals = [_][]const u8{
-        "ghostty",
-        "kitty",
-        "alacritty",
-        "foot",
-        "wezterm",
-        "konsole",
-        "terminal",
-        "console",
-        "xterm",
-        "terminator",
-        "tilix",
-        "urxvt",
-        "st-256color",
-        "rio",
-        "contour",
-        "blackbox",
+        "ghostty",         "kitty",         "alacritty",      "foot",
+        "footclient",      "wezterm",       "konsole",        "terminal",
+        "console",         "xterm",         "uxterm",         "terminator",
+        "tilix",           "urxvt",         "rxvt",           "st",
+        "st-256color",     "rio",           "contour",        "blackbox",
+        "ptyxis",          "kgx",           "terminology",    "warp",
+        "tabby",           "hyper",         "lxterminal",     "qterminal",
+        "xfce4-terminal",  "mate-terminal", "gnome-terminal", "deepin-terminal",
+        "cool-retro-term", "sakura",        "termite",        "zutty",
     };
-    var lower_buffer: [128]u8 = undefined;
-    if (class.len > lower_buffer.len) return .ctrl_v;
-    const lower = std.ascii.lowerString(&lower_buffer, class);
-    for (terminals) |terminal| if (std.mem.find(u8, lower, terminal) != null) return .ctrl_shift_v;
+    var parts = std.mem.splitScalar(u8, class, '.');
+    while (parts.next()) |part| {
+        for (terminals) |terminal| {
+            if (std.ascii.eqlIgnoreCase(part, terminal)) return .ctrl_shift_v;
+        }
+    }
     return .ctrl_v;
 }
 
@@ -755,6 +764,8 @@ test "editors open at a line, terminal ones inside a terminal" {
     try std.testing.expectEqualStrings("-e", (try terminalPrefix(allocator, &.{"ghostty"}))[1]);
     const xfce = try terminalPrefix(allocator, &.{"/usr/bin/xfce4-terminal"});
     try std.testing.expectEqualStrings("-x", xfce[1]);
+    // tilix -e takes one word too (MYP-611); -x is gnome-terminal's.
+    try std.testing.expectEqualStrings("-x", (try terminalPrefix(allocator, &.{"tilix"}))[1]);
     const kitty_words = try words(allocator, "/usr/bin/kitty --single-instance");
     const kitty = try terminalPrefix(allocator, kitty_words);
     try std.testing.expectEqual(@as(usize, 2), kitty.len);
@@ -770,6 +781,16 @@ test "terminals get Ctrl+Shift+V, everything else Ctrl+V" {
     try std.testing.expectEqual(Chord.ctrl_v, pasteChord("discord"));
     try std.testing.expectEqual(Chord.ctrl_v, pasteChord("brave-browser"));
     try std.testing.expectEqual(Chord.ctrl_v, pasteChord(""));
+    // A part of the app id, not a substring (MYP-565).
+    for ([_][]const u8{
+        "org.gnome.Ptyxis",         "org.gnome.Ptyxis.Devel", "org.gnome.Terminal",
+        "com.gexperts.Tilix",       "XTerm",                  "footclient",
+        "org.kde.konsole",          "xfce4-terminal",         "dev.warp.Warp",
+        "com.raggesilver.BlackBox", "rio",
+    }) |terminal| try std.testing.expectEqual(Chord.ctrl_shift_v, pasteChord(terminal));
+    for ([_][]const u8{ "Mario", "org.gnome.Nautilus", "steam", "Postman", "firefox" }) |app| {
+        try std.testing.expectEqual(Chord.ctrl_v, pasteChord(app));
+    }
 }
 
 test "pasteFocused ignores stale focus callback generation" {
