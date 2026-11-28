@@ -540,6 +540,7 @@ test "pictures shutdown forgets lanes, drains queued requests, and rejects new r
         .path = try gpa.dupeSentinel(u8, "/tmp/nonexistent.png", 0),
         .width_px = 32,
         .height_px = 32,
+        .fit = .contain,
         .lane = &preview_lane,
         .generation = preview_lane.current(),
         .done = &Counter.cb,
