@@ -1,6 +1,7 @@
 //! Inline calculator for the search bar.
 //!
 //!   2 + 3 * 4        (1 + 2)^3       sqrt(16) + 2!      20% of 80
+//!   50 + 10%         0xff            pi + pi
 //!   10 km to mi      100 f in c      5 gb to mb         90 min to h
 //!
 //! `evaluate` returns null for anything that is not clearly a calculation, so
@@ -24,7 +25,10 @@ pub const Result = struct {
 
 pub fn evaluate(input: []const u8) ?Result {
     const text = std.mem.trim(u8, input, " \t");
-    if (text.len == 0 or !hasDigit(text)) return null;
+    if (text.len == 0) return null;
+    // A quick no for app names: a calculation has a digit, or an operator
+    // between constants and functions ("pi+pi", "sqrt(e)").
+    if (!hasDigit(text) and std.mem.findAny(u8, text, "+-*/^(") == null) return null;
     if (looksLikeIdentifier(text)) return null;
 
     if (splitConversion(text)) |conversion| return conversion;
@@ -124,16 +128,22 @@ fn lastIndexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
 
 // ---------------------------------------------------------------- formatting
 
-/// Formats for display: thousands separators and at most 4 decimals
-/// ("1,234.5", "6.2137"). Copying uses `formatPlain`, at full precision.
-/// Never writes past `display_buffer` (32 bytes always suffice; a shorter
-/// one may get a truncated result).
+/// Formats for display: thousands separators and at most 4 decimals, or
+/// 4 significant digits below 1 ("1,234.5", "6.2137", "0.0001429").
+/// Copying uses `formatPlain`, at full precision. Never writes past
+/// `display_buffer` (32 bytes always suffice; a shorter one may get a
+/// truncated result).
 pub fn formatDisplay(display_buffer: []u8, value: f64) []const u8 {
     var raw: [64]u8 = undefined;
-    // Below 1e15 (where formatPlain switches to exponents) and above 1e-4,
-    // fixed point with 4 decimals, rounded from the exact value.
-    const fixed_point = @abs(value) >= 1e-4 and @abs(value) < 1e15;
-    const plain = if (fixed_point) fixed4(&raw, value) else formatPlain(&raw, value);
+    // Within formatPlain's fixed-point range, fixed point rounded from the
+    // exact value: 4 decimals, more for small values (4 fixed decimals
+    // showed 1/7000 as "0.0001", one significant digit).
+    const fixed_point = @abs(value) >= plain_fixed_min and @abs(value) < plain_fixed_max;
+    const display_digits = 4;
+    const plain = if (fixed_point)
+        fixed(&raw, value, @max(display_digits, significantDecimals(value, display_digits)))
+    else
+        formatPlain(&raw, value);
     // Exponents, inf and nan are left alone.
     if (std.mem.findAny(u8, plain, "ein") != null) return copyInto(display_buffer, plain);
     const negative = plain.len > 0 and plain[0] == '-';
@@ -160,9 +170,11 @@ pub fn formatDisplay(display_buffer: []u8, value: f64) []const u8 {
     return display_buffer[0..written];
 }
 
-/// "{d:.4}" without trailing zeros: "1234.5", "6.2137", "-3".
-fn fixed4(text_buffer: []u8, value: f64) []const u8 {
-    const text = std.mem.print(text_buffer, "{d:.4}", .{value}) catch return "?";
+/// `value` in fixed point with `decimals` decimals, without trailing zeros:
+/// "1234.5", "6.2137", "-3".
+fn fixed(text_buffer: []u8, value: f64, decimals: usize) []const u8 {
+    const text = std.mem.print(text_buffer, "{[0]d:.[1]}", .{ value, decimals }) catch
+        return "?";
     var end = text.len;
     if (std.mem.findScalar(u8, text, '.') != null) {
         while (text[end - 1] == '0') end -= 1;
@@ -173,11 +185,31 @@ fn fixed4(text_buffer: []u8, value: f64) []const u8 {
     return text[0..end];
 }
 
+/// The decimals that show `digits` significant digits of `value`, which is
+/// finite and nonzero: 2 for 3.14 with 3 digits, 7 for 0.0001429 with 4.
+fn significantDecimals(value: f64, digits: usize) usize {
+    assert(std.math.isFinite(value) and value != 0);
+    const magnitude: i32 = @intFromFloat(@floor(@log10(@abs(value))));
+    const decimals = @as(i32, @intCast(digits)) - 1 - magnitude;
+    return @intCast(@max(decimals, 0));
+}
+
 /// Largest integer every consecutive integer up to it is exact in f64 (2^53).
 const exact_int_max: f64 = 9007199254740992.0;
 
-/// Formats for copying: no separators, no trailing zeros: "1234.5", with full
-/// round-trip precision for scientific notation and exact integers up to 2^53.
+/// `formatPlain` writes fixed point from here up to `plain_fixed_max`,
+/// exponents outside.
+const plain_fixed_min = 1e-6;
+const plain_fixed_max = 1e15;
+
+/// Significant digits copied: all an f64 holds for certain. 10 fixed
+/// decimals copied binary noise (19.99 * 100000 as 1998999.9999999998)
+/// and cut small values short (1/300000 as 0.0000033333).
+const plain_digits = 15;
+
+/// Formats for copying: no separators, no trailing zeros: "1234.5", with 15
+/// significant digits in fixed point, and full round-trip precision for
+/// scientific notation and exact integers up to 2^53.
 pub fn formatPlain(plain_buffer: []u8, value: f64) []const u8 {
     if (!std.math.isFinite(value)) {
         return std.mem.print(plain_buffer, "{d}", .{value}) catch "?";
@@ -188,14 +220,10 @@ pub fn formatPlain(plain_buffer: []u8, value: f64) []const u8 {
     if (value == @trunc(value) and @abs(value) <= exact_int_max) {
         return std.mem.print(plain_buffer, "{d}", .{@as(i64, @intFromFloat(value))}) catch "?";
     }
-    if (@abs(value) >= 1e15 or @abs(value) < 1e-6) {
+    if (@abs(value) >= plain_fixed_max or @abs(value) < plain_fixed_min) {
         return std.mem.print(plain_buffer, "{e}", .{value}) catch "?";
     }
-    const text = std.mem.print(plain_buffer, "{d:.10}", .{value}) catch return "?";
-    var end = text.len;
-    while (end > 0 and text[end - 1] == '0') end -= 1;
-    if (end > 0 and text[end - 1] == '.') end -= 1;
-    return text[0..end];
+    return fixed(plain_buffer, value, significantDecimals(value, plain_digits));
 }
 
 fn copyInto(destination: []u8, text: []const u8) []const u8 {
@@ -285,8 +313,84 @@ test "formatting" {
     try std.testing.expectEqualStrings("1,234,567", formatDisplay(&text_buffer, 1234567));
     try std.testing.expectEqualStrings("-1,234.5", formatDisplay(&text_buffer, -1234.5));
     try std.testing.expectEqualStrings("6.2137", formatDisplay(&text_buffer, 6.2137119223733395));
-    try std.testing.expectEqualStrings("0.3333333333", formatPlain(&text_buffer, 1.0 / 3.0));
+    try std.testing.expectEqualStrings("0.333333333333333", formatPlain(&text_buffer, 1.0 / 3.0));
     try std.testing.expectEqualStrings("42", formatPlain(&text_buffer, 42));
+    // What is copied is what is shown, never binary noise (MYP-532).
+    for ([_]struct { []const u8, []const u8, []const u8 }{
+        .{ "19.99 * 100000", "1,999,000", "1999000" },
+        .{ "1.005 * 1000000", "1,005,000", "1005000" },
+        .{ "0.1 + 0.2", "0.3", "0.3" },
+    }) |case| {
+        const input, const shown, const copied = case;
+        const value = evaluate(input).?.value;
+        try std.testing.expectEqualStrings(shown, formatDisplay(&text_buffer, value));
+        try std.testing.expectEqualStrings(copied, formatPlain(&text_buffer, value));
+    }
+    // Small values keep 4 significant digits on screen and 15 when copied
+    // (MYP-459).
+    try std.testing.expectEqualStrings("0.0001429", formatDisplay(&text_buffer, 1.0 / 7000.0));
+    try std.testing.expectEqualStrings("0.00008333", formatDisplay(&text_buffer, 1.0 / 12000.0));
+    try std.testing.expectEqualStrings("0.1235", formatDisplay(&text_buffer, 0.123456));
+    try std.testing.expectEqualStrings(
+        "0.00000333333333333333",
+        formatPlain(&text_buffer, 1.0 / 300000.0),
+    );
+    try std.testing.expectEqualStrings(
+        "0.000142857142857143",
+        formatPlain(&text_buffer, 1.0 / 7000.0),
+    );
+}
+
+test "percentages: of a value, or added to and taken from it" {
+    try expectValue("50 + 10%", 55);
+    try expectValue("200 - 25%", 150);
+    try expectValue("50 + 10% ", 55);
+    try expectValue("100 + 21% - 10", 111);
+    try expectValue("50 - -10%", 55);
+    // Elsewhere "%" divides by 100.
+    try expectValue("100 * 10%", 10);
+    try expectValue("20% of 80", 16);
+    try expectValue("50 + 10% of 20", 52);
+    try expectValue("50 + 100 * 10%", 60);
+    try expectValue("50 + (10%)", 50.1);
+    try expectValue("10% + 1", 1.1);
+}
+
+test "hex literals and expressions of constants alone" {
+    try expectValue("0xff", 255);
+    try expectValue("0b101", 5);
+    try expectValue("pi+pi", 2 * std.math.pi);
+    try expectValue("sqrt(e)", @sqrt(std.math.e));
+    try std.testing.expect(evaluate("e e") == null);
+    try std.testing.expect(evaluate("pi-hole") == null);
+    try std.testing.expect(evaluate("3.5") == null);
+    try std.testing.expect(evaluate("e%") == null);
+}
+
+test "thousands separators only in the integer part" {
+    try expectValue("1,234.567 + 1", 1235.567);
+    try expectValue("1,234,567 * 1", 1234567);
+    try expectValue("1,000e3 + 0", 1e6);
+    try std.testing.expect(evaluate("1.234,567 + 1") == null);
+    try std.testing.expect(evaluate("1e3,000 + 1") == null);
+}
+
+test "only rounding dust cancels to zero" {
+    var plain_buf: [64]u8 = undefined;
+    // Real differences far below the operands (MYP-458), as near as f64
+    // gets them (1000 - 999.9999999999 is 1.00004e-10).
+    for ([_]struct { []const u8, f64 }{
+        .{ "1000 - 999.9999999999", 1e-10 },
+        .{ "100 - 99.99999999999", 1e-11 },
+        .{ "1 - 0.999999999999", 1e-12 },
+        .{ "32.0000000001 f to c", 1e-10 / 1.8 },
+    }) |case| {
+        const input, const want = case;
+        try std.testing.expectApproxEqRel(want, evaluate(input).?.value, 1e-3);
+    }
+    for ([_][]const u8{ "1000 - 999.9999999999", "1 - 0.999999999999" }) |expr| {
+        try std.testing.expect(!std.mem.eql(u8, "0", formatPlain(&plain_buf, evaluate(expr).?.value)));
+    }
 }
 
 /// `text` repeated `count` times, at comptime (Zig 0.17 has no `**`).

@@ -12,6 +12,10 @@ const Error = error{ Syntax, Domain, TooDeep };
 /// pasting 100k "(" must not overflow the stack.
 const depth_max = 64;
 
+/// What `cleanNearZero` takes for rounding dust, relative to the operands:
+/// 8 ulps of a value (an ulp is 2^-52 of it, at most).
+const near_zero_ulps = 0x1p-49;
+
 /// The largest n whose n! fits an f64 (171! is inf).
 const factorial_argument_max = 170;
 
@@ -25,6 +29,9 @@ pub const Parser = struct {
     saw_operator: bool = false,
     /// Parse levels entered and not yet left, up to `depth_max`.
     depth: u32 = 0,
+    /// Where the last factor that ended in a "%" postfix ended (spaces
+    /// after it included), so `parseTerm` can tell "10%" from "10".
+    percent_end: ?usize = null,
 
     pub fn skipSpaces(parser: *Parser) void {
         while (parser.offset < parser.source.len and parser.source[parser.offset] == ' ') {
@@ -49,31 +56,39 @@ pub const Parser = struct {
 
     /// Zeroes out rounding dust left by subtracting nearly equal values
     /// (e.g. `sqrt(2)^2 - 2`, `0.1 + 0.2 - 0.3`), without affecting small
-    /// nonzero results from products or quotients.
+    /// nonzero results from products or quotients. Dust is a few ulps of
+    /// `scale`: a threshold of `scale * 1e-12`, thousands of ulps, also
+    /// zeroed real differences such as `1000 - 999.9999999999` (1e-10).
     pub fn cleanNearZero(result: f64, scale: f64) f64 {
         if (std.math.isFinite(result) and std.math.isFinite(scale) and
-            scale > 0 and @abs(result) <= scale * 1e-12)
+            scale > 0 and @abs(result) <= scale * near_zero_ulps)
         {
             return 0;
         }
         return result;
     }
 
-    /// Parses `expression := term (('+' | '-') term)*`.
+    /// Parses `expression := term (('+' | '-') term)*`. A term that is a
+    /// percentage alone adds or takes that share of the value so far, as
+    /// other calculators do: "50 + 10%" is 55 and "200 - 25%" is 150.
+    /// Elsewhere "%" divides by 100: "100 * 10%" is 10, "20% of 80" is 16.
     pub fn parseExpression(parser: *Parser) Error!f64 {
-        var value = try parser.parseTerm();
+        var percent = false;
+        var value = try parser.parseTerm(&percent);
         while (true) {
             switch (parser.peek()) {
                 '+' => {
                     parser.offset += 1;
                     parser.saw_operator = true;
-                    const rhs = try parser.parseTerm();
+                    var rhs = try parser.parseTerm(&percent);
+                    if (percent) rhs *= value;
                     value = cleanNearZero(value + rhs, @max(@abs(value), @abs(rhs)));
                 },
                 '-' => {
                     parser.offset += 1;
                     parser.saw_operator = true;
-                    const rhs = try parser.parseTerm();
+                    var rhs = try parser.parseTerm(&percent);
+                    if (percent) rhs *= value;
                     value = cleanNearZero(value - rhs, @max(@abs(value), @abs(rhs)));
                 },
                 else => return value,
@@ -82,8 +97,10 @@ pub const Parser = struct {
     }
 
     /// Parses `term := power (('*' | '/' | 'mod' | 'of' | implicit) power)*`.
-    fn parseTerm(parser: *Parser) Error!f64 {
+    /// `percent` says whether the term was a single factor ending in "%".
+    fn parseTerm(parser: *Parser, percent: *bool) Error!f64 {
         var value = try parser.parseUnary();
+        percent.* = parser.percent_end == parser.offset;
         while (true) {
             const next = parser.peek();
             if (next == '*' or next == '/') {
@@ -113,6 +130,8 @@ pub const Parser = struct {
             } else {
                 return value;
             }
+            // Another factor came: not a percentage alone ("100*10%").
+            percent.* = false;
         }
     }
 
@@ -179,6 +198,9 @@ pub const Parser = struct {
                     parser.offset += 1;
                     parser.saw_operator = true;
                     value /= 100;
+                    // Past the spaces after it, where the factor ends.
+                    parser.skipSpaces();
+                    parser.percent_end = parser.offset;
                 },
                 else => return value,
             }
@@ -211,14 +233,25 @@ pub const Parser = struct {
             parser.skipWhile(std.ascii.isAlphanumeric);
             const digits = parser.source[digits_start..parser.offset];
             const integer = std.fmt.parseInt(i64, digits, radix) catch return error.Syntax;
+            // "0xff" alone is a calculation: its answer is 255.
+            parser.saw_operator = true;
             return @floatFromInt(integer);
         }
+        // Thousands separators belong to the integer part: "1.234,567" is
+        // not 1.234567 (it reads as no number at all).
+        var integer_part = true;
         while (parser.offset < parser.source.len) : (parser.offset += 1) {
             const char = parser.source[parser.offset];
-            if (std.ascii.isDigit(char) or char == '.' or char == '_') continue;
+            if (std.ascii.isDigit(char) or char == '_') continue;
+            if (char == '.') {
+                integer_part = false;
+                continue;
+            }
             // Thousands separator only when followed by exactly three digits.
-            if (char == ',' and isThreeDigits(parser.source[parser.offset + 1 ..])) continue;
+            if (char == ',' and integer_part and
+                isThreeDigits(parser.source[parser.offset + 1 ..])) continue;
             if ((char == 'e' or char == 'E') and parser.startsExponent()) {
+                integer_part = false;
                 parser.offset += 1;
                 continue;
             }

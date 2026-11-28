@@ -22,7 +22,7 @@ your machine.
 | | |
 |---|---|
 | **Apps** | every installed app, fuzzy search that learns what you open most |
-| **Calculator** | `2+3*4`, `(1+2)^3`, `sqrt(16)`, `5!`, `20% of 80`, `0xff`, and units: `10 km to mi`, `100 f in c`, `5 gb to mb` |
+| **Calculator** | `2+3*4`, `(1+2)^3`, `sqrt(16)`, `5!`, `20% of 80`, `50 + 10%`, `0xff`, and units: `10 km to mi`, `100 f in c`, `5 gb to mb` |
 | **Clipboard history** | text you copy, with a preview; paste it straight into the app you came from |
 | **Search files** | everything in your home folder, kept up to date as files change, with image and text previews |
 | **Search file contents** | text inside code, notes, PDFs and Office documents; jump to the matching line in your editor |
