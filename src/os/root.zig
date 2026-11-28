@@ -14,6 +14,7 @@
 //! - `wait.zig`: waiting on a descriptor or for a child to exit.
 //! - `unix.zig`: Unix sockets, reads and writes with a deadline.
 //! - `child.zig`: programs run to a deadline, fed stdin, output collected.
+//! - `sandbox.zig`: those run on untrusted input, confined.
 //! - `test_dir.zig`: temporary folders for tests.
 
 const std = @import("std");
@@ -28,6 +29,7 @@ const test_dir = @import("test_dir.zig");
 
 pub const unix = @import("unix.zig");
 pub const child = @import("child.zig");
+pub const sandbox = @import("sandbox.zig");
 
 pub const Error = syscall.Error;
 pub const close = syscall.close;

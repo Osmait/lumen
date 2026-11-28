@@ -468,11 +468,12 @@ fn runTool(
         .at_cap = .kill,
         .deadline_ns = sys.monotonicNs() + limit_ms * std.time.ns_per_ms,
         .cancel = cancel,
-        // The documents are anyone's (a download): a crafted one must not
-        // take the machine's memory or CPU, nor grow a file. Limits only,
-        // not a sandbox: code run by an exploited tool can still delete or
-        // empty the user's files, open sockets and reach the session bus.
-
+        // The documents are anyone's (a download): code run by a tool a
+        // crafted one exploits must not write, remove or empty the user's
+        // files, open sockets (the network, the session bus) or touch other
+        // processes, as far as the kernel's Landlock and seccomp allow.
+        .sandbox = true,
+        // Nor take the machine's memory or CPU.
         .limits = .{
             .memory_bytes_max = tool_memory_bytes_max,
             // Not from `limit_ms`: CPU time is what the document costs, the
@@ -1542,6 +1543,37 @@ test "runTool: size cap and timeout kill the tool" {
         ));
         try testing.expect(sys.monotonicNs() - canceled_start_ns < 2 * std.time.ns_per_s);
     }
+}
+
+test "runTool: an exploited tool cannot remove or empty the user's files" {
+    // What MYP-569 showed a crafted document could do: `sh` stands for the
+    // code it runs, under the same runTool.
+    if (sys.sandbox.landlockAbi() == 0) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var test_dir: TestDir = undefined;
+    try test_dir.init();
+    defer test_dir.deinit();
+    try test_dir.write("victim.txt", "keep");
+    try test_dir.write("other.txt", "keep too");
+    const input_path = try test_dir.absZ("victim.txt");
+    defer gpa.free(input_path);
+    const input = try sys.openRegular(input_path);
+    defer sys.close(input);
+    const script = try std.fmt.allocPrint(
+        gpa,
+        "rm -f '{0s}/victim.txt'; true > '{0s}/other.txt'; cat /dev/stdin",
+        .{test_dir.absolute},
+    );
+    defer gpa.free(script);
+    const read = try runTool(gpa, testing.io, &.{ "sh", "-c", script }, input, 1000, &.{0}, 10_000, null);
+    defer gpa.free(read);
+    // It still reads its document.
+    try testing.expectEqualStrings("keep", read);
+    var head_buffer: [64]u8 = undefined;
+    try testing.expectEqualStrings("keep", sys.readHead(input_path, &head_buffer));
+    const other_path = try test_dir.absZ("other.txt");
+    defer gpa.free(other_path);
+    try testing.expectEqualStrings("keep too", sys.readHead(other_path, &head_buffer));
 }
 
 fn fuzzXml(_: void, smith: *testing.Smith) anyerror!void {

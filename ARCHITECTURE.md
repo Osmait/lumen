@@ -212,6 +212,19 @@ directory (2.8 s cold) and every core.
   yet are kept). unzip gets `-P ''`, so an encrypted member fails instead
   of prompting.
 
+- **Extractors are confined** (`src/os/sandbox.zig`): the documents are
+  anyone's (a download), and poppler and unzip have had memory-corruption
+  bugs. Each tool is forked by hand and, before its exec, takes no new
+  privileges, a Landlock ruleset (no file or folder created, written,
+  truncated, removed or renamed anywhere, no TCP, no signal or abstract
+  socket outside it) and a seccomp filter (no socket at all, so neither the
+  network nor the session bus; no ptrace, io_uring, chmod/chown/xattrs),
+  plus its memory and CPU limits, a session of its own and an empty
+  environment. Reads stay open (libraries, fonts and data live wherever the
+  distribution put them; what is read only reaches Lumen's pipe). Each part
+  is skipped on a kernel without it, never failing the extraction; the
+  oldest kernels keep only the limits.
+
 - **Format**: one mapped file (`~/.cache/lumen/content.idx`): document table
   (path, mtime, size, ctime) and segments of sorted trigram keys with varint-delta
   posting lists. Building dedups each file's trigrams with a 16M-bit map and

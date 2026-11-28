@@ -1,11 +1,12 @@
 //! Run a program, feed it stdin, collect its output, never wait past a
 //! deadline: `lumen.exec` for extensions, and the tools text extraction
-//! runs (pdftotext, unzip).
+//! runs (pdftotext, unzip), those confined (`sandbox.zig`).
 
 const std = @import("std");
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const os = @import("root.zig");
+const sandbox = @import("sandbox.zig");
 
 pub const Stdin = union(enum) {
     /// Written while the output is read, so a program that answers before
@@ -33,16 +34,21 @@ pub const Options = struct {
     cancel: ?*const std.atomic.Value(bool) = null,
     /// Put on the program as soon as it is started: for tools run on
     /// untrusted input (a crafted PDF), whose memory and CPU must not reach
-    /// the rest of the machine. Resource limits, not a sandbox: they keep a
-    /// file from growing, not from being deleted, emptied or renamed, and
-    /// leave sockets open to it. Null: none.
+    /// the rest of the machine. Resource limits only: they keep a file from
+    /// growing, not from being deleted, emptied or renamed (`sandbox`).
+    /// Null: none.
     limits: ?Limits = null,
+    /// Confined (`sandbox.zig`): no file written or removed, no socket, no
+    /// other process touched, as far as the kernel allows; the limits are
+    /// then set before exec. Needs `environ = .empty`.
+    sandbox: bool = false,
 };
 
 /// Resource limits for a program (`Options.limits`), set with prlimit right
-/// after it starts: std.process.spawn runs nothing in the child before
-/// exec. Lowering a limit below what the program uses already only makes
-/// its next allocations fail, which is what is wanted.
+/// after it starts (std.process.spawn runs nothing in the child before
+/// exec), or by a confined program itself before its exec. Lowering a limit
+/// below what the program uses already only makes its next allocations
+/// fail, which is what is wanted.
 pub const Limits = struct {
     /// RLIMIT_AS: its whole address space.
     memory_bytes_max: u64,
@@ -55,9 +61,10 @@ pub const Limits = struct {
     nice: i32 = 10,
 };
 
-/// Applies `limits` to process `pid`. Best effort: a limit that cannot be
-/// set (an old kernel) leaves the deadline and the output cap in force.
-fn applyLimits(pid: linux.pid_t, limits: Limits) void {
+/// Applies `limits` to process `pid` (0: the caller). Best effort: a limit
+/// that cannot be set (an old kernel) leaves the deadline and the output
+/// cap in force. Raw system calls only: a forked child calls it before exec.
+pub fn applyLimits(pid: linux.pid_t, limits: Limits) void {
     const pairs = [_]struct { linux.rlimit_resource, u64 }{
         .{ .AS, limits.memory_bytes_max },
         .{ .CPU, limits.cpu_s_max },
@@ -130,7 +137,7 @@ pub fn run(
     // `cmd | head` would then run on to the deadline. The empty handler is
     // reset by execve.
     os.unix.ignoreSigpipe();
-    var child = try std.process.spawn(io, .{
+    var child = if (options.sandbox) try sandbox.spawn(gpa, argv, &options) else try std.process.spawn(io, .{
         .argv = argv,
         .environ_map = if (options.environ == .empty) &empty_environment else null,
         .stdin = switch (options.stdin) {
@@ -143,7 +150,7 @@ pub fn run(
         .pgid = 0,
     });
     const pid = child.id.?;
-    if (options.limits) |limits| applyLimits(pid, limits);
+    if (!options.sandbox) if (options.limits) |limits| applyLimits(pid, limits);
     // Readable once the program exits. Without one (an old kernel, no free
     // descriptor), the pump looks with waitid instead.
     const pidfd = os.openPidfd(pid);
