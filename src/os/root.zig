@@ -84,6 +84,10 @@ pub const sleepUs = time.sleepUs;
 
 pub const waitExit = wait.waitExit;
 pub const waitExitCancelable = wait.waitExitCancelable;
+pub const waitExitPolling = wait.waitExitPolling;
+pub const openPidfd = wait.openPidfd;
+pub const ChildState = wait.ChildState;
+pub const childState = wait.childState;
 pub const EventWait = wait.EventWait;
 pub const waitEvents = wait.waitEvents;
 pub const waitEventsTimeout = wait.waitEventsTimeout;
