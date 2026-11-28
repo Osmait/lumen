@@ -92,6 +92,12 @@ pub fn reloadSettings(ui: *Ui) void {
 
 /// Writes the settings; what init.lua fixes keeps its value in the file.
 pub fn saveSettings(ui: *Ui) void {
+    saveSettingsPatch(ui, .all);
+}
+
+/// Applies a single targeted change onto the latest `settings.conf` on disk so
+/// external edits made while Settings is open are preserved.
+pub fn saveSettingsPatch(ui: *Ui, patch: Settings.Patch) void {
     var kept: [kept_keys_max][]const u8 = undefined;
     var kept_count: usize = 0;
     if (ui.ext_registry) |registry| {
@@ -109,14 +115,16 @@ pub fn saveSettings(ui: *Ui) void {
             kept_count += 1;
         }
     }
-    ui.settings.save(
+    ui.settings.savePatch(
         ui.gpa,
         ui.settings_path,
         kept[0..kept_count],
+        patch,
     ) catch |err| {
         log.warn("saving settings: {t}", .{err});
         ui.showFailure("Could not save the settings");
     };
+    applyOverrides(ui);
     ui.settings_stamp = settings_mod.Stamp.of(ui.settings_path.ptr);
     applyAppearance(ui, null);
     window_layout.applyLayout(ui);

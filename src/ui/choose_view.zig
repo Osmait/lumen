@@ -98,12 +98,14 @@ pub fn pick(ui: *Ui, value: [:0]const u8) void {
     switch (ui.choosing) {
         .setting => |choice| {
             _ = ui.settings.setChoice(choice, value);
-            config.saveSettings(ui);
+            config.saveSettingsPatch(ui, .{ .choice = .{ .key = choice, .value = value } });
             ui.goBack();
         },
         .kind => |kind| {
             if (ui.settings.setOpenWith(@tagName(kind), value)) {
-                config.saveSettings(ui);
+                config.saveSettingsPatch(ui, .{
+                    .open_with = .{ .key = @tagName(kind), .value = value },
+                });
             } else |err| {
                 log.warn("default app for {t}: {t}", .{ kind, err });
             }
@@ -512,7 +514,7 @@ pub fn openWith(ui: *Ui, id: [:0]const u8, choice: OpenWithChoice) void {
             core.file_kind.extensionKey(&extension_bytes, name);
         if (key.len > 0) {
             if (ui.settings.setOpenWith(key, id)) {
-                config.saveSettings(ui);
+                config.saveSettingsPatch(ui, .{ .open_with = .{ .key = key, .value = id } });
             } else |err| {
                 log.warn("default app for {s}: {t}", .{ key, err });
             }

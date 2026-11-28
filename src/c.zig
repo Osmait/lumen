@@ -465,6 +465,10 @@ pub extern fn g_subprocess_launcher_setenv(
     value: [*:0]const u8,
     overwrite: gboolean,
 ) void;
+pub extern fn g_subprocess_launcher_unsetenv(
+    launcher: *GSubprocessLauncher,
+    variable: [*:0]const u8,
+) void;
 pub extern fn g_subprocess_launcher_spawnv(
     launcher: *GSubprocessLauncher,
     argv: [*]const ?[*:0]const u8,
@@ -835,6 +839,8 @@ pub extern fn gtk_layer_set_exclusive_zone(window: *GtkWindow, zone: c_int) void
 
 pub const G_IO_IN: c_uint = 1;
 pub const G_IO_OUT: c_uint = 4;
+pub const G_IO_ERR: c_uint = 8;
+pub const G_IO_HUP: c_uint = 16;
 pub const GUnixFDSourceFunc = *const fn (
     fd: c_int,
     condition: c_uint,

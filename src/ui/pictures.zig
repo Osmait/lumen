@@ -206,6 +206,8 @@ const RequestQueue = struct {
 var waiting: RequestQueue = .{};
 var waiting_gpa: ?std.mem.Allocator = null;
 var decoding = false;
+var shutting_down: std.atomic.Value(bool) = .init(false);
+var in_flight: std.atomic.Value(u32) = .init(0);
 
 /// Where a request joins the queue: a preview goes ahead of what waits
 /// (it is what is being looked at), grid pictures behind.
@@ -227,6 +229,7 @@ pub fn requestPicture(
     // A size of 0 would make the decoder scale to nothing.
     assert(width_px > 0);
     assert(height_px > 0);
+    if (shutting_down.load(.acquire)) return done(context, null, false);
     if (waiting_gpa == null) waiting_gpa = gpa;
     const queue_gpa = waiting_gpa.?;
     // Out of memory: as good as dropped (nothing is learnt about the file).
@@ -261,6 +264,7 @@ fn startNext() void {
             continue;
         }
         decoding = true;
+        _ = in_flight.fetchAdd(1, .acq_rel);
         const task = c.g_task_new(null, null, &onDecoded, request);
         c.g_task_set_task_data(task, request, null);
         c.g_task_run_in_thread(task, &decodeRequest);
@@ -274,13 +278,14 @@ fn decodeRequest(
     data: ?*anyopaque,
     _: ?*c.GCancellable,
 ) callconv(.c) void {
+    defer _ = in_flight.fetchSub(1, .acq_rel);
     const request: *Request = @ptrCast(@alignCast(data.?));
-    // Its lane moved on while it waited for a thread.
-    if (request.generation != request.lane.current()) {
+    // Its lane moved on while it waited for a thread, or the daemon is closing.
+    if (shutting_down.load(.acquire) or request.generation != request.lane.current()) {
         return c.g_task_return_pointer(task, null, null);
     }
     const pixbuf = decodeImage(
-        request.gpa,
+        std.heap.c_allocator,
         request.path.ptr,
         request.width_px,
         request.height_px,
@@ -299,6 +304,10 @@ fn onDecoded(_: ?*c.GObject, result: *c.GAsyncResult, data: ?*anyopaque) callcon
     decoding = false;
     const pixbuf: ?*c.GdkPixbuf = @ptrCast(c.g_task_propagate_pointer(@ptrCast(result), null));
     defer unrefObject(pixbuf);
+    if (shutting_down.load(.acquire)) {
+        finishRequest(request, null, false);
+        return;
+    }
     finishRequest(request, pixbuf, request.generation == request.lane.current());
     startNext();
 }
@@ -307,12 +316,18 @@ fn onDecoded(_: ?*c.GObject, result: *c.GAsyncResult, data: ?*anyopaque) callcon
 /// worker results are ignored once the UI tears down. Main thread.
 pub fn shutdown() void {
     os.assertMainThread();
+    shutting_down.store(true, .release);
     preview_lane.forget();
     grid_lane.forget();
     icon_lane.forget();
     while (waiting.popFront()) |request| {
         finishRequest(request, null, false);
     }
+    const deadline_ns = os.monotonicNs() + 2 * std.time.ns_per_s;
+    while (in_flight.load(.acquire) > 0 and os.monotonicNs() < deadline_ns) {
+        os.sleepUs(1_000);
+    }
+    decoding = false;
     if (waiting_gpa) |queue_gpa| waiting.deinit(queue_gpa);
     waiting_gpa = null;
 }
@@ -381,7 +396,8 @@ test {
     _ = image_size;
 }
 
-test "pictures shutdown forgets lanes and drains queued requests" {
+test "pictures shutdown forgets lanes, drains queued requests, and rejects new requests" {
+    defer shutting_down.store(false, .release);
     const Counter = struct {
         called: usize = 0,
         last_current: bool = true,
@@ -412,6 +428,12 @@ test "pictures shutdown forgets lanes and drains queued requests" {
     try std.testing.expectEqual(@as(usize, 0), waiting.len);
     try std.testing.expectEqual(@as(usize, 1), counter.called);
     try std.testing.expect(!counter.last_current);
+
+    // Requests arriving after shutdown invoke callback immediately without queuing.
+    requestPicture(gpa, "/tmp/nonexistent.png", 32, 32, &preview_lane, .front, &Counter.cb, &counter);
+    try std.testing.expectEqual(@as(usize, 2), counter.called);
+    try std.testing.expect(!counter.last_current);
+    try std.testing.expectEqual(@as(usize, 0), waiting.len);
 }
 
 test "RequestQueue ring buffer preserves front/back ordering across wrap-around and growth" {

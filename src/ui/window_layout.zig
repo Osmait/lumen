@@ -591,7 +591,7 @@ fn onKeyReleased(
     data: ?*anyopaque,
 ) callconv(.c) void {
     const ui: *Ui = @ptrCast(@alignCast(data));
-    if (keyval == c.GDK_KEY_BackSpace) ui.backspace_blocked = false;
+    keyboard.handleKeyReleased(ui, keyval);
 }
 
 test "style.css has the sizes the window computes with" {

@@ -61,6 +61,9 @@ const Job = struct {
     work: core.FixedStr(std.Io.Dir.max_path_bytes) = .{},
     /// Cancels the read of the output when `timer` fires.
     cancellable: *c.GCancellable,
+    /// Cancels `g_subprocess_wait_async` only on daemon shutdown, never on
+    /// timeout, so `onDone` waits for the killed process to exit before `rm -rf`.
+    wait_cancellable: *c.GCancellable,
     /// `job_timeout_s` from the start; 0 once fired or removed.
     timer: c_uint = 0,
     timed_out: bool = false,
@@ -132,6 +135,7 @@ pub fn shutdown() void {
             job.timer = 0;
         }
         c.g_cancellable_cancel(job.cancellable);
+        c.g_cancellable_cancel(job.wait_cancellable);
         killJobGroup(job.subprocess);
         if (job.caller) |command_line| {
             c.g_application_command_line_set_exit_status(command_line, 1);
@@ -464,8 +468,9 @@ fn gitCloneArgv(
 /// Single-extension update script: refuses to walk up into a parent git
 /// repository when the extension folder itself is not a git worktree root.
 const update_one_script =
+    \\unset CDPATH
     \\top=$(git -C "$1" rev-parse --show-toplevel 2>/dev/null) || { printf '%s is not a git repository\n' "$2"; exit 1; }
-    \\dir=$(cd "$1" && pwd -P) || exit 1
+    \\dir=$(cd -- "$1" && pwd -P) || exit 1
     \\if [ "$top" != "$dir" ]; then
     \\  printf '%s is not a git repository\n' "$2"
     \\  exit 1
@@ -680,16 +685,17 @@ pub fn update(ui: *Ui, caller: ?*c.GApplicationCommandLine, name: ?[]const u8) v
     ) catch return fail(ui, caller, "path too long", .{});
     var argv = [_:null]?[*:0]const u8{
         "sh",           "-c",
-        \\cd "$1" || exit 1
+        \\unset CDPATH
+        \\cd -- "$1" || exit 1
         \\file_allow=${2:-never}
         \\status=0
         \\for d in */; do
-        \\  [ -e "$d.git" ] || continue
-        \\  [ "$(git -C "$d" rev-parse --show-toplevel 2>/dev/null)" = "$(cd "$d" && pwd -P)" ] || continue
+        \\  [ -e "./${d}.git" ] || continue
+        \\  [ "$(git -C "./$d" rev-parse --show-toplevel 2>/dev/null)" = "$(cd -- "./$d" && pwd -P)" ] || continue
         \\  printf '%s: ' "${d%/}"
-        \\  before=$(git -C "$d" rev-parse HEAD 2>/dev/null)
-        \\  if git -C "$d" -c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always -c "protocol.file.allow=$file_allow" -c submodule.recurse=false pull --ff-only --quiet; then
-        \\    after=$(git -C "$d" rev-parse HEAD 2>/dev/null)
+        \\  before=$(git -C "./$d" rev-parse HEAD 2>/dev/null)
+        \\  if git -C "./$d" -c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always -c "protocol.file.allow=$file_allow" -c submodule.recurse=false pull --ff-only --quiet; then
+        \\    after=$(git -C "./$d" rev-parse HEAD 2>/dev/null)
         \\    if [ "$after" = "$before" ]; then
         \\      echo up to date
         \\    else
@@ -754,6 +760,7 @@ fn start(
     c.g_subprocess_launcher_setenv(launcher, "GIT_TERMINAL_PROMPT", "0", 1);
     c.g_subprocess_launcher_setenv(launcher, "GIT_SSH_COMMAND", "ssh -oBatchMode=yes", 1);
     c.g_subprocess_launcher_setenv(launcher, "LC_ALL", "C", 1);
+    c.g_subprocess_launcher_unsetenv(launcher, "CDPATH");
     c.g_subprocess_launcher_set_child_setup(launcher, &childSetSid, null, null);
     var err: ?*c.GError = null;
     const subprocess = c.g_subprocess_launcher_spawnv(launcher, argv, &err) orelse {
@@ -775,6 +782,7 @@ fn start(
         .subprocess = subprocess,
         .kind = kind,
         .cancellable = c.g_cancellable_new(),
+        .wait_cancellable = c.g_cancellable_new(),
     };
     job.name.set(name);
     // extensionFolder builds them in buffers of this size: they always fit.
@@ -792,7 +800,7 @@ fn start(
 
 fn readOutput(job: *Job) void {
     const stdout = c.g_subprocess_get_stdout_pipe(job.subprocess) orelse {
-        c.g_subprocess_wait_async(job.subprocess, job.cancellable, &onDone, job);
+        c.g_subprocess_wait_async(job.subprocess, job.wait_cancellable, &onDone, job);
         return;
     };
     c.g_input_stream_read_async(
@@ -831,17 +839,22 @@ fn onOutput(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) ca
         // failed read closes the pipe, or a program still writing would block
         // on it and never exit.
         if (err != null or shutting_down) _ = c.g_input_stream_close(stdout, null, null);
-        proc.warnError(.install, err, "reading {s}'s output", .{@tagName(job.kind)});
+        if (job.timed_out) {
+            if (err) |gerror| c.g_error_free(gerror);
+        } else {
+            proc.warnError(.install, err, "reading {s}'s output", .{@tagName(job.kind)});
+        }
     }
     if (shutting_down) {
         if (job.timer != 0) _ = c.g_source_remove(job.timer);
         c.g_object_unref(job.cancellable);
+        c.g_object_unref(job.wait_cancellable);
         c.g_object_unref(job.subprocess);
         if (job.caller) |command_line| c.g_object_unref(command_line);
         job.ui.gpa.destroy(job);
         return;
     }
-    c.g_subprocess_wait_async(job.subprocess, job.cancellable, &onDone, job);
+    c.g_subprocess_wait_async(job.subprocess, job.wait_cancellable, &onDone, job);
 }
 
 /// What the job printed, as UTF-8 (U+FFFD for what is not, NUL included):
@@ -863,6 +876,7 @@ fn onDone(_: ?*c.GObject, async_result: *c.GAsyncResult, data: ?*anyopaque) call
         if (!shutting_down) untrackJob(job);
         if (job.timer != 0) _ = c.g_source_remove(job.timer);
         c.g_object_unref(job.cancellable);
+        c.g_object_unref(job.wait_cancellable);
         if (!shutting_down and !busy_handed_over) unmarkBusy(job.folderPath());
         c.g_object_unref(job.subprocess);
         // The caller's `lumen --install` returns once this is released.
@@ -1334,4 +1348,136 @@ test "gitCloneArgv restricts git protocols and disables submodules" {
         if (std.mem.eql(u8, std.mem.span(arg), "protocol.file.allow=always")) saw_test_file = true;
     }
     try std.testing.expect(saw_test_file);
+}
+
+test "update scripts work with CDPATH set and dash-prefixed extension folders" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const deadline_ns = os.monotonicNs() + 15 * std.time.ns_per_s;
+
+    const runGit = struct {
+        fn call(alloc: std.mem.Allocator, io_ctx: std.Io, deadline: u64, argv: []const []const u8) ![]u8 {
+            const res = try os.child.run(alloc, io_ctx, argv, .{ .deadline_ns = deadline });
+            defer alloc.free(res.stderr);
+            if (res.code != 0) {
+                std.debug.print("git failed: {s}\n", .{res.stderr});
+                alloc.free(res.stdout);
+                return error.GitFailed;
+            }
+            return res.stdout;
+        }
+    }.call;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [path_bytes_max]u8 = undefined;
+    const root = try os.tmpDirAbs(&tmp, &root_buf);
+
+    var seed_buf: [path_bytes_max]u8 = undefined;
+    const seed = try std.fmt.bufPrint(&seed_buf, "{s}/seed", .{root});
+    var exts_buf: [path_bytes_max]u8 = undefined;
+    const exts = try std.fmt.bufPrint(&exts_buf, "{s}/extensions", .{root});
+    var dash_buf: [path_bytes_max]u8 = undefined;
+    const dash = try std.fmt.bufPrint(&dash_buf, "{s}/-dash-ext", .{exts});
+    try os.mkdirP(seed);
+    try os.mkdirP(exts);
+
+    gpa.free(try runGit(gpa, io, deadline_ns, &.{ "git", "init", seed }));
+    {
+        var init_lua_buf: [path_bytes_max]u8 = undefined;
+        const init_path = try std.fmt.bufPrintSentinel(&init_lua_buf, "{s}/init.lua", .{seed}, 0);
+        try os.writeFile(init_path, "return {}\n");
+    }
+    gpa.free(try runGit(gpa, io, deadline_ns, &.{ "git", "-C", seed, "add", "init.lua" }));
+    gpa.free(try runGit(gpa, io, deadline_ns, &.{
+        "git", "-C", seed, "-c", "user.name=T", "-c", "user.email=t@e", "commit", "-m", "c1",
+    }));
+    gpa.free(try runGit(gpa, io, deadline_ns, &.{
+        "git", "-c", "protocol.file.allow=always", "clone", seed, dash,
+    }));
+
+    // Both update-one and update-all scripts must work even with CDPATH set.
+    var one_res = try os.child.run(gpa, io, &.{
+        "sh",
+        "-c",
+        "export CDPATH=\".:/tmp\"; " ++ update_one_script,
+        "lumen-update",
+        dash,
+        "-dash-ext",
+        "always",
+    }, .{ .deadline_ns = deadline_ns });
+    defer one_res.deinit(gpa);
+    try std.testing.expectEqual(@as(?u8, 0), one_res.code);
+    try std.testing.expect(std.mem.find(u8, one_res.stdout, "up to date") != null);
+
+    const all_script =
+        \\export CDPATH=".:/tmp"
+        \\unset CDPATH
+        \\cd -- "$1" || exit 1
+        \\file_allow=${2:-never}
+        \\status=0
+        \\for d in */; do
+        \\  [ -e "./${d}.git" ] || continue
+        \\  [ "$(git -C "./$d" rev-parse --show-toplevel 2>/dev/null)" = "$(cd -- "./$d" && pwd -P)" ] || continue
+        \\  printf '%s: ' "${d%/}"
+        \\  git -C "./$d" -c protocol.allow=never -c protocol.https.allow=always -c protocol.ssh.allow=always -c "protocol.file.allow=$file_allow" -c submodule.recurse=false pull --ff-only --quiet || status=1
+        \\  echo up to date
+        \\done
+        \\exit $status
+    ;
+    var all_res = try os.child.run(gpa, io, &.{
+        "sh", "-c", all_script, "lumen-update", exts, "always",
+    }, .{ .deadline_ns = deadline_ns });
+    defer all_res.deinit(gpa);
+    try std.testing.expectEqual(@as(?u8, 0), all_res.code);
+    try std.testing.expect(std.mem.find(u8, all_res.stdout, "-dash-ext: up to date") != null);
+}
+
+test "g_subprocess_wait_async waits for killed process exit when wait_cancellable is uncancelled" {
+    const State = struct {
+        done: bool = false,
+        ran: bool = false,
+        alive_after_done: bool = true,
+        pid: i32 = 0,
+        fn onWaitDone(source: ?*c.GObject, res: *c.GAsyncResult, data: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(data.?));
+            const sub: *c.GSubprocess = @ptrCast(source.?);
+            var err: ?*c.GError = null;
+            self.ran = c.g_subprocess_wait_finish(sub, res, &err) != 0;
+            if (err) |gerror| c.g_error_free(gerror);
+            self.alive_after_done = self.pid > 0 and
+                std.os.linux.errno(std.os.linux.kill(self.pid, @fromBackingInt(@intCast(0)))) == .SUCCESS;
+            self.done = true;
+        }
+    };
+    const flags = c.G_SUBPROCESS_FLAGS_STDOUT_PIPE | c.G_SUBPROCESS_FLAGS_STDERR_MERGE;
+    const launcher = c.g_subprocess_launcher_new(flags);
+    defer c.g_object_unref(launcher);
+    var argv = [_:null]?[*:0]const u8{ "sh", "-c", "sleep 30" };
+    var err: ?*c.GError = null;
+    const sub = c.g_subprocess_launcher_spawnv(launcher, &argv, &err) orelse {
+        if (err) |gerror| c.g_error_free(gerror);
+        return error.TestUnexpectedResult;
+    };
+    defer c.g_object_unref(sub);
+    const read_cancel = c.g_cancellable_new();
+    defer c.g_object_unref(read_cancel);
+    const wait_cancel = c.g_cancellable_new();
+    defer c.g_object_unref(wait_cancel);
+
+    var state: State = .{};
+    if (c.g_subprocess_get_identifier(sub)) |ident| {
+        state.pid = std.fmt.parseInt(i32, std.mem.span(ident), 10) catch 0;
+    }
+    c.g_subprocess_force_exit(sub);
+    c.g_cancellable_cancel(read_cancel);
+    c.g_subprocess_wait_async(sub, wait_cancel, &State.onWaitDone, &state);
+
+    const deadline_ns = os.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!state.done and os.monotonicNs() < deadline_ns) {
+        _ = c.g_main_context_iteration(null, 1);
+    }
+    try std.testing.expect(state.done);
+    try std.testing.expect(state.ran);
+    try std.testing.expect(!state.alive_after_done);
 }

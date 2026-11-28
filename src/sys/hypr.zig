@@ -230,27 +230,164 @@ fn talk(arena: std.mem.Allocator, message: []const u8) ?[]const u8 {
     return if (answer.items.len > 0) answer.items else null;
 }
 
-/// Sends dispatches without blocking the UI waiting for Hyprland's "ok"
-/// reply. False only when nothing was sent (no socket), so hyprctl may try
-/// instead: once sent, a dispatch must never go twice (a toggle would undo
-/// itself).
-fn dispatchOver(message: []const u8) bool {
-    const fd = connect(.requests, .{}) orelse return false;
-    defer _ = linux.close(fd);
+const dispatch_reply_timeout_ms = 500;
+
+const ReplyMode = enum { async, sync };
+
+fn isAllOk(reply: []const u8) bool {
+    const trimmed = std.mem.trimEnd(u8, reply, "\r\n");
+    if (trimmed.len == 0 or trimmed.len % 2 != 0) return false;
+    var i: usize = 0;
+    while (i < trimmed.len) : (i += 2) {
+        if (!std.mem.eql(u8, trimmed[i..][0..2], "ok")) return false;
+    }
+    return true;
+}
+
+const DispatchReply = struct {
+    fd: linux.fd_t,
+    watch_source: c_uint = 0,
+    timer_source: c_uint = 0,
+    buf: [256]u8 = undefined,
+    len: usize = 0,
+
+    fn finish(reply: *DispatchReply) void {
+        if (reply.watch_source != 0) _ = c.g_source_remove(reply.watch_source);
+        if (reply.timer_source != 0) _ = c.g_source_remove(reply.timer_source);
+        reply.watch_source = 0;
+        reply.timer_source = 0;
+        if (reply.fd >= 0) _ = linux.close(reply.fd);
+        reply.fd = -1;
+        const text = reply.buf[0..reply.len];
+        if (text.len > 0 and !isAllOk(text)) {
+            log.warn("Hyprland dispatch reply: {s}", .{std.mem.trimEnd(u8, text, "\r\n")});
+        }
+        for (active_replies.items, 0..) |item, i| {
+            if (item == reply) {
+                _ = active_replies.swapRemove(i);
+                break;
+            }
+        }
+        std.heap.c_allocator.destroy(reply);
+    }
+};
+
+var active_replies: std.ArrayList(*DispatchReply) = .empty;
+
+fn setNonblocking(fd: linux.fd_t) bool {
+    const flags = linux.fcntl(fd, linux.F.GETFL, 0);
+    if (os.unix.failed(flags) != null) return false;
+    const nonblock: u32 = @bitCast(linux.O{ .NONBLOCK = true });
+    return os.unix.failed(linux.fcntl(fd, linux.F.SETFL, flags | nonblock)) == null;
+}
+
+fn onDispatchReply(fd: c_int, condition: c_uint, data: ?*anyopaque) callconv(.c) c.gboolean {
+    const reply: *DispatchReply = @ptrCast(@alignCast(data.?));
+    while (reply.len < reply.buf.len) {
+        const res = linux.read(fd, reply.buf[reply.len..].ptr, reply.buf.len - reply.len);
+        if (os.unix.failed(res)) |errno| switch (errno) {
+            .INTR => continue,
+            .AGAIN => {
+                if (condition & (c.G_IO_HUP | c.G_IO_ERR) != 0) break;
+                return 1;
+            },
+            else => break,
+        };
+        if (res == 0) break;
+        reply.len += res;
+    }
+    reply.watch_source = 0;
+    reply.finish();
+    return 0;
+}
+
+fn onDispatchReplyTimeout(data: ?*anyopaque) callconv(.c) c.gboolean {
+    const reply: *DispatchReply = @ptrCast(@alignCast(data.?));
+    reply.timer_source = 0;
+    reply.finish();
+    return 0;
+}
+
+fn readReplySync(fd: linux.fd_t) void {
+    const deadline_ns = os.monotonicNs() + dispatch_reply_timeout_ms * std.time.ns_per_ms;
+    var buf: [256]u8 = undefined;
+    var len: usize = 0;
+    while (len < buf.len) {
+        const n = os.unix.readSome(fd, buf[len..], deadline_ns) catch break;
+        if (n == 0) break;
+        len += n;
+    }
+    const text = buf[0..len];
+    if (text.len > 0 and !isAllOk(text)) {
+        log.warn("Hyprland dispatch reply: {s}", .{std.mem.trimEnd(u8, text, "\r\n")});
+    }
+}
+
+fn finishDispatchFd(fd: linux.fd_t, mode: ReplyMode) void {
+    if (mode == .sync or !setNonblocking(fd)) {
+        defer _ = linux.close(fd);
+        readReplySync(fd);
+        return;
+    }
+    const reply = std.heap.c_allocator.create(DispatchReply) catch {
+        defer _ = linux.close(fd);
+        readReplySync(fd);
+        return;
+    };
+    reply.* = .{ .fd = fd };
+    active_replies.append(std.heap.c_allocator, reply) catch {
+        std.heap.c_allocator.destroy(reply);
+        defer _ = linux.close(fd);
+        readReplySync(fd);
+        return;
+    };
+    reply.watch_source = c.g_unix_fd_add(
+        fd,
+        c.G_IO_IN | c.G_IO_HUP | c.G_IO_ERR,
+        &onDispatchReply,
+        reply,
+    );
+    reply.timer_source = c.g_timeout_add(
+        dispatch_reply_timeout_ms,
+        &onDispatchReplyTimeout,
+        reply,
+    );
+}
+
+/// Sends dispatches over `fd` and keeps the socket open until Hyprland replies
+/// (or times out), because Hyprland drops requests whose client closes first.
+/// False only when nothing was sent so hyprctl may try instead.
+fn dispatchOverFd(fd: linux.fd_t, message: []const u8, mode: ReplyMode) bool {
     const written = while (true) {
         const result = os.unix.send(fd, message);
         if (os.unix.failed(result)) |errno| switch (errno) {
             .INTR => continue,
-            else => return false,
+            else => {
+                _ = linux.close(fd);
+                return false;
+            },
         };
         break result;
     };
-    if (written == 0) return false;
+    if (written == 0) {
+        _ = linux.close(fd);
+        return false;
+    }
     // Partly sent: the rest goes too, never again from the start.
     if (written < message.len and !os.unix.sendAll(fd, message[written..])) {
         log.warn("dispatch partly sent: {d} of {d} bytes", .{ written, message.len });
+        _ = linux.close(fd);
+        return true;
     }
+    finishDispatchFd(fd, mode);
     return true;
+}
+
+/// Sends dispatches over Hyprland's request socket, waiting for the reply
+/// without blocking GTK (in `.async` mode). False only when nothing was sent.
+fn dispatchOver(message: []const u8, mode: ReplyMode) bool {
+    const fd = connect(.requests, .{}) orelse return false;
+    return dispatchOverFd(fd, message, mode);
 }
 
 // ---------------------------------------------------------------- dispatches
@@ -383,21 +520,30 @@ fn sendQueuedCallback(_: usize) void {
 }
 
 /// Sends what `batch` queued; hyprctl if the socket cannot be reached.
-/// At shutdown: dispatches still queued go now (they were asked for), and
-/// the GLib sources and the event socket this file holds are let go.
+/// At shutdown: dispatches still queued go synchronously, and any open
+/// reply watches and the event socket this file holds are let go.
 pub fn shutdown() void {
     os.assertMainThread();
     dispatch_queue.cancelIdle();
-    sendQueued();
+    sendQueuedMode(.sync);
+    while (active_replies.items.len > 0) {
+        active_replies.items[active_replies.items.len - 1].finish();
+    }
+    active_replies.deinit(std.heap.c_allocator);
+    active_replies = .empty;
     focus_waiter.stop();
 }
 
 pub fn sendQueued() void {
+    sendQueuedMode(.async);
+}
+
+fn sendQueuedMode(mode: ReplyMode) void {
     os.assertMainThread();
     if (dispatch_queue.len == 0) return;
     const queued = dispatch_queue.buffer[0..dispatch_queue.len];
     dispatch_queue.len = 0;
-    if (dispatchOver(queued)) return;
+    if (dispatchOver(queued, mode)) return;
     assert(std.mem.startsWith(u8, queued, batch_prefix));
     // The queue without its prefix, and the terminating zero.
     var batch_buffer: [dispatch_queue_bytes_max]u8 = undefined;
@@ -677,7 +823,7 @@ pub fn layoutCommands(
     const current_size: geometry.Size = .{ .width = window.size[0], .height = window.size[1] };
     const placed = geometry.place(layout, monitor_area.usable(), current_size, layout_gap_px);
     var commands: std.ArrayList([]const u8) = .empty;
-    if (window.fullscreen != 0) try commands.append(arena, "fullscreen 0");
+    if (window.fullscreen != 0) try commands.append(arena, "fullscreenstate 0 0");
     if (!window.floating) {
         try commands.append(arena, try arena.print("setfloating address:{s}", .{window.address}));
     }
@@ -775,8 +921,13 @@ test "layout commands: tiled window floats first, fullscreen leaves first" {
     full.floating = true;
     const full_monitor = findMonitor(monitors, 0).?;
     const full_commands = try layoutCommands(allocator, full, full_monitor, .maximize);
-    try testing.expectEqualStrings("fullscreen 0", full_commands[0]);
+    try testing.expectEqualStrings("fullscreenstate 0 0", full_commands[0]);
     try testing.expectEqual(@as(usize, 3), full_commands.len);
+    for ([_]i64{ 1, 2, 3 }) |state| {
+        full.fullscreen = state;
+        const state_cmds = try layoutCommands(allocator, full, full_monitor, .left_half);
+        try testing.expectEqualStrings("fullscreenstate 0 0", state_cmds[0]);
+    }
 
     const joined = try batchString(testing.allocator, commands[0..2]);
     defer testing.allocator.free(joined);
@@ -885,4 +1036,59 @@ test "batch flushes queued commands before overflowing and afterFocusChange upda
     try testing.expect(focus_waiter.timer_source != first_timer);
     focus_waiter.fire();
     try testing.expectEqual(@as(usize, 2), Seen.ctx);
+}
+
+test "isAllOk accepts concatenated ok replies and rejects errors" {
+    try testing.expect(isAllOk("ok"));
+    try testing.expect(isAllOk("okokok\n"));
+    try testing.expect(!isAllOk(""));
+    try testing.expect(!isAllOk("o"));
+    try testing.expect(!isAllOk("Invalid dispatcher"));
+}
+
+test "dispatchOverFd keeps socket open until peer replies in sync and async modes" {
+    defer {
+        while (active_replies.items.len > 0) {
+            active_replies.items[active_replies.items.len - 1].finish();
+        }
+        active_replies.deinit(std.heap.c_allocator);
+        active_replies = .empty;
+    }
+    const Peer = struct {
+        fd: linux.fd_t,
+        reply_ok: bool = false,
+        got_msg: bool = false,
+
+        fn run(peer: *@This()) void {
+            defer _ = linux.close(peer.fd);
+            var buf: [128]u8 = undefined;
+            const n = linux.read(peer.fd, &buf, buf.len);
+            if (os.unix.failed(n) != null or n == 0) return;
+            peer.got_msg = std.mem.eql(u8, buf[0..n], "[[BATCH]]dispatch closewindow");
+            os.sleepUs(20 * std.time.us_per_ms);
+            const sent = linux.sendto(peer.fd, "ok", 2, linux.MSG.NOSIGNAL, null, 0);
+            peer.reply_ok = os.unix.failed(sent) == null and sent == 2;
+        }
+    };
+
+    for ([_]ReplyMode{ .sync, .async }) |mode| {
+        var pair: [2]i32 = undefined;
+        try testing.expectEqual(
+            linux.E.SUCCESS,
+            linux.errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM | linux.SOCK.CLOEXEC, 0, &pair)),
+        );
+        var peer: Peer = .{ .fd = pair[1] };
+        const thread = try std.Thread.spawn(.{}, Peer.run, .{&peer});
+        try testing.expect(dispatchOverFd(pair[0], "[[BATCH]]dispatch closewindow", mode));
+        if (mode == .async) {
+            const deadline_ns = os.monotonicNs() + 2 * std.time.ns_per_s;
+            while (active_replies.items.len > 0 and os.monotonicNs() < deadline_ns) {
+                _ = c.g_main_context_iteration(null, 1);
+            }
+            try testing.expectEqual(@as(usize, 0), active_replies.items.len);
+        }
+        thread.join();
+        try testing.expect(peer.got_msg);
+        try testing.expect(peer.reply_ok);
+    }
 }

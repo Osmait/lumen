@@ -77,6 +77,33 @@ pub fn commandFailureMessage(
     ) catch "lumen: no such command\n";
 }
 
+fn refCommandLine(caller: *c.GApplicationCommandLine) *c.GApplicationCommandLine {
+    return @ptrCast(c.g_object_ref(caller));
+}
+
+fn appendPendingCommand(
+    gpa: std.mem.Allocator,
+    pending: *std.ArrayList(PendingCommand),
+    caller: *c.GApplicationCommandLine,
+    target: []const u8,
+    query: ?[*:0]const u8,
+    comptime refFn: fn (*c.GApplicationCommandLine) *c.GApplicationCommandLine,
+) std.mem.Allocator.Error!void {
+    const target_copy = try gpa.dupeSentinel(u8, target, 0);
+    errdefer gpa.free(target_copy);
+    const query_copy: ?[:0]u8 = if (query) |q|
+        try gpa.dupeSentinel(u8, std.mem.span(q), 0)
+    else
+        null;
+    errdefer if (query_copy) |q| gpa.free(q);
+    try pending.ensureUnusedCapacity(gpa, 1);
+    pending.appendAssumeCapacity(.{
+        .caller = refFn(caller),
+        .target = target_copy,
+        .query = query_copy,
+    });
+}
+
 /// Queues a `--command` invocation while the initial extension registry is still loading.
 pub fn deferCommand(
     ui: *Ui,
@@ -84,18 +111,14 @@ pub fn deferCommand(
     target: []const u8,
     query: ?[*:0]const u8,
 ) bool {
-    const target_copy = ui.gpa.dupeSentinel(u8, target, 0) catch return false;
-    errdefer ui.gpa.free(target_copy);
-    const query_copy: ?[:0]u8 = if (query) |q|
-        ui.gpa.dupeSentinel(u8, std.mem.span(q), 0) catch return false
-    else
-        null;
-    errdefer if (query_copy) |q| ui.gpa.free(q);
-    ui.pending_commands.append(ui.gpa, .{
-        .caller = @ptrCast(c.g_object_ref(caller)),
-        .target = target_copy,
-        .query = query_copy,
-    }) catch return false;
+    appendPendingCommand(
+        ui.gpa,
+        &ui.pending_commands,
+        caller,
+        target,
+        query,
+        refCommandLine,
+    ) catch return false;
     return true;
 }
 
@@ -251,12 +274,27 @@ fn registryCallback(registry: *Host.Registry, context: ?*anyopaque) void {
 fn applyStyleDefaults(ui: *Ui, registry: *const Host.Registry) void {
     assert(ui.style_defaults_pending);
     ui.style_defaults_pending = false;
+    const SettingsMod = @import("../settings.zig").Settings;
+    var patched: std.ArrayList(SettingsMod.KeyValue) = .empty;
+    defer patched.deinit(ui.gpa);
     var changed = false;
     for (registry.style_settings) |style_setting| {
         if (config.overridden(ui, style_setting.key)) continue;
-        changed = ui.settings.set(style_setting.key, style_setting.value) or changed;
+        if (ui.settings.set(style_setting.key, style_setting.value)) {
+            changed = true;
+            patched.append(ui.gpa, .{
+                .key = style_setting.key,
+                .value = style_setting.value,
+            }) catch {};
+        }
     }
-    if (changed) config.saveSettings(ui);
+    if (changed) {
+        if (patched.items.len > 0) {
+            config.saveSettingsPatch(ui, .{ .keys = patched.items });
+        } else {
+            config.saveSettings(ui);
+        }
+    }
 }
 
 fn rootCallback(answer: *Host.RootResult, context: ?*anyopaque) void {
@@ -582,6 +620,15 @@ pub fn enter(ui: *Ui) void {
     if (open_command.mode == .list) ask(ui, "");
 }
 
+pub fn keepsShownRowsForSearch(
+    latest_command: Host.CommandIndex,
+    latest_query: []const u8,
+    current_command: Host.CommandIndex,
+    query: []const u8,
+) bool {
+    return latest_command == current_command and !std.mem.eql(u8, latest_query, query);
+}
+
 /// A search command's next keystroke: while its answer is on its way, the
 /// rows on screen are the last answer's and stay as they are (rebuilding
 /// them cost a frame per keystroke; `listCallback` rebuilds when it comes).
@@ -592,7 +639,9 @@ pub fn waitingForSearch(ui: *Ui, query_typed: []const u8) bool {
     if (open_command.mode != .search) return false;
     if (!ui.ext_list.showingLatest()) return false;
     const answer = ui.ext_list.latest.?;
-    if (answer.command == ui.ext_command and std.mem.eql(u8, answer.query, query)) return false;
+    if (!keepsShownRowsForSearch(answer.command, answer.query, ui.ext_command, query)) {
+        return false;
+    }
     _ = prepare(ui, query);
     return true;
 }
@@ -983,4 +1032,59 @@ test "commandFailureMessage surfaces extension load errors when available" {
         "lumen: no command \"missing.cmd\"\n",
         commandFailureMessage(&reg, "missing.cmd", &buf),
     );
+}
+
+test "keepsShownRowsForSearch rejects stale rows when switching commands" {
+    const cmd1: Host.CommandIndex = .from(0);
+    const cmd2: Host.CommandIndex = .from(1);
+    try testing.expect(!keepsShownRowsForSearch(cmd1, "abc", cmd2, "abcd"));
+    try testing.expect(!keepsShownRowsForSearch(cmd1, "abc", cmd1, "abc"));
+    try testing.expect(keepsShownRowsForSearch(cmd1, "abc", cmd1, "abcd"));
+}
+
+test "appendPendingCommand frees copies and avoids caller ref on any OOM" {
+    const MockRef = struct {
+        var count: usize = 0;
+        fn ref(caller: *c.GApplicationCommandLine) *c.GApplicationCommandLine {
+            count += 1;
+            return caller;
+        }
+    };
+    const dummy: *c.GApplicationCommandLine = @ptrFromInt(@alignOf(usize));
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn check(gpa: std.mem.Allocator) !void {
+            MockRef.count = 0;
+            var pending: std.ArrayList(PendingCommand) = .empty;
+            defer {
+                for (pending.items) |entry| {
+                    gpa.free(entry.target);
+                    if (entry.query) |q| gpa.free(q);
+                }
+                pending.deinit(gpa);
+            }
+            try appendPendingCommand(gpa, &pending, dummy, "ext.cmd", "hello", MockRef.ref);
+            try testing.expectEqual(@as(usize, 1), MockRef.count);
+        }
+    }.check, .{});
+    // Also verify OOM after a pre-existing item still keeps MockRef.count == 0 on failure.
+    try testing.checkAllAllocationFailures(testing.allocator, struct {
+        fn check(gpa: std.mem.Allocator) !void {
+            var pending: std.ArrayList(PendingCommand) = .empty;
+            defer {
+                for (pending.items) |entry| {
+                    gpa.free(entry.target);
+                    if (entry.query) |q| gpa.free(q);
+                }
+                pending.deinit(gpa);
+            }
+            MockRef.count = 0;
+            errdefer {
+                // On failure of the second append, ref was not incremented for it.
+                if (pending.items.len == 1) std.debug.assert(MockRef.count == 1);
+            }
+            try appendPendingCommand(gpa, &pending, dummy, "a.b", "q1", MockRef.ref);
+            try appendPendingCommand(gpa, &pending, dummy, "c.d", "q2", MockRef.ref);
+            try testing.expectEqual(@as(usize, 2), MockRef.count);
+        }
+    }.check, .{});
 }

@@ -42,6 +42,17 @@ pub fn spawnInDir(argv: []const [:0]const u8, cwd: ?[*:0]const u8) bool {
     return true;
 }
 
+/// Synchronously reaps a killed child before closing its GPid handle.
+fn reapSync(pid: c.GPid) void {
+    var status: i32 = 0;
+    while (true) {
+        const res = linux.waitpid(pid, &status, 0);
+        if (linux.errno(res) == .INTR) continue;
+        break;
+    }
+    c.g_spawn_close_pid(pid);
+}
+
 /// Reaps a child spawned without GLib's intermediate one, when it exits.
 fn reapCallback(pid: c.GPid, _: c_int, _: ?*anyopaque) callconv(.c) void {
     c.g_spawn_close_pid(pid);
@@ -101,16 +112,31 @@ fn outputWithin(
         logError("run", argv[0], err);
         return null;
     }
-    // Reaped whenever it exits: until then its pid is not reused, so the
-    // kill below cannot hit another process.
-    _ = c.g_child_watch_add(pid, &reapCallback, null);
     defer _ = linux.close(stdout_fd);
     // Any way out but the end of its output (deadline, failed read, cap, no
-    // memory) kills it. Not reaped yet (see above), so the kill cannot miss.
+    // memory) kills it synchronously and reaps it before the pid can be recycled.
     var output_ended = false;
-    defer if (!output_ended) {
-        _ = linux.kill(pid, .KILL);
-    };
+    defer {
+        if (!output_ended) {
+            _ = linux.kill(pid, .KILL);
+            reapSync(pid);
+        } else {
+            var status: i32 = 0;
+            while (true) {
+                const reaped = linux.waitpid(pid, &status, linux.W.NOHANG);
+                switch (linux.errno(reaped)) {
+                    .INTR => continue,
+                    .SUCCESS => if (reaped == @as(usize, @intCast(pid))) {
+                        c.g_spawn_close_pid(pid);
+                    } else {
+                        _ = c.g_child_watch_add(pid, &reapCallback, null);
+                    },
+                    else => c.g_spawn_close_pid(pid),
+                }
+                break;
+            }
+        }
+    }
     var stdout: std.ArrayList(u8) = .empty;
     defer stdout.deinit(gpa);
     const deadline_ns = os.monotonicNs() + timeout_ms * std.time.ns_per_ms;
@@ -355,4 +381,31 @@ test "pipeToThen calls back with ok = false on invalid argv or OOM without leaki
     pipeToThen(std.testing.failing_allocator, &.{"true"}, "hello", then);
     try std.testing.expectEqual(@as(usize, 2), Seen.calls);
     try std.testing.expect(!Seen.ok_last);
+}
+
+test "outputWithin reaps killed child synchronously on timeout without leaking zombie" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try os.tmpDirPath(&tmp, &dir_buf);
+    var pid_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const pid_path = try std.fmt.bufPrintSentinel(&pid_path_buf, "{s}/child.pid", .{dir}, 0);
+    var script_buf: [std.Io.Dir.max_path_bytes + 64]u8 = undefined;
+    const script = try std.fmt.bufPrintSentinel(
+        &script_buf,
+        "echo $$ > '{s}'; exec sleep 30",
+        .{pid_path},
+        0,
+    );
+    try std.testing.expect(outputWithin(
+        std.testing.allocator,
+        &.{ "sh", "-c", script },
+        100,
+        output_bytes_max,
+    ) == null);
+    var content_buf: [64]u8 = undefined;
+    const pid_text = std.mem.trim(u8, os.readHead(pid_path, &content_buf), " \t\r\n");
+    const pid = try std.fmt.parseInt(linux.pid_t, pid_text, 10);
+    // Child was already reaped synchronously, so kill(pid, 0) fails with ESRCH.
+    try std.testing.expectEqual(linux.E.SRCH, linux.errno(linux.kill(pid, @fromBackingInt(@intCast(0)))));
 }

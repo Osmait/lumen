@@ -478,8 +478,8 @@ fn runNow(now: Request.Now, reply: *const Reply) c_int {
             return status_ok;
         },
         .clip_store => {
-            storeClip(reply.payloadBytes() orelse return usage(reply));
-            return status_ok;
+            const payload = reply.payloadBytes() orelse return usage(reply);
+            return if (storeClip(payload)) status_ok else status_failed;
         },
         else => {},
     }
@@ -791,14 +791,32 @@ fn testWatchdogCallback(_: ?*anyopaque) callconv(.c) c.gboolean {
     return 0;
 }
 
-/// Stores a copy handed over the socket by `lumen --clip-store`.
-fn storeClip(content: []const u8) void {
-    const ui = readyUi() orelse return;
-    if (!ui.settings.clipboard) return;
-    if (!std.unicode.utf8ValidateSlice(content)) return;
-    ui.db.addClip(content, os.nowSeconds(), ui.settings.clipboard_keep) catch |err| {
+fn storeClipInto(
+    db: *Db,
+    enabled: bool,
+    keep: u32,
+    now_s: i64,
+    content: []const u8,
+) bool {
+    if (!enabled) return true;
+    if (!std.unicode.utf8ValidateSlice(content)) return true;
+    db.addClip(content, now_s, keep) catch |err| {
         log.warn("clipboard: {t}", .{err});
+        return false;
     };
+    return true;
+}
+
+/// Stores a copy handed over the socket by `lumen --clip-store`.
+fn storeClip(content: []const u8) bool {
+    const ui = readyUi() orelse return false;
+    return storeClipInto(
+        &ui.db,
+        ui.settings.clipboard,
+        ui.settings.clipboard_keep,
+        os.nowSeconds(),
+        content,
+    );
 }
 
 /// `lumen-gtk --clip-store`, when no daemon took the copy: straight into the
@@ -909,4 +927,31 @@ test "the views the usage lists open" {
     while (views.next()) |view| {
         try std.testing.expect(std.meta.stringToEnum(Ui.View, view) != null);
     }
+}
+
+test "storeClipInto fails on SQLite write lock and succeeds on intentional skips" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try os.tmpDirPath(&tmp, &dir_buf);
+    var db_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const db_path = try std.fmt.bufPrintSentinel(&db_path_buf, "{s}/lumen.db", .{dir}, 0);
+
+    var locker = try Db.open(db_path);
+    defer locker.close();
+    var writer = try Db.openWith(db_path, .{ .busy_timeout_ms = 50 });
+    defer writer.close();
+
+    // Disabled clipboard or invalid UTF-8 or blank skips succeed without touching SQLite.
+    try std.testing.expect(storeClipInto(&writer, false, 100, 10, "ignored"));
+    try std.testing.expect(storeClipInto(&writer, true, 100, 10, "\xff"));
+    try std.testing.expect(storeClipInto(&writer, true, 100, 10, ""));
+
+    // Holding an exclusive lock makes real writes fail and return false.
+    try locker.exec("BEGIN EXCLUSIVE;");
+    try std.testing.expect(!storeClipInto(&writer, true, 100, 10, "hello clip"));
+    try locker.exec("COMMIT;");
+
+    // Once unlocked, writing succeeds.
+    try std.testing.expect(storeClipInto(&writer, true, 100, 10, "hello clip"));
 }

@@ -365,6 +365,7 @@ pub fn select(ui: *Ui, row_index: ?usize) void {
     };
     ui.selected = row_index;
     ui.confirm_key = "";
+    ui.confirm_repeat_keyval = null;
     ui.primary = "";
     const selected_index = row_index orelse {
         setFooterAction(ui, "", .action);
