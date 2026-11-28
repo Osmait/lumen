@@ -147,6 +147,10 @@ const Worker = struct {
     /// The index in use could not be saved: retried on the next check even
     /// if nothing changed.
     unsaved: bool = false,
+    /// Updating the index in use failed its checks (its file was written
+    /// to by another process after it was mapped): the next build is whole,
+    /// or every check would fail the same update again.
+    rebuild_whole: bool = false,
     /// Documents whose extraction failed in passing (a timeout, a missing
     /// tool, memory): kept out of the index with attempt counts and exponential
     /// backoff so a pathological file does not thrash forever. In `retry_arena`.
@@ -526,16 +530,26 @@ const ExtractOutcome = struct {
     retry: []RetryEntry,
 };
 
-fn priorRetry(service: *const ContentService, doc: content.DocIn) ?RetryEntry {
-    for (service.worker.retry) |entry| {
-        if (entry.doc.mtime == doc.mtime and
-            entry.doc.size == doc.size and
-            std.mem.eql(u8, entry.doc.path, doc.path))
-        {
-            return entry;
-        }
+/// `RetryEntry`s by document version, in a check's arena: looked up for
+/// every document missing its text, a linear search was O(documents *
+/// retries), ~10^8 comparisons with thousands of PDFs and no pdftotext.
+const PriorRetries = std.HashMapUnmanaged(
+    TextCache.Version,
+    RetryEntry,
+    TextCache.Version.Context,
+    std.hash_map.default_max_load_percentage,
+);
+
+/// The first entry of `retry` for each version (what a linear search
+/// found); null when out of memory.
+fn priorRetries(arena: std.mem.Allocator, retry: []const RetryEntry) ?PriorRetries {
+    var prior: PriorRetries = .empty;
+    prior.ensureTotalCapacity(arena, @intCast(retry.len)) catch return null;
+    for (retry) |entry| {
+        const slot = prior.getOrPutAssumeCapacity(.of(entry.doc));
+        if (!slot.found_existing) slot.value_ptr.* = entry;
     }
-    return null;
+    return prior;
 }
 
 /// Extracts what is missing from the text cache, on the background pool
@@ -558,6 +572,10 @@ fn extractMissing(
     var deferred: std.ArrayList(RetryEntry) = .empty;
     var deferred_indices: std.ArrayList(usize) = .empty;
     var path_buffer: paths.Buffer = undefined;
+    const prior_retries = priorRetries(arena, service.worker.retry) orelse {
+        log.warn("extracting documents: out of memory", .{});
+        return null;
+    };
     for (docs, 0..) |doc, doc_index| {
         if (doc.source != .extracted) continue;
         const text_path = service.text_cache.path(&path_buffer, doc) orelse continue;
@@ -565,7 +583,7 @@ fn extractMissing(
         // Cached by an older version under another name: renamed, not
         // extracted again (an upgrade found no index to sweep by).
         if (service.text_cache.adoptLegacy(doc)) continue;
-        const prior = service.priorRetry(doc);
+        const prior = prior_retries.get(.of(doc));
         const attempts: u8 = if (prior) |p| p.attempts else 0;
         const waiting_backoff = prior != null and now_ns < prior.?.next_retry_ns;
         if (cache_blocked or waiting_backoff) {
@@ -1219,6 +1237,7 @@ fn refresh(service: *ContentService) void {
     start_ns = sys.monotonicNs();
     const input: BuildInput = if (whole) .{ .whole = docs.? } else .{ .update = changed };
     const built = service.buildNext(input) orelse return;
+    if (whole) service.worker.rebuild_whole = false;
     const next_version = service.version.load(.monotonic) + 1;
     const fresh = Shared.create(service.gpa, built, next_version) catch {
         log.warn("building the content index: out of memory", .{});
@@ -1243,7 +1262,7 @@ fn refresh(service: *ContentService) void {
     if (old) |old_shared| {
         // The service's reference: a search still reading it keeps it
         // until it is done.
-        service.text_cache.dropStale(&old_shared.index, changed.gone, changed.added);
+        service.text_cache.dropStale(service.gpa, &old_shared.index, changed.gone, changed.added);
         old_shared.release();
     }
     if (whole) service.sweepText();
@@ -1278,7 +1297,7 @@ fn changes(
     }
     if (service.options.names) |names| {
         const modified = names.takeModified(arena) catch null;
-        if (modified != null and service.shouldRelistForModified(modified.?)) {
+        if (modified != null and service.shouldRelistForModified(arena, modified.?)) {
             if (service.listAll(arena, name_changes, listed)) |listed_docs| {
                 docs.* = listed_docs;
                 return service.diff(arena, listed_docs) catch {
@@ -1300,22 +1319,29 @@ fn changes(
 /// True if an in-place modification queue overflowed or includes a file not
 /// currently live in the index that is now eligible (e.g. a >1 MiB log file
 /// truncated into indexable bounds).
-fn shouldRelistForModified(service: *const ContentService, modified: Service.Modified) bool {
+/// One pass over the documents for every modified path, as a set: a pass
+/// per path was O(documents) each. Out of memory: true, as if overflowed.
+fn shouldRelistForModified(
+    service: *const ContentService,
+    arena: std.mem.Allocator,
+    modified: Service.Modified,
+) bool {
     if (modified.overflow) return true;
     const index = service.current() orelse return true;
-    for (modified.paths) |mod_path| {
-        if (service.isLivePath(index, mod_path)) continue;
-        if (content_list.eligible(service.root, mod_path, service.worker.slow_mounts)) return true;
-    }
-    return false;
-}
-
-fn isLivePath(service: *const ContentService, index: *const content.Index, target: []const u8) bool {
-    _ = service;
+    if (modified.paths.len == 0) return false;
+    // Not indexed (live) yet: what is left once the documents went by.
+    var unindexed: std.StringHashMapUnmanaged(void) = .empty;
+    unindexed.ensureTotalCapacity(arena, @intCast(modified.paths.len)) catch return true;
+    for (modified.paths) |mod_path| unindexed.putAssumeCapacity(mod_path, {});
     for (0..index.docs_count) |doc_index| {
+        if (unindexed.count() == 0) return false;
         const id: u32 = @intCast(doc_index);
         if (index.removed(id)) continue;
-        if (std.mem.eql(u8, index.path(id), target)) return true;
+        _ = unindexed.remove(index.path(id));
+    }
+    var left = unindexed.keyIterator();
+    while (left.next()) |mod_path| {
+        if (content_list.eligible(service.root, mod_path.*, service.worker.slow_mounts)) return true;
     }
     return false;
 }
@@ -1347,6 +1373,7 @@ const garbage_percent_max = 30;
 /// behind (removed versions, small segments, unused bytes) has piled up.
 fn wantsWhole(service: *const ContentService, changed: Diff) bool {
     const index = service.current() orelse return true;
+    if (service.worker.rebuild_whole) return true;
     return garbagePiledUp(index, changed, service.options);
 }
 
@@ -1424,6 +1451,17 @@ fn buildNext(service: *ContentService, input: BuildInput) ?content.Index {
         error.IndexTooLarge => {
             log.err("building the content index: too many documents or paths for u32 ids", .{});
             return null;
+        },
+        // The index in use changed in its mapping since it was parsed
+        // (`content.Index.segmentAt`): an update in memory would fail the
+        // same way. Rebuilt whole on the next check.
+        error.BadIndex => if (input == .update) {
+            log.warn("updating the content index: its file changed underneath, rebuilding it", .{});
+            service.worker.rebuild_whole = true;
+            return null;
+        } else {
+            log.warn("writing the content index: {t}", .{err});
+            service.worker.unsaved = true;
         },
         // Not written (a full disk, a read-only cache): built in memory and
         // served from there; saving is retried on the next check.

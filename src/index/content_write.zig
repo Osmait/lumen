@@ -20,6 +20,7 @@ const magic = content_format.magic;
 const header_size = content_format.header_size;
 const Header = content_format.Header;
 const SegmentEntry = content_format.SegmentEntry;
+const ContentIndex = @import("ContentIndex.zig");
 const doc_size = content_format.doc_size;
 const path_bytes_max = content_format.path_bytes_max;
 const DocIn = content_format.DocIn;
@@ -185,30 +186,28 @@ pub fn writeDocs(
     };
 }
 
-/// A segment of another index, as it is.
+/// A segment of another index, as it is (bounds checked by
+/// `ContentIndex.segmentAt`; offsets changed in its mapping since it was
+/// parsed make a file the new index's `parse` rejects).
 pub fn copySegment(
     sink: *Sink,
     directory: *std.ArrayList(SegmentEntry),
-    from: BytesConst,
-    segment: SegmentEntry,
+    segment: ContentIndex.Segment,
 ) WriteError!void {
-    const keys_count: usize = @intCast(segment.keys_count);
-    const postings_size: usize = @intCast(segment.postings_size);
     try sink.padToAlignment();
     const keys_offset = sink.position();
-    try sink.append(from[@intCast(segment.keys_offset)..][0 .. keys_count * @sizeOf(u32)]);
+    try sink.append(std.mem.sliceAsBytes(segment.keys));
     try sink.padToAlignment();
     const offsets_offset = sink.position();
-    const offsets_size = (keys_count + 1) * @sizeOf(u32);
-    try sink.append(from[@intCast(segment.offsets_offset)..][0..offsets_size]);
+    try sink.append(std.mem.sliceAsBytes(segment.offsets));
     const postings_offset = sink.position();
-    try sink.append(from[@intCast(segment.postings_offset)..][0..postings_size]);
+    try sink.append(segment.postings);
     try directory.append(sink.gpa, .{
-        .keys_count = segment.keys_count,
+        .keys_count = segment.keys.len,
         .keys_offset = keys_offset,
         .offsets_offset = offsets_offset,
         .postings_offset = postings_offset,
-        .postings_size = segment.postings_size,
+        .postings_size = segment.postings.len,
     });
 }
 

@@ -155,8 +155,10 @@ stdin with GIO's async reads, so lines show as they arrive; git runs as a
 `src/index/` keeps the names of everything under `$HOME`:
 
 - **One buffer, same format in RAM and on disk** (struct of arrays, paths as
-  name + parent id): start-up maps `~/.cache/lumen/files.idx`, then a rescan
-  always runs in the background (a saved index is a photo).
+  name + parent id): start-up maps `~/.cache/lumen/files.idx` and checks it
+  on the index's own thread (searches wait for it, the UI and its socket do
+  not), then a rescan always runs in the background (a saved index is a
+  photo).
 - **Scan level by level** with raw `getdents64` (d_type, zero `stat`), each
   level in parallel; parents end up sorted, so children are a binary search,
   and each folder's entries are sorted by name, so a name in a folder is
@@ -172,8 +174,8 @@ stdin with GIO's async reads, so lines show as they arrive; git runs as a
   rescan instead; rescans asked for in a row back off from 1 s to 60 s. A new
   folder is read with the lock released (one over 20 k entries asks for a
   rescan instead), and the watches of a folder that left the tree are
-  removed. Recency is not looked up under network or FUSE mounts, so a hung
-  one cannot stall a search.
+  removed. Recency is not looked up under network or FUSE mounts below the
+  root (a home that is one keeps it), so a hung one cannot stall a search.
 - **Words and names**: spaces separate words (`cargo toml`), a name without
   its extension counts as exact (`readme` → `README.md`), directories named
   `*cache*` rank as noise, and after each rescan the heap copy is replaced by
@@ -184,7 +186,7 @@ Measured on a 12-thread desktop, `$HOME` with 1.6 M entries:
 | | |
 |---|---|
 | full scan | 353 ms (4.6 M entries/s) |
-| map the saved index | 0.02 ms |
+| map and check the saved index (off the UI thread) | ~20 ms warm, ~45 ms cold (70 MB) |
 | `c` / `ca` | 3.7 / 4.1 ms |
 | `cargo` / `cargo.toml` | 2.3 / 1.4 ms |
 | recall vs exhaustive | 100% |
@@ -269,11 +271,18 @@ reproduces it.
 
 Every index file read from disk is validated before use (layout arithmetic is
 overflow-checked, parent chains are proven to end), and fuzz tests feed them
-garbage, updates and appends included. The name index's mapping is also
-checked where it is read (name offsets, bounded parent walks), since another
-process could write the file after it was validated. Doc order across the
-content index's segments is not checked on open; queries and merges cope
-with repeats.
+garbage, updates and appends included. The mappings are also checked
+where they are read (name offsets, bounded parent walks, a parent that is
+not the folder searched; segment bounds and list offsets on queries,
+updates and appends), since another process could write the file after it
+was validated: a changed content index fails its update and is rebuilt.
+Checks cannot stop a truncation from pulling pages out from under a mapping
+(SIGBUS): after a rescan, where the file system can clone (btrfs, XFS),
+`files.idx` is a reflink copy and the mapped file has no name, so nothing
+can truncate it; elsewhere, and for the start-up snapshot and
+`content.idx`, a `cp` or `truncate` over the file still can. Doc order
+across the content index's segments is not checked on open; queries and
+merges cope with repeats.
 
 ## Measuring
 

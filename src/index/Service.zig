@@ -3,7 +3,9 @@
 //!
 //!   1. The index is searchable at once (a mapped snapshot, or empty on the
 //!      very first run) and a rescan is always requested on start: a saved
-//!      index is a photo, and nobody watched while Lumen was off.
+//!      index is a photo, and nobody watched while Lumen was off. The photo
+//!      is opened and checked on the service's thread (`loadSnapshot`), not
+//!      the caller's; searches wait for it.
 //!   2. Watches are armed in batches, releasing the lock between batches.
 //!   3. Waiting for events happens on the inotify fd *without* the lock.
 //!   4. Rescans build outside the lock on half the cores; only the swap is
@@ -53,6 +55,10 @@ stop: std.atomic.Value(bool) = .init(false),
 wake_fd: ?i32 = null,
 mountinfo_fd: ?i32 = null,
 thread: ?std.Thread = null,
+/// Set once the thread has put the saved index in place (`loadSnapshot`),
+/// or found none: searches wait for it, so the first one still finds the
+/// photo.
+snapshot_loaded: Io.Event = .unset,
 search_pool: *Pool,
 scan_pool: *Pool,
 /// Lent to the content index (`ContentService.Pools`), never used here.
@@ -144,10 +150,9 @@ fn init(
     };
     service.refreshSlowMounts(false);
     errdefer sys.freeList(gpa, service.slow_mounts);
-    var base = Store.open(service.cache_path) catch blk: {
-        var empty: store_mod.Builder = .empty;
-        break :blk try empty.finish(gpa);
-    };
+    // Empty until the thread maps the saved one (`loadSnapshot`).
+    var empty: store_mod.Builder = .empty;
+    var base = try empty.finish(gpa);
     service.live = Live.initUnarmed(gpa, base, &service.config, service.scan_pool) catch |err| {
         base.deinit(gpa);
         return err;
@@ -226,7 +231,8 @@ fn refreshSlowMounts(service: *Service, sync_live: bool) void {
         return;
     }
     const added_mount = hasNewMount(service.slow_mounts, mounts);
-    const live_mounts = dupeDirList(service.gpa, mounts) catch {
+    // The root itself left out: no recency under the mounts below it only.
+    const live_mounts = Live.slowMountsBelow(service.gpa, &service.roots, mounts) catch {
         sys.freeList(service.gpa, mounts);
         return;
     };
@@ -325,6 +331,7 @@ pub fn search(
     limit: usize,
     out: *std.ArrayList(Live.Hit),
 ) std.mem.Allocator.Error!void {
+    service.snapshot_loaded.waitUncancelable(service.io);
     // Exclusive, not shared: a search mutates the engines' refinement cache.
     // Only the UI thread searches, so readers never queue behind each other.
     service.lock.lockUncancelable(service.io);
@@ -362,6 +369,10 @@ pub fn status(service: *Service) Status {
 /// watches it and nothing adopts it: the service is torn down right after.
 fn saveOnShutdown(service: *Service) void {
     const gpa = service.gpa;
+    // As `rescan` does: the list read on start would let this scan walk
+    // an sshfs or NFS mounted since, and hang the exit on a dead server.
+    // The thread has stopped: nothing else reads the list.
+    service.refreshSlowMounts(false);
     var base = Live.scanSaved(
         gpa,
         service.scan_pool,
@@ -409,9 +420,8 @@ pub fn takeModified(service: *Service, arena: std.mem.Allocator) std.mem.Allocat
     const items = service.modified_paths.items;
     var out = try arena.alloc([]u8, items.len);
     var count: usize = 0;
-    errdefer {
-        // Keep undrained items untouched on OOM.
-    }
+    // Out of memory, the queue is left as it was: nothing is freed or
+    // cleared before every path is copied.
     for (items) |p| {
         out[count] = try arena.dupe(u8, p);
         count += 1;
@@ -461,23 +471,35 @@ fn isIgnoreFile(name: []const u8) bool {
 /// Whether a change may concern the content index (see `name_changes`).
 /// Under the lock, before the change is applied (its parent id resolves).
 fn concernsContent(service: *Service, change: Watcher.Change) bool {
+    var path_buffer: paths.Buffer = undefined;
     const parent: u32, const name: []const u8 = switch (change) {
         .created => |created| .{ created.parent, created.name },
         .modified => |modified| .{ modified.parent, modified.name },
         .removed => |removed| .{ removed.parent, removed.name },
-        else => return true,
+        // A watched folder deleted or moved away: by its own path, so a
+        // `trash1234` of Firefox's cache leaving does not list every file.
+        .dir_gone => |raw_id| {
+            const directory = service.live.pathOf(.fromRaw(raw_id), &path_buffer) orelse
+                return true;
+            return !service.underHidden(directory);
+        },
+        .overflow => return true,
     };
     if (name.len > 0 and name[0] == '.' and !isIgnoreFile(name)) return false;
-    var path_buffer: paths.Buffer = undefined;
     const directory = service.live.pathOf(.fromRaw(parent), &path_buffer) orelse return true;
+    return !service.underHidden(directory);
+}
+
+/// Whether a component of `path` below the root starts with a dot.
+fn underHidden(service: *const Service, path: []const u8) bool {
     const root = service.roots[0];
-    const in_root = std.mem.startsWith(u8, directory, root);
-    const relative = if (in_root) directory[root.len..] else directory;
+    const in_root = std.mem.startsWith(u8, path, root);
+    const relative = if (in_root) path[root.len..] else path;
     var parts = std.mem.tokenizeScalar(u8, relative, '/');
     while (parts.next()) |part| {
-        if (part[0] == '.') return false;
+        if (part[0] == '.') return true;
     }
-    return true;
+    return false;
 }
 
 /// How long a rescan asked for `since_ns` after the last one ended waits,
@@ -771,7 +793,31 @@ fn probeRetryDirs(service: *Service) bool {
     return false;
 }
 
+/// Maps the index the last run saved in place of the empty one `init` left.
+/// Here, not in `start`: opening checks the whole file (`Store.parse` reads
+/// most of it: ~20 ms warm and ~45 ms cold for 1.6 M entries, 70 MB), and
+/// the daemon's UI thread, and its socket with it, waited on that.
+fn loadSnapshot(service: *Service) void {
+    defer service.snapshot_loaded.set(service.io);
+    if (service.stop.load(.acquire)) return;
+    var snapshot = Store.open(service.cache_path) catch return;
+    const graves = snapshot.len() - snapshot.liveCount();
+    {
+        service.lock.lockUncancelable(service.io);
+        defer service.lock.unlock(service.io);
+        // Nothing was applied to the empty index: a rescan always comes
+        // first (`pending_resync`), and it replaces this one too.
+        assert(service.live.base.len() == 0);
+        std.mem.swap(Store, &service.live.base, &snapshot);
+        service.live.graves = graves;
+        service.live.engine_base.reset();
+    }
+    // The empty one.
+    snapshot.deinit(service.gpa);
+}
+
 fn run(service: *Service) void {
+    service.loadSnapshot();
     var arena_state: std.heap.ArenaAllocator = .init(service.gpa);
     defer arena_state.deinit();
     while (!service.stop.load(.acquire)) {
@@ -797,7 +843,18 @@ fn run(service: *Service) void {
         // Phase 2: wait for events without holding the index.
         service.lock.lockSharedUncancelable(service.io);
         const fd = service.live.watcher.fd;
+        const scans_pending = service.live.scansPending();
         service.lock.unlockShared(service.io);
+        if (scans_pending) {
+            // New folders the last batch's rounds left unread are not
+            // watched yet: what is written in them now comes with no
+            // event, so waiting for one could leave them unread for good.
+            // Read now, after a pause that lets searches in.
+            sys.sleepUs(arm_yield_us);
+            _ = arena_state.reset(.retain_capacity);
+            if (service.applyEvents(arena_state.allocator())) service.rescan();
+            continue;
+        }
         const retry_ms = service.retryWaitMs();
         switch (sys.waitServiceEvents(fd, service.wake_fd, service.mountinfo_fd, retry_ms)) {
             .ready => {},
@@ -1148,6 +1205,7 @@ test "service: name changes are counted outside hidden files and folders" {
     try makeDirectory(root, ".hidden");
     var hidden_buffer: paths.Buffer = undefined;
     const hidden = try std.mem.print(&hidden_buffer, "{s}/.hidden", .{root});
+    try makeDirectory(hidden, "trash1234");
     var index_path_buffer: paths.Buffer = undefined;
     const index_path = try std.mem.printSentinel(
         &index_path_buffer,
@@ -1162,6 +1220,10 @@ test "service: name changes are counted outside hidden files and folders" {
     const before = try waitNames(service, null);
     try touch(root, ".dotfile");
     try touch(hidden, "inside.txt");
+    // A watched hidden folder going away is no name change either.
+    var trash_buffer: paths.Buffer = undefined;
+    const trash = try std.mem.printSentinel(&trash_buffer, "{s}/trash1234", .{hidden}, 0);
+    try testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.rmdir(trash)));
     sys.sleepUs(300_000);
     try testing.expectEqual(before, service.nameChanges().?);
     try touch(root, "visible.txt");

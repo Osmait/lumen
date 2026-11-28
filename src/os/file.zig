@@ -184,7 +184,9 @@ pub fn writeFileAtomic(path: []const u8, data: []const u8) Error!void {
 }
 
 /// Writes `path` atomically and returns a private writable mapping of the exact
-/// inode written, before any external writer can replace `path`.
+/// inode written, before any external writer can replace `path`. Where the
+/// file system can clone (`publishClone`), `path` gets a clone and the
+/// mapped inode no name, so writing to `path` never reaches the mapping.
 pub fn writeFileAtomicMapped(path: []const u8, data: []const u8) Error!MappedBytes {
     if (data.len == 0) return error.NotFound;
     const print = std.mem.printSentinel;
@@ -226,8 +228,17 @@ pub fn writeFileAtomicMapped(path: []const u8, data: []const u8) Error!MappedByt
     };
     try writeAll(fd, data);
     _ = try check(linux.fsync(fd));
-    try rename(temp_path, final_path);
-    fsyncParentDir(path);
+    if (publishClone(path, fd)) {
+        // `path` is a clone: the inode mapped below has no name left, and
+        // nobody can truncate it under the mapping (`cp` or `rsync
+        // --inplace` over `path` made every later read of a page past the
+        // new end a SIGBUS).
+        _ = linux.unlink(temp_path);
+    } else {
+        // No reflinks here (ext4, tmpfs): `path` is the mapped inode itself.
+        try rename(temp_path, final_path);
+        fsyncParentDir(path);
+    }
     committed = true;
     const mapping_address = try check(linux.mmap(
         null,
@@ -239,6 +250,24 @@ pub fn writeFileAtomicMapped(path: []const u8, data: []const u8) Error!MappedByt
     ));
     const mapping: [*]align(mapping_alignment_bytes) u8 = @ptrFromInt(mapping_address);
     return mapping[0..data.len];
+}
+
+/// FICLONE (`_IOW(0x94, 9, int)`): the destination shares the source's
+/// extents, nothing is copied.
+const ficlone_request: u32 = 0x40049409;
+
+/// Replaces `path` atomically with a reflink clone of the file open as
+/// `source_fd` (btrfs, XFS, bcachefs: shared extents, no data copied).
+/// False when the file system cannot clone, nothing left behind.
+fn publishClone(path: []const u8, source_fd: i32) bool {
+    var clone = AtomicFile.create(path) catch return false;
+    const result = linux.ioctl(clone.fd, ficlone_request, @intCast(source_fd));
+    if (linux.errno(result) != .SUCCESS) {
+        clone.abort();
+        return false;
+    }
+    clone.commit() catch return false;
+    return true;
 }
 
 /// Best-effort directory sync after `rename` so the new directory entry
@@ -551,6 +580,39 @@ test "special files are refused without blocking" {
     try std.testing.expect(!os.isRegular(fifo));
     try std.testing.expectEqualStrings("", readHead("/dev/null", &head_buffer));
     try std.testing.expect(os.isRegular("/proc/self/status"));
+}
+
+test "a mapped atomic write survives the file being truncated where it can clone" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var dir_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir = try os.tmpDirPath(&tmp_dir, &dir_buffer);
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path = try std.mem.printSentinel(&path_buffer, "{s}/files.idx", .{dir}, 0);
+    // Several pages, so a truncated file would leave most of them past its end.
+    const data = try std.testing.allocator.alloc(u8, 64 * 1024);
+    defer std.testing.allocator.free(data);
+    @memset(data, 'x');
+    const mapping = try writeFileAtomicMapped(path, data);
+    defer unmap(mapping);
+    // Only a clone protects the mapping: without one, `path` is the mapped
+    // inode and truncating it is the SIGBUS this guards against.
+    var probe_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const probe = try std.mem.printSentinel(&probe_buffer, "{s}/probe", .{dir}, 0);
+    try writeFileAtomic(probe, "probe");
+    const probe_fd = try openRegular(probe);
+    defer close(probe_fd);
+    var clone_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const clone = try std.mem.print(&clone_buffer, "{s}/clone", .{dir});
+    if (!publishClone(clone, probe_fd)) return error.SkipZigTest;
+    // `cp` over it: O_TRUNC, then a few bytes.
+    const truncated = linux.open(path, .{ .ACCMODE = .WRONLY, .TRUNC = true, .CLOEXEC = true }, 0);
+    try expectSuccess(truncated);
+    try writeAll(@intCast(truncated), "new");
+    close(@intCast(truncated));
+    var sum: usize = 0;
+    for (mapping) |byte| sum += byte;
+    try std.testing.expectEqual(@as(usize, 'x') * data.len, sum);
 }
 
 test "atomic writes replace the file and leave no temporary behind" {

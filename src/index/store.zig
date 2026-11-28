@@ -300,7 +300,11 @@ pub const Store = struct {
     /// Range of the direct children of `directory`. The level-by-level scan leaves
     /// the parent array non-decreasing, so children are contiguous and a
     /// binary search finds them with zero extra memory. Valid only for
-    /// stores built by `scan`.
+    /// stores built by `scan`. Parents written out of order to the file
+    /// after `validate` (`rsync --inplace` restoring ~/.cache) give a range
+    /// that may hold other folders' entries (`findChild` checks), never a
+    /// bad one: both searches take the same steps until they meet
+    /// `directory`, so `lo <= hi` whatever the array holds.
     pub fn children(store: *const Store, directory: u32) struct { lo: u32, hi: u32 } {
         assert(directory < store.layout.entries_count);
         const from = store.rootsCount();
@@ -325,7 +329,8 @@ pub const Store = struct {
                 .lt => lo = mid + 1,
                 .gt => hi = mid,
                 .eq => {
-                    assert(store.parents()[mid] == directory);
+                    // Not when the file changed after `validate` (see `children`).
+                    if (store.parents()[mid] != directory) return null;
                     return if (store.isTombstoned(mid)) null else mid;
                 },
             }
@@ -723,6 +728,14 @@ test "a mapping written to after it was checked never hangs or reads out of boun
     parents[1] = 99;
     try testing.expectEqual(@as(?[]const u8, null), store.path(3, &path_buffer));
     parents[1] = 0;
+    // `src` handed to the root: the search among proj's children meets an
+    // entry of another folder, and finds nothing rather than crashing.
+    parents[4] = 0;
+    try testing.expectEqual(@as(?u32, null), store.findChild(1, "src"));
+    const range = store.children(1);
+    try testing.expect(range.lo <= range.hi);
+    parents[4] = 1;
+    try testing.expectEqual(@as(?u32, 4), store.findChild(1, "src"));
     store.column(u32, store.layout.name_offsets_offset)[2] = std.math.maxInt(u32);
     try testing.expectEqualStrings("", store.name(2));
     try testing.expectEqualStrings("/home/u/proj/Cargo.toml", store.path(3, &path_buffer).?);

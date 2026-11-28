@@ -371,7 +371,9 @@ fn updateInto(
         .header = .reserve,
         .path_offsets_reused = &.{},
     });
-    for (old.segments) |segment| try copySegment(sink, &directory, old.bytes, segment);
+    for (0..old.segments_count) |segment_index| {
+        try copySegment(sink, &directory, try old.segmentAt(segment_index));
+    }
     var unavailable: std.ArrayList(u32) = .empty;
     defer unavailable.deinit(gpa);
     try indexDocs(
@@ -423,7 +425,10 @@ fn mergeDocs(
     for (docs[0..old.docs_count], 0..) |*doc, id| doc.* = old.docIn(@intCast(id));
     @memcpy(docs[old.docs_count..], added);
     const flags = try gpa.alloc(u8, docs_count);
-    @memcpy(flags[0..old.docs_count], old.flags);
+    // Only the bits `parse` accepts: the mapping may have changed since it
+    // checked them, and a flag written as found would make the new index
+    // one that `parse` rejects.
+    for (flags[0..old.docs_count], old.flags) |*flag, old_flag| flag.* = old_flag & flag_removed;
     @memset(flags[old.docs_count..], 0);
     for (gone) |id| {
         assert(id < old.docs_count);
@@ -451,24 +456,29 @@ fn appendInto(
 
     // The run of small segments at the end is merged into the new one, if
     // it is long enough to be worth it; the others stay where they are.
-    var segments_kept_count = old.segments.len;
+    const segments_count = old.segments_count;
+    var segments_kept_count = segments_count;
     while (segments_kept_count > 0) : (segments_kept_count -= 1) {
-        const segment = old.segments[segments_kept_count - 1];
+        const segment = old.segmentEntry(segments_kept_count - 1);
         if (segment.postings_size >= segment_small_size_max) break;
     }
-    if (old.segments.len - segments_kept_count < segments_small_merge_min) {
-        segments_kept_count = old.segments.len;
+    if (segments_count - segments_kept_count < segments_small_merge_min) {
+        segments_kept_count = segments_count;
     }
     var directory: std.ArrayList(SegmentEntry) = .empty;
     defer directory.deinit(gpa);
-    // Where they are: the file only grows.
-    try directory.appendSlice(gpa, old.segments[0..segments_kept_count]);
+    // Where they are: the file only grows. Checked as any read of a
+    // segment is: the new directory must not point outside the file.
+    try directory.ensureUnusedCapacity(gpa, segments_kept_count);
+    for (0..segments_kept_count) |segment_index| {
+        directory.appendAssumeCapacity((try old.segmentAt(segment_index)).entry);
+    }
     var pairs_merged: std.ArrayList(u64) = .empty;
     defer pairs_merged.deinit(gpa);
     var merge_scratch: std.ArrayList(u64) = .empty;
     defer merge_scratch.deinit(gpa);
-    for (old.segments[segments_kept_count..]) |segment| {
-        try segmentPairs(gpa, old, segment, flags, &pairs_merged);
+    for (segments_kept_count..segments_count) |segment_index| {
+        try segmentPairs(gpa, old, try old.segmentAt(segment_index), flags, &pairs_merged);
         if (pairs_merged.items.len >= segment_pairs_max) {
             try closePairs(sink, &directory, &pairs_merged, &merge_scratch, &build_stats);
         }
@@ -499,22 +509,19 @@ fn appendInto(
 }
 
 /// A segment's (trigram, doc) pairs, by trigram then doc, without the
-/// documents `flags` mark removed.
+/// documents `flags` mark removed. `error.BadIndex` when its offsets
+/// changed in the mapping since `parse` (`Index.segmentAt`).
 fn segmentPairs(
     gpa: std.mem.Allocator,
     index: *const Index,
-    segment: SegmentEntry,
+    segment: Index.Segment,
     flags: []const u8,
     out: *std.ArrayList(u64),
-) std.mem.Allocator.Error!void {
-    const keys_count: usize = @intCast(segment.keys_count);
-    const keys = sliceAt(u32, index.bytes, @intCast(segment.keys_offset), keys_count);
-    const offsets = sliceAt(u32, index.bytes, @intCast(segment.offsets_offset), keys_count + 1);
-    const postings_offset: usize = @intCast(segment.postings_offset);
-    const postings = index.bytes[postings_offset..][0..@intCast(segment.postings_size)];
-    for (keys, 0..) |key, key_index| {
+) (std.mem.Allocator.Error || error{BadIndex})!void {
+    assert(flags.len >= index.docs_count);
+    for (segment.keys, 0..) |key, key_index| {
         var reader: ListReader = .{
-            .list_encoded = postings[offsets[key_index]..offsets[key_index + 1]],
+            .list_encoded = segment.listAt(key_index) orelse return error.BadIndex,
             .docs_count = index.docs_count,
         };
         while (reader.next()) |doc| {
@@ -1136,6 +1143,44 @@ test "the header keeps how many segments the whole build made, through updates a
     defer appended.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), appended.segments_count);
     try testing.expect(appended.whole_segments_count <= appended.segments_count);
+}
+
+test "a mapping written to after parse fails an update or an append, never crashes it" {
+    const gpa = testing.allocator;
+    const pool = try Pool.create(gpa, testing.io, 1);
+    defer pool.destroy();
+    var test_docs: TestDocs = .{ .texts = &update_texts };
+    const reader: TextReader = .{ .read = TestDocs.readText, .context = &test_docs };
+    const added = [_]DocIn{.{ .path = "0", .mtime = 300, .size = 1 }};
+
+    // A list offset of the last (small) segment goes past its postings,
+    // as another process writing the file in place could leave it.
+    var index = try segmentedIndex(gpa, pool);
+    defer index.deinit(gpa);
+    const last = index.segmentEntry(index.segments_count - 1);
+    const offsets = sliceAt(u32, index.bytes, @intCast(last.offsets_offset), 2);
+    offsets[1] = 0xffff;
+    // Queries skip the list; an append, which decodes it to merge, fails.
+    var got: std.ArrayList(u32) = .empty;
+    defer got.deinit(gpa);
+    try index.candidates(gpa, &.{"arena"}, &got);
+    try testing.expectError(error.BadIndex, appendMemory(gpa, pool, &index, &.{}, &added, reader));
+    // An update copies the list as it is: the index it makes is rejected.
+    try testing.expectError(error.BadIndex, update(gpa, pool, &index, &.{}, &added, reader, null));
+
+    // The directory itself pointing outside the file (past the copy
+    // `parse` keeps): a whole segment out of bounds.
+    var damaged = try segmentedIndex(gpa, pool);
+    defer damaged.deinit(gpa);
+    damaged.segments_copied = 0;
+    const directory: [*]SegmentEntry = @constCast(damaged.segments.ptr);
+    directory[damaged.segments_count - 1].postings_offset = damaged.file.len;
+    directory[damaged.segments_count - 1].postings_size = 1 << 20;
+    try testing.expectError(error.BadIndex, appendMemory(gpa, pool, &damaged, &.{}, &added, reader));
+    try testing.expectError(error.BadIndex, update(gpa, pool, &damaged, &.{}, &added, reader, null));
+    // A size that overflows the sum: saturated, not a crash.
+    directory[damaged.segments_count - 1].postings_size = std.math.maxInt(u64);
+    try testing.expectEqual(@as(usize, std.math.maxInt(usize)), damaged.postingBytes());
 }
 
 test "segments that repeat or reorder doc ids (a damaged file): queries, updates and appends cope" {
