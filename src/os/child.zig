@@ -104,8 +104,13 @@ pub const Result = struct {
 
 pub const Error = std.process.SpawnError || std.mem.Allocator.Error || error{Syscall};
 
-/// Runs `argv` (PATH searched, environment inherited) to completion or to
+/// Runs `argv` (PATH searched, environment inherited) until it exits or
 /// the deadline. The child is always reaped and its pipes closed.
+///
+/// The run ends when the program itself exits, even if a program it left
+/// in the background (`gio open`, `sh -c "app &"`) still holds its outputs
+/// open: that one lives on. Its process group is killed only when the run
+/// is cut short (deadline, cancel, output cap).
 pub fn run(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -118,6 +123,11 @@ pub fn run(
         .bytes => |bytes| bytes,
         .fd => "",
     };
+    // A library may have set SIGPIPE to SIG_IGN since `main` (GDBus does on
+    // its first connection), and spawn keeps an ignored signal ignored:
+    // `cmd | head` would then run on to the deadline. The empty handler is
+    // reset by execve.
+    os.unix.ignoreSigpipe();
     var child = try std.process.spawn(io, .{
         .argv = argv,
         .environ_map = if (options.environ == .empty) &empty_environment else null,
@@ -130,15 +140,21 @@ pub fn run(
         // Run in its own process group so timeouts kill grandchildren too.
         .pgid = 0,
     });
-    if (options.limits) |limits| applyLimits(child.id.?, limits);
-    // `kill` sends SIGTERM and waits: after a SIGKILL it only reaps. The
-    // child is not reaped yet, so the SIGKILL cannot miss it.
-    defer if (child.id) |pid| {
+    const pid = child.id.?;
+    if (options.limits) |limits| applyLimits(pid, limits);
+    // Readable once the program exits. Without one (an old kernel, no free
+    // descriptor), the pump looks with waitid instead.
+    const pidfd = os.openPidfd(pid);
+    defer if (pidfd) |fd| os.close(fd);
+    // Only a run cut short leaves the child unreaped here: `wait` clears
+    // `child.id`. `kill` sends SIGTERM and waits: after a SIGKILL it only
+    // reaps. The child is not reaped yet, so the SIGKILL cannot miss it.
+    defer if (child.id) |unreaped_pid| {
         // Negative pid signals the child's entire process group so
         // grandchildren (e.g. spawned by `sh -c`) cannot outlive a timeout,
         // cancel or output cap.
-        _ = linux.kill(-pid, .KILL);
-        _ = linux.kill(pid, .KILL);
+        _ = linux.kill(-unreaped_pid, .KILL);
+        _ = linux.kill(unreaped_pid, .KILL);
         child.kill(io);
     };
 
@@ -146,6 +162,8 @@ pub fn run(
         .gpa = gpa,
         .io = io,
         .child = &child,
+        .pid = pid,
+        .pidfd = pidfd,
         .options = &options,
         .stdin_bytes = stdin_bytes,
         .stderr_open = options.stderr == .collect,
@@ -160,20 +178,25 @@ pub fn run(
         child.stdin = null;
     }
 
-    // Both outputs closed, but the program may live on (it closed them, or
-    // a background child holds them): wait for its exit up to the deadline.
-    const exited = if (end == .closed) waitExit(child.id.?, &options) else false;
+    // Both outputs closed, but the program may live on (it closed them):
+    // wait for its exit up to the deadline.
+    const exited = switch (end) {
+        .exited => true,
+        .closed => waitExit(pid, &options),
+        .timed_out, .cancelled, .capped => false,
+    };
     const cancelled = end == .cancelled or
         (end == .closed and !exited and options.cancel != null and options.cancel.?.load(.acquire));
     const timed_out = end == .timed_out or cancelled or (end == .closed and !exited);
     var code: ?u8 = null;
-    if (end == .closed and !timed_out) {
-        // A wait that fails leaves the code unknown, as a signal does; the
-        // deferred kill reaps the child either way.
+    if (exited) {
+        // A wait that fails leaves the code unknown, as a signal does. It
+        // also clears `child.id` (the deferred kill skips it), so the
+        // child, which has exited, is reaped here.
         if (child.wait(io)) |termination| switch (termination) {
             .exited => |exit_code| code = exit_code,
             else => {},
-        } else |_| {}
+        } else |_| reap(pid);
     }
     const stdout = try pump.stdout.toOwnedSlice(gpa);
     errdefer gpa.free(stdout);
@@ -188,8 +211,21 @@ pub fn run(
     };
 }
 
+/// Reaps child `pid`, which has exited: the wait does not block.
+fn reap(pid: linux.pid_t) void {
+    var status: i32 = 0;
+    while (linux.errno(linux.wait4(pid, &status, 0, null)) == .INTR) {}
+}
+
 /// How often a run that can be cancelled looks at its `cancel` flag.
 const cancel_poll_ms = 100;
+
+/// Once the program exited, how long what it wrote last is still read
+/// while a program it left in the background holds its outputs open.
+const exit_drain_ms = 50;
+
+/// Without a pidfd, how often the pump looks whether the program exited.
+const exit_check_ms = 50;
 
 /// Whether the program exited before its deadline, looked at every
 /// `cancel_poll_ms` when it can be cancelled.
@@ -199,11 +235,15 @@ fn waitExit(pid: linux.pid_t, options: *const Options) bool {
 
 /// A running program's pipes: stdin written and both outputs read in one
 /// poll loop, so a program that answers before reading all its input
-/// cannot deadlock it.
+/// cannot deadlock it. The program's pidfd is in the loop too, so its exit
+/// ends the run even while its outputs stay open.
 const Pump = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     child: *std.process.Child,
+    pid: linux.pid_t,
+    /// Null: no pidfd; exits are looked for every `exit_check_ms`.
+    pidfd: ?i32,
     options: *const Options,
     stdin_bytes: []const u8,
     written: usize = 0,
@@ -211,8 +251,19 @@ const Pump = struct {
     stderr: std.ArrayList(u8) = .empty,
     stdout_open: bool = true,
     stderr_open: bool,
+    /// Monotonic ns at which the program was seen to exit.
+    exited_ns: ?u64 = null,
 
-    const End = enum { closed, timed_out, cancelled, capped };
+    const End = enum {
+        /// Both outputs closed; the program may still be running.
+        closed,
+        /// The program exited (left to be reaped); its outputs may still
+        /// be held open by programs it left in the background.
+        exited,
+        timed_out,
+        cancelled,
+        capped,
+    };
 
     fn loop(pump: *Pump) Error!End {
         // A blocking stdin would let one write stall the whole poll loop,
@@ -220,9 +271,15 @@ const Pump = struct {
         if (pump.child.stdin) |stdin| try setNonblocking(stdin.handle);
         while (pump.stdout_open or pump.stderr_open) {
             const now_ns = os.monotonicNs();
-            if (now_ns >= pump.options.deadline_ns) return .timed_out;
-            if (pump.cancelled()) return .cancelled;
-            var poll_fds: [3]linux.pollfd = undefined;
+            if (pump.exited_ns) |exited_ns| {
+                // It exited in time: what is left past the drain is not its.
+                const drained = now_ns >= exited_ns + exit_drain_ms * std.time.ns_per_ms;
+                if (drained or now_ns >= pump.options.deadline_ns) return .exited;
+            } else {
+                if (now_ns >= pump.options.deadline_ns) return .timed_out;
+                if (pump.cancelled()) return .cancelled;
+            }
+            var poll_fds: [4]linux.pollfd = undefined;
             const poll_fds_count = pump.pollFds(&poll_fds);
             const ready_count = linux.poll(&poll_fds, poll_fds_count, pump.pollTimeoutMs(now_ns));
             switch (linux.errno(ready_count)) {
@@ -232,14 +289,23 @@ const Pump = struct {
             }
             for (poll_fds[0..poll_fds_count]) |poll_fd| {
                 if (poll_fd.revents == 0) continue;
-                if (poll_fd.events == linux.POLL.OUT) {
+                if (pump.pidfd != null and poll_fd.fd == pump.pidfd.?) {
+                    pump.exited_ns = os.monotonicNs();
+                } else if (poll_fd.events == linux.POLL.OUT) {
                     pump.feed();
                 } else if (try pump.drain(poll_fd.fd)) {
                     return .capped;
                 }
             }
+            if (pump.pidfd == null and pump.exited_ns == null and
+                os.childState(pump.pid) == .exited)
+            {
+                pump.exited_ns = os.monotonicNs();
+            }
         }
-        return .closed;
+        // Closed as it exited, or closed with the program still running:
+        // then its exit is waited for after.
+        return if (pump.exited_ns != null) .exited else .closed;
     }
 
     fn cancelled(pump: *const Pump) bool {
@@ -247,9 +313,9 @@ const Pump = struct {
         return cancel.load(.acquire);
     }
 
-    /// The open outputs to read and, while there is input left, stdin to
-    /// write; how many were filled in.
-    fn pollFds(pump: *const Pump, poll_fds: *[3]linux.pollfd) usize {
+    /// The open outputs to read, while there is input left stdin to write,
+    /// and until it exits the program's pidfd; how many were filled in.
+    fn pollFds(pump: *const Pump, poll_fds: *[4]linux.pollfd) usize {
         var count: usize = 0;
         if (pump.stdout_open) {
             poll_fds[count] = pollFd(pump.child.stdout.?.handle, linux.POLL.IN);
@@ -263,6 +329,10 @@ const Pump = struct {
             poll_fds[count] = pollFd(stdin.handle, linux.POLL.OUT);
             count += 1;
         }
+        if (pump.exited_ns == null) if (pump.pidfd) |pidfd| {
+            poll_fds[count] = pollFd(pidfd, linux.POLL.IN);
+            count += 1;
+        };
         assert(count > 0);
         return count;
     }
@@ -272,12 +342,23 @@ const Pump = struct {
     }
 
     /// Until the deadline; in slices of `cancel_poll_ms` when the run can
-    /// be cancelled, so a cancel is seen in time.
+    /// be cancelled, so a cancel is seen in time, and of `exit_check_ms`
+    /// without a pidfd, so an exit is. Once the program exited, until the
+    /// end of the drain.
     fn pollTimeoutMs(pump: *const Pump, now_ns: u64) i32 {
+        if (pump.exited_ns) |exited_ns| {
+            const drain_end_ns = @min(
+                exited_ns + exit_drain_ms * std.time.ns_per_ms,
+                pump.options.deadline_ns,
+            );
+            assert(now_ns < drain_end_ns);
+            return @intCast((drain_end_ns - now_ns) / std.time.ns_per_ms + 1);
+        }
         assert(now_ns < pump.options.deadline_ns);
         const left_ms = (pump.options.deadline_ns - now_ns) / std.time.ns_per_ms + 1;
         const cancellable = pump.options.cancel != null;
-        const slice_ms: u64 = if (cancellable) cancel_poll_ms else std.math.maxInt(i32);
+        var slice_ms: u64 = if (cancellable) cancel_poll_ms else std.math.maxInt(i32);
+        if (pump.pidfd == null) slice_ms = @min(slice_ms, exit_check_ms);
         return @intCast(@min(left_ms, slice_ms));
     }
 
@@ -448,8 +529,16 @@ test "a missing program is an error, not a crash" {
     ));
 }
 
-test "children spawned after ignoreSigpipe do not inherit SIG_IGN on SIGPIPE" {
-    os.unix.ignoreSigpipe();
+test "children start with SIGPIPE at its default, even after a library ignored it" {
+    // What GDBus does on its first connection, after `main` installed the
+    // empty handler.
+    const ignore: linux.Sigaction = .{
+        .handler = .{ .handler = linux.SIG.IGN },
+        .mask = linux.sigemptyset(),
+        .flags = 0,
+    };
+    _ = linux.sigaction(.PIPE, &ignore, null);
+    defer os.unix.ignoreSigpipe();
     const start_ns = os.monotonicNs();
     var result = try run(testing.allocator, testing.io, &.{
         "sh",
@@ -499,6 +588,36 @@ test "timing out kills grandchildren in the child's process group" {
         os.sleepUs(10_000);
     }
     try testing.expect(!procAlive(status_path));
+}
+
+test "a program that exits ends the run while what it left behind holds its outputs" {
+    // `gio open`, `xdg-open`: the app started inherits stdout and stderr.
+    const argv = &.{ "sh", "-c", "sleep 30 & echo $!; echo done >&2; exit 4" };
+    const start_ns = os.monotonicNs();
+    var result = try run(testing.allocator, testing.io, argv, .{ .deadline_ns = deadline(5000) });
+    defer result.deinit(testing.allocator);
+    try testing.expect(os.monotonicNs() - start_ns < std.time.ns_per_s);
+    try testing.expect(!result.timed_out);
+    try testing.expectEqual(@as(?u8, 4), result.code);
+    try testing.expectEqualStrings("done\n", result.stderr);
+    const pid_text = std.mem.trim(u8, result.stdout, " \t\r\n");
+    const background_pid = try std.fmt.parseInt(linux.pid_t, pid_text, 10);
+    defer _ = linux.kill(background_pid, .KILL);
+
+    // Not killed with the process group: it lives on.
+    var proc_buffer: [64]u8 = undefined;
+    const status_path = try std.mem.printSentinel(&proc_buffer, "/proc/{s}/status", .{pid_text}, 0);
+    try testing.expect(procAlive(status_path));
+}
+
+test "reap collects a program that exited, as after a wait that failed" {
+    const fork_result = linux.fork();
+    try testing.expectEqual(.SUCCESS, linux.errno(fork_result));
+    if (fork_result == 0) linux.exit_group(0);
+    const pid: linux.pid_t = @intCast(fork_result);
+    try testing.expect(os.waitExit(pid, deadline(5000)));
+    reap(pid);
+    try testing.expectEqual(os.ChildState.gone, os.childState(pid));
 }
 
 test "at_cap .kill kills only when output strictly exceeds output_bytes_max" {
