@@ -124,10 +124,7 @@ fn closeWindow(context: Context, item: *const Item) Outcome {
     assert(item.action == .focus_window);
     const address = item.action.focus_window;
     if (!hypr.validAddress(address)) return .stay;
-    var command_buffer: [64]u8 = undefined;
-    const command = std.mem.print(&command_buffer, "closewindow address:{s}", .{address}) catch
-        return .stay;
-    hypr.dispatch(context.gpa, command);
+    hypr.dispatch(context.gpa, .{ .close_window = address });
     hypr.sendQueued();
     return .refresh_view;
 }
@@ -512,13 +509,7 @@ fn launch(app_info: *c.GAppInfo) Outcome {
 fn focusWindow(context: Context, item: *const Item) void {
     assert(item.action == .focus_window);
     if (!hypr.validAddress(item.action.focus_window)) return;
-    var command_buffer: [64]u8 = undefined;
-    const command = std.mem.print(
-        &command_buffer,
-        "focuswindow address:{s}",
-        .{item.action.focus_window},
-    ) catch return;
-    hypr.dispatch(context.gpa, command);
+    hypr.dispatch(context.gpa, .{ .focus_window = item.action.focus_window });
 }
 
 fn system(context: Context, system_action: item_mod.System) void {
@@ -531,7 +522,7 @@ fn system(context: Context, system_action: item_mod.System) void {
         .sleep => _ = proc.spawn(&.{ "systemctl", "suspend" }),
         .restart => _ = proc.spawn(&.{ "systemctl", "reboot" }),
         .shutdown => _ = proc.spawn(&.{ "systemctl", "poweroff" }),
-        .logout => hypr.dispatch(context.gpa, "exit"),
+        .logout => hypr.dispatch(context.gpa, .exit),
         .volume_up => _ = proc.spawn(&.{
             "wpctl",
             "set-volume",
@@ -567,14 +558,14 @@ fn system(context: Context, system_action: item_mod.System) void {
 /// that role from the client, so it is still the window the user came from.
 fn windowOperation(context: Context, operation: item_mod.WindowOperation) void {
     hypr.dispatch(context.gpa, switch (operation) {
-        .toggle_floating => "togglefloating",
-        .toggle_fullscreen => "fullscreen 0",
-        .toggle_maximize => "fullscreen 1",
-        .pin => "pin",
-        .close => "killactive",
-        .next_workspace => "workspace e+1",
-        .prev_workspace => "workspace e-1",
-        .move_next_monitor => "movewindow mon:+1",
+        .toggle_floating => .toggle_floating,
+        .toggle_fullscreen => .toggle_fullscreen,
+        .toggle_maximize => .toggle_maximize,
+        .pin => .toggle_pin,
+        .close => .close_active,
+        .next_workspace => .next_workspace,
+        .prev_workspace => .previous_workspace,
+        .move_next_monitor => .move_to_next_monitor,
     });
 }
 
