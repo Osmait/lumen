@@ -68,13 +68,45 @@ pub fn decodeImage(
     }
     if (data.items.len > limits.bytes) return null;
     const size = decodeSize(data.items, width_px, height_px, limits) orelse return null;
+    // The size was read as one format; the decoder picks its own from the
+    // bytes, and reads its own size: a file made to look like two formats
+    // was decoded whole, past the limit (MYP-608).
+    if (image_size.readHeader(data.items)) |header| {
+        if (!decoderReadsAs(header.format, data.items)) return null;
+    }
     const stream = c.g_memory_input_stream_new_from_data(
         data.items.ptr,
         @intCast(data.items.len),
         null,
     );
     defer c.g_object_unref(stream);
-    return c.gdk_pixbuf_new_from_stream_at_scale(stream, size[0], size[1], 1, null, null);
+    const stored = c.gdk_pixbuf_new_from_stream_at_scale(stream, size[0], size[1], 1, null, null) orelse
+        return null;
+    defer c.g_object_unref(stored);
+    // The pixels as stored; a photo taken upright says how to turn them in
+    // its EXIF (MYP-553).
+    return c.gdk_pixbuf_apply_embedded_orientation(stored);
+}
+
+/// Whether gdk-pixbuf, which picks a decoder by the content type the bytes
+/// have (`g_content_type_guess`), takes `data` for `format`.
+fn decoderReadsAs(format: image_size.Format, data: []const u8) bool {
+    const content_types: []const [*:0]const u8 = switch (format) {
+        .png => &.{"image/png"},
+        .jpeg => &.{"image/jpeg"},
+        .gif => &.{"image/gif"},
+        .webp => &.{"image/webp"},
+        .bmp => &.{"image/bmp"},
+        .tiff => &.{"image/tiff"},
+        .qoi => &.{"image/qoi"},
+        .heif => &.{ "image/heif", "image/avif" },
+    };
+    const guessed = c.g_content_type_guess(null, data.ptr, data.len, null) orelse return false;
+    defer c.g_free(guessed);
+    for (content_types) |content_type| {
+        if (c.g_content_type_is_a(guessed, content_type) != 0) return true;
+    }
+    return false;
 }
 
 /// Width and height to decode `data` at, within `width_px`×`height_px`; null: not to be
@@ -82,10 +114,16 @@ pub fn decodeImage(
 fn decodeSize(data: []const u8, width_px: c_int, height_px: c_int, limits: Limits) ?[2]c_int {
     if (image_size.read(data)) |size| {
         if (size.width_px * size.height_px > limits.pixels) return null;
+        // Decoded as stored and turned after: a photo whose EXIF turns it
+        // a quarter fits the box turned too.
+        const box: [2]c_int = if (image_size.swapsSides(data))
+            .{ height_px, width_px }
+        else
+            .{ width_px, height_px };
         // GTK scales up as it draws; a bigger copy would only cost memory.
         return .{
-            @intCast(@min(size.width_px, @as(u64, @intCast(width_px)))),
-            @intCast(@min(size.height_px, @as(u64, @intCast(height_px)))),
+            @intCast(@min(size.width_px, @as(u64, @intCast(box[0])))),
+            @intCast(@min(size.height_px, @as(u64, @intCast(box[1])))),
         };
     }
     if (!isSvg(data)) return null;
@@ -390,6 +428,28 @@ test "a picture over the limits is never decoded" {
     const fifo = try test_dir.path(&path_bytes, "fifo.png");
     try testing.expect(std.os.linux.mknod(fifo, std.os.linux.S.IFIFO | 0o600, 0) == 0);
     try testing.expect(decodeImage(testing.allocator, fifo, 64, 64, limits) == null);
+}
+
+test "a photo turned a quarter by its EXIF fits the box turned (MYP-553)" {
+    const limits: Limits = .{ .bytes = 1 << 20, .pixels = 4096 * 4096, .svg_bytes = 64 << 10 };
+    const exif = "Exif\x00\x00II*\x00\x08\x00\x00\x00\x01\x00" ++
+        "\x12\x01\x03\x00\x01\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00\x00";
+    // Stored 4000×3000, shown 3000×4000.
+    const sof0 = "\xff\xc0\x00\x11\x08\x0b\xb8\x0f\xa0\x03";
+    const turned = "\xff\xd8\xff\xe1\x00" ++ [_]u8{2 + exif.len} ++ exif ++ sof0;
+    try std.testing.expectEqual([2]c_int{ 300, 400 }, decodeSize(turned, 400, 300, limits).?);
+    try std.testing.expectEqual([2]c_int{ 400, 300 }, decodeSize("\xff\xd8" ++ sof0, 400, 300, limits).?);
+}
+
+test "the decoder must take the bytes for the format their size was read as (MYP-608)" {
+    const png_file = "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR\x00\x00\x00\x10\x00\x00\x00\x10\x08\x02";
+    try std.testing.expect(decoderReadsAs(.png, png_file));
+    try std.testing.expect(!decoderReadsAs(.heif, png_file));
+    try std.testing.expect(decoderReadsAs(.jpeg, "\xff\xd8\xff\xe0\x00\x10JFIF\x00"));
+    // An `ftyp` box whose size makes its first bytes a TGA's.
+    const tga_looking = "\x00\x00\x0a\x02ftypxxxx" ++ @as([8]u8, @splat(0));
+    try std.testing.expect(!decoderReadsAs(.heif, tga_looking));
+    try std.testing.expect(decoderReadsAs(.heif, "\x00\x00\x00\x18ftypavif\x00\x00\x00\x00mif1avif"));
 }
 
 test {

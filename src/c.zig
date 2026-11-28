@@ -927,6 +927,7 @@ pub extern fn gdk_pixbuf_new_from_stream_at_scale(
     cancellable: ?*GCancellable,
     err: ?*?*GError,
 ) ?*GdkPixbuf;
+pub extern fn gdk_pixbuf_apply_embedded_orientation(src: *GdkPixbuf) ?*GdkPixbuf;
 pub extern fn gtk_box_remove(box: *GtkBox, child: *GtkWidget) void;
 pub extern fn gtk_box_prepend(box: *GtkBox, child: *GtkWidget) void;
 pub extern fn gtk_widget_get_parent(widget: *GtkWidget) ?*GtkWidget;
