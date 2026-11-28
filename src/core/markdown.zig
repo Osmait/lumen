@@ -275,10 +275,21 @@ const Finder = struct {
     }
 };
 
+/// Parentheses a link's URL may nest, as CommonMark's reference parser
+/// allows. The bound keeps the URL scans linear: a scan that goes on holds
+/// every failed link it passed open, so no more than this many failed
+/// scans cover any one place. Unbounded, each "[a](https://(" of a long
+/// line scanned the rest of it (6 ms for a 20 KB row, quadratic).
+const url_parens_depth_max = 32;
+
 /// `[text](url)` links of one line, searched like `Finder`'s markers.
 const Link = struct {
     close: Finder = .{ .marker = "]" },
     paren: Finder = .{ .marker = ")" },
+    /// The last URL scan: where it started and the ")" it found (null:
+    /// none). Every "[" before the same "](" scans from the same place.
+    scanned_from: ?usize = null,
+    scanned_end: ?usize = null,
 
     fn at(link: *Link, line: []const u8, start: usize) ?struct {
         text: []const u8,
@@ -291,21 +302,36 @@ const Link = struct {
         // Any other scheme stays text: check prefix first in O(1).
         if (!linkAllowed(line[close + 2 ..])) return null;
         _ = link.paren.next(line, close + 2) orelse return null;
-        var depth: usize = 0;
-        var i = close + 2;
-        const paren_end: usize = while (i < line.len) : (i += 1) {
-            const ch = line[i];
-            if (ch == ' ') return null;
-            if (ch == '(') {
-                depth += 1;
-            } else if (ch == ')') {
-                if (depth == 0) break i;
-                depth -= 1;
-            }
-        } else return null;
+        if (link.scanned_from != close + 2) {
+            link.scanned_from = close + 2;
+            link.scanned_end = urlEnd(line, close + 2);
+        }
+        const paren_end = link.scanned_end orelse return null;
         const url = line[close + 2 .. paren_end];
         if (url.len == 0) return null;
         return .{ .text = line[start + 1 .. close], .url = url, .end = paren_end + 1 };
+    }
+
+    /// The ")" that closes a URL starting at `from`, with its parentheses
+    /// balanced, no space and at most `url_parens_depth_max` deep; null when
+    /// there is none.
+    fn urlEnd(line: []const u8, from: usize) ?usize {
+        var depth: usize = 0;
+        for (line[from..], from..) |char, i| {
+            switch (char) {
+                ' ' => return null,
+                '(' => {
+                    depth += 1;
+                    if (depth > url_parens_depth_max) return null;
+                },
+                ')' => {
+                    if (depth == 0) return i;
+                    depth -= 1;
+                },
+                else => {},
+            }
+        }
+        return null;
     }
 };
 
@@ -399,9 +425,33 @@ test "inline spans" {
         "<a href=\"https://en.wikipedia.org/wiki/Zig_(programming_language)\">Zig</a>",
     );
     try expectMarkup("## Learn C#\n# F#\n## Title ##", "<span size=\"large\" weight=\"bold\">Learn C#</span>\n<span size=\"x-large\" weight=\"bold\">F#</span>\n<span size=\"large\" weight=\"bold\">Title</span>");
+    // A link whose URL never closes leaves the next one a link.
+    try expectMarkup(
+        "[a](https://(x[b](https://y)",
+        "[a](https://(x<a href=\"https://y\">b</a>",
+    );
+    // Each "[" before the same "](" scans the same URL.
+    try expectMarkup("[[a](https://y)", "<a href=\"https://y\">[a</a>");
+    try expectMarkup("[[a](https://(y", "[[a](https://(y");
     try expectMarkup("~/_drafts/my_notes.md", "~/_drafts/my_notes.md");
     try expectMarkup("Set _LUMEN_DEBUG to 1", "Set _LUMEN_DEBUG to 1");
     try expectMarkup("__init__.py", "__init__.py");
+}
+
+test "parentheses nest up to url_parens_depth_max in a URL" {
+    const prefix = "[n](https://x";
+    var source: [prefix.len + 2 * (url_parens_depth_max + 1) + 1]u8 = undefined;
+    for ([_]usize{ url_parens_depth_max, url_parens_depth_max + 1 }) |depth| {
+        @memcpy(source[0..prefix.len], prefix);
+        @memset(source[prefix.len..][0..depth], '(');
+        @memset(source[prefix.len + depth ..][0 .. depth + 1], ')');
+        const line = source[0 .. prefix.len + 2 * depth + 1];
+        var markup: std.Io.Writer.Allocating = .init(testing.allocator);
+        defer markup.deinit();
+        try toMarkup(&markup.writer, line);
+        const linked = std.mem.startsWith(u8, markup.written(), "<a href=");
+        try testing.expectEqual(depth <= url_parens_depth_max, linked);
+    }
 }
 
 test "blocks" {
@@ -475,18 +525,34 @@ test "a long line of unclosed markers takes linear time" {
     // Each pattern opened a span the rest of the line could not close: a
     // search to the end of the line for every marker (minutes, not ms, at
     // this size).
-    const patterns = [_][]const u8{ "*a ", "**a ", "_a ", "[", "[a](", "x`" };
+    // A link's URL scanned to the end of the line for every link (MYP-462).
+    const patterns = [_][]const u8{
+        "*a ", "**a ", "_a ", "[", "[a](", "x`", "[a](https://(", "[a](https://()",
+    };
     var markup: std.Io.Writer.Allocating = .init(testing.allocator);
     defer markup.deinit();
     for (patterns) |pattern| {
         const repeats = 200_000 / pattern.len;
-        const source = try testing.allocator.alloc(u8, repeats * pattern.len);
+        // A ")" at the end, for every URL scan to look for.
+        const source = try testing.allocator.alloc(u8, repeats * pattern.len + 1);
         defer testing.allocator.free(source);
         for (0..repeats) |i| @memcpy(source[i * pattern.len ..][0..pattern.len], pattern);
+        source[source.len - 1] = ')';
         markup.clearRetainingCapacity();
         try toMarkup(&markup.writer, source);
         try testing.expect(markup.written().len >= source.len);
     }
+    // Many "[" before one "](" and a URL that never closes: one scan.
+    const source = try testing.allocator.alloc(u8, 200_000);
+    defer testing.allocator.free(source);
+    const opens = 100_000;
+    const middle = "](https://";
+    @memset(source[0..opens], '[');
+    @memcpy(source[opens..][0..middle.len], middle);
+    for (source[opens + middle.len ..], 0..) |*char, i| char.* = if (i % 2 == 0) '(' else ')';
+    markup.clearRetainingCapacity();
+    try toMarkup(&markup.writer, source);
+    try testing.expect(markup.written().len >= source.len);
 }
 
 test "spans nest no deeper than span_depth_max, whatever the input" {
