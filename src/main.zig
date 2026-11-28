@@ -237,6 +237,7 @@ fn startupCallback(gtk_app: *c.GtkApplication, data: ?*anyopaque) callconv(.c) v
     // SIG_IGN: the programs started next (GLib's spawns too) would inherit
     // it, and `cmd | head` would run on. The empty handler again.
     os.unix.ignoreSigpipe();
+    useCNumbers();
     const path = dbPath() orelse {
         log.err("cannot create the data directory", .{});
         return;
@@ -270,6 +271,15 @@ fn startupCallback(gtk_app: *c.GtkApplication, data: ?*anyopaque) callconv(.c) v
     // Prewarm once the main loop is idle, so it does not delay startup.
     _ = c.g_idle_add(&prewarmCallback, null);
     stats.startup_ns = stats.now() - stats.started_ns;
+}
+
+/// GTK set the whole locale from the environment when it started (before
+/// `startupCallback`). Numbers go back to C's: the extensions' Lua formats
+/// and reads them through the C library, and `tostring(1.5)` must be "1.5"
+/// for every user, as in standard Lua and `lumen.json`, not "1,5" under
+/// de_DE. GTK formats its own numbers with g_ascii_*.
+fn useCNumbers() void {
+    _ = c.setlocale(c.LC_NUMERIC, "C");
 }
 
 /// Where a command's answer goes: the GApplication command line that ran
@@ -893,6 +903,22 @@ test "requests: flags in order, values, and what is refused" {
     try std.testing.expect(parseRequest(&.{ "--view", "ext" }) == null);
     try std.testing.expect(parseRequest(&.{ "--view", "nope", "--dump" }) == null);
     try std.testing.expect(parseRequest(&.{}).?.window.mode == .toggle);
+}
+
+test "numbers use a decimal point under a comma-decimal locale" {
+    const comma_locales = [_][*:0]const u8{
+        "de_DE.UTF-8", "de_DE.utf8", "es_ES.UTF-8", "es_ES.utf8", "fr_FR.UTF-8", "fr_FR.utf8",
+    };
+    defer _ = c.setlocale(c.LC_ALL, "C");
+    // As GTK does at startup, with a locale that writes 1,5.
+    const found = for (comma_locales) |locale| {
+        if (c.setlocale(c.LC_ALL, locale) == null) continue;
+        if (c.localeconv().decimal_point[0] == ',') break true;
+    } else false;
+    if (!found) return error.SkipZigTest;
+    useCNumbers();
+    // What Lua's tostring and tonumber go by (lua_getlocaledecpoint).
+    try std.testing.expectEqual('.', c.localeconv().decimal_point[0]);
 }
 
 test "requestsHelp distinguishes help flag from option values" {
