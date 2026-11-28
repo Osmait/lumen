@@ -270,6 +270,11 @@ pub fn showEmptyOrResults(ui: *Ui, arena: std.mem.Allocator, query_text: []const
 pub fn selectAfterRefresh(ui: *Ui) void {
     const adjustment = c.gtk_scrolled_window_get_vadjustment(ui.scroller);
     c.gtk_adjustment_set_value(adjustment, 0);
+    // An extension's list reloaded (its files changed) shows "Loading..."
+    // until its rows come: the row to select again is looked for then
+    // (`listCallback`), not among no rows at all (MYP-607).
+    const ext_loading = ui.view == .ext and ui.ext_list.pending and ui.items.items.len == 0;
+    if (ext_loading and ui.reselect.len > 0) return select(ui, null);
     var first = nextSelectable(ui, null, 1);
     const top = first;
     if (ui.reselect.len > 0) {
