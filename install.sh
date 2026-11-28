@@ -31,8 +31,9 @@ canonical_dir() {
     fi
 }
 
-# The daemon running from `dir`, if any: another installation's is left alone.
-# One whose file was replaced since it started reads "... (deleted)".
+# The daemons running from `dir`, one pid a line: another installation's are
+# left alone. One whose file was replaced since it started reads
+# "... (deleted)".
 our_daemon() {
     target="$dir/lumen-gtk"
     target_f=$(readlink -f "$target" 2>/dev/null || printf '%s' "$target")
@@ -41,27 +42,44 @@ our_daemon() {
         case "$exe" in
             "$target" | "$target (deleted)" | "$target_f" | "$target_f (deleted)")
                 say "$pid"
-                return
                 ;;
         esac
     done
 }
 
+# Stops the daemons `our_daemon` finds: 0 once they are gone, 1 when there
+# were none, 2 when one still runs after 5 s (its pids in $stuck). SIGTERM
+# goes to the pid itself and quits it as `lumen --quit` does; --quit would
+# reach whichever instance answers this shell's LUMEN_APP_ID, maybe another
+# installation's.
 stop_daemon() {
-    pid=$(our_daemon)
-    [ -n "$pid" ] || return 1
-    "$dir/lumen" --quit >/dev/null 2>&1 || kill "$pid" 2>/dev/null || true
+    pids=$(our_daemon)
+    [ -n "$pids" ] || return 1
+    for pid in $pids; do kill -TERM "$pid" 2>/dev/null || true; done
     i=0
-    while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 50 ]; do
+    while [ "$i" -lt 50 ]; do
+        stuck=""
+        for pid in $pids; do
+            if kill -0 "$pid" 2>/dev/null; then stuck="$stuck $pid"; fi
+        done
+        [ -n "$stuck" ] || return 0
         sleep 0.1
         i=$((i + 1))
     done
-    return 0
+    return 2
+}
+
+# stop_daemon, or the reason it did not stop, and out.
+stop_daemon_or_die() {
+    status=0
+    stop_daemon || status=$?
+    [ "$status" -ne 2 ] || die "the Lumen daemon (pid$stuck) did not stop in 5 s: quit it (kill$stuck), then run this again"
+    return "$status"
 }
 
 if [ "${1:-}" = "--uninstall" ]; then
     canonical_dir
-    stop_daemon || true
+    stop_daemon_or_die || true
     rm -f "$dir/lumen" "$dir/lumen-gtk"
     say "Removed lumen and lumen-gtk from $dir."
     say "Your settings (~/.config/lumen) and data (~/.local/share/lumen, ~/.cache/lumen) are kept."
@@ -133,7 +151,7 @@ for prog in lumen lumen-gtk; do
 done
 
 restart=no
-if stop_daemon; then restart=yes; fi
+if stop_daemon_or_die; then restart=yes; fi
 
 had_lumen=no
 had_gtk=no
@@ -222,10 +240,25 @@ case ":$PATH:" in
         ;;
 esac
 
+# daemon_started: true once a daemon of `dir` runs, waiting up to 5 s.
+daemon_started() {
+    i=0
+    while [ "$i" -lt 50 ]; do
+        [ -z "$(our_daemon)" ] || return 0
+        sleep 0.1
+        i=$((i + 1))
+    done
+    return 1
+}
+
 if [ "$restart" = yes ] && [ -n "${WAYLAND_DISPLAY:-}" ]; then
     setsid -f "$dir/lumen" --daemon >/dev/null 2>&1 </dev/null || true
     say ""
-    say "Restarted the Lumen daemon."
+    if daemon_started; then
+        say "Restarted the Lumen daemon."
+    else
+        say "The daemon was stopped and did not start again: start it from your session (lumen --daemon)."
+    fi
 elif [ "$restart" = yes ]; then
     say ""
     say "The daemon was stopped: start it again from your session (lumen --daemon)."
