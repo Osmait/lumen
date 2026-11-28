@@ -25,10 +25,32 @@ die() {
 }
 has() { command -v "$1" >/dev/null 2>&1; }
 
+# Makes `dir` absolute. The name stays the user's (`pwd`, not `pwd -P`): with
+# /home a symlink (Fedora Silverblue's /var/home) the messages and the PATH
+# check would otherwise use a path the user does not know (MYP-580);
+# `our_daemon` resolves symlinks itself. CDPATH unset: with it, cd prints the
+# folder and `dir` would get it twice (MYP-461).
 canonical_dir() {
     if [ -d "$dir" ]; then
-        dir=$(cd "$dir" && pwd -P)
+        dir=$(CDPATH='' cd -- "$dir" && pwd)
     fi
+}
+
+# Whether `dir` is on PATH, under its own name or one that resolves to the
+# same folder.
+dir_on_path() {
+    case ":$PATH:" in
+        *":$dir:"*) return 0 ;;
+    esac
+    dir_real=$(CDPATH='' cd -- "$dir" 2>/dev/null && pwd -P) || return 1
+    while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        entry_real=$(CDPATH='' cd -- "$entry" 2>/dev/null && pwd -P) || continue
+        [ "$entry_real" != "$dir_real" ] || return 0
+    done <<EOF
+$(printf '%s\n' "$PATH" | tr ':' '\n')
+EOF
+    return 1
 }
 
 # The daemons running from `dir`, one pid a line: another installation's are
@@ -180,21 +202,44 @@ fi
 rm -f "$dir/.lumen.bak.$$" "$dir/.lumen-gtk.bak.$$"
 say "Installed Lumen $version in $dir."
 
-# Returns 0 when `os_id` is ubuntu with VERSION_ID older than 24.10 (the first
-# Ubuntu release that packaged libgtk4-layer-shell0).
-ubuntu_lacks_layer_shell() {
-    [ "$1" = "ubuntu" ] || return 1
-    case "$2" in
-        [0-9]*.[0-9]*) ;;
-        *) return 1 ;;
+# Whether version $1 ("24.04", "12") is older than $2.$3; false when it is
+# not a number.
+version_before() {
+    major=${1%%.*}
+    minor=0
+    case "$1" in
+        *.*)
+            rest=${1#*.}
+            minor=${rest%%.*}
+            ;;
     esac
-    major=${2%%.*}
-    rest=${2#*.}
-    minor=${rest%%.*}
+    minor=${minor:-0}
     case "$major$minor" in
         *[!0-9]*) return 1 ;;
     esac
-    [ "$major" -lt 24 ] || { [ "$major" -eq 24 ] && [ "$minor" -lt 10 ]; }
+    [ -n "$major" ] || return 1
+    [ "$major" -lt "$2" ] || { [ "$major" -eq "$2" ] && [ "$minor" -lt "$3" ]; }
+}
+
+# Returns 0 on the releases without libgtk4-layer-shell0: Ubuntu before 24.10
+# and Debian before 13, and the distributions built on them (Mint, Pop!_OS,
+# Zorin, elementary, LMDE), which name their base in os-release (MYP-581).
+# $1 ID, $2 VERSION_ID, $3 UBUNTU_CODENAME, $4 DEBIAN_CODENAME or
+# VERSION_CODENAME.
+apt_lacks_layer_shell() {
+    case "$3" in
+        trusty | xenial | bionic | cosmic | disco | eoan | focal | groovy | hirsute | \
+            impish | jammy | kinetic | lunar | mantic | noble) return 0 ;;
+        ?*) return 1 ;;
+    esac
+    case "$4" in
+        stretch | buster | bullseye | bookworm) return 0 ;;
+    esac
+    case "$1" in
+        ubuntu) version_before "$2" 24 10 ;;
+        debian | raspbian) version_before "$2" 13 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 # lumen-gtk does not start when a library it links is missing.
@@ -204,13 +249,16 @@ if ! "$dir/lumen-gtk" --version >/dev/null 2>&1; then
     os_id=$( (. /etc/os-release 2>/dev/null && printf '%s' "${ID:-}") || true)
     os_like=$( (. /etc/os-release 2>/dev/null && printf '%s' "${ID_LIKE:-}") || true)
     os_version_id=$( (. /etc/os-release 2>/dev/null && printf '%s' "${VERSION_ID:-}") || true)
+    os_ubuntu_codename=$( (. /etc/os-release 2>/dev/null && printf '%s' "${UBUNTU_CODENAME:-}") || true)
+    os_debian_codename=$( (. /etc/os-release 2>/dev/null &&
+        printf '%s' "${DEBIAN_CODENAME:-${VERSION_CODENAME:-}}") || true)
     case " $os_id $os_like " in
         *" arch "*) say "  sudo pacman -S gtk4 gtk4-layer-shell" ;;
         *" fedora "*) say "  sudo dnf install gtk4 gtk4-layer-shell" ;;
         *" debian "* | *" ubuntu "*)
-            if ubuntu_lacks_layer_shell "$os_id" "$os_version_id"; then
+            if apt_lacks_layer_shell "$os_id" "$os_version_id" "$os_ubuntu_codename" "$os_debian_codename"; then
                 say "  sudo apt install libgtk-4-1"
-                say "  gtk4-layer-shell is not packaged in Ubuntu 24.04 and earlier (added in 24.10 / 26.04 LTS);"
+                say "  gtk4-layer-shell is not packaged before Ubuntu 24.10 and Debian 13, nor in the releases built on them;"
                 say "  build it from source: https://github.com/wmww/gtk4-layer-shell"
             else
                 say "  sudo apt install libgtk-4-1 libgtk4-layer-shell0"
@@ -232,13 +280,10 @@ if [ -n "$missing" ]; then
     say " poppler, unzip). See https://github.com/Osmait/lumen#requirements"
 fi
 
-case ":$PATH:" in
-    *":$dir:"*) ;;
-    *)
-        say ""
-        say "$dir is not on your PATH: add it, or call $dir/lumen."
-        ;;
-esac
+if ! dir_on_path; then
+    say ""
+    say "$dir is not on your PATH: add it, or call $dir/lumen."
+fi
 
 # daemon_started: true once a daemon of `dir` runs, waiting up to 5 s.
 daemon_started() {
@@ -252,7 +297,11 @@ daemon_started() {
 }
 
 if [ "$restart" = yes ] && [ -n "${WAYLAND_DISPLAY:-}" ]; then
-    setsid -f "$dir/lumen" --daemon >/dev/null 2>&1 </dev/null || true
+    # Not from this shell's folder (a USB stick it would keep busy, where
+    # terminals it opens would start), nor with the terminal multiplexer's
+    # variables, which every app it launches would inherit (MYP-564).
+    (cd "${HOME:-/}" 2>/dev/null || cd /
+        env -u TMUX -u TMUX_PANE -u STY setsid -f "$dir/lumen" --daemon >/dev/null 2>&1 </dev/null) || true
     say ""
     if daemon_started; then
         say "Restarted the Lumen daemon."
