@@ -339,7 +339,7 @@ pub fn nextSelectable(ui: *Ui, from: ?usize, direction: i32) ?usize {
             false;
         if (up_from_end or down_past_built) ensureRows(ui);
     }
-    const row_count = ui.rows.items.len;
+    var row_count = ui.rows.items.len;
     if (row_count == 0) return null;
     var i: i64 = if (from) |start|
         @as(i64, @intCast(start)) + direction
@@ -347,9 +347,16 @@ pub fn nextSelectable(ui: *Ui, from: ?usize, direction: i32) ?usize {
         0
     else
         @as(i64, @intCast(row_count)) - 1;
-    while (i >= 0 and i < row_count) : (i += direction) {
-        const item_index = ui.rows.items[@intCast(i)].item orelse continue;
-        if (isSelectable(ui.items.items[item_index])) return @intCast(i);
+    while (true) {
+        while (i >= 0 and i < row_count) : (i += direction) {
+            const item_index = ui.rows.items[@intCast(i)].item orelse continue;
+            if (isSelectable(ui.items.items[item_index])) return @intCast(i);
+        }
+        // Every row built so far is a header (dmenu's non-selectable
+        // lines): the one to select may still be queued (MYP-473).
+        if (direction < 0 or ui.pending.items.len == 0) break;
+        ensureRows(ui);
+        row_count = ui.rows.items.len;
     }
     return from;
 }
