@@ -85,7 +85,8 @@ pub fn of(mime: []const u8, name: []const u8, entry: Entry) ?Kind {
     if (std.mem.startsWith(u8, mime, "image/")) return .image;
     if (std.mem.startsWith(u8, mime, "audio/")) return .audio;
     // GLib calls some source files videos (.ts "MPEG transport stream",
-    // .mts): a code badge wins over that guess.
+    // .mts): a code badge wins over that guess. Not for camera clips
+    // ("00001.MTS"), which are videos (`file_badge.isCameraClip`).
     const code = file_badge.isKnown(name);
     if (std.mem.startsWith(u8, mime, "video/")) return if (code) .text else .video;
     if (isOffice(mime)) return .office;
@@ -198,6 +199,9 @@ test "kinds from MIME type and name" {
     // GLib's guesses for code it does not know.
     try testing.expectEqual(Kind.text, of("application/octet-stream", "main.zig", .file));
     try testing.expectEqual(Kind.text, of("video/mp2t", "app.ts", .file));
+    try testing.expectEqual(Kind.text, of("video/mp2t", "vitest.config.mts", .file));
+    try testing.expectEqual(Kind.video, of("video/mp2t", "00001.MTS", .file));
+    try testing.expectEqual(Kind.video, of("video/mp2t", "clip.m2ts", .file));
     try testing.expectEqual(@as(?Kind, null), of("application/x-executable", "a.out", .file));
     try testing.expectEqual(
         @as(?Kind, null),
