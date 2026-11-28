@@ -155,8 +155,10 @@ stdin with GIO's async reads, so lines show as they arrive; git runs as a
 `src/index/` keeps the names of everything under `$HOME`:
 
 - **One buffer, same format in RAM and on disk** (struct of arrays, paths as
-  name + parent id): start-up maps `~/.cache/lumen/files.idx`, then a rescan
-  always runs in the background (a saved index is a photo).
+  name + parent id): start-up maps `~/.cache/lumen/files.idx` and checks it
+  on the index's own thread (searches wait for it, the UI and its socket do
+  not), then a rescan always runs in the background (a saved index is a
+  photo).
 - **Scan level by level** with raw `getdents64` (d_type, zero `stat`), each
   level in parallel; parents end up sorted, so children are a binary search,
   and each folder's entries are sorted by name, so a name in a folder is
@@ -172,8 +174,8 @@ stdin with GIO's async reads, so lines show as they arrive; git runs as a
   rescan instead; rescans asked for in a row back off from 1 s to 60 s. A new
   folder is read with the lock released (one over 20 k entries asks for a
   rescan instead), and the watches of a folder that left the tree are
-  removed. Recency is not looked up under network or FUSE mounts, so a hung
-  one cannot stall a search.
+  removed. Recency is not looked up under network or FUSE mounts below the
+  root (a home that is one keeps it), so a hung one cannot stall a search.
 - **Words and names**: spaces separate words (`cargo toml`), a name without
   its extension counts as exact (`readme` → `README.md`), directories named
   `*cache*` rank as noise, and after each rescan the heap copy is replaced by
@@ -184,7 +186,7 @@ Measured on a 12-thread desktop, `$HOME` with 1.6 M entries:
 | | |
 |---|---|
 | full scan | 353 ms (4.6 M entries/s) |
-| map the saved index | 0.02 ms |
+| map and check the saved index (off the UI thread) | ~20 ms warm, ~45 ms cold (70 MB) |
 | `c` / `ca` | 3.7 / 4.1 ms |
 | `cargo` / `cargo.toml` | 2.3 / 1.4 ms |
 | recall vs exhaustive | 100% |

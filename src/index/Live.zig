@@ -2,8 +2,9 @@
 //! Not thread-safe: `Service` serializes every access with its lock.
 //!
 //! The base store is immutable and packed in one buffer, which is what makes
-//! start-up a 1 ms mmap. Rebuilding it per new file would throw that away, so
-//! changes are a layer on top:
+//! start-up a mapping of the saved file (checked once, `Store.parse`).
+//! Rebuilding it per new file would throw that away, so changes are a layer
+//! on top:
 //!
 //!   - Deleting zeroes the entry's mask (see `Store.tombstone`): free on the
 //!     hot path, copy-on-write on a mapping.

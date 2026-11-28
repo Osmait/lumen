@@ -3,7 +3,9 @@
 //!
 //!   1. The index is searchable at once (a mapped snapshot, or empty on the
 //!      very first run) and a rescan is always requested on start: a saved
-//!      index is a photo, and nobody watched while Lumen was off.
+//!      index is a photo, and nobody watched while Lumen was off. The photo
+//!      is opened and checked on the service's thread (`loadSnapshot`), not
+//!      the caller's; searches wait for it.
 //!   2. Watches are armed in batches, releasing the lock between batches.
 //!   3. Waiting for events happens on the inotify fd *without* the lock.
 //!   4. Rescans build outside the lock on half the cores; only the swap is
@@ -53,6 +55,10 @@ stop: std.atomic.Value(bool) = .init(false),
 wake_fd: ?i32 = null,
 mountinfo_fd: ?i32 = null,
 thread: ?std.Thread = null,
+/// Set once the thread has put the saved index in place (`loadSnapshot`),
+/// or found none: searches wait for it, so the first one still finds the
+/// photo.
+snapshot_loaded: Io.Event = .unset,
 search_pool: *Pool,
 scan_pool: *Pool,
 /// Lent to the content index (`ContentService.Pools`), never used here.
@@ -144,10 +150,9 @@ fn init(
     };
     service.refreshSlowMounts(false);
     errdefer sys.freeList(gpa, service.slow_mounts);
-    var base = Store.open(service.cache_path) catch blk: {
-        var empty: store_mod.Builder = .empty;
-        break :blk try empty.finish(gpa);
-    };
+    // Empty until the thread maps the saved one (`loadSnapshot`).
+    var empty: store_mod.Builder = .empty;
+    var base = try empty.finish(gpa);
     service.live = Live.initUnarmed(gpa, base, &service.config, service.scan_pool) catch |err| {
         base.deinit(gpa);
         return err;
@@ -326,6 +331,7 @@ pub fn search(
     limit: usize,
     out: *std.ArrayList(Live.Hit),
 ) std.mem.Allocator.Error!void {
+    service.snapshot_loaded.waitUncancelable(service.io);
     // Exclusive, not shared: a search mutates the engines' refinement cache.
     // Only the UI thread searches, so readers never queue behind each other.
     service.lock.lockUncancelable(service.io);
@@ -787,7 +793,31 @@ fn probeRetryDirs(service: *Service) bool {
     return false;
 }
 
+/// Maps the index the last run saved in place of the empty one `init` left.
+/// Here, not in `start`: opening checks the whole file (`Store.parse` reads
+/// most of it: ~20 ms warm and ~45 ms cold for 1.6 M entries, 70 MB), and
+/// the daemon's UI thread, and its socket with it, waited on that.
+fn loadSnapshot(service: *Service) void {
+    defer service.snapshot_loaded.set(service.io);
+    if (service.stop.load(.acquire)) return;
+    var snapshot = Store.open(service.cache_path) catch return;
+    const graves = snapshot.len() - snapshot.liveCount();
+    {
+        service.lock.lockUncancelable(service.io);
+        defer service.lock.unlock(service.io);
+        // Nothing was applied to the empty index: a rescan always comes
+        // first (`pending_resync`), and it replaces this one too.
+        assert(service.live.base.len() == 0);
+        std.mem.swap(Store, &service.live.base, &snapshot);
+        service.live.graves = graves;
+        service.live.engine_base.reset();
+    }
+    // The empty one.
+    snapshot.deinit(service.gpa);
+}
+
 fn run(service: *Service) void {
+    service.loadSnapshot();
     var arena_state: std.heap.ArenaAllocator = .init(service.gpa);
     defer arena_state.deinit();
     while (!service.stop.load(.acquire)) {
