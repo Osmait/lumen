@@ -58,6 +58,7 @@ const ipc = @import("../ipc.zig");
 const layout_mod = @import("../layout.zig");
 const Inflight = @import("inflight.zig").Inflight;
 const ActionPanel = @import("ActionPanel.zig");
+const ClipFilter = @import("ClipFilter.zig");
 
 const log = std.log.scoped(.ui);
 const Kind = core.file_kind.Kind;
@@ -128,10 +129,15 @@ reselect: ItemKey = .{},
 /// Where the row to select again was, for when no row has its key any more
 /// (`keepPlace`): the row that took its place is selected instead.
 reselect_row: ?usize = null,
+/// Where the list was scrolled, to stay there when the row to select again
+/// is found (`keepView`): a rebuild nothing typed asked for.
+reselect_scroll: ?f64 = null,
 /// Lives until the view changes: clipboard entries, window list, scripts.
 data_arena: std.heap.ArenaAllocator,
 /// Candidates of the current view before filtering.
 base: []Item = &.{},
+/// The clipboard view's filter, kept from one query to the next.
+clip_filter: ClipFilter = .{},
 /// The window Close Window was last sent to: the windows view leaves it out
 /// for a while (`ClosedWindow`).
 closed_window: ClosedWindow = .{},
@@ -352,10 +358,11 @@ const after_reload_message_bytes_max = 160;
 /// The choose view's title ("Open Markdown With", a setting's name).
 const choose_title_bytes_max = 96;
 /// An item's key kept across a rebuild, to select that row again: the row
-/// to reselect, and each view on the navigation stack. A key longer than
-/// this (a deep file path) is cut, and the row is then not found again:
-/// the first row is selected instead.
-const ItemKey = core.FixedStr(80);
+/// to reselect, and each view on the navigation stack. Room for a file's
+/// key ("file:" and its path): at 80 bytes most paths were cut, and their
+/// row was not found again (MYP-606). A longer key is cut, and the first
+/// row is selected instead.
+const ItemKey = core.FixedStr(1024);
 
 /// A window asked to close. Hyprland lists it until its client has closed
 /// it, a few ms after the list built right after the request is read: the
@@ -455,6 +462,16 @@ pub fn keepSelection(self: *Ui) void {
 pub fn keepPlace(self: *Ui) void {
     self.keepSelection();
     self.reselect_row = self.selected;
+}
+
+/// Like `keepSelection`, and the list stays scrolled where it is if the
+/// row is found again: for rows rebuilt under the user's eyes by something
+/// they did not do (the content index changing, MYP-606).
+pub fn keepView(self: *Ui) void {
+    self.keepSelection();
+    if (self.reselect.len == 0) return;
+    const adjustment = c.gtk_scrolled_window_get_vadjustment(self.scroller);
+    self.reselect_scroll = c.gtk_adjustment_get_value(adjustment);
 }
 
 pub fn setReselect(self: *Ui, comptime fmt: []const u8, args: anytype) void {
@@ -632,6 +649,7 @@ pub fn setViewWithQuery(self: *Ui, view: View, initial_query: [:0]const u8) void
     if (self.view == .dmenu and view != .dmenu) dmenu.finish(self, null);
     // A place kept is the old view's (`keepPlace`): its rows are going.
     self.reselect_row = null;
+    self.reselect_scroll = null;
     // Change Theme starts on the theme in use.
     if (view == .themes and self.reselect.len == 0) {
         self.setReselect("theme:{s}", .{self.settings.theme});
@@ -992,6 +1010,7 @@ fn reloadApps(data: ?*anyopaque) callconv(.c) c.gboolean {
         // reloads many times.
         row_list.clearRows(self);
         self.base = &.{};
+        self.clip_filter.reset();
         self.apps.dropStale();
     }
     return 0;
@@ -1003,6 +1022,7 @@ test {
     _ = @import("window_layout.zig");
     _ = @import("row_list.zig");
     _ = @import("search.zig");
+    _ = @import("ClipFilter.zig");
     _ = @import("config.zig");
     _ = @import("dump.zig");
     _ = @import("ActionPanel.zig");

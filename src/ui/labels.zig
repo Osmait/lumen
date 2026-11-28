@@ -205,15 +205,19 @@ pub fn kindLabel(
     const slash = std.mem.findScalarLast(u8, path, '/');
     const name = if (slash) |slash_index| path[slash_index + 1 ..] else path;
     var badge_text: [4]u8 = undefined;
-    if (core.file_badge.of(name, &badge_text)) |badge| {
-        const mime = if (content_type) |content_type_z| std.mem.span(content_type_z) else "";
+    const mime = if (content_type) |content_type_z| std.mem.span(content_type_z) else "";
+    // A picture, sound or video is named by its type, as its icon shows it
+    // (MYP-583): "Matroska audio", not "MKA file".
+    const badged = !core.file_badge.isMedia(mime, name);
+    const badge = if (badged) core.file_badge.of(name, &badge_text) else null;
+    if (badge) |badge_found| {
         const media = std.mem.startsWith(u8, mime, mime_video_prefix) or
             std.mem.startsWith(u8, mime, mime_audio_prefix) or
             std.mem.eql(u8, mime, mime_unknown);
         const unknown = description == null or
             std.ascii.eqlIgnoreCase(std.mem.span(description.?), "unknown");
         if (media or unknown) {
-            return arena.printSentinel("{s} file", .{badge.text}, 0) catch "File";
+            return arena.printSentinel("{s} file", .{badge_found.text}, 0) catch "File";
         }
     }
     const text = description orelse return "File";

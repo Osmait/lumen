@@ -37,15 +37,31 @@ pub fn onContentResult(result: *Ui.ContentSearch.Result, context: ?*anyopaque) v
     if (result.err) |err| log.warn("content search for \"{s}\": {t}", .{ result.query, err });
     // The same query searched again, the index having changed under it: the
     // selection (and an Enter about to be pressed) stays on its file, not
-    // the first row's (MYP-606).
+    // the first row's, the list where it was scrolled, and the action panel
+    // open on that file's actions (MYP-606).
     const searched_again = if (ui.content_query.shown) |shown|
         std.mem.eql(u8, shown.query, result.query)
     else
         false;
     const replaced = ui.content_query.take(result);
     if (ui.view == .contents) {
-        if (searched_again) ui.keepSelection();
+        // A file's actions are static (`item.actionsFor`): nothing the
+        // panel lists goes with the rows.
+        const panel_operation: ?item_mod.Operation = if (searched_again and ui.panel.isOpen())
+            ui.panel.entries[ui.panel.selected].operation
+        else
+            null;
+        if (searched_again) ui.keepView();
+        const kept_key = ui.reselect;
         ui.refresh();
+        // Not rebuilt (stale already, asked for again): what was kept is
+        // kept again when that answer comes, and not left for a keystroke's
+        // rebuild to find.
+        if (searched_again and ui.reselect.len > 0) {
+            ui.reselect.clear();
+            ui.reselect_scroll = null;
+        }
+        if (panel_operation) |operation| panelReopen(ui, kept_key.slice(), operation);
         // Latency from the keystroke that asked, not from this rebuild.
         if (stats.pending) |*pending_stats| {
             pending_stats.start_ns = result.start_ns;
@@ -53,6 +69,19 @@ pub fn onContentResult(result: *Ui.ContentSearch.Result, context: ?*anyopaque) v
         }
     }
     if (replaced) |replaced_result| replaced_result.destroy(ui.gpa);
+}
+
+/// Opens the action panel again on the row of `key`, if the rebuild
+/// selected it again, on the entry that runs `operation` (else the first).
+fn panelReopen(ui: *Ui, key: []const u8, operation: item_mod.Operation) void {
+    if (ui.panel.isOpen() or key.len == 0) return;
+    const item = ui.selectedItem() orelse return;
+    if (!std.mem.eql(u8, item.key, key)) return;
+    ui.openPanel();
+    const entries = ui.panel.entries;
+    for (entries, 0..) |entry, entry_index| {
+        if (entry.operation == operation) return ui.panel.select(entry_index);
+    }
 }
 
 /// A row per content hit: the file's name, the matching line and how many
@@ -150,8 +179,9 @@ pub fn fileItems(ui: *Ui, arena: std.mem.Allocator, query: []const u8, limit: us
 const file_key_prefix = "file:";
 const extension_bytes_max = 16;
 
-/// Icon for a file's type, guessed from its name (no I/O): the extension
-/// badge for code and text, the theme's icon for the rest.
+/// Icon for a file's type, guessed from its name (no I/O): the theme's
+/// icon for media (`file_badge.isMedia`), else the logo or extension badge
+/// for code and text, else the theme's icon.
 pub fn fileIcon(ui: *Ui, path: [:0]const u8, is_directory: bool) item_mod.Icon {
     if (is_directory) {
         if (config.keyIcon(ui, file_key_prefix ++ "folder")) |icon| return icon;
@@ -167,21 +197,26 @@ pub fn fileIcon(ui: *Ui, path: [:0]const u8, is_directory: bool) item_mod.Icon {
             const key_lower = std.ascii.lowerString(key_bytes[0..key.len], key);
             if (config.keyIcon(ui, key_lower)) |icon| return icon;
         }
-        if (core.file_badge.logoOf(name)) |logo| return .{ .logo = logo };
-        var badge_text: [4]u8 = undefined;
-        if (core.file_badge.of(name, &badge_text)) |badge| {
-            const text = ui.query_arena.allocator().dupeSentinel(
-                u8,
-                badge.text,
-                0,
-            ) catch return .none;
-            return .{ .badge = .{ .text = text, .color = badge.color } };
+        const guessed_type = c.g_content_type_guess(path, null, 0, null);
+        defer if (guessed_type) |type_name| c.g_free(type_name);
+        const content_type: [*:0]const u8 = guessed_type orelse labels.mime_unknown;
+        // Pictures, sounds and videos by their type, whatever the extension:
+        // a list of extensions left most with a grey badge (MYP-583).
+        if (!core.file_badge.isMedia(std.mem.span(content_type), name)) {
+            if (fileBadge(ui, name)) |icon| return icon;
         }
+        return .{ .gicon = typeIcon(content_type) orelse return .none };
     }
-    const guessed_type = if (is_directory) null else c.g_content_type_guess(path, null, 0, null);
-    defer if (guessed_type) |type_name| c.g_free(type_name);
-    const content_type = guessed_type orelse "inode/directory";
-    return .{ .gicon = typeIcon(content_type) orelse return .none };
+    return .{ .gicon = typeIcon("inode/directory") orelse return .none };
+}
+
+/// The logo or extension badge of a code or text file's `name`.
+fn fileBadge(ui: *Ui, name: []const u8) ?item_mod.Icon {
+    if (core.file_badge.logoOf(name)) |logo| return .{ .logo = logo };
+    var badge_text: [4]u8 = undefined;
+    const badge = core.file_badge.of(name, &badge_text) orelse return null;
+    const text = ui.query_arena.allocator().dupeSentinel(u8, badge.text, 0) catch return .none;
+    return .{ .badge = .{ .text = text, .color = badge.color } };
 }
 
 /// One GIcon per content type, kept for good (a few dozen): the files view
