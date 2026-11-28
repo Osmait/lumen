@@ -215,7 +215,9 @@ fn buildItemRow(ui: *Ui, item_index: usize) void {
     ui.rows.ensureUnusedCapacity(arena, 1) catch return;
     if (ui.grid_mode) {
         const cell_width_px = window_layout.gridCellWidth(ui);
-        const cell = widgets.gridCell(&ui.row_look, item, cell_width_px);
+        // Pictures as sharp as the monitor shows them (2 on HiDPI).
+        const scale = @max(c.gtk_widget_get_scale_factor(gtk.widget(ui.grid)), 1);
+        const cell = widgets.gridCell(&ui.row_look, item, cell_width_px, scale);
         c.gtk_flow_box_append(ui.grid, cell);
         const child = c.gtk_flow_box_get_child_at_index(
             ui.grid,

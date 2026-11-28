@@ -680,6 +680,7 @@ pub extern fn gtk_widget_get_valign(widget: *GtkWidget) c_int;
 pub extern fn gtk_widget_get_last_child(widget: *GtkWidget) ?*GtkWidget;
 pub extern fn gtk_widget_get_prev_sibling(widget: *GtkWidget) ?*GtkWidget;
 pub extern fn gtk_widget_get_size_request(widget: *GtkWidget, width: ?*c_int, height: ?*c_int) void;
+pub extern fn gtk_widget_get_scale_factor(widget: *GtkWidget) c_int;
 pub extern fn gtk_widget_set_size_request(widget: *GtkWidget, width: c_int, height: c_int) void;
 pub extern fn gtk_widget_set_margin_top(widget: *GtkWidget, margin: c_int) void;
 pub extern fn gtk_widget_set_margin_bottom(widget: *GtkWidget, margin: c_int) void;
