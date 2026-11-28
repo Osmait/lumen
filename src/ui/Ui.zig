@@ -204,6 +204,9 @@ ext_command: ExtHost.CommandIndex = .from(0),
 /// into the latest one, so it is destroyed only after the rows are built
 /// again.
 ext_list: Inflight(ExtHost.ListResult, ext_query_bytes_max) = .{},
+/// The command the last list was asked of: `ext_list.asking` knows only
+/// the query.
+ext_list_command: ExtHost.CommandIndex = .gone,
 /// Extension rows asked for the root search, and their answers.
 ext_root_search: Inflight(ExtHost.RootResult, ext_query_bytes_max) = .{},
 /// The Lua action running (0: none); its answer decides what happens.

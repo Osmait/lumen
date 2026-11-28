@@ -57,12 +57,11 @@ pub fn commandFailureMessage(
                 if (!std.mem.eql(u8, problem.extension, ext_id)) continue;
                 var line_buf: [160]u8 = undefined;
                 const end = std.mem.findScalar(u8, problem.message, '\n') orelse problem.message.len;
-                const raw = core.utf8.validPrefix(problem.message[0..@min(end, line_buf.len)]);
-                @memcpy(line_buf[0..raw.len], raw);
+                const line = core.utf8.sanitizeCut(&line_buf, problem.message[0..end]);
                 return std.mem.printSentinel(
                     buffer,
                     "lumen: extension \"{s}\" failed to load: {s}\n",
-                    .{ ext_id, line_buf[0..raw.len] },
+                    .{ ext_id, line },
                     0,
                 ) catch "lumen: extension failed to load\n";
             }
@@ -443,9 +442,24 @@ fn actCallback(answer: *Host.ActResult, context: ?*anyopaque) void {
             ui.rebuild();
         } else {
             ui.keepSelection();
+            if (ui.view == .root) askRootAgain(ui);
             ui.rebuild();
         },
     }
+}
+
+/// An action on a root-search row returned "refresh": the extensions' rows
+/// for the query load again. Built again from the last answer, the rows
+/// stayed stale until the query changed (MYP-541). Those on screen stay
+/// until the answer comes (`rootCallback` shows it, the selection kept).
+fn askRootAgain(ui: *Ui) void {
+    const host = ui.ext_host orelse return;
+    const registry = ui.ext_registry orelse return;
+    const latest = ui.ext_root_search.latest orelse return;
+    const query = Host.clipQuery(std.mem.trim(u8, ui.query(), " "));
+    // Rows of another query are not on screen: `addRootSections` asks.
+    if (!std.mem.eql(u8, latest.query, query)) return;
+    ui.ext_root_search.sent(host.root(registry.generation, query), query);
 }
 
 /// The command with `id` in `registry`.
@@ -569,8 +583,9 @@ const error_line_bytes_max = 200;
 /// The first line of an error (the rest is the traceback), in `arena`.
 fn firstLine(arena: std.mem.Allocator, message: []const u8) [:0]const u8 {
     const end = std.mem.findScalar(u8, message, '\n') orelse message.len;
-    const line = message[0..@min(end, error_line_bytes_max)];
-    return arena.dupeSentinel(u8, core.utf8.validPrefix(line), 0) catch "Failed";
+    var line_bytes: [error_line_bytes_max]u8 = undefined;
+    const line = core.utf8.sanitizeCut(&line_bytes, message[0..end]);
+    return arena.dupeSentinel(u8, line, 0) catch "Failed";
 }
 
 // ----------------------------------------------------------------- rows
@@ -662,9 +677,12 @@ pub fn prepare(ui: *Ui, query_typed: []const u8) bool {
         result.command == ui.ext_command and std.mem.eql(u8, result.query, query)
     else
         false;
+    // A request of the command left before (same query, "" most often) is
+    // not this one's: waiting for it held this command back (MYP-618).
+    const asking = ui.ext_list.asking(query) and ui.ext_list_command == ui.ext_command;
     if (answered) {
         ui.ext_list.keepLatest();
-    } else if (!ui.ext_list.asking(query)) {
+    } else if (!asking) {
         ask(ui, query);
     }
     return false;
@@ -688,6 +706,7 @@ fn ask(ui: *Ui, query: []const u8) void {
     const host = ui.ext_host orelse return;
     const registry = ui.ext_registry orelse return;
     ui.ext_list.sent(host.list(registry.generation, ui.ext_command, query), query);
+    ui.ext_list_command = ui.ext_command;
 }
 
 /// The ext view's empty row: the command's error, Loading, or a hint.

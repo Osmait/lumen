@@ -260,14 +260,17 @@ pub fn nameFromUrl(out: []u8, url: []const u8) []const u8 {
 }
 
 /// `fmt` written to `out`, cut to what fits, as valid UTF-8: it goes to the
-/// caller over D-Bus, whose strings must be.
+/// caller over D-Bus, whose strings must be. A byte that is not UTF-8 (in
+/// a path) shows as U+FFFD; it cut the message there (MYP-533).
 fn format(out: []u8, comptime fmt: []const u8, args: anytype) [:0]const u8 {
-    var writer: std.Io.Writer = .fixed(out[0 .. out.len - 1]);
+    assert(out.len <= print_bytes_max);
+    var raw: [print_bytes_max]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(raw[0 .. out.len - 1]);
     // Full: what fits is kept, which is the cut this function promises.
     writer.print(fmt, args) catch {};
-    const valid_length = core.utf8.validPrefix(writer.buffered()).len;
-    out[valid_length] = 0;
-    return out[0..valid_length :0];
+    const shown = core.utf8.sanitizeCut(out[0 .. out.len - 1], writer.buffered());
+    out[shown.len] = 0;
+    return out[0..shown.len :0];
 }
 
 /// The end of `text` in at most `bytes_max` bytes, from a character on,
@@ -1147,6 +1150,8 @@ test "long output keeps its end, and messages stay valid UTF-8" {
     // Too long: what fits, never half a character.
     try std.testing.expectEqualStrings("abcdé", format(&message_bytes, "{s}", .{"abcdéé"}));
     try std.testing.expectEqualStrings("ok", format(&message_bytes, "{s}", .{"ok"}));
+    // A byte that is not UTF-8 midway: the rest still shows (MYP-533).
+    try std.testing.expectEqualStrings("a\u{FFFD}bc", format(&message_bytes, "{s}", .{"a\xffbc"}));
 }
 
 test "extension names come from the repository" {

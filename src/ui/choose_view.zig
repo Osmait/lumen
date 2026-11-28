@@ -34,13 +34,16 @@ pub fn setChoosing(ui: *Ui, next: Ui.Choosing) void {
         ui.gpa.free(ui.choosing.file.mime);
     }
     ui.choosing = next;
-    var writer: std.Io.Writer = .fixed(ui.choose_title[0 .. ui.choose_title.len - 1]);
+    var title_bytes: [ui.choose_title.len - 1]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&title_bytes);
     // A title longer than the buffer is cut on a character boundary rather
     // than dropped, because an empty title tells the user nothing: the
-    // writer is full, and what it holds is kept.
+    // writer is full, and what it holds is kept. A file name that is not
+    // UTF-8 shows U+FFFD where it is not, and the rest of the title after
+    // it (MYP-533).
     writeChooseTitle(ui, &writer, next) catch {};
-    const title_length = core.utf8.validPrefix(writer.buffered()).len;
-    ui.choose_title[title_length] = 0;
+    const title = core.utf8.sanitizeCut(ui.choose_title[0 .. ui.choose_title.len - 1], writer.buffered());
+    ui.choose_title[title.len] = 0;
 }
 
 /// The choose view's title for what it lists values for.
