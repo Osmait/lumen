@@ -233,6 +233,10 @@ fn startupCallback(gtk_app: *c.GtkApplication, data: ?*anyopaque) callconv(.c) v
     os.assertMainThread();
     const start: *const Start = @ptrCast(@alignCast(data.?));
     assert(daemon.ui == null);
+    // Registering on the session bus opened GDBus, which set SIGPIPE to
+    // SIG_IGN: the programs started next (GLib's spawns too) would inherit
+    // it, and `cmd | head` would run on. The empty handler again.
+    os.unix.ignoreSigpipe();
     const path = dbPath() orelse {
         log.err("cannot create the data directory", .{});
         return;
