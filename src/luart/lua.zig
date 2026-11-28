@@ -116,15 +116,16 @@ pub fn openLibs(L: *State) void {
     c.lua_pushcclosure(L, wrap(isTimedOut), 0);
     c.lua_pushcclosure(L, wrap(armThreadHook), 0);
     c.lua_pushcclosure(L, wrap(checkDeadline), 0);
-    c.lua_callk(L, 4, 0, 0, null);
+    c.lua_pushcclosure(L, wrap(guardShortStringFn), 0);
+    c.lua_callk(L, 5, 0, 0, null);
     luart_cloexec_io_input(L);
 }
 
 /// Run by `openLibs` once the libraries are open, with `refuseOpen`,
-/// `isTimedOut`, `armThreadHook` and `checkDeadline` as its arguments: what
-/// it replaces and why is said there.
+/// `isTimedOut`, `armThreadHook`, `checkDeadline` and `guardShortStringFn` as
+/// its arguments: what it replaces and why is said there.
 const sandbox_prelude =
-    \\local refuse, timed_out, arm_hook, check_deadline = ...
+    \\local refuse, timed_out, arm_hook, check_deadline, guard_short_str = ...
     \\debug = nil; package.loaded.debug = nil
     \\os.exit, os.execute, os.setlocale = nil, nil, nil
     \\io.popen = nil
@@ -180,34 +181,44 @@ const sandbox_prelude =
     \\function table.move(a1, f, e, t, a2)
     \\  if a2 == nil then a2 = a1 end
     \\  local fi, ei, ti = tointeger(f), tointeger(e), tointeger(t)
-    \\  if not (fi and ei and ti) or ei - fi < move_chunk or not (fi > 0 or ei < maxinteger + fi) then
+    \\  if not (fi and ei and ti) or ei < fi then
     \\    return raw_move(a1, f, e, t, a2)
     \\  end
-    \\  local count = ei - fi + 1
-    \\  if ti > maxinteger - count + 1 then return raw_move(a1, f, e, t, a2) end
+    \\  if not (fi > 0 or ei < maxinteger + fi) then
+    \\    return raw_move(a1, f, e, t, a2)
+    \\  end
+    \\  local rem = ei - fi + 1
+    \\  if rem <= move_chunk then
+    \\    return raw_move(a1, f, e, t, a2)
+    \\  end
+    \\  if ti > maxinteger - rem + 1 then
+    \\    return raw_move(a1, f, e, t, a2)
+    \\  end
     \\  if ti > ei or ti <= fi or a1 ~= a2 then
-    \\    local from = fi
-    \\    while from <= ei do
+    \\    local off = 0
+    \\    while rem > 0 do
     \\      check_deadline()
-    \\      local last = (ei - from < move_chunk - 1) and ei or (from + move_chunk - 1)
-    \\      raw_move(a1, from, last, ti + (from - fi), a2)
-    \\      if last == ei then break end
-    \\      from = last + 1
+    \\      local n = (rem < move_chunk) and rem or move_chunk
+    \\      local from = fi + off
+    \\      raw_move(a1, from, from + (n - 1), ti + off, a2)
+    \\      off = off + n
+    \\      rem = rem - n
     \\    end
     \\  else
-    \\    local last = ei
-    \\    while last >= fi do
+    \\    while rem > 0 do
     \\      check_deadline()
-    \\      local from = (last - fi < move_chunk - 1) and fi or (last - move_chunk + 1)
-    \\      raw_move(a1, from, last, ti + (from - fi), a2)
-    \\      if from == fi then break end
-    \\      last = from - 1
+    \\      local n = (rem < move_chunk) and rem or move_chunk
+    \\      local off = rem - n
+    \\      local from = fi + off
+    \\      raw_move(a1, from, from + (n - 1), ti + off, a2)
+    \\      rem = off
     \\    end
     \\  end
     \\  return a2
     \\end
     \\local raw_load = load
     \\function load(chunk, chunkname, mode, ...)
+    \\  check_deadline()
     \\  if mode ~= nil and mode ~= "t" then
     \\    return nil, "load: binary chunks are not allowed"
     \\  end
@@ -218,16 +229,15 @@ const sandbox_prelude =
     \\end
     \\local raw_loadfile = loadfile
     \\function loadfile(path, mode, ...)
+    \\  check_deadline()
     \\  if path == nil then error("loadfile: a file name expected", 2) end
-    \\  local checked, why = check_path(path)
-    \\  if why then error(why, 2) end
     \\  if mode ~= nil and mode ~= "t" then
     \\    return nil, "loadfile: binary chunks are not allowed"
     \\  end
     \\  if select("#", ...) > 0 then
-    \\    return raw_loadfile(checked, "t", ...)
+    \\    return raw_loadfile(path, "t", ...)
     \\  end
-    \\  return raw_loadfile(checked, "t")
+    \\  return raw_loadfile(path, "t")
     \\end
     \\function dofile(path)
     \\  if path == nil then error("dofile: a file name expected", 2) end
@@ -268,15 +278,14 @@ const sandbox_prelude =
     \\end
     \\local searchpath = package.searchpath
     \\package.searchers[2] = function(name)
+    \\  check_deadline()
     \\  local filename, err = searchpath(name, package.path)
     \\  if not filename then return err end
-    \\  local checked, why = check_path(filename)
-    \\  if why then error(why, 2) end
-    \\  local chunk, lerr = raw_loadfile(checked, "t")
+    \\  local chunk, lerr = raw_loadfile(filename, "t")
     \\  if not chunk then
-    \\    error("error loading module '" .. tostring(name) .. "' from file '" .. checked .. "':\n\t" .. tostring(lerr), 2)
+    \\    error("error loading module '" .. tostring(name) .. "' from file '" .. tostring(filename) .. "':\n\t" .. tostring(lerr), 2)
     \\  end
-    \\  return chunk, checked
+    \\  return chunk, filename
     \\end
     \\local function rethrow_if_timed_out(ok, ...)
     \\  if not ok and timed_out() then error("timed out", 0) end
@@ -321,6 +330,14 @@ const sandbox_prelude =
     \\        if timed_out() then
     \\          timed_out_coroutines[co] = true
     \\          error("timed out", 0)
+    \\        end
+    \\        if raw_close then
+    \\          local _, cerr = raw_close(co)
+    \\          if timed_out() then
+    \\            timed_out_coroutines[co] = true
+    \\            error("timed out", 0)
+    \\          end
+    \\          error(cerr, 2)
     \\        end
     \\        error((...), 2)
     \\      end
@@ -417,6 +434,25 @@ const sandbox_prelude =
     \\table.concat = guarded(table.concat)
     \\table.unpack = guarded(table.unpack)
     \\string.dump = guarded(string.dump)
+    \\string.format = guarded(string.format)
+    \\string.lower = guard_short_str(string.lower)
+    \\string.upper = guard_short_str(string.upper)
+    \\string.reverse = guard_short_str(string.reverse)
+    \\string.byte = guard_short_str(string.byte)
+    \\string.char = guarded(string.char)
+    \\string.pack = guarded(string.pack)
+    \\string.unpack = guarded(string.unpack)
+    \\string.packsize = guard_short_str(string.packsize)
+    \\if type(utf8) == "table" then
+    \\  utf8.len = guard_short_str(utf8.len)
+    \\  utf8.codes = guard_short_str(utf8.codes)
+    \\  utf8.codepoint = guard_short_str(utf8.codepoint)
+    \\  utf8.char = guarded(utf8.char)
+    \\  utf8.offset = guard_short_str(utf8.offset)
+    \\end
+    \\if type(os) == "table" then
+    \\  os.date = guarded(os.date)
+    \\end
     \\collectgarbage = guarded(collectgarbage)
 ;
 
@@ -436,6 +472,35 @@ fn checkDeadline(L: *State) Error!c_int {
         return error.Raise;
     }
     return 0;
+}
+
+/// Fast C wrapper for single-string stdlib functions (`O(#arg1)`): skips the
+/// clock read when `arg1` is already a short string (< 4096 bytes) so tight
+/// callbacks like `gsub('%u', string.lower)` keep native speed, while large
+/// strings always check the deadline.
+fn guardedShortStringC(state: ?*State) callconv(.c) c_int {
+    const L = state.?;
+    const orig = c.lua_tocfunction(L, c.LUA_REGISTRYINDEX - 1).?;
+    const is_short = c.lua_type(L, 1) == c.LUA_TSTRING and c.lua_rawlen(L, 1) < 4096;
+    if (!is_short) {
+        const budget = budgetOf(L);
+        if (budget.expired()) {
+            budget.timed_out = true;
+            armTimeoutHook(L);
+            _ = c.luaL_error(L, "timed out");
+        }
+    }
+    return orig(L);
+}
+
+fn guardShortStringFn(L: *State) Error!c_int {
+    if (c.lua_tocfunction(L, 1) == null) {
+        c.lua_pushvalue(L, 1);
+        return 1;
+    }
+    c.lua_pushvalue(L, 1);
+    c.lua_pushcclosure(L, &guardedShortStringC, 1);
+    return 1;
 }
 
 fn armThreadHook(L: *State) Error!c_int {
@@ -606,7 +671,14 @@ pub fn pastDeadline(L: *State) bool {
     const budget = budgetOf(L);
     if (!budget.expired()) return false;
     budget.timed_out = true;
+    armTimeoutHook(L);
     return true;
+}
+
+/// Arms the 1-instruction timeout hook on `L` so any catchable boundary stops
+/// immediately after an expiration or cancellation.
+pub fn armTimeoutHook(L: *State) void {
+    c.lua_sethook(L, &hook, c.LUA_MASKCOUNT, 1);
 }
 
 /// An allocator over `child` that holds at most `bytes_max` bytes at once:
@@ -1675,4 +1747,178 @@ test "deadline stops loops of expensive C functions (table.sort, string.rep)" {
         "local ok, why = coroutine.close(co_timed) assert(not ok and why == 'timed out')",
     ) == null);
     try testing.expect(os.monotonicNs() - close_start_ns < 50 * std.time.ns_per_ms);
+}
+
+test "table.move near maxinteger and mininteger handles chunks without wraparound" {
+    var budget: Budget = .{ .bytes_max = 8 << 20 };
+    const L = try testState(&budget);
+    defer c.lua_close(L);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    budget.deadline_ns = os.monotonicNs() + 500 * std.time.ns_per_ms;
+    const checks =
+        \\-- Sparse large table near maxinteger (forward move across chunk boundaries).
+        \\local src = {}
+        \\local max = math.maxinteger
+        \\local f = max - 9000
+        \\src[f] = "first"
+        \\src[max - 4500] = "mid"
+        \\src[max - 1] = "last"
+        \\local dst = {}
+        \\table.move(src, f, max - 1, 1, dst)
+        \\assert(dst[1] == "first" and dst[4501] == "mid" and dst[9000] == "last")
+        \\-- Overlapping forward-in-index move near maxinteger (runs chunks high-to-low).
+        \\local ov = {}
+        \\ov[max - 9000] = "a"
+        \\ov[max - 4096] = "b"
+        \\ov[max - 1] = "c"
+        \\table.move(ov, max - 9000, max - 1, max - 8999)
+        \\assert(ov[max - 8999] == "a" and ov[max - 4095] == "b" and ov[max] == "c")
+        \\-- Forward move near mininteger.
+        \\local min = math.mininteger
+        \\local msrc = {}
+        \\msrc[min] = "m0"
+        \\msrc[min + 5000] = "m1"
+        \\msrc[min + 9000] = "m2"
+        \\local mdst = {}
+        \\table.move(msrc, min, min + 9000, 1, mdst)
+        \\assert(mdst[1] == "m0" and mdst[5001] == "m1" and mdst[9001] == "m2")
+        \\-- Overlapping high-to-low move near mininteger.
+        \\local mov = {}
+        \\mov[min] = "x0"
+        \\mov[min + 4096] = "x1"
+        \\mov[min + 9000] = "x2"
+        \\table.move(mov, min, min + 9000, min + 1)
+        \\assert(mov[min + 1] == "x0" and mov[min + 4097] == "x1" and mov[min + 9001] == "x2")
+    ;
+    if (runCode(L, arena, checks)) |msg| {
+        std.debug.print("{s}\n", .{msg});
+        return error.TestUnexpectedResult;
+    }
+}
+
+test "deadline stops loops of remaining guarded O(N) stdlib functions" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [512]u8 = undefined;
+    const dir_path = try os.tmpDirPath(&test_dir, &path_buffer);
+    const lua_file = try std.fmt.allocPrintSentinel(arena, "{s}/loop.lua", .{dir_path}, 0);
+    try os.writeFile(lua_file, "return 1");
+
+    const loadfile_loop = try std.fmt.allocPrintSentinel(
+        arena,
+        "while true do loadfile('{s}') end",
+        .{lua_file},
+        0,
+    );
+
+    const runaways = [_][:0]const u8{
+        "local s = ('A'):rep(1e5) while true do string.lower(s) end",
+        "local f = (' '):rep(1e5) while true do string.packsize(f) end",
+        "local s = ('a'):rep(1e5) while true do string.format('%s', s) end",
+        "local s = ('a'):rep(1e5) while true do utf8.len(s) end",
+        "while true do os.date('%Y-%m-%d') end",
+        "while true do load('return 1') end",
+        loadfile_loop,
+    };
+
+    for (runaways) |code| {
+        var budget: Budget = .{
+            .bytes_max = 16 << 20,
+            .deadline_ns = os.monotonicNs() + 40 * std.time.ns_per_ms,
+        };
+        const L = try testState(&budget);
+        defer c.lua_close(L);
+        const start_ns = os.monotonicNs();
+        const message = runCode(L, arena, code) orelse return error.TestUnexpectedResult;
+        try testing.expect(std.mem.find(u8, message, "timed out") != null);
+        try testing.expect(os.monotonicNs() - start_ns < std.time.ns_per_s);
+    }
+}
+
+test "loadfile supports shebang, env, atomic O_CLOEXEC, and stops infinite reads at deadline" {
+    const inheritable_before = inheritableFds();
+    var budget: Budget = .{ .bytes_max = 8 << 20 };
+    const L = try testState(&budget);
+    defer c.lua_close(L);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var test_dir = testing.tmpDir(.{});
+    defer test_dir.cleanup();
+    var path_buffer: [512]u8 = undefined;
+    const dir_path = try os.tmpDirPath(&test_dir, &path_buffer);
+    const shebang_file = try std.fmt.allocPrintSentinel(arena, "{s}/shebang.lua", .{dir_path}, 0);
+    try os.writeFile(shebang_file, "#!/usr/bin/env lua\nreturn greeting .. '!'\n");
+
+    const code = try std.fmt.allocPrintSentinel(arena,
+        \\local f, err = loadfile('{s}', 't', {{ greeting = 'hello' }})
+        \\assert(f and f() == 'hello!', tostring(err))
+        \\local mf, merr = loadfile('{s}/missing.lua')
+        \\assert(mf == nil and type(merr) == 'string')
+        \\local bf, berr = loadfile('{s}', 'b')
+        \\assert(bf == nil and berr:find('binary'))
+    , .{ shebang_file, dir_path, shebang_file }, 0);
+    if (runCode(L, arena, code)) |msg| {
+        std.debug.print("{s}\n", .{msg});
+        return error.TestUnexpectedResult;
+    }
+    try testing.expectEqual(inheritable_before, inheritableFds());
+
+    // /dev/zero fails syntax check safely without blocking or leaking fds,
+    // and repeated loadfile('/dev/zero') calls stop promptly at the deadline.
+    budget.deadline_ns = os.monotonicNs() + 40 * std.time.ns_per_ms;
+    const start_ns = os.monotonicNs();
+    const zero_err = runCode(L, arena, "while true do loadfile('/dev/zero') end") orelse
+        return error.TestUnexpectedResult;
+    try testing.expect(std.mem.find(u8, zero_err, "timed out") != null);
+    try testing.expect(os.monotonicNs() - start_ns < std.time.ns_per_s);
+    try testing.expectEqual(inheritable_before, inheritableFds());
+}
+
+test "coroutine.wrap closes <close> variables immediately on error and skips on timeout" {
+    var budget: Budget = .{ .bytes_max = 8 << 20 };
+    const L = try testState(&budget);
+    defer c.lua_close(L);
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const close_check =
+        \\local closed = false
+        \\local wrapped = coroutine.wrap(function()
+        \\  local f <close> = assert(io.open('/dev/null'))
+        \\  local g <close> = setmetatable({}, { __close = function() closed = true end })
+        \\  error('inner failure')
+        \\end)
+        \\local ok, err = pcall(wrapped)
+        \\assert(not ok and tostring(err):find('inner failure'))
+        \\assert(closed == true)
+    ;
+    if (runCode(L, arena, close_check)) |msg| {
+        std.debug.print("{s}\n", .{msg});
+        return error.TestUnexpectedResult;
+    }
+    try testing.expectEqual(@as(u32, 0), budget.open_files);
+
+    // If the wrapped coroutine times out, unwrap must NOT run __close with allowhook == 0.
+    budget.deadline_ns = os.monotonicNs() + 40 * std.time.ns_per_ms;
+    const start_ns = os.monotonicNs();
+    const timeout_check =
+        \\local wrapped = coroutine.wrap(function()
+        \\  local g <close> = setmetatable({}, { __close = function() while true do end end })
+        \\  while true do end
+        \\end)
+        \\wrapped()
+    ;
+    const msg = runCode(L, arena, timeout_check) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.find(u8, msg, "timed out") != null);
+    try testing.expect(os.monotonicNs() - start_ns < std.time.ns_per_s);
 }
