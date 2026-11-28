@@ -58,6 +58,7 @@ const ipc = @import("../ipc.zig");
 const layout_mod = @import("../layout.zig");
 const Inflight = @import("inflight.zig").Inflight;
 const ActionPanel = @import("ActionPanel.zig");
+const ClipFilter = @import("ClipFilter.zig");
 
 const log = std.log.scoped(.ui);
 const Kind = core.file_kind.Kind;
@@ -135,6 +136,8 @@ reselect_scroll: ?f64 = null,
 data_arena: std.heap.ArenaAllocator,
 /// Candidates of the current view before filtering.
 base: []Item = &.{},
+/// The clipboard view's filter, kept from one query to the next.
+clip_filter: ClipFilter = .{},
 /// The window Close Window was last sent to: the windows view leaves it out
 /// for a while (`ClosedWindow`).
 closed_window: ClosedWindow = .{},
@@ -1007,6 +1010,7 @@ fn reloadApps(data: ?*anyopaque) callconv(.c) c.gboolean {
         // reloads many times.
         row_list.clearRows(self);
         self.base = &.{};
+        self.clip_filter.reset();
         self.apps.dropStale();
     }
     return 0;
@@ -1018,6 +1022,7 @@ test {
     _ = @import("window_layout.zig");
     _ = @import("row_list.zig");
     _ = @import("search.zig");
+    _ = @import("ClipFilter.zig");
     _ = @import("config.zig");
     _ = @import("dump.zig");
     _ = @import("ActionPanel.zig");

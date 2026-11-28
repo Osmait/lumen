@@ -32,6 +32,7 @@ const row_list = @import("row_list.zig");
 const settings_view = @import("settings_view.zig");
 const choose_view = @import("choose_view.zig");
 const ContentSearch = @import("ContentSearch.zig");
+const ClipFilter = @import("ClipFilter.zig");
 const Ui = @import("Ui.zig");
 
 const log = std.log.scoped(.ui);
@@ -83,6 +84,8 @@ comptime {
 
 /// The view's candidates before filtering, in `arena` (the view's).
 pub fn loadBase(ui: *Ui, arena: std.mem.Allocator) []Item {
+    // What it kept of the last candidates goes with them.
+    ui.clip_filter.reset();
     return switch (ui.view) {
         .root => rootCandidates(ui, arena),
         .clipboard => clipCandidates(ui, arena),
@@ -400,15 +403,27 @@ fn fillFiltered(
     // Folded once, not for every field of every row.
     var query_buffer: [core.fuzzy.text_chars_max]u8 = undefined;
     const query_prepared = core.fuzzy.prepare(&query_buffer, query_text);
-    const long_matches = clipsMatchingPastScored(ui, arena, query_text);
-    for (ui.base) |item| {
-        const detail_scored = item.detail[0..@min(item.detail.len, filtered_detail_bytes_max)];
-        const text = if (item.detail.len > 0) detail_scored else item.title;
+    const long_matches: LongMatches = .{ .ids = clipsMatchingPastScored(ui, arena, query_text) };
+    // The clipboard's entries are many and long: scored on text folded once
+    // (MYP-613), the plain way below if that runs out of memory.
+    const clip_scored = ui.view == .clipboard and query_prepared.folded.len > 0 and
+        ui.clip_filter.score(
+            ui.data_arena.allocator(),
+            arena,
+            ui.base,
+            filtered_detail_bytes_max,
+            query_text,
+            query_prepared,
+            long_matches,
+            LongMatches.has,
+            long_match_score,
+            &hits,
+        );
+    if (!clip_scored) for (ui.base) |item| {
+        const text = ClipFilter.scoredText(item, filtered_detail_bytes_max);
         const fields = [_][]const u8{ text, item.subtitle };
         var score = core.fuzzy.scoreFieldsQuery(query_prepared, &fields);
-        if (score == core.fuzzy.no_match and item.action == .clip and
-            std.sort.binarySearch(Db.ClipId, long_matches, item.action.clip, orderClipId) != null)
-        {
+        if (score == core.fuzzy.no_match and long_matches.has(item)) {
             // Found in text the filter does not score: after those it does.
             score = long_match_score;
         }
@@ -416,7 +431,7 @@ fn fillFiltered(
         var copy = item;
         copy.score = score;
         hits.append(arena, copy) catch break;
-    }
+    };
     sortByScore(hits.items);
     ui.search_ns += stats.now() - search_start_ns;
     const shown = hits.items[0..@min(hits.items.len, filtered_results_max)];
@@ -446,6 +461,17 @@ fn clipsMatchingPastScored(ui: *Ui, arena: std.mem.Allocator, query_text: []cons
     }.lessThan);
     return ids;
 }
+
+/// `clipsMatchingPastScored`'s entries, sorted.
+const LongMatches = struct {
+    ids: []const Db.ClipId,
+
+    fn has(long_matches: LongMatches, item: Item) bool {
+        if (item.action != .clip) return false;
+        const id = item.action.clip;
+        return std.sort.binarySearch(Db.ClipId, long_matches.ids, id, orderClipId) != null;
+    }
+};
 
 fn orderClipId(wanted: Db.ClipId, id: Db.ClipId) std.math.Order {
     return std.math.order(@backingInt(wanted), @backingInt(id));

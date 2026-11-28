@@ -91,29 +91,130 @@ pub fn scoreQuery(query_prepared: Query, text_in: []const u8) i32 {
     var upper_buffer: [text_chars_max]bool = undefined;
     const text_len = fold.foldCase(&text_buffer, &upper_buffer, text_in);
     const text = text_buffer[0..text_len];
-    const upper = upper_buffer[0..text_len];
+    return scoreFolded(query, text, Cased{ .upper = upper_buffer[0..text_len] });
+}
+
+/// A text folded once (`Text.init`), for scoring many queries against it:
+/// the clipboard view folded each of up to 5,000 entries of 2,000 bytes
+/// again on every keystroke (MYP-613). It scores as the text it was made
+/// from does with `scoreQuery`.
+pub const Text = struct {
+    /// Folded, at most `text_chars_max` characters, as `scoreQuery` cuts.
+    folded: []const u8,
+    /// Bit `i % 64` of word `i / 64`: a word starts at `folded[i]`
+    /// (`isBoundary`), worked out once from the case the folding lost.
+    starts: []const u64,
+
+    /// `text_in` folded, in `gpa`'s memory (an arena's, typically).
+    pub fn init(gpa: std.mem.Allocator, text_in: []const u8) std.mem.Allocator.Error!Text {
+        var text_buffer: [text_chars_max]u8 = undefined;
+        var upper_buffer: [text_chars_max]bool = undefined;
+        const text_len = fold.foldCase(&text_buffer, &upper_buffer, text_in);
+        const folded = try gpa.dupe(u8, text_buffer[0..text_len]);
+        errdefer gpa.free(folded);
+        const starts = try gpa.alloc(u64, std.math.divCeil(usize, text_len, 64) catch unreachable);
+        startsOf(folded, upper_buffer[0..text_len], starts);
+        return .{ .folded = folded, .starts = starts };
+    }
+
+    /// `isBoundary` at each place of `text`, into `starts`' bits, 64 places
+    /// at a time: one by one, it took longer than folding the text.
+    fn startsOf(text: []const u8, upper: []const bool, starts: []u64) void {
+        assert(upper.len == text.len);
+        assert(starts.len * 64 >= text.len and starts.len * 64 < text.len + 64);
+        const Bytes = @Vector(64, u8);
+        const Bits = @Vector(64, u1);
+        for (starts, 0..) |*word, word_index| {
+            const first = word_index * 64;
+            if (first == 0 or first + 64 > text.len) {
+                word.* = 0;
+                for (first..@min(first + 64, text.len)) |i| {
+                    const start: u64 = @intFromBool(isBoundary(text, upper, i));
+                    word.* |= start << @intCast(i - first);
+                }
+                continue;
+            }
+            // The character before each place, and the case of both.
+            const before: Bytes = text[first - 1 ..][0..64].*;
+            // In memory a bool is a byte, 0 or 1.
+            const upper_bytes: [*]const u8 = @ptrCast(upper.ptr);
+            const upper_before: Bits = @truncate(@as(Bytes, upper_bytes[first - 1 ..][0..64].*));
+            const upper_here: Bits = @truncate(@as(Bytes, upper_bytes[first..][0..64].*));
+            const lower = bitsOf(before >= @as(Bytes, @splat('a'))) &
+                bitsOf(before <= @as(Bytes, @splat('z')));
+            const capital = bitsOf(before >= @as(Bytes, @splat('A'))) &
+                bitsOf(before <= @as(Bytes, @splat('Z')));
+            const digit = bitsOf(before >= @as(Bytes, @splat('0'))) &
+                bitsOf(before <= @as(Bytes, @splat('9')));
+            const ascii = bitsOf(before < @as(Bytes, @splat(0x80)));
+            const separator = ascii & ~(lower | capital | digit);
+            const camel = lower & ~upper_before & upper_here;
+            word.* = @bitCast(separator | camel);
+        }
+    }
+
+    inline fn bitsOf(comparison: @Vector(64, bool)) @Vector(64, u1) {
+        return @intFromBool(comparison);
+    }
+
+    pub fn deinit(text: *Text, gpa: std.mem.Allocator) void {
+        gpa.free(text.folded);
+        gpa.free(text.starts);
+        text.* = undefined;
+    }
+};
+
+/// `scoreQuery` against a text folded already.
+pub fn scoreText(query_prepared: Query, text: *const Text) i32 {
+    const query = query_prepared.folded;
+    if (query.len == 0) return 0;
+    return scoreFolded(query, text.folded, Known{ .starts = text.starts });
+}
+
+/// Word starts from the case of the original text (`isBoundary`).
+const Cased = struct {
+    upper: []const bool,
+
+    inline fn at(cased: Cased, text: []const u8, index: usize) bool {
+        return isBoundary(text, cased.upper, index);
+    }
+};
+
+/// Word starts worked out already (`Text`).
+const Known = struct {
+    starts: []const u64,
+
+    inline fn at(known: Known, _: []const u8, index: usize) bool {
+        return known.starts[index / 64] >> @intCast(index % 64) & 1 != 0;
+    }
+};
+
+/// `query` (not empty) against `text`, both folded; `starts.at(text, k)`
+/// says whether a word starts at `text[k]` (`Cased` or `Known`).
+inline fn scoreFolded(query: []const u8, text: []const u8, starts: anytype) i32 {
+    assert(query.len > 0);
     if (query.len > text.len) return no_match;
 
     // A plain substring is the strongest signal (see
-    // `substring_outranks_fuzzy_chars_max`), and a prefix more so. Score every
-    // occurrence so an earlier mid-word hit cannot hide a word-start hit.
+    // `substring_outranks_fuzzy_chars_max`), and a prefix more so. An
+    // earlier mid-word hit must not hide a word-start hit, but none after
+    // the first word-start hit beats it (each is further from the start):
+    // the occurrences are scored up to that one.
     if (std.mem.find(u8, text, query)) |first_start| {
-        var result = scoreSubstring(text, upper, query.len, first_start);
-        if (first_start > 0) {
-            var search_from = first_start + 1;
-            while (std.mem.findPos(u8, text, search_from, query)) |substring_start| {
-                result = @max(result, scoreSubstring(text, upper, query.len, substring_start));
-                search_from = substring_start + 1;
-            }
+        var result = scoreSubstring(text, starts, query.len, first_start);
+        var substring_start = first_start;
+        while (substring_start > 0 and !starts.at(text, substring_start)) {
+            substring_start = std.mem.findPos(u8, text, substring_start + 1, query) orelse break;
+            result = @max(result, scoreSubstring(text, starts, query.len, substring_start));
         }
         assert(result >= Score.substring_floor);
         return result;
     }
     if (query.len > fuzzy_query_chars_max) return no_match;
     // Most texts do not even hold the letters in order: one pass says so,
-    // before `scoreFuzzy`'s 16 KB frame is set up.
+    // before `scoreFuzzy`'s 24 KB frame is set up.
     if (!isSubsequence(query, text)) return no_match;
-    const result = scoreFuzzy(text, upper, query);
+    const result = scoreFuzzy(text, starts, query);
     if (result != no_match) {
         const letters: i32 = @intCast(query.len);
         assert(result <= letters * Score.fuzzy_letter_max);
@@ -123,7 +224,7 @@ pub fn scoreQuery(query_prepared: Query, text_in: []const u8) i32 {
 
 fn scoreSubstring(
     text: []const u8,
-    upper: []const bool,
+    starts: anytype,
     query_len: usize,
     substring_start: usize,
 ) i32 {
@@ -133,7 +234,7 @@ fn scoreSubstring(
     var result: i32 = Score.substring_base - position_penalty;
     if (substring_start == 0) {
         result += Score.substring_prefix_bonus;
-    } else if (isBoundary(text, upper, substring_start)) {
+    } else if (starts.at(text, substring_start)) {
         result += Score.substring_boundary_bonus;
     }
     if (query_len == text.len) result += Score.substring_whole_bonus;
@@ -146,90 +247,107 @@ fn scoreSubstring(
 /// "Text Editor" took the "e" of "Text" and found no "d" after it.
 ///
 /// Dynamic programming over (query letter, text position), one row per
-/// letter: `previous[j]` is the best score with the previous letter at `j`.
-/// A gap costs `min(distance, fuzzy_gap_penalty_max)`, so only the last
+/// letter: the previous row holds the best score with the previous letter
+/// at each place it reached. A gap costs `min(distance,
+/// fuzzy_gap_penalty_max)`, so only the places reached in the last
 /// `fuzzy_gap_penalty_max` positions need looking at one by one; anything
 /// further costs the same, and its best is kept as it goes (`far_best`).
 /// Each row visits only the places its letter is, from just after the
-/// previous row's first reached one (MYP-188).
+/// previous row's first reached one (MYP-188), and holds only the places
+/// reached: a row as long as the text, cleared and walked for every
+/// letter, made the clipboard's long entries cost ~50 us each (MYP-613).
 ///
-/// Out of line: its rows are 16 KB, which every call of an inlined
+/// Out of line: its rows are 24 KB, which every call of an inlined
 /// `scoreQuery` set up, matching or not.
-noinline fn scoreFuzzy(text: []const u8, upper: []const bool, query: []const u8) i32 {
+noinline fn scoreFuzzy(text: []const u8, starts: anytype, query: []const u8) i32 {
     assert(query.len > 0);
     assert(text.len <= text_chars_max);
-    const unreached = no_match;
-    var rows: [2][text_chars_max]i32 = undefined;
+    var rows: [2]Row = undefined;
     var previous = &rows[0];
     var current = &rows[1];
-    @memset(previous[0..text.len], unreached);
-    // The first position any letter of the previous row reached.
-    var previous_first: usize = text.len;
+    previous.len = 0;
     var k_first = std.mem.findScalar(u8, text, query[0]);
     while (k_first) |k| : (k_first = std.mem.findScalarPos(u8, text, k + 1, query[0])) {
-        if (!isBoundary(text, upper, k)) continue;
+        if (!starts.at(text, k)) continue;
         const first_penalty: i32 = @intCast(@min(k, Score.fuzzy_first_penalty_max));
-        previous[k] = Score.fuzzy_letter + Score.fuzzy_boundary_bonus - first_penalty;
-        previous_first = @min(previous_first, k);
+        previous.append(k, Score.fuzzy_letter + Score.fuzzy_boundary_bonus - first_penalty);
     }
-    if (previous_first == text.len) return no_match;
+    if (previous.len == 0) return no_match;
     for (query[1..]) |letter| {
-        @memset(current[0..text.len], unreached);
-        const first = rowFrom(text, upper, letter, previous, current, previous_first + 1);
+        rowFrom(text, starts, letter, previous, current);
         // No place for this letter: none for the ones after it either.
-        if (first == text.len) return no_match;
-        previous_first = first;
-        std.mem.swap(*[text_chars_max]i32, &previous, &current);
+        if (current.len == 0) return no_match;
+        std.mem.swap(*Row, &previous, &current);
     }
-    var result: i32 = unreached;
-    for (previous[previous_first..text.len]) |score_at| result = @max(result, score_at);
+    var result: i32 = no_match;
+    for (previous.scores[0..previous.len]) |score_at| result = @max(result, score_at);
+    assert(result != no_match);
     return result;
 }
 
-/// One row of `scoreFuzzy`: `letter` at each of its places in `text` from
-/// `start` on, given the previous letter's row. Returns the first position
-/// reached, or `text.len` for none.
+/// The places one letter of the query reached in the text, in order, and
+/// the best score of the letters up to it with it there.
+const Row = struct {
+    places: [text_chars_max]u16,
+    scores: [text_chars_max]i32,
+    len: usize,
+
+    comptime {
+        assert(text_chars_max <= std.math.maxInt(u16) + 1);
+    }
+
+    inline fn append(row: *Row, place: usize, score_at: i32) void {
+        assert(row.len < text_chars_max);
+        assert(row.len == 0 or row.places[row.len - 1] < place);
+        assert(score_at != no_match);
+        row.places[row.len] = @intCast(place);
+        row.scores[row.len] = score_at;
+        row.len += 1;
+    }
+};
+
+/// One row of `scoreFuzzy`: `letter` at each of its places in `text` after
+/// the first one the previous letter reached, given that letter's row.
 inline fn rowFrom(
     text: []const u8,
-    upper: []const bool,
+    starts: anytype,
     letter: u8,
-    previous: *const [text_chars_max]i32,
-    current: *[text_chars_max]i32,
-    start: usize,
-) usize {
+    previous: *const Row,
+    current: *Row,
+) void {
+    assert(previous.len > 0);
     const unreached = no_match;
     const gap_max = Score.fuzzy_gap_penalty_max;
-    var first: usize = text.len;
-    // The best of `previous[0..far_end]`, the places whose gap costs the
-    // most: everything at or before `k - gap_max`.
+    current.len = 0;
+    // The best of `previous` before `far_end`, the places whose gap costs
+    // the most: everything at or before `k - gap_max`.
     var far_best: i32 = unreached;
     var far_end: usize = 0;
+    const start = @as(usize, previous.places[0]) + 1;
     var next = if (start < text.len) std.mem.findScalarPos(u8, text, start, letter) else null;
     while (next) |k| : (next = std.mem.findScalarPos(u8, text, k + 1, letter)) {
-        if (k >= gap_max) {
-            while (far_end <= k - gap_max) : (far_end += 1) {
-                far_best = @max(far_best, previous[far_end]);
-            }
+        while (far_end < previous.len and previous.places[far_end] + gap_max <= k) {
+            far_best = @max(far_best, previous.scores[far_end]);
+            far_end += 1;
         }
+        const boundary = starts.at(text, k);
         var best: i32 = unreached;
-        if (previous[k - 1] != unreached) best = previous[k - 1] + Score.fuzzy_run_bonus;
-        const boundary = isBoundary(text, upper, k);
-        if (boundary) {
-            if (far_best != unreached) best = @max(best, far_best - gap_max);
-            // Gaps of 2 to gap_max - 1 (a gap of 1 is a run).
-            var distance: usize = 2;
-            while (distance < gap_max and distance <= k) : (distance += 1) {
-                const before = previous[k - distance];
-                if (before == unreached) continue;
-                best = @max(best, before - @as(i32, @intCast(distance)));
+        if (boundary and far_best != unreached) best = far_best - gap_max;
+        // The places reached less than `gap_max` before: right before is a
+        // run, 2 to gap_max - 1 before a gap, taken only at a word start.
+        var near = far_end;
+        while (near < previous.len and previous.places[near] < k) : (near += 1) {
+            const distance = k - previous.places[near];
+            if (distance == 1) {
+                best = @max(best, previous.scores[near] + Score.fuzzy_run_bonus);
+            } else if (boundary) {
+                best = @max(best, previous.scores[near] - @as(i32, @intCast(distance)));
             }
         }
         if (best == unreached) continue;
         const boundary_bonus: i32 = if (boundary) Score.fuzzy_boundary_bonus else 0;
-        current[k] = best + Score.fuzzy_letter + boundary_bonus;
-        first = @min(first, k);
+        current.append(k, best + Score.fuzzy_letter + boundary_bonus);
     }
-    return first;
 }
 
 /// Whether the letters of `query` appear in `text` in order. One search
@@ -394,6 +512,71 @@ test "substring scoring picks the strongest occurrence" {
     try std.testing.expect(score("code", "Xcode Code") > score("code", "Xcode mode"));
 }
 
+test "a text folded once scores as the text does (MYP-613)" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(613);
+    const random = prng.random();
+    // Capitals, accents (two bytes, folded to one), separators, and texts
+    // past `text_chars_max`, which both cut alike.
+    const pieces = [_][]const u8{ "a", "b", "C", "é", "É", "ñ", " ", "-", "/", "x", "Ab", "×" };
+    const query_letters = "abcexn ";
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(gpa);
+    for (0..3_000) |round| {
+        raw.clearRetainingCapacity();
+        const pieces_count = if (round % 100 == 0)
+            text_chars_max + random.uintAtMost(usize, 64)
+        else
+            random.uintAtMost(usize, 60);
+        for (0..pieces_count) |_| {
+            try raw.appendSlice(gpa, pieces[random.uintLessThan(usize, pieces.len)]);
+        }
+        var text: Text = try .init(gpa, raw.items);
+        defer text.deinit(gpa);
+        var query_raw: [5]u8 = undefined;
+        const query_len = random.intRangeAtMost(usize, 1, query_raw.len);
+        for (query_raw[0..query_len]) |*char| {
+            char.* = query_letters[random.uintLessThan(usize, query_letters.len)];
+        }
+        var query_buffer: [text_chars_max]u8 = undefined;
+        const query = prepare(&query_buffer, query_raw[0..query_len]);
+        try std.testing.expectEqual(scoreQuery(query, raw.items), scoreText(query, &text));
+    }
+    var empty: Text = try .init(gpa, "");
+    defer empty.deinit(gpa);
+    var query_buffer: [text_chars_max]u8 = undefined;
+    try std.testing.expectEqual(no_match, scoreText(prepare(&query_buffer, "a"), &empty));
+    try std.testing.expectEqual(@as(i32, 0), scoreText(prepare(&query_buffer, ""), &empty));
+}
+
+test "a substring scores its best occurrence, looked for up to the first word start" {
+    var prng = std.Random.DefaultPrng.init(6130);
+    const random = prng.random();
+    const alphabet = "abAB _";
+    for (0..20_000) |_| {
+        var raw: [40]u8 = undefined;
+        const raw_len = random.uintAtMost(usize, raw.len);
+        for (raw[0..raw_len]) |*char| char.* = alphabet[random.uintLessThan(usize, alphabet.len)];
+        var query_raw: [3]u8 = undefined;
+        const query_len = random.intRangeAtMost(usize, 1, query_raw.len);
+        for (query_raw[0..query_len]) |*char| char.* = "ab"[random.uintLessThan(usize, 2)];
+        const query = query_raw[0..query_len];
+        // Every occurrence scored, as before the search stopped early.
+        var text_buffer: [text_chars_max]u8 = undefined;
+        var upper_buffer: [text_chars_max]bool = undefined;
+        const text_len = fold.foldCase(&text_buffer, &upper_buffer, raw[0..raw_len]);
+        const text = text_buffer[0..text_len];
+        const cased: Cased = .{ .upper = upper_buffer[0..text_len] };
+        var expected: i32 = no_match;
+        var from: usize = 0;
+        while (std.mem.findPos(u8, text, from, query)) |start| : (from = start + 1) {
+            expected = @max(expected, scoreSubstring(text, cased, query.len, start));
+        }
+        if (expected == no_match) continue;
+        try std.testing.expectEqual(expected, score(query, raw[0..raw_len]));
+    }
+}
+
 test "the DP scores as the one that visited every position (MYP-188)" {
     var prng = std.Random.DefaultPrng.init(188);
     const random = prng.random();
@@ -417,7 +600,7 @@ test "the DP scores as the one that visited every position (MYP-188)" {
         if (query.len > text.len or !isSubsequence(query, text)) continue;
         try std.testing.expectEqual(
             scoreFuzzyReference(text, upper, query),
-            scoreFuzzy(text, upper, query),
+            scoreFuzzy(text, Cased{ .upper = upper }, query),
         );
     }
 }
