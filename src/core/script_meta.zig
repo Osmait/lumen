@@ -9,8 +9,9 @@
 //!   # @lumen.packageName System
 //!
 //! `@raycast.*` keys are accepted too, the same format, so script commands
-//! written for other launchers work unchanged. Only the header (the first
-//! lines) is read.
+//! written for other launchers work unchanged, except those that take
+//! arguments (`argument1`...): there is no prompt for them, so they are not
+//! listed. Only the header (the first lines) is read.
 
 const std = @import("std");
 
@@ -23,14 +24,31 @@ pub const Meta = struct {
     package_name: []const u8 = "",
     description: []const u8 = "",
     needs_confirmation: bool = false,
+    /// The folder to run in, as written (`~/Projects/app`); empty for the
+    /// script's own folder.
+    current_directory_path: []const u8 = "",
+    /// An `argumentN` that is not `"optional": true`: the script must not
+    /// run without it.
+    needs_arguments: bool = false,
 };
 
 /// Only the header is metadata: lines past this many are not read.
 const header_lines_max = 40;
 
 /// The keys Lumen reads, spelled as in the header. Others
-/// (`schemaVersion`, `argument1`...) are ignored.
-const Key = enum { title, mode, icon, packageName, description, needsConfirmation };
+/// (`schemaVersion`, `author`...) are ignored.
+const Key = enum {
+    title,
+    mode,
+    icon,
+    packageName,
+    description,
+    needsConfirmation,
+    currentDirectoryPath,
+    argument1,
+    argument2,
+    argument3,
+};
 
 /// Parses the header of `source`. Slices point into `source`. Returns null if
 /// there is no title (not a script command).
@@ -53,6 +71,10 @@ pub fn parse(source: []const u8) ?Meta {
             .packageName => meta.package_name = value,
             .description => meta.description = value,
             .needsConfirmation => meta.needs_confirmation = parseFlag(value),
+            .currentDirectoryPath => meta.current_directory_path = value,
+            .argument1, .argument2, .argument3 => if (!argumentOptional(value)) {
+                meta.needs_arguments = true;
+            },
         }
     }
     if (meta.title.len == 0) return null;
@@ -82,6 +104,20 @@ fn parseMode(value: []const u8) Mode {
 /// A header flag is on only when written `true`, as Raycast reads it.
 fn parseFlag(value: []const u8) bool {
     return std.mem.eql(u8, value, "true");
+}
+
+/// Whether an argument's JSON (`{ "type": "text", "optional": true }`) says
+/// it is optional. Anything else, malformed JSON included, is required:
+/// running without a required argument is what must not happen.
+fn argumentOptional(value: []const u8) bool {
+    const key = "\"optional\"";
+    const key_start = std.mem.find(u8, value, key) orelse return false;
+    var rest = std.mem.trimStart(u8, value[key_start + key.len ..], " \t");
+    if (!std.mem.startsWith(u8, rest, ":")) return false;
+    rest = std.mem.trimStart(u8, rest[1..], " \t");
+    if (!std.mem.startsWith(u8, rest, "true")) return false;
+    rest = rest["true".len..];
+    return rest.len == 0 or !std.ascii.isAlphanumeric(rest[0]);
 }
 
 /// The text after a `#`, `//` or `--` comment marker; null for the shebang
@@ -127,6 +163,31 @@ test "@raycast keys and other comment styles" {
     const meta = parse(source).?;
     try std.testing.expectEqualStrings("Say Hi", meta.title);
     try std.testing.expect(meta.needs_confirmation);
+}
+
+test "arguments and the folder to run in" {
+    const source =
+        \\#!/bin/bash
+        \\# @raycast.title Clean Folder
+        \\# @raycast.currentDirectoryPath ~/Projects/app
+        \\# @raycast.argument1 { "type": "text", "placeholder": "folder", "optional": true }
+    ;
+    const meta = parse(source).?;
+    try std.testing.expectEqualStrings("~/Projects/app", meta.current_directory_path);
+    try std.testing.expect(!meta.needs_arguments);
+
+    const required =
+        \\# @raycast.title Remove
+        \\# @raycast.argument1 {"type":"text","placeholder":"folder"}
+    ;
+    try std.testing.expect(parse(required).?.needs_arguments);
+    try std.testing.expect(!parse("# @raycast.title T\n").?.needs_arguments);
+
+    try std.testing.expect(argumentOptional("{\"optional\":true}"));
+    try std.testing.expect(!argumentOptional("{\"optional\": false}"));
+    try std.testing.expect(!argumentOptional("{\"optional\": trueish}"));
+    try std.testing.expect(!argumentOptional("{\"type\": \"text\"}"));
+    try std.testing.expect(!argumentOptional("not json"));
 }
 
 test "no title, no command" {

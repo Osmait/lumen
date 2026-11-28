@@ -74,7 +74,7 @@ fn primary(context: Context, item: *const Item) Outcome {
         .window_operation => |operation| hideAfter(windowOperation(context, operation)),
         .focus_window => hideAfter(focusWindow(context, item)),
         .clip => hideAfter(pasteClip(context, item)),
-        .script => |script| hideAfter(runScript(script.path, script.mode, item.title)),
+        .script => |script| runScript(script.path, script.mode, script.cwd, item.title),
         .calc => hideAfter(copy(item.detail)),
         .file => |file| blk: {
             _ = openFile(context, file.path, file.entry());
@@ -344,10 +344,12 @@ const editors_known = [_]KnownEditor{
         .syntax = .plus_line,
         .in_terminal = false,
     },
-    .{ .names = &.{ "hx", "helix", "micro" }, .syntax = .path_colon_line, .in_terminal = true },
+    .{ .names = &.{ "hx", "helix" }, .syntax = .path_colon_line, .in_terminal = true },
 };
 
-/// vi, vim, nvim, nano, and anything unknown: `+line path` in a terminal.
+/// vi, vim, nvim, nano, micro, and anything unknown: `+line path` in a
+/// terminal. micro reads `path:line` only with its `parsecursor` option,
+/// which is off by default; otherwise it opens a new file by that name.
 const editor_unknown: KnownEditor = .{ .names = &.{}, .syntax = .plus_line, .in_terminal = true };
 
 /// How each editor is told to open a file at a line. `editor` is the
@@ -569,16 +571,18 @@ fn windowOperation(context: Context, operation: item_mod.WindowOperation) void {
     });
 }
 
-fn runScript(path: [:0]const u8, mode: @import("core").script_meta.Mode, title: []const u8) void {
-    var cwd_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
-    const dir = std.Io.Dir.path.dirname(path);
-    const cwd: ?[*:0]const u8 = if (dir) |folder|
-        (std.mem.printSentinel(&cwd_buffer, "{s}", .{folder}, 0) catch null)
-    else
-        null;
+/// Runs a script command in `cwd`. When that fails (a `currentDirectoryPath`
+/// that does not exist, among others) it says so and runs nothing: never in
+/// another folder.
+fn runScript(
+    path: [:0]const u8,
+    mode: @import("core").script_meta.Mode,
+    cwd: [:0]const u8,
+    title: []const u8,
+) Outcome {
+    const failed: Outcome = .{ .failed = "Could not run the script (see the log)" };
     if (mode == .silent) {
-        _ = proc.spawnInDir(&.{path}, cwd);
-        return;
+        return if (proc.spawnInDir(&.{path}, cwd)) .hide else failed;
     }
     // Other modes show the output: last lines as a desktop notification.
     // After `--`, a title or an output line starting with "-" is text, not
@@ -586,13 +590,14 @@ fn runScript(path: [:0]const u8, mode: @import("core").script_meta.Mode, title: 
     var title_buffer: [512:0]u8 = undefined;
     const title_terminated = std.mem.printSentinel(&title_buffer, "{s}", .{title}, 0) catch
         "Script";
-    _ = proc.spawnInDir(&.{
+    const spawned = proc.spawnInDir(&.{
         "sh",             "-c",
         \\out=$("$1" 2>&1); notify-send -a Lumen -- "$2" "$(printf '%s' "$out" | tail -n 5)"
         ,
         "lumen-script",   path,
         title_terminated,
     }, cwd);
+    return if (spawned) .hide else failed;
 }
 
 /// Copies `text` with wl-copy (it keeps serving the selection after we hide).
@@ -726,6 +731,7 @@ test "editors open at a line, terminal ones inside a terminal" {
         .{ "nvim", &.{ "nvim", "+12", "/x/a.zig" }, true },
         .{ "/usr/bin/vim", &.{ "/usr/bin/vim", "+12", "/x/a.zig" }, true },
         .{ "hx", &.{ "hx", "/x/a.zig:12" }, true },
+        .{ "micro", &.{ "micro", "+12", "/x/a.zig" }, true },
         .{ "code", &.{ "code", "-g", "/x/a.zig:12" }, false },
         .{ "zed", &.{ "zed", "/x/a.zig:12" }, false },
         .{ "kate", &.{ "kate", "-l", "12", "/x/a.zig" }, false },

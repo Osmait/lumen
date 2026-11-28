@@ -201,9 +201,11 @@ pkill waybar; waybar &
 ```
 
 `mode` is `silent` to just run it; any other mode (`compact`, `fullOutput`,
-`inline`) shows the last lines of its output as a notification. Script commands written for other
-launchers with `@raycast.*` keys work unchanged, except interactive `@raycast.argument*`
-prompts are not supported. See [`examples/scripts`](examples/scripts).
+`inline`) shows the last lines of its output as a notification. A script runs in its own folder,
+or in `currentDirectoryPath` (`~` is your home) when it has one; if that folder does not exist, it
+does not run. Script commands written for other launchers with `@raycast.*` keys work unchanged,
+except that there is no prompt for `@raycast.argument*`: a script with an argument that is not
+`"optional": true` is not listed. See [`examples/scripts`](examples/scripts).
 
 ## Extensions
 
