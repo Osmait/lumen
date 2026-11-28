@@ -37,15 +37,31 @@ pub fn onContentResult(result: *Ui.ContentSearch.Result, context: ?*anyopaque) v
     if (result.err) |err| log.warn("content search for \"{s}\": {t}", .{ result.query, err });
     // The same query searched again, the index having changed under it: the
     // selection (and an Enter about to be pressed) stays on its file, not
-    // the first row's (MYP-606).
+    // the first row's, the list where it was scrolled, and the action panel
+    // open on that file's actions (MYP-606).
     const searched_again = if (ui.content_query.shown) |shown|
         std.mem.eql(u8, shown.query, result.query)
     else
         false;
     const replaced = ui.content_query.take(result);
     if (ui.view == .contents) {
-        if (searched_again) ui.keepSelection();
+        // A file's actions are static (`item.actionsFor`): nothing the
+        // panel lists goes with the rows.
+        const panel_operation: ?item_mod.Operation = if (searched_again and ui.panel.isOpen())
+            ui.panel.entries[ui.panel.selected].operation
+        else
+            null;
+        if (searched_again) ui.keepView();
+        const kept_key = ui.reselect;
         ui.refresh();
+        // Not rebuilt (stale already, asked for again): what was kept is
+        // kept again when that answer comes, and not left for a keystroke's
+        // rebuild to find.
+        if (searched_again and ui.reselect.len > 0) {
+            ui.reselect.clear();
+            ui.reselect_scroll = null;
+        }
+        if (panel_operation) |operation| panelReopen(ui, kept_key.slice(), operation);
         // Latency from the keystroke that asked, not from this rebuild.
         if (stats.pending) |*pending_stats| {
             pending_stats.start_ns = result.start_ns;
@@ -53,6 +69,19 @@ pub fn onContentResult(result: *Ui.ContentSearch.Result, context: ?*anyopaque) v
         }
     }
     if (replaced) |replaced_result| replaced_result.destroy(ui.gpa);
+}
+
+/// Opens the action panel again on the row of `key`, if the rebuild
+/// selected it again, on the entry that runs `operation` (else the first).
+fn panelReopen(ui: *Ui, key: []const u8, operation: item_mod.Operation) void {
+    if (ui.panel.isOpen() or key.len == 0) return;
+    const item = ui.selectedItem() orelse return;
+    if (!std.mem.eql(u8, item.key, key)) return;
+    ui.openPanel();
+    const entries = ui.panel.entries;
+    for (entries, 0..) |entry, entry_index| {
+        if (entry.operation == operation) return ui.panel.select(entry_index);
+    }
 }
 
 /// A row per content hit: the file's name, the matching line and how many

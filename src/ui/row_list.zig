@@ -269,10 +269,16 @@ pub fn showEmptyOrResults(ui: *Ui, arena: std.mem.Allocator, query_text: []const
 }
 
 /// Selects the first row, or the one asked for with `setReselect` (or, it
-/// gone, the one in its place, with `Ui.keepPlace`).
+/// gone, the one in its place, with `Ui.keepPlace`). The list is scrolled
+/// to the top, or left where it was if `Ui.keepView`'s row is found.
 pub fn selectAfterRefresh(ui: *Ui) void {
     const adjustment = c.gtk_scrolled_window_get_vadjustment(ui.scroller);
-    c.gtk_adjustment_set_value(adjustment, 0);
+    // Left alone until the row is looked for: the adjustment keeps the old
+    // rows' range until the next layout, and moving it there and back
+    // flashed the scrollbar.
+    const scroll_kept = ui.reselect_scroll;
+    ui.reselect_scroll = null;
+    if (scroll_kept == null) c.gtk_adjustment_set_value(adjustment, 0);
     // An extension's list reloaded (its files changed) shows "Loading..."
     // until its rows come: the row to select again is looked for then
     // (`listCallback`), not among no rows at all (MYP-607).
@@ -306,10 +312,15 @@ pub fn selectAfterRefresh(ui: *Ui) void {
     if (found) |row_found| first = row_found;
     assert(ui.reselect.len == 0);
     assert(ui.reselect_row == null);
+    assert(ui.reselect_scroll == null);
     if (first) |row_first| assert(ui.rows.items[row_first].item != null);
+    // Where it was, with the row found again: that row is scrolled to (next
+    // frame) only if it is out of sight. Not found, to the top.
+    const scroll_back = found != null and scroll_kept != null;
+    if (scroll_kept != null and !scroll_back) c.gtk_adjustment_set_value(adjustment, 0);
     // The list was just scrolled to the top, where the first row is: no
     // need to wait a frame for its place to scroll to it.
-    ui.scroll.suppressed = first == top;
+    ui.scroll.suppressed = first == top and !scroll_back;
     select(ui, first);
     ui.scroll.suppressed = false;
 }
