@@ -1,12 +1,14 @@
 //! A query sent to a worker thread whose answer comes back later on the GTK
-//! main loop: content search, an extension command's list, and the
-//! extensions' rows for the root search all follow the same protocol.
+//! main loop: content search, the clipboard filter, an extension command's
+//! list, and the extensions' rows for the root search all follow the same
+//! protocol.
 //!
 //! Each request gets a generation from the worker. An answer of any other
 //! generation was overtaken by a newer request and is dropped. The newest
 //! answer taken is `latest`; the rows on screen are built from `shown` and
 //! point into it, so an answer is destroyed only once the rows built from
-//! it are gone.
+//! it are gone (the clipboard's rows point into its entries instead, and
+//! leave `shown` null).
 
 const std = @import("std");
 const assert = std.debug.assert;
@@ -74,6 +76,13 @@ pub fn Inflight(comptime Result: type, comptime asked_bytes_max: usize) type {
             if (self.latest) |latest| self.generation = latest.generation;
         }
 
+        /// Forgets the request in flight: its answer will not be current.
+        /// `latest` stays.
+        pub fn drop(self: *Self) void {
+            self.pending = false;
+            self.generation = std.mem.zeroes(Generation);
+        }
+
         /// Forgets the requests in flight (their answers will not be
         /// current) and returns the latest answer for the caller to destroy.
         pub fn forget(self: *Self) ?*Result {
@@ -130,4 +139,19 @@ test "inflight: keepLatest drops an overtaken in-flight query when returning to 
     try std.testing.expect(!inflight.pending);
     try std.testing.expect(!inflight.current(&abc));
     try std.testing.expect(inflight.current(&ab));
+}
+
+test "inflight: drop makes the answer in flight stale and keeps the latest" {
+    const Answer = struct { generation: u32 };
+    var inflight: Inflight(Answer, 16) = .{};
+    var ab: Answer = .{ .generation = 1 };
+    var abc: Answer = .{ .generation = 2 };
+
+    inflight.sent(1, "ab");
+    try std.testing.expectEqual(@as(?*Answer, null), inflight.take(&ab));
+    inflight.sent(2, "abc");
+    inflight.drop();
+    try std.testing.expect(!inflight.pending);
+    try std.testing.expect(!inflight.current(&abc));
+    try std.testing.expectEqual(&ab, inflight.latest.?);
 }

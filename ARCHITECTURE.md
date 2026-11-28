@@ -321,7 +321,7 @@ tools/lumen-stats.sh --scenario    # + drives the window (every view, x3) and
 ```
 
 Threads are named (`lm-search-N`, `lm-scan-N`, `lm-csearch-N`, `lm-cbuild-N`,
-`lm-files`, `lm-content`) so CPU can be attributed. Latency is measured to GdkFrameClock's `after-paint`,
+`lm-files`, `lm-content`, `lm-clipsearch`) so CPU can be attributed. Latency is measured to GdkFrameClock's `after-paint`,
 so it includes GTK's layout and drawing, not only the search.
 
 What the measurements changed (12 threads, 1.06 M files and 43 k text
