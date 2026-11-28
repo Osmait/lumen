@@ -335,15 +335,45 @@ pub fn apply(live: *Live, changes: []const Watcher.Change) std.mem.Allocator.Err
         live.pending_resync = true;
         return changes.len;
     }
+    const MoveKey = struct { parent: u32, name: []const u8 };
+    const MoveKeyContext = struct {
+        pub fn hash(_: @This(), key: MoveKey) u64 {
+            var hasher: std.hash.Wyhash = .init(0);
+            hasher.update(std.mem.asBytes(&key.parent));
+            hasher.update(key.name);
+            return hasher.final();
+        }
+        pub fn eql(_: @This(), a: MoveKey, b: MoveKey) bool {
+            return a.parent == b.parent and std.mem.eql(u8, a.name, b.name);
+        }
+    };
+    // Track IN_MOVED_TO cookies in this batch so RENAME_EXCHANGE (`mv --exchange`)
+    // emitting MOVED_FROM(a,c1), MOVED_TO(b,c1), MOVED_FROM(b,c2), MOVED_TO(a,c2)
+    // does not let MOVED_FROM(b,c2) delete the newly arrived b from MOVED_TO(b,c1).
+    var moved_tos: std.HashMapUnmanaged(MoveKey, u32, MoveKeyContext, 80) = .empty;
+    defer moved_tos.deinit(live.gpa);
+
     var applied_count: usize = 0;
     for (changes) |change| switch (change) {
         .created => |created| {
+            if (created.moved_to and created.cookie != 0) {
+                try moved_tos.put(
+                    live.gpa,
+                    .{ .parent = created.parent, .name = created.name },
+                    created.cookie,
+                );
+            }
             const parent: EntryId = .fromRaw(created.parent);
             const added = try live.add(parent, created.name, created.is_dir, created.moved_to);
             applied_count += @intFromBool(added);
         },
         .modified => {},
         .removed => |removed| {
+            if (removed.cookie != 0) {
+                if (moved_tos.get(.{ .parent = removed.parent, .name = removed.name })) |to_cookie| {
+                    if (to_cookie != removed.cookie) continue;
+                }
+            }
             applied_count += @intFromBool(live.remove(.fromRaw(removed.parent), removed.name));
         },
         .dir_gone => |raw_id| {
@@ -502,11 +532,12 @@ fn add(live: *Live, parent: EntryId, name: []const u8, is_dir: bool, moved_to: b
     // it now must not come back under its old path.
     if (!live.alive(parent)) return false;
     if (live.childOf(parent, name)) |known| {
-        // Already indexed: an IN_MOVED_TO of something known, or what a
-        // rescan read before its event came (`IN_CREATE`). No duplicate.
-        // Only an `IN_MOVED_TO` directory over an existing one (`mv -T a b`)
-        // replaces unknown contents and needs tombstoning + rescanning.
-        if (!moved_to or !is_dir or !live.isDirEntry(known)) return false;
+        // Already indexed: an IN_MOVED_TO of a file over an existing file
+        // keeps the same path, and IN_CREATE after a rescan avoids duplicates.
+        // An IN_MOVED_TO replacing a directory (mv -T / RENAME_EXCHANGE) or a
+        // directory moving over a file replaces the existing entry and subtree.
+        const known_is_dir = live.isDirEntry(known);
+        if (!moved_to or (!is_dir and !known_is_dir)) return false;
         live.stats.removed += live.tombstoneTree(known);
     }
     var parent_path_buffer: paths.Buffer = undefined;
@@ -1903,4 +1934,46 @@ test "live: IN_CREATE for an already-indexed directory keeps its subtree without
     try testing.expectEqual(@as(usize, 0), applied);
     try testing.expectEqual(graves_before, tree.live.graves);
     try testing.expectEqual(@as(usize, 1), try tree.count("hoja", "modulo/interno/hoja.rs"));
+}
+
+test "live: renameat2 RENAME_EXCHANGE keeps both swapped files, directories, and mixed entries" {
+    const tree = try Tree.create(&.{
+        "alpha_file",
+        "beta_file",
+        "da/inner_a.txt",
+        "db/inner_b.txt",
+        "f_one",
+        "d_one/sub.txt",
+    });
+    defer tree.destroy();
+
+    const exchange = struct {
+        fn swap(root: []const u8, a: []const u8, b: []const u8) !bool {
+            var a_buf: paths.Buffer = undefined;
+            var b_buf: paths.Buffer = undefined;
+            const a_z = try std.mem.printSentinel(&a_buf, "{s}/{s}", .{ root, a }, 0);
+            const b_z = try std.mem.printSentinel(&b_buf, "{s}/{s}", .{ root, b }, 0);
+            const res = linux.renameat2(linux.AT.FDCWD, a_z, linux.AT.FDCWD, b_z, .{ .EXCHANGE = true });
+            switch (linux.errno(res)) {
+                .SUCCESS => return true,
+                .NOSYS, .INVAL, .OPNOTSUPP => return false,
+                else => return error.UnexpectedErrno,
+            }
+        }
+    }.swap;
+
+    if (!try exchange(tree.root, "alpha_file", "beta_file")) return error.SkipZigTest;
+    _ = try exchange(tree.root, "da", "db");
+    _ = try exchange(tree.root, "f_one", "d_one");
+    _ = try tree.sync();
+
+    try testing.expect(try tree.found("alpha_file", "alpha_file"));
+    try testing.expect(try tree.found("beta_file", "beta_file"));
+    try testing.expect(try tree.found("inner_b", "da/inner_b.txt"));
+    try testing.expect(try tree.found("inner_a", "db/inner_a.txt"));
+    try testing.expect(!try tree.found("inner_a", "da/inner_a.txt"));
+    try testing.expect(!try tree.found("inner_b", "db/inner_b.txt"));
+    try testing.expect(try tree.found("sub", "f_one/sub.txt"));
+    try testing.expect(try tree.found("d_one", "d_one"));
+    try testing.expect(!try tree.found("sub", "d_one/sub.txt"));
 }

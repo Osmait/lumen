@@ -87,6 +87,7 @@ pub const waitExitCancelable = wait.waitExitCancelable;
 pub const EventWait = wait.EventWait;
 pub const waitEvents = wait.waitEvents;
 pub const waitEventsTimeout = wait.waitEventsTimeout;
+pub const waitServiceEvents = wait.waitServiceEvents;
 pub const waitReadable = wait.waitReadable;
 pub const pollUntil = wait.pollUntil;
 pub const deadline_ns_none = wait.deadline_ns_none;

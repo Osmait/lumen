@@ -2475,3 +2475,62 @@ test "content service: unreadable subdirectory does not stall initial build or u
     try testing.expectEqual(@as(usize, 0), (try fixture.find(service, "chameleon")).len);
     try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "pangolin")).len);
 }
+
+test "content service: editing .ignore bumps name_changes so excluded files disappear" {
+    const gpa = testing.allocator;
+    var tmp = try sys.TestDir.init();
+    defer tmp.deinit();
+    var root_buf: paths.Buffer = undefined;
+    var cache_buf: paths.Buffer = undefined;
+    var files_idx_buf: paths.Buffer = undefined;
+    try tmp.mkdir("root");
+    try tmp.mkdir("cache");
+    const root_dir = try tmp.path(&root_buf, "root");
+    const cache_dir = try tmp.path(&cache_buf, "cache");
+    const files_idx = try std.mem.print(&files_idx_buf, "{s}/files.idx", .{cache_dir});
+
+    try tmp.write("root/.ignore", "");
+    try tmp.write("root/waterbird.txt", "violetcormorant lives by the shore\n");
+
+    const file_service = try Service.start(gpa, testing.io, root_dir, files_idx);
+    defer file_service.shutdown();
+    const deadline_ns = sys.monotonicNs() + 5 * std.time.ns_per_s;
+    while (file_service.nameChanges() == null) {
+        if (sys.monotonicNs() > deadline_ns) return error.Timeout;
+        sys.sleepUs(2_000);
+    }
+
+    const content_service = try ContentService.startWith(
+        gpa,
+        testing.io,
+        root_dir,
+        cache_dir,
+        file_service.contentPools(),
+        .{ .names = file_service, .poke_interval_ns_min = 0 },
+    );
+    defer content_service.shutdown();
+    try waitChecks(content_service, 1);
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var hits: std.ArrayList(Hit) = .empty;
+    defer hits.deinit(arena);
+    _ = try content_service.searchUntil(arena, "violetcormorant", 10, null, &hits);
+    try testing.expectEqual(@as(usize, 1), hits.items.len);
+
+    const before_changes = file_service.nameChanges().?;
+    try tmp.write("root/.ignore", "waterbird.txt\n");
+    const wait_until_ns = sys.monotonicNs() + 5 * std.time.ns_per_s;
+    while (true) {
+        if (file_service.nameChanges()) |now_changes| {
+            if (now_changes > before_changes) break;
+        }
+        if (sys.monotonicNs() > wait_until_ns) return error.Timeout;
+        sys.sleepUs(2_000);
+    }
+
+    try pokeAndWait(content_service);
+    _ = try content_service.searchUntil(arena, "violetcormorant", 10, null, &hits);
+    try testing.expectEqual(@as(usize, 0), hits.items.len);
+}
