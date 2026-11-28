@@ -32,8 +32,10 @@ pub const Options = struct {
     /// (a service shutting down does not wait for its tools).
     cancel: ?*const std.atomic.Value(bool) = null,
     /// Put on the program as soon as it is started: for tools run on
-    /// untrusted input (a crafted PDF), whose memory, CPU and writes must
-    /// not reach the rest of the machine. Null: none.
+    /// untrusted input (a crafted PDF), whose memory and CPU must not reach
+    /// the rest of the machine. Resource limits, not a sandbox: they keep a
+    /// file from growing, not from being deleted, emptied or renamed, and
+    /// leave sockets open to it. Null: none.
     limits: ?Limits = null,
 };
 

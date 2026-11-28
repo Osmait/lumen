@@ -95,10 +95,11 @@ fn nameOf(name_buffer: *[name_bytes_max]u8, doc: DocIn) []const u8 {
 
 /// Bump xlsx and docx cache key suffix (-v2) so stale entries re-extract
 /// with inlineStr worksheet text and docx header/footer support; xlsx -v3:
-/// shared strings stored after sheets past the cap were left out.
+/// shared strings stored after sheets past the cap were left out; xlsx
+/// -v4: the text results of formulas (`t="str"` cells) were left out.
 fn suffixOf(doc: DocIn) []const u8 {
     return switch (extract.kindOf(doc.path) orelse .pdf) {
-        .xlsx => "-v3",
+        .xlsx => "-v4",
         .docx => "-v2",
         else => "",
     };
@@ -112,7 +113,7 @@ const legacy_names_count = 3;
 /// SHA-256 name with the mtime in whole seconds (before nanoseconds), then
 /// Wyhash names with and without size. xlsx and docx texts from before
 /// `-v2` miss inlineStr / headers & footers, and xlsx ones from before
-/// `-v3` maybe their shared strings: never reused.
+/// `-v4` maybe their shared strings or formula results: never reused.
 fn legacyName(name_buffer: *[name_bytes_max]u8, doc: DocIn, which: usize) ?[]const u8 {
     if (extract.kindOf(doc.path) == .xlsx) return null;
     const mtime_s = @divFloor(doc.mtime, std.time.ns_per_s);
@@ -182,25 +183,79 @@ pub fn adoptLegacy(cache: TextCache, doc: DocIn) bool {
 }
 
 /// Reads the cached text of `doc` into `text`, up to `content.extracted_bytes_max`
-/// bytes: false when there is none (not extracted yet, or nothing to
-/// extract).
+/// bytes: `.none` when there is none (not extracted yet, or nothing to
+/// extract), `.unavailable` when it is there but could not be read (EMFILE,
+/// EIO, EACCES): the document is tried again later, never indexed as one
+/// with no text, which it stayed until it changed.
 pub fn read(
     cache: TextCache,
     gpa: std.mem.Allocator,
     doc: DocIn,
     text: *std.ArrayList(u8),
-) std.mem.Allocator.Error!bool {
+) std.mem.Allocator.Error!content.ReadOutcome {
     var path_buffer: paths.Buffer = undefined;
-    const text_path = cache.path(&path_buffer, doc) orelse return false;
+    const text_path = cache.path(&path_buffer, doc) orelse return .none;
     text.clearRetainingCapacity();
-    const fd = sys.openRegular(text_path) catch return false;
+    const fd = sys.openRegular(text_path) catch |err| switch (err) {
+        // Not extracted, or gone since (extracted again: `textCached`).
+        error.NotFound, error.NotRegular, error.NameTooLong => return .none,
+        else => return .unavailable,
+    };
     defer sys.close(fd);
     sys.readUpTo(gpa, fd, text, content.extracted_bytes_max) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         // Part of the text is not the document's text.
-        error.ReadFailed => return false,
+        error.ReadFailed => return .unavailable,
     };
-    return text.items.len > 0;
+    return if (text.items.len > 0) .text else .none;
+}
+
+/// In the folder once the empty texts cached before it were deleted
+/// (`retryFailed`). A dot-name: no cached text has one, and `sweep` leaves
+/// it alone.
+const failures_retried_name = ".failures-retried-v1";
+
+/// Deletes, once, the empty texts (documents that could not be extracted,
+/// kept from being tried again until they changed) that older versions
+/// cached: they came from failures fixed since, so they are extracted
+/// again. unzip's warning exit (a zip with bytes before it), a docx whose
+/// main part is not `word/document.xml`, a PDF timing out three times on a
+/// loaded machine. Texts that were extracted stay, under their names.
+pub fn retryFailed(cache: TextCache) void {
+    var marker_buffer: paths.Buffer = undefined;
+    const marker = std.mem.printSentinel(
+        &marker_buffer,
+        "{s}/{s}",
+        .{ cache.directory, failures_retried_name },
+        0,
+    ) catch return;
+    if (sys.exists(marker)) return;
+    var directory_buffer: paths.Buffer = undefined;
+    const directory = std.mem.printSentinel(&directory_buffer, "{s}", .{cache.directory}, 0) catch
+        return;
+    const fd = sys.openDir(directory) catch return;
+    defer sys.close(fd);
+    var iterator: sys.DirIter = .{ .fd = fd };
+    while (iterator.next() catch return) |entry| {
+        if (entry.kind == linux.DT.DIR) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".txt")) continue;
+        var name_buffer: [256]u8 = undefined;
+        const name = std.mem.printSentinel(&name_buffer, "{s}", .{entry.name}, 0) catch continue;
+        var statx: linux.Statx = undefined;
+        const stat_result = linux.statx(fd, name, linux.AT.SYMLINK_NOFOLLOW, .{ .SIZE = true }, &statx);
+        if (linux.errno(stat_result) != .SUCCESS or statx.size != 0) continue;
+        // Left behind, the marker is not written: tried again on the next start.
+        switch (linux.errno(linux.unlinkat(fd, name, 0))) {
+            .SUCCESS, .NOENT => {},
+            else => |errno| {
+                log.warn("deleting {s}/{s}: {t}", .{ directory, name, errno });
+                return;
+            },
+        }
+    }
+    sys.writeFileAtomic(marker, "") catch |err| {
+        log.warn("{s}: {t}", .{ marker, err });
+    };
 }
 
 /// How many bytes the cached text of `doc` has (0: none yet).
@@ -273,12 +328,26 @@ pub fn dropStale(
     }
 }
 
+pub const SweepOptions = struct {
+    /// Whether texts no live document refers to are deleted, or only those
+    /// under older names renamed. Only once files were listed and what was
+    /// extracted put in `index`: on start, the texts extracted for a batch
+    /// that a shutdown or a crash kept from being indexed were deleted, and
+    /// every one of them extracted again (MYP-571).
+    delete: bool,
+};
+
 /// Deletes the cached texts no live document of `index` refers to: what
 /// `dropStale` cannot know of, versions extracted and never indexed (out
-/// of memory, a shutdown or a crash in between), half-written ones. A text
+/// of memory, or deleted before they could be), half-written ones. A text
 /// cached under a name an older version used (`legacyName`) is renamed
-/// instead, not extracted again.
-pub fn sweep(cache: TextCache, gpa: std.mem.Allocator, index: *const Index) void {
+/// instead, not extracted again. Names starting with a dot are not texts.
+pub fn sweep(
+    cache: TextCache,
+    gpa: std.mem.Allocator,
+    index: *const Index,
+    options: SweepOptions,
+) void {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const keep = namesKept(arena_state.allocator(), index) catch return;
@@ -290,9 +359,11 @@ pub fn sweep(cache: TextCache, gpa: std.mem.Allocator, index: *const Index) void
     var iterator: sys.DirIter = .{ .fd = fd };
     while (iterator.next() catch return) |entry| {
         if (entry.kind == linux.DT.DIR) continue;
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
         var name_buffer: [256]u8 = undefined;
         const name = std.mem.printSentinel(&name_buffer, "{s}", .{entry.name}, 0) catch continue;
         const name_wanted = keep.get(entry.name) orelse {
+            if (!options.delete) continue;
             // Left behind, it is tried again by the next sweep.
             const result = linux.unlinkat(fd, name, 0);
             switch (linux.errno(result)) {
@@ -351,7 +422,7 @@ test "xlsx and docx use versioned cache keys while other docs keep legacy rename
     const testing = std.testing;
     var buf: [name_bytes_max]u8 = undefined;
     const xlsx_name = nameOf(&buf, .{ .path = "/tmp/book.xlsx", .mtime = 10, .size = 20, .source = .extracted });
-    try testing.expect(std.mem.endsWith(u8, xlsx_name, "-10-20-v3.txt"));
+    try testing.expect(std.mem.endsWith(u8, xlsx_name, "-10-20-v4.txt"));
     var docx_buf: [name_bytes_max]u8 = undefined;
     const docx_name = nameOf(&docx_buf, .{ .path = "/tmp/doc.docx", .mtime = 10, .size = 20, .source = .extracted });
     try testing.expect(std.mem.endsWith(u8, docx_name, "-10-20-v2.txt"));
@@ -384,8 +455,8 @@ test "texts cached under older names are renamed without an index, before extrac
     try cache_dir.write(try std.mem.print(&name_buffer, "text/{x:0>16}-1700000000.txt", .{
         std.hash.Wyhash.hash(0, odt.path),
     }), "odt words");
-    // An xlsx from before -v3: extracted again.
-    try cache_dir.write(try std.mem.print(&name_buffer, "text/{s}-1700000000-5-v2.txt", .{
+    // An xlsx from before -v4: extracted again.
+    try cache_dir.write(try std.mem.print(&name_buffer, "text/{s}-1700000000123456789-5-v3.txt", .{
         pathHashHex(&hash_hex, xlsx.path),
     }), "xlsx words");
 
@@ -393,7 +464,7 @@ test "texts cached under older names are renamed without an index, before extrac
     defer text.deinit(testing.allocator);
     for ([_]DocIn{ pdf, docx, odt }, [_][]const u8{ "pdf words", "docx words", "odt words" }) |doc, want| {
         try testing.expect(cache.adoptLegacy(doc));
-        try testing.expect(try cache.read(testing.allocator, doc, &text));
+        try testing.expectEqual(.text, try cache.read(testing.allocator, doc, &text));
         try testing.expectEqualStrings(want, text.items);
         // Moved, not copied: nothing left under the older name.
         try testing.expect(!cache.adoptLegacy(doc));
@@ -432,6 +503,77 @@ test "sweep renames a text named with the mtime in seconds instead of deleting i
     try cache_dir.write(try std.mem.print(&name_buffer, "text/{s}-1700000000-4242.txt", .{
         pathHashHex(&hash_hex, docs[0].path),
     }), "pdf words");
-    cache.sweep(testing.allocator, &index);
+    // Renamed on start already, when nothing is deleted.
+    cache.sweep(testing.allocator, &index, .{ .delete = false });
     try testing.expectEqual(@as(u64, "pdf words".len), cache.size(docs[0]));
+    cache.sweep(testing.allocator, &index, .{ .delete = true });
+    try testing.expectEqual(@as(u64, "pdf words".len), cache.size(docs[0]));
+}
+
+test "read: a cached text that cannot be read is unavailable, not empty" {
+    const testing = std.testing;
+    var cache_dir = try sys.TestDir.init();
+    defer cache_dir.deinit();
+    var cache: TextCache = try .init(testing.allocator, cache_dir.absolute);
+    defer cache.deinit(testing.allocator);
+    const doc: DocIn = .{ .path = "/home/u/a.pdf", .mtime = 1, .size = 2, .source = .extracted };
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(testing.allocator);
+    try testing.expectEqual(.none, try cache.read(testing.allocator, doc, &text));
+    var path_buffer: paths.Buffer = undefined;
+    const text_path = cache.path(&path_buffer, doc).?;
+    try sys.writeFile(text_path, "");
+    try testing.expectEqual(.none, try cache.read(testing.allocator, doc, &text));
+    try sys.writeFile(text_path, "words");
+    try testing.expectEqual(.text, try cache.read(testing.allocator, doc, &text));
+    // Not readable (EACCES here; EMFILE, EIO): not "nothing to extract"
+    // for good.
+    if (linux.geteuid() == 0) return;
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(text_path, 0)));
+    try testing.expectEqual(.unavailable, try cache.read(testing.allocator, doc, &text));
+}
+
+test "retryFailed: empty texts cached before are deleted once, others kept" {
+    const testing = std.testing;
+
+    var cache_dir = try sys.TestDir.init();
+    defer cache_dir.deinit();
+    var cache: TextCache = try .init(testing.allocator, cache_dir.absolute);
+    defer cache.deinit(testing.allocator);
+    const failed: DocIn = .{ .path = "/home/u/a.odt", .mtime = 1, .size = 2, .source = .extracted };
+    const good: DocIn = .{ .path = "/home/u/b.pdf", .mtime = 1, .size = 2, .source = .extracted };
+    var path_buffer: paths.Buffer = undefined;
+    try sys.writeFile(cache.path(&path_buffer, failed).?, "");
+    try sys.writeFile(cache.path(&path_buffer, good).?, "words");
+    cache.retryFailed();
+    try testing.expect(!sys.exists(cache.path(&path_buffer, failed).?));
+    try testing.expectEqual(@as(u64, "words".len), cache.size(good));
+    // Once: an empty text cached since stays.
+    try sys.writeFile(cache.path(&path_buffer, failed).?, "");
+    cache.retryFailed();
+    try testing.expect(sys.exists(cache.path(&path_buffer, failed).?));
+    // The marker is no text: a sweep leaves it alone.
+    var no_docs: [0]DocIn = .{};
+    const pool = try @import("Pool.zig").create(testing.allocator, testing.io, 0);
+    defer pool.destroy();
+    const NoText = struct {
+        fn read(_: *anyopaque, _: DocIn, _: *std.ArrayList(u8), _: std.mem.Allocator) std.mem.Allocator.Error!content.ReadOutcome {
+            return .none;
+        }
+    };
+    var context: u8 = 0;
+    var index = try content.build(testing.allocator, pool, &no_docs, .{
+        .read = NoText.read,
+        .context = &context,
+    }, null);
+    defer index.deinit(testing.allocator);
+    cache.sweep(testing.allocator, &index, .{ .delete = true });
+    try testing.expect(!sys.exists(cache.path(&path_buffer, failed).?));
+    var marker_buffer: paths.Buffer = undefined;
+    try testing.expect(sys.exists(try std.mem.printSentinel(
+        &marker_buffer,
+        "{s}/{s}",
+        .{ cache.directory, failures_retried_name },
+        0,
+    )));
 }

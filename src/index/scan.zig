@@ -464,7 +464,7 @@ fn readDir(
         // Dot-dirs and caches are noise: searchable, ranked low, and the
         // flag is inherited by everything below ("~/orca/skein-zig-pkg-cache"
         // READMEs outranked the user's own).
-        if (hiddenByName(entry.name)) flags |= store_mod.flag_hidden;
+        if (hiddenByName(entry.name, kind == sys.Kind.directory)) flags |= store_mod.flag_hidden;
         if (kind == sys.Kind.symlink) flags |= store_mod.flag_symlink;
         // A skipped directory is still indexed (searchable), just not opened.
         const descend = kind == sys.Kind.directory and shouldDescendAt(fd, path, entry.name, config);
@@ -485,13 +485,15 @@ fn readDir(
 /// "ShaderCache", "__pycache__".
 const hidden_word = "cache";
 
-/// Whether `name` hides itself and what is below it: a dot-name, or one
-/// that says "cache". The scan sets `flag_hidden` by it, and so does `Live`
-/// for what appears after the scan.
-pub fn hiddenByName(name: []const u8) bool {
+/// Whether `name` hides itself and what is below it: a dot-name, or a
+/// folder (`is_folder`) that says "cache". The scan sets `flag_hidden` by
+/// it, and so does `Live` for what appears after the scan. A file that says
+/// "cache" is the user's own (`cache.rs`, `LRUCache.java`): ranked below any
+/// fuzzy match when the word counted for files too.
+pub fn hiddenByName(name: []const u8, is_folder: bool) bool {
     assert(name.len > 0);
     if (name[0] == '.') return true;
-    return std.ascii.findIgnoreCase(name, hidden_word) != null;
+    return is_folder and std.ascii.findIgnoreCase(name, hidden_word) != null;
 }
 
 /// Whether `path` ends in the whole components `tail`: "/x/a" ends in "a",
@@ -625,6 +627,51 @@ const ScanTree = struct {
         return count;
     }
 };
+
+test "scan: \"cache\" hides folders and what is below them, not files" {
+    var tree = try ScanTree.init();
+    defer tree.temporary.cleanup();
+    tree.file("r/src/cache.rs");
+    tree.file("r/src/LRUCache.java");
+    tree.file("r/src/calc_helper.rs");
+    tree.file("r/notes/coach_schedule.md");
+    tree.file("r/ShaderCache/blob.rs");
+    tree.file("r/.dotdir/plain.rs");
+    tree.file("r/.cache.rs");
+    // Not opened when it has a CACHEDIR.TAG; this one has none.
+    tree.file("r/pkg/cache/inside.rs");
+    var store = try tree.scanOf("r", .{ .roots = &.{}, .cachedir_probe = &.{} }, null);
+    defer store.deinit(testing.allocator);
+    const hidden_names = [_][]const u8{ "ShaderCache", "blob.rs", ".dotdir", "plain.rs", ".cache.rs", "cache", "inside.rs" };
+    const shown_names = [_][]const u8{ "cache.rs", "LRUCache.java", "calc_helper.rs", "coach_schedule.md", "src", "pkg" };
+    var seen: usize = 0;
+    for (0..store.len()) |i| {
+        const id: u32 = @intCast(i);
+        const hidden = store.flags()[id] & store_mod.flag_hidden != 0;
+        for (hidden_names) |name| if (std.mem.eql(u8, store.name(id), name)) {
+            try testing.expect(hidden);
+            seen += 1;
+        };
+        for (shown_names) |name| if (std.mem.eql(u8, store.name(id), name)) {
+            try testing.expect(!hidden);
+            seen += 1;
+        };
+    }
+    try testing.expectEqual(hidden_names.len + shown_names.len, seen);
+    try testing.expect(hiddenByName(".x", false));
+    try testing.expect(hiddenByName("__pycache__", true));
+    try testing.expect(!hiddenByName("cache.rs", false));
+
+    // The file named as the query comes first.
+    const pool = try Pool.create(testing.allocator, testing.io, 1);
+    defer pool.destroy();
+    var engine: @import("search.zig").Engine = .empty;
+    defer engine.deinit(testing.allocator);
+    var hits: std.ArrayList(@import("search.zig").Hit) = .empty;
+    defer hits.deinit(testing.allocator);
+    try engine.search(testing.allocator, pool, &store, "cache", .{ .limit = 10, .recency = false }, &hits);
+    try testing.expectEqualStrings("cache.rs", store.name(hits.items[0].id));
+}
 
 test "scan: a folder it does not open is still a folder" {
     var tree = try ScanTree.init();

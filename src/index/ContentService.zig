@@ -116,8 +116,11 @@ pub const Counters = struct {
     extract_ns_last: std.atomic.Value(u64) = .init(0),
 };
 
-/// Maximum extraction attempts for deterministic per-document Timeout / ToolKilled
-/// before caching an empty marker until the document changes.
+/// Maximum extraction attempts for a document whose tool keeps being killed
+/// (`error.ToolKilled`: its CPU or memory limit) before caching an empty
+/// marker until the document changes. A wall-clock `Timeout` never counts
+/// for it: a loaded machine, not the document, which gets more time on
+/// each attempt instead (`extract.wallMs`).
 const extract_retries_max: u8 = 3;
 
 const RetryEntry = struct {
@@ -164,7 +167,18 @@ const Worker = struct {
     /// update (two fsyncs, a new version, another removed row). Paths owned
     /// by `ContentService.gpa`.
     unreadable: std.ArrayList(Unreadable) = .empty,
+    /// Modified files that made a check list every file and that the
+    /// listing left out all the same (a .gitignore'd log a dev server
+    /// appends to, a build's output): writing to them again does not list
+    /// again (ripgrep, ~0.45 s of CPU each time). Forgotten once a listing
+    /// has them. At most `unlisted_max`, paths owned by
+    /// `ContentService.gpa`.
+    unlisted: std.StringHashMapUnmanaged(void) = .empty,
 };
+
+/// The most modified-but-unlisted paths remembered (`Worker.unlisted`);
+/// past it they are forgotten, and listed again once each.
+const unlisted_max = 1024;
 
 /// A file a build could not read, as it was then. Its ctime too: `chmod`
 /// makes it readable without changing its mtime or size.
@@ -245,6 +259,8 @@ pub fn shutdown(service: *ContentService) void {
     service.worker.retry_arena.deinit();
     for (service.worker.unreadable.items) |entry| service.gpa.free(entry.path);
     service.worker.unreadable.deinit(service.gpa);
+    service.forgetUnlisted();
+    service.worker.unlisted.deinit(service.gpa);
     service.gpa.free(service.root);
     service.gpa.free(service.cache_path);
     service.text_cache.deinit(service.gpa);
@@ -512,7 +528,7 @@ fn textOf(
     const service: *ContentService = @ptrCast(@alignCast(context));
     return switch (doc.source) {
         .plain => content.readPlain(gpa, doc.path, text),
-        .extracted => if (try service.text_cache.read(gpa, doc, text)) .text else .none,
+        .extracted => service.text_cache.read(gpa, doc, text),
     };
 }
 
@@ -554,7 +570,7 @@ fn priorRetries(arena: std.mem.Allocator, retry: []const RetryEntry) ?PriorRetri
 
 /// Extracts what is missing from the text cache, on the background pool
 /// (a PDF takes 10-40 ms, a whole book up to ~0.7 s). Documents that cannot
-/// be extracted (a corrupt file, or repeatedly hitting Timeout/ToolKilled)
+/// be extracted (a corrupt file, or repeatedly hitting ToolKilled)
 /// get an empty cache file so they do not thrash every refresh. Unwritable
 /// caches (full, read-only, no access) pause extraction for `cache_write_backoff_ns`.
 /// `indexed`: `docs` are in the index already (`Diff.reextract`), which
@@ -628,6 +644,7 @@ fn extractMissing(
             .service = service,
             .docs = docs,
             .missing = missing.items,
+            .attempts = prev_attempts.items,
             .failed = failed,
         };
         service.build_pool.run(missing.items.len, &context, ExtractContext.extractOne);
@@ -655,6 +672,8 @@ const ExtractContext = struct {
     docs: []const content.DocIn,
     /// Positions in `docs` of the documents to extract.
     missing: []const usize,
+    /// One per `missing`: how many times its extraction failed before.
+    attempts: []const u8,
     /// One per `missing`: set when extracting or caching failed.
     failed: []?Failure,
     cache_unwritable: std.atomic.Value(bool) = .init(false),
@@ -684,6 +703,7 @@ const ExtractContext = struct {
             kind,
             extracted_bytes_max,
             &service.stop,
+            extract.wallMs(context.attempts[missing_index]),
         ) catch |err| switch (err) {
             // For good: an empty text, so that it is not tried again until
             // the document changes.
@@ -766,8 +786,8 @@ fn leaveOut(
             continue;
         }
         const next_attempts: u8 = prev +| 1;
-        const permanent_tool_fail =
-            (failure.err == error.Timeout or failure.err == error.ToolKilled) and
+        // Not a Timeout: the wall clock says how busy the machine was.
+        const permanent_tool_fail = failure.err == error.ToolKilled and
             next_attempts >= extract_retries_max;
         if (permanent_tool_fail) {
             if (service.text_cache.path(&cache_path_buffer, doc)) |text_path| {
@@ -954,6 +974,10 @@ fn commitUnreadable(service: *ContentService, input: BuildInput, index: *const c
     entries.shrinkRetainingCapacity(kept_count);
     for (added, first_id..) |doc, id| {
         if (!index.removed(@intCast(id))) continue;
+        // What could not be read is its cached text (`TextCache.read`), not
+        // the document: tried again by the next listing, or it stayed out
+        // until the document changed.
+        if (doc.source == .extracted) continue;
         // Out of memory: read again by the next listing, nothing worse.
         entries.ensureUnusedCapacity(gpa, 1) catch return;
         const owned = gpa.dupe(u8, doc.path) catch return;
@@ -1179,6 +1203,7 @@ fn refresh(service: *ContentService) void {
     {
         service.commitListing(listed);
         if (service.worker.unsaved) service.retrySave();
+        if (listed != null) service.sweepText(.{ .delete = true });
         return;
     }
 
@@ -1202,6 +1227,7 @@ fn refresh(service: *ContentService) void {
             service.lock.unlock(service.io);
             if (service.options.on_published) |hook| hook.callback(hook.context);
         }
+        if (listed != null) service.sweepText(.{ .delete = true });
         return;
     }
     const whole = service.wantsWhole(changed);
@@ -1232,6 +1258,7 @@ fn refresh(service: *ContentService) void {
     if (!whole and changed.gone.len == 0 and changed.added.len == 0) {
         service.commitListing(listed);
         service.commitRetry(&retry);
+        if (listed != null) service.sweepText(.{ .delete = true });
         return;
     }
     start_ns = sys.monotonicNs();
@@ -1265,7 +1292,8 @@ fn refresh(service: *ContentService) void {
         service.text_cache.dropStale(service.gpa, &old_shared.index, changed.gone, changed.added);
         old_shared.release();
     }
-    if (whole) service.sweepText();
+    // A whole build listed every file as well.
+    if (listed != null) service.sweepText(.{ .delete = true });
 }
 
 /// What changed since the index was built: every file listed again (no
@@ -1284,6 +1312,7 @@ fn changes(
         if (service.options.names) |names| _ = names.takeModified(arena) catch {};
         if (service.listAll(arena, name_changes, listed)) |listed_docs| {
             docs.* = listed_docs;
+            service.noteUnlisted(arena, listed_docs, &.{});
             return service.diff(arena, listed_docs) catch {
                 logOutOfMemory("comparing the listing");
                 return null;
@@ -1297,9 +1326,11 @@ fn changes(
     }
     if (service.options.names) |names| {
         const modified = names.takeModified(arena) catch null;
-        if (modified != null and service.shouldRelistForModified(arena, modified.?)) {
+        var relisted: std.ArrayList([]const u8) = .empty;
+        if (modified != null and service.shouldRelistForModified(arena, modified.?, &relisted)) {
             if (service.listAll(arena, name_changes, listed)) |listed_docs| {
                 docs.* = listed_docs;
+                service.noteUnlisted(arena, listed_docs, relisted.items);
                 return service.diff(arena, listed_docs) catch {
                     logOutOfMemory("comparing the listing");
                     return null;
@@ -1318,13 +1349,16 @@ fn changes(
 
 /// True if an in-place modification queue overflowed or includes a file not
 /// currently live in the index that is now eligible (e.g. a >1 MiB log file
-/// truncated into indexable bounds).
+/// truncated into indexable bounds), and that the last listing that it made
+/// did not leave out (`Worker.unlisted`). Those files are put in `relisted`
+/// (paths of `modified`), for `noteUnlisted`.
 /// One pass over the documents for every modified path, as a set: a pass
 /// per path was O(documents) each. Out of memory: true, as if overflowed.
 fn shouldRelistForModified(
     service: *const ContentService,
     arena: std.mem.Allocator,
     modified: Service.Modified,
+    relisted: *std.ArrayList([]const u8),
 ) bool {
     if (modified.overflow) return true;
     const index = service.current() orelse return true;
@@ -1341,9 +1375,50 @@ fn shouldRelistForModified(
     }
     var left = unindexed.keyIterator();
     while (left.next()) |mod_path| {
-        if (content_list.eligible(service.root, mod_path.*, service.worker.slow_mounts)) return true;
+        if (service.worker.unlisted.contains(mod_path.*)) continue;
+        if (!content_list.eligible(service.root, mod_path.*, service.worker.slow_mounts)) continue;
+        relisted.append(arena, mod_path.*) catch return true;
     }
-    return false;
+    return relisted.items.len > 0;
+}
+
+/// After a listing, `docs`: remembers which of `relisted` (the modified
+/// files that made it, `shouldRelistForModified`) it left out, and forgets
+/// the files remembered before that it has now. Out of memory, nothing new
+/// is remembered: they are listed again.
+fn noteUnlisted(
+    service: *ContentService,
+    arena: std.mem.Allocator,
+    docs: []const content.DocIn,
+    relisted: []const []const u8,
+) void {
+    service.assertWorkerThread();
+    const gpa = service.gpa;
+    const unlisted = &service.worker.unlisted;
+    if (relisted.len == 0 and unlisted.count() == 0) return;
+    var wanted: std.StringHashMapUnmanaged(void) = .empty;
+    wanted.ensureTotalCapacity(arena, @intCast(relisted.len)) catch return;
+    for (relisted) |path| wanted.putAssumeCapacity(path, {});
+    for (docs) |doc| {
+        _ = wanted.remove(doc.path);
+        if (unlisted.fetchRemove(doc.path)) |entry| gpa.free(entry.key);
+    }
+    var left = wanted.keyIterator();
+    while (left.next()) |path| {
+        if (unlisted.count() >= unlisted_max) service.forgetUnlisted();
+        const owned = gpa.dupe(u8, path.*) catch return;
+        const slot = unlisted.getOrPut(gpa, owned) catch {
+            gpa.free(owned);
+            return;
+        };
+        if (slot.found_existing) gpa.free(owned);
+    }
+}
+
+fn forgetUnlisted(service: *ContentService) void {
+    var paths_left = service.worker.unlisted.keyIterator();
+    while (paths_left.next()) |path| service.gpa.free(path.*);
+    service.worker.unlisted.clearRetainingCapacity();
 }
 
 /// Why every file must be listed again rather than only the indexed ones
@@ -1554,12 +1629,16 @@ fn retrySave(service: *ContentService) void {
 }
 
 /// Sweeps the text cache of what the index in use does not refer to
-/// (`TextCache.sweep`). On start and after a whole build, on the service
-/// thread: the one that writes the cache.
-fn sweepText(service: *ContentService) void {
+/// (`TextCache.sweep`), on the service thread: the one that writes the
+/// cache. On start only renaming what older versions named otherwise:
+/// texts extracted for documents a shutdown kept from being indexed are
+/// kept, for the first check to index. Deleting once a check listed every
+/// file and indexed what was extracted: what is left then is no
+/// document's (gone, or the old version of an edited one).
+fn sweepText(service: *ContentService, options: TextCache.SweepOptions) void {
     service.assertWorkerThread();
     const index = service.current() orelse return;
-    service.text_cache.sweep(service.gpa, index);
+    service.text_cache.sweep(service.gpa, index, options);
 }
 
 fn run(service: *ContentService) void {
@@ -1568,9 +1647,13 @@ fn run(service: *ContentService) void {
     // `seen` is read before refreshing: a poke that lands during a refresh
     // still counts afterwards (it may come after the listing).
     var seen = service.wake.load(.acquire);
+    // What a crash or SIGKILL in the middle of writing the index left: each
+    // run writes under its own pid, so nothing else deletes it.
+    sys.removeAbandonedTemporaries(service.cache_path);
     // Before the check, which would extract again what is cached under the
-    // older naming.
-    service.sweepText();
+    // older naming, and extracts what failed before for reasons fixed since.
+    service.text_cache.retryFailed();
+    service.sweepText(.{ .delete = false });
     service.refresh();
     while (!service.stop.load(.acquire)) {
         // Sleep until the next periodic check; `poke` and `shutdown` wake
@@ -1692,7 +1775,8 @@ fn setMtime(path: [:0]const u8, mtime_s: i64) !void {
     try testing.expectEqual(linux.E.SUCCESS, linux.errno(result));
 }
 
-/// Files in the text cache whose name starts with `prefix`.
+/// Files in the text cache whose name starts with `prefix` (dot-names are
+/// no texts: `TextCache.retryFailed`'s marker).
 fn countText(service: *ContentService, prefix: []const u8) !usize {
     var text_dir_buffer: paths.Buffer = undefined;
     const directory = service.text_cache.directory;
@@ -1702,6 +1786,7 @@ fn countText(service: *ContentService, prefix: []const u8) !usize {
     var iterator: sys.DirIter = .{ .fd = fd };
     var count: usize = 0;
     while (try iterator.next()) |entry| {
+        if (entry.name[0] == '.') continue;
         count += @intFromBool(std.mem.startsWith(u8, entry.name, prefix));
     }
     return count;
@@ -2164,7 +2249,8 @@ test "content service: a document whose extraction failed in passing is left out
     try testing.expectEqualStrings(pdf, changes_found.added[0].path);
     try testing.expectEqual(content.Source.extracted, changes_found.added[0].source);
 
-    // Repeated deterministic timeouts up to extract_retries_max cache an empty file and stop retrying.
+    // Timeouts are retried with backoff, never cached empty: the wall clock
+    // says how loaded the machine was.
     const second = service.leaveOut(
         arena,
         changes_found.added,
@@ -2177,14 +2263,33 @@ test "content service: a document whose extraction failed in passing is left out
     ).?;
     try testing.expectEqual(@as(usize, 1), second.retry.len);
     try testing.expectEqual(@as(u8, 2), second.retry[0].attempts);
+    const timed_out = service.leaveOut(
+        arena,
+        changes_found.added,
+        &.{0},
+        &.{extract_retries_max + 4},
+        &[_]?ExtractContext.Failure{.{ .err = error.Timeout }},
+        &.{},
+        &.{},
+        now,
+    ).?;
+    try testing.expectEqual(@as(usize, 1), timed_out.retry.len);
+    try testing.expectEqual(@as(usize, 0), timed_out.docs.len);
+    try testing.expect(!service.textCached(changes_found.added[0]));
+    // Each attempt gets more time, up to 4x.
+    try testing.expect(extract.wallMs(1) > extract.wallMs(0));
+    try testing.expectEqual(4 * extract.wallMs(0), extract.wallMs(extract_retries_max + 4));
 
+    // The tool killed by its limits (CPU, memory) up to extract_retries_max:
+    // an empty text cached, not retried.
     const third = service.leaveOut(
         arena,
         changes_found.added,
         &.{0},
         &.{2},
-        &[_]?ExtractContext.Failure{.{ .err = error.Timeout }},
+        &[_]?ExtractContext.Failure{.{ .err = error.ToolKilled }},
         &.{},
+
         &.{},
         now,
     ).?;
@@ -2631,6 +2736,137 @@ test "content service: file truncated below text_bytes_max is indexed promptly v
         sys.sleepUs(10_000);
     }
     try testing.expect(indexed);
+}
+
+test "content service: text extracted but not indexed before a restart is reused" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var cache: TextCache = try .init(testing.allocator, fixture.cache.absolute);
+    defer cache.deinit(testing.allocator);
+    // Not PDFs: extracting either would fail. Their texts are cached under
+    // their keys, as an extraction leaves them.
+    const Cached = struct {
+        fn write(text_cache: TextCache, tree: *TestTree, name: []const u8, text: []const u8) !void {
+            try tree.write(name, "not really a pdf");
+            var path_buffer: paths.Buffer = undefined;
+            const path = try tree.path(&path_buffer, name);
+            const stat = content_list.stat(path, .document).?;
+            var text_path_buffer: paths.Buffer = undefined;
+            const text_path = text_cache.path(&text_path_buffer, .{
+                .path = path,
+                .mtime = stat.mtime,
+                .size = stat.size,
+                .source = .extracted,
+            }).?;
+            try sys.writeFileAtomic(text_path, text);
+        }
+    };
+    try Cached.write(cache, &fixture.root, "docs/a.pdf", "alpha aardwolf minutes");
+    {
+        const service = try fixture.start();
+        defer service.shutdown();
+        try waitChecks(service, 1);
+        try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "aardwolf")).len);
+    }
+    // What a shutdown in the middle of extracting a batch leaves: its texts
+    // cached, the index on disk without them.
+    try Cached.write(cache, &fixture.root, "docs/b.pdf", "beta bushbaby minutes");
+    const service = try fixture.start();
+    defer service.shutdown();
+    try waitChecks(service, 1);
+    try testing.expectEqual(@as(u32, 0), service.status().extractions);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "bushbaby")).len);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "aardwolf")).len);
+    // Once listed and indexed, what no document refers to is deleted.
+    try fixture.cache.write("text/0123456789abcdef-1700000000-99.txt", "stale");
+    try pokeAndWait(service);
+    try testing.expectEqual(@as(usize, 0), try countText(service, "0123456789abcdef-"));
+    try testing.expectEqual(@as(usize, 2), try countText(service, ""));
+}
+
+test "content service: a cached text that cannot be read is read again later, not indexed empty" {
+    if (linux.geteuid() == 0) return error.SkipZigTest;
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var cache: TextCache = try .init(testing.allocator, fixture.cache.absolute);
+    defer cache.deinit(testing.allocator);
+    try fixture.root.write("docs/a.pdf", "not really a pdf");
+    var path_buffer: paths.Buffer = undefined;
+    const path = try fixture.root.path(&path_buffer, "docs/a.pdf");
+    const stat = content_list.stat(path, .document).?;
+    var text_path_buffer: paths.Buffer = undefined;
+    const text_path = cache.path(&text_path_buffer, .{
+        .path = path,
+        .mtime = stat.mtime,
+        .size = stat.size,
+        .source = .extracted,
+    }).?;
+    try sys.writeFileAtomic(text_path, "gamma galago minutes");
+    // EACCES here; EMFILE or EIO as well.
+    try testing.expectEqual(linux.E.SUCCESS, linux.errno(linux.chmod(text_path, 0)));
+    const service = try fixture.start();
+    defer service.shutdown();
+    try waitChecks(service, 1);
+    try testing.expectEqual(@as(usize, 0), (try fixture.find(service, "galago")).len);
+    try testing.expectEqual(@as(usize, 0), service.status().docs);
+    // Readable again (the sweep after that listing may have deleted it:
+    // then it would be extracted again).
+    try sys.writeFileAtomic(text_path, "gamma galago minutes");
+    try pokeAndWait(service);
+
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "galago")).len);
+    try testing.expectEqual(@as(u32, 0), service.status().extractions);
+}
+
+test "content service: writing to a file the listing leaves out lists again once, not every time" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    // ripgrep reads .ignore files outside a repository too.
+    try fixture.root.write(".ignore", "logs/\n");
+    try fixture.root.write("logs/app.log", "first line of the log\n");
+    try fixture.root.write("notes.txt", "plain notes about otters\n");
+    var names_path_buffer: paths.Buffer = undefined;
+    const names_path = try fixture.cache.path(&names_path_buffer, "files.idx");
+    const names = try Service.start(testing.allocator, testing.io, fixture.root.absolute, names_path);
+    defer names.shutdown();
+    _ = try Service.waitNames(names, null);
+    const service = try fixture.startWith(.{
+        .refresh_interval_ns = std.math.maxInt(u64),
+        .poke_interval_ns_min = 0,
+        .removed_percent_max = 100,
+        .names = names,
+    });
+    defer service.shutdown();
+    try waitChecks(service, 1);
+    try testing.expectEqual(@as(usize, 1), (try fixture.find(service, "otters")).len);
+    const listings_start = service.status().listings;
+    // Written in place: not indexed, so a check lists every file to look
+    // for it, once.
+    var listed_again = false;
+    for (0..100) |_| {
+        try fixture.root.write("logs/app.log", "another line of the log\n");
+        try pokeAndWait(service);
+        if (service.status().listings > listings_start) {
+            listed_again = true;
+            break;
+        }
+        sys.sleepUs(10_000);
+    }
+    try testing.expect(listed_again);
+    // Left out by that listing: writing to it again lists nothing.
+    sys.sleepUs(50_000);
+    try pokeAndWait(service);
+    const listings_after = service.status().listings;
+    for (0..10) |_| {
+        try fixture.root.write("logs/app.log", "yet another line of the log\n");
+        sys.sleepUs(10_000);
+        try pokeAndWait(service);
+    }
+    try testing.expectEqual(listings_after, service.status().listings);
+    try testing.expectEqual(@as(usize, 0), (try fixture.find(service, "another")).len);
 }
 
 test "content service: initial listing failure reports list_failed without becoming ready" {

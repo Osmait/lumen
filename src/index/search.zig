@@ -41,8 +41,14 @@ const share_factor = 8;
 /// named `handler-N`), "hndlr" finds none of the right 60 with 16, all with
 /// 32; 64 keeps twice that margin for ~0.3 ms more per query.
 const finalist_factor = 64;
-/// Recency `stat` cap, in multiples of `limit`.
+/// Recency `stat`s per round, in multiples of `limit` (`byRecency`).
 const recency_factor = 16;
+/// The least `limit` finalists and recency stats are counted from: the
+/// factors above were measured for the Files view's 60. The root view asks
+/// for 5, and with 320 finalists its top was not the Files view's first
+/// 5 for the same query ("hndlr" found none of them on `zig build perf`'s
+/// home).
+const limit_counted_min = 60;
 /// Candidate sets larger than this are not cached for refinement.
 const cache_entries_max = 100_000;
 /// Shorter queries are not cached: with one or two letters almost every
@@ -212,7 +218,8 @@ pub const Engine = struct {
     }
 
     const SiftOptions = struct {
-        /// Hits the search returns; `limit * finalist_factor` finalists are kept.
+        /// Hits the search returns; `limit * finalist_factor` finalists
+        /// are kept (`limit_counted_min` at least).
         limit: usize,
         /// Sift the last query's candidates instead of the whole store.
         refine: bool,
@@ -248,7 +255,7 @@ pub const Engine = struct {
         const limit = options.limit;
         const refine = options.refine;
         const cacheable = options.cacheable;
-        const keep = limit * finalist_factor;
+        const keep = @max(limit, limit_counted_min) * finalist_factor;
         const source_count: usize = if (refine) engine.last_candidates.items.len else store.len();
         const chunks_count = @max(std.math.divCeil(usize, source_count, chunk_entries) catch 1, 1);
         const partials = try gpa.alloc(Partial, chunks_count);
@@ -274,6 +281,8 @@ pub const Engine = struct {
             ) catch keep))),
             .candidates_max = if (cacheable) cache_entries_max else 0,
             .partials = partials,
+            // Refined candidates came from a sift that left the roots out.
+            .skip_before = if (refine) 0 else store.rootsCount(),
         };
         pool.runBlocks(source_count, chunk_entries, &context, siftChunkCallback);
 
@@ -422,6 +431,10 @@ const SiftContext = struct {
     partials: []Partial,
     /// The `Pair.rank` a pair needs to be kept at all.
     floor: u64 = 0,
+    /// Positions below this are not scored: the roots, which come first
+    /// and whose name is their whole path ("/home/me" matched "hos",
+    /// "osm" and "meos", with a folder's bonus and no depth).
+    skip_before: usize = 0,
 };
 
 fn siftChunkCallback(context: *SiftContext, start: usize, end: usize) void {
@@ -457,7 +470,7 @@ fn siftChunk(
     // A `Pair.rank`, raised as the top fills.
     var threshold = context.floor;
 
-    var position = start;
+    var position = @max(start, context.skip_before);
     while (position < end) : (position += 1) {
         const id: u32 = if (context.ids) |ids| ids[position] else @intCast(position);
         if (masks[id] & context.query_mask != context.query_mask) continue;
@@ -601,6 +614,11 @@ const RecencyContext = struct {
 /// only the head of `hits` (sorted) is checked: with the bonus capped at
 /// `recency_max`, nothing below `cut - recency_max` can climb into the top
 /// `limit`. The cut comes from position `limit`, not further down.
+/// In rounds of stats (960 for the UI's 60, on the pool), the head sorted
+/// again after each and the cut taken again: it only rises, and the next
+/// hits are stat'ed while they could still reach it. Capped at one round,
+/// a `notes.md` edited a moment ago below a thousand older ones (the same
+/// name, ids in scan order) never got its bonus, nor a place in the top.
 fn byRecency(
     pool: *Pool,
     store: *const Store,
@@ -609,20 +627,29 @@ fn byRecency(
     no_stat: []const []const u8,
 ) void {
     if (hits.len == 0) return;
-    const cut = hits[@min(limit, hits.len) - 1].score;
-    const floor = cut -| recency_max;
-    var stat_count: usize = 0;
-    while (stat_count < hits.len and hits[stat_count].score >= floor) stat_count += 1;
-    stat_count = @min(stat_count, limit * recency_factor);
-    // Up to 960 path rebuilds and stats for the UI's 60: on the pool.
-    var recency_context: RecencyContext = .{
-        .store = store,
-        .hits = hits[0..stat_count],
-        .now = sys.nowSeconds(),
-        .no_stat = no_stat,
-    };
-    pool.runBlocks(stat_count, recency_block_entries, &recency_context, RecencyContext.block);
-    std.mem.sort(Pair, hits[0..stat_count], {}, lessThan);
+    const cut_position = @min(limit, hits.len) - 1;
+    const round_max = @max(limit, limit_counted_min) * recency_factor;
+    const now = sys.nowSeconds();
+    // `hits[0..stated]` have their bonus, sorted again; the rest have none.
+    var stated: usize = 0;
+    while (stated < hits.len) {
+        // The first round stats the whole top (`round_max >= limit`): from
+        // then on the cut is with bonuses.
+        const floor = hits[cut_position].score -| recency_max;
+        var round_end = stated;
+        while (round_end < hits.len and round_end - stated < round_max and
+            hits[round_end].score >= floor) round_end += 1;
+        if (round_end == stated) break;
+        var recency_context: RecencyContext = .{
+            .store = store,
+            .hits = hits[stated..round_end],
+            .now = now,
+            .no_stat = no_stat,
+        };
+        pool.runBlocks(round_end - stated, recency_block_entries, &recency_context, RecencyContext.block);
+        stated = round_end;
+        std.mem.sort(Pair, hits[0..stated], {}, lessThan);
+    }
 }
 
 /// Coarse on purpose: today vs this month vs old.
@@ -655,9 +682,13 @@ pub fn searchExhaustive(
     const query_mask = store_mod.charMask(query_folded);
     var all: std.ArrayList(Pair) = .empty;
     defer all.deinit(gpa);
+    const roots_count = store.rootsCount();
     for (store.masks(), 0..) |mask, i| {
         if (mask & query_mask != query_mask) continue;
         const id: u32 = @intCast(i);
+        // The cascade leaves the roots out (`SiftContext.skip_before`).
+        if (id < roots_count) continue;
+
         const cheap_score = cheap.scoreMasked(store.name(id), query_folded, mask) orelse continue;
         const fine_score = fine.score(store.name(id), query_folded) orelse 0;
         const score = fine_score * fine_weight + adjust(store, id, cheap_score);
@@ -801,9 +832,13 @@ test "cascade matches the exhaustive reference (recall 100%)" {
 /// first, then 24k deeper files. The shallow files rank first but score
 /// below the folders cheaply, and all of them land in the first chunk.
 fn scanOrdered(gpa: std.mem.Allocator) !Store {
+    return scanOrderedWith(gpa, 100, 240);
+}
+
+/// `scanOrdered` with `folders_count` folders of `files_count` files each.
+fn scanOrderedWith(gpa: std.mem.Allocator, comptime folders_count: usize, files_count: usize) !Store {
     var builder: store_mod.Builder = .empty;
     const root = try builder.push(gpa, "/r", store_mod.no_parent, store_mod.flag_dir, 0);
-    const folders_count = 100;
     var folder_names: [folders_count][16]u8 = undefined;
     var sorted: [folders_count][]const u8 = undefined;
     for (&folder_names, &sorted, 0..) |*text, *entry_name, i| {
@@ -822,7 +857,7 @@ fn scanOrdered(gpa: std.mem.Allocator) !Store {
     _ = try builder.push(gpa, "handler_readme.ts", root, 0, 1);
     _ = try builder.push(gpa, "handler_readme.zig", root, 0, 1);
     for (folders) |folder| {
-        for (0..240) |i| {
+        for (0..files_count) |i| {
             var text: [32]u8 = undefined;
             const entry_name = try std.mem.print(&text, "notes_{d:0>3}.md", .{i});
             _ = try builder.push(gpa, entry_name, folder, 0, 2);
@@ -849,6 +884,101 @@ test "shallow files crowded into the first chunk still reach the finalists" {
     try engine.search(gpa, pool, &store, "hndlr", .{ .limit = 2, .recency = false }, &got);
     try testing.expectEqual(want.items.len, got.items.len);
     for (want.items, got.items) |wanted, found| try testing.expectEqual(wanted, found);
+}
+
+test "a search for a few hits ranks them as one for many does" {
+    const gpa = testing.allocator;
+    // More `handler-N` folders, which the cheap score puts first, than a
+    // search for 5 kept finalists (320) when they were counted from its
+    // limit: the two files that rank first were left out.
+    var store = try scanOrderedWith(gpa, 1000, 2);
+    defer store.deinit(gpa);
+    const pool = try Pool.create(gpa, testing.io, 3);
+    defer pool.destroy();
+    var engine: Engine = .empty;
+    defer engine.deinit(gpa);
+    var got: std.ArrayList(Hit) = .empty;
+    defer got.deinit(gpa);
+    var want: std.ArrayList(Hit) = .empty;
+    defer want.deinit(gpa);
+    for ([_]usize{ 1, 2, 5, 60 }) |limit| {
+        for ([_][]const u8{ "hndlr", "hdlr", "handler_r" }) |query| {
+            engine.reset();
+            try searchExhaustive(gpa, &store, query, limit, &want);
+            try engine.search(gpa, pool, &store, query, .{ .limit = limit, .recency = false }, &got);
+            try testing.expectEqual(want.items.len, got.items.len);
+            for (want.items, got.items) |wanted, found| try testing.expectEqual(wanted, found);
+        }
+    }
+    try searchExhaustive(gpa, &store, "hndlr", 2, &want);
+    for (want.items) |hit| try testing.expect(!store.isFolder(hit.id));
+}
+
+test "the root is not a result: its name is its whole path" {
+    const gpa = testing.allocator;
+    var builder: store_mod.Builder = .empty;
+    const root = try builder.push(gpa, "/home/osmait", store_mod.no_parent, store_mod.flag_dir, 0);
+    const folder_flags = store_mod.flag_dir | store_mod.flag_folder;
+    const documents = try builder.push(gpa, "Documents", root, folder_flags, 1);
+    const project = try builder.push(gpa, "proj", root, folder_flags, 1);
+    _ = try builder.push(gpa, "informe_semestral.pdf", documents, 0, 2);
+    const source = try builder.push(gpa, "src", project, folder_flags, 2);
+    _ = try builder.push(gpa, "main.rs", source, 0, 3);
+    var store = try builder.finish(gpa);
+    defer store.deinit(gpa);
+    const pool = try Pool.create(gpa, testing.io, 1);
+    defer pool.destroy();
+    var got: std.ArrayList(Hit) = .empty;
+    defer got.deinit(gpa);
+    for ([_][]const u8{ "mai", "hos", "osm", "meos", "eit", "/home" }) |query| {
+        var engine: Engine = .empty;
+        defer engine.deinit(gpa);
+        try engine.search(gpa, pool, &store, query, .{ .limit = 10, .recency = false }, &got);
+        for (got.items) |hit| try testing.expect(hit.id != root);
+        try searchExhaustive(gpa, &store, query, 10, &got);
+        for (got.items) |hit| try testing.expect(hit.id != root);
+    }
+    try testing.expectEqualStrings("main.rs", try topName(gpa, pool, &store, "mai"));
+    try testing.expectEqualStrings("", try topName(gpa, pool, &store, "hos"));
+}
+
+test "recency: a recent file below more look-alikes than one round of stats still ranks first" {
+    const gpa = testing.allocator;
+    var temporary = testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory_buffer: paths.Buffer = undefined;
+    const directory = try sys.tmpDirAbs(&temporary, &directory_buffer);
+    var path_buffer: paths.Buffer = undefined;
+    try sys.mkdirP(try std.mem.printSentinel(&path_buffer, "{s}/z/deep", .{directory}, 0));
+    try sys.writeFile(try std.mem.printSentinel(&path_buffer, "{s}/z/deep/notes.md", .{directory}, 0), "x");
+    // 1,200 `notes.md` one level up, none of them on disk (no bonus), more
+    // than the stats of one round (60 * 16).
+    const copies = 1200;
+    var builder: store_mod.Builder = .empty;
+    const root = try builder.push(gpa, directory, store_mod.no_parent, store_mod.flag_dir, 0);
+    const folder_flags = store_mod.flag_dir | store_mod.flag_folder;
+    var first_folder: u32 = undefined;
+    for (0..copies) |i| {
+        var name_buffer: [16]u8 = undefined;
+        const folder = try builder.push(gpa, try std.mem.print(&name_buffer, "d{d}", .{i}), root, folder_flags, 1);
+        if (i == 0) first_folder = folder;
+    }
+    const z = try builder.push(gpa, "z", root, folder_flags, 1);
+    for (0..copies) |i| _ = try builder.push(gpa, "notes.md", first_folder + @as(u32, @intCast(i)), 0, 2);
+    const deep = try builder.push(gpa, "deep", z, folder_flags, 2);
+    const recent = try builder.push(gpa, "notes.md", deep, 0, 3);
+    var store = try builder.finish(gpa);
+    defer store.deinit(gpa);
+    const pool = try Pool.create(gpa, testing.io, 2);
+    defer pool.destroy();
+    var engine: Engine = .empty;
+    defer engine.deinit(gpa);
+    var got: std.ArrayList(Hit) = .empty;
+    defer got.deinit(gpa);
+    try engine.search(gpa, pool, &store, "notes.md", .{ .limit = 60 }, &got);
+    try testing.expectEqual(@as(usize, 60), got.items.len);
+    try testing.expectEqual(recent, got.items[0].id);
+    try testing.expect(got.items[0].score > got.items[1].score);
 }
 
 fn smallStore(gpa: std.mem.Allocator, names: []const []const u8) !Store {

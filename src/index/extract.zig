@@ -9,9 +9,11 @@
 //!     `ab.docx`), and no file name can be mistaken for an option.
 //!   - A pathological file must not stall the indexer: output is read up to a
 //!     cap, then the tool is SIGKILLed, and what was read is kept (truncated
-//!     text still indexes). Past `timeout_ms` likewise, but that is an error
-//!     (`Timeout`): text cut short by a busy machine would be cached as the
-//!     document's whole text for good.
+//!     text still indexes). Past its wall-clock budget (`wallMs`) likewise,
+//!     but that is an error (`Timeout`): text cut short by a busy machine
+//!     would be cached as the document's whole text for good. The CPU limit
+//!     stays at `timeout_ms` whatever the budget: what the document itself
+//!     costs, unlike the time a loaded machine takes.
 //!   - The tools get an empty environment (`UNZIP=-a` and friends stay out),
 //!     and unzip an empty password: an encrypted document made it ask for
 //!     one on the terminal the daemon was started from, and wait for it.
@@ -24,8 +26,18 @@ const file_kind = @import("core").file_kind;
 
 pub const Kind = enum { pdf, docx, xlsx, pptx, odt, ods, odp };
 
-/// Wall-clock budget for one tool run.
+/// Wall-clock budget for one tool run on a first attempt, and its CPU
+/// limit on every attempt.
 pub const timeout_ms = 15_000;
+
+/// Wall-clock budget for one tool run after `attempts` failed ones: doubled
+/// each time, up to 4x. The tools run niced with idle I/O, so a machine
+/// busy compiling for minutes made a PDF of 1-2 s time out again and again;
+/// a document that needs that much CPU hits the CPU limit instead
+/// (`error.ToolKilled`).
+pub fn wallMs(attempts: u8) u64 {
+    return @as(u64, timeout_ms) << @as(u6, @intCast(@min(attempts, 2)));
+}
 
 /// Office writes `~$name.docx` next to an open document: who has it open,
 /// not a zip.
@@ -47,7 +59,8 @@ pub const ExtractError = Error || std.mem.Allocator.Error || sys.child.Error;
 /// `gpa`, at most `bytes_max` long (truncated, never failing for size).
 /// An error for unreadable or corrupt files, which callers skip;
 /// error.ToolMissing when pdftotext or unzip is not installed. Setting
-/// `cancel` kills the tool: error.Timeout.
+/// `cancel` kills the tool: error.Cancelled. Each tool run gets `wall_ms`
+/// of wall-clock time (`wallMs`), past which it fails with error.Timeout.
 pub fn extractText(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -55,9 +68,11 @@ pub fn extractText(
     kind: Kind,
     bytes_max: usize,
     cancel: ?*const std.atomic.Value(bool),
+    wall_ms: u64,
 ) ExtractError![]u8 {
     const fd = try sys.openRegular(path);
     defer sys.close(fd);
+    const run: ToolRun = .{ .io = io, .cancel = cancel, .wall_ms = wall_ms };
 
     if (kind == .pdf) {
         const raw = try runTool(
@@ -67,7 +82,7 @@ pub fn extractText(
             fd,
             bytes_max,
             &.{0},
-            timeout_ms,
+            wall_ms,
             cancel,
         );
         // Pages are separated by form feeds.
@@ -77,29 +92,19 @@ pub fn extractText(
 
     // Markup outweighs text several times over; the cap only guards memory.
     const xml_bytes_read_max = @max(bytes_max, @min(bytes_max *| xml_per_text_max, xml_bytes_max));
-    if (kind == .xlsx) return extractXlsx(gpa, io, fd, bytes_max, xml_bytes_read_max, cancel);
+    if (kind == .xlsx) return extractXlsx(gpa, run, fd, bytes_max, xml_bytes_read_max);
 
     var extra_arena: std.heap.ArenaAllocator = .init(gpa);
     defer extra_arena.deinit();
     var extra_members: []const []const u8 = &.{};
+    var docx_members = docx_base_members;
     if (kind == .docx) {
-        const rels_xml = try runUnzipMembers(
-            gpa,
-            io,
-            fd,
-            &.{"word/_rels/document.xml.rels"},
-            docx_rels_bytes_max,
-            cancel,
-        );
-        defer gpa.free(rels_xml);
-        // The first unzip read `fd` to EOF; rewind before reading the document parts.
-        _ = linux.lseek(fd, 0, linux.SEEK.SET);
-        extra_members = try parseDocxRelsMembers(extra_arena.allocator(), rels_xml);
+        extra_members = try docxParts(gpa, extra_arena.allocator(), run, fd, &docx_members);
     }
 
     const base_members: []const []const u8 = switch (kind) {
         .pdf, .xlsx => unreachable, // Handled above.
-        .docx => &docx_base_members,
+        .docx => &docx_members,
         .pptx => &.{"ppt/slides/slide*.xml"},
         .odt, .ods, .odp => &.{"content.xml"},
     };
@@ -110,11 +115,10 @@ pub fn extractText(
 
     const xml = try runUnzipMembers(
         gpa,
-        io,
+        run,
         fd,
         members_buf[0..members_len],
         xml_bytes_read_max,
-        cancel,
     );
     defer gpa.free(xml);
     return shrink(gpa, try xmlToText(gpa, xml, bytes_max), bytes_max);
@@ -127,19 +131,17 @@ pub fn extractText(
 /// (~100 k rows of numbers) was cached with none of its strings.
 fn extractXlsx(
     gpa: std.mem.Allocator,
-    io: std.Io,
+    run: ToolRun,
     fd: i32,
     bytes_max: usize,
     xml_bytes_read_max: usize,
-    cancel: ?*const std.atomic.Value(bool),
 ) ExtractError![]u8 {
     const shared_xml = try runUnzipMembers(
         gpa,
-        io,
+        run,
         fd,
         &.{"xl/sharedStrings.xml"},
         xml_bytes_read_max,
-        cancel,
     );
     defer gpa.free(shared_xml);
     const shared = try xlsxXmlToText(gpa, shared_xml, bytes_max);
@@ -152,11 +154,10 @@ fn extractXlsx(
     _ = linux.lseek(fd, 0, linux.SEEK.SET);
     const sheets_xml = try runUnzipMembers(
         gpa,
-        io,
+        run,
         fd,
         &.{"xl/worksheets/sheet*.xml"},
         sheets_xml_bytes_max,
-        cancel,
     );
     defer gpa.free(sheets_xml);
     const separator = if (shared.len > 0) "\n" else "";
@@ -168,19 +169,96 @@ fn extractXlsx(
 
 const docx_rels_bytes_max = 256 << 10;
 const docx_extra_members_max = 16;
+/// The main part (as Word names it; `_rels/.rels` may name another), then
+/// the notes.
 const docx_base_members = [_][]const u8{
     "word/document.xml",
     "word/footnotes.xml",
     "word/endnotes.xml",
 };
+const docx_main_default = docx_base_members[0];
+const docx_root_rels = "_rels/.rels";
+
+/// What every tool run of one extraction shares.
+const ToolRun = struct {
+    io: std.Io,
+    cancel: ?*const std.atomic.Value(bool),
+    wall_ms: u64,
+};
+
+/// The parts of a docx besides `members` (whose first, the main part, is
+/// set to the one `_rels/.rels` names): the headers and footers the main
+/// part's relationships link, in `arena`. The main part's name is up to the
+/// producer: Word and Office 365 write `word/document2.xml` at times, and
+/// asking for `word/document.xml` then gave no text, cached for good.
+/// Both relationship files are read in one run when the main part has its
+/// usual name; `fd` is left rewound.
+fn docxParts(
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    run: ToolRun,
+    fd: i32,
+    members: *[docx_base_members.len][]const u8,
+) ExtractError![]const []const u8 {
+    const rels_xml = try runUnzipMembers(
+        gpa,
+        run,
+        fd,
+        &.{ docx_root_rels, "word/_rels/document.xml.rels" },
+        docx_rels_bytes_max,
+    );
+    defer gpa.free(rels_xml);
+    // Each unzip reads `fd` to EOF; rewound before the next one.
+    _ = linux.lseek(fd, 0, linux.SEEK.SET);
+    const main = try docxMainPart(arena, rels_xml) orelse docx_main_default;
+    members[0] = main;
+    const main_directory = std.Io.Dir.path.dirname(main) orelse "";
+    // Only the root's relationships name the main part, and only the main
+    // part's link headers and footers: one parse of both is the same.
+    if (std.mem.eql(u8, main, docx_main_default)) {
+        return parseDocxRelsMembers(arena, rels_xml, main_directory, members);
+    }
+    const main_rels = try std.fmt.allocPrint(arena, "{s}{s}_rels/{s}.rels", .{
+        main_directory,
+        if (main_directory.len > 0) "/" else "",
+        std.Io.Dir.path.basename(main),
+    });
+    const main_rels_xml = try runUnzipMembers(gpa, run, fd, &.{main_rels}, docx_rels_bytes_max);
+    defer gpa.free(main_rels_xml);
+    _ = linux.lseek(fd, 0, linux.SEEK.SET);
+    return parseDocxRelsMembers(arena, main_rels_xml, main_directory, members);
+}
+
+/// The main part `_rels/.rels` names (its `officeDocument` relationship),
+/// normalized from the archive root; null when it names none.
+fn docxMainPart(arena: std.mem.Allocator, xml: []const u8) std.mem.Allocator.Error!?[]const u8 {
+    var i: usize = 0;
+    while (i < xml.len) {
+        const lt = std.mem.findScalarPos(u8, xml, i, '<') orelse break;
+        if (nonTagMarkupEnd(xml, lt)) |next| {
+            i = next;
+            continue;
+        }
+        const tag = Tag.parse(xml, lt) orelse break;
+        i = tag.end + 1;
+        if (tag.closing or !std.mem.eql(u8, tag.local, "Relationship")) continue;
+        const rel_type = tagAttribute(xml, lt, tag.end, "Type") orelse continue;
+        // Transitional and Strict OOXML name the type under different URIs.
+        if (!std.mem.endsWith(u8, rel_type, "/officeDocument")) continue;
+        const target_mode = tagAttribute(xml, lt, tag.end, "TargetMode") orelse "";
+        if (std.ascii.eqlIgnoreCase(target_mode, "External")) continue;
+        const target = tagAttribute(xml, lt, tag.end, "Target") orelse continue;
+        return try normalizeDocxTarget(arena, "", target);
+    }
+    return null;
+}
 
 fn runUnzipMembers(
     gpa: std.mem.Allocator,
-    io: std.Io,
+    run: ToolRun,
     fd: i32,
     members: []const []const u8,
     output_bytes_max: usize,
-    cancel: ?*const std.atomic.Value(bool),
 ) ExtractError![]u8 {
     // An encrypted member fails (exit 82) instead of prompting.
     const argv_head = [_][]const u8{ "unzip", "-P", "", "-p", "/dev/stdin" };
@@ -189,21 +267,25 @@ fn runUnzipMembers(
     @memcpy(argv[argv_head.len..][0..members.len], members);
     return runTool(
         gpa,
-        io,
+        run.io,
         argv[0 .. argv_head.len + members.len],
         fd,
         output_bytes_max,
-        &.{ unzip_exit.ok, unzip_exit.member_missing },
-        timeout_ms,
-        cancel,
+        &.{ unzip_exit.ok, unzip_exit.warning, unzip_exit.member_missing },
+        run.wall_ms,
+        run.cancel,
     );
 }
 
-/// Parses `word/_rels/document.xml.rels` for linked internal header/footer XML
-/// members, normalized relative to the archive root and deduplicated.
+/// Parses the main part's relationships (`word/_rels/document.xml.rels`)
+/// for linked internal header/footer XML members, normalized relative to
+/// the archive root (targets are relative to `directory`, the main part's)
+/// and deduplicated, none of `members`.
 fn parseDocxRelsMembers(
     arena: std.mem.Allocator,
     xml: []const u8,
+    directory: []const u8,
+    members: []const []const u8,
 ) std.mem.Allocator.Error![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     var i: usize = 0;
@@ -222,8 +304,8 @@ fn parseDocxRelsMembers(
         if (std.ascii.eqlIgnoreCase(target_mode, "External")) continue;
         if (!std.mem.endsWith(u8, rel_type, "/header") and
             !std.mem.endsWith(u8, rel_type, "/footer")) continue;
-        const normalized = try normalizeDocxTarget(arena, target) orelse continue;
-        if (containsMember(&docx_base_members, normalized) or containsMember(out.items, normalized)) {
+        const normalized = try normalizeDocxTarget(arena, directory, target) orelse continue;
+        if (containsMember(members, normalized) or containsMember(out.items, normalized)) {
             continue;
         }
         try out.append(arena, normalized);
@@ -286,7 +368,15 @@ fn tagAttribute(xml: []const u8, tag_start: usize, tag_end: usize, attr_name: []
     return null;
 }
 
-fn normalizeDocxTarget(arena: std.mem.Allocator, raw_target: []const u8) std.mem.Allocator.Error!?[]const u8 {
+/// A relationship's `raw_target` as an archive member name: absolute ones
+/// from the root, others from `directory` (the source part's, "" for the
+/// root). Null for one that leaves the archive or that unzip would read as
+/// a pattern or an option.
+fn normalizeDocxTarget(
+    arena: std.mem.Allocator,
+    directory: []const u8,
+    raw_target: []const u8,
+) std.mem.Allocator.Error!?[]const u8 {
     if (raw_target.len == 0) return null;
     for (raw_target) |ch| {
         if (ch < 0x20 or ch == '\\' or ch == '*' or ch == '?' or ch == '[' or ch == ']') return null;
@@ -295,8 +385,12 @@ fn normalizeDocxTarget(arena: std.mem.Allocator, raw_target: []const u8) std.mem
     var count: usize = 0;
     const is_abs = raw_target[0] == '/';
     if (!is_abs) {
-        parts[0] = "word";
-        count = 1;
+        var directory_parts = std.mem.tokenizeScalar(u8, directory, '/');
+        while (directory_parts.next()) |component| {
+            if (count >= parts.len) return null;
+            parts[count] = component;
+            count += 1;
+        }
     }
     var it = std.mem.tokenizeScalar(u8, std.mem.trimStart(u8, raw_target, "/"), '/');
     while (it.next()) |component| {
@@ -339,6 +433,10 @@ const xml_bytes_max = 256 << 20;
 /// password-protected one 82: those fail.
 const unzip_exit = struct {
     const ok = 0;
+    /// "Warnings, but processing completed successfully anyway": a zip
+    /// with bytes before it (a self-extractor, a botched download), whose
+    /// members still came out whole.
+    const warning = 1;
     /// Some member was not found: an optional one, or an xlsx without
     /// shared strings.
     const member_missing = 11;
@@ -371,10 +469,15 @@ fn runTool(
         .deadline_ns = sys.monotonicNs() + limit_ms * std.time.ns_per_ms,
         .cancel = cancel,
         // The documents are anyone's (a download): a crafted one must not
-        // take the machine's memory, nor write anywhere.
+        // take the machine's memory or CPU, nor grow a file. Limits only,
+        // not a sandbox: code run by an exploited tool can still delete or
+        // empty the user's files, open sockets and reach the session bus.
+
         .limits = .{
             .memory_bytes_max = tool_memory_bytes_max,
-            .cpu_s_max = limit_ms / std.time.ms_per_s + 1,
+            // Not from `limit_ms`: CPU time is what the document costs, the
+            // wall clock what a loaded machine takes as well (`wallMs`).
+            .cpu_s_max = timeout_ms / std.time.ms_per_s + 1,
         },
     }) catch |err| return switch (err) {
         error.FileNotFound => error.ToolMissing,
@@ -473,8 +576,10 @@ fn xmlToText(gpa: std.mem.Allocator, xml: []const u8, bytes_max: usize) ![]u8 {
 
 /// Text of concatenated XLSX XML members (`sharedStrings.xml` and
 /// `sheet*.xml`): keeps all text outside worksheets (`sharedStrings.xml`), and
-/// inside worksheets keeps only `<is>` inline-string elements while skipping
-/// numeric cell `<v>` values and `<f>` formulas.
+/// inside worksheets keeps only `<is>` inline-string elements and the `<v>`
+/// of string cells (`t="str"`: a formula's text result, as last computed),
+/// while skipping other cells' `<v>` values (numbers, indexes of shared
+/// strings) and `<f>` formulas.
 fn xlsxXmlToText(gpa: std.mem.Allocator, xml: []const u8, bytes_max: usize) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
@@ -484,9 +589,13 @@ fn xlsxXmlToText(gpa: std.mem.Allocator, xml: []const u8, bytes_max: usize) ![]u
     var skip: Skip = .{};
     var worksheet_depth: usize = 0;
     var inline_str_depth: usize = 0;
+    // Inside a `t="str"` cell, and inside its value.
+    var str_cell = false;
+    var str_value_depth: usize = 0;
     var i: usize = 0;
     while (i < xml.len and !text_out.full()) {
-        const skipping = skip.name != null or (worksheet_depth > 0 and inline_str_depth == 0);
+        const kept = inline_str_depth > 0 or str_value_depth > 0;
+        const skipping = skip.name != null or (worksheet_depth > 0 and !kept);
         if (xml[i] != '<') {
             i = try text_out.charData(xml, i, skipping);
             continue;
@@ -495,6 +604,7 @@ fn xlsxXmlToText(gpa: std.mem.Allocator, xml: []const u8, bytes_max: usize) ![]u
             i = next;
             continue;
         }
+        const tag_start = i;
         const tag = Tag.parse(xml, i) orelse break; // Truncated.
         i = tag.end + 1;
         if (skip.swallow(tag)) continue;
@@ -513,6 +623,16 @@ fn xlsxXmlToText(gpa: std.mem.Allocator, xml: []const u8, bytes_max: usize) ![]u
                 inline_str_depth -|= 1;
             } else if (!tag.self_closing) {
                 inline_str_depth += 1;
+            }
+        } else if (worksheet_depth > 0 and std.mem.eql(u8, tag.local, "c")) {
+            const cell_type = if (tag.closing) "" else tagAttribute(xml, tag_start, tag.end, "t") orelse "";
+            str_cell = !tag.closing and !tag.self_closing and std.mem.eql(u8, cell_type, "str");
+            str_value_depth = 0;
+        } else if (str_cell and std.mem.eql(u8, tag.local, "v")) {
+            if (tag.closing) {
+                str_value_depth -|= 1;
+            } else if (!tag.self_closing) {
+                str_value_depth += 1;
             }
         }
         text_out.widenGap(gapOf(tag.local));
@@ -881,6 +1001,7 @@ const TestDir = struct {
             kindOf(name).?,
             bytes_max,
             null,
+            timeout_ms,
         ) catch |err| switch (err) {
             error.ToolMissing => error.SkipZigTest,
             else => err,
@@ -1029,6 +1150,105 @@ test "extract xlsx: shared strings stored after sheets past the cap are still re
     const got = try test_dir.extract("big.xlsx", bytes_max);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("QuarterlyRevenueHeader", got);
+}
+
+test "extract xlsx: a formula's text result is read, numbers and formulas are not" {
+    var test_dir: TestDir = undefined;
+    try test_dir.init();
+    defer test_dir.deinit();
+    try test_dir.write("f/xl/workbook.xml", "<workbook/>");
+    try test_dir.write("f/xl/worksheets/sheet1.xml",
+        \\<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>
+        \\<row r="1"><c r="A1" t="inlineStr"><is><t>ArenaAllocator</t></is></c><c r="B1" t="str"><f>CONCAT("use","State")</f><v>useState</v></c></row>
+        \\<row r="2"><c r="A2"><f>SUM(B2:B3)</f><v>42</v></c><c r="B2" t="b"><v>1</v></c><c r="C2" t="e"><v>#N/A</v></c><c r="D2" t="s"><v>0</v></c></row>
+        \\<row r="3"><c r="A3" t="str"/><c r="B3"><v>7</v></c><c r="C3" t="str"><f>LOWER("X")</f><v>tokenPlusLower</v></c></row>
+        \\</sheetData></worksheet>
+    );
+    try zipInto(&test_dir, "f", "formulas.xlsx");
+    try expectExtract(&test_dir, "formulas.xlsx", "ArenaAllocator\nuseState tokenPlusLower");
+}
+
+test "extract docx: the main part `_rels/.rels` names, with its headers" {
+    var test_dir: TestDir = undefined;
+    try test_dir.init();
+    defer test_dir.deinit();
+    try test_dir.write("d/[Content_Types].xml",
+        \\<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/word/document2.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>
+    );
+    try test_dir.write("d/_rels/.rels",
+        \\<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+        \\<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>
+        \\<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document2.xml"/>
+        \\</Relationships>
+    );
+    try test_dir.write(
+        "d/word/document2.xml",
+        "<w:document><w:body><w:p><w:r><w:t>BodyTextZanzibar</w:t></w:r></w:p></w:body></w:document>",
+    );
+    try test_dir.write("d/word/_rels/document2.xml.rels",
+        \\<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+        \\<Relationship Id="rId7" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" Target="header1.xml"/>
+        \\</Relationships>
+    );
+    try test_dir.write(
+        "d/word/header1.xml",
+        "<w:hdr><w:p><w:r><w:t>HeaderKalahari</w:t></w:r></w:p></w:hdr>",
+    );
+    try test_dir.write(
+        "d/word/footnotes.xml",
+        "<w:footnotes><w:footnote><w:p><w:r><w:t>NoteOkavango</w:t></w:r></w:p></w:footnote></w:footnotes>",
+    );
+    try zipInto(&test_dir, "d", "renamed.docx");
+    try expectExtract(&test_dir, "renamed.docx", "BodyTextZanzibar\nNoteOkavango\nHeaderKalahari");
+
+    // `_rels/.rels` naming the usual part: as before, headers included.
+    try test_dir.write("u/_rels/.rels",
+        \\<Relationships><Relationship Id="rId1" Type="http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument" Target="/word/document.xml"/></Relationships>
+    );
+    try test_dir.write(
+        "u/word/document.xml",
+        "<w:document><w:body><w:p><w:r><w:t>UsualBody</w:t></w:r></w:p></w:body></w:document>",
+    );
+    try test_dir.write("u/word/_rels/document.xml.rels",
+        \\<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/footer" Target="footer1.xml"/></Relationships>
+    );
+    try test_dir.write("u/word/footer1.xml", "<w:ftr><w:p><w:r><w:t>UsualFooter</w:t></w:r></w:p></w:ftr>");
+    try zipInto(&test_dir, "u", "usual.docx");
+    try expectExtract(&test_dir, "usual.docx", "UsualBody\nUsualFooter");
+}
+
+test "normalizeDocxTarget: from the source part's folder, never out of the archive" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try testing.expectEqualStrings("word/document2.xml", (try normalizeDocxTarget(arena, "", "word/document2.xml")).?);
+    try testing.expectEqualStrings("word/header1.xml", (try normalizeDocxTarget(arena, "word", "header1.xml")).?);
+    try testing.expectEqualStrings("word/footer1.xml", (try normalizeDocxTarget(arena, "word", "/word/footer1.xml")).?);
+    try testing.expectEqualStrings("a/b/x.xml", (try normalizeDocxTarget(arena, "a/b", "./x.xml")).?);
+    try testing.expectEqual(@as(?[]const u8, null), try normalizeDocxTarget(arena, "", "../x.xml"));
+    try testing.expectEqual(@as(?[]const u8, null), try normalizeDocxTarget(arena, "word", "../../etc/passwd"));
+    try testing.expectEqual(@as(?[]const u8, null), try normalizeDocxTarget(arena, "", "word/doc*.xml"));
+    try testing.expectEqual(@as(?[]const u8, null), try normalizeDocxTarget(arena, "", "-x.xml"));
+}
+
+test "extract: unzip's warning (bytes before the zip) still gives the text" {
+    var test_dir: TestDir = undefined;
+    try test_dir.init();
+    defer test_dir.deinit();
+    try test_dir.write("o/content.xml", "<office:text><text:p>okapi minutes</text:p></office:text>");
+    try zipInto(&test_dir, "o", "good.odt");
+    try expectExtract(&test_dir, "good.odt", "okapi minutes");
+    // The same zip with 12 bytes of junk in front: unzip says so, prints
+    // the member whole and exits 1.
+    const good_path = try test_dir.absZ("good.odt");
+    defer testing.allocator.free(good_path);
+    var good_buffer: [4096]u8 = undefined;
+    const good = sys.readHead(good_path, &good_buffer);
+    try testing.expect(good.len > 0 and good.len < good_buffer.len);
+    const prefixed = try std.mem.concat(testing.allocator, u8, &.{ "junk-junk-12", good });
+    defer testing.allocator.free(prefixed);
+    try test_dir.write("prefixed.odt", prefixed);
+    try expectExtract(&test_dir, "prefixed.odt", "okapi minutes");
 }
 
 /// Zips `folder` into `name` at the test dir's top level, members (relative
